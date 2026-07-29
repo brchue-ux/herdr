@@ -291,7 +291,11 @@ Space 行支持以下内置 token：
 - `workspace` — 工作区名称。
 - `branch` — Git 分支（如有）。
 - `git_status` — 非零时显示 Git ahead 和 behind 数量。
+- `terminal_title` — 从单个窗格汇总的、经过安全规范化的最新 OSC 0/2 终端标题。
+- `terminal_title_stripped` — 对同一汇总标题，移除一个可识别的开头活动或旋转指示符字形及其后空白后的结果。
 - `$name` — 名为 `name` 的自定义工作区元数据。
+
+一个 Space 可以包含多个窗格，因此它的终端标题取自与 `state_icon`、`state_text` 相同的窗格：注意力优先级最高的窗格（依次为 blocked、未查看的已完成、working、idle、unknown），优先级相同时取标签页与布局顺序中的第一个窗格。因此同一 Space 行上的图标与标题始终描述同一个窗格。没有窗格、没有运行中的终端，或所选窗格从未设置终端标题的 Space 不会渲染标题；与其他缺失值一样，它会连同分隔符一起消失，当该行其余 token 也没有值时整行消失。折叠的 worktree 分组会跨成员 Space 汇总状态图标，但每行的标题仍是该 Space 自身的标题，这与 `workspace` 和 `branch` 一致。
 
 token 会按配置顺序渲染。Herdr 通常使用 ` · ` 分隔相邻值，并在 `state_icon` 后使用一个空格。缺失值及其分隔符会消失；当一行中的所有 token 都没有值时，该行会消失。每个布局最多可包含 16 行，每行最多可包含 16 个 token。
 

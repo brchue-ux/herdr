@@ -93,6 +93,9 @@ pub(super) struct SpaceTokenContext<'a> {
     pub branch: Option<&'a str>,
     pub state_text: &'a str,
     pub ahead_behind: Option<(usize, usize)>,
+    /// Terminal titles of the pane that also decides this space's state icon.
+    pub terminal_title: Option<&'a str>,
+    pub terminal_title_stripped: Option<&'a str>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
 }
@@ -126,6 +129,12 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        SpaceSidebarToken::TerminalTitle => context
+                            .terminal_title
+                            .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
+                        SpaceSidebarToken::TerminalTitleStripped => context
+                            .terminal_title_stripped
+                            .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -298,6 +307,8 @@ mod tests {
                     branch: Some("worktree/feature"),
                     state_text: "idle",
                     ahead_behind: Some((2, 1)),
+                    terminal_title: None,
+                    terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
                 },
@@ -305,6 +316,111 @@ mod tests {
             vec![vec![
                 ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
                 ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
+            ]]
+        );
+    }
+
+    #[test]
+    fn space_terminal_title_tokens_resolve_raw_and_stripped_values() {
+        let config = SpacesSidebarConfig {
+            rows: vec![
+                vec![SpaceSidebarToken::Workspace],
+                vec![
+                    SpaceSidebarToken::TerminalTitle,
+                    SpaceSidebarToken::TerminalTitleStripped,
+                ],
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "repo",
+                    branch: None,
+                    state_text: "working",
+                    ahead_behind: None,
+                    terminal_title: Some("⠋ running tests"),
+                    terminal_title_stripped: Some("running tests"),
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: false,
+                },
+            ),
+            vec![
+                vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
+                    "repo".into()
+                ))],
+                vec![
+                    ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle(
+                        "⠋ running tests".into()
+                    )),
+                    ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle(
+                        "running tests".into()
+                    )),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_space_terminal_titles_elide_their_row() {
+        let config = SpacesSidebarConfig {
+            rows: vec![
+                vec![SpaceSidebarToken::Workspace],
+                vec![SpaceSidebarToken::TerminalTitleStripped],
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "repo",
+                    branch: None,
+                    state_text: "unknown",
+                    ahead_behind: None,
+                    terminal_title: None,
+                    terminal_title_stripped: None,
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: false,
+                },
+            ),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
+                "repo".into()
+            ))]]
+        );
+    }
+
+    #[test]
+    fn grouped_space_children_keep_terminal_titles() {
+        let config = SpacesSidebarConfig {
+            rows: vec![vec![
+                SpaceSidebarToken::Workspace,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::TerminalTitleStripped,
+            ]],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "feature",
+                    branch: Some("worktree/feature"),
+                    state_text: "working",
+                    ahead_behind: None,
+                    terminal_title: Some("⠋ running tests"),
+                    terminal_title_stripped: Some("running tests"),
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: true,
+                },
+            ),
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("running tests".into())),
             ]]
         );
     }
@@ -325,6 +441,8 @@ mod tests {
                     branch: None,
                     state_text: "idle",
                     ahead_behind: None,
+                    terminal_title: None,
+                    terminal_title_stripped: None,
                     tokens: &tokens,
                     suppress_git_details: false,
                 },

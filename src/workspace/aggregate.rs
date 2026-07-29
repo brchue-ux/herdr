@@ -72,6 +72,13 @@ impl Tab {
     }
 }
 
+/// Terminal titles rolled up to one Space sidebar row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AggregateTerminalTitle {
+    pub raw: Option<String>,
+    pub stripped: Option<String>,
+}
+
 fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
@@ -97,6 +104,37 @@ impl Workspace {
             })
             .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))
+    }
+
+    /// Terminal titles of the pane that also decides [`Workspace::aggregate_state`]:
+    /// the highest attention priority, resolving ties to the first pane in tab and
+    /// layout order. A workspace with no panes, or whose winning pane has no
+    /// terminal title, reports no title.
+    pub fn aggregate_terminal_title(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+    ) -> AggregateTerminalTitle {
+        let mut best: Option<(u8, &TerminalState)> = None;
+        for tab in &self.tabs {
+            for pane_id in tab.layout.pane_ids() {
+                let Some(pane) = tab.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+                    continue;
+                };
+                let priority = pane_attention_priority(terminal.state, pane.seen);
+                if best.is_none_or(|(best_priority, _)| priority > best_priority) {
+                    best = Some((priority, terminal));
+                }
+            }
+        }
+
+        best.map(|(_, terminal)| AggregateTerminalTitle {
+            raw: terminal.terminal_title.clone(),
+            stripped: terminal.terminal_title_stripped(),
+        })
+        .unwrap_or_default()
     }
 
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
@@ -191,6 +229,83 @@ mod tests {
 
         assert_eq!(state, AgentState::Idle);
         assert!(!seen);
+    }
+
+    #[test]
+    fn aggregate_terminal_title_follows_the_pane_that_wins_the_state_rollup() {
+        let mut ws = Workspace::test_new("test");
+        let id2 = ws.test_split(Direction::Horizontal);
+        let root_id = ws.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != id2)
+            .copied()
+            .unwrap();
+        let mut terminals = HashMap::new();
+        let mut root_terminal = terminal_for_pane(&ws, root_id);
+        root_terminal.state = AgentState::Idle;
+        root_terminal.set_terminal_title(Some("idle pane".into()));
+        terminals.insert(root_terminal.id.clone(), root_terminal);
+        let mut second_terminal = terminal_for_pane(&ws, id2);
+        second_terminal.state = AgentState::Working;
+        second_terminal.set_terminal_title(Some("⠋ running tests".into()));
+        terminals.insert(second_terminal.id.clone(), second_terminal);
+
+        let title = ws.aggregate_terminal_title(&terminals);
+
+        assert_eq!(ws.aggregate_state(&terminals).0, AgentState::Working);
+        assert_eq!(title.raw.as_deref(), Some("⠋ running tests"));
+        assert_eq!(title.stripped.as_deref(), Some("running tests"));
+    }
+
+    #[test]
+    fn aggregate_terminal_title_reports_nothing_without_panes_terminals_or_titles() {
+        let mut ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+
+        assert_eq!(
+            ws.aggregate_terminal_title(&HashMap::new()),
+            AggregateTerminalTitle::default(),
+            "a workspace with no live terminals reports no title"
+        );
+
+        let mut terminals = HashMap::new();
+        let terminal = terminal_for_pane(&ws, root_pane);
+        terminals.insert(terminal.id.clone(), terminal);
+        assert_eq!(
+            ws.aggregate_terminal_title(&terminals),
+            AggregateTerminalTitle::default(),
+            "a pane that never set a terminal title reports no title"
+        );
+
+        ws.tabs.clear();
+        assert_eq!(
+            ws.aggregate_terminal_title(&terminals),
+            AggregateTerminalTitle::default(),
+            "an empty workspace reports no title"
+        );
+    }
+
+    #[test]
+    fn aggregate_terminal_title_resolves_priority_ties_to_the_first_pane_in_layout_order() {
+        let mut ws = Workspace::test_new("test");
+        let id2 = ws.test_split(Direction::Horizontal);
+        let ordered = ws.tabs[0].layout.pane_ids();
+        let first = ordered[0];
+        let second = ordered[1];
+        assert!(ordered.len() == 2 && (first == id2 || second == id2));
+        let mut terminals = HashMap::new();
+        for (index, pane_id) in ordered.iter().enumerate() {
+            let mut terminal = terminal_for_pane(&ws, *pane_id);
+            terminal.state = AgentState::Working;
+            terminal.set_terminal_title(Some(format!("pane {index}")));
+            terminals.insert(terminal.id.clone(), terminal);
+        }
+
+        assert_eq!(
+            ws.aggregate_terminal_title(&terminals).raw.as_deref(),
+            Some("pane 0")
+        );
     }
 
     #[test]

@@ -295,7 +295,20 @@ Space rows accept these built-in tokens:
 - `workspace` — workspace name.
 - `branch` — Git branch when available.
 - `git_status` — Git ahead and behind counts when nonzero.
+- `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
+- `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
+
+A space can hold several panes, so its terminal title is rolled up from the same
+pane that `state_icon` and `state_text` describe: the pane with the highest
+attention priority (blocked, then finished-unseen, then working, then idle, then
+unknown), resolving ties to the first pane in tab and layout order. An icon and a
+title on one Space row therefore always describe one pane. A space with no panes,
+no running terminals, or a winning pane that never set a terminal title renders no
+title at all; like every other missing value it disappears together with its
+separator, and its row disappears when nothing else on that row has a value. A
+collapsed worktree group rolls its state icon up across member spaces, but each
+row's title stays that space's own, matching `workspace` and `branch`.
 
 Tokens render in their configured order. Herdr normally separates adjacent values with ` · ` and uses a single space after `state_icon`. Missing values and their separators disappear; a row disappears when none of its tokens have a value. Each layout may contain at most 16 rows, with at most 16 tokens in each row.
 

@@ -193,6 +193,19 @@ pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static 
     }
 }
 
+/// Space rows roll a terminal title up from the same pane the state icon
+/// describes, so an icon and a title on one row always talk about one pane.
+/// Skipped entirely when no Space row asks for a title.
+fn space_terminal_title(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+) -> crate::workspace::AggregateTerminalTitle {
+    if !app.sidebar_spaces.uses_terminal_title() {
+        return crate::workspace::AggregateTerminalTitle::default();
+    }
+    ws.aggregate_terminal_title(&app.terminals)
+}
+
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if indented {
@@ -205,6 +218,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
         ws.display_name_from_terminals(&app.terminals)
     };
     let token_values = ws.metadata_tokens.values();
+    let terminal_title = space_terminal_title(app, ws);
     tokens::space_rows(
         &app.sidebar_spaces,
         SpaceTokenContext {
@@ -212,6 +226,8 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             branch: ws.branch().as_deref(),
             state_text: state_label(state, seen),
             ahead_behind: ws.git_ahead_behind(),
+            terminal_title: terminal_title.raw.as_deref(),
+            terminal_title_stripped: terminal_title.stripped.as_deref(),
             tokens: &token_values,
             suppress_git_details: indented,
         },
@@ -1293,6 +1309,7 @@ fn render_workspace_list(
             p.overlay0
         });
         let token_values = ws.metadata_tokens.values();
+        let terminal_title = space_terminal_title(app, ws);
         let rows = tokens::space_rows(
             &app.sidebar_spaces,
             SpaceTokenContext {
@@ -1300,6 +1317,8 @@ fn render_workspace_list(
                 branch: ws.branch().as_deref(),
                 state_text: state_label(display_state, display_seen),
                 ahead_behind: ws.git_ahead_behind(),
+                terminal_title: terminal_title.raw.as_deref(),
+                terminal_title_stripped: terminal_title.stripped.as_deref(),
                 tokens: &token_values,
                 suppress_git_details: card.indented,
             },
@@ -1710,6 +1729,78 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
             .add_modifier
             .intersects(Modifier::BOLD | Modifier::DIM));
         assert_eq!(inactive.bg, Some(ratatui::style::Color::Reset));
+    }
+
+    #[test]
+    fn space_terminal_title_row_renders_the_active_pane_title() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["terminal_title_stripped"]]
+"#,
+        )
+        .unwrap();
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_spaces = config.ui.sidebar.spaces;
+        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let pane_terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        pane_terminal.detected_agent = Some(Agent::Claude);
+        pane_terminal.state = AgentState::Working;
+        pane_terminal.set_terminal_title(Some("⠋ shipping the token".into()));
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let titled = app.view.workspace_card_areas[0].rect;
+        let untitled = app.view.workspace_card_areas[1].rect;
+        let mut renderer = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        renderer
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = renderer.backend().buffer();
+
+        let content_width = area.width - 1;
+        assert_eq!(titled.height, 2, "the title row is laid out");
+        assert!(row_text(buffer, titled.y, content_width).contains("one"));
+        assert_eq!(
+            row_text(buffer, titled.y + 1, content_width),
+            "   shipping the token"
+        );
+
+        assert_eq!(untitled.height, 1, "a space with no title keeps one row");
+        assert!(row_text(buffer, untitled.y, content_width).contains("two"));
+    }
+
+    #[test]
+    fn space_without_terminal_title_renders_no_placeholder_row() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.spaces]
+rows = [["workspace"], ["terminal_title"], ["terminal_title_stripped"]]
+"#,
+        )
+        .unwrap();
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_spaces = config.ui.sidebar.spaces;
+        app.workspaces = vec![Workspace::test_new("one")];
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        let mut renderer = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        renderer
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = renderer.backend().buffer();
+
+        let content_width = area.width - 1;
+        assert_eq!(card.height, 1);
+        assert_eq!(row_text(buffer, card.y, content_width), " one");
+        assert_eq!(row_text(buffer, card.y + 1, content_width), "");
     }
 
     #[test]
