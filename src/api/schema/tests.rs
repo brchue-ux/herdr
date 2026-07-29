@@ -671,11 +671,16 @@ fn session_snapshot_request_and_response_round_trip() {
                 panes: Vec::new(),
                 layouts: Vec::new(),
                 agents: Vec::new(),
+                agent_view: Some(AgentViewInfo {
+                    source: "config".into(),
+                    label: Some("blocked".into()),
+                }),
             }),
         },
     };
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("\"type\":\"session_snapshot\""));
+    assert!(json.contains("\"agent_view\":{\"source\":\"config\""));
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
 }

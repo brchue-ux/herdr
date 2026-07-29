@@ -4,6 +4,13 @@ use crate::app::state::{AppState, ViewLayout};
 
 use super::ScrollbarClickTarget;
 
+/// Click outcome for the single control in the Agents panel header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentPanelHeaderAction {
+    ToggleSort,
+    ClearView,
+}
+
 impl AppState {
     pub(super) fn workspace_list_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
@@ -465,21 +472,39 @@ impl AppState {
         })
     }
 
-    pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {
-        if self.sidebar_collapsed || self.agent_view_override.is_some() {
-            return false;
+    /// What clicking the Agents panel header control at `col`/`row` should do.
+    ///
+    /// The control doubles as the escape hatch from a sticky view: while one is
+    /// active it names the owning tier and clears it on click, so the user can
+    /// always get back to the unfiltered panel.
+    pub(super) fn agent_panel_header_action_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<AgentPanelHeaderAction> {
+        if self.sidebar_collapsed {
+            return None;
         }
 
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
-        rect.width > 0
+        let control = crate::ui::agent_panel_control(self, detail_area);
+        let rect = control.rect;
+        let hit = rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
             && row >= rect.y
-            && row < rect.y + rect.height
+            && row < rect.y + rect.height;
+        if !hit {
+            return None;
+        }
+        Some(if control.clears_view {
+            AgentPanelHeaderAction::ClearView
+        } else {
+            AgentPanelHeaderAction::ToggleSort
+        })
     }
 
     pub(super) fn agent_detail_target_at(
@@ -820,19 +845,22 @@ mod tests {
                 .unwrap()
                 .detected_agent = Some(Agent::Claude);
         }
-        app.state.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
-            source: "example.views".to_string(),
-            label: None,
-            filter: Some(crate::api::schema::AgentViewFilter::Eq {
-                field: crate::api::schema::AgentViewField::Builtin(
-                    crate::api::schema::AgentViewBuiltinField::WorkspaceId,
-                ),
-                value: crate::api::schema::AgentViewValue::Context {
-                    context: crate::api::schema::AgentViewContext::CurrentWorkspaceId,
-                },
+        app.state.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(crate::api::schema::AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(crate::api::schema::AgentViewFilter::Eq {
+                    field: crate::api::schema::AgentViewField::Builtin(
+                        crate::api::schema::AgentViewBuiltinField::WorkspaceId,
+                    ),
+                    value: crate::api::schema::AgentViewValue::Context {
+                        context: crate::api::schema::AgentViewContext::CurrentWorkspaceId,
+                    },
+                }),
+                sort: Vec::new(),
             }),
-            sort: Vec::new(),
-        });
+        );
         app.state.agent_panel_scroll = 10;
         let detail_area = app.state.agent_panel_rect();
         let body = crate::ui::agent_panel_body_rect(detail_area, false);
@@ -856,7 +884,7 @@ mod tests {
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
         );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
+        let toggle = crate::ui::agent_panel_control(&app.state, detail_area).rect;
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
@@ -865,6 +893,60 @@ mod tests {
 
         assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
+    }
+
+    #[test]
+    fn clicking_the_header_of_a_filtered_panel_clears_one_tier_at_a_time() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let blocked_only = |source: &str| crate::api::schema::AgentViewSetParams {
+            source: source.to_string(),
+            label: None,
+            filter: Some(crate::api::schema::AgentViewFilter::Eq {
+                field: crate::api::schema::AgentViewField::Builtin(
+                    crate::api::schema::AgentViewBuiltinField::Status,
+                ),
+                value: crate::api::schema::AgentViewValue::String("blocked".to_string()),
+            }),
+            sort: Vec::new(),
+        };
+        app.state.agent_views.set(
+            crate::agent_view::AgentViewTier::Config,
+            Some(blocked_only(crate::agent_view::CONFIG_VIEW_SOURCE)),
+        );
+        app.state.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(blocked_only("plugin:agents")),
+        );
+
+        let click = |app: &mut crate::app::App| {
+            let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+                app.state.view.sidebar_rect,
+                app.state.sidebar_section_split,
+            );
+            let control = crate::ui::agent_panel_control(&app.state, detail_area);
+            assert!(control.clears_view, "header should offer to clear the view");
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                control.rect.x,
+                control.rect.y,
+            ));
+        };
+
+        click(&mut app);
+        assert_eq!(
+            app.state.agent_views.active_tier(),
+            Some(crate::agent_view::AgentViewTier::Config)
+        );
+
+        click(&mut app);
+        assert!(!app.state.agent_views.is_active());
+        // With nothing filtering the panel the header is a sort toggle again.
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
     }
 
     #[test]

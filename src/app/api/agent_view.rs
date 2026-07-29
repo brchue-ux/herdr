@@ -9,8 +9,19 @@ impl App {
         id: String,
         mut params: AgentViewSetParams,
     ) -> String {
-        if let Err(message) = crate::app::agent_view::validate_agent_view(&mut params) {
+        if let Err(message) = crate::agent_view::validate_agent_view(&mut params) {
             return encode_error(id, "invalid_agent_view", message);
+        }
+        if let Some(tier) = crate::agent_view::reserved_source_owner(&params.source) {
+            return encode_error(
+                id,
+                "invalid_agent_view",
+                format!(
+                    "agent view source `{}` is reserved for the {} tier and cannot be set over the API",
+                    params.source,
+                    tier.label()
+                ),
+            );
         }
         if let Some(plugin_id) = params.source.strip_prefix("plugin:") {
             let Some(plugin_id) = super::plugins::normalize_plugin_id(plugin_id) else {
@@ -29,7 +40,7 @@ impl App {
         }
         let source = params.source.clone();
         let label = params.label.clone();
-        self.replace_agent_view_override(Some(params));
+        self.replace_agent_view(crate::agent_view::AgentViewTier::Api, Some(params));
         encode_success(
             id,
             ResponseResult::AgentView {
@@ -46,21 +57,25 @@ impl App {
         params: AgentViewClearParams,
     ) -> String {
         let source = match params.source {
-            Some(source) => match crate::app::agent_view::validate_agent_view_source(&source) {
+            Some(source) => match crate::agent_view::validate_agent_view_source(&source) {
                 Ok(source) => Some(source),
                 Err(message) => return encode_error(id, "invalid_agent_view", message),
             },
             None => None,
         };
+        // `agent.view.clear` only owns the API tier. A config- or UI-declared
+        // view is not the caller's to drop, and the response reports whichever
+        // view is left in charge so a plugin can see it fell back rather than
+        // off.
         if source.as_deref().is_none_or(|source| {
             self.state
-                .agent_view_override
-                .as_ref()
+                .agent_views
+                .get(crate::agent_view::AgentViewTier::Api)
                 .is_some_and(|active| active.source == source)
         }) {
-            self.replace_agent_view_override(None);
+            self.replace_agent_view(crate::agent_view::AgentViewTier::Api, None);
         }
-        let active = self.state.agent_view_override.as_ref();
+        let active = self.state.agent_views.active();
         encode_success(
             id,
             ResponseResult::AgentView {
@@ -74,52 +89,69 @@ impl App {
     pub(crate) fn clear_agent_view_for_source(&mut self, source: &str) -> bool {
         if self
             .state
-            .agent_view_override
-            .as_ref()
+            .agent_views
+            .get(crate::agent_view::AgentViewTier::Api)
             .is_some_and(|active| active.source == source)
         {
-            self.replace_agent_view_override(None);
+            self.replace_agent_view(crate::agent_view::AgentViewTier::Api, None);
             true
         } else {
             false
         }
     }
 
-    fn replace_agent_view_override(&mut self, view: Option<AgentViewSetParams>) {
-        self.state.agent_view_override = view;
-        self.state.agent_panel_scroll = 0;
-        self.state.mobile_switcher_scroll = 0;
+    /// Replace one tier's view, resetting panel scroll only when the projected
+    /// view actually changed.
+    pub(crate) fn replace_agent_view(
+        &mut self,
+        tier: crate::agent_view::AgentViewTier,
+        view: Option<AgentViewSetParams>,
+    ) {
+        if self.state.agent_views.set(tier, view) {
+            self.state.agent_panel_scroll = 0;
+            self.state.mobile_switcher_scroll = 0;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_view::{AgentViewTier, CONFIG_VIEW_SOURCE, UI_VIEW_SOURCE};
     use crate::api::schema::{
         AgentViewBuiltinField, AgentViewField, AgentViewFilter, AgentViewValue,
     };
 
     fn test_app() -> App {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        )
+        app_with_config(&crate::config::Config::default())
     }
 
-    fn working_view(source: &str) -> AgentViewSetParams {
+    fn app_with_config(config: &crate::config::Config) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(config, true, None, api_rx, crate::api::EventHub::default())
+    }
+
+    fn status_view(source: &str, status: &str) -> AgentViewSetParams {
         AgentViewSetParams {
             source: source.to_string(),
-            label: Some("working".to_string()),
+            label: Some(status.to_string()),
             filter: Some(AgentViewFilter::Eq {
                 field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
-                value: AgentViewValue::String("working".to_string()),
+                value: AgentViewValue::String(status.to_string()),
             }),
             sort: Vec::new(),
         }
+    }
+
+    fn working_view(source: &str) -> AgentViewSetParams {
+        status_view(source, "working")
+    }
+
+    fn active_source(app: &App) -> Option<&str> {
+        app.state
+            .agent_views
+            .active()
+            .map(|view| view.source.as_str())
     }
 
     #[test]
@@ -136,13 +168,7 @@ mod tests {
                 label: Some("working".to_string()),
             }
         );
-        assert_eq!(
-            app.state
-                .agent_view_override
-                .as_ref()
-                .map(|view| view.source.as_str()),
-            Some("example.views")
-        );
+        assert_eq!(active_source(&app), Some("example.views"));
 
         app.handle_agent_view_clear(
             "wrong-source".to_string(),
@@ -150,7 +176,7 @@ mod tests {
                 source: Some("other.views".to_string()),
             },
         );
-        assert!(app.state.agent_view_override.is_some());
+        assert!(app.state.agent_views.is_active());
 
         app.handle_agent_view_clear(
             "right-source".to_string(),
@@ -158,7 +184,7 @@ mod tests {
                 source: Some("example.views".to_string()),
             },
         );
-        assert!(app.state.agent_view_override.is_none());
+        assert!(!app.state.agent_views.is_active());
     }
 
     #[test]
@@ -174,12 +200,118 @@ mod tests {
         let response: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
 
         assert_eq!(response.error.code, "invalid_agent_view");
+        assert_eq!(active_source(&app), Some("example.views"));
+    }
+
+    #[test]
+    fn declared_config_view_is_applied_at_startup() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents.view]
+label = "blocked"
+filter = { op = "eq", field = "status", value = "blocked" }
+"#,
+        )
+        .unwrap();
+        let app = app_with_config(&config);
+
+        assert_eq!(active_source(&app), Some(CONFIG_VIEW_SOURCE));
         assert_eq!(
-            app.state
-                .agent_view_override
-                .as_ref()
-                .map(|view| view.source.as_str()),
-            Some("example.views")
+            app.state.agent_views.active_tier(),
+            Some(AgentViewTier::Config)
+        );
+    }
+
+    #[test]
+    fn api_view_outranks_config_view_and_clearing_it_falls_back() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.view]\nfilter = { op = \"eq\", field = \"status\", value = \"blocked\" }\n",
+        )
+        .unwrap();
+        let mut app = app_with_config(&config);
+        assert_eq!(active_source(&app), Some(CONFIG_VIEW_SOURCE));
+
+        app.handle_agent_view_set("set".to_string(), working_view("plugin-ish.views"));
+        assert_eq!(active_source(&app), Some("plugin-ish.views"));
+
+        // Clearing the API view reveals the config view again instead of
+        // dropping the user into an unfiltered panel they never asked for.
+        let cleared =
+            app.handle_agent_view_clear("clear".to_string(), AgentViewClearParams::default());
+        let cleared: crate::api::schema::SuccessResponse = serde_json::from_str(&cleared).unwrap();
+        assert_eq!(
+            cleared.result,
+            ResponseResult::AgentView {
+                active: true,
+                source: Some(CONFIG_VIEW_SOURCE.to_string()),
+                label: None,
+            }
+        );
+        assert_eq!(active_source(&app), Some(CONFIG_VIEW_SOURCE));
+    }
+
+    #[test]
+    fn api_cannot_clear_or_claim_a_reserved_tier_source() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.view]\nfilter = { op = \"eq\", field = \"status\", value = \"blocked\" }\n",
+        )
+        .unwrap();
+        let mut app = app_with_config(&config);
+
+        for source in [CONFIG_VIEW_SOURCE, UI_VIEW_SOURCE] {
+            let response = app.handle_agent_view_set("set".to_string(), working_view(source));
+            let response: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&response).unwrap();
+            assert_eq!(response.error.code, "invalid_agent_view");
+            assert!(
+                response.error.message.contains("reserved"),
+                "{}",
+                response.error.message
+            );
+        }
+
+        app.handle_agent_view_clear(
+            "clear-config".to_string(),
+            AgentViewClearParams {
+                source: Some(CONFIG_VIEW_SOURCE.to_string()),
+            },
+        );
+        assert_eq!(active_source(&app), Some(CONFIG_VIEW_SOURCE));
+    }
+
+    #[test]
+    fn ui_view_outranks_config_but_loses_to_the_api() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.view]\nfilter = { op = \"eq\", field = \"status\", value = \"blocked\" }\n",
+        )
+        .unwrap();
+        let mut app = app_with_config(&config);
+
+        app.replace_agent_view(AgentViewTier::Ui, Some(status_view(UI_VIEW_SOURCE, "idle")));
+        assert_eq!(active_source(&app), Some(UI_VIEW_SOURCE));
+
+        app.handle_agent_view_set("set".to_string(), working_view("plugin-ish.views"));
+        assert_eq!(active_source(&app), Some("plugin-ish.views"));
+
+        app.handle_agent_view_clear("clear".to_string(), AgentViewClearParams::default());
+        assert_eq!(active_source(&app), Some(UI_VIEW_SOURCE));
+    }
+
+    #[test]
+    fn invalid_config_view_leaves_the_panel_unfiltered_with_a_diagnostic() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.view]\nfilter = { op = \"eq\", field = \"status\", value = \"workin\" }\n",
+        )
+        .unwrap();
+        let app = app_with_config(&config);
+
+        assert!(!app.state.agent_views.is_active());
+        let diagnostics = config.collect_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("unknown agent status `workin`")),
+            "{diagnostics:?}"
         );
     }
 }

@@ -356,6 +356,44 @@ herdr pane report-metadata <pane_id> \
 
 サイドバーの行設定は、展開されたデスクトップサイドバーにだけ適用されます。折りたたみ表示とモバイル表示はコンパクトなレイアウトを保ちます。
 
+### エージェントパネルビュー
+
+`[ui.sidebar.agents.view]` は、Agents パネルに表示するエージェントとその並び順を宣言します。フィルタとソートの文法は [`agent.view.set`](/docs/socket-api/#agent-view) ソケットコマンドと同一です。`agent.view.set` と違い、宣言されたビューは起動時と設定リロードごとに `config.toml` から読み込まれるため、外部プロセスが再適用しなくてもサーバー再起動をまたいで残ります。
+
+```toml
+[ui.sidebar.agents.view]
+label = "needs me"
+filter = { op = "any", filters = [
+  { op = "eq", field = "status", value = "blocked" },
+  { op = "eq", field = "seen", value = false },
+] }
+sort = [{ field = "attention", order = "desc" }]
+```
+
+`filter` は `status`、`workspace_id`、`tab_id`、`pane_id`、`agent`、`seen`、`state_change_seq`、および `{ token = "name" }` のペインメタデータに対する `all`、`any`、`not`、`eq`、`in`、`exists` の木構造です。`sort` は `workspace_order`、`tab_order`、`pane_order`、`attention`、`status`、`agent`、`seen`、`state_change_seq`、`{ token = "name" }` を対象とする `{ field, order }` テーブルの順序付きリストです。`order` は `"asc"` または `"desc"` で、既定は `"asc"` です。`sort` が空でない場合、ビューが有効な間は `ui.agent_panel_sort` を置き換えます。ネスト 8 段、フィルタノード 64 個、`in` の値 32 個、ソートキー 8 個という上限はソケットコマンドと同じです。
+
+Agents ビューを所有できるソースは 3 つあり、優先順位は `config` < `ui` < `plugin` です:
+
+- **`config`** — このキー。ユーザーが一度書き留めた標準の既定値です。
+- **`ui`** — Herdr 自身がセッション中に設定するビュー。その場の操作は保存された設定より具体的なので、標準の既定値を一時的に上書きします。
+- **`plugin`** — `agent.view.set` で設定されたビュー。意図してインストールし有効化したプラグインの指示なので、設定ファイルの 1 行がそれを黙って無効化しないよう最優先になります。
+
+`agent.view.set` と `agent.view.clear` が所有するのは plugin 層だけです。`config` と `ui` は予約されたソース名で、ソケット API からは拒否されます。プラグインのビューをクリアすると、フィルタなしのパネルに飛ぶのではなく config のビューが再び現れます。
+
+パネルのヘッダーは常に担当している層を表示するので、フィルタが見えなくなることはありません:
+
+```text
+ agents      config:needs me · 3 hidden !
+```
+
+数値はビューが隠しているエージェント数で、末尾の `!` は隠れているエージェントのうち 1 つが blocked で入力を待っていることを意味します。サイドバーが狭い場合は層の接頭辞、次に `hidden` の語が省略されますが、件数は決して省略されません。ヘッダーをクリックするとビューを所有する層がクリアされ、1 つ下の層が現れます。config で宣言したビューは次の設定リロードまたは再起動で戻ります。
+
+不正なビューは適用されません。Herdr はそれを無視してすべてのエージェントを表示し、設定診断バナーと `herdr config check` で問題を報告します:
+
+```text
+invalid [ui.sidebar.agents.view]: unknown agent status `workin`; ignoring the declared view and showing every agent
+```
+
 ## 通知
 
 Herdr は、バックグラウンドのエージェントが完了したり入力を必要としたりしたときに通知できます:

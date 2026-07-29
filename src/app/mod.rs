@@ -241,6 +241,18 @@ fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginR
         .collect()
 }
 
+/// Seed the view slots from `[ui.sidebar.agents.view]`. The config tier is the
+/// only one that can be populated before any client connects, which is what
+/// makes a declared view survive a server restart.
+fn config_agent_views(config: &crate::config::Config) -> crate::agent_view::AgentViewSlots {
+    let mut slots = crate::agent_view::AgentViewSlots::default();
+    slots.set(
+        crate::agent_view::AgentViewTier::Config,
+        config.ui.sidebar.agents.view.declared_view(),
+    );
+    slots
+}
+
 fn agent_panel_sort_from_config(
     sort: crate::config::AgentPanelSortConfig,
 ) -> state::AgentPanelSort {
@@ -624,7 +636,7 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
-            agent_view_override: None,
+            agent_views: config_agent_views(config),
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,
@@ -1413,6 +1425,7 @@ impl App {
                 diagnostics.push(format!("{diagnostic}; keeping previous [ui] settings"));
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
+                diagnostics.extend(config.ui.sidebar.agents.view.diagnostics());
 
                 self.state.default_sidebar_width = config.ui.sidebar_width;
                 if self.state.sidebar_width_source == state::SidebarWidthSource::ConfigDefault {
@@ -1453,6 +1466,12 @@ impl App {
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
+                // A reload re-owns the config tier only. A plugin- or UI-set
+                // view keeps the panel until its own owner gives it up.
+                self.replace_agent_view(
+                    crate::agent_view::AgentViewTier::Config,
+                    config.ui.sidebar.agents.view.declared_view(),
+                );
                 self.state.agent_panel_scroll = 0;
                 self.state.accent = crate::config::parse_color(&config.ui.accent);
                 if !self.state.local_sound_playback && self.state.sound != config.ui.sound {

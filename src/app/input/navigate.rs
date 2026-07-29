@@ -1939,17 +1939,20 @@ mod tests {
                 crate::detect::AgentState::Working
             };
         }
-        app.state.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
-            source: "example.views".to_string(),
-            label: None,
-            filter: Some(crate::api::schema::AgentViewFilter::Eq {
-                field: crate::api::schema::AgentViewField::Builtin(
-                    crate::api::schema::AgentViewBuiltinField::Status,
-                ),
-                value: crate::api::schema::AgentViewValue::String("working".to_string()),
+        app.state.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(crate::api::schema::AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(crate::api::schema::AgentViewFilter::Eq {
+                    field: crate::api::schema::AgentViewField::Builtin(
+                        crate::api::schema::AgentViewBuiltinField::Status,
+                    ),
+                    value: crate::api::schema::AgentViewValue::String("working".to_string()),
+                }),
+                sort: Vec::new(),
             }),
-            sort: Vec::new(),
-        });
+        );
 
         app.execute_tui_navigate_action(NavigateAction::NextAgent, ActionContext::Prefix);
 

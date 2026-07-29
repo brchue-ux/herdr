@@ -53,6 +53,12 @@ impl App {
             panes: self.collect_panes_for_workspace(None).unwrap_or_default(),
             layouts,
             agents: self.collect_agent_infos(),
+            agent_view: self.state.agent_views.active().map(|view| {
+                crate::api::schema::AgentViewInfo {
+                    source: view.source.clone(),
+                    label: view.label.clone(),
+                }
+            }),
         }
     }
 }

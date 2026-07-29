@@ -55,6 +55,7 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
 }
 
 mod agent_resume;
+mod agent_view;
 mod api;
 mod app;
 mod build_info;
@@ -331,6 +332,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Optional canonical agent IDs replace the default rows for matching agents.
 # [ui.sidebar.agents.rows_by_agent]
 # claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
+
+# A durable Agents panel view: the same filter/sort grammar as the agent.view.set
+# socket command, applied at startup and on config reload so it survives a restart.
+# A plugin- or UI-owned view outranks this one; the panel header names whichever
+# tier is in charge, counts the rows it is hiding, and clears that tier on click.
+# [ui.sidebar.agents.view]
+# label = "needs me"
+# filter = { op = "any", filters = [
+#   { op = "eq", field = "status", value = "blocked" },
+#   { op = "eq", field = "seen", value = false },
+# ] }
+# sort = [{ field = "attention", order = "desc" }]
 
 # Expanded space rows. Built-ins are state_icon, state_text, workspace, branch, git_status,
 # terminal_title, and terminal_title_stripped.

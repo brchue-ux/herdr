@@ -12,6 +12,7 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
+use crate::app::agent_view::AgentViewHidden;
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -85,10 +86,6 @@ fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
     }
 }
 
-pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect {
-    agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
-}
-
 fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
     if area.width == 0 || area.height < 2 {
         return Rect::default();
@@ -103,34 +100,143 @@ fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
     )
 }
 
-fn active_agent_view_label(app: &AppState) -> Option<&str> {
-    app.agent_view_override
-        .as_ref()
-        .map(|view| view.label.as_deref().unwrap_or("filtered"))
+/// The single control in the Agents panel header: a sort toggle when nothing is
+/// filtering the panel, and a clear-the-active-view button when something is.
+pub(crate) struct AgentPanelControl {
+    pub label: String,
+    pub rect: Rect,
+    /// Clicking clears the winning view tier instead of toggling sort order.
+    pub clears_view: bool,
+    /// A blocked agent is among the hidden rows.
+    pub alert: bool,
+}
+
+/// Header label candidates for an active view, widest first.
+///
+/// The Agents panel is supposed to be the always-on truth, so a view that hides
+/// rows has to say so even in an 18-column sidebar. Every candidate keeps the
+/// hidden count; only the owner name and the word "hidden" are given up as
+/// space runs out.
+fn agent_view_label_candidates(app: &AppState, hidden: AgentViewHidden) -> Vec<String> {
+    let Some(tier) = app.agent_views.active_tier() else {
+        return Vec::new();
+    };
+    let owner = tier.label();
+    let name = app
+        .agent_views
+        .active()
+        .and_then(|view| view.label.as_deref());
+    let qualified = match name {
+        Some(name) => format!("{owner}:{name}"),
+        None => owner.to_string(),
+    };
+    let short = name.unwrap_or(owner).to_string();
+
+    let mut candidates = if hidden.any() {
+        let mark = if hidden.hidden_blocked > 0 { " !" } else { "" };
+        let count = hidden.hidden;
+        vec![
+            format!("{qualified} · {count} hidden{mark}"),
+            format!("{short} · {count} hidden{mark}"),
+            format!("{short} ·{count}{mark}"),
+            format!("{count} hidden{mark}"),
+            format!("{count}{mark}"),
+        ]
+    } else {
+        vec![qualified, short]
+    };
+    candidates.dedup();
+    candidates
+}
+
+/// Resolve the header control for `area`, given what the active view is hiding.
+pub(crate) fn agent_panel_control_with_hidden(
+    app: &AppState,
+    area: Rect,
+    hidden: AgentViewHidden,
+) -> AgentPanelControl {
+    let candidates = agent_view_label_candidates(app, hidden);
+    if candidates.is_empty() {
+        let label = agent_panel_sort_label(app.agent_panel_sort).to_string();
+        return AgentPanelControl {
+            rect: agent_panel_header_label_rect(area, &label),
+            label,
+            clears_view: false,
+            alert: false,
+        };
+    }
+
+    // Leave room for the " agents" title on the left so the two never overlap.
+    let budget = area.width.saturating_sub(display_width_u16(" agents") + 1);
+    let label = candidates
+        .iter()
+        .find(|candidate| display_width_u16(candidate) <= budget)
+        .or_else(|| candidates.last())
+        .cloned()
+        .unwrap_or_default();
+    AgentPanelControl {
+        rect: agent_panel_header_label_rect(area, &label),
+        label,
+        clears_view: true,
+        alert: hidden.hidden_blocked > 0,
+    }
+}
+
+/// Same as [`agent_panel_control_with_hidden`], for callers that do not already
+/// have the panel entries in hand (mouse hit-testing).
+pub(crate) fn agent_panel_control(app: &AppState, area: Rect) -> AgentPanelControl {
+    let hidden = if app.agent_views.is_active() {
+        agent_panel_entries_and_hidden(app).1
+    } else {
+        AgentViewHidden::default()
+    };
+    agent_panel_control_with_hidden(app, area, hidden)
+}
+
+/// Label for the mobile switcher's agents section title, which has more room
+/// than the sidebar header.
+pub(crate) fn mobile_agents_title(app: &AppState, hidden: AgentViewHidden) -> String {
+    let Some(label) = agent_view_label_candidates(app, hidden).into_iter().next() else {
+        return "agents".to_string();
+    };
+    format!("agents · {label}")
 }
 
 pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
 }
 
-pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
-    collect_agent_panel_entries_with_runtimes(app, None)
+pub(crate) fn agent_panel_entries_and_hidden(
+    app: &AppState,
+) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
+    agent_panel_entries_and_hidden_with_runtimes(app, None)
 }
 
-pub(crate) fn agent_panel_entries_from(
+pub(crate) fn agent_panel_entries_and_hidden_from(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Vec<AgentPanelEntry> {
-    agent_panel_entries_with_runtimes(app, Some(terminal_runtimes))
+) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
+    agent_panel_entries_and_hidden_with_runtimes(app, Some(terminal_runtimes))
+}
+
+fn agent_panel_entries_and_hidden_with_runtimes(
+    app: &AppState,
+    terminal_runtimes: Option<&TerminalRuntimeRegistry>,
+) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
+    let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    let hidden = crate::app::agent_view::apply_agent_view(app, &mut entries);
+    (entries, hidden)
+}
+
+pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    collect_agent_panel_entries_with_runtimes(app, None)
 }
 
 fn agent_panel_entries_with_runtimes(
     app: &AppState,
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
 ) -> Vec<AgentPanelEntry> {
-    let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
-    crate::app::agent_view::apply_agent_view(app, &mut entries);
-    entries
+    agent_panel_entries_and_hidden_with_runtimes(app, terminal_runtimes).0
 }
 
 fn collect_agent_panel_entries_with_runtimes(
@@ -841,7 +947,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
     if let Some(divider_y) = divider_y {
         let buf = frame.buffer_mut();
-        let divider_color = if app.agent_view_override.is_some() {
+        let divider_color = if app.agent_views.is_active() {
             p.accent
         } else {
             p.surface_dim
@@ -1452,33 +1558,33 @@ fn render_agent_detail(
         )])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let control_label = active_agent_view_label(app)
-        .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
-    let toggle_rect = agent_panel_header_label_rect(area, control_label);
-    if toggle_rect != Rect::default() {
-        let color = if app.agent_view_override.is_some() {
+    let (details, hidden) = agent_panel_entries_and_hidden_from(app, terminal_runtimes);
+    let control = agent_panel_control_with_hidden(app, area, hidden);
+    if control.rect != Rect::default() {
+        let color = if control.alert {
+            state_label_color(crate::detect::AgentState::Blocked, true, p)
+        } else if control.clears_view {
             p.accent
         } else {
             p.overlay0
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                control_label,
+                control.label.as_str(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
-            toggle_rect,
+            control.rect,
         );
     }
 
-    let details = agent_panel_entries_from(app, terminal_runtimes);
     let metrics = agent_panel_scroll_metrics(app, area);
     let scrollbar_rect = agent_panel_scrollbar_rect(app, area);
     let body = agent_panel_body_rect(area, should_show_scrollbar(metrics));
     if body == Rect::default() {
         return;
     }
-    if details.is_empty() && app.agent_view_override.is_some() {
+    if details.is_empty() && app.agent_views.is_active() {
         frame.render_widget(
             Paragraph::new(" no matching agents")
                 .style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
@@ -1615,6 +1721,142 @@ mod tests {
                     row_text(buffer, row, width)
                 )
             })
+    }
+
+    /// Two agents in two spaces: the first idle, the second whatever `second`
+    /// says.
+    fn app_with_two_agents(second: AgentState) -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        for (ws_idx, agent_state) in [(0, AgentState::Idle), (1, second)] {
+            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Pi);
+            terminal.state = agent_state;
+        }
+        app
+    }
+
+    fn idle_only_view(source: &str, label: Option<&str>) -> crate::api::schema::AgentViewSetParams {
+        crate::api::schema::AgentViewSetParams {
+            source: source.to_string(),
+            label: label.map(str::to_string),
+            filter: Some(crate::api::schema::AgentViewFilter::Eq {
+                field: crate::api::schema::AgentViewField::Builtin(
+                    crate::api::schema::AgentViewBuiltinField::Status,
+                ),
+                value: crate::api::schema::AgentViewValue::String("idle".to_string()),
+            }),
+            sort: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_filtered_panel_names_its_owner_and_counts_what_it_hides() {
+        let mut app = app_with_two_agents(AgentState::Working);
+        app.agent_views.set(
+            crate::agent_view::AgentViewTier::Config,
+            Some(idle_only_view(
+                crate::agent_view::CONFIG_VIEW_SOURCE,
+                Some("idle"),
+            )),
+        );
+
+        let area = Rect::new(0, 0, 36, 20);
+        let control = agent_panel_control(
+            &app,
+            expanded_sidebar_sections(area, app.sidebar_section_split).1,
+        );
+
+        assert_eq!(control.label, "config:idle · 1 hidden");
+        assert!(control.clears_view);
+        assert!(!control.alert);
+    }
+
+    #[test]
+    fn a_hidden_blocked_agent_is_flagged_and_coloured_as_an_alert() {
+        let mut app = app_with_two_agents(AgentState::Blocked);
+        app.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(idle_only_view("plugin:agents", Some("idle"))),
+        );
+
+        let area = Rect::new(0, 0, 36, 20);
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let control = agent_panel_control(&app, agent_area);
+        assert_eq!(control.label, "plugin:idle · 1 hidden !");
+        assert!(control.alert);
+
+        let mut terminal = Terminal::new(TestBackend::new(36, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let header = row_text(buffer, agent_area.y + 1, 36);
+        assert!(header.contains("1 hidden !"), "{header}");
+        let alert_x = find_symbol_x(buffer, agent_area.y + 1, 36, "!");
+        assert_eq!(
+            buffer[(alert_x, agent_area.y + 1)].style().fg,
+            Some(state_label_color(AgentState::Blocked, true, &app.palette))
+        );
+    }
+
+    #[test]
+    fn a_narrow_sidebar_gives_up_the_owner_name_before_the_hidden_count() {
+        let mut app = app_with_two_agents(AgentState::Working);
+        app.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(idle_only_view("plugin:agents", Some("only-idle-agents"))),
+        );
+
+        // Real sidebars are 18-36 columns wide, so the widest form is mostly
+        // aspirational; the hidden count is what must never be dropped.
+        for (width, expected) in [
+            (44, "plugin:only-idle-agents · 1 hidden"),
+            (38, "only-idle-agents · 1 hidden"),
+            (30, "only-idle-agents ·1"),
+            (20, "1 hidden"),
+        ] {
+            let area = Rect::new(0, 0, width, 20);
+            let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+            assert_eq!(
+                agent_panel_control(&app, agent_area).label,
+                expected,
+                "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_that_hides_nothing_only_names_its_owner() {
+        let mut app = app_with_two_agents(AgentState::Idle);
+        app.agent_views.set(
+            crate::agent_view::AgentViewTier::Config,
+            Some(idle_only_view(crate::agent_view::CONFIG_VIEW_SOURCE, None)),
+        );
+
+        let area = Rect::new(0, 0, 30, 20);
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let control = agent_panel_control(&app, agent_area);
+        assert_eq!(control.label, "config");
+        assert!(control.clears_view);
+    }
+
+    #[test]
+    fn an_unfiltered_panel_keeps_the_sort_toggle() {
+        let app = app_with_two_agents(AgentState::Working);
+        let area = Rect::new(0, 0, 30, 20);
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let control = agent_panel_control(&app, agent_area);
+
+        assert_eq!(control.label, "grouped");
+        assert!(!control.clears_view);
     }
 
     #[test]
@@ -2360,7 +2602,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let mut runtime_registry = TerminalRuntimeRegistry::new();
         runtime_registry.insert(terminal_id, runtime);
-        let entries = agent_panel_entries_from(&app, &runtime_registry);
+        let entries = agent_panel_entries_and_hidden_from(&app, &runtime_registry).0;
         let primary_label = entries[0].primary_label.clone();
 
         for (_, runtime) in runtime_registry.drain() {

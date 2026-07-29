@@ -356,6 +356,44 @@ herdr pane report-metadata <pane_id> \
 
 侧边栏行设置仅影响展开的桌面侧边栏。折叠视图和移动视图仍使用紧凑布局。
 
+### 智能体面板视图
+
+`[ui.sidebar.agents.view]` 声明 Agents 面板显示哪些智能体以及排列顺序，使用与 [`agent.view.set`](/docs/socket-api/#agent-view) 套接字命令完全相同的过滤和排序语法。与 `agent.view.set` 不同，声明式视图在启动时以及每次配置重载时从 `config.toml` 读取，因此无需外部进程重新应用即可跨服务器重启保留。
+
+```toml
+[ui.sidebar.agents.view]
+label = "needs me"
+filter = { op = "any", filters = [
+  { op = "eq", field = "status", value = "blocked" },
+  { op = "eq", field = "seen", value = false },
+] }
+sort = [{ field = "attention", order = "desc" }]
+```
+
+`filter` 是由 `all`、`any`、`not`、`eq`、`in`、`exists` 组成的树，作用于 `status`、`workspace_id`、`tab_id`、`pane_id`、`agent`、`seen`、`state_change_seq` 以及 `{ token = "name" }` 窗格元数据。`sort` 是 `{ field, order }` 表的有序列表，字段可为 `workspace_order`、`tab_order`、`pane_order`、`attention`、`status`、`agent`、`seen`、`state_change_seq` 或 `{ token = "name" }`。`order` 为 `"asc"` 或 `"desc"`，默认 `"asc"`。非空的 `sort` 会在视图生效期间替代 `ui.agent_panel_sort`。限制与套接字命令相同：嵌套 8 层、过滤节点 64 个、每个 `in` 最多 32 个值、最多 8 个排序键。
+
+有三个来源可以拥有 Agents 视图，优先级为 `config` < `ui` < `plugin`：
+
+- **`config`** — 本配置键。用户一次写下的长期默认值。
+- **`ui`** — Herdr 自身为当前会话设置的视图。即时操作比存储的偏好更具体，因此临时覆盖长期默认值。
+- **`plugin`** — 通过 `agent.view.set` 设置的视图。它优先级最高：插件是用户有意安装并启用的，一行配置不应静默地让它失效。
+
+`agent.view.set` 和 `agent.view.clear` 只拥有 plugin 层。`config` 和 `ui` 是保留的来源名称，套接字 API 会拒绝它们；清除插件视图会重新显示 config 视图，而不是跳到未过滤的面板。
+
+面板标题始终标明当前负责的层，因此过滤状态永远不会隐形：
+
+```text
+ agents      config:needs me · 3 hidden !
+```
+
+数字表示视图隐藏了多少个智能体，结尾的 `!` 表示其中有一个处于 blocked 状态并在等待你。侧边栏较窄时会先去掉层前缀，再去掉 `hidden` 一词，但绝不会去掉数量。点击标题会清除拥有该视图的层，露出下一层；config 声明的视图会在下次配置重载或重启后回来。
+
+无效的视图永远不会被应用。Herdr 会忽略它、显示全部智能体，并通过配置诊断横幅和 `herdr config check` 报告问题：
+
+```text
+invalid [ui.sidebar.agents.view]: unknown agent status `workin`; ignoring the declared view and showing every agent
+```
+
 ## 通知
 
 当后台智能体完成任务或需要输入时，Herdr 可以通知你：
