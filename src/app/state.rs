@@ -1600,7 +1600,80 @@ pub struct AppState {
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
 }
 
+/// The workspaces one worktree space key contributes as a parent/child group.
+///
+/// See [`AppState::worktree_space_group`] for how it is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSpaceGroup {
+    /// The repo's main (non-linked) checkout workspace: the group's parent.
+    pub parent_idx: usize,
+    /// Linked-worktree members, in workspace order.
+    pub children: Vec<usize>,
+}
+
+impl WorktreeSpaceGroup {
+    pub fn contains(&self, ws_idx: usize) -> bool {
+        self.parent_idx == ws_idx || self.children.contains(&ws_idx)
+    }
+
+    /// Parent first, then the linked worktrees in workspace order.
+    pub fn indices(&self) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(self.children.len() + 1);
+        indices.push(self.parent_idx);
+        indices.extend(self.children.iter().copied());
+        indices
+    }
+}
+
 impl AppState {
+    /// Resolve the parent/child group for one worktree space key.
+    ///
+    /// A worktree group means exactly one thing: the parent is the repo's main
+    /// (non-linked) checkout and every child is a linked worktree of it. Two
+    /// rules keep that promise honest when a repo has more than one workspace
+    /// open in the same main checkout:
+    ///
+    /// * Only linked worktrees are ever children. A second workspace opened in
+    ///   the main checkout is a peer, not a child, so it never joins the group
+    ///   and never renders as a worktree of its own sibling.
+    /// * A group only forms when it has at least one linked worktree. A key
+    ///   whose members are all non-linked has no parentage to express.
+    ///
+    /// The parent is the first non-linked member in workspace order. Workspace
+    /// order is the user-controlled sidebar order, so the choice is
+    /// deterministic rather than dependent on map iteration order; and because
+    /// every non-linked member of a key describes the same main checkout, they
+    /// all name the same parent row.
+    pub(crate) fn worktree_space_group(&self, key: &str) -> Option<WorktreeSpaceGroup> {
+        let mut parent_idx = None;
+        let mut children = Vec::new();
+        for (ws_idx, space) in self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(ws_idx, ws)| ws.worktree_space().map(|space| (ws_idx, space)))
+            .filter(|(_, space)| space.key == key)
+        {
+            if space.is_linked_worktree {
+                children.push(ws_idx);
+            } else if parent_idx.is_none() {
+                parent_idx = Some(ws_idx);
+            }
+        }
+        let parent_idx = parent_idx?;
+        (!children.is_empty()).then_some(WorktreeSpaceGroup {
+            parent_idx,
+            children,
+        })
+    }
+
+    /// The group `ws_idx` belongs to, or `None` when it is a standalone row.
+    pub(crate) fn worktree_space_group_of(&self, ws_idx: usize) -> Option<WorktreeSpaceGroup> {
+        let key = &self.workspaces.get(ws_idx)?.worktree_space()?.key;
+        self.worktree_space_group(key)
+            .filter(|group| group.contains(ws_idx))
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }

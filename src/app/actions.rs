@@ -1669,23 +1669,11 @@ impl AppState {
         self.selection = None;
         self.selection_autoscroll = None;
         self.mark_session_dirty();
+        // Closing a group parent closes its linked worktrees with it. Only the
+        // group's own rows go: a second workspace opened in the same main
+        // checkout is a peer, not a child, and closes on its own.
         let close_indices = self
-            .workspaces
-            .get(self.selected)
-            .and_then(|ws| ws.worktree_space())
-            .filter(|space| !space.is_linked_worktree)
-            .map(|space| {
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, ws)| {
-                        ws.worktree_space()
-                            .is_some_and(|member| member.key == space.key)
-                            .then_some(idx)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|indices| indices.len() >= 2)
+            .worktree_group_close_indices(self.selected)
             .unwrap_or_else(|| vec![self.selected]);
 
         let mut terminal_ids = Vec::new();
@@ -1976,21 +1964,16 @@ impl AppState {
         self.apply_pane_zoom(ws_idx, pane_id, PaneZoomCommand::Toggle);
     }
 
+    /// The workspaces closed alongside `ws_idx`, when it is a worktree group
+    /// parent. `None` when closing it only closes itself.
+    pub(crate) fn worktree_group_close_indices(&self, ws_idx: usize) -> Option<Vec<usize>> {
+        self.worktree_space_group_of(ws_idx)
+            .filter(|group| group.parent_idx == ws_idx)
+            .map(|group| group.indices())
+    }
+
     pub(crate) fn workspace_close_would_close_worktree_group(&self, ws_idx: usize) -> bool {
-        self.workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.worktree_space())
-            .filter(|space| !space.is_linked_worktree)
-            .is_some_and(|space| {
-                self.workspaces
-                    .iter()
-                    .filter(|ws| {
-                        ws.worktree_space()
-                            .is_some_and(|member| member.key == space.key)
-                    })
-                    .count()
-                    >= 2
-            })
+        self.worktree_group_close_indices(ws_idx).is_some()
     }
 
     pub(crate) fn confirm_implicit_worktree_group_close(&mut self, ws_idx: usize) -> bool {
@@ -4623,6 +4606,41 @@ mod tests {
         assert_eq!(state.workspaces[0].display_name(), "notes");
         assert_eq!(state.active, Some(0));
         assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn close_peer_main_checkout_workspace_leaves_the_group_alone() {
+        let mut state = app_with_workspaces(&["mainA", "issue", "mainB"]);
+        for (idx, checkout, linked) in [
+            (0usize, "/repo/herdr", false),
+            (1, "/repo/herdr-issue", true),
+            (2, "/repo/herdr", false),
+        ] {
+            state.workspaces[idx].worktree_space =
+                Some(crate::workspace::WorktreeSpaceMembership {
+                    key: "repo-key".into(),
+                    label: "herdr".into(),
+                    repo_root: "/repo/herdr".into(),
+                    checkout_path: checkout.into(),
+                    is_linked_worktree: linked,
+                });
+        }
+        state.selected = 2;
+        state.active = Some(2);
+
+        assert!(!state.workspace_close_would_close_worktree_group(2));
+        assert!(state.workspace_close_would_close_worktree_group(0));
+
+        state.close_selected_workspace();
+
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|ws| ws.display_name())
+                .collect::<Vec<_>>(),
+            vec!["mainA".to_string(), "issue".to_string()]
+        );
     }
 
     #[test]

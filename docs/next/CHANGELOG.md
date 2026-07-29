@@ -7,6 +7,7 @@
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- A second workspace opened in a repo's main checkout no longer renders as an indented worktree of its own sibling in the Spaces sidebar, and closing it no longer closes the whole worktree group. Only linked Git worktrees are grouped as children, and a group only forms once the repo has at least one linked worktree open.
 - Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
 - Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)
 - Plain mouse movement no longer triggers continuous full renders while preserving Herdr menu hover and pane application mouse tracking. (#1865)

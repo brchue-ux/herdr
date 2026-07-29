@@ -271,11 +271,21 @@ fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     }
 }
 
+/// Aggregate state of a collapsed group, over the group's rows only.
+///
+/// Workspaces that share the key but are not group members (a second workspace
+/// opened in the same main checkout) keep their own visible row, so folding
+/// their state into the parent would double-report it.
 fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
+    let group = app.worktree_space_group(key);
     app.workspaces
         .iter()
-        .filter(|ws| ws.worktree_space().is_some_and(|space| space.key == key))
-        .map(|ws| ws.aggregate_state(&app.terminals))
+        .enumerate()
+        .filter(|(ws_idx, ws)| {
+            ws.worktree_space().is_some_and(|space| space.key == key)
+                && group.as_ref().is_none_or(|group| group.contains(*ws_idx))
+        })
+        .map(|(_, ws)| ws.aggregate_state(&app.terminals))
         .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
         .unwrap_or((AgentState::Unknown, true))
 }
@@ -285,18 +295,8 @@ pub(crate) fn workspace_parent_group_state(
     ws_idx: usize,
 ) -> Option<(String, bool)> {
     let space = app.workspaces.get(ws_idx)?.worktree_space()?;
-    if space.is_linked_worktree {
-        return None;
-    }
-    let member_count = app
-        .workspaces
-        .iter()
-        .filter(|ws| {
-            ws.worktree_space()
-                .is_some_and(|member| member.key == space.key)
-        })
-        .count();
-    (member_count >= 2).then(|| {
+    let group = app.worktree_space_group(&space.key)?;
+    (group.parent_idx == ws_idx).then(|| {
         (
             space.key.clone(),
             app.collapsed_space_keys.contains(&space.key),
@@ -359,48 +359,39 @@ pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceLi
 }
 
 fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
-    let mut members_by_key = std::collections::HashMap::<String, Vec<usize>>::new();
-    for (ws_idx, ws) in app.workspaces.iter().enumerate() {
-        if let Some(space) = ws.worktree_space() {
-            members_by_key
-                .entry(space.key.clone())
-                .or_default()
-                .push(ws_idx);
+    let mut groups_by_key =
+        std::collections::HashMap::<String, crate::app::state::WorktreeSpaceGroup>::new();
+    for ws in app.workspaces.iter() {
+        let Some(space) = ws.worktree_space() else {
+            continue;
+        };
+        if groups_by_key.contains_key(&space.key) {
+            continue;
+        }
+        if let Some(group) = app.worktree_space_group(&space.key) {
+            groups_by_key.insert(space.key.clone(), group);
         }
     }
-    let grouped_keys = members_by_key
-        .iter()
-        .filter(|(_, members)| {
-            members.len() >= 2
-                && members.iter().any(|idx| {
-                    app.workspaces
-                        .get(*idx)
-                        .and_then(|ws| ws.worktree_space())
-                        .is_some_and(|space| !space.is_linked_worktree)
-                })
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<std::collections::HashSet<_>>();
 
     let visible_group_idx = if matches!(app.mode, Mode::Navigate) {
         Some(app.selected)
     } else {
         app.active
     };
-    let active_group = visible_group_idx.and_then(|idx| {
-        app.workspaces
-            .get(idx)
-            .and_then(|ws| ws.worktree_space())
-            .map(|space| space.key.clone())
-    });
 
     let mut emitted_groups = std::collections::HashSet::<String>::new();
     let mut entries = Vec::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
-        let Some(space) = ws
-            .worktree_space()
-            .filter(|space| grouped_keys.contains(&space.key))
-        else {
+        // A workspace only joins a tree when it is that tree's main-checkout
+        // parent or one of its linked worktrees. Anything else - including a
+        // second workspace opened in the same main checkout - keeps its own
+        // top-level row.
+        let Some((space, group)) = ws.worktree_space().and_then(|space| {
+            groups_by_key
+                .get(&space.key)
+                .filter(|group| group.contains(ws_idx))
+                .map(|group| (space, group))
+        }) else {
             entries.push(WorkspaceListEntry::Workspace {
                 ws_idx,
                 indented: false,
@@ -412,44 +403,23 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
             continue;
         }
 
-        let Some(members) = members_by_key.get(&space.key) else {
-            continue;
-        };
-        let Some(parent_idx) = members.iter().copied().find(|idx| {
-            app.workspaces
-                .get(*idx)
-                .and_then(|member| member.worktree_space())
-                .is_some_and(|member_space| !member_space.is_linked_worktree)
-        }) else {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
-            });
-            continue;
-        };
         let collapsed = !force_expanded && app.collapsed_space_keys.contains(&space.key);
         entries.push(WorkspaceListEntry::Workspace {
-            ws_idx: parent_idx,
+            ws_idx: group.parent_idx,
             indented: false,
         });
 
         if collapsed {
-            if let Some(active_idx) = visible_group_idx
-                .filter(|idx| *idx != parent_idx)
-                .filter(|_| active_group.as_deref() == Some(space.key.as_str()))
-            {
+            if let Some(active_idx) = visible_group_idx.filter(|idx| group.children.contains(idx)) {
                 entries.push(WorkspaceListEntry::Workspace {
                     ws_idx: active_idx,
                     indented: true,
                 });
             }
         } else {
-            for member_idx in members {
-                if *member_idx == parent_idx {
-                    continue;
-                }
+            for child_idx in &group.children {
                 entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: *member_idx,
+                    ws_idx: *child_idx,
                     indented: true,
                 });
             }
@@ -2941,5 +2911,137 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 },
             ]
         );
+    }
+
+    /// A member of the `repo-key` space with an explicit linked flag, so tests
+    /// can build a checkout that has more than one workspace open in it.
+    fn space_member(name: &str, checkout: &str, linked: bool) -> crate::workspace::Workspace {
+        let mut ws = crate::workspace::Workspace::test_new(name);
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from(checkout),
+            is_linked_worktree: linked,
+        });
+        ws
+    }
+
+    fn top_level(ws_idx: usize) -> WorkspaceListEntry {
+        WorkspaceListEntry::Workspace {
+            ws_idx,
+            indented: false,
+        }
+    }
+
+    fn child(ws_idx: usize) -> WorkspaceListEntry {
+        WorkspaceListEntry::Workspace {
+            ws_idx,
+            indented: true,
+        }
+    }
+
+    #[test]
+    fn second_main_checkout_workspace_keeps_its_own_top_level_row() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            space_member("mainA", "/repo/herdr", false),
+            space_member("issue", "/repo/herdr-issue", true),
+            space_member("mainB", "/repo/herdr", false),
+            space_member("review", "/repo/herdr-review", true),
+        ];
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), child(1), child(3), top_level(2)]
+        );
+    }
+
+    #[test]
+    fn only_the_group_parent_carries_the_collapse_chevron() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            space_member("mainA", "/repo/herdr", false),
+            space_member("issue", "/repo/herdr-issue", true),
+            space_member("mainB", "/repo/herdr", false),
+        ];
+
+        assert_eq!(
+            workspace_parent_group_state(&app, 0),
+            Some(("repo-key".to_string(), false))
+        );
+        assert_eq!(workspace_parent_group_state(&app, 1), None);
+        assert_eq!(workspace_parent_group_state(&app, 2), None);
+    }
+
+    #[test]
+    fn collapsed_group_ignores_a_selected_peer_main_checkout_workspace() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            space_member("mainA", "/repo/herdr", false),
+            space_member("issue", "/repo/herdr-issue", true),
+            space_member("mainB", "/repo/herdr", false),
+        ];
+        app.mode = Mode::Navigate;
+        app.selected = 2;
+        app.active = Some(2);
+        app.collapsed_space_keys.insert("repo-key".into());
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), top_level(2)]
+        );
+    }
+
+    #[test]
+    fn main_checkout_members_without_a_linked_worktree_do_not_form_a_group() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            space_member("mainA", "/repo/herdr", false),
+            space_member("mainB", "/repo/herdr", false),
+        ];
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), top_level(1)]
+        );
+        assert_eq!(workspace_parent_group_state(&app, 0), None);
+    }
+
+    #[test]
+    fn desktop_tree_never_indents_a_second_main_checkout_workspace() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            space_member("mainA", "/repo/herdr", false),
+            space_member("issue", "/repo/herdr-issue", true),
+            space_member("mainB", "/repo/herdr", false),
+        ];
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_spaces.row_gap = 0;
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    list_area,
+                    false,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let cards = &app.view.workspace_card_areas;
+        assert_eq!(cards[2].ws_idx, 2);
+        assert!(!cards[2].indented);
+        assert_eq!(buffer[(cards[1].rect.x + 3, cards[1].rect.y)].symbol(), "└");
+        let parent_name_x = find_symbol_x(buffer, cards[0].rect.y, cards[0].rect.width, "m");
+        let peer_name_x = find_symbol_x(buffer, cards[2].rect.y, cards[2].rect.width, "m");
+        assert_eq!(peer_name_x, parent_name_x);
     }
 }
