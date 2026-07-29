@@ -557,6 +557,120 @@ mod tests {
         )));
     }
 
+    fn report_metadata(app: &mut App, workspace_id: &str, key: &str) -> String {
+        app.handle_workspace_report_metadata(
+            "req".into(),
+            WorkspaceReportMetadataParams {
+                workspace_id: workspace_id.into(),
+                source: "user:test".into(),
+                tokens: std::collections::HashMap::from([(key.into(), Some("value".into()))]),
+                seq: None,
+                ttl_ms: None,
+            },
+        )
+    }
+
+    // A metadata write addressed to a workspace id that no longer names any
+    // workspace must fail loudly. Reporting success made publishing to a closed
+    // workspace indistinguishable from publishing to a live one.
+    #[test]
+    fn workspace_report_metadata_rejects_closed_workspace_id() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("keeper"), Workspace::test_new("doomed")];
+        let keeper_id = app.public_workspace_id(0);
+        let doomed_id = app.public_workspace_id(1);
+
+        // A live workspace still accepts the write.
+        let response = report_metadata(&mut app, &doomed_id, "phase");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            app.workspace_info(1)
+                .tokens
+                .get("phase")
+                .map(String::as_str),
+            Some("value")
+        );
+
+        app.state.workspaces.remove(1);
+
+        let response = report_metadata(&mut app, &doomed_id, "after_close");
+        let error: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(error["error"]["code"], "workspace_not_found");
+        // The write must not land on the surviving workspace either.
+        assert!(app.workspace_info(0).tokens.is_empty());
+        assert_eq!(app.public_workspace_id(0), keeper_id);
+    }
+
+    // Positional resolution used to accept `N`/`w_N` as a 1-based index, so a
+    // stale id that named no workspace silently patched whichever workspace
+    // currently occupied that slot.
+    #[test]
+    fn workspace_report_metadata_rejects_positional_workspace_ids() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("alpha"), Workspace::test_new("beta")];
+
+        for positional_id in ["1", "2", "w_1", "w_2"] {
+            let response = report_metadata(&mut app, positional_id, "misdelivered");
+            let error: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                error["error"]["code"], "workspace_not_found",
+                "positional id {positional_id} must not resolve"
+            );
+        }
+
+        assert!(app.workspace_info(0).tokens.is_empty());
+        assert!(app.workspace_info(1).tokens.is_empty());
+    }
+
+    // Sibling write paths resolve their target through the same workspace id
+    // parser, so they must refuse a positional id too instead of creating the
+    // tab on an unrelated workspace.
+    #[test]
+    fn tab_create_rejects_positional_workspace_id() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("alpha")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let tab_count = app.state.workspaces[0].tabs.len();
+
+        let response = app.handle_tab_create(
+            "req".into(),
+            crate::api::schema::TabCreateParams {
+                workspace_id: Some("1".into()),
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        let error: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(error["error"]["code"], "workspace_not_found");
+        assert_eq!(app.state.workspaces[0].tabs.len(), tab_count);
+    }
+
     #[test]
     fn workspace_token_ttl_expires_through_runtime_and_emits_update() {
         let event_hub = crate::api::EventHub::default();

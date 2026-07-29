@@ -131,6 +131,14 @@ Pane control methods use public pane ids such as `w1:p1`. Methods whose
 schema makes `pane_id` optional use the server's active focused pane when it is
 omitted. `pane.move` always requires the source `pane_id`.
 
+Workspace ids such as `w1` are stable identity and are independent of display
+order. They are resolved by identity only: a `workspace_id` that no longer names
+an open workspace returns `workspace_not_found` rather than resolving to the
+workspace currently in that position. Long-running publishers that cache
+`HERDR_WORKSPACE_ID` should treat `workspace_not_found` as the signal that the
+cached id is stale and re-read it, rather than assuming a successful write
+reached the intended Space.
+
 `pane.send_keys` and `pane.send_input.keys` accept Herdr key-combo strings:
 plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
