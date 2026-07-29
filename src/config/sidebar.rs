@@ -69,9 +69,9 @@ impl<'de> Deserialize<'de> for SidebarTokenColor {
                 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
         let Some(hex) = hex else {
-            return Err(serde::de::Error::custom(
-                "sidebar token fg must be #RGB or #RRGGBB",
-            ));
+            return Err(serde::de::Error::custom(format!(
+                "sidebar token colors must be #RGB or #RRGGBB, got `{value}`"
+            )));
         };
         let (r, g, b) = if hex.len() == 3 {
             let mut digits = hex
@@ -93,11 +93,43 @@ impl<'de> Deserialize<'de> for SidebarTokenColor {
     }
 }
 
+/// Optional animated emphasis for one styled sidebar token occurrence.
+///
+/// Emphasis is opt-in: an omitted or `none` value renders exactly like an
+/// unstyled token and keeps the sidebar animation clock disarmed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarTokenEmphasis {
+    /// No animation. The calm default.
+    #[default]
+    None,
+    /// Ramp the token foreground toward the panel background and back.
+    Pulse,
+}
+
+impl SidebarTokenEmphasis {
+    fn animates(self) -> bool {
+        matches!(self, Self::Pulse)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SidebarTokenStyle {
     pub fg: Option<SidebarTokenColor>,
+    pub bg: Option<SidebarTokenColor>,
     pub bold: Option<bool>,
     pub dim: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub reverse: Option<bool>,
+    pub emphasis: Option<SidebarTokenEmphasis>,
+}
+
+impl SidebarTokenStyle {
+    /// True when this occurrence needs the sidebar animation clock running.
+    pub(crate) fn animates(self) -> bool {
+        self.emphasis.is_some_and(SidebarTokenEmphasis::animates)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,16 +190,62 @@ struct RawStyledSidebarToken {
     #[serde(default)]
     fg: Option<SidebarTokenColor>,
     #[serde(default)]
+    bg: Option<SidebarTokenColor>,
+    #[serde(default)]
     bold: Option<bool>,
     #[serde(default)]
     dim: Option<bool>,
+    #[serde(default)]
+    italic: Option<bool>,
+    #[serde(default)]
+    underline: Option<bool>,
+    #[serde(default)]
+    reverse: Option<bool>,
+    #[serde(default)]
+    emphasis: Option<SidebarTokenEmphasis>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
 enum RawSidebarToken {
     Plain(String),
     Styled(RawStyledSidebarToken),
+}
+
+/// Hand-written instead of `#[serde(untagged)]` so an invalid inline style
+/// table reports the offending field instead of "did not match any variant".
+impl<'de> Deserialize<'de> for RawSidebarToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RawSidebarTokenVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RawSidebarTokenVisitor {
+            type Value = RawSidebarToken;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sidebar token name or an inline style table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RawSidebarToken::Plain(value.to_string()))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                RawStyledSidebarToken::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    map,
+                ))
+                .map(RawSidebarToken::Styled)
+            }
+        }
+
+        deserializer.deserialize_any(RawSidebarTokenVisitor)
+    }
 }
 
 impl RawSidebarToken {
@@ -178,8 +256,13 @@ impl RawSidebarToken {
                 token.token,
                 Some(SidebarTokenStyle {
                     fg: token.fg,
+                    bg: token.bg,
                     bold: token.bold,
                     dim: token.dim,
+                    italic: token.italic,
+                    underline: token.underline,
+                    reverse: token.reverse,
+                    emphasis: token.emphasis,
                 }),
             ),
         }
@@ -223,11 +306,26 @@ where
     if let Some(fg) = style.fg {
         map.serialize_entry("fg", &fg)?;
     }
+    if let Some(bg) = style.bg {
+        map.serialize_entry("bg", &bg)?;
+    }
     if let Some(bold) = style.bold {
         map.serialize_entry("bold", &bold)?;
     }
     if let Some(dim) = style.dim {
         map.serialize_entry("dim", &dim)?;
+    }
+    if let Some(italic) = style.italic {
+        map.serialize_entry("italic", &italic)?;
+    }
+    if let Some(underline) = style.underline {
+        map.serialize_entry("underline", &underline)?;
+    }
+    if let Some(reverse) = style.reverse {
+        map.serialize_entry("reverse", &reverse)?;
+    }
+    if let Some(emphasis) = style.emphasis {
+        map.serialize_entry("emphasis", &emphasis)?;
     }
     map.end()
 }
@@ -386,6 +484,16 @@ pub struct AgentsSidebarConfig {
 }
 
 impl AgentsSidebarConfig {
+    /// True when any configured Agent row asks for animated emphasis.
+    pub(crate) fn has_animated_tokens(&self) -> bool {
+        let animates = |rows: &AgentSidebarRows| {
+            rows.iter()
+                .flatten()
+                .any(|token| token.parts().1.animates())
+        };
+        animates(&self.rows) || self.rows_by_agent.values().any(animates)
+    }
+
     pub(crate) fn rows_for_agent(&self, agent: Option<Agent>) -> &AgentSidebarRows {
         agent
             .and_then(|agent| self.rows_by_agent.get(crate::detect::agent_label(agent)))
@@ -442,6 +550,14 @@ impl SpacesSidebarConfig {
                 SpaceSidebarToken::TerminalTitle | SpaceSidebarToken::TerminalTitleStripped
             )
         })
+    }
+
+    /// True when any configured Space row asks for animated emphasis.
+    pub(crate) fn has_animated_tokens(&self) -> bool {
+        self.rows
+            .iter()
+            .flatten()
+            .any(|token| token.parts().1.animates())
     }
 }
 
@@ -648,7 +764,14 @@ rows = [[{ token = "git_status", fg = "#ff00aa" }], [{ token = "$jj", bold = tru
         for entry in [
             r##"{ token = "workspace", fg = "red" }"##,
             r##"{ token = "workspace", fg = "#abcd" }"##,
-            r##"{ token = "workspace", underline = true }"##,
+            r##"{ token = "workspace", bg = "rebeccapurple" }"##,
+            r##"{ token = "workspace", bg = "#12345" }"##,
+            r##"{ token = "workspace", italic = "yes" }"##,
+            r##"{ token = "workspace", underline = 1 }"##,
+            r##"{ token = "workspace", reverse = "on" }"##,
+            r##"{ token = "workspace", emphasis = "flash" }"##,
+            r##"{ token = "workspace", emphasis = true }"##,
+            r##"{ token = "workspace", blink = true }"##,
         ] {
             let input = format!("[ui.sidebar.agents]\nrows = [[{entry}]]\n");
             assert!(
@@ -656,6 +779,138 @@ rows = [[{ token = "git_status", fg = "#ff00aa" }], [{ token = "$jj", bold = tru
                 "accepted {entry}"
             );
         }
+    }
+
+    #[test]
+    fn parses_every_static_attribute_and_pulse_emphasis() {
+        let config: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.agents]
+rows = [[{ token = "$dot", fg = "#a6e3a1", bg = "#181825", bold = true, dim = false, italic = true, underline = true, reverse = true, emphasis = "pulse" }]]
+
+[ui.sidebar.spaces]
+rows = [[{ token = "workspace", emphasis = "none" }]]
+"##,
+        )
+        .expect("full style table");
+
+        let (token, style) = config.ui.sidebar.agents.rows[0][0].parts();
+        assert_eq!(token, &AgentSidebarToken::Custom("dot".into()));
+        assert_eq!(
+            style.fg.expect("fg").ratatui(),
+            ratatui::style::Color::Rgb(0xa6, 0xe3, 0xa1)
+        );
+        assert_eq!(
+            style.bg.expect("bg").ratatui(),
+            ratatui::style::Color::Rgb(0x18, 0x18, 0x25)
+        );
+        assert_eq!(style.bold, Some(true));
+        assert_eq!(style.dim, Some(false));
+        assert_eq!(style.italic, Some(true));
+        assert_eq!(style.underline, Some(true));
+        assert_eq!(style.reverse, Some(true));
+        assert_eq!(style.emphasis, Some(SidebarTokenEmphasis::Pulse));
+        assert!(style.animates());
+
+        let (_, calm) = config.ui.sidebar.spaces.rows[0][0].parts();
+        assert_eq!(calm.emphasis, Some(SidebarTokenEmphasis::None));
+        assert!(!calm.animates());
+    }
+
+    #[test]
+    fn invalid_style_fields_report_the_offending_value() {
+        let color_error = toml::from_str::<crate::config::Config>(
+            "[ui.sidebar.agents]\nrows = [[{ token = \"workspace\", bg = \"red\" }]]\n",
+        )
+        .expect_err("invalid bg")
+        .to_string();
+        assert!(
+            color_error.contains("#RGB or #RRGGBB") && color_error.contains("red"),
+            "unhelpful color error: {color_error}"
+        );
+
+        let emphasis_error = toml::from_str::<crate::config::Config>(
+            "[ui.sidebar.agents]\nrows = [[{ token = \"workspace\", emphasis = \"flash\" }]]\n",
+        )
+        .expect_err("invalid emphasis")
+        .to_string();
+        assert!(
+            emphasis_error.contains("flash")
+                && emphasis_error.contains("pulse")
+                && emphasis_error.contains("none"),
+            "unhelpful emphasis error: {emphasis_error}"
+        );
+
+        let unknown_error = toml::from_str::<crate::config::Config>(
+            "[ui.sidebar.agents]\nrows = [[{ token = \"workspace\", blink = true }]]\n",
+        )
+        .expect_err("unknown field")
+        .to_string();
+        assert!(
+            unknown_error.contains("blink"),
+            "unhelpful unknown-field error: {unknown_error}"
+        );
+    }
+
+    #[test]
+    fn only_pulse_emphasis_arms_the_animation_clock() {
+        let calm: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.agents]
+rows = [[{ token = "workspace", fg = "#abc", bold = true, italic = true, underline = true, reverse = true }], ["agent"]]
+
+[ui.sidebar.spaces]
+rows = [[{ token = "branch", emphasis = "none" }]]
+"##,
+        )
+        .expect("calm config");
+        assert!(!calm.ui.sidebar.agents.has_animated_tokens());
+        assert!(!calm.ui.sidebar.spaces.has_animated_tokens());
+
+        let default = SidebarConfig::default();
+        assert!(!default.agents.has_animated_tokens());
+        assert!(!default.spaces.has_animated_tokens());
+
+        let spaces_pulse: crate::config::Config = toml::from_str(
+            "[ui.sidebar.spaces]\nrows = [[{ token = \"branch\", emphasis = \"pulse\" }]]\n",
+        )
+        .expect("space pulse");
+        assert!(spaces_pulse.ui.sidebar.spaces.has_animated_tokens());
+        assert!(!spaces_pulse.ui.sidebar.agents.has_animated_tokens());
+
+        let override_pulse: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.rows_by_agent]\nclaude = [[{ token = \"agent\", emphasis = \"pulse\" }]]\n",
+        )
+        .expect("override pulse");
+        assert!(override_pulse.ui.sidebar.agents.has_animated_tokens());
+    }
+
+    #[test]
+    fn styles_without_new_attributes_serialize_exactly_as_before() {
+        let config: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.agents]
+rows = [["state_icon", { token = "workspace", fg = "#89b4fa", bold = true, dim = false }]]
+"##,
+        )
+        .expect("legacy style config");
+
+        let serialized = toml::to_string(&config.ui.sidebar.agents).expect("serialize agents");
+        assert!(
+            serialized.contains("fg = \"#89b4fa\"")
+                && serialized.contains("bold = true")
+                && serialized.contains("dim = false"),
+            "legacy style lost an attribute: {serialized}"
+        );
+        for absent in ["bg", "italic", "underline", "reverse", "emphasis"] {
+            assert!(
+                !serialized.contains(absent),
+                "{absent} leaked into a legacy style: {serialized}"
+            );
+        }
+
+        let reparsed: AgentsSidebarConfig = toml::from_str(&serialized).expect("roundtrip agents");
+        assert_eq!(reparsed, config.ui.sidebar.agents);
     }
 
     #[test]

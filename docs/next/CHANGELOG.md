@@ -29,6 +29,8 @@
 - Added transient declarative Agent view queries through `agent.view.set/clear`; filtered and sorted views now define sidebar, mobile, mouse, and agent-keybind navigation order.
 - Added one-shot plugin `[[startup]]` hooks for restoring plugin-owned state after server startup and live handoff.
 - Added per-token foreground, bold, and dim styling to expanded Space and Agent sidebar row layouts.
+- Added `bg`, `italic`, `underline`, and `reverse` attributes to expanded Space and Agent sidebar token styles.
+- Added opt-in `emphasis = "pulse"` to sidebar token styles, animating one occurrence as a foreground ramp toward the panel background instead of terminal blink. The animation clock stays stopped unless an expanded sidebar row asks for it and a client is attached to see it, so configurations without `emphasis` repaint exactly as often as before.
 - Added `ui.sidebar_start_collapsed` to launch Herdr with the sidebar collapsed. (#1463)
 - Added `ui.prompt_new_workspace_name` to ask for a workspace name before interactive TUI creation.
 - Added macOS support for the `HERDR_AGENT=<agent>` foreground-process hint, allowing agents hidden behind host-visible wrappers such as `nono` to use the named agent's screen manifest. (#679)

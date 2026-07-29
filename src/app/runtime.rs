@@ -1,13 +1,11 @@
-use std::time::Instant;
-
-#[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::terminal;
 
 use super::{
-    background_update_check_enabled, pressed_key_identity, App, AUTO_UPDATE_CHECK_INTERVAL,
-    MIN_RENDER_INTERVAL, RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    background_update_check_enabled, pressed_key_identity, App, ANIMATION_INTERVAL,
+    AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL, RESIZE_POLL_INTERVAL,
+    SELECTION_AUTOSCROLL_INTERVAL,
 };
 fn retain_custom_command_after_wait(
     pid: u32,
@@ -226,6 +224,8 @@ impl App {
         let mut changed = false;
         let mut resized = false;
 
+        self.sync_animation_timer(now);
+
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
             changed |= resized;
@@ -287,6 +287,15 @@ impl App {
         }
 
         if self
+            .next_animation_tick
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.state.animation_tick = self.state.animation_tick.wrapping_add(1);
+            self.next_animation_tick = Some(now + ANIMATION_INTERVAL);
+            changed = true;
+        }
+
+        if self
             .selection_autoscroll_deadline
             .is_some_and(|deadline| now >= deadline)
         {
@@ -327,7 +336,38 @@ impl App {
             self.sync_pending_agent_resume_deadline(now);
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
+        self.sync_animation_timer(now);
         changed
+    }
+
+    pub(crate) fn sync_animation_timer(&mut self, now: Instant) {
+        self.sync_animation_timer_with_interval(now, ANIMATION_INTERVAL, true);
+    }
+
+    /// `has_viewers` is false when no client is rendering the app, so a detached
+    /// server does not animate a sidebar nobody is looking at.
+    pub(crate) fn sync_headless_animation_timer(&mut self, now: Instant, has_viewers: bool) {
+        self.sync_animation_timer_with_interval(
+            now,
+            crate::app::HEADLESS_ANIMATION_INTERVAL,
+            has_viewers,
+        );
+    }
+
+    /// Arms the animation clock only while a visible sidebar token opts into
+    /// animated emphasis; otherwise leaves the loop with no animation deadline
+    /// so an unconfigured Herdr never wakes up to repaint.
+    fn sync_animation_timer_with_interval(
+        &mut self,
+        now: Instant,
+        interval: Duration,
+        has_viewers: bool,
+    ) {
+        if has_viewers && self.state.sidebar_animation_active() {
+            self.next_animation_tick.get_or_insert(now + interval);
+        } else {
+            self.next_animation_tick = None;
+        }
     }
 
     /// Clears temporary copied-token highlights, such as after double-click copy.
@@ -535,6 +575,7 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
+            self.next_animation_tick,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
@@ -595,6 +636,104 @@ mod tests {
         let interrupted = std::io::Error::new(std::io::ErrorKind::Interrupted, "test interrupt");
 
         assert!(retain_custom_command_after_wait(42, Err(interrupted)));
+    }
+
+    fn pulse_space_rows() -> Vec<Vec<crate::config::SpaceSidebarToken>> {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.spaces]\nrows = [[{ token = \"workspace\", emphasis = \"pulse\" }]]\n",
+        )
+        .expect("pulse space config");
+        config.ui.sidebar.spaces.rows
+    }
+
+    #[test]
+    fn calm_sidebar_never_arms_the_animation_clock() {
+        let (mut app, _) = test_app_with_pane();
+        let now = Instant::now();
+
+        app.sync_animation_timer(now);
+
+        assert_eq!(app.next_animation_tick, None);
+        assert!(!app.handle_scheduled_tasks(now, false));
+        assert_eq!(app.state.animation_tick, 0);
+        assert_eq!(
+            app.next_loop_deadline(now, false),
+            Some(app.next_resize_poll)
+        );
+    }
+
+    #[test]
+    fn pulse_token_arms_the_clock_and_advances_the_tick() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        let now = Instant::now();
+
+        app.sync_animation_timer(now);
+        let armed = app.next_animation_tick.expect("pulse arms the clock");
+        assert_eq!(armed, now + ANIMATION_INTERVAL);
+
+        // Nothing to do before the deadline.
+        assert!(!app.handle_scheduled_tasks(now, false));
+        assert_eq!(app.state.animation_tick, 0);
+
+        // At the deadline the tick advances and the frame is marked dirty.
+        assert!(app.handle_scheduled_tasks(armed, false));
+        assert_eq!(app.state.animation_tick, 1);
+        assert_eq!(
+            app.next_animation_tick,
+            Some(armed + ANIMATION_INTERVAL),
+            "the clock reschedules itself"
+        );
+    }
+
+    #[test]
+    fn collapsing_the_sidebar_disarms_the_animation_clock() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        let now = Instant::now();
+
+        app.sync_animation_timer(now);
+        assert!(app.next_animation_tick.is_some());
+
+        app.state.sidebar_collapsed = true;
+        app.sync_animation_timer(now);
+
+        assert_eq!(app.next_animation_tick, None);
+    }
+
+    #[test]
+    fn detached_server_with_no_viewers_does_not_animate() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        let now = Instant::now();
+
+        app.sync_headless_animation_timer(now, false);
+        assert_eq!(app.next_animation_tick, None);
+
+        app.sync_headless_animation_timer(now, true);
+        assert!(app.next_animation_tick.is_some());
+
+        app.sync_headless_animation_timer(now, false);
+        assert_eq!(app.next_animation_tick, None);
+    }
+
+    #[test]
+    fn headless_animation_clock_uses_the_low_power_interval() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        let now = Instant::now();
+
+        app.sync_headless_animation_timer(now, true);
+
+        assert_eq!(
+            app.next_animation_tick,
+            Some(now + crate::app::HEADLESS_ANIMATION_INTERVAL)
+        );
+        assert!(
+            crate::app::HEADLESS_ANIMATION_INTERVAL
+                == ANIMATION_INTERVAL * crate::app::HEADLESS_ANIMATION_TICK_STEP,
+            "the headless step must keep the pulse cycle the same wall-clock length"
+        );
     }
 
     fn test_app_with_pane() -> (super::super::App, crate::layout::PaneId) {
