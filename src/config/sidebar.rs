@@ -124,6 +124,8 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    TerminalTitle,
+    TerminalTitleStripped,
     Custom(String),
     Styled {
         token: Box<SpaceSidebarToken>,
@@ -252,6 +254,8 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::TerminalTitle => "terminal_title".into(),
+        SpaceSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
         SpaceSidebarToken::Styled { token, .. } => space_token_name(token),
     }
@@ -338,6 +342,8 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("terminal_title", Self::TerminalTitle),
+                ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -385,6 +391,21 @@ impl AgentsSidebarConfig {
             .and_then(|agent| self.rows_by_agent.get(crate::detect::agent_label(agent)))
             .unwrap_or(&self.rows)
     }
+
+    /// Whether any configured Agent row, including per-agent overrides, renders
+    /// a terminal title.
+    pub(crate) fn uses_terminal_title(&self) -> bool {
+        std::iter::once(&self.rows)
+            .chain(self.rows_by_agent.values())
+            .flatten()
+            .flatten()
+            .any(|token| {
+                matches!(
+                    token.parts().0,
+                    AgentSidebarToken::TerminalTitle | AgentSidebarToken::TerminalTitleStripped
+                )
+            })
+    }
 }
 
 impl Default for AgentsSidebarConfig {
@@ -410,6 +431,18 @@ pub struct SpacesSidebarConfig {
     #[serde(deserialize_with = "deserialize_sidebar_rows")]
     pub rows: SpaceSidebarRows,
     pub row_gap: u16,
+}
+
+impl SpacesSidebarConfig {
+    /// Whether any configured Space row renders a terminal title.
+    pub(crate) fn uses_terminal_title(&self) -> bool {
+        self.rows.iter().flatten().any(|token| {
+            matches!(
+                token.parts().0,
+                SpaceSidebarToken::TerminalTitle | SpaceSidebarToken::TerminalTitleStripped
+            )
+        })
+    }
 }
 
 impl Default for SpacesSidebarConfig {
@@ -511,6 +544,59 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn space_rows_parse_terminal_title_builtins_distinctly_from_custom_tokens() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.spaces]
+rows = [["workspace"], ["terminal_title", "terminal_title_stripped", "$terminal_title"]]
+"#,
+        )
+        .expect("space terminal title config");
+
+        assert_eq!(
+            config.ui.sidebar.spaces.rows[1],
+            vec![
+                SpaceSidebarToken::TerminalTitle,
+                SpaceSidebarToken::TerminalTitleStripped,
+                SpaceSidebarToken::Custom("terminal_title".into()),
+            ]
+        );
+        assert!(config.ui.sidebar.spaces.uses_terminal_title());
+        assert!(!config.ui.sidebar.agents.uses_terminal_title());
+    }
+
+    #[test]
+    fn terminal_title_space_tokens_round_trip_through_serialization() {
+        let rows = vec![vec![
+            SpaceSidebarToken::TerminalTitle,
+            SpaceSidebarToken::Styled {
+                token: Box::new(SpaceSidebarToken::TerminalTitleStripped),
+                style: SidebarTokenStyle {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            },
+        ]];
+        let config = SpacesSidebarConfig {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&config).expect("serialize spaces config");
+        let decoded: SpacesSidebarConfig = toml::from_str(&encoded).expect("round trip");
+
+        assert_eq!(decoded.rows, rows);
+    }
+
+    #[test]
+    fn default_space_and_agent_layouts_do_not_use_terminal_titles() {
+        let config = SidebarConfig::default();
+
+        assert!(!config.spaces.uses_terminal_title());
+        assert!(!config.agents.uses_terminal_title());
     }
 
     #[test]
