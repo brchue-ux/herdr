@@ -1551,6 +1551,11 @@ pub struct AppState {
     pub local_sound_playback: bool,
     pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
+    /// Frame counter for sidebar token emphasis animation (wraps around).
+    ///
+    /// Only advanced while a sidebar token opts into animated emphasis, so a
+    /// calm configuration leaves it at `0` forever.
+    pub animation_tick: u32,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1603,6 +1608,17 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// True when a visible sidebar token opts into animated emphasis.
+    ///
+    /// Drives whether the animation clock runs at all. The collapsed sidebar
+    /// renders its own compact layout without configured token rows, so a
+    /// collapsed sidebar never animates.
+    pub(crate) fn sidebar_animation_active(&self) -> bool {
+        !self.sidebar_collapsed
+            && (self.sidebar_agents.has_animated_tokens()
+                || self.sidebar_spaces.has_animated_tokens())
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1918,6 +1934,7 @@ impl AppState {
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
+            animation_tick: 0,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {

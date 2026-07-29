@@ -318,11 +318,30 @@ A token entry can also be an inline style table:
 [ui.sidebar.agents]
 rows = [
   ["state_icon", { token = "workspace", bold = false }, "tab"],
-  [{ token = "$summary", fg = "#89b4fa", bold = true, dim = false }],
+  [{ token = "$summary", fg = "#89b4fa", bg = "#1e1e2e", bold = true, dim = false }],
+  [{ token = "$note", italic = true, underline = true, reverse = false }],
 ]
 ```
 
-`fg` accepts strict `#RGB` or `#RRGGBB`. `bold` and `dim` accept booleans. Omitted fields preserve the token's contextual style; explicit `false` removes that modifier. Styling applies to one occurrence, so the same token may look different in another row or agent override. A foreground override replaces all semantic foregrounds inside that occurrence: for example, styled `git_status` ahead and behind counts use one color instead of their default green and red. Token styles never change separators or row backgrounds.
+`fg` and `bg` accept strict `#RGB` or `#RRGGBB`. `bold`, `dim`, `italic`, `underline`, and `reverse` accept booleans. Omitted fields preserve the token's contextual style; explicit `false` removes that modifier. Styling applies to one occurrence, so the same token may look different in another row or agent override. A foreground override replaces all semantic foregrounds inside that occurrence: for example, styled `git_status` ahead and behind counts use one color instead of their default green and red. A `bg` override paints only the cells that occurrence draws, so it reads as a token badge rather than a row background. Token styles never change separators or row backgrounds.
+
+Terminal support for `italic`, `underline`, and `reverse` varies. Herdr emits the standard attributes and leaves the rest to your terminal.
+
+`emphasis` adds animation to one occurrence. It is off by default:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  [{ token = "$dot", fg = "#a6e3a1", emphasis = "pulse" }],
+]
+```
+
+- `none` — the default. Renders exactly like a token without `emphasis`.
+- `pulse` — breathes the token's foreground toward the panel background and back over about 1.6 seconds.
+
+`pulse` is drawn as a color ramp, not with terminal blink, so it stays legible at its dimmest point and works on terminals that ignore blink. It ramps toward the occurrence's own `bg` when one is set, otherwise toward the panel background, so a `pulse` on a token with no foreground color has nothing to ramp and stays static.
+
+Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for `pulse`, so a configuration without `emphasis` repaints exactly as often as before. When a `pulse` is configured, a locally attached Herdr repaints the sidebar about 10 times a second and a Herdr server about 5 times a second for as long as the sidebar stays expanded. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one pulsing token over several.
 
 `row_gap` controls the blank terminal rows between entries, independently for the Agent and Space panels. It defaults to `0`, which packs entries together; set it to `1` to restore the previous spacing. It does not add spacing between the content lines declared in `rows`. Consecutive indented worktree children remain packed as one Space group.
 

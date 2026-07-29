@@ -4036,6 +4036,9 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
+        self.app
+            .sync_headless_animation_timer(now, self.has_app_viewers());
+
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
 
@@ -4085,6 +4088,20 @@ impl HeadlessServer {
         {
             self.app.copy_feedback_deadline = None;
             self.app.state.copy_feedback = None;
+            changed = true;
+        }
+
+        if self
+            .app
+            .next_animation_tick
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.app.state.animation_tick = self
+                .app
+                .state
+                .animation_tick
+                .wrapping_add(app::HEADLESS_ANIMATION_TICK_STEP);
+            self.app.next_animation_tick = Some(now + app::HEADLESS_ANIMATION_INTERVAL);
             changed = true;
         }
 
@@ -4144,7 +4161,17 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
+        self.app
+            .sync_headless_animation_timer(now, self.has_app_viewers());
         changed
+    }
+
+    /// True when at least one connected client is rendering the app, and would
+    /// therefore actually see an animated sidebar token.
+    fn has_app_viewers(&self) -> bool {
+        self.clients
+            .values()
+            .any(ClientConnection::is_full_app_client)
     }
 
     /// Initiates graceful shutdown.
@@ -6187,6 +6214,65 @@ next_tab = ""
 
         assert!(!server.handle_scheduled_tasks_headless(now, false));
         assert_eq!(server.app.next_agent_manifest_update_check, None);
+    }
+
+    #[test]
+    fn headless_sidebar_pulse_ticks_in_coarse_steps_and_only_when_configured() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+
+        // A calm sidebar leaves the server with no animation deadline at all.
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
+        assert_eq!(server.app.next_animation_tick, None);
+        assert_eq!(server.app.state.animation_tick, 0);
+
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.spaces]\nrows = [[{ token = \"workspace\", emphasis = \"pulse\" }]]\n",
+        )
+        .expect("pulse space config");
+        server.app.state.sidebar_spaces = config.ui.sidebar.spaces;
+
+        // Still nothing: no client is rendering the app yet.
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
+        assert_eq!(server.app.next_animation_tick, None);
+
+        let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        assert!(server.has_app_viewers());
+
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
+        let armed = server
+            .app
+            .next_animation_tick
+            .expect("pulse arms the clock");
+        assert_eq!(armed, now + app::HEADLESS_ANIMATION_INTERVAL);
+
+        assert!(server.handle_scheduled_tasks_headless(armed, false));
+        assert_eq!(
+            server.app.state.animation_tick,
+            app::HEADLESS_ANIMATION_TICK_STEP
+        );
+        assert_eq!(
+            server.app.next_animation_tick,
+            Some(armed + app::HEADLESS_ANIMATION_INTERVAL)
+        );
+
+        // A detaching client disarms the clock again.
+        server.clients.clear();
+        assert!(!server
+            .handle_scheduled_tasks_headless(armed + app::HEADLESS_ANIMATION_INTERVAL, false));
+        assert_eq!(server.app.next_animation_tick, None);
     }
 
     #[tokio::test]
