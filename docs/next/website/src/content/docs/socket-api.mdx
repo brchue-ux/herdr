@@ -118,7 +118,8 @@ Raw socket method names use dot notation:
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
 focused workspace/tab/pane ids, workspace records, tab records, pane records,
-tab layout snapshots, and agent records. It is not a subscription; after reading
+tab layout snapshots, agent records, and an `agent_view` object naming the
+active Agents view when one is in force. It is not a subscription; after reading
 it, subscribe to resource events and update the local cache from those events.
 Call `session.snapshot` again after reconnecting or when the local cache may be
 stale. Attached worktree provenance is included on workspace records. Full repo
@@ -427,11 +428,19 @@ that policy without rewriting config.
 
 `source` identifies the owner. Plugins use `plugin:<HERDR_PLUGIN_ID>`; Herdr
 rejects plugin-owned sets when that plugin is missing or disabled. Other callers
-may use their own non-`plugin:` source. A successful set atomically replaces the
-previous view. The view lasts until it is cleared, replaced, its owning plugin
-is disabled, unlinked, or uninstalled, or the server exits. Plugins that want
-durable behavior should save the query under `HERDR_PLUGIN_STATE_DIR` and
-reapply it from a `[[startup]]` hook.
+may use their own non-`plugin:` source. `config` and `ui` are reserved for
+Herdr's own tiers and are rejected with `invalid_agent_view`. A successful set
+atomically replaces the previous API-owned view. The view lasts until it is
+cleared, replaced, its owning plugin is disabled, unlinked, or uninstalled, or
+the server exits. Plugins that want durable behavior should save the query under
+`HERDR_PLUGIN_STATE_DIR` and reapply it from a `[[startup]]` hook.
+
+Three tiers can own the Agents view, ranked `config` < `ui` < `plugin`. The
+socket API owns the `plugin` tier only, and it is the highest, so
+`agent.view.set` always takes the panel. The `config` tier is the declarative
+[`[ui.sidebar.agents.view]`](/docs/configuration/#agents-panel-view) config key,
+which is durable across restarts and is never overwritten or cleared by an API
+call. The `ui` tier is reserved for views Herdr sets for itself.
 
 Clear unconditionally, or only when the named source still owns the view:
 
@@ -441,7 +450,9 @@ Clear unconditionally, or only when the named source still owns the view:
 ```
 
 A source mismatch leaves the active view unchanged. Set and clear responses use
-`type: "agent_view"` and report `active`, `source`, and optional `label`.
+`type: "agent_view"` and report `active`, `source`, and optional `label`. Because
+clearing the API tier reveals a lower tier rather than an unfiltered panel, a
+clear response can report `active: true` with `source: "config"`.
 
 ## Plugin APIs
 

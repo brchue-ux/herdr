@@ -1296,12 +1296,15 @@ platforms = ["linux", "macos"]
         let root = unique_temp_path("plugin-enable-disable");
         write_manifest(&root);
         link_manifest(&mut app, &root);
-        app.state.agent_view_override = Some(crate::api::schema::AgentViewSetParams {
-            source: "plugin:example.worktree-bootstrap".into(),
-            label: None,
-            filter: None,
-            sort: Vec::new(),
-        });
+        app.state.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(crate::api::schema::AgentViewSetParams {
+                source: "plugin:example.worktree-bootstrap".into(),
+                label: None,
+                filter: None,
+                sort: Vec::new(),
+            }),
+        );
 
         let disabled = app.handle_api_request(Request {
             id: "disable".into(),
@@ -1313,7 +1316,7 @@ platforms = ["linux", "macos"]
             panic!("expected disabled response: {disabled}");
         };
         assert!(!plugin.enabled);
-        assert!(app.state.agent_view_override.is_none());
+        assert!(!app.state.agent_views.is_active());
         let delayed_restore = app.handle_api_request(Request {
             id: "delayed-startup-restore".into(),
             method: Method::AgentViewSet(crate::api::schema::AgentViewSetParams {

@@ -6275,6 +6275,25 @@
           ],
           "type": "string"
         },
+        "AgentViewInfo": {
+          "description": "The Agents view currently projecting the agent list.\n\nA view can exist before any client connects, because\n`[ui.sidebar.agents.view]` is read at startup. Clients that keep their own\nprojection of the agent list need to know that from the bootstrap snapshot,\nnot only from their own `agent.view.set` calls.",
+          "properties": {
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "description": "Owning source: `config`, `ui`, `plugin:<id>`, or a caller-chosen source.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleReason": {
           "enum": [
             "set",
@@ -9671,6 +9690,17 @@
         },
         "SessionSnapshot": {
           "properties": {
+            "agent_view": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentViewInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The Agents view in force, if any. Absent when nothing is filtering or\nreordering the agent list."
+            },
             "agents": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/AgentInfo"

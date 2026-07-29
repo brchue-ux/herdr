@@ -1,20 +1,19 @@
+//! Evaluate an Agents view against app state.
+//!
+//! Grammar, limits, source reservation, and tier precedence are owned by
+//! [`crate::agent_view`]; this module only projects an already-validated spec
+//! onto the Agents panel.
+
 use std::cmp::Ordering;
 
 use crate::api::schema::{
     AgentStatus, AgentViewBuiltinField, AgentViewBuiltinSortField, AgentViewContext,
-    AgentViewField, AgentViewFilter, AgentViewSetParams, AgentViewSort, AgentViewSortField,
-    AgentViewSortOrder, AgentViewValue,
+    AgentViewField, AgentViewFilter, AgentViewSort, AgentViewSortField, AgentViewSortOrder,
+    AgentViewValue,
 };
 use crate::ui::AgentPanelEntry;
 
 use super::{AppState, Mode};
-
-const MAX_FILTER_DEPTH: usize = 8;
-const MAX_FILTER_NODES: usize = 64;
-const MAX_FILTER_VALUES: usize = 32;
-const MAX_SORT_FIELDS: usize = 8;
-const MAX_SOURCE_CHARS: usize = 120;
-const MAX_LABEL_CHARS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum EvalValue {
@@ -23,41 +22,43 @@ enum EvalValue {
     Number(u64),
 }
 
-pub(crate) fn validate_agent_view(spec: &mut AgentViewSetParams) -> Result<(), String> {
-    spec.source = normalize_source(&spec.source)?;
-    spec.label = spec
-        .label
-        .take()
-        .map(|label| normalize_label(&label))
-        .transpose()?;
-
-    let mut nodes = 0;
-    if let Some(filter) = &spec.filter {
-        validate_filter(filter, 1, &mut nodes)?;
-    }
-    if spec.sort.len() > MAX_SORT_FIELDS {
-        return Err(format!(
-            "agent view sort may contain at most {MAX_SORT_FIELDS} fields"
-        ));
-    }
-    for sort in &spec.sort {
-        validate_sort_field(&sort.field)?;
-    }
-    Ok(())
+/// What an active view is keeping out of the Agents panel.
+///
+/// The panel is meant to be the always-on truth, so a filtered panel has to say
+/// what it is holding back — especially a blocked agent waiting on the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AgentViewHidden {
+    pub hidden: usize,
+    pub hidden_blocked: usize,
 }
 
-pub(crate) fn validate_agent_view_source(source: &str) -> Result<String, String> {
-    normalize_source(source)
+impl AgentViewHidden {
+    pub(crate) fn any(self) -> bool {
+        self.hidden > 0
+    }
 }
 
-pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry>) {
-    if let Some(spec) = app.agent_view_override.as_ref() {
+pub(crate) fn apply_agent_view(
+    app: &AppState,
+    entries: &mut Vec<AgentPanelEntry>,
+) -> AgentViewHidden {
+    let mut hidden = AgentViewHidden::default();
+    if let Some(spec) = app.agent_views.active() {
         if let Some(filter) = &spec.filter {
-            entries.retain(|entry| matches_filter(app, entry, filter));
+            entries.retain(|entry| {
+                if matches_filter(app, entry, filter) {
+                    return true;
+                }
+                hidden.hidden += 1;
+                if entry.state == crate::detect::AgentState::Blocked {
+                    hidden.hidden_blocked += 1;
+                }
+                false
+            });
         }
         if !spec.sort.is_empty() {
             entries.sort_by(|left, right| compare_entries(app, left, right, &spec.sort));
-            return;
+            return hidden;
         }
     }
 
@@ -75,6 +76,7 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
             )
         });
     }
+    hidden
 }
 
 pub(crate) fn presented_workspace_idx(app: &AppState) -> Option<usize> {
@@ -83,153 +85,6 @@ pub(crate) fn presented_workspace_idx(app: &AppState) -> Option<usize> {
     } else {
         app.active
     }
-}
-
-fn normalize_source(source: &str) -> Result<String, String> {
-    let source = source.trim();
-    if source.is_empty()
-        || source.chars().count() > MAX_SOURCE_CHARS
-        || !source
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-'))
-    {
-        return Err(format!(
-            "agent view source must be non-empty, at most {MAX_SOURCE_CHARS} characters, and contain only ASCII letters, digits, colon, dot, underscore, or hyphen"
-        ));
-    }
-    Ok(source.to_string())
-}
-
-fn normalize_label(label: &str) -> Result<String, String> {
-    let label = label
-        .trim()
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect::<String>();
-    if label.is_empty() || label.chars().count() > MAX_LABEL_CHARS {
-        return Err(format!(
-            "agent view label must be non-empty and at most {MAX_LABEL_CHARS} characters"
-        ));
-    }
-    Ok(label)
-}
-
-fn validate_filter(
-    filter: &AgentViewFilter,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<(), String> {
-    if depth > MAX_FILTER_DEPTH {
-        return Err(format!(
-            "agent view filter may be nested at most {MAX_FILTER_DEPTH} levels"
-        ));
-    }
-    *nodes += 1;
-    if *nodes > MAX_FILTER_NODES {
-        return Err(format!(
-            "agent view filter may contain at most {MAX_FILTER_NODES} nodes"
-        ));
-    }
-
-    match filter {
-        AgentViewFilter::All { filters } | AgentViewFilter::Any { filters } => {
-            if filters.is_empty() {
-                return Err("agent view all/any filters must not be empty".to_string());
-            }
-            for filter in filters {
-                validate_filter(filter, depth + 1, nodes)?;
-            }
-        }
-        AgentViewFilter::Not { filter } => validate_filter(filter, depth + 1, nodes)?,
-        AgentViewFilter::Eq { field, value } => validate_field_value(field, value)?,
-        AgentViewFilter::In { field, values } => {
-            if values.is_empty() || values.len() > MAX_FILTER_VALUES {
-                return Err(format!(
-                    "agent view in filters require 1 to {MAX_FILTER_VALUES} values"
-                ));
-            }
-            for value in values {
-                validate_field_value(field, value)?;
-            }
-        }
-        AgentViewFilter::Exists { field } => validate_field(field)?,
-    }
-    Ok(())
-}
-
-fn validate_field(field: &AgentViewField) -> Result<(), String> {
-    if let AgentViewField::Token { token } = field {
-        validate_token(token)?;
-    }
-    Ok(())
-}
-
-fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Result<(), String> {
-    validate_field(field)?;
-    match (field, value) {
-        (
-            AgentViewField::Builtin(AgentViewBuiltinField::WorkspaceId),
-            AgentViewValue::Context {
-                context: AgentViewContext::CurrentWorkspaceId,
-            },
-        )
-        | (
-            AgentViewField::Builtin(AgentViewBuiltinField::TabId),
-            AgentViewValue::Context {
-                context: AgentViewContext::CurrentTabId,
-            },
-        ) => Ok(()),
-        (_, AgentViewValue::Context { .. }) => {
-            Err("agent view context type does not match the selected field".to_string())
-        }
-        (AgentViewField::Builtin(AgentViewBuiltinField::Seen), AgentViewValue::Bool(_))
-        | (
-            AgentViewField::Builtin(AgentViewBuiltinField::StateChangeSeq),
-            AgentViewValue::Number(_),
-        ) => Ok(()),
-        (
-            AgentViewField::Builtin(
-                AgentViewBuiltinField::Status
-                | AgentViewBuiltinField::WorkspaceId
-                | AgentViewBuiltinField::TabId
-                | AgentViewBuiltinField::PaneId
-                | AgentViewBuiltinField::Agent,
-            )
-            | AgentViewField::Token { .. },
-            AgentViewValue::String(value),
-        ) => {
-            if matches!(
-                field,
-                AgentViewField::Builtin(AgentViewBuiltinField::Status)
-            ) && !matches!(
-                value.as_str(),
-                "idle" | "working" | "blocked" | "done" | "unknown"
-            ) {
-                return Err(format!("unknown agent status `{value}`"));
-            }
-            Ok(())
-        }
-        _ => Err("agent view value type does not match the selected field".to_string()),
-    }
-}
-
-fn validate_sort_field(field: &AgentViewSortField) -> Result<(), String> {
-    if let AgentViewSortField::Token { token } = field {
-        validate_token(token)?;
-    }
-    Ok(())
-}
-
-fn validate_token(token: &str) -> Result<(), String> {
-    if token.is_empty()
-        || token.len() > 32
-        || !token
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-    {
-        return Err(format!("invalid agent view token `{token}`"));
-    }
-    Ok(())
 }
 
 fn matches_filter(app: &AppState, entry: &AgentPanelEntry, filter: &AgentViewFilter) -> bool {
@@ -427,7 +282,8 @@ fn public_pane_id(app: &AppState, entry: &AgentPanelEntry) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::{AgentViewBuiltinSortField, AgentViewSortField};
+    use crate::agent_view::AgentViewTier;
+    use crate::api::schema::AgentViewSetParams;
     use crate::detect::{Agent, AgentState};
     use crate::workspace::Workspace;
 
@@ -466,7 +322,9 @@ mod tests {
     #[test]
     fn current_workspace_filter_tracks_presented_workspace() {
         let mut state = state_with_agents();
-        state.agent_view_override = Some(current_workspace_view());
+        state
+            .agent_views
+            .set(AgentViewTier::Api, Some(current_workspace_view()));
 
         assert_eq!(crate::ui::agent_panel_entries(&state)[0].ws_idx, 0);
 
@@ -490,28 +348,31 @@ mod tests {
             .attached_terminal_id
             .clone();
         state.terminals.get_mut(&first_terminal).unwrap().state = AgentState::Working;
-        state.agent_view_override = Some(AgentViewSetParams {
-            source: "example.views".to_string(),
-            label: None,
-            filter: Some(AgentViewFilter::All {
-                filters: vec![
-                    AgentViewFilter::Eq {
-                        field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
-                        value: AgentViewValue::String("working".to_string()),
-                    },
-                    AgentViewFilter::Not {
-                        filter: Box::new(AgentViewFilter::Eq {
-                            field: AgentViewField::Builtin(AgentViewBuiltinField::WorkspaceId),
-                            value: AgentViewValue::String("missing".to_string()),
-                        }),
-                    },
-                ],
+        state.agent_views.set(
+            AgentViewTier::Api,
+            Some(AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(AgentViewFilter::All {
+                    filters: vec![
+                        AgentViewFilter::Eq {
+                            field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
+                            value: AgentViewValue::String("working".to_string()),
+                        },
+                        AgentViewFilter::Not {
+                            filter: Box::new(AgentViewFilter::Eq {
+                                field: AgentViewField::Builtin(AgentViewBuiltinField::WorkspaceId),
+                                value: AgentViewValue::String("missing".to_string()),
+                            }),
+                        },
+                    ],
+                }),
+                sort: vec![AgentViewSort {
+                    field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
+                    order: AgentViewSortOrder::Desc,
+                }],
             }),
-            sort: vec![AgentViewSort {
-                field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
-                order: AgentViewSortOrder::Desc,
-            }],
-        });
+        );
 
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 2);
@@ -537,15 +398,18 @@ mod tests {
                 None,
                 None,
             );
-        state.agent_view_override = Some(AgentViewSetParams {
-            source: "example.views".to_string(),
-            label: None,
-            filter: Some(AgentViewFilter::Eq {
-                field: AgentViewField::Builtin(AgentViewBuiltinField::Agent),
-                value: AgentViewValue::String("custom-agent".to_string()),
+        state.agent_views.set(
+            AgentViewTier::Api,
+            Some(AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(AgentViewFilter::Eq {
+                    field: AgentViewField::Builtin(AgentViewBuiltinField::Agent),
+                    value: AgentViewValue::String("custom-agent".to_string()),
+                }),
+                sort: Vec::new(),
             }),
-            sort: Vec::new(),
-        });
+        );
 
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
@@ -553,21 +417,55 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_mismatched_context_type() {
-        let mut spec = AgentViewSetParams {
-            source: "example.views".to_string(),
-            label: None,
-            filter: Some(AgentViewFilter::Eq {
-                field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
-                value: AgentViewValue::Context {
-                    context: AgentViewContext::CurrentWorkspaceId,
-                },
+    fn hidden_rows_are_counted_and_blocked_rows_are_flagged() {
+        let mut state = state_with_agents();
+        let second_pane = state.workspaces[1].tabs[0].root_pane;
+        let second_terminal = state.workspaces[1].tabs[0].panes[&second_pane]
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&second_terminal).unwrap().state = AgentState::Blocked;
+        state.agent_views.set(
+            AgentViewTier::Api,
+            Some(AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(AgentViewFilter::Eq {
+                    field: AgentViewField::Builtin(AgentViewBuiltinField::Status),
+                    value: AgentViewValue::String("idle".to_string()),
+                }),
+                sort: Vec::new(),
             }),
-            sort: Vec::new(),
-        };
+        );
 
-        assert!(validate_agent_view(&mut spec)
-            .unwrap_err()
-            .contains("context type"));
+        let mut entries = crate::ui::all_agent_panel_entries(&state);
+        let hidden = apply_agent_view(&state, &mut entries);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(hidden.hidden, 1);
+        assert_eq!(hidden.hidden_blocked, 1);
+        assert!(hidden.any());
+    }
+
+    #[test]
+    fn an_unfiltered_view_hides_nothing() {
+        let mut state = state_with_agents();
+        state.agent_views.set(
+            AgentViewTier::Api,
+            Some(AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: None,
+                sort: vec![AgentViewSort {
+                    field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::WorkspaceOrder),
+                    order: AgentViewSortOrder::Desc,
+                }],
+            }),
+        );
+
+        let mut entries = crate::ui::all_agent_panel_entries(&state);
+        let hidden = apply_agent_view(&state, &mut entries);
+
+        assert_eq!(entries.len(), 2);
+        assert!(!hidden.any());
     }
 }

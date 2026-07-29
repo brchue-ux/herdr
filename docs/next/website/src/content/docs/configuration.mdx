@@ -390,6 +390,44 @@ Metadata reporters provide values only; styling stays in the local sidebar confi
 
 Sidebar row settings affect only the expanded desktop sidebar. Collapsed and mobile views keep their compact layouts.
 
+### Agents panel view
+
+`[ui.sidebar.agents.view]` declares which agents the Agents panel shows and in what order, using the same filter and sort grammar as the [`agent.view.set`](/docs/socket-api/#agent-view) socket command. Unlike `agent.view.set`, a declared view is read from `config.toml` at startup and on every config reload, so it survives a server restart without an external process reapplying it.
+
+```toml
+[ui.sidebar.agents.view]
+label = "needs me"
+filter = { op = "any", filters = [
+  { op = "eq", field = "status", value = "blocked" },
+  { op = "eq", field = "seen", value = false },
+] }
+sort = [{ field = "attention", order = "desc" }]
+```
+
+`filter` is a tree of `all`, `any`, `not`, `eq`, `in`, and `exists` operations over `status`, `workspace_id`, `tab_id`, `pane_id`, `agent`, `seen`, `state_change_seq`, and `{ token = "name" }` pane metadata. `sort` is an ordered list of `{ field, order }` tables over `workspace_order`, `tab_order`, `pane_order`, `attention`, `status`, `agent`, `seen`, `state_change_seq`, and `{ token = "name" }`. `order` is `"asc"` or `"desc"` and defaults to `"asc"`. A non-empty `sort` replaces `ui.agent_panel_sort` while the view is active. The same limits as the socket command apply: 8 nesting levels, 64 filter nodes, 32 values per `in`, and 8 sort keys.
+
+Three sources can own the Agents view, and they rank `config` < `ui` < `plugin`:
+
+- **`config`** — this key. A standing default the user wrote down once.
+- **`ui`** — a view Herdr itself sets for the session. It temporarily overrides the standing default, because an in-the-moment gesture is more specific than a stored preference.
+- **`plugin`** — a view set over `agent.view.set`. It wins outright: a plugin was installed and enabled on purpose, and a line of config must not silently disable it.
+
+`agent.view.set` and `agent.view.clear` own only the plugin tier. `config` and `ui` are reserved source names and are rejected over the socket API, and clearing a plugin view reveals the config view again rather than jumping to an unfiltered panel.
+
+The panel header always names the tier in charge, so a filter is never invisible:
+
+```text
+ agents      config:needs me · 3 hidden !
+```
+
+The count is how many agents the view is hiding, and the trailing `!` means one of them is blocked and waiting on you. Narrow sidebars drop the tier prefix and then the word `hidden`, but never the count. Clicking the header clears the tier that owns the view, revealing the next tier down; a config-declared view returns on the next config reload or restart.
+
+An invalid view is never applied. Herdr ignores it, shows every agent, and reports what is wrong through the config diagnostic banner and `herdr config check`:
+
+```text
+invalid [ui.sidebar.agents.view]: unknown agent status `workin`; ignoring the declared view and showing every agent
+```
+
 ## Notifications
 
 Herdr can notify you when a background agent finishes or needs input:

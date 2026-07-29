@@ -57,6 +57,20 @@ pub struct AgentViewSetParams {
     pub sort: Vec<AgentViewSort>,
 }
 
+/// The Agents view currently projecting the agent list.
+///
+/// A view can exist before any client connects, because
+/// `[ui.sidebar.agents.view]` is read at startup. Clients that keep their own
+/// projection of the agent list need to know that from the bootstrap snapshot,
+/// not only from their own `agent.view.set` calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentViewInfo {
+    /// Owning source: `config`, `ui`, `plugin:<id>`, or a caller-chosen source.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct AgentViewClearParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

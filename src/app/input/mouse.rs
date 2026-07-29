@@ -22,6 +22,7 @@ use super::{
         modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
     },
     settings::SettingsAction,
+    sidebar::AgentPanelHeaderAction,
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
@@ -589,13 +590,26 @@ impl AppState {
                         return None;
                     }
 
-                    if self.on_agent_panel_sort_toggle(mouse.column, mouse.row) {
-                        self.agent_panel_sort = match self.agent_panel_sort {
-                            AgentPanelSort::Spaces => AgentPanelSort::Priority,
-                            AgentPanelSort::Priority => AgentPanelSort::Spaces,
-                        };
-                        self.agent_panel_scroll = 0;
-                        self.mark_session_dirty();
+                    if let Some(action) = self.agent_panel_header_action_at(mouse.column, mouse.row)
+                    {
+                        match action {
+                            AgentPanelHeaderAction::ToggleSort => {
+                                self.agent_panel_sort = match self.agent_panel_sort {
+                                    AgentPanelSort::Spaces => AgentPanelSort::Priority,
+                                    AgentPanelSort::Priority => AgentPanelSort::Spaces,
+                                };
+                                self.agent_panel_scroll = 0;
+                                self.mark_session_dirty();
+                            }
+                            AgentPanelHeaderAction::ClearView => {
+                                // Clearing the winner reveals the next tier down;
+                                // a config-declared view returns on the next config
+                                // reload or restart.
+                                self.agent_views.clear_active_tier();
+                                self.agent_panel_scroll = 0;
+                                self.mobile_switcher_scroll = 0;
+                            }
+                        }
                         return None;
                     }
 

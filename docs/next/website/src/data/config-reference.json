@@ -699,6 +699,24 @@
           "description": "Complete Agent-row overrides keyed by strict canonical agent id. Agents without an override use ui.sidebar.agents.rows."
         },
         {
+          "key": "ui.sidebar.agents.view.filter",
+          "type": "agent view filter tree",
+          "default": "unset",
+          "description": "Declarative Agents panel filter, using the same grammar as the agent.view.set socket command: all/any/not/eq/in/exists over status, workspace_id, tab_id, pane_id, agent, seen, state_change_seq, and { token = \"name\" } metadata tokens. Applied at startup and on config reload, so it survives a server restart. A plugin- or UI-owned view outranks it; an invalid filter is dropped with a diagnostic instead of emptying the panel."
+        },
+        {
+          "key": "ui.sidebar.agents.view.label",
+          "type": "string",
+          "default": "unset",
+          "description": "Short name shown in the Agents panel header while the config-declared view is active, at most 32 characters. Without one the header shows the owning tier, \"config\"."
+        },
+        {
+          "key": "ui.sidebar.agents.view.sort",
+          "type": "list of agent view sort keys",
+          "default": "[]",
+          "description": "Declarative Agents panel sort, using the same grammar as agent.view.set's sort: an ordered list of { field, order } tables over workspace_order, tab_order, pane_order, attention, status, agent, seen, state_change_seq, or { token = \"name\" }, with order \"asc\" or \"desc\". At most 8 keys. Replaces ui.agent_panel_sort while the view is active."
+        },
+        {
           "key": "ui.sidebar.spaces.row_gap",
           "type": "integer",
           "default": "0",

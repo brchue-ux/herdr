@@ -473,6 +473,139 @@ where
     Ok(rows_by_agent)
 }
 
+/// A declaratively owned Agents view: the `agent.view.set` filter/sort grammar
+/// written down in `config.toml` so it survives a server restart instead of
+/// needing an external process to reapply it.
+///
+/// The grammar itself is owned by [`crate::agent_view`]; this type only parses
+/// and records a diagnostic. An illegal view is dropped rather than partially
+/// applied, so a broken config shows every agent instead of an empty panel that
+/// looks like "no agents".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct AgentsViewConfig {
+    /// Short name shown in the Agents panel header while this view is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Filter tree, identical in shape to `agent.view.set`'s `filter`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<crate::api::schema::AgentViewFilter>,
+    /// Sort keys, identical in shape to `agent.view.set`'s `sort`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sort: Vec<crate::api::schema::AgentViewSort>,
+    /// Why the declared view was rejected. Not a config key.
+    #[serde(skip)]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentsViewConfig {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    filter: Option<toml::Value>,
+    #[serde(default)]
+    sort: Option<toml::Value>,
+}
+
+impl<'de> Deserialize<'de> for AgentsViewConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Buffer the table instead of failing the deserializer: one malformed
+        // view must not take the rest of the user's config down with it.
+        Ok(Self::from_toml_value(toml::Value::deserialize(
+            deserializer,
+        )?))
+    }
+}
+
+impl AgentsViewConfig {
+    fn from_toml_value(value: toml::Value) -> Self {
+        let raw = match value.try_into::<RawAgentsViewConfig>() {
+            Ok(raw) => raw,
+            Err(err) => return Self::rejected(err.to_string()),
+        };
+
+        let filter = match raw.filter {
+            Some(value) => match value.clone().try_into() {
+                Ok(filter) => Some(filter),
+                Err(err) => {
+                    return Self::rejected(format!(
+                        "filter is not a valid agent view filter: {}",
+                        crate::agent_view::explain_view_value(&value, false)
+                            .unwrap_or_else(|| err.to_string())
+                    ))
+                }
+            },
+            None => None,
+        };
+        let sort = match raw.sort {
+            Some(value) => match value.clone().try_into::<Vec<_>>() {
+                Ok(sort) => sort,
+                Err(err) => {
+                    return Self::rejected(format!(
+                        "sort is not a valid agent view sort: {}",
+                        crate::agent_view::explain_view_value(&value, true)
+                            .unwrap_or_else(|| err.to_string())
+                    ))
+                }
+            },
+            None => Vec::new(),
+        };
+
+        let declared_anything = raw.label.is_some() || filter.is_some() || !sort.is_empty();
+        let mut spec = crate::api::schema::AgentViewSetParams {
+            source: crate::agent_view::CONFIG_VIEW_SOURCE.to_string(),
+            label: raw.label,
+            filter,
+            sort,
+        };
+        if let Err(message) = crate::agent_view::validate_agent_view(&mut spec) {
+            return Self::rejected(message);
+        }
+        if declared_anything && spec.filter.is_none() && spec.sort.is_empty() {
+            return Self::rejected(
+                "declares no filter and no sort, so it selects nothing".to_string(),
+            );
+        }
+
+        Self {
+            label: spec.label,
+            filter: spec.filter,
+            sort: spec.sort,
+            diagnostic: None,
+        }
+    }
+
+    fn rejected(reason: String) -> Self {
+        Self {
+            diagnostic: Some(format!(
+                "invalid [ui.sidebar.agents.view]: {reason}; ignoring the declared view and showing every agent"
+            )),
+            ..Self::default()
+        }
+    }
+
+    /// The view this config declares, ready for the config tier of the view
+    /// slots. `None` when nothing was declared or the declaration was rejected.
+    pub(crate) fn declared_view(&self) -> Option<crate::api::schema::AgentViewSetParams> {
+        (self.filter.is_some() || !self.sort.is_empty()).then(|| {
+            crate::api::schema::AgentViewSetParams {
+                source: crate::agent_view::CONFIG_VIEW_SOURCE.to_string(),
+                label: self.label.clone(),
+                filter: self.filter.clone(),
+                sort: self.sort.clone(),
+            }
+        })
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<String> {
+        self.diagnostic.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentsSidebarConfig {
@@ -481,6 +614,7 @@ pub struct AgentsSidebarConfig {
     #[serde(default, deserialize_with = "deserialize_rows_by_agent")]
     pub rows_by_agent: BTreeMap<String, AgentSidebarRows>,
     pub row_gap: u16,
+    pub view: AgentsViewConfig,
 }
 
 impl AgentsSidebarConfig {
@@ -529,6 +663,7 @@ impl Default for AgentsSidebarConfig {
             ],
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
+            view: AgentsViewConfig::default(),
         }
     }
 }
@@ -973,6 +1108,153 @@ rows = [["state_icon", { token = "workspace", fg = "#89b4fa", bold = true, dim =
         let config: crate::config::Config = toml::from_str(&input).expect("canonical keys");
 
         assert_eq!(config.ui.sidebar.agents.rows_by_agent.len(), agents.len());
+    }
+
+    fn view_config(body: &str) -> AgentsViewConfig {
+        let config: crate::config::Config =
+            toml::from_str(&format!("[ui.sidebar.agents.view]\n{body}"))
+                .expect("a malformed view must not fail the whole config load");
+        config.ui.sidebar.agents.view
+    }
+
+    #[test]
+    fn no_declared_view_leaves_the_panel_alone() {
+        let config = AgentsSidebarConfig::default();
+        assert_eq!(config.view, AgentsViewConfig::default());
+        assert!(config.view.declared_view().is_none());
+        assert!(config.view.diagnostics().is_none());
+    }
+
+    #[test]
+    fn parses_the_same_filter_and_sort_grammar_as_the_socket_api() {
+        let view = view_config(
+            r#"
+label = "attention"
+filter = { op = "all", filters = [
+  { op = "in", field = "status", values = ["working", "blocked"] },
+  { op = "not", filter = { op = "eq", field = "seen", value = true } },
+  { op = "exists", field = { token = "model" } },
+] }
+sort = [
+  { field = "attention", order = "desc" },
+  { field = { token = "model" } },
+]
+"#,
+        );
+
+        assert!(view.diagnostics().is_none(), "{:?}", view.diagnostics());
+        let declared = view.declared_view().expect("declared view");
+        assert_eq!(declared.source, crate::agent_view::CONFIG_VIEW_SOURCE);
+        assert_eq!(declared.label.as_deref(), Some("attention"));
+        assert_eq!(declared.sort.len(), 2);
+        assert!(matches!(
+            declared.filter,
+            Some(crate::api::schema::AgentViewFilter::All { ref filters }) if filters.len() == 3
+        ));
+    }
+
+    #[test]
+    fn a_context_filter_survives_the_config_front_door() {
+        let view = view_config(
+            "filter = { op = \"eq\", field = \"workspace_id\", value = { context = \"current_workspace_id\" } }\n",
+        );
+
+        assert!(view.diagnostics().is_none(), "{:?}", view.diagnostics());
+        assert!(view.declared_view().is_some());
+    }
+
+    #[test]
+    fn an_invalid_view_is_dropped_and_named_in_a_diagnostic() {
+        // Each case must leave the panel unfiltered: an empty Agents panel that
+        // really means "your config is broken" is the failure to design against.
+        for (body, expected) in [
+            (
+                "filter = { op = \"eq\", field = \"status\", value = \"workin\" }\n",
+                "unknown agent status `workin`",
+            ),
+            (
+                "filter = { op = \"eq\", field = \"statuss\", value = \"working\" }\n",
+                "`field = \"statuss\"`",
+            ),
+            (
+                "filter = { op = \"equals\", field = \"status\", value = \"working\" }\n",
+                "unknown variant `equals`",
+            ),
+            (
+                "filter = { op = \"any\", filters = [] }\n",
+                "all/any filters must not be empty",
+            ),
+            (
+                "sort = [{ field = \"attension\" }]\n",
+                "`field = \"attension\"`",
+            ),
+            (
+                "filterr = { op = \"exists\", field = \"agent\" }\n",
+                "filterr",
+            ),
+            ("label = \"orphan\"\n", "declares no filter and no sort"),
+        ] {
+            let view = view_config(body);
+            let diagnostic = view
+                .diagnostics()
+                .unwrap_or_else(|| panic!("expected a diagnostic for {body}"));
+            assert!(
+                diagnostic.contains(expected),
+                "{body} produced {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("[ui.sidebar.agents.view]"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("showing every agent"), "{diagnostic}");
+            assert!(view.declared_view().is_none(), "{body} was still applied");
+        }
+    }
+
+    /// The snippet printed by `herdr --default-config` and shown in the docs.
+    /// If it stops parsing, the documentation is lying.
+    #[test]
+    fn the_documented_example_view_parses() {
+        let view = view_config(
+            r#"
+label = "needs me"
+filter = { op = "any", filters = [
+  { op = "eq", field = "status", value = "blocked" },
+  { op = "eq", field = "seen", value = false },
+] }
+sort = [{ field = "attention", order = "desc" }]
+"#,
+        );
+
+        assert!(view.diagnostics().is_none(), "{:?}", view.diagnostics());
+        assert!(view.declared_view().is_some());
+    }
+
+    #[test]
+    fn a_broken_view_does_not_take_the_rest_of_the_config_with_it() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui]
+agent_panel_sort = "priority"
+
+[ui.sidebar.agents]
+row_gap = 1
+
+[ui.sidebar.agents.view]
+filter = { op = "eq", field = "nope", value = "working" }
+"#,
+        )
+        .expect("config load");
+
+        assert_eq!(config.ui.sidebar.agents.row_gap, 1);
+        assert_eq!(
+            config.ui.agent_panel_sort,
+            crate::config::AgentPanelSortConfig::Priority
+        );
+        assert!(config
+            .collect_diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("[ui.sidebar.agents.view]")));
     }
 
     #[test]
