@@ -1182,8 +1182,12 @@ pub(crate) enum DragTarget {
     KeybindHelpScrollbar {
         grab_row_offset: u16,
     },
-    SidebarDivider,
-    SidebarSectionDivider,
+    SidebarDivider {
+        grab_offset: i16,
+    },
+    SidebarSectionDivider {
+        grab_offset: i16,
+    },
 }
 
 /// Active mouse drag on a split border or sidebar divider.

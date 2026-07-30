@@ -240,22 +240,91 @@ impl AppState {
         Rect::new(x, y, menu_w, menu_h)
     }
 
-    pub(super) fn on_sidebar_divider(&self, col: u16, row: u16) -> bool {
+    /// Grab tolerance around a one-cell sidebar divider, in cells.
+    ///
+    /// This is the same one extra cell `find_border_at` accepts around a pane
+    /// split border. Unlike a pane split, neither sidebar divider has dead
+    /// space beside it, so the band is applied on one side only, biased toward
+    /// the neighbour with less to lose.
+    pub(super) const DIVIDER_GRAB_TOLERANCE: u16 = 1;
+
+    /// Divider position for a pointer at `coord`, given the offset recorded
+    /// when the divider was grabbed. Keeping the offset is what stops a press
+    /// inside the tolerance band from snapping the divider under the cursor.
+    pub(super) fn divider_pos_from_grab(coord: u16, grab_offset: i16) -> u16 {
+        (i32::from(coord) + i32::from(grab_offset)).clamp(0, i32::from(u16::MAX)) as u16
+    }
+
+    /// Where the sidebar's vertical bar sits relative to a press, or `None`
+    /// when the press is outside the grab band. Adding the returned offset to
+    /// the press column gives the divider column, so a drag keeps the divider
+    /// at the same distance from the cursor it was grabbed at.
+    ///
+    /// The band extends left, over the sidebar's last content column, the same
+    /// direction `find_border_at` extends a pane split border. Extending right
+    /// instead would cover the leftmost pane's first content column — herdr
+    /// draws no border for a lone pane — and a press there is forwarded to the
+    /// running program. Losing the right-hand edge of a workspace card is the
+    /// cheaper of the two. The collapse toggle lives in that column and stays
+    /// carved out.
+    pub(super) fn sidebar_divider_grab_at(&self, col: u16, row: u16) -> Option<i16> {
         if self.sidebar_collapsed {
-            return false;
+            return None;
         }
         let sidebar = self.view.sidebar_rect;
+        if sidebar.width == 0 || row < sidebar.y || row >= sidebar.y + sidebar.height {
+            return None;
+        }
+
         let toggle = crate::ui::expanded_sidebar_toggle_rect(sidebar);
-        let on_toggle = toggle.width > 0
+        if toggle.width > 0
             && col >= toggle.x
             && col < toggle.x + toggle.width
             && row >= toggle.y
-            && row < toggle.y + toggle.height;
-        sidebar.width > 0
-            && !on_toggle
-            && col == sidebar.x + sidebar.width.saturating_sub(1)
-            && row >= sidebar.y
-            && row < sidebar.y + sidebar.height
+            && row < toggle.y + toggle.height
+        {
+            return None;
+        }
+
+        let divider_col = sidebar.x + sidebar.width - 1;
+        let offset = divider_col.checked_sub(col)?;
+        if offset > Self::DIVIDER_GRAB_TOLERANCE {
+            return None;
+        }
+        // The band must not reach past the sidebar's own left edge.
+        if col < sidebar.x {
+            return None;
+        }
+
+        // Worktree group chevrons sit in the tolerance column too; they keep
+        // their clicks.
+        if offset > 0 && self.workspace_group_chevron_at(col, row).is_some() {
+            return None;
+        }
+
+        Some(offset as i16)
+    }
+
+    /// The workspace whose group chevron occupies this cell, when that chevron
+    /// is live. Only parents of a worktree group render one.
+    pub(super) fn workspace_group_chevron_at(&self, col: u16, row: u16) -> Option<usize> {
+        let cards = if self.view.workspace_card_areas.is_empty() {
+            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+        } else {
+            self.view.workspace_card_areas.clone()
+        };
+        cards.iter().find_map(|card| {
+            let chevron = crate::ui::workspace_group_chevron_rect(card);
+            (chevron.width > 0
+                && col == chevron.x
+                && row == chevron.y
+                && crate::ui::workspace_parent_group_state(self, card.ws_idx).is_some())
+            .then_some(card.ws_idx)
+        })
+    }
+
+    pub(super) fn on_sidebar_divider(&self, col: u16, row: u16) -> bool {
+        self.sidebar_divider_grab_at(col, row).is_some()
     }
 
     pub(super) fn on_sidebar_toggle(&self, col: u16, row: u16) -> bool {
@@ -279,19 +348,47 @@ impl AppState {
         self.mark_session_dirty();
     }
 
-    pub(super) fn on_sidebar_section_divider(&self, col: u16, row: u16) -> bool {
+    /// Where the Spaces/Agents separator sits relative to a press, or `None`
+    /// when the press is outside the grab band. Adding the returned offset to
+    /// the press row gives the separator row.
+    ///
+    /// The band extends down, onto the agent panel's ` agents` header row. That
+    /// row carries no click target except the sort toggle, which is carved back
+    /// out, so this side costs almost nothing. Extending up would take clicks
+    /// from workspace cards instead.
+    pub(super) fn sidebar_section_divider_grab_at(&self, col: u16, row: u16) -> Option<i16> {
         if self.sidebar_collapsed {
-            return false;
+            return None;
         }
-        let rect = crate::ui::sidebar_section_divider_rect(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
-        rect.width > 0
-            && col >= rect.x
-            && col < rect.x + rect.width
-            && row >= rect.y
-            && row < rect.y + rect.height
+        let sidebar = self.view.sidebar_rect;
+        let rect = crate::ui::sidebar_section_divider_rect(sidebar, self.sidebar_section_split);
+        if rect.width == 0 || col < rect.x || col >= rect.x + rect.width {
+            return None;
+        }
+
+        let below = row.checked_sub(rect.y)?;
+        if below > Self::DIVIDER_GRAB_TOLERANCE {
+            return None;
+        }
+
+        if below > 0 {
+            if row >= sidebar.y + sidebar.height {
+                return None;
+            }
+            let (_, detail_area) =
+                crate::ui::expanded_sidebar_sections(sidebar, self.sidebar_section_split);
+            let toggle = crate::ui::agent_panel_control(self, detail_area).rect;
+            if toggle.width > 0
+                && col >= toggle.x
+                && col < toggle.x + toggle.width
+                && row >= toggle.y
+                && row < toggle.y + toggle.height
+            {
+                return None;
+            }
+        }
+
+        Some(-(below as i16))
     }
 
     pub(super) fn set_sidebar_section_split(&mut self, row: u16) {
@@ -2076,34 +2173,225 @@ mod tests {
     }
 
     #[test]
-    fn drawn_sidebar_divider_column_is_the_grabbable_column() {
+    fn sidebar_divider_grab_band_covers_the_drawn_bar_and_one_cell_left() {
         let mut app = app_for_divider_test();
         let (bar_col, _) = drawn_divider_cells(&mut app);
         let bar_col = bar_col.expect("sidebar bar is drawn");
+        let row = DIVIDER_TEST_AREA.y + 4;
 
-        assert!(app
-            .state
-            .on_sidebar_divider(bar_col, DIVIDER_TEST_AREA.y + 4));
-        // The cells either side belong to sidebar content and to the terminal
-        // area, so they stay owned by their normal click handlers.
-        assert!(!app
-            .state
-            .on_sidebar_divider(bar_col - 1, DIVIDER_TEST_AREA.y + 4));
-        assert!(!app
-            .state
-            .on_sidebar_divider(bar_col + 1, DIVIDER_TEST_AREA.y + 4));
+        assert_eq!(app.state.sidebar_divider_grab_at(bar_col, row), Some(0));
+        assert_eq!(app.state.sidebar_divider_grab_at(bar_col - 1, row), Some(1));
+        // One cell wide and biased left; it never reaches the terminal area,
+        // whose first column is the leftmost pane's content when that pane is
+        // not split, nor a second column of sidebar content.
+        assert_eq!(app.state.sidebar_divider_grab_at(bar_col + 1, row), None);
+        assert_eq!(app.state.sidebar_divider_grab_at(bar_col - 2, row), None);
     }
 
     #[test]
-    fn drawn_sidebar_section_divider_row_is_the_grabbable_row() {
+    fn sidebar_divider_grab_band_never_covers_the_terminal_area_or_tab_bar() {
+        let app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let tab_bar = app.state.view.tab_bar_rect;
+        let terminal = app.state.view.terminal_area;
+        assert!(tab_bar.width > 0, "fixture should render a tab bar");
+        assert_eq!(
+            terminal.x,
+            sidebar.x + sidebar.width,
+            "fixture should butt the terminal area against the sidebar"
+        );
+
+        for row in [tab_bar.y, terminal.y, terminal.y + terminal.height - 1] {
+            assert_eq!(app.state.sidebar_divider_grab_at(terminal.x, row), None);
+        }
+    }
+
+    #[test]
+    fn sidebar_divider_grab_band_excludes_the_collapse_toggle_and_rows_outside_the_sidebar() {
+        let app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+        let toggle = crate::ui::expanded_sidebar_toggle_rect(sidebar);
+
+        // The toggle sits in the tolerance column, so the band must not eat it.
+        assert_eq!(toggle.x, bar_col - 1);
+        assert_eq!(app.state.sidebar_divider_grab_at(toggle.x, toggle.y), None);
+
+        assert_eq!(
+            app.state
+                .sidebar_divider_grab_at(bar_col, sidebar.y + sidebar.height),
+            None
+        );
+    }
+
+    #[test]
+    fn sidebar_section_divider_grab_band_covers_the_separator_and_the_agents_header() {
         let mut app = app_for_divider_test();
         let (_, sep_row) = drawn_divider_cells(&mut app);
         let sep_row = sep_row.expect("section separator is drawn");
         let col = app.state.view.sidebar_rect.x + 2;
 
-        assert!(app.state.on_sidebar_section_divider(col, sep_row));
-        assert!(!app.state.on_sidebar_section_divider(col, sep_row - 1));
-        assert!(!app.state.on_sidebar_section_divider(col, sep_row + 1));
+        assert_eq!(
+            app.state.sidebar_section_divider_grab_at(col, sep_row),
+            Some(0)
+        );
+        assert_eq!(
+            app.state.sidebar_section_divider_grab_at(col, sep_row + 1),
+            Some(-1)
+        );
+        // Not the workspace card row above, and not a second agent row below.
+        assert_eq!(
+            app.state.sidebar_section_divider_grab_at(col, sep_row - 1),
+            None
+        );
+        assert_eq!(
+            app.state.sidebar_section_divider_grab_at(col, sep_row + 2),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_panel_sort_toggle_is_carved_out_of_the_section_divider_band() {
+        let mut app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let (_, detail_area) =
+            crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
+        let toggle = crate::ui::agent_panel_control(&app.state, detail_area).rect;
+        assert!(toggle.width > 0, "fixture should render a sort toggle");
+
+        assert_eq!(
+            app.state
+                .sidebar_section_divider_grab_at(toggle.x, toggle.y),
+            None
+        );
+
+        // The toggle still switches sort rather than starting a divider drag.
+        let sort_before = app.state.agent_panel_sort;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        ));
+        assert!(app.state.drag.is_none());
+        assert_ne!(app.state.agent_panel_sort, sort_before);
+    }
+
+    #[test]
+    fn pressing_inside_a_grab_band_does_not_jump_either_divider() {
+        let mut app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+        let width_before = app.state.sidebar_width;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar_col - 1,
+            sidebar.y + 4,
+        ));
+        assert_eq!(app.state.sidebar_width, width_before);
+
+        let mut app = app_for_divider_test();
+        let section = crate::ui::sidebar_section_divider_rect(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let split_before = app.state.sidebar_section_split;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            section.x + 2,
+            section.y + 1,
+        ));
+        assert_eq!(app.state.sidebar_section_split, split_before);
+    }
+
+    #[test]
+    fn a_non_moving_press_in_the_band_is_swallowed_rather_than_falling_through() {
+        // The input layer commits to a divider drag on mouse-down, so the
+        // underlying control does not get the press. Nothing moves either --
+        // the grab offset keeps the divider where it was -- so the cost of a
+        // mis-grab is a dead click, not a layout change. Distinguishing a click
+        // from a drag here would need press-and-hold disambiguation, which was
+        // deliberately not taken.
+        let mut app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+        let card = app.state.view.workspace_card_areas[1];
+        assert_ne!(app.state.selected, card.ws_idx);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar_col - 1,
+            card.rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            bar_col - 1,
+            card.rect.y,
+        ));
+
+        assert_ne!(
+            app.state.selected, card.ws_idx,
+            "the swallowed press does not select the workspace"
+        );
+        assert_eq!(
+            app.state.sidebar_width, sidebar.width,
+            "and it does not move the divider either"
+        );
+
+        // The same press one column further into the card still selects it.
+        let mut app = app_for_divider_test();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar_col - 2,
+            card.rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            bar_col - 2,
+            card.rect.y,
+        ));
+        assert_eq!(app.state.selected, card.ws_idx);
+    }
+
+    #[test]
+    fn dragging_from_the_grab_band_keeps_the_grab_offset() {
+        let mut app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+
+        // Grabbing one cell left of the bar and moving six cells right must
+        // move the bar six cells, not five.
+        drag_divider(
+            &mut app,
+            (bar_col - 1, sidebar.y + 4),
+            (bar_col + 5, sidebar.y + 4),
+        );
+        recompute(&mut app);
+
+        assert_eq!(app.state.view.sidebar_rect.width, sidebar.width + 6);
+        let (drawn_bar, _) = drawn_divider_cells(&mut app);
+        assert_eq!(drawn_bar, Some(bar_col + 6));
+
+        let mut app = app_for_divider_test();
+        let section = crate::ui::sidebar_section_divider_rect(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        drag_divider(
+            &mut app,
+            (section.x + 2, section.y + 1),
+            (section.x + 2, section.y + 6),
+        );
+        recompute(&mut app);
+
+        let (_, drawn_sep) = drawn_divider_cells(&mut app);
+        assert_eq!(drawn_sep, Some(section.y + 5));
     }
 
     #[test]
@@ -2279,7 +2567,10 @@ mod tests {
             for col in 0..DIVIDER_TEST_AREA.width.min(8) {
                 for row in 0..DIVIDER_TEST_AREA.height.min(8) {
                     assert!(!app.state.on_sidebar_divider(col, row));
-                    assert!(!app.state.on_sidebar_section_divider(col, row));
+                    assert!(app
+                        .state
+                        .sidebar_section_divider_grab_at(col, row)
+                        .is_none());
                 }
             }
 
@@ -2299,7 +2590,7 @@ mod tests {
 
         for col in 0..mobile_area.width {
             assert!(!app.state.on_sidebar_divider(col, 4));
-            assert!(!app.state.on_sidebar_section_divider(col, 4));
+            assert!(app.state.sidebar_section_divider_grab_at(col, 4).is_none());
         }
 
         assert_eq!(app.state.sidebar_width, width_before);
