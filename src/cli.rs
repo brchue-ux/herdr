@@ -20,6 +20,7 @@ mod runtime;
 mod server;
 mod spec;
 mod status;
+mod swap;
 mod tab;
 mod workspace;
 mod worktree;

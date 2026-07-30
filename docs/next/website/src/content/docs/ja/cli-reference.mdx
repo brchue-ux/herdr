@@ -81,13 +81,14 @@ compinit
 ```bash
 herdr server
 herdr server stop
+herdr server swap --exe <path> [--dry-run] [--yes] [--allow-downgrade] [--promote-client <path>|--no-promote-client]
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
 
-`herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
+`herdr server` はヘッドレスサーバーを明示的に起動します。監視下やサービス的な構成で使ってください。`swap` は、ハンドオフの前後でプロトコルの互換性とワークスペースのインベントリを確認しながら、稼働中のサーバーをローカルビルドのバイナリへライブ交換します。詳細は [セッション状態](/docs/session-state/#ローカルビルドのバイナリへの交換) を参照してください。`reload-config` はペインを再起動せずにリロード可能な設定を適用します。`agent-manifests` は、アクティブなエージェント検出マニフェストのソース、キャッシュされたリモートバージョン、直近のリモート更新結果を表示します。`update-agent-manifests` はリモートマニフェストの更新を即座に取得し、実行中のサーバーにリロードして、更新後のマニフェスト状態を表示します。生のステータスレスポンスが欲しいときは `--json` を渡してください。`reload-agent-manifests` は、ローカルオーバーライドの編集後にエージェント検出マニフェストを実行中のサーバーにリロードします。
 
 ## 通知
 

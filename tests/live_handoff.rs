@@ -1857,3 +1857,339 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
 }
+
+// ---------------------------------------------------------------------------
+// `herdr server swap`: the guarded wrapper around live handoff.
+// ---------------------------------------------------------------------------
+
+/// Run `herdr server swap` against a spawned test server.
+fn run_server_swap(config_home: &Path, api_socket: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command.args(["server", "swap"]);
+    command.args(args);
+    command.env("XDG_CONFIG_HOME", config_home);
+    command.env("HERDR_SOCKET_PATH", api_socket);
+    command.env("SHELL", "/bin/sh");
+    command.output().expect("run herdr server swap")
+}
+
+/// A stand-in herdr binary that only answers `status client --json`. Used to
+/// drive pre-flight decisions from versions we cannot build in a test.
+fn write_fake_herdr(path: &Path, version: &str, protocol: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = status ] && [ \"$2\" = client ]; then\n\
+             \x20 echo '{{\"version\":\"{version}\",\"channel\":\"stable\",\"protocol\":{protocol},\"binary\":\"fake\",\"session\":null}}'\n\
+             \x20 exit 0\n\
+             fi\n\
+             exit 1\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn workspace_inventory(api_socket: &Path) -> Vec<(String, u64, u64)> {
+    let response = request(
+        api_socket,
+        serde_json::json!({"id":"test:workspace:list","method":"workspace.list","params":{}}),
+    );
+    let mut inventory: Vec<(String, u64, u64)> = response["result"]["workspaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("workspace list had no workspaces: {response}"))
+        .iter()
+        .map(|workspace| {
+            (
+                workspace["workspace_id"].as_str().unwrap().to_string(),
+                workspace["tab_count"].as_u64().unwrap(),
+                workspace["pane_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    inventory.sort();
+    inventory
+}
+
+struct SwapFixture {
+    base: PathBuf,
+    config_home: PathBuf,
+    api_socket: PathBuf,
+    spawned: Option<SpawnedHerdr>,
+    pane_id: String,
+    child_pid: u32,
+    inventory: Vec<(String, u64, u64)>,
+}
+
+impl SwapFixture {
+    fn start() -> Self {
+        Self::start_with_env(&[])
+    }
+
+    /// A server with two workspaces, a split pane, and a live shell process in
+    /// one of them, so a swap has something real to preserve.
+    fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        let marker = base.join("child.pid");
+
+        let spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, extra_env);
+        wait_for_socket(&api_socket, Duration::from_secs(10));
+        register_runtime_dir(&runtime_dir);
+
+        let created = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:workspace:create",
+                "method": "workspace.create",
+                "params": {"cwd": "/tmp", "focus": true}
+            }),
+        );
+        let pane_id = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:pane:split",
+                "method": "pane.split",
+                "params": {"pane_id": pane_id, "direction": "right"}
+            }),
+        ));
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:workspace:create-second",
+                "method": "workspace.create",
+                "params": {"cwd": "/tmp"}
+            }),
+        ));
+
+        let command = format!(
+            "sh -c 'echo READY $$ > {}; while true; do sleep 1; done'",
+            marker.display()
+        );
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:pane:run",
+                "method": "pane.send_input",
+                "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
+            }),
+        ));
+        support::wait_for_file(&marker, Duration::from_secs(5));
+        let child_pid: u32 = fs::read_to_string(&marker)
+            .unwrap()
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let inventory = workspace_inventory(&api_socket);
+        assert_eq!(inventory.len(), 2, "fixture should have two workspaces");
+
+        Self {
+            base,
+            config_home,
+            api_socket,
+            spawned: Some(spawned),
+            pane_id,
+            child_pid,
+            inventory,
+        }
+    }
+
+    fn swap(&self, args: &[&str]) -> std::process::Output {
+        run_server_swap(&self.config_home, &self.api_socket, args)
+    }
+
+    fn pane_process_is_alive(&self) -> bool {
+        unsafe { libc::kill(self.child_pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Whether the server process this fixture spawned is still the one
+    /// running. A completed handoff replaces it with the imported process.
+    fn spawned_server_is_still_running(&mut self) -> bool {
+        self.spawned
+            .as_mut()
+            .is_some_and(|spawned| matches!(spawned.child.try_wait(), Ok(None)))
+    }
+
+    fn finish(mut self) {
+        let _ = request(
+            &self.api_socket,
+            serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+        );
+        drop(self.spawned.take());
+        cleanup_test_base(&self.base);
+    }
+}
+
+#[test]
+fn server_swap_preserves_workspace_inventory_and_promotes_the_client() {
+    let _lock = test_lock();
+    let fixture = SwapFixture::start();
+    let promote_target = fixture.base.join("bin-herdr");
+    fs::write(&promote_target, b"stale client\n").unwrap();
+
+    let output = fixture.swap(&[
+        "--exe",
+        env!("CARGO_BIN_EXE_herdr"),
+        "--yes",
+        "--promote-client",
+        promote_target.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "server swap failed: {stderr}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("inventory identical"),
+        "swap should prove the inventory survived: {stderr}"
+    );
+
+    // The old server exited; a new one owns the socket and the same panes.
+    wait_for_api(&fixture.api_socket, Duration::from_secs(10));
+    assert_eq!(
+        workspace_inventory(&fixture.api_socket),
+        fixture.inventory,
+        "every workspace, tab and pane must survive the swap"
+    );
+    assert!(
+        fixture.pane_process_is_alive(),
+        "the pane process must keep running across the swap"
+    );
+    assert_ok(request(
+        &fixture.api_socket,
+        serde_json::json!({
+            "id": "test:pane:after-swap",
+            "method": "pane.send_input",
+            "params": {"pane_id": fixture.pane_id, "text": "", "keys": ["Enter"]}
+        }),
+    ));
+
+    assert_eq!(
+        fs::read(&promote_target).unwrap(),
+        fs::read(env!("CARGO_BIN_EXE_herdr")).unwrap(),
+        "the client must be promoted only after the swap verified"
+    );
+
+    fixture.finish();
+}
+
+#[test]
+fn server_swap_dry_run_checks_everything_and_changes_nothing() {
+    let _lock = test_lock();
+    let mut fixture = SwapFixture::start();
+    let promote_target = fixture.base.join("bin-herdr");
+    fs::write(&promote_target, b"stale client\n").unwrap();
+
+    assert!(fixture.spawned_server_is_still_running());
+    let output = fixture.swap(&[
+        "--exe",
+        env!("CARGO_BIN_EXE_herdr"),
+        "--dry-run",
+        "--promote-client",
+        promote_target.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(output.status.success(), "dry run should succeed: {stderr}");
+    assert!(stderr.contains("dry run"), "{stderr}");
+    assert!(stderr.contains("2 workspaces"), "{stderr}");
+    assert_eq!(
+        fs::read(&promote_target).unwrap(),
+        b"stale client\n",
+        "a dry run must not promote any client"
+    );
+    assert!(
+        fixture.spawned_server_is_still_running(),
+        "a dry run must not replace the running server"
+    );
+    assert_eq!(workspace_inventory(&fixture.api_socket), fixture.inventory);
+    assert!(fixture.pane_process_is_alive());
+
+    fixture.finish();
+}
+
+#[test]
+fn server_swap_refuses_a_downgrade_unless_it_is_allowed() {
+    let _lock = test_lock();
+    let fixture = SwapFixture::start();
+    let older = fixture.base.join("older-herdr");
+    write_fake_herdr(&older, "0.0.1", 1);
+
+    let output = fixture.swap(&["--exe", older.to_str().unwrap(), "--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "downgrade should be refused");
+    assert!(stderr.contains("downgrade_refused"), "{stderr}");
+    assert!(stderr.contains("--allow-downgrade"), "{stderr}");
+    assert_eq!(
+        workspace_inventory(&fixture.api_socket),
+        fixture.inventory,
+        "a refused swap must not touch the running server"
+    );
+    assert!(fixture.pane_process_is_alive());
+
+    fixture.finish();
+}
+
+#[test]
+fn server_swap_reports_the_surviving_server_after_a_failed_handoff() {
+    let _lock = test_lock();
+    // The import server fails after it has restored the session, which is the
+    // late failure point: descriptors were already sent before it gave up.
+    let fixture =
+        SwapFixture::start_with_env(&[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored")]);
+    let promote_target = fixture.base.join("bin-herdr");
+    fs::write(&promote_target, b"stale client\n").unwrap();
+
+    let output = fixture.swap(&[
+        "--exe",
+        env!("CARGO_BIN_EXE_herdr"),
+        "--yes",
+        "--promote-client",
+        promote_target.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "a failed handoff must not succeed"
+    );
+    assert!(
+        stderr.contains("live handoff failed"),
+        "the failure must be reported: {stderr}"
+    );
+    // Swapping onto the same build cannot be told apart by ping, and the
+    // report must say so rather than claim the handoff landed.
+    assert!(
+        stderr.contains("panes are intact") && stderr.contains("cannot tell them apart"),
+        "the operator must be told which server is live: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&promote_target).unwrap(),
+        b"stale client\n",
+        "a failed swap must not promote a client"
+    );
+
+    wait_for_api(&fixture.api_socket, Duration::from_secs(10));
+    assert_eq!(
+        workspace_inventory(&fixture.api_socket),
+        fixture.inventory,
+        "the rolled-back server keeps its panes when the import never takes over"
+    );
+    assert!(fixture.pane_process_is_alive());
+
+    fixture.finish();
+}

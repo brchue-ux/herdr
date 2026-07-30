@@ -159,6 +159,23 @@ fn server_command() -> Command {
     Command::new("server")
         .about("Run or control the headless server")
         .subcommand(Command::new("stop").about("Stop the running server"))
+        .subcommand(
+            Command::new("swap")
+                .about("Live-swap the running server onto a locally built binary")
+                .arg(path_option("exe", "PATH").required(true))
+                .arg(flag("dry-run").help("Run every check and stop before the handoff"))
+                .arg(
+                    flag("yes")
+                        .short('y')
+                        .help("Do not ask before interrupting working agents"),
+                )
+                .arg(flag("allow-downgrade").help("Allow swapping onto an older, unverified build"))
+                .arg(
+                    path_option("promote-client", "PATH")
+                        .help("Client path to install the new binary over after a verified swap"),
+                )
+                .arg(flag("no-promote-client").help("Leave installed clients alone")),
+        )
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
         .subcommand(
             Command::new("agent-manifests")
