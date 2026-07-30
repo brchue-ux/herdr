@@ -1917,7 +1917,6 @@ fn workspace_inventory(api_socket: &Path) -> Vec<(String, u64, u64)> {
 struct SwapFixture {
     base: PathBuf,
     config_home: PathBuf,
-    runtime_dir: PathBuf,
     api_socket: PathBuf,
     spawned: Option<SpawnedHerdr>,
     pane_id: String,
@@ -1999,7 +1998,6 @@ impl SwapFixture {
         Self {
             base,
             config_home,
-            runtime_dir,
             api_socket,
             spawned: Some(spawned),
             pane_id,
@@ -2014,6 +2012,14 @@ impl SwapFixture {
 
     fn pane_process_is_alive(&self) -> bool {
         unsafe { libc::kill(self.child_pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Whether the server process this fixture spawned is still the one
+    /// running. A completed handoff replaces it with the imported process.
+    fn spawned_server_is_still_running(&mut self) -> bool {
+        self.spawned
+            .as_mut()
+            .is_some_and(|spawned| matches!(spawned.child.try_wait(), Ok(None)))
     }
 
     fn finish(mut self) {
@@ -2083,11 +2089,11 @@ fn server_swap_preserves_workspace_inventory_and_promotes_the_client() {
 #[test]
 fn server_swap_dry_run_checks_everything_and_changes_nothing() {
     let _lock = test_lock();
-    let fixture = SwapFixture::start();
+    let mut fixture = SwapFixture::start();
     let promote_target = fixture.base.join("bin-herdr");
     fs::write(&promote_target, b"stale client\n").unwrap();
 
-    let old_pids = support::herdr_server_pids_for_runtime_dir(&fixture.runtime_dir).unwrap();
+    assert!(fixture.spawned_server_is_still_running());
     let output = fixture.swap(&[
         "--exe",
         env!("CARGO_BIN_EXE_herdr"),
@@ -2105,9 +2111,8 @@ fn server_swap_dry_run_checks_everything_and_changes_nothing() {
         b"stale client\n",
         "a dry run must not promote any client"
     );
-    assert_eq!(
-        support::herdr_server_pids_for_runtime_dir(&fixture.runtime_dir).unwrap(),
-        old_pids,
+    assert!(
+        fixture.spawned_server_is_still_running(),
         "a dry run must not replace the running server"
     );
     assert_eq!(workspace_inventory(&fixture.api_socket), fixture.inventory);
