@@ -1004,11 +1004,14 @@ enum Promotion {
     Skipped,
 }
 
-fn promote_client(new_exe: &Path, choice: &PromoteChoice) -> Result<Promotion, String> {
-    let driving_client = std::env::current_exe()
+fn driving_client_path() -> Option<PathBuf> {
+    std::env::current_exe()
         .ok()
-        .and_then(|path| std::fs::canonicalize(path).ok());
-    let Some(destination) = promote_destination(choice, driving_client) else {
+        .and_then(|path| std::fs::canonicalize(path).ok())
+}
+
+fn promote_client(new_exe: &Path, choice: &PromoteChoice) -> Result<Promotion, String> {
+    let Some(destination) = promote_destination(choice, driving_client_path()) else {
         return Ok(Promotion::Skipped);
     };
     if std::fs::canonicalize(&destination).is_ok_and(|resolved| resolved == new_exe) {
@@ -1062,8 +1065,9 @@ fn set_executable(_path: &Path) -> Result<(), String> {
 }
 
 fn manual_promote_hint(new_exe: &Path, choice: &PromoteChoice) -> String {
-    let driving_client = std::env::current_exe().ok();
-    match promote_destination(choice, driving_client) {
+    // Resolve the driving client the same way promotion would, so the hint
+    // names the path the command would have written to.
+    match promote_destination(choice, driving_client_path()) {
         Some(destination) => format!(
             "the client at {} still speaks the old protocol; install the new one yourself with `cp {} {}` once you are satisfied.",
             destination.display(),
