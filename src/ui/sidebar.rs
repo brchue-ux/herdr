@@ -2987,6 +2987,53 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     #[test]
+    fn desktop_tree_indents_derived_worktree_children_like_flow_created_ones() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            derived_space_member("demo", "/lab/demo", false),
+            derived_space_member("feature-a", "/lab/demo-feature-a", true),
+            derived_space_member("feature-b", "/lab/demo-feature-b", true),
+            Workspace::test_new("home"),
+        ];
+        app.sidebar_spaces.rows = vec![vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+        ]];
+        app.sidebar_spaces.row_gap = 0;
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    list_area,
+                    false,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let cards = &app.view.workspace_card_areas;
+        assert_eq!(cards.len(), 4);
+        // The main checkout and the non-repository row share the parent column.
+        let parent_name_x = find_symbol_x(buffer, cards[0].rect.y, cards[0].rect.width, "d");
+        let plain_name_x = find_symbol_x(buffer, cards[3].rect.y, cards[3].rect.width, "h");
+        assert_eq!(parent_name_x, plain_name_x);
+        // Both linked worktrees render as indented children of that checkout.
+        assert_eq!(buffer[(cards[1].rect.x + 3, cards[1].rect.y)].symbol(), "├");
+        assert_eq!(buffer[(cards[2].rect.x + 3, cards[2].rect.y)].symbol(), "└");
+        assert_eq!(
+            buffer[(cards[0].rect.x + cards[0].rect.width - 1, cards[0].rect.y)].symbol(),
+            "▾"
+        );
+    }
+
+    #[test]
     fn desktop_worktree_connector_uses_full_list_at_viewport_boundary() {
         let mut app = AppState::test_new();
         app.workspaces = vec![
@@ -3427,6 +3474,117 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             ws_idx,
             indented: true,
         }
+    }
+
+    /// A member of the `repo-key` space whose membership was derived from its
+    /// own directory rather than recorded by Herdr's worktree flow.
+    fn derived_space_member(
+        name: &str,
+        checkout: &str,
+        linked: bool,
+    ) -> crate::workspace::Workspace {
+        let mut ws = crate::workspace::Workspace::test_new(name);
+        ws.derived_worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from(checkout),
+            is_linked_worktree: linked,
+        });
+        ws
+    }
+
+    #[test]
+    fn derived_worktree_members_group_and_indent_under_their_main_checkout() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            derived_space_member("main", "/repo/herdr", false),
+            derived_space_member("issue", "/repo/herdr-issue", true),
+            derived_space_member("review", "/repo/herdr-review", true),
+            Workspace::test_new("home"),
+        ];
+
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), child(1), child(2), top_level(3)]
+        );
+        assert_eq!(
+            app.worktree_space_group("repo-key")
+                .map(|group| group.parent_idx),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn derived_and_flow_created_members_of_one_repo_share_a_group() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            derived_space_member("main", "/repo/herdr", false),
+            space_member("flow-issue", "/repo/herdr-issue", true),
+            derived_space_member("derived-review", "/repo/herdr-review", true),
+        ];
+
+        let group = app
+            .worktree_space_group("repo-key")
+            .expect("derived and flow-created members form one group");
+        assert_eq!(group.parent_idx, 0);
+        assert_eq!(group.children, vec![1, 2]);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), child(1), child(2)]
+        );
+    }
+
+    #[test]
+    fn a_flow_created_membership_is_not_replaced_by_the_derived_one() {
+        let mut app = AppState::test_new();
+        let mut child_ws = space_member("issue", "/repo/herdr-issue", true);
+        // A stale derivation naming a different repo must stay invisible while
+        // the flow-recorded membership is present.
+        child_ws.derived_worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "other-repo-key".into(),
+            label: "other".into(),
+            repo_root: std::path::PathBuf::from("/repo/other"),
+            checkout_path: std::path::PathBuf::from("/repo/other"),
+            is_linked_worktree: false,
+        });
+        app.workspaces = vec![space_member("main", "/repo/herdr", false), child_ws];
+
+        assert_eq!(workspace_list_entries(&app), vec![top_level(0), child(1)]);
+    }
+
+    #[test]
+    fn a_derived_non_repository_workspace_stays_ungrouped() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            derived_space_member("main", "/repo/herdr", false),
+            derived_space_member("issue", "/repo/herdr-issue", true),
+            Workspace::test_new("home"),
+        ];
+
+        assert!(app.workspaces[2].worktree_space().is_none());
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), child(1), top_level(2)]
+        );
+    }
+
+    #[test]
+    fn a_second_derived_main_checkout_leaves_exactly_one_group_parent() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            derived_space_member("mainA", "/repo/herdr", false),
+            derived_space_member("issue", "/repo/herdr-issue", true),
+            derived_space_member("mainB", "/repo/herdr", false),
+        ];
+
+        let group = app.worktree_space_group("repo-key").expect("one group");
+        assert_eq!(group.parent_idx, 0);
+        assert_eq!(group.children, vec![1]);
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![top_level(0), child(1), top_level(2)]
+        );
     }
 
     #[test]

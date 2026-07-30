@@ -60,6 +60,19 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
     Some(git_space_metadata_from_info(&info))
 }
 
+/// Repo metadata plus the worktree grouping derived from it, in one repo walk.
+///
+/// Returns `None` when `cwd` is not inside a Git work tree; a plain directory
+/// is simply not part of any repository and stays ungrouped.
+pub fn git_space_identity(
+    cwd: &Path,
+) -> Option<(GitSpaceMetadata, crate::workspace::WorktreeSpaceMembership)> {
+    let info = git_worktree_info(cwd)?;
+    let space = git_space_metadata_from_info(&info);
+    let derived = derived_worktree_space_from_info(&info, &space);
+    Some((space, derived))
+}
+
 pub(crate) fn automatic_workspace_label(cwd: &Path, repo_root: &Path) -> String {
     repo_root
         .file_name()
@@ -97,6 +110,49 @@ pub(super) fn git_space_metadata_from_info(info: &GitWorktreeInfo) -> GitSpaceMe
         repo_root: info.repo_root.clone(),
         is_linked_worktree: info.is_linked_worktree,
     }
+}
+
+/// Worktree grouping derived from a checkout that Herdr did not create.
+///
+/// Produces the same shape the `NewLinkedWorktree` / `OpenExistingWorktree`
+/// flows record, and above all the same `key`, so a Space merely started in a
+/// linked worktree lands in the same group as one created through the flow
+/// instead of forming an island of its own.
+fn derived_worktree_space_from_info(
+    info: &GitWorktreeInfo,
+    space: &GitSpaceMetadata,
+) -> crate::workspace::WorktreeSpaceMembership {
+    let repo_root = if info.is_linked_worktree {
+        main_checkout_for_common_dir(&info.git_common_dir).unwrap_or_else(|| info.repo_root.clone())
+    } else {
+        info.repo_root.clone()
+    };
+
+    crate::workspace::WorktreeSpaceMembership {
+        key: space.key.clone(),
+        label: space.repo_name.clone(),
+        repo_root,
+        checkout_path: info.repo_root.clone(),
+        is_linked_worktree: info.is_linked_worktree,
+    }
+}
+
+/// The main checkout that owns `git_common_dir`, read from the repo layout.
+///
+/// A linked worktree's common dir is the main checkout's `.git` directory, so
+/// that directory's parent is the main checkout. Returns `None` for layouts
+/// where the working tree cannot be named from the common dir alone - a bare
+/// repository has none, and a `--separate-git-dir` common dir does not sit
+/// inside its checkout. Callers then keep the space's own root; grouping is
+/// unaffected because it keys off `key`, never the root.
+fn main_checkout_for_common_dir(git_common_dir: &Path) -> Option<PathBuf> {
+    if git_common_dir.file_name().and_then(|name| name.to_str()) != Some(".git")
+        || git_dir_is_bare(git_common_dir)
+    {
+        return None;
+    }
+
+    git_common_dir.parent().map(Path::to_path_buf)
 }
 
 pub(super) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
@@ -451,6 +507,94 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derived_worktree_space_groups_linked_checkout_under_its_main_checkout() {
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree("derived-group");
+
+        let (_, main) = git_space_identity(&repo).expect("main checkout is a git space");
+        let (_, linked) = git_space_identity(&checkout).expect("linked worktree is a git space");
+
+        assert_eq!(main.key, linked.key);
+        assert!(!main.is_linked_worktree);
+        assert!(linked.is_linked_worktree);
+        assert_eq!(main.checkout_path, repo);
+        assert_eq!(linked.checkout_path, checkout);
+        assert_eq!(
+            canonicalize_best_effort_path(&linked.repo_root),
+            canonicalize_best_effort_path(&repo)
+        );
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn derived_worktree_space_key_matches_the_flow_repo_key() {
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree("derived-key");
+
+        // The worktree flow records `GitSpaceMetadata::key` as the membership
+        // key, so a derived Space must produce the identical value or the two
+        // become separate groups for the same repository.
+        for checkout_path in [&repo, &checkout] {
+            let (space, derived) = git_space_identity(checkout_path).expect("git space");
+            assert_eq!(derived.key, space.key);
+            assert_eq!(derived.label, space.repo_name);
+        }
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_worktree_space_resolves_symlinked_paths_to_one_key() {
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree("derived-link");
+        let repo_link = base.join("link-to-repo");
+        let checkout_link = base.join("link-to-checkout");
+        std::os::unix::fs::symlink(&repo, &repo_link).unwrap();
+        std::os::unix::fs::symlink(&checkout, &checkout_link).unwrap();
+
+        let (_, direct) = git_space_identity(&repo).expect("git space");
+        let (_, through_repo_link) = git_space_identity(&repo_link).expect("git space");
+        let (_, through_checkout_link) = git_space_identity(&checkout_link).expect("git space");
+
+        assert_eq!(through_repo_link.key, direct.key);
+        assert_eq!(through_checkout_link.key, direct.key);
+        assert!(!through_repo_link.is_linked_worktree);
+        assert!(through_checkout_link.is_linked_worktree);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn derived_worktree_space_is_absent_outside_a_repository() {
+        let plain = temp_test_dir("derived-non-repo");
+
+        assert!(git_space_identity(&plain).is_none());
+
+        std::fs::remove_dir_all(plain).unwrap();
+    }
+
+    #[test]
+    fn derived_worktree_space_of_bare_repo_checkout_keeps_its_own_root() {
+        let (base, bare, checkout) =
+            crate::workspace::git::test_support::create_bare_repo_with_linked_worktree(
+                "derived-bare",
+            );
+
+        let (_, bare_derived) = git_space_identity(&bare).expect("bare repo is a git space");
+        let (_, derived) = git_space_identity(&checkout).expect("linked worktree is a git space");
+
+        // A bare repo has no main working tree to name, so the checkout keeps
+        // its own root. Grouping is unaffected: it keys off `key`.
+        assert_eq!(derived.key, bare_derived.key);
+        assert!(derived.is_linked_worktree);
+        assert_eq!(derived.repo_root, checkout);
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
