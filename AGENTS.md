@@ -34,6 +34,7 @@ These instructions are layered.
 - **Detection is decoupled.** The detector reads a screen snapshot, never touches the parser or viewport state.
 - **Screen detection is evidence-based.** When changing `src/detect/manifests/`, first capture the relevant bottom-buffer state with `herdr agent read <pane> --source detection --format text` and, when styling or alternate screen behavior matters, `--format ansi`. Decide which visible controls are invariant, which are alternatives, and encode them as explicit AND/OR gates. Do not match whole-pane incidental text, and do not use the user-visible viewport for agent status because users can scroll it.
 - **Worktree membership is explicit first, derived second.** A workspace's grouping comes from `Workspace::worktree_space()`: the flow-recorded `worktree_space` wins, and `derived_worktree_space` (resolved once from `identity_cwd`, never from a live pane cwd, and never persisted) only fills the gap. See `src/workspace.rs` and `src/workspace/git/discovery.rs`.
+- **The sidebar's last two columns are crowded.** Both panels are laid out inside `sidebar.width - 1` (`expanded_sidebar_sections`), so each panel's scrollbar track, the collapse toggle, and the worktree chevrons all land on `sidebar.width - 2`, one cell left of the vertical divider bar. Anything hit-tested near that edge — including the divider's one-cell grab band in `sidebar_divider_grab_at` — has to carve out the controls it would otherwise swallow, and mouse-down in `handle_mouse` commits to a drag before any of the sidebar control handlers run. Sidebar wheel scrolling is a separate path keyed only on `in_sidebar`, so a hit-target bug can kill scrollbar dragging while leaving the wheel working.
 - **UI patterns should be reused.** Herdr is a mouse-first TUI. New dialogs, onboarding, settings, and post-update flows should follow the existing UI/UX language and interaction patterns instead of inventing one-off screens. Prefer reusing existing modal/screen structure, affordances, and close actions so the app feels consistent.
 
 ### Runtime/client boundary guardrail
@@ -129,6 +130,14 @@ fleet with the normal CLI (`workspace create`, `pane report-agent`,
 under a PTY to read the rendered cells back. Two binaries built at different
 commits, run against identical state, is what turns "the sidebar looks wrong"
 into a diff.
+
+For a mouse bug, run that private TUI inside a pane of a second private fleet
+and read it with `pane read <pane> --source visible --format text`. Herdr is
+the terminal emulator, so no external one is needed. Drive it by sending raw
+SGR mouse reports with `pane send-text` — `\e[<0;C;RM` press, `\e[<32;C;RM`
+drag, `\e[<0;C;Rm` release, `64`/`65` wheel up/down, `66`/`67` wheel
+left/right, with `C` and `R` 1-based in the nested TUI's own coordinates.
+crossterm parses them off stdin exactly as it would from a real terminal.
 
 ## Server state that has to survive a restart
 

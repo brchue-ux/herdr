@@ -302,7 +302,31 @@ impl AppState {
             return None;
         }
 
+        // So do both sidebar scrollbars: each panel is laid out inside
+        // `sidebar.width - 1`, so its track is drawn on exactly the column the
+        // band extends over. Swallowing a track press turns every scrollbar
+        // drag into a sidebar resize, so the tracks keep their presses. Only
+        // the tolerance column is given up, and only on the rows a track
+        // actually covers; the bar itself stays grabbable everywhere.
+        if offset > 0 && self.sidebar_scrollbar_track_at(col, row) {
+            return None;
+        }
+
         Some(offset as i16)
+    }
+
+    /// Whether either sidebar panel draws a scrollbar track over this cell.
+    /// Both tracks only exist while their panel overflows, so this is false
+    /// whenever the panels fit and the band is at full width.
+    fn sidebar_scrollbar_track_at(&self, col: u16, row: u16) -> bool {
+        let workspaces = crate::ui::workspace_list_scrollbar_rect(self, self.workspace_list_rect());
+        let agents = crate::ui::agent_panel_scrollbar_rect(self, self.agent_panel_rect());
+        [workspaces, agents].into_iter().flatten().any(|track| {
+            col >= track.x
+                && col < track.x + track.width
+                && row >= track.y
+                && row < track.y + track.height
+        })
     }
 
     /// The workspace whose group chevron occupies this cell, when that chevron
@@ -2279,6 +2303,215 @@ mod tests {
         ));
         assert!(app.state.drag.is_none());
         assert_ne!(app.state.agent_panel_sort, sort_before);
+    }
+
+    /// A divider-test app whose Spaces list and Agents panel both overflow, so
+    /// both sidebar scrollbars are actually drawn. Both tracks live in the
+    /// vertical divider's tolerance column, which is what these tests pin.
+    fn app_for_sidebar_scroll_test() -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("alpha");
+        for idx in 0..32 {
+            ws.test_add_tab(Some(&format!("tab-{idx:02}")));
+        }
+        let mut workspaces = vec![ws];
+        for idx in 0..24 {
+            workspaces.push(Workspace::test_new(&format!("space-{idx:02}")));
+        }
+        app.state.workspaces = workspaces;
+        app.state.ensure_test_terminals();
+
+        let agents = [Agent::Claude, Agent::Codex, Agent::Gemini, Agent::Pi];
+        let tab_count = app.state.workspaces[0].tabs.len();
+        for tab_idx in 0..tab_count {
+            let pane_id = app.state.workspaces[0].tabs[tab_idx].root_pane;
+            let terminal_id = app.state.workspaces[0].tabs[tab_idx].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+                terminal.detected_agent = Some(agents[tab_idx % agents.len()]);
+            }
+        }
+
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, DIVIDER_TEST_AREA);
+        app
+    }
+
+    /// Both sidebar scrollbar tracks, asserted to be drawn.
+    fn sidebar_scrollbar_tracks(app: &crate::app::App) -> (Rect, Rect) {
+        let workspaces =
+            crate::ui::workspace_list_scrollbar_rect(&app.state, app.state.workspace_list_rect())
+                .expect("fixture should overflow the Spaces list");
+        let agents =
+            crate::ui::agent_panel_scrollbar_rect(&app.state, app.state.agent_panel_rect())
+                .expect("fixture should overflow the Agents panel");
+        (workspaces, agents)
+    }
+
+    #[test]
+    fn both_sidebar_scrollbar_tracks_sit_in_the_divider_tolerance_column() {
+        let app = app_for_sidebar_scroll_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+        let (workspaces, agents) = sidebar_scrollbar_tracks(&app);
+
+        // Both panels are laid out inside `sidebar.width - 1`, so their last
+        // column - where the scrollbar is drawn - is exactly the one cell of
+        // divider tolerance. Neither is on the bar itself.
+        assert_eq!(workspaces.x, bar_col - 1);
+        assert_eq!(agents.x, bar_col - 1);
+    }
+
+    #[test]
+    fn pressing_the_workspace_list_scrollbar_scrolls_instead_of_resizing_the_sidebar() {
+        let mut app = app_for_sidebar_scroll_test();
+        let width_before = app.state.sidebar_width;
+        let (track, _) = sidebar_scrollbar_tracks(&app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+
+        assert!(
+            matches!(
+                app.state.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::WorkspaceListScrollbar { .. })
+            ),
+            "a press on the Spaces scrollbar must start a scroll drag"
+        );
+        assert_eq!(app.state.sidebar_width, width_before);
+    }
+
+    #[test]
+    fn dragging_the_workspace_list_scrollbar_thumb_moves_the_list() {
+        let mut app = app_for_sidebar_scroll_test();
+        let (track, _) = sidebar_scrollbar_tracks(&app);
+        assert_eq!(app.state.workspace_scroll, 0);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y + track.height - 1,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y + track.height - 1,
+        ));
+
+        assert!(app.state.workspace_scroll > 0);
+        assert_eq!(app.state.sidebar_width, 26);
+    }
+
+    #[test]
+    fn pressing_the_agent_panel_scrollbar_scrolls_instead_of_resizing_the_sidebar() {
+        let mut app = app_for_sidebar_scroll_test();
+        let width_before = app.state.sidebar_width;
+        let (_, track) = sidebar_scrollbar_tracks(&app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+
+        assert!(
+            matches!(
+                app.state.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::AgentPanelScrollbar { .. })
+            ),
+            "a press on the Agents scrollbar must start a scroll drag"
+        );
+        assert_eq!(app.state.sidebar_width, width_before);
+    }
+
+    #[test]
+    fn dragging_the_agent_panel_scrollbar_thumb_moves_the_panel() {
+        let mut app = app_for_sidebar_scroll_test();
+        let (_, track) = sidebar_scrollbar_tracks(&app);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track.x,
+            track.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track.x,
+            track.y + track.height - 1,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track.x,
+            track.y + track.height - 1,
+        ));
+
+        assert!(app.state.agent_panel_scroll > 0);
+        assert_eq!(app.state.sidebar_width, 26);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_both_panels_from_over_their_scrollbar_column() {
+        let mut app = app_for_sidebar_scroll_test();
+        let (workspaces, agents) = sidebar_scrollbar_tracks(&app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            workspaces.x,
+            workspaces.y,
+        ));
+        assert_eq!(app.state.workspace_scroll, 1);
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, workspaces.x, workspaces.y));
+        assert_eq!(app.state.workspace_scroll, 0);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, agents.x, agents.y));
+        assert_eq!(app.state.agent_panel_scroll, 1);
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, agents.x, agents.y));
+        assert_eq!(app.state.agent_panel_scroll, 0);
+    }
+
+    #[test]
+    fn the_divider_grab_band_survives_beside_a_drawn_scrollbar() {
+        let mut app = app_for_sidebar_scroll_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let bar_col = sidebar.x + sidebar.width - 1;
+        let (workspaces, _) = sidebar_scrollbar_tracks(&app);
+
+        // The bar itself stays grabbable on every row, including the rows a
+        // scrollbar track covers.
+        assert_eq!(
+            app.state.sidebar_divider_grab_at(bar_col, workspaces.y),
+            Some(0)
+        );
+
+        // The tolerance column still works on rows no track covers - here the
+        // Spaces header, above the track.
+        let header_row = app.state.workspace_list_rect().y;
+        assert!(header_row < workspaces.y);
+        assert_eq!(
+            app.state.sidebar_divider_grab_at(bar_col - 1, header_row),
+            Some(1)
+        );
+
+        // And a drag from the tolerance column still resizes the sidebar.
+        drag_divider(
+            &mut app,
+            (bar_col - 1, header_row),
+            (bar_col - 1 + 6, header_row),
+        );
+        recompute(&mut app);
+        assert_eq!(app.state.sidebar_width, sidebar.width + 6);
     }
 
     #[test]
