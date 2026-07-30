@@ -129,6 +129,24 @@ under a PTY to read the rendered cells back. Two binaries built at different
 commits, run against identical state, is what turns "the sidebar looks wrong"
 into a diff.
 
+## Server state that has to survive a restart
+
+Two different boundaries carry server-owned state, and they are not
+interchangeable. `persist::SessionSnapshot` is the **cold-start** format: it is
+written to `session.json`, outlives the process, and so deliberately holds no
+value with a deadline attached. A **live handoff** replaces the process while
+the fleet keeps running and carries `server::handoff::HandoffManifest`, which is
+that snapshot plus per-pane runtime plus `handoff_metadata::HandoffMetadata`.
+
+When adding runtime state, decide which boundary owns it. Anything TTL-bearing
+or otherwise only true right now belongs in the handoff manifest, not the
+snapshot. Timestamps cannot go in either as-is: `Instant` is process-local, so
+handoff carries deadlines as time remaining and report times as age, rebuilt
+against the importing clock (see `handoff_metadata`). Manifest sections are
+`#[serde(default)]` so a handoff works in both directions across versions, and
+the whole handoff path is `#[cfg(unix)]` — `just windows-lint` is what catches
+a new module that compiles into Windows as dead code.
+
 ## Local Can Machine Workflow
 
 This section applies only on Can's workstation or Windows VM setup when the
