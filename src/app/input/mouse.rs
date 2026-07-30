@@ -423,19 +423,27 @@ impl AppState {
                     return None;
                 }
 
-                if self.on_sidebar_divider(mouse.column, mouse.row) {
+                if let Some(grab_offset) = self.sidebar_divider_grab_at(mouse.column, mouse.row) {
                     self.drag = Some(DragState {
-                        target: DragTarget::SidebarDivider,
+                        target: DragTarget::SidebarDivider { grab_offset },
                     });
-                    self.set_manual_sidebar_width(mouse.column);
+                    self.set_manual_sidebar_width(AppState::divider_pos_from_grab(
+                        mouse.column,
+                        grab_offset,
+                    ));
                     return None;
                 }
 
-                if self.on_sidebar_section_divider(mouse.column, mouse.row) {
+                if let Some(grab_offset) =
+                    self.sidebar_section_divider_grab_at(mouse.column, mouse.row)
+                {
                     self.drag = Some(DragState {
-                        target: DragTarget::SidebarSectionDivider,
+                        target: DragTarget::SidebarSectionDivider { grab_offset },
                     });
-                    self.set_sidebar_section_split(mouse.row);
+                    self.set_sidebar_section_split(AppState::divider_pos_from_grab(
+                        mouse.row,
+                        grab_offset,
+                    ));
                     return None;
                 }
 
@@ -559,17 +567,9 @@ impl AppState {
                         return None;
                     }
 
-                    let cards = if self.view.workspace_card_areas.is_empty() {
-                        crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
-                    } else {
-                        self.view.workspace_card_areas.clone()
-                    };
-                    if let Some(card) = cards.iter().find(|card| {
-                        let chevron = crate::ui::workspace_group_chevron_rect(card);
-                        mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
-                    }) {
+                    if let Some(ws_idx) = self.workspace_group_chevron_at(mouse.column, mouse.row) {
                         if let Some((key, collapsed)) =
-                            crate::ui::workspace_parent_group_state(self, card.ws_idx)
+                            crate::ui::workspace_parent_group_state(self, ws_idx)
                         {
                             if collapsed {
                                 self.collapsed_space_keys.remove(&key);
@@ -797,11 +797,17 @@ impl AppState {
                                 );
                             }
                         }
-                        DragTarget::SidebarDivider => {
-                            self.set_manual_sidebar_width(mouse.column);
+                        DragTarget::SidebarDivider { grab_offset } => {
+                            self.set_manual_sidebar_width(AppState::divider_pos_from_grab(
+                                mouse.column,
+                                *grab_offset,
+                            ));
                         }
-                        DragTarget::SidebarSectionDivider => {
-                            self.set_sidebar_section_split(mouse.row);
+                        DragTarget::SidebarSectionDivider { grab_offset } => {
+                            self.set_sidebar_section_split(AppState::divider_pos_from_grab(
+                                mouse.row,
+                                *grab_offset,
+                            ));
                         }
                         DragTarget::ReleaseNotesScrollbar { .. }
                         | DragTarget::ProductAnnouncementScrollbar { .. }
