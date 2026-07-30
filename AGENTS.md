@@ -116,6 +116,19 @@ server:
 env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
 ```
 
+To verify what a build actually draws, rather than what a unit test asserts,
+give the debug binary a whole private fleet: set `HOME` and `XDG_CONFIG_HOME`
+somewhere short, and it takes its config and its socket from
+`$XDG_CONFIG_HOME/herdr-dev` (`config::app_dir_name`), reaching nothing the
+user is running. Keep the prefix short — a long path overruns `sun_path` and
+the server fails to bind. Launching the TUI from inside a Herdr pane also
+needs `[experimental] allow_nested = true` in that private config. Drive the
+fleet with the normal CLI (`workspace create`, `pane report-agent`,
+`pane report-metadata`, `pane send-text` for OSC titles), then run the client
+under a PTY to read the rendered cells back. Two binaries built at different
+commits, run against identical state, is what turns "the sidebar looks wrong"
+into a diff.
+
 ## Local Can Machine Workflow
 
 This section applies only on Can's workstation or Windows VM setup when the
