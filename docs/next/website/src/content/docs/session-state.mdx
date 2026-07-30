@@ -106,3 +106,24 @@ herdr --remote workbox --handoff
 Plain `herdr update` and plain `herdr --remote workbox` use the normal restart/stop flow by default.
 
 `herdr update --handoff` only applies to installs managed by Herdr's own updater. Homebrew, mise, and Nix installs are updated through their package managers, so `herdr update` is disabled there and cannot perform live handoff.
+
+### Swapping onto a locally built binary
+
+`herdr update --handoff` covers installs managed by Herdr's own updater. `herdr server swap` performs the same live handoff onto any local binary — a branch build, a packager's build, a release candidate — with the same guard rails:
+
+```bash
+herdr server swap --exe ./target/release/herdr --dry-run
+herdr server swap --exe ./target/release/herdr
+```
+
+Run it with the binary the running server was started from, not with the new build. A client may only talk to a server on its own protocol, so the old client has to make every pre-handoff call and issue the handoff itself; the new binary is only the import target until the server has actually moved to its protocol. `herdr server swap` refuses when the two protocols differ and names the binary to run instead.
+
+Before handing off it checks that the target binary runs and reports a version and protocol, that a server is running and advertises `live_handoff`, and that the workspace inventory is not empty. It reports how many agents are working, because handoff does not preserve in-flight API calls, waits, or subscriptions; on a terminal it asks before interrupting them, and `--yes` skips the question.
+
+After the handoff it waits for the server to answer as the expected version and protocol, reads the workspace inventory back through the new binary, and compares it with the inventory captured before. Only then does it install the new binary over the client that drove the swap. `--promote-client <path>` replaces a different client and `--no-promote-client` leaves every installed client alone. The install is a rename, so a half-finished swap can never leave a partially written client on `PATH`.
+
+`--dry-run` runs every check and stops before the handoff.
+
+When the handoff fails, `herdr server swap` first works out which server owns the socket and then says whether anything changed. If the old server rolled back it says so and promotes nothing. If no server is left it prints the command to start one. Swapping onto the same version and protocol is a refresh, where a rollback and a successful swap look identical over `ping`; after a failed refresh the report says the panes are intact without claiming which server won.
+
+Downgrades — an older protocol, or an older version on the same protocol — are refused. Nothing on the handoff path checks that an older binary understands a session captured by a newer one, and state it does not recognize is dropped silently rather than rejected, so a downgrade can lose session state without failing. `--allow-downgrade` proceeds anyway, unverified.

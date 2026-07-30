@@ -81,13 +81,14 @@ compinit
 ```bash
 herdr server
 herdr server stop
+herdr server swap --exe <path> [--dry-run] [--yes] [--allow-downgrade] [--promote-client <path>|--no-promote-client]
 herdr server reload-config
 herdr server agent-manifests [--json]
 herdr server update-agent-manifests [--json]
 herdr server reload-agent-manifests
 ```
 
-`herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
+`herdr server` 显式运行无界面服务器,适合被监管或服务式的部署。`swap` 把运行中的服务器实时交换到本地构建的二进制文件上,并在交接前后检查协议兼容性和工作区清单;参见[会话状态](/docs/session-state/#交换到本地构建的二进制文件)。`reload-config` 在不重启窗格的情况下应用可重载设置。`agent-manifests` 显示生效的智能体检测清单来源、缓存的远程版本和最近的远程更新结果。`update-agent-manifests` 立即拉取远程清单更新,重载到运行中的服务器,并打印更新后的清单状态;要原始状态响应就加 `--json`。`reload-agent-manifests` 在编辑本地覆盖后,把智能体检测清单重载到运行中的服务器。
 
 ## 通知
 
