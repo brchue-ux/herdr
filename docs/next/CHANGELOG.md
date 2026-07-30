@@ -8,6 +8,7 @@
 
 ### Fixed
 - Live handoff now carries published metadata across the server replacement. Workspace and pane metadata tokens, reported agent metadata, and reported agent lifecycle identity survive an update instead of being silently dropped, so sidebar rows built from `workspace.report_metadata` or `pane.report_metadata` no longer go blank until whatever publishes them happens to run again. Metadata is only carried by a server that has this fix, so the update onto it is the last handoff that loses it.
+- Workspaces started directly in a Git checkout now carry worktree provenance, so linked worktrees of one repository group under their main checkout and render indented in the Spaces sidebar without having to be created through Herdr's worktree commands. Workspaces created through those commands are unchanged, and a workspace outside a Git work tree stays an ungrouped row.
 - A second workspace opened in a repo's main checkout no longer renders as an indented worktree of its own sibling in the Spaces sidebar, and closing it no longer closes the whole worktree group. Only linked Git worktrees are grouped as children, and a group only forms once the repo has at least one linked worktree open.
 - Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
 - Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)

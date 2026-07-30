@@ -25,8 +25,9 @@ use self::git::git_status_cache_key_for_space;
 pub use self::{
     aggregate::AggregateTerminalTitle,
     git::{
-        derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_metadata,
-        git_status_cache_key, GitSpaceMetadata, GitStatusCacheEntry, GitStatusRefreshDemand,
+        derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_identity,
+        git_space_metadata, git_status_cache_key, GitSpaceMetadata, GitStatusCacheEntry,
+        GitStatusRefreshDemand,
     },
     tab::{NewPane, Tab},
 };
@@ -61,10 +62,23 @@ pub struct WorkspaceGitStatusSnapshot {
     pub space: Option<GitSpaceMetadata>,
 }
 
-pub(crate) fn discover_workspace_git_identity(
-    cwd: &std::path::Path,
-) -> (Option<GitSpaceMetadata>, String, PathBuf) {
-    let space = git_space_metadata(cwd);
+/// Everything a workspace caches about the directory it was created in.
+///
+/// Resolved once per workspace, off the render path, by a single Git repo
+/// discovery walk.
+pub(crate) struct WorkspaceGitIdentity {
+    pub(crate) space: Option<GitSpaceMetadata>,
+    pub(crate) auto_label: String,
+    pub(crate) status_cache_key: PathBuf,
+    /// Worktree grouping derived from `cwd`, for checkouts Herdr did not create.
+    pub(crate) derived_worktree_space: Option<WorktreeSpaceMembership>,
+}
+
+pub(crate) fn discover_workspace_git_identity(cwd: &std::path::Path) -> WorkspaceGitIdentity {
+    let (space, derived_worktree_space) = match git_space_identity(cwd) {
+        Some((space, derived)) => (Some(space), Some(derived)),
+        None => (None, None),
+    };
     let auto_label = space
         .as_ref()
         .map(|space| self::git::automatic_workspace_label(cwd, &space.repo_root))
@@ -73,7 +87,12 @@ pub(crate) fn discover_workspace_git_identity(
         .as_ref()
         .map(git_status_cache_key_for_space)
         .unwrap_or_else(|| cwd.to_path_buf());
-    (space, auto_label, status_cache_key)
+    WorkspaceGitIdentity {
+        space,
+        auto_label,
+        status_cache_key,
+        derived_worktree_space,
+    }
 }
 
 impl WorkspaceGitStatusSnapshot {
@@ -190,6 +209,14 @@ pub struct Workspace {
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
+    /// Worktree grouping derived from the directory the workspace was created
+    /// in, for checkouts Herdr did not create.
+    ///
+    /// Fixed at creation from `identity_cwd` and never refreshed: a pane's
+    /// foreground cwd moves as the user types `cd`, and sidebar rows must not
+    /// regroup and re-indent underneath them. It is only ever consulted when
+    /// `worktree_space` is absent - see [`Workspace::worktree_space`].
+    pub(crate) derived_worktree_space: Option<WorktreeSpaceMembership>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub(crate) metadata_token_sequences: HashMap<String, u64>,
     /// Public pane numbers within this workspace. Closed pane numbers are not reused.
@@ -243,19 +270,19 @@ impl Workspace {
         let tab = Tab::from_existing_pane(1, tab_label, moved, events, render_notify, render_dirty);
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(root_pane, 1);
-        let (cached_git_space, cached_auto_label, cached_git_status_key) =
-            discover_workspace_git_identity(&identity_cwd);
+        let identity = discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
-            cached_auto_label,
-            cached_git_status_key,
+            cached_auto_label: identity.auto_label,
+            cached_git_status_key: identity.status_cache_key,
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
-            cached_git_space,
+            cached_git_space: identity.space,
             worktree_space: None,
+            derived_worktree_space: identity.derived_worktree_space,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
@@ -430,20 +457,20 @@ impl Workspace {
         };
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(tab.root_pane, 1);
-        let (cached_git_space, cached_auto_label, cached_git_status_key) =
-            discover_workspace_git_identity(&initial_cwd);
+        let identity = discover_workspace_git_identity(&initial_cwd);
         Ok((
             Self {
                 id,
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
-                cached_auto_label,
-                cached_git_status_key,
+                cached_auto_label: identity.auto_label,
+                cached_git_status_key: identity.status_cache_key,
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
-                cached_git_space,
+                cached_git_space: identity.space,
                 worktree_space: None,
+                derived_worktree_space: identity.derived_worktree_space,
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
                 metadata_token_sequences: HashMap::new(),
                 public_pane_numbers,
@@ -1156,8 +1183,15 @@ impl Workspace {
         self.cached_git_space.as_ref()
     }
 
+    /// This workspace's worktree grouping, explicit first.
+    ///
+    /// A membership recorded by Herdr's own worktree flow is authoritative and
+    /// is never replaced; the derived membership only fills the gap left when
+    /// a workspace was simply started in a checkout Herdr did not create.
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
-        self.worktree_space.as_ref()
+        self.worktree_space
+            .as_ref()
+            .or(self.derived_worktree_space.as_ref())
     }
 
     #[cfg(test)]
@@ -1279,6 +1313,7 @@ impl Workspace {
             cached_git_ahead_behind: None,
             cached_git_space: None,
             worktree_space: None,
+            derived_worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
@@ -1684,15 +1719,79 @@ mod tests {
         let (base, repo, checkout) =
             self::git::test_support::create_repo_with_linked_worktree("linked-auto-label");
 
-        let (space, auto_label, _) = discover_workspace_git_identity(&checkout);
+        let identity = discover_workspace_git_identity(&checkout);
 
         assert_eq!(
-            space.unwrap().repo_name,
+            identity.space.unwrap().repo_name,
             repo.file_name().unwrap().to_str().unwrap()
         );
-        assert_eq!(auto_label, checkout.file_name().unwrap().to_str().unwrap());
+        assert_eq!(
+            identity.auto_label,
+            checkout.file_name().unwrap().to_str().unwrap()
+        );
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn workspace_created_in_a_linked_worktree_derives_its_membership() {
+        let (base, repo, checkout) =
+            self::git::test_support::create_repo_with_linked_worktree("derived-membership");
+
+        let main = discover_workspace_git_identity(&repo);
+        let linked = discover_workspace_git_identity(&checkout);
+
+        let main = main
+            .derived_worktree_space
+            .expect("main checkout membership");
+        let linked = linked
+            .derived_worktree_space
+            .expect("linked worktree membership");
+        assert_eq!(main.key, linked.key);
+        assert!(!main.is_linked_worktree);
+        assert!(linked.is_linked_worktree);
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn explicit_worktree_membership_wins_over_the_derived_one() {
+        let mut ws = Workspace::test_new("flow-created");
+        ws.derived_worktree_space = Some(WorktreeSpaceMembership {
+            key: "derived-key".into(),
+            label: "derived".into(),
+            repo_root: PathBuf::from("/derived/repo"),
+            checkout_path: PathBuf::from("/derived/repo"),
+            is_linked_worktree: false,
+        });
+
+        assert_eq!(
+            ws.worktree_space().map(|space| space.key.as_str()),
+            Some("derived-key")
+        );
+
+        let explicit = WorktreeSpaceMembership {
+            key: "flow-key".into(),
+            label: "flow".into(),
+            repo_root: PathBuf::from("/flow/repo"),
+            checkout_path: PathBuf::from("/flow/repo-issue"),
+            is_linked_worktree: true,
+        };
+        ws.worktree_space = Some(explicit.clone());
+
+        assert_eq!(ws.worktree_space(), Some(&explicit));
+    }
+
+    #[test]
+    fn workspace_outside_a_repository_derives_no_membership() {
+        let plain = self::git::test_support::temp_test_dir("derived-membership-non-repo");
+
+        let identity = discover_workspace_git_identity(&plain);
+
+        assert!(identity.space.is_none());
+        assert!(identity.derived_worktree_space.is_none());
+
+        std::fs::remove_dir_all(plain).unwrap();
     }
 
     #[test]
