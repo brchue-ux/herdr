@@ -1194,9 +1194,11 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
+        let metadata = self.app.capture_handoff_metadata(Instant::now());
         let manifest = crate::server::handoff::manifest_for(
             snapshot,
             panes,
+            metadata,
             params.expected_protocol,
             params.expected_version,
         );
@@ -4521,7 +4523,10 @@ fn take_startup_cwd() -> Option<PathBuf> {
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
-    crate::server::handoff::log_import_result(received.manifest.panes.len());
+    crate::server::handoff::log_import_result(
+        received.manifest.panes.len(),
+        &received.manifest.metadata,
+    );
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
@@ -4552,6 +4557,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &received.manifest.snapshot,
             &mut imports,
         )?;
+        app.apply_handoff_metadata(received.manifest.metadata, Instant::now());
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;

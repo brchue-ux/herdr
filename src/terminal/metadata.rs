@@ -306,6 +306,165 @@ impl TerminalState {
         self.effective_presentation_for_state_at(self.state, Instant::now())
     }
 
+    /// Everything a live handoff has to carry for this terminal, beyond what
+    /// the session snapshot already holds.
+    ///
+    /// Reported agent metadata is the reason the Agents panel knows a pane has
+    /// an agent at all when detection never fires, so losing it drops the pane
+    /// out of the panel entirely, not just its title.
+    #[cfg(unix)]
+    pub(crate) fn metadata_to_handoff(
+        &self,
+        pane_id: u32,
+        now: Instant,
+    ) -> crate::handoff_metadata::PaneHandoffMetadata {
+        use crate::handoff_metadata::{age_of, HandoffAgentMetadata};
+
+        let mut agent_metadata = self
+            .agent_metadata
+            .values()
+            .map(|metadata| HandoffAgentMetadata {
+                source: metadata.source.clone(),
+                agent_label: metadata.agent_label.clone(),
+                applies_to_source: metadata.applies_to_source.clone(),
+                title: metadata.title.clone(),
+                display_agent: metadata.display_agent.clone(),
+                state_labels: metadata.state_labels.clone(),
+                reported_age: age_of(metadata.reported_at, now),
+                title_reported_age: metadata.title_reported_at.map(|at| age_of(at, now)),
+                display_agent_reported_age: metadata
+                    .display_agent_reported_at
+                    .map(|at| age_of(at, now)),
+                state_label_reported_age: metadata
+                    .state_label_reported_at
+                    .iter()
+                    .map(|(state, at)| (state.clone(), age_of(*at, now)))
+                    .collect(),
+                ttl: metadata.ttl,
+                expiry_event_pending: metadata.expiry_event_pending,
+            })
+            .collect::<Vec<_>>();
+        agent_metadata.sort_by(|left, right| left.source.cmp(&right.source));
+
+        let mut token_sequence_sources = self
+            .metadata_token_sequence_sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        token_sequence_sources.sort();
+
+        crate::handoff_metadata::PaneHandoffMetadata {
+            pane_id,
+            tokens: self.metadata_tokens.to_handoff(now),
+            agent_metadata,
+            hook_authority: self.hook_authority.as_ref().map(|authority| {
+                crate::handoff_metadata::HandoffHookAuthority {
+                    source: authority.source.clone(),
+                    agent_label: authority.agent_label.clone(),
+                    state: crate::handoff_metadata::agent_state_to_wire(authority.state),
+                    message: authority.message.clone(),
+                    reported_age: age_of(authority.reported_at, now),
+                    session_ref_kind: authority.session_ref.as_ref().map(|r| r.kind),
+                    session_ref_value: authority.session_ref.as_ref().map(|r| r.value.clone()),
+                }
+            }),
+            agent_state: Some(crate::handoff_metadata::agent_state_to_wire(self.state)),
+            last_agent_state_change_seq: self.last_agent_state_change_seq,
+            report_sequences: self.metadata_report_sequences.clone(),
+            hook_report_sequences: self.hook_report_sequences.clone(),
+            report_agents: self
+                .metadata_report_agents
+                .iter()
+                .map(|(source, agent)| {
+                    (
+                        source.clone(),
+                        crate::detect::agent_label(*agent).to_string(),
+                    )
+                })
+                .collect(),
+            token_sequence_sources,
+        }
+    }
+
+    /// Rebuild handoff-carried metadata against this process's clock.
+    ///
+    /// The sequence maps travel with the values they gate. Dropping them would
+    /// leave every source's replay guard wide open for one report, so a slow
+    /// in-flight publish from before the handoff could overwrite a newer one
+    /// that landed after it.
+    #[cfg(unix)]
+    pub(crate) fn restore_metadata_from_handoff(
+        &mut self,
+        metadata: crate::handoff_metadata::PaneHandoffMetadata,
+        now: Instant,
+    ) {
+        use crate::handoff_metadata::instant_from_age;
+
+        self.metadata_tokens.restore_handoff(metadata.tokens, now);
+        self.metadata_report_sequences = metadata.report_sequences;
+        self.hook_report_sequences = metadata.hook_report_sequences;
+        self.metadata_report_agents = metadata
+            .report_agents
+            .into_iter()
+            .filter_map(|(source, label)| {
+                crate::detect::parse_agent_label(&label).map(|agent| (source, agent))
+            })
+            .collect();
+        self.metadata_token_sequence_sources =
+            metadata.token_sequence_sources.into_iter().collect();
+
+        if let Some(authority) = metadata.hook_authority {
+            let session_ref = match (authority.session_ref_kind, authority.session_ref_value) {
+                (Some(kind), Some(value)) => {
+                    Some(crate::agent_resume::AgentSessionRef { kind, value })
+                }
+                _ => None,
+            };
+            self.hook_authority = Some(super::HookAuthority {
+                source: authority.source,
+                agent_label: authority.agent_label,
+                state: crate::handoff_metadata::agent_state_from_wire(authority.state),
+                message: authority.message,
+                reported_at: instant_from_age(authority.reported_age, now),
+                session_ref,
+            });
+        }
+        if let Some(state) = metadata.agent_state {
+            self.state = crate::handoff_metadata::agent_state_from_wire(state);
+        }
+        if metadata.last_agent_state_change_seq.is_some() {
+            self.last_agent_state_change_seq = metadata.last_agent_state_change_seq;
+        }
+
+        for carried in metadata.agent_metadata {
+            self.agent_metadata.insert(
+                carried.source.clone(),
+                AgentMetadata {
+                    source: carried.source,
+                    agent_label: carried.agent_label,
+                    applies_to_source: carried.applies_to_source,
+                    title: carried.title,
+                    display_agent: carried.display_agent,
+                    state_labels: carried.state_labels,
+                    reported_at: instant_from_age(carried.reported_age, now),
+                    title_reported_at: carried
+                        .title_reported_age
+                        .map(|age| instant_from_age(age, now)),
+                    display_agent_reported_at: carried
+                        .display_agent_reported_age
+                        .map(|age| instant_from_age(age, now)),
+                    state_label_reported_at: carried
+                        .state_label_reported_age
+                        .into_iter()
+                        .map(|(state, age)| (state, instant_from_age(age, now)))
+                        .collect(),
+                    ttl: carried.ttl,
+                    expiry_event_pending: carried.expiry_event_pending,
+                },
+            );
+        }
+    }
+
     pub fn next_agent_metadata_expiry(&self) -> Option<Instant> {
         let now = Instant::now();
         self.agent_metadata
