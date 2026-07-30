@@ -3532,4 +3532,147 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let peer_name_x = find_symbol_x(buffer, cards[2].rect.y, cards[2].rect.width, "m");
         assert_eq!(peer_name_x, parent_name_x);
     }
+
+    /// A two-row layout in both panels where every row mixes builtin tokens with
+    /// inline-styled custom `$tokens`.
+    ///
+    /// This is the shape a live sidebar was reported to have lost - second row
+    /// gone, rows reading as unstyled text - so it is pinned here in both
+    /// panels at once. A row keeps its line as long as one token on it
+    /// resolves, and an inline `fg`/`bold` reaches the drawn cell; both hold
+    /// whether the value comes from a builtin token or from published metadata.
+    ///
+    /// The elision this does NOT cover is the intended one: a row whose only
+    /// tokens are custom values that were never published has nothing to draw
+    /// and is dropped, which looks identical to the row having disappeared.
+    /// `missing_custom_tokens_elide_rows_and_separators` in `tokens.rs` owns
+    /// that case.
+    const TWO_ROW_STYLED_CONFIG: &str = r##"
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", { token = "$doing", fg = "#e0def4" }, { token = "$context", fg = "#c4a7e7", bold = true }],
+  ["workspace"],
+]
+
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "terminal_title_stripped", { token = "$context", fg = "#c4a7e7", bold = true }],
+  [{ token = "$project", fg = "#9ccfd8" }],
+]
+"##;
+
+    fn rose_pine(r: u8, g: u8, b: u8) -> ratatui::style::Color {
+        ratatui::style::Color::Rgb(r, g, b)
+    }
+
+    /// One space and one agent carrying every custom token the config names.
+    fn app_with_two_row_styled_config() -> crate::app::state::AppState {
+        let config: crate::config::Config =
+            toml::from_str(TWO_ROW_STYLED_CONFIG).expect("two-row styled sidebar config");
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_agents = config.ui.sidebar.agents;
+        app.sidebar_spaces = config.ui.sidebar.spaces;
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let pane_terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        pane_terminal.detected_agent = Some(Agent::Claude);
+        pane_terminal.state = AgentState::Working;
+        pane_terminal.set_terminal_title(Some("⠋ Wiring".into()));
+        pane_terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([
+                ("context".into(), Some("Ctx".into())),
+                ("project".into(), Some("Proj".into())),
+            ]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([
+                ("doing".into(), Some("Doing".into())),
+                ("context".into(), Some("Ctx".into())),
+            ]),
+            None,
+            std::time::Instant::now(),
+        );
+        app
+    }
+
+    #[test]
+    fn two_row_styled_space_config_renders_both_rows_with_inline_styles() {
+        let mut app = app_with_two_row_styled_config();
+
+        let area = Rect::new(0, 0, 40, 24);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        let mut renderer = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        renderer
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = renderer.backend().buffer();
+
+        assert_eq!(card.height, 2, "both configured Space rows are laid out");
+        let first = row_text(buffer, card.y, card.width);
+        let second = row_text(buffer, card.y + 1, card.width);
+        assert!(first.contains("Doing"), "first Space row: {first:?}");
+        assert!(first.contains("Ctx"), "first Space row: {first:?}");
+        assert!(
+            second.contains("one"),
+            "second Space row is missing: {second:?}"
+        );
+
+        let doing = buffer[(find_symbol_x(buffer, card.y, card.width, "D"), card.y)].style();
+        assert_eq!(doing.fg, Some(rose_pine(0xe0, 0xde, 0xf4)));
+        let context = buffer[(find_symbol_x(buffer, card.y, card.width, "C"), card.y)].style();
+        assert_eq!(context.fg, Some(rose_pine(0xc4, 0xa7, 0xe7)));
+        assert!(context.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn two_row_styled_agent_config_renders_both_rows_with_inline_styles() {
+        let app = app_with_two_row_styled_config();
+
+        let area = Rect::new(0, 0, 40, 24);
+        let mut renderer = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        renderer
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = renderer.backend().buffer();
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let body = agent_panel_body_rect(agent_area, false);
+
+        let entries = all_agent_panel_entries(&app);
+        assert_eq!(
+            resolved_agent_rows(&app, &entries[0]).len(),
+            2,
+            "both configured Agent rows resolve"
+        );
+
+        let first = row_text(buffer, body.y, body.width);
+        let second = row_text(buffer, body.y + 1, body.width);
+        assert!(first.contains("Wiring"), "first Agent row: {first:?}");
+        assert!(first.contains("Ctx"), "first Agent row: {first:?}");
+        assert!(
+            second.contains("Proj"),
+            "second Agent row is missing: {second:?}"
+        );
+
+        let context = buffer[(find_symbol_x(buffer, body.y, body.width, "C"), body.y)].style();
+        assert_eq!(context.fg, Some(rose_pine(0xc4, 0xa7, 0xe7)));
+        assert!(context.add_modifier.contains(Modifier::BOLD));
+
+        let project = buffer[(
+            find_symbol_x(buffer, body.y + 1, body.width, "P"),
+            body.y + 1,
+        )]
+            .style();
+        assert_eq!(project.fg, Some(rose_pine(0x9c, 0xcf, 0xd8)));
+    }
 }

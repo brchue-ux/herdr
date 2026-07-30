@@ -101,6 +101,53 @@ impl MetadataTokens {
             .retain(|_, token| token.expires_at.is_none_or(|deadline| deadline > now));
         self.entries.len() != before
     }
+
+    /// Tokens in the form a live handoff can carry to the next process.
+    ///
+    /// Already-expired tokens are dropped rather than shipped: the importing
+    /// server would only sweep them on its first expiry pass, and a token that
+    /// was invisible before the handoff must not flicker back into a row.
+    #[cfg(unix)]
+    pub(crate) fn to_handoff(&self, now: Instant) -> Vec<crate::handoff_metadata::HandoffToken> {
+        let mut tokens = self
+            .entries
+            .iter()
+            .filter_map(|(name, token)| {
+                let expires_in = match token.expires_at {
+                    Some(deadline) if deadline <= now => return None,
+                    Some(deadline) => Some(deadline.duration_since(now)),
+                    None => None,
+                };
+                Some(crate::handoff_metadata::HandoffToken {
+                    name: name.clone(),
+                    value: token.value.clone(),
+                    expires_in,
+                })
+            })
+            .collect::<Vec<_>>();
+        // HashMap order is not stable, and a manifest that reorders between
+        // runs is needlessly hard to diff when a handoff goes wrong.
+        tokens.sort_by(|left, right| left.name.cmp(&right.name));
+        tokens
+    }
+
+    /// Rebuild handoff-carried tokens against this process's clock.
+    #[cfg(unix)]
+    pub(crate) fn restore_handoff(
+        &mut self,
+        tokens: Vec<crate::handoff_metadata::HandoffToken>,
+        now: Instant,
+    ) {
+        for token in tokens {
+            self.entries.insert(
+                token.name,
+                MetadataToken {
+                    value: token.value,
+                    expires_at: token.expires_in.and_then(|left| now.checked_add(left)),
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]

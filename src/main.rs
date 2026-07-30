@@ -67,6 +67,9 @@ mod config;
 mod detect;
 mod events;
 mod ghostty;
+// Live handoff is a Unix-only path; the whole transfer form goes with it.
+#[cfg(unix)]
+mod handoff_metadata;
 mod handoff_runtime;
 mod input;
 mod integration;

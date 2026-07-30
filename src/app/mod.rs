@@ -875,6 +875,100 @@ impl App {
         Ok(app)
     }
 
+    /// Collect the durable API-published metadata a live handoff has to carry.
+    ///
+    /// The session snapshot is a cold-start format and holds none of this, so
+    /// without it a handoff silently blanks every sidebar row whose value came
+    /// from `workspace.report_metadata` or `pane.report_metadata`.
+    #[cfg(unix)]
+    pub(crate) fn capture_handoff_metadata(
+        &self,
+        now: Instant,
+    ) -> crate::handoff_metadata::HandoffMetadata {
+        let workspaces = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|ws| {
+                let tokens = ws.metadata_tokens.to_handoff(now);
+                if tokens.is_empty() && ws.metadata_token_sequences.is_empty() {
+                    return None;
+                }
+                Some(crate::handoff_metadata::WorkspaceHandoffMetadata {
+                    workspace_id: ws.id.clone(),
+                    tokens,
+                    token_sequences: ws.metadata_token_sequences.clone(),
+                })
+            })
+            .collect();
+
+        let panes = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|(pane_id, pane)| {
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                let carried = terminal.metadata_to_handoff(pane_id.raw(), now);
+                carried.carries_anything().then_some(carried)
+            })
+            .collect();
+
+        crate::handoff_metadata::HandoffMetadata { workspaces, panes }
+    }
+
+    /// Reapply handoff-carried metadata after the session itself is restored.
+    ///
+    /// Workspaces are matched by their stable id and panes by pane id, so a
+    /// restore that drops a pane or reorders workspaces just leaves that entry
+    /// unclaimed instead of attaching it to the wrong row.
+    #[cfg(unix)]
+    pub(crate) fn apply_handoff_metadata(
+        &mut self,
+        metadata: crate::handoff_metadata::HandoffMetadata,
+        now: Instant,
+    ) {
+        for carried in metadata.workspaces {
+            let Some(ws) = self
+                .state
+                .workspaces
+                .iter_mut()
+                .find(|ws| ws.id == carried.workspace_id)
+            else {
+                continue;
+            };
+            ws.metadata_tokens.restore_handoff(carried.tokens, now);
+            ws.metadata_token_sequences = carried.token_sequences;
+        }
+
+        let terminal_by_pane = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .map(|(pane_id, pane)| (pane_id.raw(), pane.attached_terminal_id.clone()))
+            .collect::<HashMap<_, _>>();
+        for carried in metadata.panes {
+            // Restore can renumber a pane; `pane_id_aliases` is the same
+            // old-to-new map clients are given, so metadata follows the pane
+            // rather than landing on whoever inherited its old number.
+            let pane_id = self
+                .state
+                .pane_id_aliases
+                .get(&carried.pane_id)
+                .map(|id| id.raw())
+                .unwrap_or(carried.pane_id);
+            let Some(terminal_id) = terminal_by_pane.get(&pane_id) else {
+                continue;
+            };
+            if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                terminal.restore_metadata_from_handoff(carried, now);
+            }
+        }
+    }
+
     #[cfg(unix)]
     pub fn unpause_handoff_readers(&self) {
         self.terminal_runtimes.set_handoff_readers_paused(false);
@@ -5994,5 +6088,260 @@ last_pane = "prefix+tab"
             &input[events[1].start..events[1].start + events[1].len],
             b"a"
         );
+    }
+
+    /// A live handoff replaces the server process while the fleet keeps
+    /// running, and documents durable metadata as preserved. The session
+    /// snapshot holds none of it, so these cover the manifest carrying it.
+    #[cfg(unix)]
+    mod handoff_metadata {
+        use super::*;
+        use std::time::Duration;
+
+        fn app_with_one_pane() -> (App, crate::layout::PaneId) {
+            let mut app = App::new(
+                &Config::default(),
+                true,
+                None,
+                tokio::sync::mpsc::unbounded_channel().1,
+                crate::api::EventHub::default(),
+            );
+            let ws = Workspace::test_new("one");
+            let pane_id = ws.tabs[0].root_pane;
+            app.state.workspaces.push(ws);
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            (app, pane_id)
+        }
+
+        /// Stand in for the restore the importing server does first. Workspaces
+        /// come back under their snapshot ids, and a restored pane can be
+        /// renumbered - which is what `pane_id_aliases` records - so this
+        /// deliberately hands the importing app a different pane id than the
+        /// manifest was captured under.
+        fn imported_like(
+            source: &App,
+            source_pane: crate::layout::PaneId,
+        ) -> (App, crate::layout::PaneId) {
+            let (mut app, pane_id) = app_with_one_pane();
+            app.state.workspaces[0].id = source.state.workspaces[0].id.clone();
+            if pane_id != source_pane {
+                app.state.pane_id_aliases.insert(source_pane.raw(), pane_id);
+            }
+            (app, pane_id)
+        }
+
+        fn terminal_id(app: &App, pane_id: crate::layout::PaneId) -> crate::terminal::TerminalId {
+            app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone()
+        }
+
+        fn publish_tokens(app: &mut App, pane_id: crate::layout::PaneId, now: std::time::Instant) {
+            let ttl = Some(Duration::from_secs(86_400));
+            app.state.workspaces[0].metadata_tokens.patch(
+                HashMap::from([
+                    ("doing".into(), Some("Building connector".into())),
+                    ("context".into(), Some("41%".into())),
+                ]),
+                ttl,
+                now,
+            );
+            app.state.workspaces[0]
+                .metadata_token_sequences
+                .insert("claude-ctx".into(), 100);
+            let id = terminal_id(app, pane_id);
+            app.state
+                .terminals
+                .get_mut(&id)
+                .expect("terminal")
+                .metadata_tokens
+                .patch(
+                    HashMap::from([
+                        ("project".into(), Some("alpha-proj".into())),
+                        ("owner".into(), Some("firstmate".into())),
+                    ]),
+                    ttl,
+                    now,
+                );
+        }
+
+        /// The captain-visible case: rows built from published tokens must not
+        /// go blank because the server was replaced under them.
+        #[test]
+        fn published_tokens_survive_a_handoff() {
+            let (mut source, pane_id) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            publish_tokens(&mut source, pane_id, now);
+
+            let metadata = source.capture_handoff_metadata(now);
+            let (mut imported, imported_pane) = imported_like(&source, pane_id);
+            imported.apply_handoff_metadata(metadata, now + Duration::from_millis(400));
+
+            assert_eq!(
+                imported.state.workspaces[0].metadata_tokens.values(),
+                HashMap::from([
+                    ("doing".to_string(), "Building connector".to_string()),
+                    ("context".to_string(), "41%".to_string()),
+                ])
+            );
+            assert_eq!(
+                imported.state.workspaces[0].metadata_token_sequences,
+                HashMap::from([("claude-ctx".to_string(), 100)]),
+                "the replay guard travels with the values it gates"
+            );
+            let id = terminal_id(&imported, imported_pane);
+            assert_eq!(
+                imported.state.terminals[&id].metadata_tokens.values(),
+                HashMap::from([
+                    ("project".to_string(), "alpha-proj".to_string()),
+                    ("owner".to_string(), "firstmate".to_string()),
+                ])
+            );
+        }
+
+        /// TTLs are deadlines, and `Instant` does not cross a process boundary.
+        /// A carried token has to expire when it always would have, not restart
+        /// its clock in the importing server.
+        #[test]
+        fn a_carried_ttl_keeps_its_original_deadline() {
+            let (mut source, pane_id) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            source.state.workspaces[0].metadata_tokens.patch(
+                HashMap::from([("doing".into(), Some("Building".into()))]),
+                Some(Duration::from_secs(60)),
+                now,
+            );
+            let _ = pane_id;
+
+            // Exported 45s in, imported immediately: 15s should be left.
+            let metadata = source.capture_handoff_metadata(now + Duration::from_secs(45));
+            let import_now = now + Duration::from_secs(45);
+            let (mut imported, _) = imported_like(&source, pane_id);
+            imported.apply_handoff_metadata(metadata, import_now);
+
+            let tokens = &mut imported.state.workspaces[0].metadata_tokens;
+            assert!(!tokens.expire_at(import_now + Duration::from_secs(14)));
+            assert!(
+                tokens.expire_at(import_now + Duration::from_secs(16)),
+                "the deadline lands 15s after import, not 60s"
+            );
+        }
+
+        /// A token that had already lapsed was invisible before the handoff and
+        /// must not reappear on the other side.
+        #[test]
+        fn an_already_expired_token_is_not_carried() {
+            let (mut source, _) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            source.state.workspaces[0].metadata_tokens.patch(
+                HashMap::from([("stale".into(), Some("gone".into()))]),
+                Some(Duration::from_secs(10)),
+                now,
+            );
+
+            let metadata = source.capture_handoff_metadata(now + Duration::from_secs(30));
+            assert!(
+                metadata.workspaces.is_empty(),
+                "an expired token leaves nothing worth carrying: {metadata:?}"
+            );
+        }
+
+        /// Reported agent metadata is what makes a pane an agent when detection
+        /// never fires, so losing it drops the row out of the Agents panel
+        /// rather than merely blanking its title.
+        #[test]
+        fn reported_agent_identity_and_presentation_survive_a_handoff() {
+            let (mut source, pane_id) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            let id = terminal_id(&source, pane_id);
+            let terminal = source.state.terminals.get_mut(&id).expect("terminal");
+            terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
+                source: "lab".into(),
+                agent_label: Some("claude".into()),
+                applies_to_source: None,
+                title: Some("pane title from api".into()),
+                display_agent: Some("shown-agent".into()),
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_state_labels: false,
+                ttl: None,
+                seq: Some(7),
+            });
+            terminal.hook_authority = Some(crate::terminal::state::HookAuthority {
+                source: "lab".into(),
+                agent_label: "claude".into(),
+                state: AgentState::Working,
+                message: None,
+                reported_at: now,
+                session_ref: Some(crate::agent_resume::AgentSessionRef {
+                    kind: crate::agent_resume::AgentSessionRefKind::Id,
+                    value: "sess-abc123".into(),
+                }),
+            });
+            terminal.state = AgentState::Working;
+
+            let metadata = source.capture_handoff_metadata(now);
+            let (mut imported, imported_pane) = imported_like(&source, pane_id);
+            imported.apply_handoff_metadata(metadata, now + Duration::from_millis(400));
+
+            let id = terminal_id(&imported, imported_pane);
+            let terminal = &imported.state.terminals[&id];
+            assert_eq!(terminal.effective_agent_label(), Some("claude"));
+            assert_eq!(terminal.effective_known_agent(), Some(Agent::Claude));
+            assert_eq!(terminal.state, AgentState::Working);
+            assert_eq!(
+                terminal.effective_title().as_deref(),
+                Some("pane title from api")
+            );
+            assert_eq!(
+                terminal.effective_display_agent().as_deref(),
+                Some("shown-agent")
+            );
+            let authority = terminal.hook_authority.as_ref().expect("hook authority");
+            assert_eq!(
+                authority.session_ref.as_ref().map(|r| r.value.as_str()),
+                Some("sess-abc123"),
+                "agent session identity travels with the authority that owns it"
+            );
+            assert!(
+                !terminal.metadata_report_sequence_is_fresh("lab", Some(7)),
+                "a replayed report is still rejected after the handoff"
+            );
+        }
+
+        /// Metadata is matched by pane id, and restore may renumber panes.
+        #[test]
+        fn metadata_for_an_unknown_pane_is_dropped_rather_than_misapplied() {
+            let (source, _) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            let mut metadata = source.capture_handoff_metadata(now);
+            metadata.panes = vec![crate::handoff_metadata::PaneHandoffMetadata {
+                pane_id: 9999,
+                tokens: vec![crate::handoff_metadata::HandoffToken {
+                    name: "project".into(),
+                    value: "wrong-pane".into(),
+                    expires_in: None,
+                }],
+                agent_metadata: Vec::new(),
+                hook_authority: None,
+                agent_state: None,
+                last_agent_state_change_seq: None,
+                report_sequences: HashMap::new(),
+                hook_report_sequences: HashMap::new(),
+                report_agents: HashMap::new(),
+                token_sequence_sources: Vec::new(),
+            }];
+
+            let (mut imported, imported_pane) = app_with_one_pane();
+            imported.apply_handoff_metadata(metadata, now);
+
+            let id = terminal_id(&imported, imported_pane);
+            assert!(imported.state.terminals[&id]
+                .metadata_tokens
+                .values()
+                .is_empty());
+        }
     }
 }

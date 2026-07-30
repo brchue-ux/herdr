@@ -39,6 +39,10 @@ pub(crate) struct HandoffManifest {
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// Durable API-published metadata the session snapshot does not hold.
+    /// Defaulted so a handoff from a server that predates it still imports.
+    #[serde(default)]
+    pub metadata: crate::handoff_metadata::HandoffMetadata,
 }
 
 #[cfg(unix)]
@@ -302,6 +306,7 @@ pub(crate) fn report_owned(stream: &mut UnixStream) -> io::Result<()> {
 pub(crate) fn manifest_for(
     snapshot: crate::persist::SessionSnapshot,
     panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    metadata: crate::handoff_metadata::HandoffMetadata,
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
 ) -> HandoffManifest {
@@ -313,6 +318,7 @@ pub(crate) fn manifest_for(
         expected_protocol,
         snapshot,
         panes,
+        metadata,
     }
 }
 
@@ -461,6 +467,77 @@ fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
 }
 
 #[cfg(unix)]
-pub(crate) fn log_import_result(panes: usize) {
-    info!(panes, "handoff import ready");
+pub(crate) fn log_import_result(panes: usize, metadata: &crate::handoff_metadata::HandoffMetadata) {
+    // Metadata loss across a handoff is otherwise silent - rows just go blank -
+    // so record what came over the wire, including nothing.
+    info!(
+        panes,
+        metadata_workspaces = metadata.workspaces.len(),
+        metadata_panes = metadata.panes.len(),
+        metadata_empty = metadata.is_empty(),
+        "handoff import ready"
+    );
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A handoff can hand an old server's manifest to a new binary - that is
+    /// what an update does. The metadata section must be optional both ways:
+    /// absent on the way in, and ignored rather than fatal on the way out to a
+    /// binary that predates it.
+    #[test]
+    fn a_manifest_without_a_metadata_section_still_imports() {
+        let manifest = serde_json::json!({
+            "version": HANDOFF_VERSION,
+            "source_version": "0.7.4",
+            "source_protocol": 17,
+            "expected_version": null,
+            "expected_protocol": null,
+            "snapshot": {
+                "version": 0,
+                "workspaces": [],
+                "active": null,
+                "selected": 0,
+            },
+            "panes": [],
+        });
+
+        let manifest: HandoffManifest =
+            serde_json::from_value(manifest).expect("older manifest deserializes");
+
+        assert!(manifest.metadata.is_empty());
+        assert!(manifest.metadata.workspaces.is_empty());
+        assert!(manifest.metadata.panes.is_empty());
+    }
+
+    #[test]
+    fn a_metadata_section_round_trips_through_the_wire_form() {
+        let metadata = crate::handoff_metadata::HandoffMetadata {
+            workspaces: vec![crate::handoff_metadata::WorkspaceHandoffMetadata {
+                workspace_id: "w1".into(),
+                tokens: vec![crate::handoff_metadata::HandoffToken {
+                    name: "doing".into(),
+                    value: "Building connector".into(),
+                    expires_in: Some(std::time::Duration::from_secs(60)),
+                }],
+                token_sequences: std::collections::HashMap::from([("claude-ctx".into(), 100)]),
+            }],
+            panes: Vec::new(),
+        };
+
+        let encoded = serde_json::to_string(&metadata).expect("encode");
+        let decoded: crate::handoff_metadata::HandoffMetadata =
+            serde_json::from_str(&encoded).expect("decode");
+
+        assert_eq!(decoded.workspaces.len(), 1);
+        assert_eq!(decoded.workspaces[0].workspace_id, "w1");
+        assert_eq!(decoded.workspaces[0].tokens[0].value, "Building connector");
+        assert_eq!(
+            decoded.workspaces[0].tokens[0].expires_in,
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(decoded.workspaces[0].token_sequences["claude-ctx"], 100);
+    }
 }
