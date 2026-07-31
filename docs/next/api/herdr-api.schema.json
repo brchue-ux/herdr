@@ -603,6 +603,22 @@
             },
             {
               "properties": {
+                "exit_code": {
+                  "description": "Process exit code, absent when herdr never owned the child (adopted PTY).",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exit_signal": {
+                  "description": "Signal name when the process was terminated by a signal.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -6834,6 +6850,22 @@
             },
             {
               "properties": {
+                "exit_code": {
+                  "description": "Process exit code, absent when herdr never owned the child (adopted PTY).",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exit_signal": {
+                  "description": "Signal name when the process was terminated by a signal.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },

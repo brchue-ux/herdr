@@ -1851,7 +1851,11 @@ impl PaneRuntime {
             });
             let exit_events = events.clone();
             let on_reader_exit = Box::new(move || {
-                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied { pane_id }));
+                // An adopted PTY has no child handle, so the exit status is unknown.
+                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
+                    pane_id,
+                    exit: None,
+                }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
@@ -1948,16 +1952,24 @@ impl PaneRuntime {
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
-                match child.wait() {
+                let exit = match child.wait() {
                     Ok(status) => {
-                        let status_text = format!("{status:?}");
-                        crate::logging::pane_exited(pane_id.raw(), &status_text);
+                        let exit = crate::events::PaneExitStatus::from(status);
+                        crate::logging::pane_exited(
+                            pane_id.raw(),
+                            exit.code,
+                            exit.signal.as_deref(),
+                        );
+                        Some(exit)
                     }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
-                }
+                    Err(e) => {
+                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                        None
+                    }
+                };
                 child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
-                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
+                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id, exit })) {
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
                 }
             });

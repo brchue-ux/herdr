@@ -172,7 +172,7 @@ impl App {
             return;
         }
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self
                 .state
                 .popup_pane
@@ -199,7 +199,7 @@ impl App {
             }
         }
 
-        let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
+        let overlay_state = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.overlay_panes.remove(pane_id).map(|overlay| {
                 let was_overlay_active =
                     self.state
@@ -223,7 +223,7 @@ impl App {
             None
         };
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, exit } = &ev {
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
                 if let Some(public_pane_id) = self.public_pane_id(ws_idx, *pane_id) {
                     self.emit_event(crate::api::schema::EventEnvelope {
@@ -231,12 +231,14 @@ impl App {
                         data: crate::api::schema::EventData::PaneExited {
                             pane_id: public_pane_id,
                             workspace_id: self.public_workspace_id(ws_idx),
+                            exit_code: exit.as_ref().map(|exit| exit.code),
+                            exit_signal: exit.as_ref().and_then(|exit| exit.signal.clone()),
                         },
                     });
                 }
             }
         }
-        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id } = &ev {
+        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.find_pane(*pane_id).and_then(|(ws_idx, _)| {
                 self.layout_update_target_after_pane_removal(ws_idx, *pane_id)
             })
@@ -680,6 +682,7 @@ impl App {
                 ToastKind::NeedsAttention => "needs attention",
                 ToastKind::Finished => "finished",
                 ToastKind::UpdateInstalled => "updated",
+                ToastKind::ProcessFailed => "exited",
             };
             let workspace_label =
                 ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
@@ -705,6 +708,7 @@ impl App {
                     ToastKind::NeedsAttention => Duration::from_secs(8),
                     ToastKind::Finished => Duration::from_secs(5),
                     ToastKind::UpdateInstalled => Duration::from_secs(3),
+                    ToastKind::ProcessFailed => Duration::from_secs(8),
                 };
                 Instant::now() + duration
             });
@@ -1864,6 +1868,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            exit: None,
         });
 
         let overlay_tab = &app.state.workspaces[0].tabs[0];
@@ -1871,6 +1876,76 @@ mod tests {
         assert_eq!(overlay_tab.layout.focused(), previous_focus);
         assert!(overlay_tab.zoomed);
         assert!(app.overlay_panes.is_empty());
+    }
+
+    #[test]
+    fn pane_exited_event_carries_exit_status() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("pane-exit-status");
+        let dead_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            exit: Some(crate::events::PaneExitStatus {
+                code: 1,
+                signal: Some("Terminated".to_string()),
+            }),
+        });
+
+        let events = event_hub.events_after(0);
+        let exited = events
+            .iter()
+            .find(|(_, event)| event.event == crate::api::schema::EventKind::PaneExited)
+            .expect("pane.exited should be emitted");
+        assert!(matches!(
+            &exited.1.data,
+            crate::api::schema::EventData::PaneExited {
+                exit_code: Some(1),
+                exit_signal: Some(signal),
+                ..
+            } if signal == "Terminated"
+        ));
+    }
+
+    #[test]
+    fn pane_exited_event_omits_unknown_exit_status() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("pane-exit-unknown");
+        let dead_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            exit: None,
+        });
+
+        let events = event_hub.events_after(0);
+        let exited = events
+            .iter()
+            .find(|(_, event)| event.event == crate::api::schema::EventKind::PaneExited)
+            .expect("pane.exited should be emitted");
+        let json = serde_json::to_value(&exited.1.data).expect("serializable");
+        assert!(json.get("exit_code").is_none());
+        assert!(json.get("exit_signal").is_none());
     }
 
     #[test]
@@ -1890,7 +1965,10 @@ mod tests {
         app.state.ensure_test_terminals();
         let tab_id = app.public_tab_id(0, 0).unwrap();
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id: dead_pane });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            exit: None,
+        });
 
         let events = event_hub.events_after(0);
         let pane_exited = events
@@ -2039,6 +2117,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            exit: None,
         });
 
         let events = event_hub.events_after(0);
@@ -2064,6 +2143,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            exit: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2083,6 +2163,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            exit: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2121,7 +2202,10 @@ mod tests {
                 .expect("test session id should be valid"),
         });
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit: None,
+        });
 
         assert!(
             app.find_pane(pane_id).is_some(),

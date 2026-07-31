@@ -1335,6 +1335,8 @@ pub enum ToastKind {
     NeedsAttention,
     Finished,
     UpdateInstalled,
+    /// A pane's process ended with a failing status.
+    ProcessFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

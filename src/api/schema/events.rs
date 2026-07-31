@@ -526,6 +526,12 @@ pub enum EventData {
     PaneExited {
         pane_id: String,
         workspace_id: String,
+        /// Process exit code, absent when herdr never owned the child (adopted PTY).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<u32>,
+        /// Signal name when the process was terminated by a signal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_signal: Option<String>,
     },
     PaneAgentDetected {
         pane_id: String,
