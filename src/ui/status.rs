@@ -194,10 +194,18 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
+/// Single-cell status mark for a rolled-up agent state.
+///
+/// Every state gets a distinct glyph so the mark stays readable without colour.
+/// Colour vision deficiency, monochrome/low-contrast terminals, and reading the
+/// sidebar from across a desk all lose the red/yellow/teal channel, and three of
+/// these five states used to share `●`. `◉` and `●` match the vocabulary already
+/// used by the mobile header roll-up (`agent_summary_segments`). These stay
+/// static marks: spinners were removed deliberately for redraw cost.
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     match (state, seen) {
-        (AgentState::Blocked, _) => ("●", Style::default().fg(p.red)),
-        (AgentState::Working, _) => ("●", Style::default().fg(p.yellow)),
+        (AgentState::Blocked, _) => ("◉", Style::default().fg(p.red)),
+        (AgentState::Working, _) => ("◐", Style::default().fg(p.yellow)),
         (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
         (AgentState::Idle, true) => ("○", Style::default().fg(p.green)),
         (AgentState::Unknown, _) => ("·", Style::default().fg(p.overlay0)),
@@ -249,8 +257,8 @@ mod tests {
     fn state_dots_use_aligned_static_workspace_marks() {
         let palette = Palette::catppuccin();
         for (state, seen, symbol, color) in [
-            (AgentState::Blocked, true, "●", palette.red),
-            (AgentState::Working, true, "●", palette.yellow),
+            (AgentState::Blocked, true, "◉", palette.red),
+            (AgentState::Working, true, "◐", palette.yellow),
             (AgentState::Idle, false, "●", palette.teal),
             (AgentState::Idle, true, "○", palette.green),
             (AgentState::Unknown, true, "·", palette.overlay0),
@@ -258,6 +266,33 @@ mod tests {
             let (actual_symbol, style) = state_dot(state, seen, &palette);
             assert_eq!(actual_symbol, symbol);
             assert_eq!(style.fg, Some(color));
+        }
+    }
+
+    #[test]
+    fn state_dots_are_distinct_single_cell_glyphs() {
+        let palette = Palette::catppuccin();
+        let states = [
+            (AgentState::Blocked, true),
+            (AgentState::Working, true),
+            (AgentState::Idle, false),
+            (AgentState::Idle, true),
+            (AgentState::Unknown, true),
+        ];
+
+        let mut used: Vec<&'static str> = Vec::new();
+        for (state, seen) in states {
+            let (symbol, _) = state_dot(state, seen, &palette);
+            assert_eq!(
+                crate::ui::text::display_width(symbol),
+                1,
+                "state mark {symbol:?} must occupy exactly one cell so token layout stays aligned"
+            );
+            assert!(
+                !used.contains(&symbol),
+                "state mark {symbol:?} is reused; rolled-up state must not be encoded in colour alone"
+            );
+            used.push(symbol);
         }
     }
 
