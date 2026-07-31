@@ -1870,6 +1870,7 @@ impl HeadlessServer {
             crate::app::state::ToastKind::NeedsAttention => "needs attention",
             crate::app::state::ToastKind::Finished => "finished",
             crate::app::state::ToastKind::UpdateInstalled => "updated",
+            crate::app::state::ToastKind::ProcessFailed => "exited",
         };
         let workspace_label =
             ws.display_name_from(&self.app.state.terminals, &self.app.terminal_runtimes);
@@ -2303,8 +2304,14 @@ impl HeadlessServer {
 
                 true
             }
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, exit } => {
                 let pane_id_val = *pane_id;
+                // Built before the pane is removed and before the process-exit
+                // publish clears the agent attribution.
+                let exit_failure = self
+                    .app
+                    .state
+                    .pane_exit_failure_notification(pane_id_val, exit.as_ref());
                 let terminal_id = self.app.state.workspaces.iter().find_map(|ws| {
                     ws.tabs.iter().find_map(|tab| {
                         tab.panes
@@ -2322,6 +2329,16 @@ impl HeadlessServer {
                 }
 
                 self.app.handle_internal_event(ev);
+
+                if let Some(toast) = exit_failure {
+                    if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+                        self.send_flat_toast_to_foreground_client(
+                            toast_notify_kind(self.app.state.toast_config.delivery)
+                                .expect("toast forwarding requires a client notification kind"),
+                            format!("{}: {}", toast.title, toast.context),
+                        );
+                    }
+                }
 
                 if self.app.find_pane(pane_id_val).is_none() {
                     if let Some(terminal_id) = terminal_id {
@@ -3330,6 +3347,7 @@ impl HeadlessServer {
                             crate::app::state::ToastKind::NeedsAttention => "needs attention",
                             crate::app::state::ToastKind::Finished => "finished",
                             crate::app::state::ToastKind::UpdateInstalled => "updated",
+                            crate::app::state::ToastKind::ProcessFailed => "exited",
                         };
                         let workspace_label = self.app.state.workspaces[*ws_idx].display_name_from(
                             &self.app.state.terminals,
@@ -5913,7 +5931,12 @@ next_tab = ""
         );
         assert_eq!(server.terminal_attach_owners.get(&terminal_id), Some(&7));
 
-        assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneDied { pane_id }));
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                exit: None
+            })
+        );
 
         assert!(!server.clients.contains_key(&7));
         assert!(!server.terminal_attach_owners.contains_key(&terminal_id));

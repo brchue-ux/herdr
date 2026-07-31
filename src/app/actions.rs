@@ -199,6 +199,7 @@ fn toast_event_text(kind: ToastKind) -> &'static str {
         ToastKind::NeedsAttention => "needs attention",
         ToastKind::Finished => "finished",
         ToastKind::UpdateInstalled => "updated",
+        ToastKind::ProcessFailed => "exited",
     }
 }
 
@@ -211,7 +212,7 @@ fn sound_for_toast_kind(
         ToastKind::Finished if !suppress_active_tab_notifications => {
             Some(crate::sound::Sound::Done)
         }
-        ToastKind::Finished | ToastKind::UpdateInstalled => None,
+        ToastKind::Finished | ToastKind::UpdateInstalled | ToastKind::ProcessFailed => None,
     }
 }
 
@@ -2695,7 +2696,16 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, exit } => {
+                if matches!(
+                    self.toast_config.delivery,
+                    crate::config::ToastDelivery::Herdr
+                ) {
+                    if let Some(toast) = self.pane_exit_failure_notification(pane_id, exit.as_ref())
+                    {
+                        self.toast = Some(toast);
+                    }
+                }
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
@@ -3273,6 +3283,67 @@ impl AppState {
         }
 
         deliveries
+    }
+
+    /// Label to attribute a post-mortem toast to, for a pane that is about to be
+    /// removed.
+    ///
+    /// Reads the raw authority/detection fields rather than
+    /// `effective_agent_label`, because the process-exit publish that runs just
+    /// before this already marked the agent as recently exited.
+    fn exited_pane_agent_label(&self, pane_id: PaneId) -> Option<String> {
+        let terminal = self
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))?;
+        terminal
+            .hook_authority
+            .as_ref()
+            .map(|authority| authority.agent_label.clone())
+            .or_else(|| {
+                terminal
+                    .detected_agent
+                    .map(|agent| crate::detect::agent_label(agent).to_string())
+            })
+    }
+
+    /// Build the post-mortem notification for a pane whose process failed.
+    ///
+    /// Returns `None` unless the pane still exists, ran a known agent, and
+    /// reported a failing status. Restricting it to agent panes keeps routine
+    /// shell exits quiet; a user-closed pane is already removed from its
+    /// workspace before `PaneDied` arrives, so it does not resolve here either.
+    pub(crate) fn pane_exit_failure_notification(
+        &self,
+        pane_id: PaneId,
+        exit: Option<&crate::events::PaneExitStatus>,
+    ) -> Option<ToastNotification> {
+        let exit = exit.filter(|exit| !exit.success())?;
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.find_tab_index_for_pane(pane_id).is_some())?;
+        let agent_label = self.exited_pane_agent_label(pane_id)?;
+        let workspace_label = self.workspaces[ws_idx].display_name_from_terminals(&self.terminals);
+        Some(ToastNotification {
+            kind: ToastKind::ProcessFailed,
+            title: format!(
+                "{} {} ({})",
+                toast_agent_label(&agent_label),
+                toast_event_text(ToastKind::ProcessFailed),
+                exit.summary()
+            ),
+            context: notification_context(
+                &self.workspaces[ws_idx],
+                &workspace_label,
+                ws_idx,
+                pane_id,
+            ),
+            position: None,
+            // The pane is removed moments later, so there is nothing to focus.
+            target: None,
+        })
     }
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
@@ -5135,10 +5206,143 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
             pane_id: bg_pane_id,
+            exit: None,
         });
 
         assert!(state.pending_agent_notifications.is_empty());
         assert!(state.drain_due_agent_notifications(deadline).is_empty());
+        assert!(state.toast.is_none());
+    }
+
+    fn state_with_agent_pane() -> (AppState, PaneId) {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        state.toast = None;
+        (state, pane_id)
+    }
+
+    fn exit(code: u32, signal: Option<&str>) -> Option<crate::events::PaneExitStatus> {
+        Some(crate::events::PaneExitStatus {
+            code,
+            signal: signal.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn agent_pane_failing_exit_sets_toast_with_exit_code() {
+        let (mut state, pane_id) = state_with_agent_pane();
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: exit(137, None),
+        });
+
+        let toast = state.toast.expect("failing exit should toast");
+        assert_eq!(toast.kind, ToastKind::ProcessFailed);
+        assert!(
+            toast.title.contains("exit code 137"),
+            "unexpected title: {}",
+            toast.title
+        );
+        assert!(toast.target.is_none());
+    }
+
+    #[test]
+    fn agent_pane_signalled_exit_reports_signal_name() {
+        let (mut state, pane_id) = state_with_agent_pane();
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: exit(1, Some("Killed")),
+        });
+
+        let toast = state.toast.expect("signalled exit should toast");
+        assert!(
+            toast.title.contains("Killed"),
+            "unexpected title: {}",
+            toast.title
+        );
+    }
+
+    #[test]
+    fn agent_pane_clean_exit_does_not_toast() {
+        let (mut state, pane_id) = state_with_agent_pane();
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: exit(0, None),
+        });
+
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn unknown_exit_status_does_not_toast() {
+        let (mut state, pane_id) = state_with_agent_pane();
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: None,
+        });
+
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn non_agent_pane_failing_exit_does_not_toast() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: exit(1, None),
+        });
+
+        assert!(state.toast.is_none());
+    }
+
+    /// A user-initiated close removes the pane from its workspace before
+    /// `PaneDied` arrives, so the post-mortem must stay quiet for it.
+    #[test]
+    fn already_removed_pane_failing_exit_does_not_toast() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let pane_id = state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
+        state.ensure_test_terminals();
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        state.toast = None;
+        assert!(!state.workspaces[1].remove_pane(pane_id));
+        assert!(state.workspaces[1]
+            .find_tab_index_for_pane(pane_id)
+            .is_none());
+
+        state.handle_app_event(AppEvent::PaneDied {
+            pane_id,
+            exit: exit(1, None),
+        });
+
         assert!(state.toast.is_none());
     }
 

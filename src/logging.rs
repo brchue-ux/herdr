@@ -191,13 +191,14 @@ pub(crate) fn pane_spawned(pane_id: u32, pid: u32) {
     );
 }
 
-pub(crate) fn pane_exited(pane_id: u32, status: &str) {
+pub(crate) fn pane_exited(pane_id: u32, exit_code: u32, signal: Option<&str>) {
     tracing::info!(
         event = "pane.exit",
         subsystem = "pane",
         outcome = "completed",
         pane_id,
-        status,
+        exit_code,
+        signal,
         "pane child exited"
     );
 }

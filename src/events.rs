@@ -51,11 +51,51 @@ pub struct WorktreeRemoveResult {
     pub result: Result<(), String>,
 }
 
+/// How a pane's child process ended.
+///
+/// Mirrors `portable_pty::ExitStatus`: a signalled process reports the signal
+/// name and a synthesised code, so `signal` is the authoritative field whenever
+/// it is set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExitStatus {
+    pub code: u32,
+    pub signal: Option<String>,
+}
+
+impl PaneExitStatus {
+    pub fn success(&self) -> bool {
+        self.signal.is_none() && self.code == 0
+    }
+
+    /// Short human-readable summary, e.g. `exit code 1` or `SIGTERM`.
+    pub fn summary(&self) -> String {
+        match &self.signal {
+            Some(signal) => signal.clone(),
+            None => format!("exit code {}", self.code),
+        }
+    }
+}
+
+impl From<portable_pty::ExitStatus> for PaneExitStatus {
+    fn from(status: portable_pty::ExitStatus) -> Self {
+        Self {
+            code: status.exit_code(),
+            signal: status.signal().map(str::to_string),
+        }
+    }
+}
+
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
     /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    ///
+    /// `exit` is `None` when herdr never owned the child (an adopted PTY after a
+    /// live handoff), so the status is genuinely unknown rather than successful.
+    PaneDied {
+        pane_id: PaneId,
+        exit: Option<PaneExitStatus>,
+    },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

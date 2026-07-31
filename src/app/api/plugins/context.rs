@@ -166,6 +166,7 @@ impl App {
             | EventData::PaneExited {
                 pane_id,
                 workspace_id,
+                ..
             }
             | EventData::PaneAgentDetected {
                 pane_id,
