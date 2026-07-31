@@ -248,7 +248,7 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
-        "check" => config_check(&args[1..]),
+        "check" | "validate" => config_check(&args[1..]),
         "reset-keys" => config_reset_keys(&args[1..]),
         "help" | "--help" | "-h" => {
             print_config_help();
@@ -262,29 +262,67 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
+    let mut json = false;
     match args {
         [] => {}
         [flag] if matches!(flag.as_str(), "help" | "--help" | "-h") => {
-            eprintln!("usage: herdr config check");
+            eprintln!("usage: herdr config check [--json]");
             return Ok(0);
         }
+        [flag] if flag == "--json" => json = true,
         _ => {
-            eprintln!("usage: herdr config check");
+            eprintln!("usage: herdr config check [--json]");
             return Ok(2);
         }
     }
 
-    let diagnostics = crate::config::Config::load().diagnostics;
-    if diagnostics.is_empty() {
-        println!("config: ok");
-    } else {
-        println!("config: issues found");
-        for diagnostic in &diagnostics {
-            println!("{diagnostic}");
-        }
+    let report = crate::config::check_config();
+    let path = report.path.display().to_string();
+    let has_issues = !report.diagnostics.is_empty();
+
+    if json {
+        println!("{}", config_check_json(&report));
+        return Ok(i32::from(has_issues));
     }
 
-    Ok(i32::from(!diagnostics.is_empty()))
+    if !report.exists {
+        println!("config: no config file at {path}; using defaults");
+        println!("config: ok");
+        return Ok(0);
+    }
+
+    println!("config: {path}");
+    if has_issues {
+        println!("config: issues found");
+        for diagnostic in &report.loaded.diagnostics {
+            println!("{diagnostic}");
+        }
+    } else {
+        println!("config: ok");
+    }
+
+    Ok(i32::from(has_issues))
+}
+
+fn config_check_json(report: &crate::config::ConfigCheckReport) -> String {
+    fn diagnostic_json(diagnostic: &crate::config::LocatedDiagnostic) -> serde_json::Value {
+        serde_json::json!({
+            "message": diagnostic.message,
+            "line": diagnostic.location.map(|location| location.line),
+            "column": diagnostic.location.map(|location| location.column),
+        })
+    }
+
+    let diagnostics: Vec<serde_json::Value> =
+        report.diagnostics.iter().map(diagnostic_json).collect();
+
+    serde_json::json!({
+        "path": report.path.display().to_string(),
+        "exists": report.exists,
+        "ok": report.diagnostics.is_empty(),
+        "diagnostics": diagnostics,
+    })
+    .to_string()
 }
 
 fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
@@ -931,7 +969,8 @@ fn print_session_error(code: &str, message: &str) {
 
 fn print_config_help() {
     eprintln!("herdr config commands:");
-    eprintln!("  herdr config check  validate config.toml and print diagnostics");
+    eprintln!("  herdr config check [--json]  validate config.toml and print located diagnostics");
+    eprintln!("  herdr config validate  alias for herdr config check");
     eprintln!("  herdr config reset-keys  back up config.toml and remove custom keybindings");
 }
 

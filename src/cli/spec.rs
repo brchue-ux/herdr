@@ -137,7 +137,16 @@ fn status_command() -> Command {
 fn config_command() -> Command {
     Command::new("config")
         .about("Manage local configuration")
-        .subcommand(Command::new("check").about("Validate config.toml and print diagnostics"))
+        .subcommand(
+            Command::new("check")
+                .about("Validate config.toml and print located diagnostics")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("validate")
+                .about("Alias for herdr config check")
+                .arg(json_flag()),
+        )
         .subcommand(Command::new("reset-keys").about("Reset custom keybindings"))
 }
 

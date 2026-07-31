@@ -531,18 +531,67 @@ fn config_check_reports_ok_when_config_is_missing() {
 }
 
 #[test]
-fn config_check_rejects_json_output() {
+fn config_check_reports_located_diagnostics_as_json() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "[ui]\nmouse_capture = true\nmouse_captur = false\n",
+    )
+    .unwrap();
 
     let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check", "--json"]);
 
-    assert_eq!(checked.status.code(), Some(2));
-    assert!(checked.stdout.is_empty());
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(
+        checked.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&checked.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(report["ok"], serde_json::Value::Bool(false));
+    assert_eq!(report["exists"], serde_json::Value::Bool(true));
+    assert_eq!(report["path"], config_path.display().to_string());
     assert_eq!(
-        String::from_utf8_lossy(&checked.stderr),
-        "usage: herdr config check\n"
+        report["diagnostics"],
+        serde_json::json!([{
+            "message": "unknown config key ui.mouse_captur; ignoring key",
+            "line": 3,
+            "column": 1,
+        }])
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn config_validate_is_an_alias_for_config_check() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[ui]\nmouse_capture = true\nmouse_captur = false\n",
+    )
+    .unwrap();
+
+    let checked = run_named_cli(&config_home, &runtime_dir, &["config", "check"]);
+    let validated = run_named_cli(&config_home, &runtime_dir, &["config", "validate"]);
+
+    assert_eq!(checked.status.code(), Some(1));
+    assert_eq!(validated.status.code(), checked.status.code());
+    assert_eq!(validated.stdout, checked.stdout);
+    let stdout = String::from_utf8_lossy(&validated.stdout);
+    assert!(
+        stdout.contains("unknown config key ui.mouse_captur; ignoring key (config.toml:3:1)"),
+        "{stdout}"
     );
 
     cleanup_test_base(&base);

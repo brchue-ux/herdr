@@ -4,6 +4,7 @@
 
 ### Added
 - Tab labels can carry a rolled-up agent state dot and the tab's jump number, so a collapsed sidebar and the mobile tab list are no longer state-blind. Controlled by `ui.show_tab_state_dots` and `ui.show_tab_numbers`; both default to `"auto"`, which shows the decorations only while the sidebar is collapsed.
+- `herdr config check` now reports the resolved config path and the `line:column` each diagnostic came from, so an unknown key or an out-of-range value points at the line that has to change instead of only naming the key. `herdr config validate` is an alias, and `--json` prints `{path, ok, diagnostics[{message, line, column}]}` for editors and CI. Startup and reload diagnostics carry the same locations.
 
 ### Changed
 - Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.

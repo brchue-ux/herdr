@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
+use super::{
+    locate::{self, LocatedDiagnostic},
+    model::LoadedConfig,
+    Config, CONFIG_PATH_ENV_VAR,
+};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
@@ -102,31 +106,75 @@ fn read_optional_config(path: &Path) -> std::io::Result<Option<String>> {
 
 impl Config {
     pub fn load() -> LoadedConfig {
-        let path = config_path();
-        let content = match read_optional_config(&path) {
-            Ok(Some(content)) => content,
-            Ok(None) => {
-                return LoadedConfig {
-                    config: Self::default(),
+        load_report().loaded
+    }
+}
+
+/// A config load with per-diagnostic source locations kept intact.
+///
+/// `LoadedConfig::diagnostics` renders those locations into the message text;
+/// `diagnostics` here keeps them structured for `herdr config check`.
+pub struct ConfigCheckReport {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub loaded: LoadedConfig,
+    pub diagnostics: Vec<LocatedDiagnostic>,
+}
+
+/// Load the config file exactly as the app does, keeping diagnostic locations.
+pub fn check_config() -> ConfigCheckReport {
+    load_report()
+}
+
+fn config_file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml")
+        .to_string()
+}
+
+fn load_report() -> ConfigCheckReport {
+    let path = config_path();
+
+    let content = match read_optional_config(&path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return ConfigCheckReport {
+                path,
+                exists: false,
+                loaded: LoadedConfig {
+                    config: Config::default(),
                     diagnostics: Vec::new(),
                     invalid_sections: Vec::new(),
-                };
-            }
-            Err(err) => {
-                warn!(err = %err, "config read error, using defaults");
-                return LoadedConfig {
-                    config: Self::default(),
-                    diagnostics: vec![format!("config read error: {err}; using defaults")],
+                },
+                diagnostics: Vec::new(),
+            };
+        }
+        Err(err) => {
+            warn!(err = %err, "config read error, using defaults");
+            let message = format!("config read error: {err}; using defaults");
+            return ConfigCheckReport {
+                path,
+                exists: true,
+                loaded: LoadedConfig {
+                    config: Config::default(),
+                    diagnostics: vec![message.clone()],
                     invalid_sections: Vec::new(),
-                };
-            }
-        };
+                },
+                diagnostics: vec![LocatedDiagnostic {
+                    message,
+                    location: None,
+                }],
+            };
+        }
+    };
 
-        match deserialize_with_ignored::<Config, _>(toml::Deserializer::new(&content)) {
-            Ok((config, ignored_keys)) => {
-                let (unknown_sections, mut diagnostics) =
-                    unknown_top_level_sections_from_str(&content);
-                diagnostics.extend(unknown_config_key_diagnostics(
+    let (config, diagnostics) = match deserialize_with_ignored::<Config, _>(
+        toml::Deserializer::new(&content),
+    ) {
+        Ok((config, ignored_keys)) => {
+            let (unknown_sections, mut diagnostics) = unknown_top_level_sections_from_str(&content);
+            diagnostics.extend(unknown_config_key_diagnostics(
                     ignored_keys
                         .into_iter()
                         .filter(|path| {
@@ -135,22 +183,34 @@ impl Config {
                         .collect(),
                     None,
                 ));
-                diagnostics.extend(config.collect_diagnostics());
-                LoadedConfig {
-                    config,
-                    diagnostics,
-                    invalid_sections: Vec::new(),
-                }
-            }
-            Err(err) => {
-                warn!(err = %err, "config parse error, using defaults");
-                LoadedConfig {
-                    config: Self::default(),
-                    diagnostics: vec![format!("config parse error: {err}; using defaults")],
-                    invalid_sections: Vec::new(),
-                }
-            }
+            diagnostics.extend(config.collect_diagnostics());
+            (config, diagnostics)
         }
+        Err(err) => {
+            warn!(err = %err, "config parse error, using defaults");
+            (
+                Config::default(),
+                vec![format!("config parse error: {err}; using defaults")],
+            )
+        }
+    };
+
+    let located = locate::locate_diagnostics(&content, diagnostics);
+    let label = config_file_label(&path);
+    let rendered = located
+        .iter()
+        .map(|diagnostic| diagnostic.render(&label))
+        .collect();
+
+    ConfigCheckReport {
+        path,
+        exists: true,
+        loaded: LoadedConfig {
+            config,
+            diagnostics: rendered,
+            invalid_sections: Vec::new(),
+        },
+        diagnostics: located,
     }
 }
 
@@ -177,11 +237,7 @@ pub fn config_diagnostic_summary(diagnostics: &[String]) -> Option<String> {
         return None;
     }
 
-    let target = config_path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml")
-        .to_string();
+    let target = config_file_label(&config_path());
     let read_error = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.starts_with("config read error:"));
@@ -232,10 +288,10 @@ pub fn load_live_config() -> Result<LoadedConfig, Vec<String>> {
             )]);
         }
     };
-    load_live_config_from_str(&content)
+    load_live_config_from_str(&content, &config_file_label(&path))
 }
 
-fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
+fn load_live_config_from_str(content: &str, file_label: &str) -> Result<LoadedConfig, Vec<String>> {
     let value = content
         .parse::<toml::Value>()
         .map_err(|err| vec![format!("config parse error: {err}; keeping current config")])?;
@@ -340,6 +396,11 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.remote = section,
     );
+
+    let diagnostics = locate::locate_diagnostics(content, diagnostics)
+        .iter()
+        .map(|diagnostic| diagnostic.render(file_label))
+        .collect();
 
     Ok(LoadedConfig {
         config,
@@ -855,6 +916,7 @@ mod tests {
 [session]
 resume_agents_on_restore = true
 "#,
+            "config.toml",
         )
         .unwrap();
 
@@ -873,12 +935,13 @@ delivery = "system"
 [ui.toast]
 delivery = "herdr"
 "#,
+            "config.toml",
         )
         .unwrap();
 
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown config section [toast]; did you mean [ui.toast]? ignoring section"]
+            vec!["unknown config section [toast]; did you mean [ui.toast]? ignoring section (config.toml:2:2)"]
         );
         assert!(loaded.invalid_sections.is_empty());
         assert_eq!(
@@ -921,20 +984,21 @@ delivry = "system"
 [ui.sidebar.agents.rows_by_agent]
 claude = [["terminal_title"]]
 "##,
+            "config.toml",
         )
         .unwrap();
 
         assert_eq!(
             loaded.diagnostics,
             vec![
-                "unknown config key plugin; ignoring key",
-                "unknown config key theme.custom.accentt; ignoring key",
-                "unknown config key keys.command.0.descrption; ignoring key",
-                "unknown config key keys.new_tabb; ignoring key",
-                "unknown config key ui.\"foo.?.bar\"; ignoring key",
-                "unknown config key ui.\"foo.bar\"; ignoring key",
-                "unknown config key ui.mouse_captur; ignoring key",
-                "unknown config key ui.toast.delivry; ignoring key",
+                "unknown config key plugin; ignoring key (config.toml:2:1)",
+                "unknown config key theme.custom.accentt; ignoring key (config.toml:5:1)",
+                "unknown config key keys.command.0.descrption; ignoring key (config.toml:17:1)",
+                "unknown config key keys.new_tabb; ignoring key (config.toml:12:1)",
+                "unknown config key ui.\"foo.?.bar\"; ignoring key (config.toml:23:1)",
+                "unknown config key ui.\"foo.bar\"; ignoring key (config.toml:22:1)",
+                "unknown config key ui.mouse_captur; ignoring key (config.toml:21:1)",
+                "unknown config key ui.toast.delivry; ignoring key (config.toml:27:1)",
             ]
         );
         assert!(loaded.invalid_sections.is_empty());
@@ -961,6 +1025,7 @@ claude = [["terminal_title"]]
 mouse_capture = "yes"
 mouse_captur = true
 "#,
+            "config.toml",
         )
         .unwrap();
 
@@ -994,7 +1059,10 @@ delivery = "system"
 
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown config section [[plugin]]; ignoring section"]
+            vec![format!(
+                "unknown config section [[plugin]]; ignoring section ({}:2:3)",
+                config_file_label(&path)
+            )]
         );
         assert_eq!(
             loaded.config.ui.toast.delivery,
@@ -1003,6 +1071,73 @@ delivery = "system"
 
         std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_config_reports_located_diagnostics_and_the_resolved_path() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-check-{}-{}.toml",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(
+            &path,
+            "[ui]\nsidebar_min_width = 90\nsidebar_max_width = 40\nmouse_captur = true\n",
+        )
+        .unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let report = check_config();
+
+        assert_eq!(report.path, path);
+        assert!(report.exists);
+        let located: Vec<(String, Option<usize>)> = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.message.clone(),
+                    diagnostic.location.map(|location| location.line),
+                )
+            })
+            .collect();
+        assert_eq!(
+            located,
+            vec![
+                (
+                    "unknown config key ui.mouse_captur; ignoring key".to_string(),
+                    Some(4)
+                ),
+                (
+                    "ui.sidebar_min_width (90) is greater than sidebar_max_width (40)".to_string(),
+                    Some(2)
+                ),
+            ]
+        );
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn check_config_reports_a_missing_config_without_diagnostics() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-absent-{}-{}.toml",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let report = check_config();
+
+        assert!(!report.exists);
+        assert!(report.diagnostics.is_empty());
+        assert!(report.loaded.diagnostics.is_empty());
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
     }
 
     #[test]
