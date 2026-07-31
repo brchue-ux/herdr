@@ -151,6 +151,50 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(check.CheckError, "exceeds engine"):
                 check.load_manifest_dir(bundled, engine_version=1)
 
+    def test_accepts_transcript_region_at_its_engine_floor(self):
+        floor = check.transcript_region_engine_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            content = manifest("codex", "2026.06.10.1").replace(
+                "min_engine_version = 1",
+                f'min_engine_version = {floor}\ntranscript_region = "above_prompt_box"',
+            )
+            (bundled / "codex.toml").write_text(content)
+
+            loaded = check.load_manifest_dir(bundled, engine_version=floor)
+            self.assertEqual(loaded["codex"][1]["transcript_region"], "above_prompt_box")
+
+    def test_rejects_transcript_region_below_its_engine_floor(self):
+        floor = check.transcript_region_engine_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            content = manifest("codex", "2026.06.10.1").replace(
+                "min_engine_version = 1",
+                f'min_engine_version = {floor - 1}\ntranscript_region = "above_prompt_box"',
+            )
+            (bundled / "codex.toml").write_text(content)
+
+            with self.assertRaisesRegex(
+                check.CheckError, f"transcript_region requires min_engine_version {floor}"
+            ):
+                check.load_manifest_dir(bundled, engine_version=floor)
+
+    def test_rejects_unknown_transcript_region(self):
+        floor = check.transcript_region_engine_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            content = manifest("codex", "2026.06.10.1").replace(
+                "min_engine_version = 1",
+                f'min_engine_version = {floor}\ntranscript_region = "not_a_region"',
+            )
+            (bundled / "codex.toml").write_text(content)
+
+            with self.assertRaisesRegex(check.CheckError, "is not a known region"):
+                check.load_manifest_dir(bundled, engine_version=floor)
+
     def test_rejects_top_non_empty_lines_below_engine_three(self):
         with tempfile.TemporaryDirectory() as tmp:
             bundled = Path(tmp) / "bundled"

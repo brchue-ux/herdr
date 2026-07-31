@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.07.18.1"
+version = "2026.07.31.1"
 min_engine_version = 4
-updated_at = "2026-07-18T00:00:00Z"
+updated_at = "2026-07-31T00:00:00Z"
 
 # Everything above the current `›` composer line.
 transcript_region = "before_current_prompt_marker"
