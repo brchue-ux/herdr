@@ -203,6 +203,13 @@ manual testing, reset `C:\work\repo` back to a clean checkout before finishing.
 
 Agent detection changes should use the manifest hot-reload loop. Use the project-local `herdr-throwaway-repro` skill to create a disposable named session and drive the real agent UI through Herdr's CLI/API into the target state. Read the pane with `herdr agent read <pane> --source detection --format text` and inspect matching with `herdr agent explain <pane> --json`. Update the bundled manifest in `src/detect/manifests/<agent>.toml`, copy that manifest to the local override path at `~/.config/herdr/agent-detection/<agent>.toml`, then run `herdr server reload-agent-manifests` against the session under test. Before writing the override, check whether one already exists; never overwrite or remove a pre-existing override without alignment. Once the rule is correct, remove the temporary override or restore the previous one exactly so the committed bundled manifest remains the source of truth.
 
+A new manifest capability is gated in four places that must move together: the
+per-feature `*_ENGINE_VERSION` constant and `MANIFEST_ENGINE_VERSION` in
+`src/detect/`, the mirrored constant in `scripts/agent_detection_manifest_check.py`,
+and the manifest's own `min_engine_version`. Raising a bundled manifest past the
+engine the website publishes also needs its `STAGED_WEBSITE_MANIFESTS` entry
+updated, or every client below that engine rejects the remote manifest outright.
+
 Do not add large agent-specific full-screen fixture suites for routine manifest tuning. Keep Rust tests focused on manifest parsing, rule semantics, skip-state semantics, source precedence, cache reload behavior, and update flow. Use live pane reads for agent-specific screen evidence.
 
 ## Vendored libghostty-vt
