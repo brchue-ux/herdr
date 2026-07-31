@@ -7,9 +7,9 @@ use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
 use super::panes::{
-    LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
-    PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
-    PaneSwapResult, PaneZoomResult,
+    LayoutArrangement, LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo,
+    PaneLayoutSnapshot, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
+    PaneResizeResult, PaneSwapResult, PaneZoomResult,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -145,6 +145,11 @@ pub enum ResponseResult {
         layout: LayoutDescription,
     },
     LayoutSplitRatioSet {
+        layout: LayoutDescription,
+    },
+    LayoutArrange {
+        /// The arrangement that was applied, never `next`/`previous`.
+        arrangement: LayoutArrangement,
         layout: LayoutDescription,
     },
     PaneNeighbor {

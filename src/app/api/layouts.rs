@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
+    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutArrangeParams, LayoutArrangement,
+    LayoutDescription, LayoutExportParams, LayoutNode, LayoutPane, LayoutSetSplitRatioParams,
+    ResponseResult, SplitDirection,
 };
+use crate::app::actions::LayoutArrangeStep;
 use crate::app::{App, Mode};
-use crate::layout::{Node, PaneId};
+use crate::layout::{Arrangement, Node, PaneId};
 use crate::workspace::NewPane;
 
 use super::responses::{encode_error, encode_success};
@@ -246,6 +248,47 @@ impl App {
         };
         self.emit_layout_updated_event(ws_idx, tab_idx);
         encode_success(id, ResponseResult::LayoutSplitRatioSet { layout })
+    }
+
+    /// Rearrange a tab's existing panes into a built-in arrangement. Unlike
+    /// `layout.apply` this never creates, closes, or relaunches a pane.
+    pub(super) fn handle_layout_arrange(
+        &mut self,
+        id: String,
+        params: LayoutArrangeParams,
+    ) -> String {
+        let Some((ws_idx, tab_idx)) = self.resolve_layout_export_target(&LayoutExportParams {
+            tab_id: params.tab_id,
+            pane_id: params.pane_id,
+        }) else {
+            return encode_error(id, "layout_not_found", "layout target not found");
+        };
+
+        let step = match params.arrangement {
+            LayoutArrangement::Next => LayoutArrangeStep::Next,
+            LayoutArrangement::Previous => LayoutArrangeStep::Previous,
+            other => match arrangement_from_api(other) {
+                Some(arrangement) => LayoutArrangeStep::Exact(arrangement),
+                None => return encode_error(id, "invalid_layout", "unknown arrangement"),
+            },
+        };
+
+        let Some(applied) = self.state.arrange_tab_layout(ws_idx, tab_idx, step) else {
+            return encode_error(id, "layout_not_found", "layout target not found");
+        };
+
+        self.schedule_session_save();
+        let Some(layout) = self.layout_description(ws_idx, tab_idx) else {
+            return encode_error(id, "layout_not_found", "layout unavailable");
+        };
+        self.emit_layout_updated_event(ws_idx, tab_idx);
+        encode_success(
+            id,
+            ResponseResult::LayoutArrange {
+                arrangement: arrangement_to_api(applied),
+                layout,
+            },
+        )
     }
 
     fn resolve_layout_export_target(&self, params: &LayoutExportParams) -> Option<(usize, usize)> {
@@ -506,6 +549,28 @@ impl App {
             self.state.remove_unattached_terminal_ids(terminal_ids);
             self.shutdown_detached_terminal_runtimes();
         }
+    }
+}
+
+/// `None` for the relative steps, which are not arrangements themselves.
+fn arrangement_from_api(arrangement: LayoutArrangement) -> Option<Arrangement> {
+    match arrangement {
+        LayoutArrangement::EvenHorizontal => Some(Arrangement::EvenHorizontal),
+        LayoutArrangement::EvenVertical => Some(Arrangement::EvenVertical),
+        LayoutArrangement::MainVertical => Some(Arrangement::MainVertical),
+        LayoutArrangement::MainHorizontal => Some(Arrangement::MainHorizontal),
+        LayoutArrangement::Tiled => Some(Arrangement::Tiled),
+        LayoutArrangement::Next | LayoutArrangement::Previous => None,
+    }
+}
+
+fn arrangement_to_api(arrangement: Arrangement) -> LayoutArrangement {
+    match arrangement {
+        Arrangement::EvenHorizontal => LayoutArrangement::EvenHorizontal,
+        Arrangement::EvenVertical => LayoutArrangement::EvenVertical,
+        Arrangement::MainVertical => LayoutArrangement::MainVertical,
+        Arrangement::MainHorizontal => LayoutArrangement::MainHorizontal,
+        Arrangement::Tiled => LayoutArrangement::Tiled,
     }
 }
 
@@ -899,6 +964,119 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "invalid_layout");
         assert_eq!(app.state.workspaces[0].tabs.len(), original_tab_count);
+    }
+
+    #[tokio::test]
+    async fn layout_arrange_rebuilds_existing_panes_without_touching_terminals() {
+        let mut app = app_with_workspace();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let second = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let third = app.state.workspaces[0].test_split(Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[0].layout.focus_pane(second);
+        app.state.workspaces[0].tabs[0].zoomed = true;
+        let terminals_before: Vec<_> = [root, second, third]
+            .iter()
+            .map(|pane| {
+                app.state.workspaces[0].tabs[0]
+                    .terminal_id(*pane)
+                    .cloned()
+                    .expect("pane has a terminal")
+            })
+            .collect();
+
+        let response = app.handle_layout_arrange(
+            "req".into(),
+            LayoutArrangeParams {
+                tab_id: None,
+                pane_id: None,
+                arrangement: LayoutArrangement::EvenVertical,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::LayoutArrange {
+            arrangement,
+            layout,
+        } = success.result
+        else {
+            panic!("expected layout arrange response");
+        };
+        assert_eq!(arrangement, LayoutArrangement::EvenVertical);
+        assert!(!layout.zoomed, "arranging should clear zoom");
+        assert_eq!(
+            layout.focused_pane_id,
+            app.public_pane_id(0, second).unwrap()
+        );
+
+        let tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(tab.layout.pane_ids(), vec![root, second, third]);
+        assert_eq!(tab.panes.len(), 3);
+        let terminals_after: Vec<_> = [root, second, third]
+            .iter()
+            .map(|pane| tab.terminal_id(*pane).cloned().expect("pane kept terminal"))
+            .collect();
+        assert_eq!(terminals_before, terminals_after);
+        assert!(matches!(
+            &app.event_hub.events_after(0).last().expect("layout event").1.data,
+            EventData::LayoutUpdated { layout }
+                if layout.tab_id == app.public_tab_id(0, 0).unwrap()
+                    && layout.panes.len() == 3
+        ));
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn layout_arrange_next_walks_the_built_in_list_and_clears_zoom() {
+        let mut app = app_with_workspace();
+        app.state.workspaces[0].test_split(Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        app.state.workspaces[0].tabs[0].zoomed = true;
+
+        let mut applied = Vec::new();
+        for _ in 0..Arrangement::ALL.len() + 1 {
+            let response = app.handle_layout_arrange(
+                "req".into(),
+                LayoutArrangeParams {
+                    tab_id: None,
+                    pane_id: None,
+                    arrangement: LayoutArrangement::Next,
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::LayoutArrange { arrangement, .. } = success.result else {
+                panic!("expected layout arrange response");
+            };
+            applied.push(arrangement);
+        }
+
+        let mut expected: Vec<LayoutArrangement> = Arrangement::ALL
+            .iter()
+            .copied()
+            .map(arrangement_to_api)
+            .collect();
+        expected.push(arrangement_to_api(Arrangement::ALL[0]));
+        assert_eq!(applied, expected);
+        assert!(!app.state.workspaces[0].tabs[0].zoomed);
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn layout_arrange_reports_an_unknown_target() {
+        let mut app = app_with_workspace();
+
+        let response = app.handle_layout_arrange(
+            "req".into(),
+            LayoutArrangeParams {
+                tab_id: Some("w9:t9".into()),
+                pane_id: None,
+                arrangement: LayoutArrangement::Tiled,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "layout_not_found");
+        shutdown_test_runtimes(&mut app);
     }
 
     #[test]

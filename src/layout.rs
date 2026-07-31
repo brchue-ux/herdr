@@ -80,10 +80,67 @@ pub enum Node {
     },
 }
 
+/// A built-in pane arrangement, listed in the order `cycle_arrangement` steps
+/// through. Applying one rebuilds the split tree from the panes that already
+/// exist; it never creates or closes a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Arrangement {
+    /// Every pane in one row, left to right.
+    EvenHorizontal,
+    /// Every pane in one column, top to bottom.
+    EvenVertical,
+    /// The first pane fills the left half; the rest stack down the right half.
+    MainVertical,
+    /// The first pane fills the top half; the rest sit side by side below.
+    MainHorizontal,
+    /// A grid, filled row by row.
+    Tiled,
+}
+
+impl Arrangement {
+    /// Cycle order, matching the order tmux's `next-layout` walks.
+    pub const ALL: [Arrangement; 5] = [
+        Arrangement::EvenHorizontal,
+        Arrangement::EvenVertical,
+        Arrangement::MainVertical,
+        Arrangement::MainHorizontal,
+        Arrangement::Tiled,
+    ];
+
+    /// Stable wire/UI name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Arrangement::EvenHorizontal => "even-horizontal",
+            Arrangement::EvenVertical => "even-vertical",
+            Arrangement::MainVertical => "main-vertical",
+            Arrangement::MainHorizontal => "main-horizontal",
+            Arrangement::Tiled => "tiled",
+        }
+    }
+
+    fn index(self) -> usize {
+        Arrangement::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0)
+    }
+
+    /// The arrangement after (or before) this one, wrapping around.
+    pub fn step(self, forward: bool) -> Self {
+        let len = Arrangement::ALL.len();
+        let offset = if forward { 1 } else { len - 1 };
+        Arrangement::ALL[(self.index() + offset) % len]
+    }
+}
+
 /// BSP tiling layout. Tracks a tree of splits and a focused pane.
 pub struct TileLayout {
     root: Node,
     focus: PaneId,
+    /// Last built-in arrangement applied to this tree, if any. Purely the
+    /// cursor for `cycle_arrangement`; the tree stays the source of truth, so
+    /// this is deliberately not persisted and resets on restore.
+    arrangement: Option<Arrangement>,
 }
 
 impl TileLayout {
@@ -95,9 +152,32 @@ impl TileLayout {
             Self {
                 root: Node::Pane(root_id),
                 focus: root_id,
+                arrangement: None,
             },
             root_id,
         )
+    }
+
+    /// Rebuild the tree into `arrangement`. Pane ids, their current order, and
+    /// the focused pane are all preserved; only splits and ratios change.
+    pub fn apply_arrangement(&mut self, arrangement: Arrangement) {
+        let ids = self.pane_ids();
+        if let Some(root) = build_arrangement(arrangement, &ids) {
+            self.root = root;
+        }
+        self.arrangement = Some(arrangement);
+    }
+
+    /// Apply the arrangement after (or before) the current one and return it.
+    /// A tree that has never been arranged starts at the head of the list.
+    pub fn cycle_arrangement(&mut self, forward: bool) -> Arrangement {
+        let next = match self.arrangement {
+            Some(current) => current.step(forward),
+            None if forward => Arrangement::ALL[0],
+            None => Arrangement::ALL[Arrangement::ALL.len() - 1],
+        };
+        self.apply_arrangement(next);
+        next
     }
 
     pub fn focused(&self) -> PaneId {
@@ -270,7 +350,11 @@ impl TileLayout {
     /// Reconstruct a layout from a saved tree.
     /// Reconstruct a layout from a saved tree.
     pub fn from_saved(root: Node, focus: PaneId) -> Self {
-        Self { root, focus }
+        Self {
+            root,
+            focus,
+            arrangement: None,
+        }
     }
 }
 
@@ -543,6 +627,105 @@ fn split_at(
             first: Box::new(split_at(*first, target, direction, new_id, split_ratio)),
             second: Box::new(split_at(*second, target, direction, new_id, split_ratio)),
         },
+    }
+}
+
+/// Build the split tree for `arrangement` over `ids`, in order.
+/// `None` only when `ids` is empty, which a live tree never is.
+fn build_arrangement(arrangement: Arrangement, ids: &[PaneId]) -> Option<Node> {
+    let (first, rest) = ids.split_first()?;
+    Some(match arrangement {
+        Arrangement::EvenHorizontal => even_chain(*first, rest, Direction::Horizontal),
+        Arrangement::EvenVertical => even_chain(*first, rest, Direction::Vertical),
+        Arrangement::MainVertical => main_chain(*first, rest, Direction::Horizontal),
+        Arrangement::MainHorizontal => main_chain(*first, rest, Direction::Vertical),
+        Arrangement::Tiled => tiled_grid(ids)?,
+    })
+}
+
+/// Right-leaning chain that gives every pane an equal share of `direction`.
+fn even_chain(first: PaneId, rest: &[PaneId], direction: Direction) -> Node {
+    match rest.split_first() {
+        None => Node::Pane(first),
+        Some((next, tail)) => Node::Split {
+            direction,
+            // `first` takes one slot out of the panes still to be placed.
+            ratio: 1.0 / (rest.len() + 1) as f32,
+            first: Box::new(Node::Pane(first)),
+            second: Box::new(even_chain(*next, tail, direction)),
+        },
+    }
+}
+
+/// One main pane taking half of `direction`, with the rest evenly sharing the
+/// other half across the perpendicular axis.
+fn main_chain(main: PaneId, rest: &[PaneId], direction: Direction) -> Node {
+    match rest.split_first() {
+        None => Node::Pane(main),
+        Some((next, tail)) => Node::Split {
+            direction,
+            ratio: 0.5,
+            first: Box::new(Node::Pane(main)),
+            second: Box::new(even_chain(*next, tail, perpendicular(direction))),
+        },
+    }
+}
+
+/// Grid filled row by row, with `columns_for_tiled` columns and equal-height
+/// rows. Earlier rows absorb the remainder, so they are the wider ones.
+/// `None` only when `ids` is empty.
+fn tiled_grid(ids: &[PaneId]) -> Option<Node> {
+    if ids.is_empty() {
+        return None;
+    }
+    let columns = columns_for_tiled(ids.len());
+    let rows = ids.len().div_ceil(columns);
+    // `rows <= ids.len()`, so every row gets at least one pane.
+    let base = ids.len() / rows;
+    let extra = ids.len() % rows;
+
+    let mut row_nodes = Vec::with_capacity(rows);
+    let mut offset = 0;
+    for row in 0..rows {
+        let len = base + usize::from(row < extra);
+        if let Some((first, rest)) = ids[offset..offset + len].split_first() {
+            row_nodes.push(even_chain(*first, rest, Direction::Horizontal));
+        }
+        offset += len;
+    }
+    stack_rows(row_nodes)
+}
+
+/// Stack row subtrees vertically at equal heights.
+fn stack_rows(mut rows: Vec<Node>) -> Option<Node> {
+    let total = rows.len();
+    let mut stacked = rows.pop()?;
+    while let Some(row) = rows.pop() {
+        // `rows.len()` rows are still unplaced above this one.
+        let remaining = total - rows.len();
+        stacked = Node::Split {
+            direction: Direction::Vertical,
+            ratio: 1.0 / remaining as f32,
+            first: Box::new(row),
+            second: Box::new(stacked),
+        };
+    }
+    Some(stacked)
+}
+
+/// Smallest `c` with `c * c >= n`, i.e. `ceil(sqrt(n))` without floats.
+fn columns_for_tiled(n: usize) -> usize {
+    let mut columns = 1;
+    while columns * columns < n {
+        columns += 1;
+    }
+    columns
+}
+
+fn perpendicular(direction: Direction) -> Direction {
+    match direction {
+        Direction::Horizontal => Direction::Vertical,
+        Direction::Vertical => Direction::Horizontal,
     }
 }
 
@@ -953,5 +1136,188 @@ mod tests {
             find_in_direction(&focused, NavDirection::Left, &panes),
             Some(pane(3))
         );
+    }
+
+    fn layout_of(count: u32) -> TileLayout {
+        let ids: Vec<PaneId> = (1..=count).map(pane).collect();
+        let root = build_arrangement(Arrangement::EvenHorizontal, &ids)
+            .expect("non-empty pane list builds a tree");
+        TileLayout::from_saved(root, pane(1))
+    }
+
+    /// Rects in reading order: top to bottom, then left to right.
+    fn ordered_rects(layout: &TileLayout, area: Rect) -> Vec<(PaneId, Rect)> {
+        let mut rects: Vec<(PaneId, Rect)> = layout
+            .panes(area)
+            .into_iter()
+            .map(|info| (info.id, info.rect))
+            .collect();
+        rects.sort_by_key(|(_, rect)| (rect.y, rect.x));
+        rects
+    }
+
+    #[test]
+    fn arrangements_preserve_pane_set_order_and_focus() {
+        for arrangement in Arrangement::ALL {
+            let mut layout = layout_of(5);
+            layout.focus_pane(pane(4));
+            layout.apply_arrangement(arrangement);
+
+            assert_eq!(
+                layout.pane_ids(),
+                vec![pane(1), pane(2), pane(3), pane(4), pane(5)],
+                "{} changed the pane list",
+                arrangement.label()
+            );
+            assert_eq!(layout.focused(), pane(4), "{}", arrangement.label());
+            assert_eq!(layout.arrangement, Some(arrangement));
+        }
+    }
+
+    #[test]
+    fn even_horizontal_gives_every_pane_an_equal_column() {
+        let mut layout = layout_of(4);
+        layout.apply_arrangement(Arrangement::EvenHorizontal);
+
+        let rects = ordered_rects(&layout, Rect::new(0, 0, 100, 40));
+        assert_eq!(
+            rects
+                .iter()
+                .map(|(_, rect)| (rect.x, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 25, 40), (25, 25, 40), (50, 25, 40), (75, 25, 40)]
+        );
+    }
+
+    #[test]
+    fn even_vertical_gives_every_pane_an_equal_row() {
+        let mut layout = layout_of(4);
+        layout.apply_arrangement(Arrangement::EvenVertical);
+
+        let rects = ordered_rects(&layout, Rect::new(0, 0, 100, 40));
+        assert_eq!(
+            rects
+                .iter()
+                .map(|(_, rect)| (rect.y, rect.height, rect.width))
+                .collect::<Vec<_>>(),
+            vec![(0, 10, 100), (10, 10, 100), (20, 10, 100), (30, 10, 100)]
+        );
+    }
+
+    #[test]
+    fn main_vertical_keeps_the_first_pane_on_the_left_half() {
+        let mut layout = layout_of(3);
+        layout.apply_arrangement(Arrangement::MainVertical);
+
+        let area = Rect::new(0, 0, 100, 40);
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(1)),
+            Rect::new(0, 0, 50, 40)
+        );
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(2)),
+            Rect::new(50, 0, 50, 20)
+        );
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(3)),
+            Rect::new(50, 20, 50, 20)
+        );
+    }
+
+    #[test]
+    fn main_horizontal_keeps_the_first_pane_on_the_top_half() {
+        let mut layout = layout_of(3);
+        layout.apply_arrangement(Arrangement::MainHorizontal);
+
+        let area = Rect::new(0, 0, 100, 40);
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(1)),
+            Rect::new(0, 0, 100, 20)
+        );
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(2)),
+            Rect::new(0, 20, 50, 20)
+        );
+        assert_eq!(
+            pane_rect_in(&layout, area, pane(3)),
+            Rect::new(50, 20, 50, 20)
+        );
+    }
+
+    #[test]
+    fn tiled_fills_rows_first_and_puts_the_remainder_on_top() {
+        let mut layout = layout_of(5);
+        layout.apply_arrangement(Arrangement::Tiled);
+
+        let rects = ordered_rects(&layout, Rect::new(0, 0, 120, 40));
+        assert_eq!(
+            rects,
+            vec![
+                (pane(1), Rect::new(0, 0, 40, 20)),
+                (pane(2), Rect::new(40, 0, 40, 20)),
+                (pane(3), Rect::new(80, 0, 40, 20)),
+                (pane(4), Rect::new(0, 20, 60, 20)),
+                (pane(5), Rect::new(60, 20, 60, 20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn tiled_column_count_is_ceil_sqrt() {
+        assert_eq!(columns_for_tiled(1), 1);
+        assert_eq!(columns_for_tiled(2), 2);
+        assert_eq!(columns_for_tiled(4), 2);
+        assert_eq!(columns_for_tiled(5), 3);
+        assert_eq!(columns_for_tiled(9), 3);
+        assert_eq!(columns_for_tiled(10), 4);
+    }
+
+    #[test]
+    fn cycling_walks_the_built_in_list_and_wraps_both_ways() {
+        let mut layout = layout_of(3);
+        assert_eq!(layout.arrangement, None);
+
+        let forward: Vec<Arrangement> = (0..6).map(|_| layout.cycle_arrangement(true)).collect();
+        let mut expected = Arrangement::ALL.to_vec();
+        expected.push(Arrangement::ALL[0]);
+        assert_eq!(forward, expected);
+
+        let backward: Vec<Arrangement> = (0..2).map(|_| layout.cycle_arrangement(false)).collect();
+        assert_eq!(
+            backward,
+            vec![
+                Arrangement::ALL[Arrangement::ALL.len() - 1],
+                Arrangement::ALL[Arrangement::ALL.len() - 2],
+            ]
+        );
+    }
+
+    #[test]
+    fn cycling_a_single_pane_layout_is_a_structural_no_op() {
+        let mut layout = TileLayout::from_saved(Node::Pane(pane(1)), pane(1));
+        for _ in 0..Arrangement::ALL.len() {
+            layout.cycle_arrangement(true);
+            assert_eq!(layout.pane_ids(), vec![pane(1)]);
+            assert!(matches!(layout.root(), Node::Pane(id) if *id == pane(1)));
+        }
+    }
+
+    #[test]
+    fn a_manual_split_does_not_strand_the_cycle_cursor() {
+        let mut layout = layout_of(2);
+        layout.apply_arrangement(Arrangement::Tiled);
+        layout.split_focused(Direction::Vertical);
+
+        // The tree no longer matches `Tiled`, but the cursor still advances.
+        assert_eq!(layout.cycle_arrangement(true), Arrangement::ALL[0]);
+        assert_eq!(layout.pane_count(), 3);
+    }
+
+    fn pane_rect_in(layout: &TileLayout, area: Rect, pane_id: PaneId) -> Rect {
+        layout
+            .panes(area)
+            .into_iter()
+            .find_map(|info| (info.id == pane_id).then_some(info.rect))
+            .expect("pane should exist")
     }
 }

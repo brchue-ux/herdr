@@ -7,9 +7,9 @@ use tracing::{info, warn};
 
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
-use crate::layout::PaneId;
 #[cfg(test)]
 use crate::layout::{find_in_direction, NavDirection};
+use crate::layout::{Arrangement, PaneId};
 use crate::selection::Selection;
 use crate::terminal::{EffectiveStateChange, TerminalStateMutation};
 use crate::workspace::WorkspaceGitStatus;
@@ -1757,6 +1757,14 @@ pub(crate) enum PaneZoomCommand {
     Off,
 }
 
+/// How `arrange_tab_layout` picks the arrangement to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutArrangeStep {
+    Exact(Arrangement),
+    Next,
+    Previous,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneZoomNoopReason {
     SinglePane,
@@ -1947,6 +1955,42 @@ impl AppState {
             reason: None,
             zoomed,
         })
+    }
+
+    /// Rebuild a tab's existing panes into a built-in arrangement, or step
+    /// through the built-in list. Pane ids, their order, and focus survive;
+    /// zoom is cleared so the new arrangement is actually visible, which is
+    /// what tmux's `next-layout` does too. Returns the arrangement applied.
+    pub(crate) fn arrange_tab_layout(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        step: LayoutArrangeStep,
+    ) -> Option<Arrangement> {
+        let tab = self
+            .workspaces
+            .get_mut(ws_idx)
+            .and_then(|ws| ws.tabs.get_mut(tab_idx))?;
+        let applied = match step {
+            LayoutArrangeStep::Exact(arrangement) => {
+                tab.layout.apply_arrangement(arrangement);
+                arrangement
+            }
+            LayoutArrangeStep::Next => tab.layout.cycle_arrangement(true),
+            LayoutArrangeStep::Previous => tab.layout.cycle_arrangement(false),
+        };
+        tab.zoomed = false;
+        self.mark_session_dirty();
+        info!(arrangement = applied.label(), "arranged tab layout");
+        Some(applied)
+    }
+
+    /// Cycle the active tab of the active workspace to the next arrangement.
+    #[cfg(test)]
+    pub(crate) fn cycle_active_layout_arrangement(&mut self) -> Option<Arrangement> {
+        let ws_idx = self.active?;
+        let tab_idx = self.workspaces.get(ws_idx)?.active_tab_index();
+        self.arrange_tab_layout(ws_idx, tab_idx, LayoutArrangeStep::Next)
     }
 
     #[cfg(test)]

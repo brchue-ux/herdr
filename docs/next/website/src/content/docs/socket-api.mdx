@@ -105,7 +105,7 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
-| Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
+| Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio`, `layout.arrange` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
@@ -252,6 +252,20 @@ is `type: "layout_split_ratio_set"` with the updated portable `layout`.
 
 ```json
 {"id":"req_ratio","method":"layout.set_split_ratio","params":{"tab_id":"w1:t1","path":[],"ratio":0.6}}
+```
+
+`layout.arrange` rebuilds a tab's existing panes into a built-in arrangement.
+Unlike `layout.apply` it never creates, closes, or relaunches a pane: pane ids,
+their order, and the focused pane all survive, and only the splits and ratios
+change. Zoom is cleared so the new arrangement is visible. `arrangement` accepts
+`even_horizontal`, `even_vertical`, `main_vertical`, `main_horizontal`, `tiled`,
+or the relative steps `next` and `previous`, which walk that list in order from
+the last arrangement applied to the tab. The response is `type:
+"layout_arrange"` with the concrete `arrangement` that was applied and the
+updated portable `layout`.
+
+```json
+{"id":"req_arrange","method":"layout.arrange","params":{"tab_id":"w1:t1","arrangement":"next"}}
 ```
 
 Process-launching methods accept an `env` object. Herdr applies those key/value
