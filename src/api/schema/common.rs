@@ -64,6 +64,13 @@ pub enum ReadSource {
     Recent,
     RecentUnwrapped,
     Detection,
+    // `Transcript` is `Recent` with the agent's composer/prompt-box region
+    // removed, so a reader cannot mistake pre-filled input for something the
+    // agent printed. It falls back to `Recent` when the pane has no agent whose
+    // manifest declares a `transcript_region`; `PaneReadResult.transcript_applied`
+    // reports which happened. Kept as a plain doc-free variant so the generated
+    // schema stays a flat string enum.
+    Transcript,
 }
 
 #[derive(

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `herdr pane read` and `herdr agent read` accept `--source transcript`: the same rows as `recent`, with the agent's composer/prompt box removed. A program reading a pane can no longer mistake text sitting unsent in the input line — a pre-filled suggestion, a queued prompt — for something the agent printed. The cut comes from a new `transcript_region` field on the agent detection manifest (declared today for Claude Code and Codex); panes with no detected agent, or an agent whose manifest declares none, return the unmodified `recent` bytes and report `transcript_applied: false` on the JSON read result. This changes what a read excludes, not how far back it reaches.
 - Tab labels can carry a rolled-up agent state dot and the tab's jump number, so a collapsed sidebar and the mobile tab list are no longer state-blind. Controlled by `ui.show_tab_state_dots` and `ui.show_tab_numbers`; both default to `"auto"`, which shows the decorations only while the sidebar is collapsed.
 - `herdr config check` now reports the resolved config path and the `line:column` each diagnostic came from, so an unknown key or an out-of-range value points at the line that has to change instead of only naming the key. `herdr config validate` is an alias, and `--json` prints `{path, ok, diagnostics[{message, line, column}]}` for editors and CI. Startup and reload diagnostics carry the same locations.
 

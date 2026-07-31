@@ -938,9 +938,15 @@ fn pane_agent_state_option(name: &'static str) -> Arg {
 
 fn read_source_option(include_detection: bool) -> Arg {
     let values = if include_detection {
-        vec!["visible", "recent", "recent-unwrapped", "detection"]
+        vec![
+            "visible",
+            "recent",
+            "recent-unwrapped",
+            "detection",
+            "transcript",
+        ]
     } else {
-        vec!["visible", "recent", "recent-unwrapped"]
+        vec!["visible", "recent", "recent-unwrapped", "transcript"]
     };
     option("source", "SOURCE")
         .value_parser(values)

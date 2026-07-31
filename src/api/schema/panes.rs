@@ -654,4 +654,9 @@ pub struct PaneReadResult {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+    /// Only set for `source = "transcript"`: whether a transcript region was
+    /// actually resolved and applied. `false` means the read fell back to the
+    /// `recent` bytes and may still contain the composer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_applied: Option<bool>,
 }

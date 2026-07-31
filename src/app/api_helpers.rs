@@ -109,17 +109,41 @@ pub(super) fn pane_agent_status(
     }
 }
 
+/// A pane read plus the transcript-slicing outcome. `transcript_applied` is
+/// `None` for every source other than `transcript`.
+pub(super) struct PaneReadOutcome {
+    pub(super) snapshot: crate::pane::TerminalReadSnapshot,
+    pub(super) transcript_applied: Option<bool>,
+}
+
+impl From<crate::pane::TerminalReadSnapshot> for PaneReadOutcome {
+    fn from(snapshot: crate::pane::TerminalReadSnapshot) -> Self {
+        Self {
+            snapshot,
+            transcript_applied: None,
+        }
+    }
+}
+
 pub(super) fn read_terminal_snapshot(
     terminal: &crate::terminal::TerminalRuntime,
+    agent: Option<crate::detect::Agent>,
     source: crate::api::schema::ReadSource,
     format: crate::api::schema::ReadFormat,
     lines: Option<u32>,
-) -> crate::pane::TerminalReadSnapshot {
+) -> PaneReadOutcome {
     use crate::api::schema::{ReadFormat, ReadSource};
 
     let line_limit = lines.map(|lines| lines.min(1000) as usize);
     let recent_lines = line_limit.unwrap_or(80);
-    match (format, source) {
+    if matches!(source, ReadSource::Transcript) {
+        let snapshot = match format {
+            ReadFormat::Text => terminal.recent_text_snapshot(recent_lines),
+            ReadFormat::Ansi => terminal.recent_ansi_snapshot(recent_lines),
+        };
+        return transcript_outcome(agent, snapshot, format);
+    }
+    PaneReadOutcome::from(match (format, source) {
         (ReadFormat::Text, ReadSource::Visible) => {
             limit_snapshot_lines(terminal.visible_text(), line_limit)
         }
@@ -140,7 +164,94 @@ pub(super) fn read_terminal_snapshot(
         (ReadFormat::Ansi, ReadSource::Detection) => {
             limit_snapshot_lines(terminal.detection_text(), line_limit)
         }
+        // Handled above, before the recent snapshot is taken.
+        (_, ReadSource::Transcript) => crate::pane::TerminalReadSnapshot::default(),
+    })
+}
+
+/// Cut the composer out of a recent snapshot using the agent manifest's
+/// `transcript_region`. When no region resolves, the snapshot is returned
+/// unchanged — identical to `recent` — and reported as not applied.
+fn transcript_outcome(
+    agent: Option<crate::detect::Agent>,
+    snapshot: crate::pane::TerminalReadSnapshot,
+    format: crate::api::schema::ReadFormat,
+) -> PaneReadOutcome {
+    let lines: Vec<&str> = snapshot.text.lines().collect();
+    // Regions are matched on plain text; an ANSI read is stripped only to
+    // locate the cut, so both formats slice at the same line indices.
+    let plain = match format {
+        crate::api::schema::ReadFormat::Text => None,
+        crate::api::schema::ReadFormat::Ansi => Some(
+            lines
+                .iter()
+                .map(|line| strip_ansi_sequences(line))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    };
+    let screen = match &plain {
+        Some(plain) => plain.as_str(),
+        None => snapshot.text.as_str(),
+    };
+    let Some(range) = crate::detect::transcript_line_range(agent, screen) else {
+        return PaneReadOutcome {
+            snapshot,
+            transcript_applied: Some(false),
+        };
+    };
+    let end = range.end.min(lines.len());
+    let start = range.start.min(end);
+    let mut text = lines[start..end].join("\n");
+    if !text.is_empty() {
+        text.push('\n');
     }
+    PaneReadOutcome {
+        snapshot: crate::pane::TerminalReadSnapshot {
+            text,
+            truncated: snapshot.truncated || start > 0,
+        },
+        transcript_applied: Some(true),
+    }
+}
+
+/// Remove ANSI escape sequences from a single line. Only used to align a
+/// styled read with the plain-text region matchers; the returned text is never
+/// handed to a caller.
+fn strip_ansi_sequences(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters/intermediates until a final byte in @..~
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            // OSC / other string sequences: run to BEL or ST.
+            Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Two-byte escapes consume just the second byte.
+            Some(_) | None => {}
+        }
+    }
+    out
 }
 
 fn limit_snapshot_lines(text: String, limit: Option<usize>) -> crate::pane::TerminalReadSnapshot {
@@ -159,7 +270,75 @@ fn limit_snapshot_lines(text: String, limit: Option<usize>) -> crate::pane::Term
 
 #[cfg(test)]
 mod read_snapshot_tests {
-    use super::limit_snapshot_lines;
+    use super::{limit_snapshot_lines, strip_ansi_sequences, transcript_outcome};
+    use crate::api::schema::ReadFormat;
+    use crate::detect::Agent;
+    use crate::pane::TerminalReadSnapshot;
+
+    fn snapshot(text: &str) -> TerminalReadSnapshot {
+        TerminalReadSnapshot {
+            text: text.to_string(),
+            truncated: false,
+        }
+    }
+
+    const CLAUDE_SCREEN: &str = concat!(
+        "  Applied the patch.\n",
+        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        " \u{276f} rm -rf /tmp/scratch\n",
+        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        "  ? for shortcuts\n",
+    );
+
+    #[test]
+    fn transcript_read_drops_the_composer_and_reports_it_applied() {
+        let outcome = transcript_outcome(
+            Some(Agent::Claude),
+            snapshot(CLAUDE_SCREEN),
+            ReadFormat::Text,
+        );
+
+        assert_eq!(outcome.transcript_applied, Some(true));
+        assert_eq!(outcome.snapshot.text, "  Applied the patch.\n");
+    }
+
+    #[test]
+    fn transcript_read_without_a_known_agent_falls_back_to_recent_and_says_so() {
+        let outcome = transcript_outcome(None, snapshot(CLAUDE_SCREEN), ReadFormat::Text);
+
+        assert_eq!(outcome.transcript_applied, Some(false));
+        assert_eq!(outcome.snapshot.text, CLAUDE_SCREEN);
+    }
+
+    #[test]
+    fn transcript_read_keeps_styling_while_cutting_at_the_plain_text_boundary() {
+        let styled = CLAUDE_SCREEN
+            .lines()
+            .map(|line| format!("\u{1b}[38;5;42m{line}\u{1b}[0m"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = transcript_outcome(Some(Agent::Claude), snapshot(&styled), ReadFormat::Ansi);
+
+        assert_eq!(outcome.transcript_applied, Some(true));
+        assert_eq!(
+            outcome.snapshot.text,
+            "\u{1b}[38;5;42m  Applied the patch.\u{1b}[0m\n"
+        );
+    }
+
+    #[test]
+    fn ansi_stripping_removes_csi_and_osc_sequences_only() {
+        assert_eq!(strip_ansi_sequences("\u{1b}[1;31mred\u{1b}[0m"), "red");
+        assert_eq!(strip_ansi_sequences("\u{1b}]0;title\u{7}after"), "after");
+        assert_eq!(
+            strip_ansi_sequences("\u{1b}]8;;https://x\u{1b}\\link"),
+            "link"
+        );
+        assert_eq!(
+            strip_ansi_sequences("plain \u{2500} text"),
+            "plain \u{2500} text"
+        );
+    }
 
     #[test]
     fn line_limit_preserves_endings_and_reports_omitted_lines() {

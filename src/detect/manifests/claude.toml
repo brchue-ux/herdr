@@ -1,8 +1,12 @@
 id = "claude"
 version = "2026.07.13.1"
-min_engine_version = 2
+min_engine_version = 4
 updated_at = "2026-07-13T00:00:00Z"
 aliases = ["claude-code"]
+
+# Everything above the composer box: what Claude Code printed, never what is
+# sitting unsent in the input line.
+transcript_region = "above_prompt_box"
 
 [[rules]]
 id = "osc_title_working"

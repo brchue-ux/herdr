@@ -1179,8 +1179,10 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
-        let snapshot = crate::app::api_helpers::read_terminal_snapshot(
+        let agent = self.pane_agent(ws_idx, pane_id);
+        let outcome = crate::app::api_helpers::read_terminal_snapshot(
             pane,
+            agent,
             params.source,
             params.format,
             params.lines,
@@ -1195,9 +1197,10 @@ impl App {
                     tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
                     source: params.source,
                     format: params.format,
-                    text: snapshot.text,
+                    text: outcome.snapshot.text,
                     revision: 0,
-                    truncated: snapshot.truncated,
+                    truncated: outcome.snapshot.truncated,
+                    transcript_applied: outcome.transcript_applied,
                 },
             },
         )

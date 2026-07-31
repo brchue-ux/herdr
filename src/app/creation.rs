@@ -478,6 +478,19 @@ impl App {
         Some((runtime, self.public_workspace_id(ws_idx)))
     }
 
+    /// The agent a pane is hosting, for read paths that need to interpret the
+    /// screen (transcript slicing). Prefers the authoritative label, falling
+    /// back to screen detection.
+    pub(super) fn pane_agent(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::detect::Agent> {
+        let pane_state = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
+        terminal.effective_known_agent().or(terminal.detected_agent)
+    }
+
     pub(super) fn lookup_runtime_sender(
         &self,
         ws_idx: usize,
