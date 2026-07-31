@@ -321,6 +321,23 @@ mod tests {
         assert_eq!(frame.cursor, None);
         assert_eq!(
             frame_digest(&frame),
+            "921c7ce380e6be0d304a5256f520861a17302ce27fd8b6c8f30bd80601a821cf"
+        );
+    }
+
+    /// The mobile switcher's tab rows carry a rolled-up agent state dot, which
+    /// moved the mobile frame digest. Turning the decoration off must reproduce
+    /// the pre-decoration frame exactly, so the digest above differs from this
+    /// one by the dot and nothing else.
+    #[tokio::test]
+    async fn mobile_frame_without_tab_state_dots_is_unchanged() {
+        let mut app = full_app_characterization_state("https://example.com/mobile");
+        app.mode = Mode::Navigate;
+        app.show_tab_state_dots = crate::config::TabDecorationConfig::Never;
+        let frame = full_app_frame(&mut app, Rect::new(0, 0, 44, 20));
+
+        assert_eq!(
+            frame_digest(&frame),
             "295608a66067f1e1f066c0adb3cf427e8a2d68bba8f68949fb72d464dcd8baab"
         );
     }

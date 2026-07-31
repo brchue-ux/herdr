@@ -89,6 +89,28 @@ fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     }
 }
 
+impl Tab {
+    /// Roll this tab's panes up to a single attention state.
+    ///
+    /// Uses the same [`pane_attention_priority`] ordering as
+    /// [`Workspace::aggregate_state`] so a tab dot and the sidebar's workspace
+    /// dot never disagree about the same panes.
+    pub fn aggregate_state(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+    ) -> (AgentState, bool) {
+        self.panes
+            .values()
+            .filter_map(|pane| {
+                terminals
+                    .get(&pane.attached_terminal_id)
+                    .map(|terminal| (terminal.state, pane.seen))
+            })
+            .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
+            .unwrap_or((AgentState::Unknown, true))
+    }
+}
+
 impl Workspace {
     pub fn aggregate_state(
         &self,

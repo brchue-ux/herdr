@@ -671,6 +671,28 @@
           "description": "Hide the tab row when the workspace has one tab."
         },
         {
+          "key": "ui.show_tab_state_dots",
+          "type": "enum",
+          "default": "\"auto\"",
+          "description": "Show a rolled-up agent state dot on each tab label, using the same marks as the sidebar. \"auto\" shows it only while the sidebar is collapsed.",
+          "values": [
+            "auto",
+            "always",
+            "never"
+          ]
+        },
+        {
+          "key": "ui.show_tab_numbers",
+          "type": "enum",
+          "default": "\"auto\"",
+          "description": "Show the tab's jump number next to custom tab titles. Auto-named tabs already display their number as the title, so they are never double-numbered. \"auto\" shows it only while the sidebar is collapsed.",
+          "values": [
+            "auto",
+            "always",
+            "never"
+          ]
+        },
+        {
           "key": "ui.agent_panel_sort",
           "type": "enum",
           "default": "\"spaces\"",

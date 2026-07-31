@@ -319,6 +319,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # New tabs can still be created with the configured keybinding.
 # hide_tab_bar_when_single_tab = false
 
+# Show a rolled-up agent state dot on each tab label, using the same marks as the sidebar.
+# "auto" shows it only while the sidebar is collapsed, "always" and "never" force it.
+# show_tab_state_dots = "auto"
+
+# Show the tab's jump number next to custom tab titles.
+# Auto-named tabs already display their number as the title, so they are never double-numbered.
+# "auto" shows it only while the sidebar is collapsed, "always" and "never" force it.
+# show_tab_numbers = "auto"
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
