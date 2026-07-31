@@ -736,8 +736,13 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let blocked_rect = app.view.tab_hit_areas[1];
         let dot_cell = &buffer[(blocked_rect.x + 1, blocked_rect.y)];
-        assert_eq!(dot_cell.symbol(), "●");
-        assert_eq!(dot_cell.style().fg, Some(app.palette.red));
+        // Assert against `state_dot` itself, not a copy of the glyph it happens
+        // to return today, so changing a state mark can't silently invalidate
+        // this test.
+        let (blocked_dot, blocked_style) =
+            state_dot(crate::detect::AgentState::Blocked, false, &app.palette);
+        assert_eq!(dot_cell.symbol(), blocked_dot);
+        assert_eq!(dot_cell.style().fg, blocked_style.fg);
         // The dot never repaints the tab chip's own background.
         assert_eq!(dot_cell.style().bg, Some(app.palette.surface0));
 
