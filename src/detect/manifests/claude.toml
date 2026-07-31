@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.07.13.1"
+version = "2026.07.31.1"
 min_engine_version = 4
-updated_at = "2026-07-13T00:00:00Z"
+updated_at = "2026-07-31T00:00:00Z"
 aliases = ["claude-code"]
 
 # Everything above the composer box: what Claude Code printed, never what is

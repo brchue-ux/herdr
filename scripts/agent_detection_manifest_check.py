@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import re
 import sys
@@ -15,8 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLED_DIR = PROJECT_ROOT / "src" / "detect" / "manifests"
 DEFAULT_WEBSITE_DIR = PROJECT_ROOT / "website" / "agent-detection"
 ENGINE_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest_update.rs"
+MANIFEST_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest.rs"
 
-MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
+MANIFEST_KEYS = {
+    "id",
+    "version",
+    "min_engine_version",
+    "updated_at",
+    "aliases",
+    "rules",
+    "transcript_region",
+}
 RULE_KEYS = {
     "id",
     "state",
@@ -53,14 +63,34 @@ MAX_MATCHERS_PER_GATE = 32
 MAX_TOTAL_MATCHERS = 1024
 MAX_MATCHER_CHARS = 512
 
-# Keep engine-2 clients on the OSC-capable manifest until an engine-3 release
-# can consume top_non_empty_lines. Remove this entry when the website publishes
-# the bundled Grok manifest.
+# Manifests whose published copy is deliberately older than the bundled one,
+# to keep clients on an older engine working until a release catches up.
+#
+# Each entry is (bundled_version, website_version, website_digest,
+# bundled_min_engine_version). The recorded engine is what the staging was
+# approved against: comparing against the *current* engine instead would
+# silently invalidate every existing entry the moment one agent raises the
+# engine floor, which is exactly how the Grok entry broke when transcript
+# regions took the engine to 4. Remove an entry once the website publishes the
+# bundled manifest.
 STAGED_WEBSITE_MANIFESTS = {
     "grok": (
         "2026.07.16.2",
         "2026.07.16.1",
         "1f35b3271a96cf830c64bed78751619bfd8013c277c0d7c0f999b7a433895f28",
+        3,
+    ),
+    "claude": (
+        "2026.07.31.1",
+        "2026.07.13.1",
+        "d7b3e653a6d84024d1cca5b35bfa8a1d59afd9ce6bbfe06275d38315f18c2dc8",
+        4,
+    ),
+    "codex": (
+        "2026.07.31.1",
+        "2026.07.18.1",
+        "473928cc50a70d1ac71d06a17a482077a6a2dfe8080225cdce42360cab3d1345",
+        4,
     ),
 }
 
@@ -85,6 +115,23 @@ def read_engine_version(explicit: int | None) -> int:
     match = re.search(r"MANIFEST_ENGINE_VERSION:\s*u32\s*=\s*([0-9]+)", content)
     if not match:
         raise CheckError(f"could not find MANIFEST_ENGINE_VERSION in {ENGINE_SOURCE}")
+    return int(match.group(1))
+
+
+@functools.lru_cache(maxsize=1)
+def transcript_region_engine_version() -> int:
+    """The engine floor for `transcript_region`, read from the loader itself.
+
+    Kept as one fact rather than two: a hardcoded copy here would go stale the
+    next time the Rust floor moves, and this check would then disagree with the
+    loader it exists to protect.
+    """
+    content = MANIFEST_SOURCE.read_text(encoding="utf-8")
+    match = re.search(r"TRANSCRIPT_REGION_ENGINE_VERSION:\s*u32\s*=\s*([0-9]+)", content)
+    if not match:
+        raise CheckError(
+            f"could not find TRANSCRIPT_REGION_ENGINE_VERSION in {MANIFEST_SOURCE}"
+        )
     return int(match.group(1))
 
 
@@ -142,6 +189,18 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
     aliases = manifest.get("aliases", [])
     if not isinstance(aliases, list) or not all(isinstance(item, str) for item in aliases):
         raise CheckError(f"{path}: aliases must be an array of strings")
+
+    if "transcript_region" in manifest:
+        transcript_region = manifest["transcript_region"]
+        if not isinstance(transcript_region, str) or not REGION_RE.fullmatch(transcript_region):
+            raise CheckError(
+                f"{path}: transcript_region {transcript_region!r} is not a known region"
+            )
+        floor = transcript_region_engine_version()
+        if min_engine < floor:
+            raise CheckError(
+                f"{path}: transcript_region requires min_engine_version {floor}"
+            )
 
     rules = manifest.get("rules")
     if not isinstance(rules, list) or not rules:
@@ -326,8 +385,13 @@ def validate_catalog(
         website_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         stages_new_engine_manifest = (
             staged_manifest
-            == (bundled_manifest["version"], manifest["version"], website_digest)
-            and bundled_manifest["min_engine_version"] == engine_version
+            == (
+                bundled_manifest["version"],
+                manifest["version"],
+                website_digest,
+                bundled_manifest["min_engine_version"],
+            )
+            and bundled_manifest["min_engine_version"] <= engine_version
             and manifest["min_engine_version"] < bundled_manifest["min_engine_version"]
         )
         if cmp < 0 and not stages_new_engine_manifest:
