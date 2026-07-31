@@ -815,10 +815,18 @@ herdr pane read w1:p1 --source visible --lines 80
 herdr pane read w1:p1 --source recent --lines 120
 herdr pane read w1:p1 --source recent-unwrapped --lines 120
 herdr pane read w1:p1 --source detection
+herdr pane read w1:p1 --source transcript --lines 120
 ```
 
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
 `detection` returns the bottom-buffer snapshot used by agent screen detection.
+`transcript` returns the `recent` rows with the agent's composer/prompt box cut
+off, using the `transcript_region` declared by that agent's detection manifest,
+so a program reading the pane cannot mistake unsent input for agent output. When
+the pane has no detected agent, or its manifest declares no `transcript_region`,
+the read falls back to the unmodified `recent` bytes. `.result.read.transcript_applied`
+is `true` when the composer was actually cut and `false` when the read fell back;
+it is absent for every other source.
 
 ## Waiting for state
 

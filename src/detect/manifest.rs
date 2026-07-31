@@ -145,6 +145,11 @@ pub(crate) struct AgentManifest {
     _updated_at: Option<String>,
     #[serde(default)]
     aliases: Vec<String>,
+    /// Region holding everything the agent has printed, excluding its
+    /// composer/prompt box. Used only by the `transcript` read source; it never
+    /// participates in state detection.
+    #[serde(default)]
+    transcript_region: Option<String>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
 }
@@ -336,6 +341,47 @@ pub fn detect_with_osc(agent: Agent, input: DetectionInput<'_>) -> AgentDetectio
         return fallback_explain(Some(agent), None, false).into_detection();
     };
     evaluate_loaded_manifest(agent, input, loaded, false).into_detection()
+}
+
+/// The region spec this agent's manifest declares as its transcript — the part
+/// of the screen the agent printed, excluding its composer. `None` when the
+/// manifest does not declare one.
+pub fn transcript_region_spec(agent: Agent) -> Option<String> {
+    load_manifest(agent)?.manifest.transcript_region.clone()
+}
+
+/// Line range (half-open, indices into `screen.lines()`) covering the agent's
+/// transcript region. `None` when the manifest declares no transcript region,
+/// or when the declared region does not resolve to a slice of `screen`.
+pub fn transcript_line_range(agent: Agent, screen: &str) -> Option<std::ops::Range<usize>> {
+    let spec = transcript_region_spec(agent)?;
+    let slice = region(
+        DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        },
+        &spec,
+    );
+    subslice_line_range(screen, slice)
+}
+
+/// Map a subslice of `content` back to the half-open line range it covers.
+/// Returns `None` when `slice` is not a subslice of `content` — which is how
+/// the region resolver reports "this region is not present on this screen"
+/// (it hands back a `""` literal rather than a slice).
+fn subslice_line_range(content: &str, slice: &str) -> Option<std::ops::Range<usize>> {
+    let base = content.as_ptr() as usize;
+    let start = slice.as_ptr() as usize;
+    let end = start.checked_add(slice.len())?;
+    if start < base || end > base + content.len() {
+        return None;
+    }
+    let start_offset = start - base;
+    let end_offset = end - base;
+    let start_line = content[..start_offset].lines().count();
+    let line_count = content[start_offset..end_offset].lines().count();
+    Some(start_line..start_line + line_count)
 }
 
 pub fn explain(agent: Agent, screen_content: &str) -> DetectionExplain {
@@ -936,6 +982,18 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
             .map_err(|err| format!("rule {} has invalid matcher gates: {err}", rule.id))?;
     }
 
+    if let Some(spec) = &manifest.transcript_region {
+        validate_region_name(spec).map_err(|err| format!("transcript_region is invalid: {err}"))?;
+        if manifest
+            .min_engine_version
+            .is_some_and(|version| version < TRANSCRIPT_REGION_ENGINE_VERSION)
+        {
+            return Err(format!(
+                "manifest uses transcript_region but min_engine_version is below {TRANSCRIPT_REGION_ENGINE_VERSION}"
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1299,6 +1357,7 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
 }
 
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
+const TRANSCRIPT_REGION_ENGINE_VERSION: u32 = 4;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
 fn top_region_count(spec: &str) -> Option<usize> {

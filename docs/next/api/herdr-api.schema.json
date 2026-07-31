@@ -3661,7 +3661,8 @@
             "visible",
             "recent",
             "recent_unwrapped",
-            "detection"
+            "detection",
+            "transcript"
           ],
           "type": "string"
         },
@@ -6009,6 +6010,13 @@
             "text": {
               "type": "string"
             },
+            "transcript_applied": {
+              "description": "Only set for `source = \"transcript\"`: whether a transcript region was\nactually resolved and applied. `false` means the read fell back to the\n`recent` bytes and may still contain the composer.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "truncated": {
               "type": "boolean"
             },
@@ -6084,7 +6092,8 @@
             "visible",
             "recent",
             "recent_unwrapped",
-            "detection"
+            "detection",
+            "transcript"
           ],
           "type": "string"
         },
@@ -7931,6 +7940,13 @@
             "text": {
               "type": "string"
             },
+            "transcript_applied": {
+              "description": "Only set for `source = \"transcript\"`: whether a transcript region was\nactually resolved and applied. `false` means the read fell back to the\n`recent` bytes and may still contain the composer.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "truncated": {
               "type": "boolean"
             },
@@ -8693,7 +8709,8 @@
             "visible",
             "recent",
             "recent_unwrapped",
-            "detection"
+            "detection",
+            "transcript"
           ],
           "type": "string"
         },

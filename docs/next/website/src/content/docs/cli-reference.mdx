@@ -194,7 +194,7 @@ After `pane move`, use `.result.move_result.pane.pane_id` for later commands. A 
 Read output:
 
 ```bash
-herdr pane read <pane_id> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi] [--raw]
+herdr pane read <pane_id> [--source visible|recent|recent-unwrapped|detection|transcript] [--lines N] [--format text|ansi] [--ansi] [--raw]
 herdr pane read <pane_id> --source visible --ansi
 herdr pane read <pane_id> --source recent-unwrapped --lines 120
 ```
@@ -285,7 +285,7 @@ For the pane-versus-agent model and complete orchestration examples, see [Agent 
 ```bash
 herdr agent list
 herdr agent get <target>
-herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
+herdr agent read <target> [--source visible|recent|recent-unwrapped|detection|transcript] [--lines N] [--format text|ansi] [--ansi]
 herdr agent send-keys <target> <key> [key ...]
 herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
@@ -342,7 +342,7 @@ without taking input, resize, scroll, or takeover authority.
 Wait for output in a pane:
 
 ```bash
-herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]
+herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source visible|recent|recent-unwrapped|transcript] [--lines N] [--timeout MS] [--raw]
 ```
 
 Use `pane wait-output` for normal commands and servers. Use `agent wait` for coding agents.
@@ -470,8 +470,19 @@ in pane or agent APIs. Native non-terminal plugin panes are a later surface.
 | `recent` | Recent scrollback with terminal wrapping. |
 | `recent-unwrapped` | Recent scrollback without soft wrapping. Best for logs. |
 | `detection` | Bottom-buffer snapshot used by agent screen detection. |
+| `transcript` | Recent scrollback with the agent's composer excluded, so a reader cannot mistake unsent input for agent output. |
 
 These meanings apply to reads. For `pane wait-output` only, both `recent` and `recent-unwrapped` search the unwrapped recent snapshot; `recent` remains the default spelling.
+
+`transcript` reads the same rows as `recent` and then removes the agent's
+composer/prompt box, using the `transcript_region` declared by that agent's
+detection manifest. It is the source to use when another program reads a pane
+and must not treat text sitting unsent in the input line as something the agent
+said. Panes with no detected agent, or whose agent manifest declares no
+`transcript_region`, return the unmodified `recent` bytes; the JSON read result
+reports which happened in `transcript_applied`. `transcript` changes only what
+is excluded, never how far back a read reaches — alternate-screen output that
+never entered the host scrollback is unreachable from every source.
 
 ## Environment variables
 

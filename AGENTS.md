@@ -128,7 +128,10 @@ the server fails to bind. Launching the TUI from inside a Herdr pane also
 needs `[experimental] allow_nested = true` in that private config. Drive the
 fleet with the normal CLI (`workspace create`, `pane report-agent`,
 `pane report-metadata`, `pane send-text` for OSC titles), then run the client
-under a PTY to read the rendered cells back. Two binaries built at different
+under a PTY to read the rendered cells back. Size that PTY explicitly
+(`TIOCSWINSZ`): a PTY opened without a window size reports about four columns,
+so every pane wraps and any evidence about layout, regions, or rendered rows is
+worthless while still looking like a real read. Two binaries built at different
 commits, run against identical state, is what turns "the sidebar looks wrong"
 into a diff.
 

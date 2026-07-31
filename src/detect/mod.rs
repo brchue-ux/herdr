@@ -276,6 +276,14 @@ pub fn detect_agent_with_osc(
     )
 }
 
+/// Half-open line range of `screen` that holds the agent's transcript — what it
+/// printed, with its composer/prompt box excluded. `None` when the agent is
+/// unknown or its manifest declares no `transcript_region`, in which case
+/// callers should fall back to the unsliced screen.
+pub fn transcript_line_range(agent: Option<Agent>, screen: &str) -> Option<std::ops::Range<usize>> {
+    manifest::transcript_line_range(agent?, screen)
+}
+
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
     agent.is_some_and(|agent| manifest::should_skip_state_update(agent, screen_content))
 }

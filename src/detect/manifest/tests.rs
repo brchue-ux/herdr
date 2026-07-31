@@ -879,3 +879,100 @@ fn codex_osc_working_beats_weak_blocker_screen() {
         Some("osc_title_working")
     );
 }
+
+// ---------------------------------------------------------------------------
+// transcript_region — the `transcript` read source. Never participates in state
+// detection; it only tells a reader where the composer stops.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bundled_claude_transcript_region_excludes_the_composer_box() {
+    let screen = concat!(
+        "> summarize the report\n",
+        "\n",
+        "  The report says three things.\n",
+        "─────────────────────────────\n",
+        " ❯ rm -rf /tmp/scratch\n",
+        "─────────────────────────────\n",
+        "  ? for shortcuts\n",
+    );
+
+    let range = transcript_line_range(Agent::Claude, screen).expect("claude transcript region");
+    let lines: Vec<&str> = screen.lines().collect();
+    let transcript = lines[range.clone()].join("\n");
+
+    assert!(transcript.contains("The report says three things."));
+    assert!(
+        !transcript.contains("rm -rf /tmp/scratch"),
+        "composer body leaked into the transcript: {transcript:?}"
+    );
+    assert_eq!(range.start, 0);
+}
+
+#[test]
+fn bundled_codex_transcript_region_stops_at_the_current_prompt_marker() {
+    let screen = concat!("• ran tests\n", "  all green\n", "› deploy to prod\n",);
+
+    let range = transcript_line_range(Agent::Codex, screen).expect("codex transcript region");
+    let transcript = screen.lines().collect::<Vec<_>>()[range].join("\n");
+
+    assert!(transcript.contains("all green"));
+    assert!(!transcript.contains("deploy to prod"));
+}
+
+#[test]
+fn transcript_region_covers_everything_when_no_composer_is_on_screen() {
+    let screen = "• ran tests\n  all green\n";
+    let range = transcript_line_range(Agent::Codex, screen).expect("codex transcript region");
+    assert_eq!(range, 0..2);
+}
+
+#[test]
+fn manifest_without_transcript_region_reports_none() {
+    // Only the manifests that have evidence for a composer region declare one.
+    assert!(transcript_region_spec(Agent::Gemini).is_none());
+    assert!(transcript_line_range(Agent::Gemini, "hello\n").is_none());
+}
+
+#[test]
+fn transcript_region_must_name_a_known_region() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 4
+transcript_region = "not_a_region"
+
+[[rules]]
+id = "test"
+state = "idle"
+contains = ["ready"]
+"#;
+
+    let err = parse_manifest(manifest).expect_err("invalid transcript region must be rejected");
+    assert!(err.contains("transcript_region"), "{err}");
+}
+
+#[test]
+fn transcript_region_requires_engine_four_when_declared() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 3
+transcript_region = "before_current_prompt_marker"
+
+[[rules]]
+id = "test"
+state = "idle"
+contains = ["ready"]
+"#;
+
+    assert!(parse_manifest(manifest).is_err());
+}
+
+#[test]
+fn subslice_line_range_rejects_a_foreign_slice() {
+    let content = "one\ntwo\n";
+    assert_eq!(subslice_line_range(content, &content[..4]), Some(0..1));
+    assert_eq!(subslice_line_range(content, content), Some(0..2));
+    assert_eq!(subslice_line_range(content, ""), None);
+}

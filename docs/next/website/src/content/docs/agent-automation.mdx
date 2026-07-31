@@ -89,6 +89,14 @@ Ask the agent for concise responses, enlarge the pane or use a smaller font, or 
 
 After that failed read, ask the agent to write its complete response as Markdown in a temporary directory and reply only with the file path, then read the file directly. Use this only as a fallback; do not request file output in the initial prompt.
 
+## Reading agent output without reading its composer
+
+`--source transcript` reads the same rows as `recent` and then removes the agent's composer/prompt box. Use it whenever another program reads a pane and must not treat text sitting unsent in the input line — a pre-filled suggestion, a queued prompt — as something the agent said. It does not reach further back than `recent`, so it is no help with the alternate-screen caveat above; it only removes a source of misreads. Panes with no detected agent, or agents whose detection manifest declares no `transcript_region`, return the unmodified `recent` bytes and report `.result.read.transcript_applied` as `false`.
+
+```bash
+herdr agent read reviewer --source transcript --lines 120
+```
+
 Successful `agent start`, `agent prompt`, and `agent wait` commands return the current agent at `.result.agent`. `pane wait-output` returns `.result.pane_id`, `.result.matched_line`, and the matched snapshot at `.result.read`.
 
 Wait commands have no default timeout and can wait indefinitely. On timeout or another server error, CLI commands print a JSON error to stderr and exit with status 1; invalid CLI syntax exits with status 2.
