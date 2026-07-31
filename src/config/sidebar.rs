@@ -136,6 +136,7 @@ impl SidebarTokenStyle {
 pub enum AgentSidebarToken {
     StateIcon,
     StateText,
+    StateAge,
     Workspace,
     Tab,
     Pane,
@@ -153,6 +154,7 @@ pub enum AgentSidebarToken {
 pub enum SpaceSidebarToken {
     StateIcon,
     StateText,
+    StateAge,
     Workspace,
     Branch,
     GitStatus,
@@ -334,6 +336,7 @@ fn agent_token_name(token: &AgentSidebarToken) -> String {
     match token {
         AgentSidebarToken::StateIcon => "state_icon".into(),
         AgentSidebarToken::StateText => "state_text".into(),
+        AgentSidebarToken::StateAge => "state_age".into(),
         AgentSidebarToken::Workspace => "workspace".into(),
         AgentSidebarToken::Tab => "tab".into(),
         AgentSidebarToken::Pane => "pane".into(),
@@ -349,6 +352,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
     match token {
         SpaceSidebarToken::StateIcon => "state_icon".into(),
         SpaceSidebarToken::StateText => "state_text".into(),
+        SpaceSidebarToken::StateAge => "state_age".into(),
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
@@ -390,6 +394,7 @@ impl<'de> Deserialize<'de> for AgentSidebarToken {
             &[
                 ("state_icon", Self::StateIcon),
                 ("state_text", Self::StateText),
+                ("state_age", Self::StateAge),
                 ("workspace", Self::Workspace),
                 ("tab", Self::Tab),
                 ("pane", Self::Pane),
@@ -437,6 +442,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
             &[
                 ("state_icon", Self::StateIcon),
                 ("state_text", Self::StateText),
+                ("state_age", Self::StateAge),
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
@@ -648,6 +654,17 @@ impl AgentsSidebarConfig {
                 )
             })
     }
+
+    /// Whether any configured Agent row, including per-agent overrides, draws
+    /// an elapsed time. Nothing else may arm the repaint clock that keeps one
+    /// current, so an unconfigured Herdr never wakes up for it.
+    pub(crate) fn uses_state_age(&self) -> bool {
+        std::iter::once(&self.rows)
+            .chain(self.rows_by_agent.values())
+            .flatten()
+            .flatten()
+            .any(|token| matches!(token.parts().0, AgentSidebarToken::StateAge))
+    }
 }
 
 impl Default for AgentsSidebarConfig {
@@ -693,6 +710,14 @@ impl SpacesSidebarConfig {
             .iter()
             .flatten()
             .any(|token| token.parts().1.animates())
+    }
+
+    /// Whether any configured Space row draws an elapsed time.
+    pub(crate) fn uses_state_age(&self) -> bool {
+        self.rows
+            .iter()
+            .flatten()
+            .any(|token| matches!(token.parts().0, SpaceSidebarToken::StateAge))
     }
 }
 
@@ -743,6 +768,49 @@ mod tests {
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+    }
+
+    #[test]
+    fn state_age_parses_round_trips_and_arms_only_its_own_rows() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+rows = [["state_text", "state_age"]]
+
+[ui.sidebar.spaces]
+rows = [["workspace"]]
+"#,
+        )
+        .expect("state_age config");
+
+        assert_eq!(
+            config.ui.sidebar.agents.rows,
+            vec![vec![
+                AgentSidebarToken::StateText,
+                AgentSidebarToken::StateAge
+            ]]
+        );
+        assert!(config.ui.sidebar.agents.uses_state_age());
+        // The two panels are gated independently, so a Space row without the
+        // token does not pay for an Agent row that has it, or the reverse.
+        assert!(!config.ui.sidebar.spaces.uses_state_age());
+        assert!(!SidebarConfig::default().agents.uses_state_age());
+        assert!(!SidebarConfig::default().spaces.uses_state_age());
+
+        // A styled occurrence still counts, or a coloured age would silently
+        // stop repainting.
+        let styled: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.spaces]
+rows = [[{ token = "state_age", fg = "#89b4fa" }]]
+"##,
+        )
+        .expect("styled state_age config");
+        assert!(styled.ui.sidebar.spaces.uses_state_age());
+
+        // Serializing back out keeps the name the config file used.
+        let round_trip = toml::to_string(&config.ui.sidebar).expect("serialize");
+        assert!(round_trip.contains("state_age"), "{round_trip}");
     }
 
     #[test]

@@ -3012,6 +3012,9 @@ impl AppState {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                // Same `now` the rest of this update was evaluated against, so
+                // the stamp cannot land after an effect it caused.
+                terminal.last_agent_state_change_at = Some(now);
             }
         }
         let seen = self.apply_pane_state_change(ws_idx, pane_id, &change)?;
@@ -4949,6 +4952,69 @@ mod tests {
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+    }
+
+    /// The timestamp is a sibling of `last_agent_state_change_seq` and shares
+    /// its one stamping site, so the two can never disagree about whether the
+    /// state changed.
+    #[test]
+    fn a_state_change_stamps_a_timestamp_beside_the_sequence() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        // Before any observed change there is nothing to report.
+        assert!(state.terminals[&terminal_id]
+            .last_agent_state_change_at
+            .is_none());
+
+        let change = |state: &mut AppState, agent_state| {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: agent_state,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+        };
+
+        change(&mut state, AgentState::Working);
+        let first = state.terminals[&terminal_id]
+            .last_agent_state_change_at
+            .expect("a real transition stamps a time");
+        let first_seq = state.terminals[&terminal_id].last_agent_state_change_seq;
+        assert!(first_seq.is_some());
+
+        // Re-reporting the same state is not a change: neither the counter nor
+        // the clock may move, or a steady agent would look freshly started on
+        // every detection pass.
+        change(&mut state, AgentState::Working);
+        assert_eq!(
+            state.terminals[&terminal_id].last_agent_state_change_at,
+            Some(first)
+        );
+        assert_eq!(
+            state.terminals[&terminal_id].last_agent_state_change_seq,
+            first_seq
+        );
+
+        // A genuine transition moves both.
+        change(&mut state, AgentState::Idle);
+        let second = state.terminals[&terminal_id]
+            .last_agent_state_change_at
+            .expect("stamped again");
+        assert!(second >= first);
+        assert_ne!(
+            state.terminals[&terminal_id].last_agent_state_change_seq,
+            first_seq
+        );
     }
 
     #[test]

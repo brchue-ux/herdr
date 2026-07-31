@@ -6202,6 +6202,15 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "state_age_ms": {
+              "description": "How long this agent has held `agent_status`, in milliseconds.\n\n`state_change_seq` orders state changes but says nothing about time, so\nan agent one minute into `working` and one ninety minutes into it are\nindistinguishable without this. Absent when the state has not been\nobserved to change since the server started: a cold restart genuinely\ndoes not know when the current state began, and omitting the field says\nthat rather than reporting a bogus zero.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",

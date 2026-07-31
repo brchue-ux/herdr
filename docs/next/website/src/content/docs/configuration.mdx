@@ -307,6 +307,7 @@ Agent rows accept these built-in tokens:
 
 - `state_icon` — colored icon for the agent's semantic state.
 - `state_text` — `idle`, `working`, `blocked`, `done`, or `unknown`, including a reported display label when present.
+- `state_age` — how long the agent has held that state, as a single unit: `9s`, `47m`, `3h`, `6d`.
 - `workspace` — workspace name.
 - `tab` — tab name when available.
 - `pane` — pane name when available.
@@ -319,12 +320,35 @@ Space rows accept these built-in tokens:
 
 - `state_icon` — colored icon for the space's rolled-up agent state.
 - `state_text` — text for the rolled-up agent state.
+- `state_age` — how long the rolled-up state has been held, from the same pane the icon describes.
 - `workspace` — workspace name.
 - `branch` — Git branch when available.
 - `git_status` — Git ahead and behind counts when nonzero.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
 - `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
+
+`state_age` reports elapsed time and nothing else. It is not a stall warning:
+nothing about it changes colour or shape as the number grows, because Herdr has
+no evidence that a long-held state is a bad one. Reading it that way is the
+reader's call.
+
+The unit coarsens as the state ages, so a state held for ninety minutes reads
+`1h` rather than `90m`. That keeps the token to a few columns on a narrow
+sidebar; when an exact figure matters, `herdr agent list` reports
+`state_age_ms` in milliseconds.
+
+The token renders nothing when Herdr does not know when the state changed —
+before the first observed transition, and after a server restart, which does not
+carry the timestamp. Like every other missing value it disappears together with
+its separator, and takes the whole row with it if nothing else on that row has a
+value. A live handoff does carry it, so replacing the server in place leaves the
+elapsed times counting from where they were.
+
+Rows that use `state_age` make Herdr repaint the sidebar when a drawn number
+would change — about once a second while a state is seconds old, once a minute
+once it is minutes old, and once an hour beyond that. Rows that do not use it
+cost nothing.
 
 A space can hold several panes, so its terminal title is rolled up from the same
 pane that `state_icon` and `state_text` describe: the pane with the highest

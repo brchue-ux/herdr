@@ -4058,6 +4058,7 @@ impl HeadlessServer {
 
         self.app
             .sync_headless_animation_timer(now, self.has_app_viewers());
+        self.app.refresh_state_age_clock(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
@@ -4125,6 +4126,18 @@ impl HeadlessServer {
             changed = true;
         }
 
+        // The headless server owns the render for every attached client, so
+        // the elapsed-time deadline has to fire here too. Without it a client
+        // sits in front of a frozen age until something else redraws.
+        if self
+            .app
+            .next_state_age_tick
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.app.next_state_age_tick = None;
+            changed = true;
+        }
+
         if self
             .app
             .selection_autoscroll_deadline
@@ -4183,6 +4196,8 @@ impl HeadlessServer {
         }
         self.app
             .sync_headless_animation_timer(now, self.has_app_viewers());
+        let has_viewers = self.has_app_viewers();
+        self.app.sync_state_age_timer(now, has_viewers);
         changed
     }
 

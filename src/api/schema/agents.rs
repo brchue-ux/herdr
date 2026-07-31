@@ -229,6 +229,16 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// How long this agent has held `agent_status`, in milliseconds.
+    ///
+    /// `state_change_seq` orders state changes but says nothing about time, so
+    /// an agent one minute into `working` and one ninety minutes into it are
+    /// indistinguishable without this. Absent when the state has not been
+    /// observed to change since the server started: a cold restart genuinely
+    /// does not know when the current state began, and omitting the field says
+    /// that rather than reporting a bogus zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
@@ -21,6 +22,7 @@ pub struct PaneDetail {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    pub last_agent_state_change_at: Option<Instant>,
     pub state_labels: HashMap<String, String>,
     pub tokens: HashMap<String, String>,
 }
@@ -64,6 +66,7 @@ impl Tab {
                     state: terminal.state,
                     seen: pane.seen,
                     last_agent_state_change_seq: terminal.last_agent_state_change_seq,
+                    last_agent_state_change_at: terminal.last_agent_state_change_at,
                     state_labels: presentation.state_labels,
                     tokens: terminal.metadata_tokens.values(),
                 })
@@ -128,14 +131,16 @@ impl Workspace {
             .unwrap_or((AgentState::Unknown, true))
     }
 
-    /// Terminal titles of the pane that also decides [`Workspace::aggregate_state`]:
-    /// the highest attention priority, resolving ties to the first pane in tab and
-    /// layout order. A workspace with no panes, or whose winning pane has no
-    /// terminal title, reports no title.
-    pub fn aggregate_terminal_title(
+    /// The pane that speaks for this workspace: the highest attention
+    /// priority, resolving ties to the first pane in tab and layout order.
+    ///
+    /// Every rolled-up per-pane fact on a Space row has to come from this one
+    /// terminal. Resolving the winner twice is how a row ends up showing one
+    /// pane's title next to another pane's elapsed time.
+    fn attention_winner<'a>(
         &self,
-        terminals: &HashMap<TerminalId, TerminalState>,
-    ) -> AggregateTerminalTitle {
+        terminals: &'a HashMap<TerminalId, TerminalState>,
+    ) -> Option<&'a TerminalState> {
         let mut best: Option<(u8, &TerminalState)> = None;
         for tab in &self.tabs {
             for pane_id in tab.layout.pane_ids() {
@@ -151,12 +156,35 @@ impl Workspace {
                 }
             }
         }
+        best.map(|(_, terminal)| terminal)
+    }
 
-        best.map(|(_, terminal)| AggregateTerminalTitle {
-            raw: terminal.terminal_title.clone(),
-            stripped: terminal.terminal_title_stripped(),
-        })
-        .unwrap_or_default()
+    /// Terminal titles of the pane that also decides [`Workspace::aggregate_state`].
+    /// A workspace with no panes, or whose winning pane has no terminal title,
+    /// reports no title.
+    pub fn aggregate_terminal_title(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+    ) -> AggregateTerminalTitle {
+        self.attention_winner(terminals)
+            .map(|terminal| AggregateTerminalTitle {
+                raw: terminal.terminal_title.clone(),
+                stripped: terminal.terminal_title_stripped(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// When the pane behind [`Workspace::aggregate_state`] last changed state.
+    ///
+    /// The Space row draws one state icon for the whole workspace, so its
+    /// elapsed time has to be that same pane's, not the oldest or newest of
+    /// the set.
+    pub fn aggregate_state_changed_at(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+    ) -> Option<Instant> {
+        self.attention_winner(terminals)
+            .and_then(|terminal| terminal.last_agent_state_change_at)
     }
 
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
