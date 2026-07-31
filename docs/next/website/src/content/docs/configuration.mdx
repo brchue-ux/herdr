@@ -55,7 +55,7 @@ The exit code is `0` when the config is clean and `1` when there are diagnostics
 herdr config check --json
 ```
 
-A diagnostic whose key path is no longer present in the file — a parse error, or an unreadable file — is reported without a location.
+A diagnostic whose key path is no longer present in the file — a parse error, or an unreadable file — is reported without a location. With no config file at all, it says so and exits `0`, because running on defaults is a valid state.
 
 Herdr shows first-run setup when `onboarding` is missing or true. Continuing from onboarding writes `onboarding = false` and opens settings on the integrations tab. Set it when you want to skip that flow after setup.
 

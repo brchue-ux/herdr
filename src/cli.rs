@@ -287,6 +287,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
 
     if !report.exists {
         println!("config: no config file at {path}; using defaults");
+        println!("config: ok");
         return Ok(0);
     }
 
