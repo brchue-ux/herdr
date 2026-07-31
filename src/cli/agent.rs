@@ -191,16 +191,59 @@ fn agent_view_get(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:view:get".into(),
         method: Method::SessionSnapshot(EmptyParams::default()),
     })?;
-    let Some(result) = response.get("result") else {
+    // `session.snapshot` answers as `{"result": {"type": ..., "snapshot": {...}}}`,
+    // so the view is one level below `result`. Reading `result.agent_view`
+    // directly always misses and reports every view as inactive.
+    let Some(snapshot) = response
+        .get("result")
+        .and_then(|result| result.get("snapshot"))
+    else {
         return super::print_response(&response);
     };
-    let view = result.get("agent_view").cloned().unwrap_or(
+    let view = snapshot.get("agent_view").cloned().unwrap_or(
         // An absent view is a fact, not an error: nothing is filtering the
         // panel. Say so in the same shape a set view is reported.
         serde_json::json!({ "active": false }),
     );
     println!("{}", serde_json::to_string_pretty(&view)?);
     Ok(0)
+}
+
+/// The `session.snapshot` traversal `agent view get` depends on.
+///
+/// This is a wire-shape contract, not an internal detail: the view sits at
+/// `result.snapshot.agent_view`, and reading `result.agent_view` silently
+/// reports every active view as inactive rather than failing.
+#[cfg(test)]
+mod agent_view_get_tests {
+    #[test]
+    fn the_view_is_read_from_result_snapshot_not_result() {
+        let response = serde_json::json!({
+            "id": "cli:agent:view:get",
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "agent_view": { "source": "workers-only", "label": "workers" }
+                }
+            }
+        });
+
+        let view = response
+            .get("result")
+            .and_then(|result| result.get("snapshot"))
+            .and_then(|snapshot| snapshot.get("agent_view"));
+
+        assert_eq!(
+            view.and_then(|view| view.get("source"))
+                .and_then(|s| s.as_str()),
+            Some("workers-only")
+        );
+        // The shape this test exists to pin down: one level up finds nothing.
+        assert!(response
+            .get("result")
+            .and_then(|result| result.get("agent_view"))
+            .is_none());
+    }
 }
 
 /// `field`, `field:asc`, or `field:desc`, where `field` is a builtin sort key
