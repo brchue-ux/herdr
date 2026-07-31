@@ -12,6 +12,49 @@ pub(super) const STABLE_VISIBLE_SIGNAL_REFRESH: std::time::Duration =
 pub(super) const AGENT_STARTUP_GRACE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(3);
 
+/// How many consecutive scans must agree before a screen-identified agent is
+/// adopted. Identification runs on a pane the process probe cannot read, so a
+/// single frame of another program's output — a pager showing a transcript, a
+/// help screen — must not be enough to claim a pane.
+const SCREEN_IDENTITY_CONFIRMATIONS: u8 = 3;
+
+/// Confirmation window for screen-based agent identification.
+#[derive(Debug, Default)]
+pub(super) struct ScreenIdentityConfirmation {
+    candidate: Option<Agent>,
+    confirmations: u8,
+}
+
+impl ScreenIdentityConfirmation {
+    pub(super) fn clear(&mut self) {
+        self.candidate = None;
+        self.confirmations = 0;
+    }
+
+    /// Feed one scan's identification result.
+    ///
+    /// Returns the agent once the same one has been identified on
+    /// `SCREEN_IDENTITY_CONFIRMATIONS` consecutive scans. Any disagreeing scan,
+    /// including one that identifies nothing, restarts the window.
+    pub(super) fn observe(&mut self, identified: Option<Agent>) -> Option<Agent> {
+        let Some(identified) = identified else {
+            self.clear();
+            return None;
+        };
+        if self.candidate != Some(identified) {
+            self.candidate = Some(identified);
+            self.confirmations = 1;
+        } else {
+            self.confirmations = self.confirmations.saturating_add(1);
+        }
+        if self.confirmations >= SCREEN_IDENTITY_CONFIRMATIONS {
+            self.clear();
+            return Some(identified);
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DetectionPublishState {
     pub(super) state: AgentState,
@@ -529,6 +572,39 @@ mod tests {
                 process_exited: false,
             }
         );
+    }
+
+    #[test]
+    fn screen_identity_needs_consecutive_agreement_before_adopting() {
+        let mut identity = ScreenIdentityConfirmation::default();
+
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn screen_identity_restarts_when_a_scan_disagrees() {
+        let mut identity = ScreenIdentityConfirmation::default();
+
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        // An ambiguous or unrecognized frame is not neutral; it restarts.
+        assert_eq!(identity.observe(None), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn screen_identity_does_not_carry_confirmations_between_agents() {
+        let mut identity = ScreenIdentityConfirmation::default();
+
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Claude)), None);
+        assert_eq!(identity.observe(Some(Agent::Codex)), None);
+        assert_eq!(identity.observe(Some(Agent::Codex)), None);
+        assert_eq!(identity.observe(Some(Agent::Codex)), Some(Agent::Codex));
     }
 
     #[test]

@@ -976,3 +976,150 @@ fn subslice_line_range_rejects_a_foreign_slice() {
     assert_eq!(subslice_line_range(content, content), Some(0..2));
     assert_eq!(subslice_line_range(content, ""), None);
 }
+
+#[test]
+fn manifest_validation_rejects_identity_rules_below_their_engine_version() {
+    let err = parse_manifest(
+        r#"
+id = "codex"
+min_engine_version = 4
+
+[[rules]]
+id = "idle"
+state = "idle"
+contains = ["›"]
+
+[[identity]]
+id = "too_old"
+region = "osc_title"
+contains = ["codex"]
+"#,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.contains("min_engine_version"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn manifest_validation_rejects_identity_rules_without_a_positive_matcher() {
+    assert!(parse_manifest(
+        r#"
+id = "codex"
+min_engine_version = 5
+
+[[rules]]
+id = "idle"
+state = "idle"
+contains = ["›"]
+
+[[identity]]
+id = "empty"
+region = "osc_title"
+"#,
+    )
+    .is_err());
+
+    assert!(parse_manifest(
+        r#"
+id = "codex"
+min_engine_version = 5
+
+[[rules]]
+id = "idle"
+state = "idle"
+contains = ["›"]
+
+[[identity]]
+id = "bad_region"
+region = "after_last_promt_marker"
+contains = ["codex"]
+"#,
+    )
+    .is_err());
+}
+
+#[test]
+fn identity_rules_are_separate_from_state_rules() {
+    // An identity block carries no state, priority, or visible-signal flags.
+    assert!(parse_manifest(
+        r#"
+id = "codex"
+min_engine_version = 5
+
+[[rules]]
+id = "idle"
+state = "idle"
+contains = ["›"]
+
+[[identity]]
+id = "state_is_not_an_identity_field"
+region = "osc_title"
+state = "idle"
+contains = ["codex"]
+"#,
+    )
+    .is_err());
+}
+
+#[test]
+fn bundled_claude_manifest_identifies_its_osc_title_and_nothing_else_does() {
+    let identified = identify_agent_from_screen(DetectionInput {
+        screen: "",
+        osc_title: "\u{2733} Claude Code",
+        osc_progress: "",
+    });
+
+    assert_eq!(
+        identified.map(|candidate| candidate.agent),
+        Some(Agent::Claude)
+    );
+}
+
+#[test]
+fn bundled_claude_manifest_identifies_a_live_task_title() {
+    // Claude Code replaces "Claude Code" with a task summary after the first
+    // turn, so identification cannot depend on the startup title.
+    let identified = identify_agent_from_screen(DetectionInput {
+        screen: "",
+        osc_title: "\u{2733} Write terminal haiku",
+        osc_progress: "",
+    });
+
+    assert_eq!(
+        identified.map(|candidate| candidate.agent),
+        Some(Agent::Claude)
+    );
+}
+
+#[test]
+fn screen_identification_stays_silent_for_a_plain_shell_title() {
+    // The captured shell title from a pane before any agent started.
+    assert_eq!(
+        identify_agent_from_screen(DetectionInput {
+            screen: "",
+            osc_title: "bchue@homeserver: ~/.treehouse/herdr",
+            osc_progress: "",
+        }),
+        None
+    );
+}
+
+#[test]
+fn screen_identification_stays_silent_without_an_osc_title() {
+    // A Claude transcript on screen is not identification evidence: a pager
+    // showing one would look identical.
+    let screen = " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.220\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n";
+
+    assert_eq!(
+        identify_agent_from_screen(DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        }),
+        None
+    );
+}

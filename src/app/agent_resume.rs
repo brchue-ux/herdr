@@ -275,6 +275,12 @@ impl App {
             return false;
         }
 
+        runtime.set_declared_agent(
+            self.state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.declared_agent()),
+        );
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;

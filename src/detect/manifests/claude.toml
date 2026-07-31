@@ -1,6 +1,6 @@
 id = "claude"
-version = "2026.07.31.1"
-min_engine_version = 4
+version = "2026.07.31.2"
+min_engine_version = 5
 updated_at = "2026-07-31T00:00:00Z"
 aliases = ["claude-code"]
 
@@ -160,3 +160,22 @@ state = "idle"
 priority = 250
 region = "osc_progress"
 regex = ['^4;0']
+
+# Identification, not state. These only run when the process probe cannot see
+# any agent at all — a wrapped or multiplexed Claude Code. They key on the OSC
+# title Claude Code sets for the life of its session, which a shell overwrites
+# from its own prompt as soon as Claude Code exits, so a stale title cannot
+# outlive the process for long.
+#
+# Deliberately not keyed on the startup banner ("Claude Code v2.1.220"): that
+# text scrolls away, and a pager showing a Claude transcript would match it.
+
+[[identity]]
+id = "osc_title_claude_glyph"
+region = "osc_title"
+regex = ['^\x{2733}\s+\S']
+
+[[identity]]
+id = "osc_title_claude_code"
+region = "osc_title"
+regex = ['(?i)^\s*claude code\s*$']

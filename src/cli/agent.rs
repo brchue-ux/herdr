@@ -25,6 +25,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "explain" => agent_explain(&args[1..]),
+        "identify" => agent_identify(&args[1..]),
         "view" => agent_view(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -248,6 +249,110 @@ fn read_inline_json_argument(value: &str) -> Result<String, String> {
             None => Ok(value.to_string()),
         },
     }
+}
+
+/// Offline harness for tuning `[[identity]]` manifest rules against a captured
+/// screen. Identification runs before any agent is known, so unlike `explain`
+/// this takes no `--agent`: it reports which agents the screen matches, and
+/// whether that answer is unique enough to act on.
+fn agent_identify(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str =
+        "usage: herdr agent identify --file PATH [--osc-title TEXT] [--osc-progress TEXT] [--json]";
+    let mut file = None;
+    let mut osc_title = String::new();
+    let mut osc_progress = String::new();
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --file");
+                    return Ok(2);
+                };
+                file = Some(value.clone());
+                index += 2;
+            }
+            "--osc-title" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --osc-title");
+                    return Ok(2);
+                };
+                osc_title = value.clone();
+                index += 2;
+            }
+            "--osc-progress" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --osc-progress");
+                    return Ok(2);
+                };
+                osc_progress = value.clone();
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("{USAGE}");
+                return Ok(0);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(path) = file else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let screen = std::fs::read_to_string(path)?;
+    let input = crate::detect::manifest::DetectionInput {
+        screen: &screen,
+        osc_title: &osc_title,
+        osc_progress: &osc_progress,
+    };
+    let candidates = crate::detect::manifest::screen_identity_candidates(input);
+    let identified = crate::detect::manifest::identify_agent_from_screen(input);
+
+    if json {
+        let value = serde_json::json!({
+            "identified_agent": identified
+                .as_ref()
+                .map(|candidate| crate::detect::agent_label(candidate.agent)),
+            "matched_rule": identified.as_ref().map(|candidate| candidate.rule_id.clone()),
+            "candidates": candidates
+                .iter()
+                .map(|candidate| serde_json::json!({
+                    "agent": crate::detect::agent_label(candidate.agent),
+                    "rule": candidate.rule_id,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{value}");
+        return Ok(0);
+    }
+
+    match identified {
+        Some(candidate) => println!(
+            "identified: {} (rule={})",
+            crate::detect::agent_label(candidate.agent),
+            candidate.rule_id
+        ),
+        None if candidates.is_empty() => println!("identified: none (no identity rule matched)"),
+        None => println!("identified: none (ambiguous)"),
+    }
+    for candidate in &candidates {
+        println!(
+            "  candidate: {} (rule={})",
+            crate::detect::agent_label(candidate.agent),
+            candidate.rule_id
+        );
+    }
+    Ok(0)
 }
 
 fn agent_explain(args: &[String]) -> std::io::Result<i32> {
@@ -1018,6 +1123,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
+    );
+    eprintln!(
+        "  herdr agent identify --file PATH [--osc-title TEXT] [--osc-progress TEXT] [--json]"
     );
     eprintln!("  herdr agent view get|set|clear   (durable Agents panel filter and sort)");
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");

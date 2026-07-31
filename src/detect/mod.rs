@@ -288,6 +288,24 @@ pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> b
     agent.is_some_and(|agent| manifest::should_skip_state_update(agent, screen_content))
 }
 
+/// Identify the agent that owns a screen when the process probe found nothing.
+///
+/// Only agents whose manifest ships `[[identity]]` rules can be identified this
+/// way, and only when exactly one of them matches. Everything else stays
+/// `None`, which the caller must treat as an honest "unknown".
+pub fn identify_agent_from_screen(
+    screen_content: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> Option<Agent> {
+    manifest::identify_agent_from_screen(manifest::DetectionInput {
+        screen: screen_content,
+        osc_title,
+        osc_progress,
+    })
+    .map(|candidate| candidate.agent)
+}
+
 pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> bool {
     matches!(
         (source, agent_label),
