@@ -11,7 +11,7 @@ use ratatui::{
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
-use super::text::{display_width, display_width_u16, truncate_end};
+use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
@@ -1118,6 +1118,21 @@ fn resolved_token_spans(
             _ => 0,
         })
         .collect::<Vec<_>>();
+    // Every token at its full width, with decorated separators. When even this
+    // fits there is nothing to reclaim and the row renders exactly as before.
+    let natural_width = fixed_widths.iter().chain(&flexible_widths).sum::<usize>()
+        + resolved
+            .windows(2)
+            .map(|pair| display_width(tokens::separator(&pair[0], &pair[1])))
+            .sum::<usize>();
+    let compact_separators = natural_width > max_width;
+    let separator_for = |previous: &ResolvedToken, current: &ResolvedToken| {
+        if compact_separators {
+            tokens::compact_separator(previous, current)
+        } else {
+            tokens::separator(previous, current)
+        }
+    };
     let minimum_width = |active: &[bool]| {
         let indices = active
             .iter()
@@ -1130,7 +1145,7 @@ fn resolved_token_spans(
             .sum::<usize>();
         let separators = indices
             .windows(2)
-            .map(|pair| display_width(tokens::separator(&resolved[pair[0]], &resolved[pair[1]])))
+            .map(|pair| display_width(separator_for(&resolved[pair[0]], &resolved[pair[1]])))
             .sum::<usize>();
         content + separators
     };
@@ -1158,7 +1173,7 @@ fn resolved_token_spans(
         .collect::<Vec<_>>();
     let separator_width = visible_indices
         .windows(2)
-        .map(|pair| display_width(tokens::separator(&resolved[pair[0]], &resolved[pair[1]])))
+        .map(|pair| display_width(separator_for(&resolved[pair[0]], &resolved[pair[1]])))
         .sum::<usize>();
     let fixed_width = visible_indices
         .iter()
@@ -1195,11 +1210,20 @@ fn resolved_token_spans(
         if position > 0 {
             let previous = &resolved[visible_indices[position - 1]];
             spans.push(Span::styled(
-                tokens::separator(previous, token),
+                separator_for(previous, token),
                 Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
             ));
         }
         match &token.kind {
+            // Identity tokens (workspace/tab/pane/agent/branch) elide in the
+            // middle; the prose tokens (state text, terminal title, custom
+            // metadata) keep truncating from the end. Prose is written to be
+            // read front to back, so its head is the part worth keeping. Names
+            // are not: siblings routinely share a long prefix - `2ndmate-`,
+            // `issue/`, `feature/` - and end-truncation spends the whole budget
+            // redrawing the one part every row already agrees on. Eliding the
+            // middle keeps both anchors, so what survives is what actually tells
+            // two rows apart.
             ResolvedTokenKind::StateIcon => {
                 spans.push(Span::styled(
                     state_icon.0.to_string(),
@@ -1214,7 +1238,7 @@ fn resolved_token_spans(
             }
             ResolvedTokenKind::Workspace(text) => {
                 spans.push(Span::styled(
-                    truncate_end(text, budgets[index]),
+                    middle_elide(text, budgets[index]),
                     apply_token_style(workspace_style, token.style, p, animation_tick),
                 ));
             }
@@ -1223,7 +1247,7 @@ fn resolved_token_spans(
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::Branch(text) => {
                 spans.push(Span::styled(
-                    truncate_end(text, budgets[index]),
+                    middle_elide(text, budgets[index]),
                     apply_token_style(secondary_style, token.style, p, animation_tick),
                 ));
             }
@@ -3832,5 +3856,91 @@ rows = [
         )]
             .style();
         assert_eq!(project.fg, Some(rose_pine(0x9c, 0xcf, 0xd8)));
+    }
+
+    /// Render one configured row at `max_width` and return the drawn text, so a
+    /// narrow row can be asserted on the way the captain actually reads it.
+    fn narrow_row(resolved: &[tokens::ResolvedToken], max_width: usize) -> String {
+        let palette = crate::app::state::Palette::catppuccin();
+        resolved_token_spans(
+            resolved,
+            ("●", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &palette,
+            0,
+            max_width,
+        )
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+    }
+
+    /// The captain's Spaces row 1: `state_icon`, `$doing`, `$context`. At their
+    /// sidebar width a grouped child gets 16 columns for the whole row.
+    fn doing_row(doing: &str, context: &str) -> Vec<tokens::ResolvedToken> {
+        vec![
+            tokens::ResolvedToken::unstyled(ResolvedTokenKind::StateIcon),
+            tokens::ResolvedToken::unstyled(ResolvedTokenKind::Custom(doing.to_string())),
+            tokens::ResolvedToken::unstyled(ResolvedTokenKind::Custom(context.to_string())),
+        ]
+    }
+
+    #[test]
+    fn overflowing_row_spends_the_middot_padding_on_the_flexible_token() {
+        // 16 columns is what a grouped child row has at sidebar_width 23.
+        let row = narrow_row(&doing_row("Own herding runtime work", "9%"), 16);
+
+        // " · " costs three columns to draw one glyph of decoration; on a row that
+        // has to truncate anyway those go back to $doing.
+        assert_eq!(row, "● Own herdin… 9%");
+        assert_eq!(display_width(&row), 16);
+    }
+
+    #[test]
+    fn row_that_fits_keeps_its_middot() {
+        // Widen the same row until everything fits and the decoration is free.
+        let row = narrow_row(&doing_row("Own herding runtime work", "9%"), 40);
+
+        assert_eq!(row, "● Own herding runtime work · 9%");
+    }
+
+    #[test]
+    fn sibling_names_keep_the_part_that_tells_them_apart() {
+        // Row 2 of a grouped child is a bare `workspace` token with 14 columns.
+        let rendered = ["2ndmate-explore", "2ndmate-wallpanel", "2ndmate-scraper"].map(|name| {
+            narrow_row(
+                &[tokens::ResolvedToken::unstyled(
+                    ResolvedTokenKind::Workspace(name.to_string()),
+                )],
+                14,
+            )
+        });
+
+        // End-truncation spent the budget redrawing the shared `2ndmate-` prefix
+        // and cut exactly where the names start to differ.
+        assert_eq!(
+            rendered,
+            ["2ndmat…explore", "2ndmat…llpanel", "2ndmat…scraper"]
+        );
+        for row in &rendered {
+            assert!(display_width(row) <= 14, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn prose_tokens_still_truncate_from_the_end() {
+        // A terminal title is written to be read front to back, so its head is
+        // the part worth keeping - it must not pick up the name treatment.
+        let row = narrow_row(
+            &[tokens::ResolvedToken::unstyled(
+                ResolvedTokenKind::TerminalTitle("Rebuild fitness RPG progression".to_string()),
+            )],
+            14,
+        );
+
+        assert_eq!(row, "Rebuild fitne…");
     }
 }

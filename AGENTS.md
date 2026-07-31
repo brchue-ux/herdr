@@ -132,6 +132,14 @@ under a PTY to read the rendered cells back. Two binaries built at different
 commits, run against identical state, is what turns "the sidebar looks wrong"
 into a diff.
 
+Run each of those two binaries as its own server *and* client. Pointing a
+differently built client at a server left running from the other commit draws
+the other commit's layout, so the capture silently shows no change. Reproduce
+the reporter's geometry too, or the fixture is not their shape: a sidebar width
+the user dragged is persisted as `sidebar_width` in `session.json` and overrides
+the `config.toml` default, and a panel loses one more column to its scrollbar as
+soon as the list outgrows the pane, so the PTY has to be as tall as theirs.
+
 For a mouse bug, run that private TUI inside a pane of a second private fleet
 and read it with `pane read <pane> --source visible --format text`. Herdr is
 the terminal emulator, so no external one is needed. Drive it by sending raw

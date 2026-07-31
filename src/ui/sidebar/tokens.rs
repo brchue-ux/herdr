@@ -160,11 +160,44 @@ pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
     }
 }
 
+/// The separator to draw when the row cannot fit its content anyway.
+///
+/// `" · "` spends three columns to draw one glyph of decoration. That is a fine
+/// trade while a row still fits, and a bad one the moment those columns are
+/// coming out of a token that is already being truncated: a grouped child row
+/// in a 23-column sidebar has 16 columns to work with, so the middot and its
+/// padding are nearly a fifth of the row and come straight out of the one token
+/// the reader cares about. On an overflowing row the dot is dropped and its two
+/// padding columns go back to the flexible tokens; rows that fit keep the dot
+/// and render exactly as before.
+pub(super) fn compact_separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
+    match separator(previous, current) {
+        " · " => " ",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{AgentSidebarToken, SpaceSidebarToken};
     use crate::detect::AgentState;
+
+    #[test]
+    fn compaction_only_drops_the_middot_never_the_icon_gap() {
+        let icon = ResolvedToken::unstyled(ResolvedTokenKind::StateIcon);
+        let doing = ResolvedToken::unstyled(ResolvedTokenKind::Custom("doing".into()));
+        let context = ResolvedToken::unstyled(ResolvedTokenKind::Custom("9%".into()));
+
+        // The icon already sits one space from its row; there is nothing there
+        // to reclaim and squeezing it would glue the dot to the text.
+        assert_eq!(separator(&icon, &doing), " ");
+        assert_eq!(compact_separator(&icon, &doing), " ");
+
+        // Between two value tokens the middot is pure decoration.
+        assert_eq!(separator(&doing, &context), " · ");
+        assert_eq!(compact_separator(&doing, &context), " ");
+    }
 
     fn entry() -> AgentPanelEntry {
         AgentPanelEntry {
