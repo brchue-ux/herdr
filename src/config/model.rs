@@ -123,6 +123,31 @@ pub enum SidebarCollapsedModeConfig {
     Hidden,
 }
 
+/// When a tab-label decoration (state dot, index number) is drawn.
+///
+/// `Auto` shows the decoration only while the sidebar is collapsed, which is
+/// exactly when the sidebar is no longer able to answer "does anything need
+/// me?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabDecorationConfig {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl TabDecorationConfig {
+    /// Whether the decoration should be drawn for the current sidebar state.
+    pub fn enabled(self, sidebar_collapsed: bool) -> bool {
+        match self {
+            Self::Auto => sidebar_collapsed,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RightClickPassthroughModifierConfig(Option<KeyModifiers>);
 
@@ -812,6 +837,14 @@ pub struct UiConfig {
     pub show_agent_labels_on_pane_borders: bool,
     /// Hide the tab row when the workspace has one tab. Default: false.
     pub hide_tab_bar_when_single_tab: bool,
+    /// Show a rolled-up agent state dot on each tab label.
+    /// "auto" (default) shows it only while the sidebar is collapsed.
+    pub show_tab_state_dots: TabDecorationConfig,
+    /// Show the tab's 1-based jump number next to custom tab titles.
+    /// Auto-named tabs already display their number as the title, so they are
+    /// never double-numbered. "auto" (default) shows it only while the sidebar
+    /// is collapsed.
+    pub show_tab_numbers: TabDecorationConfig,
     /// Agent sidebar ordering. Saved values are "spaces" or "priority". Default: "spaces".
     pub agent_panel_sort: AgentPanelSortConfig,
     /// Expanded sidebar row composition.
@@ -1014,6 +1047,8 @@ impl Default for UiConfig {
             pane_gaps: true,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            show_tab_state_dots: TabDecorationConfig::Auto,
+            show_tab_numbers: TabDecorationConfig::Auto,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
@@ -1397,6 +1432,36 @@ sidebar_start_collapsed = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.sidebar_start_collapsed);
+    }
+
+    #[test]
+    fn tab_decorations_default_to_auto_and_parse_overrides() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.show_tab_state_dots,
+            TabDecorationConfig::Auto
+        );
+        assert_eq!(
+            default_config.ui.show_tab_numbers,
+            TabDecorationConfig::Auto
+        );
+
+        let toml = r#"
+[ui]
+show_tab_state_dots = "always"
+show_tab_numbers = "never"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.show_tab_state_dots, TabDecorationConfig::Always);
+        assert_eq!(config.ui.show_tab_numbers, TabDecorationConfig::Never);
+    }
+
+    #[test]
+    fn tab_decoration_auto_follows_the_collapsed_sidebar() {
+        assert!(!TabDecorationConfig::Auto.enabled(false));
+        assert!(TabDecorationConfig::Auto.enabled(true));
+        assert!(TabDecorationConfig::Always.enabled(false));
+        assert!(!TabDecorationConfig::Never.enabled(true));
     }
 
     #[test]

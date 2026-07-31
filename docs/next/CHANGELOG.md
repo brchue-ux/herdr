@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Tab labels can carry a rolled-up agent state dot and the tab's jump number, so a collapsed sidebar and the mobile tab list are no longer state-blind. Controlled by `ui.show_tab_state_dots` and `ui.show_tab_numbers`; both default to `"auto"`, which shows the decorations only while the sidebar is collapsed.
+
 ### Changed
 - Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.

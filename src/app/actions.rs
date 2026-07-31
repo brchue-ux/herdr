@@ -1731,12 +1731,14 @@ impl AppState {
             return;
         };
 
+        let decor = crate::ui::TabLabelDecor::from_state(self);
         let layout = crate::ui::compute_tab_bar_view(
             ws,
             area,
             self.tab_scroll,
             self.tab_scroll_follow_active,
             self.mouse_capture,
+            decor,
         );
         self.tab_scroll = layout.scroll;
         self.view.tab_hit_areas = layout.tab_hit_areas;

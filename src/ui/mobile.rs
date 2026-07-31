@@ -684,16 +684,28 @@ fn render_mobile_switcher_content(
             } else {
                 format!("{} · {display_name}", idx + 1)
             };
-            let title = Line::from(vec![
-                Span::styled("  ", Style::default().bg(bg)),
-                Span::styled(
-                    truncate_end(&label, content.width.saturating_sub(3) as usize),
-                    Style::default()
-                        .fg(p.text)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
+            let mut spans = vec![Span::styled("  ", Style::default().bg(bg))];
+            let mut reserved = 3usize;
+            // Mobile has no sidebar at all, so "auto" resolves the same way it
+            // does for a collapsed desktop sidebar.
+            if app.show_tab_state_dots.enabled(true) {
+                let (tab_state, tab_seen) = tab.aggregate_state(&app.terminals);
+                let (dot, dot_style) = state_dot(tab_state, tab_seen, p);
+                spans.push(Span::styled(dot, dot_style.bg(bg)));
+                spans.push(Span::styled(" ", Style::default().bg(bg)));
+                reserved += 2;
+            }
+            spans.push(Span::styled(
+                truncate_end(
+                    &label,
+                    content.width.saturating_sub(reserved as u16) as usize,
                 ),
-            ]);
+                Style::default()
+                    .fg(p.text)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let title = Line::from(spans);
             render_one_line_item(
                 frame,
                 viewport,

@@ -1531,6 +1531,10 @@ pub struct AppState {
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub hide_tab_bar_when_single_tab: bool,
+    /// When to draw a rolled-up agent state dot on each tab label.
+    pub show_tab_state_dots: crate::config::TabDecorationConfig,
+    /// When to draw the tab's jump number next to custom tab titles.
+    pub show_tab_numbers: crate::config::TabDecorationConfig,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1994,6 +1998,8 @@ impl AppState {
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
+            show_tab_state_dots: crate::config::TabDecorationConfig::default(),
+            show_tab_numbers: crate::config::TabDecorationConfig::default(),
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
