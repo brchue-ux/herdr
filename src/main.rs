@@ -212,6 +212,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # last_pane = ""          # optional, unset by default; bind e.g. "prefix+tab" for global back-and-forth
 # split_vertical = "prefix+v"
 # split_horizontal = "prefix+minus"
+# cycle_layout = "prefix+space"   # cycle built-in pane arrangements
 # close_pane = "prefix+x"
 # zoom = "prefix+z"       # legacy alias: fullscreen
 # resize_mode = "prefix+r"

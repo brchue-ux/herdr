@@ -371,6 +371,10 @@ impl App {
                 self.split_focused_pane_via_api(crate::api::schema::SplitDirection::Down);
                 leave_navigate_mode(&mut self.state);
             }
+            NavigateAction::CycleLayout => {
+                self.cycle_layout_via_api();
+                leave_navigate_mode(&mut self.state);
+            }
             NavigateAction::ClosePane => {
                 if !self.close_focused_pane_via_api_requires_confirmation() {
                     leave_navigate_mode(&mut self.state);
@@ -600,6 +604,18 @@ impl App {
             crate::api::schema::PaneZoomParams {
                 pane_id: None,
                 mode: crate::api::schema::PaneZoomMode::Toggle,
+            },
+        );
+    }
+
+    /// Rearrange the active tab into the next built-in arrangement.
+    pub(crate) fn cycle_layout_via_api(&mut self) {
+        self.runtime_layout_arrange(
+            "tui.layout.arrange",
+            crate::api::schema::LayoutArrangeParams {
+                tab_id: None,
+                pane_id: None,
+                arrangement: crate::api::schema::LayoutArrangement::Next,
             },
         );
     }
@@ -1354,6 +1370,7 @@ pub(crate) enum NavigateAction {
     SwapPaneRight,
     SplitVertical,
     SplitHorizontal,
+    CycleLayout,
     ClosePane,
     EditScrollback,
     CopyMode,
@@ -1500,6 +1517,7 @@ fn non_indexed_action_for_key(
         (&kb.cycle_pane_previous, NavigateAction::CyclePanePrevious),
         (&kb.split_vertical, NavigateAction::SplitVertical),
         (&kb.split_horizontal, NavigateAction::SplitHorizontal),
+        (&kb.cycle_layout, NavigateAction::CycleLayout),
         (&kb.close_pane, NavigateAction::ClosePane),
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
@@ -1720,6 +1738,10 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::SplitHorizontal => {
             state.split_pane(terminal_runtimes, Direction::Vertical);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::CycleLayout => {
+            state.cycle_active_layout_arrangement();
             leave_navigate_mode(state);
         }
         NavigateAction::ClosePane => {
@@ -1969,6 +1991,53 @@ mod tests {
         );
 
         assert_eq!(state.mode, Mode::Navigator);
+    }
+
+    #[test]
+    fn prefix_space_cycles_the_built_in_pane_arrangements() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let ids = state.workspaces[0].tabs[0].layout.pane_ids();
+
+        // Default binding is prefix+space, and navigate mode is prefix mode.
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+        );
+
+        let area = ratatui::layout::Rect::new(0, 0, 90, 30);
+        let rects: Vec<_> = state.workspaces[0].tabs[0]
+            .layout
+            .panes(area)
+            .into_iter()
+            .map(|info| (info.id, info.rect))
+            .collect();
+        assert_eq!(
+            rects,
+            vec![
+                (ids[0], ratatui::layout::Rect::new(0, 0, 30, 30)),
+                (ids[1], ratatui::layout::Rect::new(30, 0, 30, 30)),
+                (ids[2], ratatui::layout::Rect::new(60, 0, 30, 30)),
+            ],
+            "first press should lay the panes out evenly across one row"
+        );
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+        );
+        let heights: Vec<_> = state.workspaces[0].tabs[0]
+            .layout
+            .panes(area)
+            .into_iter()
+            .map(|info| (info.rect.y, info.rect.height))
+            .collect();
+        assert_eq!(
+            heights,
+            vec![(0, 10), (10, 10), (20, 10)],
+            "second press should step to the even-vertical arrangement"
+        );
     }
 
     #[test]

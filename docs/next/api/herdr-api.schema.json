@@ -2183,6 +2183,54 @@
           ],
           "type": "object"
         },
+        "LayoutArrangeParams": {
+          "properties": {
+            "arrangement": {
+              "$ref": "#/schemas/request/$defs/LayoutArrangement"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "arrangement"
+          ],
+          "type": "object"
+        },
+        "LayoutArrangement": {
+          "description": "Built-in arrangement to rebuild a tab's existing panes into, or a step\nthrough the built-in list.",
+          "oneOf": [
+            {
+              "enum": [
+                "even_horizontal",
+                "even_vertical",
+                "main_vertical",
+                "main_horizontal",
+                "tiled"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "next",
+              "description": "The arrangement after the last one applied to this tab, wrapping.",
+              "type": "string"
+            },
+            {
+              "const": "previous",
+              "description": "The arrangement before the last one applied to this tab, wrapping.",
+              "type": "string"
+            }
+          ]
+        },
         "LayoutExportParams": {
           "properties": {
             "pane_id": {
@@ -5216,6 +5264,22 @@
         {
           "properties": {
             "method": {
+              "const": "layout.arrange",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutArrangeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.neighbor",
               "type": "string"
             },
@@ -7181,6 +7245,31 @@
             "messages"
           ],
           "type": "object"
+        },
+        "LayoutArrangement": {
+          "description": "Built-in arrangement to rebuild a tab's existing panes into, or a step\nthrough the built-in list.",
+          "oneOf": [
+            {
+              "enum": [
+                "even_horizontal",
+                "even_vertical",
+                "main_vertical",
+                "main_horizontal",
+                "tiled"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "next",
+              "description": "The arrangement after the last one applied to this tab, wrapping.",
+              "type": "string"
+            },
+            {
+              "const": "previous",
+              "description": "The arrangement before the last one applied to this tab, wrapping.",
+              "type": "string"
+            }
+          ]
         },
         "LayoutDescription": {
           "properties": {
@@ -9157,6 +9246,27 @@
               },
               "required": [
                 "type",
+                "layout"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "arrangement": {
+                  "$ref": "#/schemas/success_response/$defs/LayoutArrangement",
+                  "description": "The arrangement that was applied, never `next`/`previous`."
+                },
+                "layout": {
+                  "$ref": "#/schemas/success_response/$defs/LayoutDescription"
+                },
+                "type": {
+                  "const": "layout_arrange",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "arrangement",
                 "layout"
               ],
               "type": "object"

@@ -500,6 +500,12 @@
           "description": "Split pane horizontally (stacked)."
         },
         {
+          "key": "keys.cycle_layout",
+          "type": "keybinding",
+          "default": "\"prefix+space\"",
+          "description": "Cycle the focused tab through the built-in pane arrangements."
+        },
+        {
           "key": "keys.close_pane",
           "type": "keybinding",
           "default": "\"prefix+x\"",

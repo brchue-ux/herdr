@@ -1125,6 +1125,33 @@ fn authority_mutation_requests_round_trip() {
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, split_ratio);
 
+    let arrange = Request {
+        id: "arrange".into(),
+        method: Method::LayoutArrange(LayoutArrangeParams {
+            tab_id: Some("w1:1".into()),
+            pane_id: None,
+            arrangement: LayoutArrangement::Next,
+        }),
+    };
+    let json = serde_json::to_value(&arrange).unwrap();
+    assert_eq!(json["method"], "layout.arrange");
+    assert_eq!(json["params"]["arrangement"], "next");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, arrange);
+
+    let arrange_exact = Request {
+        id: "arrange_exact".into(),
+        method: Method::LayoutArrange(LayoutArrangeParams {
+            tab_id: None,
+            pane_id: None,
+            arrangement: LayoutArrangement::MainVertical,
+        }),
+    };
+    let json = serde_json::to_value(&arrange_exact).unwrap();
+    assert_eq!(json["params"]["arrangement"], "main_vertical");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, arrange_exact);
+
     let subscription = Request {
         id: "sub_moves".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {

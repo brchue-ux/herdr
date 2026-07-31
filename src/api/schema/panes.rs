@@ -131,6 +131,31 @@ pub struct LayoutApplyParams {
     pub root: LayoutNode,
 }
 
+/// Built-in arrangement to rebuild a tab's existing panes into, or a step
+/// through the built-in list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutArrangement {
+    EvenHorizontal,
+    EvenVertical,
+    MainVertical,
+    MainHorizontal,
+    Tiled,
+    /// The arrangement after the last one applied to this tab, wrapping.
+    Next,
+    /// The arrangement before the last one applied to this tab, wrapping.
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LayoutArrangeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    pub arrangement: LayoutArrangement,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LayoutSetSplitRatioParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
