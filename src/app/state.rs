@@ -612,6 +612,59 @@ impl Palette {
         }
         self
     }
+
+    /// Raise the four muted tokens until they clear a minimum WCAG contrast
+    /// against the host terminal background Herdr measured over OSC 10/11.
+    ///
+    /// Only `surface0`, `surface_dim`, `overlay0` and `overlay1` are floored.
+    /// Accents carry meaning and are hand-tuned per theme, so a computed floor
+    /// on them would look worse than the palette it "fixed"; these four are
+    /// the tokens whose whole job is to be quiet, and therefore the ones that
+    /// disappear when the palette and the host background disagree.
+    ///
+    /// Two deliberate no-ops:
+    /// - No measured background (the host never answered the OSC query, which
+    ///   multiplexers commonly cause) leaves the palette exactly as authored.
+    /// - `Color::Reset` means "inherit the host" and is never rewritten, so a
+    ///   theme that opts out of painting a surface keeps opting out.
+    pub fn with_contrast_floor(mut self, host: &crate::terminal_theme::TerminalTheme) -> Self {
+        use crate::ui::color::{ensure_contrast, resolve_color_rgb, terminal_theme_to_rgb};
+
+        /// WCAG AA for body text — `overlay1` is read as text.
+        const OVERLAY1_FLOOR: f32 = 4.5;
+        /// WCAG AA for large text and non-text UI — `overlay0` is secondary
+        /// text and scrollbar thumbs.
+        const OVERLAY0_FLOOR: f32 = 3.0;
+        /// Deliberately *not* a WCAG number. Separators, scrollbar tracks and
+        /// selection fills are meant to be nearly invisible, so this only has
+        /// to catch "literally indistinguishable from the background" and lift
+        /// just far enough to be seen. Calibrated so a hand-tuned theme on its
+        /// own background is barely touched — Catppuccin Mocha's `surface_dim`
+        /// (which equals its base colour, so it vanishes on a matching host)
+        /// moves #1e1e2e → #262635 and nothing else in the theme changes.
+        const SURFACE_FLOOR: f32 = 1.1;
+
+        let Some(background) = host.background.map(terminal_theme_to_rgb) else {
+            return self;
+        };
+
+        for (token, floor) in [
+            (&mut self.surface0, SURFACE_FLOOR),
+            (&mut self.surface_dim, SURFACE_FLOOR),
+            (&mut self.overlay0, OVERLAY0_FLOOR),
+            (&mut self.overlay1, OVERLAY1_FLOOR),
+        ] {
+            let Some(rgb) = resolve_color_rgb(*token, host) else {
+                continue;
+            };
+            let floored = ensure_contrast(rgb, background, floor);
+            if floored != rgb {
+                *token = Color::Rgb(floored.0, floored.1, floored.2);
+            }
+        }
+
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2406,6 +2459,124 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    mod contrast_floor {
+        use super::super::Palette;
+        use crate::terminal_theme::{RgbColor, TerminalTheme};
+        use crate::ui::color::{contrast_ratio, resolve_color_rgb};
+        use ratatui::style::Color;
+
+        fn host_background(r: u8, g: u8, b: u8) -> TerminalTheme {
+            TerminalTheme::default().with_color(
+                crate::terminal_theme::DefaultColorKind::Background,
+                RgbColor { r, g, b },
+            )
+        }
+
+        fn ratio_against(color: Color, host: &TerminalTheme, background: (u8, u8, u8)) -> f32 {
+            let rgb = resolve_color_rgb(color, host).expect("token should resolve");
+            contrast_ratio(rgb, background)
+        }
+
+        #[test]
+        fn white_terminal_background_makes_the_terminal_theme_readable() {
+            let background = (255, 255, 255);
+            let host = host_background(background.0, background.1, background.2);
+            let before = Palette::terminal();
+            let after = before.clone().with_contrast_floor(&host);
+
+            // Precondition: the authored palette really is unreadable here.
+            assert!(ratio_against(before.overlay1, &host, background) < 4.5);
+            assert!(ratio_against(before.overlay0, &host, background) < 3.0);
+
+            assert!(ratio_against(after.overlay1, &host, background) >= 4.5);
+            assert!(ratio_against(after.overlay0, &host, background) >= 3.0);
+            assert!(ratio_against(after.surface_dim, &host, background) >= 1.5);
+        }
+
+        #[test]
+        fn reset_tokens_keep_inheriting_the_host() {
+            let host = host_background(255, 255, 255);
+            let floored = Palette::terminal().with_contrast_floor(&host);
+            // `terminal` deliberately paints no surface0 fill; the floor must
+            // not turn that into an opaque background.
+            assert_eq!(Palette::terminal().surface0, Color::Reset);
+            assert_eq!(floored.surface0, Color::Reset);
+        }
+
+        #[test]
+        fn an_unmeasured_host_leaves_the_palette_untouched() {
+            let palette = Palette::catppuccin();
+            assert_eq!(
+                palette
+                    .clone()
+                    .with_contrast_floor(&TerminalTheme::default()),
+                palette
+            );
+        }
+
+        #[test]
+        fn a_hand_tuned_theme_on_its_own_background_is_barely_touched() {
+            // Catppuccin Mocha on a Mocha terminal. `surface0` and `overlay0`
+            // already clear their floors untouched; `surface_dim` is literally
+            // the base colour and so renders invisible, and `overlay1` sits a
+            // hair under AA. Both get the smallest nudge that clears the floor
+            // — a nudge, not a restyle.
+            let before = Palette::catppuccin();
+            let after = before
+                .clone()
+                .with_contrast_floor(&host_background(30, 30, 46));
+
+            assert_eq!(after.surface0, before.surface0);
+            assert_eq!(after.overlay0, before.overlay0);
+
+            for (label, b, a) in [
+                ("surface_dim", before.surface_dim, after.surface_dim),
+                ("overlay1", before.overlay1, after.overlay1),
+            ] {
+                let unmeasured = TerminalTheme::default();
+                let b = resolve_color_rgb(b, &unmeasured).expect("rgb");
+                let a = resolve_color_rgb(a, &unmeasured).expect("rgb");
+                let moved =
+                    a.0.abs_diff(b.0)
+                        .max(a.1.abs_diff(b.1))
+                        .max(a.2.abs_diff(b.2));
+                assert!(moved <= 12, "{label} moved {b:?} -> {a:?}");
+            }
+        }
+
+        #[test]
+        fn accents_are_never_floored() {
+            let host = host_background(255, 255, 255);
+            let before = Palette::terminal();
+            let after = before.clone().with_contrast_floor(&host);
+            assert_eq!(after.accent, before.accent);
+            assert_eq!(after.green, before.green);
+            assert_eq!(after.yellow, before.yellow);
+            assert_eq!(after.red, before.red);
+            assert_eq!(after.text, before.text);
+            assert_eq!(after.subtext0, before.subtext0);
+            assert_eq!(after.surface1, before.surface1);
+        }
+
+        #[test]
+        fn the_measured_palette_decides_whether_a_named_token_needs_lifting() {
+            // A host whose "white" slot is a light grey on a white background:
+            // the static table would call it compliant, the measurement does not.
+            let background = (255, 255, 255);
+            let host = host_background(background.0, background.1, background.2)
+                .with_palette_color(
+                    15,
+                    RgbColor {
+                        r: 224,
+                        g: 224,
+                        b: 224,
+                    },
+                );
+            let floored = Palette::terminal().with_contrast_floor(&host);
+            assert!(ratio_against(floored.overlay1, &host, background) >= 4.5);
+        }
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

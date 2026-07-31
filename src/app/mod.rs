@@ -371,6 +371,7 @@ fn resolve_palette_for_theme_name(
 fn resolve_effective_theme(
     runtime: &state::ThemeRuntimeConfig,
     appearance: Option<crate::terminal_theme::HostAppearance>,
+    host_theme: &crate::terminal_theme::TerminalTheme,
 ) -> (state::Palette, String) {
     let (name, fallback) = if runtime.auto_switch {
         match appearance.unwrap_or(crate::terminal_theme::HostAppearance::Dark) {
@@ -383,7 +384,7 @@ fn resolve_effective_theme(
         (&runtime.manual_name, "catppuccin")
     };
     (
-        resolve_palette_for_theme_name(name, fallback, runtime),
+        resolve_palette_for_theme_name(name, fallback, runtime).with_contrast_floor(host_theme),
         name.clone(),
     )
 }
@@ -542,7 +543,13 @@ impl App {
         #[cfg(test)]
         let agent_manifest_summaries = Vec::new();
         let theme_runtime = theme_runtime_config(config, true);
-        let (theme_palette, theme_name) = resolve_effective_theme(&theme_runtime, None);
+        // Nothing has been measured yet at construction time, so the floor is a
+        // no-op here; it lands when the host answers the OSC query.
+        let (theme_palette, theme_name) = resolve_effective_theme(
+            &theme_runtime,
+            None,
+            &crate::terminal_theme::TerminalTheme::default(),
+        );
 
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
