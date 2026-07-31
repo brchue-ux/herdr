@@ -48,6 +48,50 @@ pub struct WorkspaceReportMetadataParams {
     pub ttl_ms: Option<u64>,
 }
 
+/// What happened between two workspaces.
+///
+/// Describes the fleet, never the drawing: Herdr decides on its own whether a
+/// signal becomes a moving mark on a branch line, a brief emphasis, or nothing
+/// at all on a layout that has no room for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSignalKind {
+    /// Work moved from `from_workspace_id` to `to_workspace_id`.
+    Transfer,
+    /// `from_workspace_id` finished the work it was given.
+    Completed,
+}
+
+/// A transient relation between two runtime entities.
+///
+/// Fire-and-forget: never persisted, never part of agent state, never part of
+/// seen/unseen. A report that is dropped costs a decoration and nothing else,
+/// which is why every reason to drop one — an unknown workspace, a replayed
+/// `seq`, a layout with nowhere to put it — answers success rather than an
+/// error. A publisher can retry blindly and can never fail a turn on this call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceReportSignalParams {
+    /// Publisher identity, as in `workspace.report_metadata`. `seq` is tracked
+    /// per source.
+    pub source: String,
+    pub kind: WorkspaceSignalKind,
+    /// Required for `completed`; the origin of a `transfer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_workspace_id: Option<String>,
+    /// Required for `transfer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_workspace_id: Option<String>,
+    /// Monotonic per source. A report at or below the last accepted value is
+    /// ignored, so retries are safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// How long the signal stays meaningful. Clamped by the server; omit to let
+    /// Herdr choose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 86_400_000))]
+    pub ttl_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceInfo {
     pub workspace_id: String,

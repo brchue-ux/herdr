@@ -4137,6 +4137,9 @@ impl HeadlessServer {
             self.app.next_state_age_tick = None;
             changed = true;
         }
+        changed |= self
+            .app
+            .advance_relation_signals(now, self.has_app_viewers());
 
         if self
             .app

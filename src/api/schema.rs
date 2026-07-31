@@ -79,6 +79,8 @@ pub enum Method {
     WorkspaceMoveBlock(WorkspaceMoveBlockParams),
     #[serde(rename = "workspace.report_metadata")]
     WorkspaceReportMetadata(WorkspaceReportMetadataParams),
+    #[serde(rename = "workspace.report_signal")]
+    WorkspaceReportSignal(WorkspaceReportSignalParams),
     #[serde(rename = "workspace.close")]
     WorkspaceClose(WorkspaceTarget),
     #[serde(rename = "worktree.list")]

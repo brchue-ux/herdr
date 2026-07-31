@@ -245,6 +245,16 @@ fn workspace_command() -> Command {
                 .arg(option("seq", "N"))
                 .arg(option("ttl-ms", "N")),
         )
+        .subcommand(
+            Command::new("report-signal")
+                .about("Report a transient relation between workspaces")
+                .arg(option("source", "ID").required(true))
+                .arg(option("kind", "KIND").required(true))
+                .arg(option("from", "WORKSPACE_ID"))
+                .arg(option("to", "WORKSPACE_ID"))
+                .arg(option("seq", "N"))
+                .arg(option("ttl-ms", "N")),
+        )
         .subcommand(id_command("close", "workspace_id", "Close a workspace"))
 }
 
@@ -1157,6 +1167,7 @@ mod tests {
     fn spec_marks_runtime_required_options_as_required() {
         for (path, options) in [
             (&["workspace", "report-metadata"][..], &["source"][..]),
+            (&["workspace", "report-signal"][..], &["source", "kind"][..]),
             (&["pane", "neighbor"][..], &["direction"][..]),
             (&["pane", "focus"][..], &["direction"][..]),
             (&["pane", "resize"][..], &["direction"][..]),

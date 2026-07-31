@@ -997,6 +997,9 @@ impl App {
             Method::WorkspaceReportMetadata(params) => {
                 return self.handle_workspace_report_metadata(request.id, params);
             }
+            Method::WorkspaceReportSignal(params) => {
+                return self.handle_workspace_report_signal(request.id, params);
+            }
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target)
             }

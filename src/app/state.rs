@@ -1629,6 +1629,13 @@ pub struct AppState {
     /// frame from `animation_tick`. The runtime refreshes this every loop
     /// iteration; a test can set it and get a deterministic render.
     pub state_age_now: Instant,
+    /// Fleet relation signals currently travelling a sidebar row.
+    ///
+    /// Deliberately absent from both `persist::SessionSnapshot` and the live
+    /// handoff manifest: a signal is decoration over state that is already
+    /// correct, so a client that attaches late, or a server that restarts, is
+    /// right to show the settled row and nothing else.
+    pub(crate) relation_signals: crate::app::relation_signal::RelationSignals,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1794,6 +1801,36 @@ impl AppState {
             .filter_map(|terminal| terminal.state_age(now))
             .map(|age| now + crate::state_age::next_change_after(age))
             .min()
+    }
+
+    /// True when at least one live relation signal is travelling a row the
+    /// sidebar actually laid out.
+    ///
+    /// This is the damage test. `view.workspace_card_areas` is the authority on
+    /// what was laid out for the current frame: it is empty for a collapsed
+    /// sidebar and for the mobile layout, and it omits rows scrolled past the
+    /// end of the list or hidden inside a collapsed group. A signal aimed
+    /// anywhere else damages nothing, so the loop is never woken to repaint for
+    /// it — while the signal itself still expires on schedule, because expiry
+    /// does not go through here.
+    pub(crate) fn relation_signal_damage(&self) -> bool {
+        self.relation_signals.iter().any(|signal| {
+            self.view.workspace_card_areas.iter().any(|card| {
+                self.workspaces
+                    .get(card.ws_idx)
+                    .is_some_and(|workspace| workspace.id == signal.carrier_workspace_id())
+            })
+        })
+    }
+
+    /// Where a relation signal has reached on this workspace's row, if one is
+    /// travelling it.
+    pub(crate) fn workspace_relation_signal_phase(
+        &self,
+        ws_idx: usize,
+    ) -> Option<crate::app::relation_signal::RelationSignalPhase> {
+        let workspace = self.workspaces.get(ws_idx)?;
+        self.relation_signals.phase_for_workspace(&workspace.id)
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -2113,6 +2150,7 @@ impl AppState {
             keybinds: Keybinds::default(),
             animation_tick: 0,
             state_age_now: Instant::now(),
+            relation_signals: crate::app::relation_signal::RelationSignals::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {

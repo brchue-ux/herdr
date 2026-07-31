@@ -16,6 +16,7 @@ mod git_refresh;
 mod ids;
 mod input;
 mod popup;
+pub(crate) mod relation_signal;
 mod runtime;
 mod runtime_mutations;
 mod session;
@@ -692,6 +693,7 @@ impl App {
             keybinds: config.keybinds(),
             animation_tick: 0,
             state_age_now: Instant::now(),
+            relation_signals: relation_signal::RelationSignals::default(),
             palette: theme_palette,
             theme_name,
             theme_runtime,

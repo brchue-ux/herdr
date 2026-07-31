@@ -3,8 +3,10 @@ use std::path::PathBuf;
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCreateParams,
     WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
-    WorkspaceReportMetadataParams, WorkspaceTarget,
+    WorkspaceReportMetadataParams, WorkspaceReportSignalParams, WorkspaceSignalKind,
+    WorkspaceTarget,
 };
+use crate::app::relation_signal::RelationSignalKind;
 use crate::app::App;
 
 use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_ttl};
@@ -292,6 +294,79 @@ impl App {
             self.sync_agent_metadata_deadline();
             self.emit_workspace_token_updated(index);
         }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Records a transient relation between two workspaces.
+    ///
+    /// Every way this can come to nothing answers success. An unknown workspace
+    /// id, a workspace that has since closed, a replayed `seq`, a source that
+    /// has exhausted the sequence table — none of them are the publisher's
+    /// problem to handle, because none of them mean anything went wrong with the
+    /// fleet. Only a malformed report is an error.
+    ///
+    /// Accepting a signal deliberately does **not** request a repaint. It arms
+    /// the loop's own clock, and that clock is what paints. A publisher
+    /// reporting a thousand signals a second therefore still cannot make Herdr
+    /// draw more often than it already would.
+    pub(super) fn handle_workspace_report_signal(
+        &mut self,
+        id: String,
+        params: WorkspaceReportSignalParams,
+    ) -> String {
+        let source = match normalize_metadata_source(params.source) {
+            Ok(source) => source,
+            Err(message) => return encode_error(id, "invalid_metadata_source", message),
+        };
+        let ttl = match normalize_metadata_ttl(params.ttl_ms) {
+            Ok(ttl) => ttl,
+            Err(message) => return encode_error(id, "invalid_metadata_ttl", message),
+        };
+
+        // Which end of the relation carries the signal is Herdr's decision, not
+        // the publisher's: work arriving lands on the receiver's row, work
+        // finishing leaves from the row that finished it.
+        let (kind, carrier_id) = match params.kind {
+            WorkspaceSignalKind::Transfer => (
+                RelationSignalKind::Transfer,
+                params.to_workspace_id.as_deref(),
+            ),
+            WorkspaceSignalKind::Completed => (
+                RelationSignalKind::Completed,
+                params.from_workspace_id.as_deref(),
+            ),
+        };
+        let Some(carrier_id) = carrier_id else {
+            return encode_error(
+                id,
+                "invalid_signal_target",
+                match params.kind {
+                    WorkspaceSignalKind::Transfer => {
+                        "workspace signal kind transfer requires to_workspace_id"
+                    }
+                    WorkspaceSignalKind::Completed => {
+                        "workspace signal kind completed requires from_workspace_id"
+                    }
+                },
+            );
+        };
+
+        let Some(carrier) = self
+            .parse_workspace_id(carrier_id)
+            .and_then(|index| self.state.workspaces.get(index))
+            .map(|workspace| workspace.id.clone())
+        else {
+            return encode_success(id, ResponseResult::Ok {});
+        };
+
+        let _ = self.state.relation_signals.accept(
+            &source,
+            params.seq,
+            kind,
+            carrier,
+            ttl,
+            std::time::Instant::now(),
+        );
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -587,6 +662,169 @@ mod tests {
             &event.data,
             EventData::WorkspaceMetadataUpdated { workspace } if workspace.tokens.is_empty()
         )));
+    }
+
+    fn app_with_two_workspaces() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("first"), Workspace::test_new("second")];
+        app
+    }
+
+    fn report_signal(app: &mut App, params: WorkspaceReportSignalParams) -> String {
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorkspaceReportSignal(params),
+        })
+    }
+
+    fn signal_params(kind: WorkspaceSignalKind) -> WorkspaceReportSignalParams {
+        WorkspaceReportSignalParams {
+            source: "firstmate".into(),
+            kind,
+            from_workspace_id: None,
+            to_workspace_id: None,
+            seq: None,
+            ttl_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_transfer_lands_on_the_receiving_workspace_and_a_completion_on_the_finishing_one() {
+        for (kind, carrier_idx) in [
+            (WorkspaceSignalKind::Transfer, 1),
+            (WorkspaceSignalKind::Completed, 0),
+        ] {
+            let mut app = app_with_two_workspaces();
+            let (from, to) = (app.public_workspace_id(0), app.public_workspace_id(1));
+            let response = report_signal(
+                &mut app,
+                WorkspaceReportSignalParams {
+                    from_workspace_id: Some(from),
+                    to_workspace_id: Some(to),
+                    ..signal_params(kind)
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(success.result, ResponseResult::Ok {});
+
+            let carrier = app.state.workspaces[carrier_idx].id.clone();
+            assert!(app
+                .state
+                .relation_signals
+                .phase_for_workspace(&carrier)
+                .is_some());
+            let other = app.state.workspaces[1 - carrier_idx].id.clone();
+            assert!(app
+                .state
+                .relation_signals
+                .phase_for_workspace(&other)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn a_workspace_that_no_longer_exists_answers_success_and_records_nothing() {
+        let mut app = app_with_two_workspaces();
+        let response = report_signal(
+            &mut app,
+            WorkspaceReportSignalParams {
+                to_workspace_id: Some("w_9999".into()),
+                ..signal_params(WorkspaceSignalKind::Transfer)
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            success.result,
+            ResponseResult::Ok {},
+            "a mate that has already closed must not be able to fail its caller"
+        );
+        assert!(app.state.relation_signals.is_empty());
+    }
+
+    #[test]
+    fn a_replayed_sequence_is_accepted_without_restarting_the_row() {
+        let mut app = app_with_two_workspaces();
+        let to = app.public_workspace_id(1);
+        for _ in 0..3 {
+            let response = report_signal(
+                &mut app,
+                WorkspaceReportSignalParams {
+                    to_workspace_id: Some(to.clone()),
+                    seq: Some(7),
+                    ..signal_params(WorkspaceSignalKind::Transfer)
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(success.result, ResponseResult::Ok {});
+        }
+        assert_eq!(app.state.relation_signals.iter().count(), 1);
+
+        // A report behind the watermark is ignored outright, so a retry that
+        // races a newer one cannot rewind the row.
+        let response = report_signal(
+            &mut app,
+            WorkspaceReportSignalParams {
+                from_workspace_id: Some(to.clone()),
+                seq: Some(6),
+                ..signal_params(WorkspaceSignalKind::Completed)
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        let carrier = app.state.workspaces[1].id.clone();
+        assert_eq!(
+            app.state
+                .relation_signals
+                .phase_for_workspace(&carrier)
+                .map(|phase| phase.direction),
+            Some(crate::app::relation_signal::SignalDirection::Toward),
+        );
+    }
+
+    #[test]
+    fn a_signal_kind_without_the_workspace_it_needs_is_the_one_real_error() {
+        for kind in [
+            WorkspaceSignalKind::Transfer,
+            WorkspaceSignalKind::Completed,
+        ] {
+            let mut app = app_with_two_workspaces();
+            let response = report_signal(&mut app, signal_params(kind));
+            let error: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(error["error"]["code"], "invalid_signal_target");
+        }
+    }
+
+    #[test]
+    fn a_publisher_lifetime_is_clamped_rather_than_trusted() {
+        let mut app = app_with_two_workspaces();
+        let to = app.public_workspace_id(1);
+        let response = report_signal(
+            &mut app,
+            WorkspaceReportSignalParams {
+                to_workspace_id: Some(to),
+                ttl_ms: Some(86_400_000),
+                ..signal_params(WorkspaceSignalKind::Transfer)
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        let carrier = app.state.workspaces[1].id.clone();
+        app.state
+            .relation_signals
+            .advance(std::time::Instant::now() + crate::app::relation_signal::MAX_SIGNAL_TTL);
+        assert_eq!(
+            app.state.relation_signals.phase_for_workspace(&carrier),
+            None,
+            "a day-long ttl must not pin a row for a day"
+        );
     }
 
     #[test]

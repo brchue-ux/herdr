@@ -308,6 +308,8 @@ impl App {
             self.next_state_age_tick = None;
             changed = true;
         }
+        // The app's own loop is by definition its viewer.
+        changed |= self.advance_relation_signals(now, true);
 
         if self
             .selection_autoscroll_deadline
@@ -353,6 +355,28 @@ impl App {
         self.sync_animation_timer(now);
         self.sync_state_age_timer(now, true);
         changed
+    }
+
+    /// Moves live relation signals to the stop they are due at `now` and drops
+    /// the ones that have expired.
+    ///
+    /// Runs on every loop iteration, not only while something is being drawn,
+    /// so a signal always dies on schedule. What it gates is the *repaint*: the
+    /// caller only learns that something changed when the change lands on a row
+    /// the sidebar actually laid out, before or after this advance. A signal
+    /// aimed at a collapsed sidebar, a mobile layout, or a row scrolled out of
+    /// view therefore costs its own expiry and no frames at all.
+    ///
+    /// `has_viewers` is false when no client is rendering the app, so a detached
+    /// server does not paint a travel nobody is looking at — the same rule the
+    /// animation clock already follows.
+    pub(crate) fn advance_relation_signals(&mut self, now: Instant, has_viewers: bool) -> bool {
+        if self.state.relation_signals.is_empty() {
+            return false;
+        }
+        let damaged_before = has_viewers && self.state.relation_signal_damage();
+        let advanced = self.state.relation_signals.advance(now);
+        advanced && (damaged_before || (has_viewers && self.state.relation_signal_damage()))
     }
 
     pub(crate) fn sync_animation_timer(&mut self, now: Instant) {
@@ -616,6 +640,7 @@ impl App {
             self.copy_feedback_deadline,
             self.next_animation_tick,
             self.next_state_age_tick,
+            self.state.relation_signals.next_deadline(),
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
@@ -839,6 +864,90 @@ mod tests {
         app.state.sidebar_collapsed = true;
         app.sync_state_age_timer(now, true);
         assert_eq!(app.next_state_age_tick, None);
+    }
+
+    /// Arms a relation signal on the app's only workspace and reports the stop
+    /// length, so a test can walk the clock the way the loop does.
+    fn arm_relation_signal(app: &mut super::super::App, now: Instant) -> Duration {
+        let carrier = app.state.workspaces[0].id.clone();
+        app.state
+            .relation_signals
+            .accept(
+                "firstmate",
+                None,
+                crate::app::relation_signal::RelationSignalKind::Transfer,
+                carrier,
+                None,
+                now,
+            )
+            .expect("a fresh row always accepts its first signal");
+        crate::app::relation_signal::DEFAULT_SIGNAL_TTL
+            / u32::from(crate::app::relation_signal::SIGNAL_STOPS)
+    }
+
+    fn lay_out_the_only_workspace(app: &mut super::super::App) {
+        app.state.view.workspace_card_areas = vec![state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect: ratatui::layout::Rect::new(0, 0, 30, 2),
+            indented: true,
+        }];
+    }
+
+    #[test]
+    fn a_signal_on_a_laid_out_row_repaints_once_per_stop_and_once_more_to_clear() {
+        let (mut app, _) = test_app_with_pane();
+        let now = Instant::now();
+        lay_out_the_only_workspace(&mut app);
+        let step = arm_relation_signal(&mut app, now);
+
+        assert_eq!(
+            app.next_loop_deadline(now, false)
+                .map(|deadline| deadline <= now + step),
+            Some(true),
+            "the loop has to wake for the next stop, not for the resize poll"
+        );
+
+        let mut repaints = 0;
+        for stop in 1..=u32::from(crate::app::relation_signal::SIGNAL_STOPS) {
+            if app.handle_scheduled_tasks(now + step * stop + Duration::from_millis(1), false) {
+                repaints += 1;
+            }
+        }
+        // Three moves along the route plus the frame that puts the row back the
+        // way it was. No animation clock is running, and nothing else in this
+        // app is dirty, so every one of those frames is the signal's own.
+        assert_eq!(
+            repaints,
+            u32::from(crate::app::relation_signal::SIGNAL_STOPS)
+        );
+        assert!(app.state.relation_signals.is_empty());
+        assert!(!app.handle_scheduled_tasks(
+            now + crate::app::relation_signal::DEFAULT_SIGNAL_TTL * 2,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_signal_on_a_row_that_was_never_laid_out_expires_without_a_single_repaint() {
+        let (mut app, _) = test_app_with_pane();
+        let now = Instant::now();
+        // No `workspace_card_areas`: what a collapsed sidebar, a mobile layout,
+        // a collapsed parent group, and a row scrolled past the end of the list
+        // all look like from here.
+        assert!(app.state.view.workspace_card_areas.is_empty());
+        let step = arm_relation_signal(&mut app, now);
+
+        for stop in 1..=u32::from(crate::app::relation_signal::SIGNAL_STOPS) {
+            assert!(
+                !app.handle_scheduled_tasks(now + step * stop + Duration::from_millis(1), false),
+                "a signal nobody can see must never cost a frame"
+            );
+        }
+        assert!(
+            app.state.relation_signals.is_empty(),
+            "and it still has to die on schedule, or a row could be stranded \
+             mid-travel the moment it scrolls back into view"
+        );
     }
 
     #[test]
