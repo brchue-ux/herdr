@@ -3291,7 +3291,7 @@ mod tests {
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(
             report.diagnostics,
-            vec!["unknown config key ui.mouse_captur; ignoring key"]
+            vec!["unknown config key ui.mouse_captur; ignoring key (config.toml:3:1)"]
         );
         assert_eq!(app.state.mouse_capture, target_mouse_capture);
         assert_eq!(
