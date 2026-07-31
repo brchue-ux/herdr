@@ -11,7 +11,7 @@ use super::sidebar::{
     mobile_agents_title, next_entry_is_indented_workspace, workspace_list_entries_expanded,
     AgentPanelEntry, WorkspaceListEntry,
 };
-use super::status::state_dot;
+use super::status::{state_dot, state_mark};
 use super::text::{display_width_u16, truncate_end};
 use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
@@ -407,9 +407,10 @@ fn render_switch_button(app: &AppState, frame: &mut Frame, area: Rect) {
     // "tap me" without the user reading the summary row.
     if global_agent_counts(app).blocked > 0 {
         let bx = area.x + area.width.saturating_sub(1);
+        let (mark, mark_style) = state_dot(AgentState::Blocked, false, p);
         frame.buffer_mut()[(bx, area.y)]
-            .set_symbol("●")
-            .set_style(Style::default().fg(p.red).bg(p.surface0));
+            .set_symbol(mark)
+            .set_style(mark_style.bg(p.surface0));
     }
 }
 
@@ -1029,12 +1030,23 @@ fn agent_summary_segments(counts: GlobalAgentCounts) -> Vec<(String, SummaryTone
     let mut segments = Vec::new();
     if counts.blocked > 0 {
         segments.push((
-            format!("◉ {} blocked", counts.blocked),
+            format!(
+                "{} {} blocked",
+                state_mark(AgentState::Blocked, false),
+                counts.blocked
+            ),
             SummaryTone::Blocked,
         ));
     }
     if counts.done > 0 {
-        segments.push((format!("● {} done", counts.done), SummaryTone::Done));
+        segments.push((
+            format!(
+                "{} {} done",
+                state_mark(AgentState::Idle, false),
+                counts.done
+            ),
+            SummaryTone::Done,
+        ));
     }
     if counts.working > 0 {
         segments.push((format!("{} working", counts.working), SummaryTone::Working));
@@ -1177,6 +1189,34 @@ mod tests {
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn switch_button_attention_badge_uses_the_shared_blocked_mark() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("blocked")];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal.state = AgentState::Blocked;
+
+        let area = Rect::new(0, 0, SWITCH_BUTTON_WIDTH, 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| render_switch_button(&app, frame, area))
+            .expect("draw");
+
+        // Assert against `state_dot` itself, not a copy of the glyph, so the
+        // badge cannot drift away from every other rolled-up state mark.
+        let (expected, _) = state_dot(AgentState::Blocked, false, &app.palette);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(area.width - 1, 0)].symbol(), expected);
     }
 
     #[test]

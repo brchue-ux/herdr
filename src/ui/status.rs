@@ -203,12 +203,22 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
 /// used by the mobile header roll-up (`agent_summary_segments`). These stay
 /// static marks: spinners were removed deliberately for redraw cost.
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
+    (
+        state_mark(state, seen),
+        Style::default().fg(state_label_color(state, seen, p)),
+    )
+}
+
+/// The glyph half of [`state_dot`], for surfaces that build their own style
+/// (the mobile header roll-up tones its own text). Keeping one match here is
+/// what stops a surface from re-typing a mark and drifting.
+pub(super) fn state_mark(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
-        (AgentState::Blocked, _) => ("◉", Style::default().fg(p.red)),
-        (AgentState::Working, _) => ("◐", Style::default().fg(p.yellow)),
-        (AgentState::Idle, false) => ("●", Style::default().fg(p.teal)),
-        (AgentState::Idle, true) => ("○", Style::default().fg(p.green)),
-        (AgentState::Unknown, _) => ("·", Style::default().fg(p.overlay0)),
+        (AgentState::Blocked, _) => "◉",
+        (AgentState::Working, _) => "◐",
+        (AgentState::Idle, false) => "●",
+        (AgentState::Idle, true) => "○",
+        (AgentState::Unknown, _) => "·",
     }
 }
 
