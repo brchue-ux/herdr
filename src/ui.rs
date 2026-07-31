@@ -5,6 +5,7 @@ use ratatui::{
     Frame,
 };
 
+pub(crate) mod color;
 mod dialogs;
 mod keybind_help;
 mod menus;

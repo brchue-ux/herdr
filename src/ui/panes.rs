@@ -819,7 +819,7 @@ fn render_selection_highlight(
     }
 }
 
-type Rgb = (u8, u8, u8);
+use super::color::{color_to_rgb, mix_rgb, relative_luminance, terminal_theme_to_rgb};
 
 fn automatic_selection_style(
     p: &Palette,
@@ -851,10 +851,6 @@ fn selection_palette_background(p: &Palette) -> Color {
     }
 }
 
-fn terminal_theme_to_rgb(color: crate::terminal_theme::RgbColor) -> Rgb {
-    (color.r, color.g, color.b)
-}
-
 fn selection_fg_for_bg(bg: Color, p: &Palette) -> Color {
     color_to_rgb(bg)
         .map(|bg| {
@@ -865,53 +861,6 @@ fn selection_fg_for_bg(bg: Color, p: &Palette) -> Color {
             }
         })
         .unwrap_or_else(|| panel_contrast_fg(p))
-}
-
-fn mix_rgb(base: Rgb, target: Rgb, amount: f32) -> Rgb {
-    fn channel(base: u8, target: u8, amount: f32) -> u8 {
-        (f32::from(base) + (f32::from(target) - f32::from(base)) * amount).round() as u8
-    }
-    (
-        channel(base.0, target.0, amount),
-        channel(base.1, target.1, amount),
-        channel(base.2, target.2, amount),
-    )
-}
-
-fn relative_luminance(color: Rgb) -> f32 {
-    fn channel(value: u8) -> f32 {
-        let value = f32::from(value) / 255.0;
-        if value <= 0.03928 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    }
-    0.2126 * channel(color.0) + 0.7152 * channel(color.1) + 0.0722 * channel(color.2)
-}
-
-fn color_to_rgb(color: Color) -> Option<Rgb> {
-    match color {
-        Color::Reset => None,
-        Color::Black => Some((0, 0, 0)),
-        Color::Red => Some((128, 0, 0)),
-        Color::Green => Some((0, 128, 0)),
-        Color::Yellow => Some((128, 128, 0)),
-        Color::Blue => Some((0, 0, 128)),
-        Color::Magenta => Some((128, 0, 128)),
-        Color::Cyan => Some((0, 128, 128)),
-        Color::Gray => Some((192, 192, 192)),
-        Color::DarkGray => Some((128, 128, 128)),
-        Color::LightRed => Some((255, 0, 0)),
-        Color::LightGreen => Some((0, 255, 0)),
-        Color::LightYellow => Some((255, 255, 0)),
-        Color::LightBlue => Some((0, 0, 255)),
-        Color::LightMagenta => Some((255, 0, 255)),
-        Color::LightCyan => Some((0, 255, 255)),
-        Color::White => Some((255, 255, 255)),
-        Color::Rgb(r, g, b) => Some((r, g, b)),
-        Color::Indexed(_) => None,
-    }
 }
 
 pub(super) fn render_empty(app: &AppState, frame: &mut Frame, area: Rect) {

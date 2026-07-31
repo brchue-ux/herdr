@@ -76,6 +76,9 @@ impl App {
             return false;
         }
         self.state.host_terminal_theme = theme;
+        // The measured host colours feed Herdr's own chrome too, not just the
+        // panes: the palette contrast floor is derived from them.
+        self.refresh_effective_app_theme();
         self.apply_host_terminal_theme_to_panes();
         true
     }
@@ -84,6 +87,7 @@ impl App {
         let (palette, theme_name) = super::resolve_effective_theme(
             &self.state.theme_runtime,
             self.state.host_terminal_appearance,
+            &self.state.host_terminal_theme,
         );
         if self.state.theme_name == theme_name && self.state.palette == palette {
             return false;
@@ -102,5 +106,62 @@ impl App {
 
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use crate::terminal_theme::{DefaultColorKind, RgbColor, TerminalTheme};
+    use crate::ui::color::{contrast_ratio, resolve_color_rgb};
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn white() -> RgbColor {
+        RgbColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        }
+    }
+
+    #[test]
+    fn a_measured_background_re_derives_the_palette() {
+        let mut app = test_app();
+        let before = app.state.palette.clone();
+
+        // Not through `update_host_terminal_theme`: this is the case where the
+        // host is light but the theme stays dark (auto-switch off, or an
+        // explicit appearance), which is where the floor has to do the work.
+        let theme = TerminalTheme::default().with_color(DefaultColorKind::Background, white());
+        assert!(app.set_host_terminal_theme(theme));
+
+        assert_ne!(app.state.palette, before);
+        let overlay1 =
+            resolve_color_rgb(app.state.palette.overlay1, &theme).expect("overlay1 should resolve");
+        assert!(contrast_ratio(overlay1, (255, 255, 255)) >= 4.5);
+    }
+
+    #[test]
+    fn losing_the_measurement_restores_the_authored_palette() {
+        let mut app = test_app();
+        let authored = app.state.palette.clone();
+
+        app.set_host_terminal_theme(
+            TerminalTheme::default().with_color(DefaultColorKind::Background, white()),
+        );
+        assert_ne!(app.state.palette, authored);
+
+        app.set_host_terminal_theme(TerminalTheme::default());
+        assert_eq!(app.state.palette, authored);
     }
 }
