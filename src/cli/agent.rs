@@ -209,43 +209,6 @@ fn agent_view_get(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
-/// The `session.snapshot` traversal `agent view get` depends on.
-///
-/// This is a wire-shape contract, not an internal detail: the view sits at
-/// `result.snapshot.agent_view`, and reading `result.agent_view` silently
-/// reports every active view as inactive rather than failing.
-#[cfg(test)]
-mod agent_view_get_tests {
-    #[test]
-    fn the_view_is_read_from_result_snapshot_not_result() {
-        let response = serde_json::json!({
-            "id": "cli:agent:view:get",
-            "result": {
-                "type": "session_snapshot",
-                "snapshot": {
-                    "agent_view": { "source": "workers-only", "label": "workers" }
-                }
-            }
-        });
-
-        let view = response
-            .get("result")
-            .and_then(|result| result.get("snapshot"))
-            .and_then(|snapshot| snapshot.get("agent_view"));
-
-        assert_eq!(
-            view.and_then(|view| view.get("source"))
-                .and_then(|s| s.as_str()),
-            Some("workers-only")
-        );
-        // The shape this test exists to pin down: one level up finds nothing.
-        assert!(response
-            .get("result")
-            .and_then(|result| result.get("agent_view"))
-            .is_none());
-    }
-}
-
 /// `field`, `field:asc`, or `field:desc`, where `field` is a builtin sort key
 /// or a `$token` published through pane metadata.
 fn parse_agent_view_sort(value: &str) -> Result<AgentViewSort, String> {
@@ -1066,4 +1029,41 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+/// The `session.snapshot` traversal `agent view get` depends on.
+///
+/// This is a wire-shape contract, not an internal detail: the view sits at
+/// `result.snapshot.agent_view`, and reading `result.agent_view` silently
+/// reports every active view as inactive rather than failing.
+#[cfg(test)]
+mod agent_view_get_tests {
+    #[test]
+    fn the_view_is_read_from_result_snapshot_not_result() {
+        let response = serde_json::json!({
+            "id": "cli:agent:view:get",
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "agent_view": { "source": "workers-only", "label": "workers" }
+                }
+            }
+        });
+
+        let view = response
+            .get("result")
+            .and_then(|result| result.get("snapshot"))
+            .and_then(|snapshot| snapshot.get("agent_view"));
+
+        assert_eq!(
+            view.and_then(|view| view.get("source"))
+                .and_then(|s| s.as_str()),
+            Some("workers-only")
+        );
+        // The shape this test exists to pin down: one level up finds nothing.
+        assert!(response
+            .get("result")
+            .and_then(|result| result.get("agent_view"))
+            .is_none());
+    }
 }
