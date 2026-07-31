@@ -225,6 +225,7 @@ impl App {
         let mut resized = false;
 
         self.sync_animation_timer(now);
+        self.refresh_state_age_clock(now);
 
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
@@ -295,6 +296,19 @@ impl App {
             changed = true;
         }
 
+        // Nothing to mutate: `state_age_now` already moved with the clock.
+        // Reaching the deadline only means a drawn age is now stale, so the
+        // one thing to do is ask for a repaint. Cleared here and re-armed by
+        // the `sync_state_age_timer` at the end of this pass, so a fired
+        // deadline can never sit in the past and spin the loop.
+        if self
+            .next_state_age_tick
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.next_state_age_tick = None;
+            changed = true;
+        }
+
         if self
             .selection_autoscroll_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -337,11 +351,36 @@ impl App {
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
         self.sync_animation_timer(now);
+        self.sync_state_age_timer(now, true);
         changed
     }
 
     pub(crate) fn sync_animation_timer(&mut self, now: Instant) {
         self.sync_animation_timer_with_interval(now, ANIMATION_INTERVAL, true);
+    }
+
+    /// Move the clock the sidebar renders elapsed times against.
+    ///
+    /// Deliberately separate from arming the repaint deadline. This runs every
+    /// loop iteration so that a frame drawn for any other reason already shows
+    /// current ages; re-arming on the same schedule would push the deadline
+    /// past `now` on every pass and it would never fire.
+    pub(crate) fn refresh_state_age_clock(&mut self, now: Instant) {
+        self.state.state_age_now = now;
+    }
+
+    /// Arm the deadline that forces a repaint when nothing else would.
+    ///
+    /// Called after the scheduled-task pass has had its chance to fire the
+    /// previous deadline, so the new one is always computed from a `now` at or
+    /// past it. `has_viewers` is false when no client is rendering, so a
+    /// detached server does not wake up to keep a number current that nobody
+    /// is reading.
+    pub(crate) fn sync_state_age_timer(&mut self, now: Instant, has_viewers: bool) {
+        self.state.state_age_now = now;
+        self.next_state_age_tick = has_viewers
+            .then(|| self.state.next_sidebar_state_age_tick(now))
+            .flatten();
     }
 
     /// `has_viewers` is false when no client is rendering the app, so a detached
@@ -576,6 +615,7 @@ impl App {
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
             self.next_animation_tick,
+            self.next_state_age_tick,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
@@ -684,6 +724,121 @@ mod tests {
             Some(armed + ANIMATION_INTERVAL),
             "the clock reschedules itself"
         );
+    }
+
+    fn state_age_space_rows() -> Vec<Vec<crate::config::SpaceSidebarToken>> {
+        let config: crate::config::Config =
+            toml::from_str("[ui.sidebar.spaces]\nrows = [[\"state_text\", \"state_age\"]]\n")
+                .expect("state_age space config");
+        config.ui.sidebar.spaces.rows
+    }
+
+    /// Give the app's one terminal a state stamped `held_for` ago.
+    fn stamp_state_age(app: &mut super::super::App, now: Instant, held_for: Duration) {
+        app.state.ensure_test_terminals();
+        let terminal = app
+            .state
+            .terminals
+            .values_mut()
+            .next()
+            .expect("test app has a terminal");
+        terminal.last_agent_state_change_at = Some(now - held_for);
+    }
+
+    #[test]
+    fn a_sidebar_with_no_state_age_token_never_arms_the_repaint_clock() {
+        let (mut app, _) = test_app_with_pane();
+        let now = Instant::now();
+        stamp_state_age(&mut app, now, Duration::from_secs(5));
+
+        app.sync_state_age_timer(now, true);
+
+        assert_eq!(app.next_state_age_tick, None);
+        assert!(!app.handle_scheduled_tasks(now, false));
+    }
+
+    /// The cost argument for the feature: the wake-up interval follows the
+    /// token's resolution, so an old state is nearly free to keep current.
+    #[test]
+    fn the_repaint_interval_coarsens_as_the_state_ages() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = state_age_space_rows();
+        let now = Instant::now();
+
+        stamp_state_age(&mut app, now, Duration::from_secs(5));
+        app.sync_state_age_timer(now, true);
+        let seconds_old = app
+            .next_state_age_tick
+            .expect("a fresh state arms the clock");
+        assert_eq!(seconds_old, now + Duration::from_secs(1));
+
+        stamp_state_age(&mut app, now, Duration::from_secs(2 * 60 * 60));
+        app.sync_state_age_timer(now, true);
+        assert_eq!(
+            app.next_state_age_tick,
+            Some(now + Duration::from_secs(60 * 60)),
+            "a two-hour-old state costs one wake-up an hour, not 3600"
+        );
+    }
+
+    #[test]
+    fn reaching_the_repaint_deadline_asks_for_a_redraw() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = state_age_space_rows();
+        let now = Instant::now();
+        stamp_state_age(&mut app, now, Duration::from_secs(5));
+
+        app.sync_state_age_timer(now, true);
+        let armed = app.next_state_age_tick.expect("arms");
+        assert!(app
+            .next_loop_deadline(now, false)
+            .is_some_and(|d| d <= armed));
+
+        // Before the deadline the drawn text is still correct.
+        assert!(!app.handle_scheduled_tasks(now, false));
+        // At it, the age has changed and the frame is dirty.
+        assert!(app.handle_scheduled_tasks(armed, false));
+    }
+
+    #[test]
+    fn a_state_with_no_timestamp_leaves_the_repaint_clock_unarmed() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = state_age_space_rows();
+        app.state.ensure_test_terminals();
+        let now = Instant::now();
+
+        // A configured token with nothing to draw must not cost a wake-up.
+        app.sync_state_age_timer(now, true);
+        assert_eq!(app.next_state_age_tick, None);
+    }
+
+    #[test]
+    fn a_detached_server_does_not_repaint_ages_nobody_is_reading() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = state_age_space_rows();
+        let now = Instant::now();
+        stamp_state_age(&mut app, now, Duration::from_secs(5));
+
+        app.sync_state_age_timer(now, false);
+        assert_eq!(app.next_state_age_tick, None);
+
+        app.sync_state_age_timer(now, true);
+        assert!(app.next_state_age_tick.is_some());
+    }
+
+    #[test]
+    fn collapsing_the_sidebar_disarms_the_repaint_clock() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = state_age_space_rows();
+        let now = Instant::now();
+        stamp_state_age(&mut app, now, Duration::from_secs(5));
+
+        app.sync_state_age_timer(now, true);
+        assert!(app.next_state_age_tick.is_some());
+
+        app.state.sidebar_collapsed = true;
+        app.sync_state_age_timer(now, true);
+        assert_eq!(app.next_state_age_tick, None);
     }
 
     #[test]

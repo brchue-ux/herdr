@@ -389,6 +389,9 @@ impl App {
             launch_pending: terminal.managed_agent_launch_pending(),
             interactive_ready: terminal.managed_agent_interactive_ready(),
             state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
+            state_age_ms: terminal
+                .state_age(std::time::Instant::now())
+                .map(|age| age.as_millis().min(u128::from(u64::MAX)) as u64),
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,

@@ -370,6 +370,7 @@ impl TerminalState {
             }),
             agent_state: Some(crate::handoff_metadata::agent_state_to_wire(self.state)),
             last_agent_state_change_seq: self.last_agent_state_change_seq,
+            last_agent_state_change_age: self.last_agent_state_change_at.map(|at| age_of(at, now)),
             report_sequences: self.metadata_report_sequences.clone(),
             hook_report_sequences: self.hook_report_sequences.clone(),
             report_agents: self
@@ -434,6 +435,9 @@ impl TerminalState {
         }
         if metadata.last_agent_state_change_seq.is_some() {
             self.last_agent_state_change_seq = metadata.last_agent_state_change_seq;
+        }
+        if let Some(age) = metadata.last_agent_state_change_age {
+            self.last_agent_state_change_at = Some(instant_from_age(age, now));
         }
 
         for carried in metadata.agent_metadata {

@@ -14,6 +14,7 @@ pub(super) struct ResolvedToken {
 pub(super) enum ResolvedTokenKind {
     StateIcon,
     StateText(String),
+    StateAge(String),
     Workspace(String),
     Tab(String),
     Pane(String),
@@ -39,6 +40,7 @@ pub(super) fn agent_rows(
     config: &AgentsSidebarConfig,
     entry: &AgentPanelEntry,
     state_text: &str,
+    state_age: Option<std::time::Duration>,
 ) -> Vec<Vec<ResolvedToken>> {
     config
         .rows_for_agent(entry.agent)
@@ -53,6 +55,12 @@ pub(super) fn agent_rows(
                         AgentSidebarToken::StateText => {
                             Some(ResolvedTokenKind::StateText(state_text.to_string()))
                         }
+                        // Elides when the runtime has no stamp, exactly like a
+                        // missing custom token. A row that cannot say how long
+                        // is better off saying nothing than saying `0s`.
+                        AgentSidebarToken::StateAge => state_age
+                            .map(crate::state_age::format)
+                            .map(ResolvedTokenKind::StateAge),
                         AgentSidebarToken::Workspace => {
                             Some(ResolvedTokenKind::Workspace(entry.primary_label.clone()))
                         }
@@ -92,6 +100,8 @@ pub(super) struct SpaceTokenContext<'a> {
     pub workspace: &'a str,
     pub branch: Option<&'a str>,
     pub state_text: &'a str,
+    /// How long the pane behind this row's state icon has held that state.
+    pub state_age: Option<std::time::Duration>,
     pub ahead_behind: Option<(usize, usize)>,
     /// Terminal titles of the pane that also decides this space's state icon.
     pub terminal_title: Option<&'a str>,
@@ -117,6 +127,10 @@ pub(super) fn space_rows(
                         SpaceSidebarToken::StateText => {
                             Some(ResolvedTokenKind::StateText(context.state_text.to_string()))
                         }
+                        SpaceSidebarToken::StateAge => context
+                            .state_age
+                            .map(crate::state_age::format)
+                            .map(ResolvedTokenKind::StateAge),
                         SpaceSidebarToken::Workspace => {
                             Some(ResolvedTokenKind::Workspace(context.workspace.to_string()))
                         }
@@ -151,8 +165,15 @@ pub(super) fn space_rows(
 }
 
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
+    // An elapsed time straight after the state it belongs to is not a second
+    // value on the row, it is the rest of the same phrase: `working 47m`. A
+    // middot there reads as two facts and costs two columns to say so. After
+    // anything else the age is its own fact and keeps the decorated separator.
+    let age_qualifies_the_state = matches!(previous.kind, ResolvedTokenKind::StateText(_))
+        && matches!(current.kind, ResolvedTokenKind::StateAge(_));
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+        || age_qualifies_the_state
     {
         " "
     } else {
@@ -182,6 +203,112 @@ mod tests {
     use super::*;
     use crate::config::{AgentSidebarToken, SpaceSidebarToken};
     use crate::detect::AgentState;
+
+    #[test]
+    fn an_elapsed_time_reads_as_part_of_the_state_it_qualifies() {
+        let state = ResolvedToken::unstyled(ResolvedTokenKind::StateText("working".into()));
+        let age = ResolvedToken::unstyled(ResolvedTokenKind::StateAge("47m".into()));
+        let doing = ResolvedToken::unstyled(ResolvedTokenKind::Custom("doing".into()));
+
+        // `working 47m` is one phrase; `working · 47m` reads as two facts and
+        // spends two more columns saying it.
+        assert_eq!(separator(&state, &age), " ");
+        assert_eq!(compact_separator(&state, &age), " ");
+
+        // Anywhere else the age is a value like any other and keeps the dot.
+        assert_eq!(separator(&doing, &age), " · ");
+        assert_eq!(separator(&age, &doing), " · ");
+    }
+
+    #[test]
+    fn a_state_age_token_elides_when_the_runtime_has_no_stamp() {
+        let entry = entry();
+        let config = AgentsSidebarConfig {
+            rows: vec![vec![
+                AgentSidebarToken::StateText,
+                AgentSidebarToken::StateAge,
+            ]],
+            ..Default::default()
+        };
+
+        // No stamp: the row must not invent `0s`, which would read as a state
+        // that just changed when in fact nothing is known about when it did.
+        assert_eq!(
+            agent_rows(&config, &entry, "working", None),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::StateText(
+                "working".into()
+            ))]]
+        );
+
+        assert_eq!(
+            agent_rows(
+                &config,
+                &entry,
+                "working",
+                Some(std::time::Duration::from_secs(47 * 60))
+            ),
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::StateText("working".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::StateAge("47m".into())),
+            ]]
+        );
+    }
+
+    /// The whole point of the feature: two rows in the same state, told apart.
+    #[test]
+    fn minute_one_and_minute_ninety_render_differently() {
+        let entry = entry();
+        let config = AgentsSidebarConfig {
+            rows: vec![vec![AgentSidebarToken::StateAge]],
+            ..Default::default()
+        };
+        let render = |secs| {
+            agent_rows(
+                &config,
+                &entry,
+                "working",
+                Some(std::time::Duration::from_secs(secs)),
+            )
+        };
+        assert_ne!(render(60), render(90 * 60));
+    }
+
+    #[test]
+    fn a_space_row_state_age_follows_the_same_missing_stamp_rule() {
+        let tokens = std::collections::HashMap::new();
+        let config = SpacesSidebarConfig {
+            rows: vec![vec![
+                SpaceSidebarToken::StateText,
+                SpaceSidebarToken::StateAge,
+            ]],
+            ..Default::default()
+        };
+        let context = |state_age| SpaceTokenContext {
+            workspace: "repo",
+            branch: None,
+            state_text: "blocked",
+            state_age,
+            ahead_behind: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens: &tokens,
+            suppress_git_details: false,
+        };
+
+        assert_eq!(
+            space_rows(&config, context(None)),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::StateText(
+                "blocked".into()
+            ))]]
+        );
+        assert_eq!(
+            space_rows(
+                &config,
+                context(Some(std::time::Duration::from_secs(3 * 60 * 60)))
+            )[0][1],
+            ResolvedToken::unstyled(ResolvedTokenKind::StateAge("3h".into()))
+        );
+    }
 
     #[test]
     fn compaction_only_drops_the_middot_never_the_icon_gap() {
@@ -215,6 +342,7 @@ mod tests {
             state: AgentState::Working,
             seen: true,
             last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
         }
@@ -235,7 +363,7 @@ mod tests {
             ..Default::default()
         };
 
-        let rows = agent_rows(&config, &entry, "working");
+        let rows = agent_rows(&config, &entry, "working", None);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -265,7 +393,7 @@ mod tests {
         };
 
         assert_eq!(
-            agent_rows(&config, &entry, "deep in the mines"),
+            agent_rows(&config, &entry, "deep in the mines", None),
             vec![vec![
                 ResolvedToken::unstyled(ResolvedTokenKind::StateText("deep in the mines".into())),
                 ResolvedToken::unstyled(ResolvedTokenKind::Custom("reviewing auth".into())),
@@ -291,7 +419,7 @@ mod tests {
         };
 
         assert_eq!(
-            agent_rows(&config, &entry, "working"),
+            agent_rows(&config, &entry, "working", None),
             vec![vec![
                 ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("⠋ raw title".into())),
                 ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("raw title".into())),
@@ -313,7 +441,7 @@ mod tests {
         pi.agent_label = Some("renamed pi".into());
 
         assert_eq!(
-            agent_rows(&config, &pi, "working"),
+            agent_rows(&config, &pi, "working", None),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Agent(
                 "renamed pi".into()
             ))]]
@@ -321,7 +449,7 @@ mod tests {
 
         pi.agent = None;
         assert_eq!(
-            agent_rows(&config, &pi, "working"),
+            agent_rows(&config, &pi, "working", None),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
                 "repo".into()
             ))]]
@@ -336,6 +464,7 @@ mod tests {
             space_rows(
                 &config,
                 SpaceTokenContext {
+                    state_age: None,
                     workspace: "feature",
                     branch: Some("worktree/feature"),
                     state_text: "idle",
@@ -370,6 +499,7 @@ mod tests {
             space_rows(
                 &config,
                 SpaceTokenContext {
+                    state_age: None,
                     workspace: "repo",
                     branch: None,
                     state_text: "working",
@@ -410,6 +540,7 @@ mod tests {
             space_rows(
                 &config,
                 SpaceTokenContext {
+                    state_age: None,
                     workspace: "repo",
                     branch: None,
                     state_text: "unknown",
@@ -441,6 +572,7 @@ mod tests {
             space_rows(
                 &config,
                 SpaceTokenContext {
+                    state_age: None,
                     workspace: "feature",
                     branch: Some("worktree/feature"),
                     state_text: "working",
@@ -470,6 +602,7 @@ mod tests {
             space_rows(
                 &config,
                 SpaceTokenContext {
+                    state_age: None,
                     workspace: "repo",
                     branch: None,
                     state_text: "idle",

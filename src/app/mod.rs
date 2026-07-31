@@ -129,6 +129,8 @@ pub struct App {
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
+    /// When the sidebar's elapsed-time tokens next need a repaint.
+    pub(crate) next_state_age_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -689,6 +691,7 @@ impl App {
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             animation_tick: 0,
+            state_age_now: Instant::now(),
             palette: theme_palette,
             theme_name,
             theme_runtime,
@@ -778,6 +781,7 @@ impl App {
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
+            next_state_age_tick: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -1165,6 +1169,7 @@ impl App {
 
             let now = Instant::now();
             self.sync_animation_timer(now);
+            self.refresh_state_age_clock(now);
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
             self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
 
@@ -6239,6 +6244,57 @@ last_pane = "prefix+tab"
             );
         }
 
+        /// Elapsed time is the one fact a handoff is most likely to get wrong:
+        /// `Instant` is process-local, so carrying it verbatim would either
+        /// panic or restart every agent's clock at zero the moment the server
+        /// is replaced. It crosses as an age and is rebuilt against the
+        /// importing clock, exactly like a TTL.
+        #[test]
+        fn a_carried_state_age_keeps_counting_from_the_original_change() {
+            let (mut source, pane_id) = app_with_one_pane();
+            let now = std::time::Instant::now();
+            let id = terminal_id(&source, pane_id);
+            source
+                .state
+                .terminals
+                .get_mut(&id)
+                .unwrap()
+                .last_agent_state_change_at = Some(now);
+
+            // Exported 90 minutes in, imported immediately.
+            let export_at = now + Duration::from_secs(90 * 60);
+            let metadata = source.capture_handoff_metadata(export_at);
+            let (mut imported, imported_pane) = imported_like(&source, pane_id);
+            imported.apply_handoff_metadata(metadata, export_at);
+
+            let imported_id = terminal_id(&imported, imported_pane);
+            let age = imported.state.terminals[&imported_id]
+                .state_age(export_at)
+                .expect("the age survives the handoff");
+            assert_eq!(
+                crate::state_age::format(age),
+                "1h",
+                "the importing server must not restart the clock at zero"
+            );
+        }
+
+        /// A pane whose state has never been observed to change carries no
+        /// timestamp, and the importing server must not invent one.
+        #[test]
+        fn a_pane_with_no_state_change_carries_no_age() {
+            let (source, pane_id) = app_with_one_pane();
+            let now = std::time::Instant::now();
+
+            let metadata = source.capture_handoff_metadata(now);
+            let (mut imported, imported_pane) = imported_like(&source, pane_id);
+            imported.apply_handoff_metadata(metadata, now);
+
+            let imported_id = terminal_id(&imported, imported_pane);
+            assert!(imported.state.terminals[&imported_id]
+                .state_age(now)
+                .is_none());
+        }
+
         /// A token that had already lapsed was invisible before the handoff and
         /// must not reappear on the other side.
         #[test]
@@ -6339,6 +6395,7 @@ last_pane = "prefix+tab"
                 hook_authority: None,
                 agent_state: None,
                 last_agent_state_change_seq: None,
+                last_agent_state_change_age: None,
                 report_sequences: HashMap::new(),
                 hook_report_sequences: HashMap::new(),
                 report_agents: HashMap::new(),

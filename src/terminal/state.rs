@@ -140,6 +140,18 @@ pub struct TerminalState {
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
+    /// When [`Self::state`] last changed, as a monotonic instant.
+    ///
+    /// Sibling to `last_agent_state_change_seq` and stamped at the same site.
+    /// The counter orders state changes; this answers how long the current one
+    /// has been held, which is what tells a minute-old `working` apart from a
+    /// ninety-minute-old one.
+    ///
+    /// `Instant` is process-local, so this crosses a live handoff as an age
+    /// rebuilt against the importing clock, and does not cross a cold restart
+    /// at all - after a restart nobody knows when the state changed, and
+    /// `None` says so rather than inventing a start time.
+    pub last_agent_state_change_at: Option<Instant>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -173,6 +185,7 @@ impl TerminalState {
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
@@ -1940,6 +1953,7 @@ impl TerminalState {
         self.stale_full_lifecycle_hook_sessions.clear();
         self.state = AgentState::Unknown;
         self.last_agent_state_change_seq = None;
+        self.last_agent_state_change_at = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
@@ -1949,6 +1963,16 @@ impl TerminalState {
 
     pub fn is_agent_terminal(&self) -> bool {
         self.agent_name.is_some() || self.effective_agent_label().is_some()
+    }
+
+    /// How long this terminal has held [`Self::state`], or `None` when the
+    /// state has never been observed to change in this process.
+    ///
+    /// Saturating, because `now` is supplied by the caller and a render clock
+    /// that lags the stamp by a frame must read as "just changed", not panic.
+    pub fn state_age(&self, now: Instant) -> Option<Duration> {
+        self.last_agent_state_change_at
+            .map(|at| now.saturating_duration_since(at))
     }
 
     fn reconcile_agent_name_owner(

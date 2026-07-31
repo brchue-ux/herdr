@@ -48,6 +48,7 @@ impl PaneHandoffMetadata {
             || !self.report_sequences.is_empty()
             || !self.hook_report_sequences.is_empty()
             || self.last_agent_state_change_seq.is_some()
+            || self.last_agent_state_change_age.is_some()
             || !matches!(
                 self.agent_state,
                 None | Some(crate::api::schema::PaneAgentState::Unknown)
@@ -88,6 +89,13 @@ pub(crate) struct PaneHandoffMetadata {
     pub agent_state: Option<crate::api::schema::PaneAgentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_agent_state_change_seq: Option<u64>,
+    /// How long ago the agent state last changed, at capture time.
+    ///
+    /// Carried as an age rather than an instant for the reason the module
+    /// header gives: `Instant` is process-local and means nothing to the
+    /// importing server, so the importer rebuilds it against its own clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_state_change_age: Option<Duration>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub report_sequences: HashMap<String, u64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

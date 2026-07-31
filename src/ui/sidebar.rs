@@ -37,6 +37,7 @@ pub(crate) struct AgentPanelEntry {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    pub last_agent_state_change_at: Option<std::time::Instant>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
 }
@@ -282,6 +283,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
+                        last_agent_state_change_at: detail.last_agent_state_change_at,
                         state_labels: detail.state_labels,
                         tokens: detail.tokens,
                     }
@@ -313,6 +315,22 @@ fn space_terminal_title(
     ws.aggregate_terminal_title(&app.terminals)
 }
 
+/// Elapsed time for the pane that decides this Space row's state icon.
+///
+/// Skipped entirely when no Space row asks for an age, the same way
+/// [`space_terminal_title`] is skipped: resolving the winning pane walks every
+/// pane in the workspace, and an unconfigured sidebar should not pay for it.
+fn space_state_age(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+) -> Option<std::time::Duration> {
+    if !app.sidebar_spaces.uses_state_age() {
+        return None;
+    }
+    ws.aggregate_state_changed_at(&app.terminals)
+        .map(|at| app.state_age_now.saturating_duration_since(at))
+}
+
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if indented {
@@ -332,6 +350,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             workspace: &label,
             branch: ws.branch().as_deref(),
             state_text: state_label(state, seen),
+            state_age: space_state_age(app, ws),
             ahead_behind: ws.git_ahead_behind(),
             terminal_title: terminal_title.raw.as_deref(),
             terminal_title_stripped: terminal_title.stripped.as_deref(),
@@ -383,8 +402,15 @@ fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
 /// Workspaces that share the key but are not group members (a second workspace
 /// opened in the same main checkout) keep their own visible row, so folding
 /// their state into the parent would double-report it.
-fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
+///
+/// State and elapsed time are resolved in one pass so the parent row cannot
+/// show one member's dot beside another member's clock.
+fn space_aggregate_state_and_age(
+    app: &AppState,
+    key: &str,
+) -> (AgentState, bool, Option<std::time::Duration>) {
     let group = app.worktree_space_group(key);
+    let wants_age = app.sidebar_spaces.uses_state_age();
     app.workspaces
         .iter()
         .enumerate()
@@ -392,9 +418,16 @@ fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
             ws.worktree_space().is_some_and(|space| space.key == key)
                 && group.as_ref().is_none_or(|group| group.contains(*ws_idx))
         })
-        .map(|(_, ws)| ws.aggregate_state(&app.terminals))
-        .max_by_key(|(state, seen)| workspace_attention_priority(*state, *seen))
-        .unwrap_or((AgentState::Unknown, true))
+        .map(|(_, ws)| {
+            let (state, seen) = ws.aggregate_state(&app.terminals);
+            let age = wants_age
+                .then(|| ws.aggregate_state_changed_at(&app.terminals))
+                .flatten()
+                .map(|at| app.state_age_now.saturating_duration_since(at));
+            (state, seen, age)
+        })
+        .max_by_key(|(state, seen, _)| workspace_attention_priority(*state, *seen))
+        .unwrap_or((AgentState::Unknown, true, None))
 }
 
 pub(crate) fn workspace_parent_group_state(
@@ -648,7 +681,10 @@ fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<Resol
         .get(agent_panel_status_key(entry.state, entry.seen))
         .map(String::as_str)
         .unwrap_or_else(|| state_label(entry.state, entry.seen));
-    tokens::agent_rows(&app.sidebar_agents, entry, label)
+    let state_age = entry
+        .last_agent_state_change_at
+        .map(|at| app.state_age_now.saturating_duration_since(at));
+    tokens::agent_rows(&app.sidebar_agents, entry, label, state_age)
 }
 
 pub(crate) fn agent_entry_height_in_body(
@@ -1096,6 +1132,11 @@ fn resolved_token_spans(
         .iter()
         .map(|token| match &token.kind {
             ResolvedTokenKind::StateIcon => display_width(state_icon.0),
+            // Fixed, not flexible: at two to four columns there is nothing to
+            // reclaim, and a truncated age is a wrong age - `4` out of `47m`
+            // reads as four of something. It shares the fixed lane with the
+            // state icon and the git counters for the same reason.
+            ResolvedTokenKind::StateAge(text) => display_width(text),
             ResolvedTokenKind::GitStatus { ahead, behind } => {
                 usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
@@ -1234,6 +1275,22 @@ fn resolved_token_spans(
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     apply_token_style(state_text_style, token.style, p, animation_tick),
+                ));
+            }
+            // Drawn in the state's own colour, dimmed. The age qualifies the
+            // state rather than competing with it, and dimming is how the row
+            // says so without a second hue. It is not an alarm: nothing about
+            // the styling changes as the number grows, because the runtime has
+            // no evidence that a long state is a bad one.
+            ResolvedTokenKind::StateAge(text) => {
+                spans.push(Span::styled(
+                    text.clone(),
+                    apply_token_style(
+                        state_text_style.add_modifier(Modifier::DIM),
+                        token.style,
+                        p,
+                        animation_tick,
+                    ),
                 ));
             }
             ResolvedTokenKind::Workspace(text) => {
@@ -1485,11 +1542,11 @@ fn render_workspace_list(
                     )
                 })
                 .is_none_or(|entry_idx| !next_entry_is_indented_workspace(&entries, entry_idx));
-        let (display_state, display_seen) = parent_group
+        let (display_state, display_seen, display_state_age) = parent_group
             .as_ref()
             .filter(|(_, collapsed)| *collapsed)
-            .map(|(key, _)| space_aggregate_state(app, key))
-            .unwrap_or((agg_state, agg_seen));
+            .map(|(key, _)| space_aggregate_state_and_age(app, key))
+            .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
         let state_icon = state_dot(display_state, display_seen, p);
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
@@ -1507,6 +1564,7 @@ fn render_workspace_list(
                 workspace: &display_label,
                 branch: ws.branch().as_deref(),
                 state_text: state_label(display_state, display_seen),
+                state_age: display_state_age,
                 ahead_behind: ws.git_ahead_behind(),
                 terminal_title: terminal_title.raw.as_deref(),
                 terminal_title_stripped: terminal_title.stripped.as_deref(),
@@ -1944,6 +2002,129 @@ mod tests {
 
         assert_eq!(control.label, "grouped");
         assert!(!control.clears_view);
+    }
+
+    /// The live complaint this exists for: two agents in the same state, one a
+    /// minute in and one ninety minutes in, must not draw the same row.
+    ///
+    /// Asserts against a real render rather than the resolver, and derives the
+    /// state glyph and colour from `state_dot`/`state_label_color` rather than
+    /// naming them, so a palette or glyph change elsewhere cannot silently
+    /// make this pass for the wrong reason.
+    #[test]
+    fn elapsed_time_tells_a_fresh_state_apart_from_an_old_one() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+rows = [["state_icon", "state_text", "state_age"]]
+"#,
+        )
+        .unwrap();
+
+        let render_at = |held_for: std::time::Duration| {
+            let mut app = crate::app::state::AppState::test_new();
+            app.sidebar_agents = config.ui.sidebar.agents.clone();
+            let workspace = Workspace::test_new("one");
+            let pane_id = workspace.tabs[0].root_pane;
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+            app.active = Some(0);
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let now = std::time::Instant::now();
+            app.state_age_now = now;
+            let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal_state.detected_agent = Some(Agent::Pi);
+            terminal_state.state = AgentState::Working;
+            terminal_state.last_agent_state_change_at = Some(now - held_for);
+
+            let area = Rect::new(0, 0, 26, 20);
+            let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+            terminal
+                .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+            let body = agent_panel_body_rect(agent_area, false);
+            (row_text(&buffer, body.y, 25), buffer, body, app)
+        };
+
+        let (fresh, _, _, _) = render_at(std::time::Duration::from_secs(60));
+        let (old, buffer, body, app) = render_at(std::time::Duration::from_secs(90 * 60));
+
+        // The token coarsens as it ages, so minute 90 reads `1h` rather than
+        // `90m`. That is the deliberate trade for a two-column glance: the
+        // sidebar answers "how long, roughly" and `state_age_ms` on the agent
+        // API carries the exact figure for anything that needs to compare.
+        assert!(fresh.contains("working 1m"), "fresh row read {fresh:?}");
+        assert!(old.contains("working 1h"), "old row read {old:?}");
+        assert_ne!(fresh, old);
+
+        // The glyph and colour are whatever the shared status helpers say they
+        // are; this test asserts the age sits beside them, not what they are.
+        let (dot, _) = state_dot(AgentState::Working, true, &app.palette);
+        assert!(
+            old.contains(dot),
+            "the age must not have displaced the state glyph: {old:?}"
+        );
+        let age_x = find_symbol_x(&buffer, body.y, body.width, "h");
+        let age_style = buffer[(age_x, body.y)].style();
+        assert_eq!(
+            age_style.fg,
+            Some(state_label_color(AgentState::Working, true, &app.palette)),
+            "the age qualifies the state, so it takes the state's colour"
+        );
+        // Dimmed and never restyled by magnitude: this is a clock, not an alarm.
+        assert!(age_style.add_modifier.contains(Modifier::DIM));
+        let fresh_age_style = {
+            let (_, fresh_buffer, fresh_body, _) = render_at(std::time::Duration::from_secs(60));
+            let x = find_symbol_x(&fresh_buffer, fresh_body.y, fresh_body.width, "m");
+            fresh_buffer[(x, fresh_body.y)].style()
+        };
+        assert_eq!(
+            fresh_age_style.fg, age_style.fg,
+            "a long-held state must not change colour; that would be a threshold badge"
+        );
+    }
+
+    /// A row configured for an age still renders when the runtime has no
+    /// stamp - it just says nothing about time.
+    #[test]
+    fn a_state_age_row_without_a_stamp_renders_the_rest_of_the_row() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+rows = [["state_text", "state_age"]]
+"#,
+        )
+        .unwrap();
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_agents = config.ui.sidebar.agents;
+        let workspace = Workspace::test_new("one");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(Agent::Pi);
+        terminal_state.state = AgentState::Working;
+        assert!(terminal_state.last_agent_state_change_at.is_none());
+
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let body = agent_panel_body_rect(agent_area, false);
+
+        let row = row_text(buffer, body.y, 25);
+        assert_eq!(row.trim(), state_label(AgentState::Working, true));
     }
 
     #[test]

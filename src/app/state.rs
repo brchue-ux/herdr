@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
@@ -1621,6 +1622,13 @@ pub struct AppState {
     /// Only advanced while a sidebar token opts into animated emphasis, so a
     /// calm configuration leaves it at `0` forever.
     pub animation_tick: u32,
+    /// The clock the sidebar's elapsed-time tokens are rendered against.
+    ///
+    /// Render stays pure by taking its `now` from state rather than reading
+    /// the system clock mid-draw, the same way animated emphasis takes its
+    /// frame from `animation_tick`. The runtime refreshes this every loop
+    /// iteration; a test can set it and get a deterministic render.
+    pub state_age_now: Instant,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1757,6 +1765,35 @@ impl AppState {
         !self.sidebar_collapsed
             && (self.sidebar_agents.has_animated_tokens()
                 || self.sidebar_spaces.has_animated_tokens())
+    }
+
+    /// True when a visible sidebar token draws an elapsed time.
+    ///
+    /// Same gate as [`Self::sidebar_animation_active`], and for the same
+    /// reason: the collapsed sidebar draws its own compact layout with no
+    /// configured token rows, so it can never show an age.
+    pub(crate) fn sidebar_state_age_active(&self) -> bool {
+        !self.sidebar_collapsed
+            && (self.sidebar_agents.uses_state_age() || self.sidebar_spaces.uses_state_age())
+    }
+
+    /// When the sidebar's elapsed-time tokens would next draw different text.
+    ///
+    /// Not a fixed interval. The token's resolution coarsens as the state ages
+    /// (seconds, then minutes, then hours), so this schedules the one wake-up
+    /// that actually changes a character rather than a repaint every second
+    /// forever. A fleet whose agents have all been in state for an hour costs
+    /// one wake-up an hour; with no timestamps at all it costs nothing, because
+    /// there is no deadline to arm.
+    pub(crate) fn next_sidebar_state_age_tick(&self, now: Instant) -> Option<Instant> {
+        if !self.sidebar_state_age_active() {
+            return None;
+        }
+        self.terminals
+            .values()
+            .filter_map(|terminal| terminal.state_age(now))
+            .map(|age| now + crate::state_age::next_change_after(age))
+            .min()
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -2075,6 +2112,7 @@ impl AppState {
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             animation_tick: 0,
+            state_age_now: Instant::now(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {
