@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::api::schema::{
     Method, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceReportMetadataParams,
+    WorkspaceReportSignalParams, WorkspaceSignalKind,
 };
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
@@ -17,6 +18,7 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         "focus" => workspace_focus(&args[1..]),
         "rename" => workspace_rename(&args[1..]),
         "report-metadata" => workspace_report_metadata(&args[1..]),
+        "report-signal" => workspace_report_signal(&args[1..]),
         "close" => workspace_close(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workspace_help();
@@ -224,6 +226,82 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     ))
 }
 
+const REPORT_SIGNAL_USAGE: &str = "usage: herdr workspace report-signal --source ID --kind transfer|completed [--from WORKSPACE_ID] [--to WORKSPACE_ID] [--seq N] [--ttl-ms N]";
+
+fn workspace_report_signal(args: &[String]) -> std::io::Result<i32> {
+    let mut source = None;
+    let mut kind = None;
+    let mut from_workspace_id = None;
+    let mut to_workspace_id = None;
+    let mut seq = None;
+    let mut ttl_ms = None;
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {}", args[index]);
+            return Ok(2);
+        };
+        match args[index].as_str() {
+            "--source" => source = Some(value.clone()),
+            "--kind" => kind = Some(value.clone()),
+            "--from" => from_workspace_id = Some(super::normalize_workspace_id(value)),
+            "--to" => to_workspace_id = Some(super::normalize_workspace_id(value)),
+            "--seq" => seq = Some(super::parse_u64_flag("--seq", value)?),
+            "--ttl-ms" => ttl_ms = Some(super::parse_u64_flag("--ttl-ms", value)?),
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+        index += 2;
+    }
+
+    let Some(source) = source.filter(|source| !source.trim().is_empty()) else {
+        eprintln!("missing required --source");
+        eprintln!("{REPORT_SIGNAL_USAGE}");
+        return Ok(2);
+    };
+    let kind = match kind.as_deref() {
+        Some("transfer") => WorkspaceSignalKind::Transfer,
+        Some("completed") => WorkspaceSignalKind::Completed,
+        Some(other) => {
+            eprintln!("unknown --kind: {other}");
+            eprintln!("{REPORT_SIGNAL_USAGE}");
+            return Ok(2);
+        }
+        None => {
+            eprintln!("missing required --kind");
+            eprintln!("{REPORT_SIGNAL_USAGE}");
+            return Ok(2);
+        }
+    };
+    let required = match kind {
+        WorkspaceSignalKind::Transfer => ("--to", to_workspace_id.is_some()),
+        WorkspaceSignalKind::Completed => ("--from", from_workspace_id.is_some()),
+    };
+    if !required.1 {
+        eprintln!("--kind {} requires {}", kind_name(kind), required.0);
+        eprintln!("{REPORT_SIGNAL_USAGE}");
+        return Ok(2);
+    }
+
+    super::send_ok_request(Method::WorkspaceReportSignal(WorkspaceReportSignalParams {
+        source,
+        kind,
+        from_workspace_id,
+        to_workspace_id,
+        seq,
+        ttl_ms,
+    }))
+}
+
+fn kind_name(kind: WorkspaceSignalKind) -> &'static str {
+    match kind {
+        WorkspaceSignalKind::Transfer => "transfer",
+        WorkspaceSignalKind::Completed => "completed",
+    }
+}
+
 fn workspace_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
         eprintln!("usage: herdr workspace close <workspace_id>");
@@ -245,5 +323,6 @@ fn print_workspace_help() {
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
     eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+    eprintln!("  {REPORT_SIGNAL_USAGE}");
     eprintln!("  herdr workspace close <workspace_id>");
 }

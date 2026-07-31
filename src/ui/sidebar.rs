@@ -13,6 +13,7 @@ use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
+use crate::app::relation_signal::RelationSignalPhase;
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::config::SidebarTokenEmphasis;
@@ -1349,6 +1350,40 @@ fn resolved_token_spans(
     spans
 }
 
+/// Style for one cell of a child row's branch-line connector.
+///
+/// A relation signal only ever changes a cell's *style*. The symbol, the cell
+/// count, and every width the layout was computed from stay exactly what they
+/// would be with no signal at all, so a row whose signal was skipped, cut
+/// short, or never scheduled draws the same characters in the same columns as
+/// one that never had a signal.
+fn connector_cell_style(
+    base: Style,
+    phase: Option<RelationSignalPhase>,
+    cell: u8,
+    p: &Palette,
+) -> Style {
+    match phase.and_then(|phase| phase.connector_cell()) {
+        // A block, not a coloured glyph: one of the three connector cells is a
+        // blank, and a foreground colour on a blank has nothing to ink.
+        Some(lit) if lit == cell => Style::default().fg(p.panel_bg).bg(p.accent),
+        _ => base,
+    }
+}
+
+/// Emphasis on a row's state icon while a signal is sitting on it.
+///
+/// The icon's own colour becomes the block, rather than being replaced by the
+/// accent, because that colour *is* the agent state. A decoration is never
+/// allowed to overwrite the information underneath it.
+fn arrived_state_icon_style(base: Style, phase: Option<RelationSignalPhase>, p: &Palette) -> Style {
+    if !phase.is_some_and(|phase| phase.is_at_state_icon()) {
+        return base;
+    }
+    let ink = base.fg.unwrap_or(p.text);
+    base.fg(p.panel_bg).bg(ink).add_modifier(Modifier::BOLD)
+}
+
 /// Frames in each half of one pulse cycle. The full cycle is twice this, so at
 /// `ANIMATION_INTERVAL` the pulse breathes over about 1.6 seconds.
 const PULSE_HALF_CYCLE_FRAMES: u32 = 8;
@@ -1548,6 +1583,7 @@ fn render_workspace_list(
             .map(|(key, _)| space_aggregate_state_and_age(app, key))
             .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
         let state_icon = state_dot(display_state, display_seen, p);
+        let signal_phase = app.workspace_relation_signal_phase(i);
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
             .add_modifier(Modifier::DIM);
@@ -1577,14 +1613,21 @@ fn render_workspace_list(
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
                 break;
             }
+            // The branch line only exists on a child card's first row, so that
+            // is the only row a signal can travel and the only row it damages.
+            let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
             let mut spans = Vec::new();
             let prefix_width = if card.indented {
                 spans.push(Span::raw("   "));
                 if row_index == 0 {
-                    spans.push(Span::styled(
-                        if is_last_child { "└─ " } else { "├─ " },
-                        Style::default().fg(p.overlay0),
-                    ));
+                    let connector = if is_last_child { "└─ " } else { "├─ " };
+                    let connector_style = Style::default().fg(p.overlay0);
+                    for (cell, glyph) in connector.chars().enumerate() {
+                        spans.push(Span::styled(
+                            glyph.to_string(),
+                            connector_cell_style(connector_style, row_signal_phase, cell as u8, p),
+                        ));
+                    }
                     6
                 } else if is_last_child {
                     spans.push(Span::raw("     "));
@@ -1608,7 +1651,10 @@ fn render_workspace_list(
             };
             spans.extend(resolved_token_spans(
                 resolved,
-                state_icon,
+                (
+                    state_icon.0,
+                    arrived_state_icon_style(state_icon.1, row_signal_phase, p),
+                ),
                 state_text_style,
                 name_style,
                 branch_style,
@@ -3189,6 +3235,189 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             buffer[(cards[0].rect.x + cards[0].rect.width - 1, cards[0].rect.y)].symbol(),
             "▾"
         );
+    }
+
+    /// A three-space worktree tree — one parent, two indented children — with a
+    /// relation signal of `kind` advanced to `stop` on the first child.
+    ///
+    /// Returns the rendered buffer alongside the app, so a caller can compare
+    /// two stops, or a signalled render against an unsignalled one, cell by
+    /// cell.
+    fn render_signalled_tree(
+        kind: Option<crate::app::relation_signal::RelationSignalKind>,
+        stop: u8,
+    ) -> (ratatui::buffer::Buffer, AppState) {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace_with_worktree_space("main", Some("repo-key"), "/repo/herdr"),
+            workspace_with_worktree_space("issue", Some("repo-key"), "/repo/herdr-issue"),
+            workspace_with_worktree_space("review", Some("repo-key"), "/repo/herdr-review"),
+        ];
+        app.sidebar_spaces.rows = vec![vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::Workspace,
+        ]];
+        app.sidebar_spaces.row_gap = 0;
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+
+        if let Some(kind) = kind {
+            let now = std::time::Instant::now();
+            let carrier = app.workspaces[1].id.clone();
+            app.relation_signals
+                .accept("firstmate", None, kind, carrier, None, now)
+                .expect("a fresh row always accepts its first signal");
+            // Walk the clock to the requested stop the same way the runtime
+            // tick does, rather than reaching into the signal's internals.
+            let step = crate::app::relation_signal::DEFAULT_SIGNAL_TTL
+                / u32::from(crate::app::relation_signal::SIGNAL_STOPS);
+            app.relation_signals
+                .advance(now + step * u32::from(stop) + std::time::Duration::from_millis(1));
+        }
+
+        let list_area = workspace_list_rect(area, app.sidebar_section_split);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    list_area,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (buffer, app)
+    }
+
+    fn changed_cells(
+        before: &ratatui::buffer::Buffer,
+        after: &ratatui::buffer::Buffer,
+    ) -> Vec<(u16, u16)> {
+        let area = before.area;
+        assert_eq!(area, after.area, "frames must share a geometry to diff");
+        (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                before[(*x, *y)].symbol() != after[(*x, *y)].symbol()
+                    || before[(*x, *y)].style() != after[(*x, *y)].style()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_signal_frame_damages_only_the_branch_line_of_the_row_it_travels() {
+        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS, SIGNAL_STOPS};
+
+        // The whole route: from no signal, through every stop, back to none.
+        let mut frames = vec![render_signalled_tree(None, 0).0];
+        for stop in 0..SIGNAL_STOPS {
+            frames.push(render_signalled_tree(Some(RelationSignalKind::Transfer), stop).0);
+        }
+        frames.push(render_signalled_tree(None, 0).0);
+
+        let (_, app) = render_signalled_tree(None, 0);
+        let child = app.view.workspace_card_areas[1].rect;
+        // Three connector cells sit after a three-column indent, and the state
+        // icon is the first token drawn after them.
+        let first = child.x + 3;
+        let last = first + u16::from(CONNECTOR_CELLS);
+
+        let mut moved = 0;
+        for pair in frames.windows(2) {
+            let changed = changed_cells(&pair[0], &pair[1]);
+            for (x, y) in &changed {
+                assert_eq!(
+                    *y, child.y,
+                    "a signal must not touch any row but the one it travels"
+                );
+                assert!(
+                    (first..=last).contains(x),
+                    "a signal must not touch any column but its branch line and state icon; \
+                     changed x={x} outside {first}..={last}"
+                );
+            }
+            moved += changed.len();
+        }
+        assert!(moved > 0, "the signal has to actually draw something");
+    }
+
+    #[test]
+    fn a_row_draws_the_same_characters_whether_or_not_its_signal_ever_runs() {
+        use crate::app::relation_signal::{RelationSignalKind, SIGNAL_STOPS};
+
+        let (calm, _) = render_signalled_tree(None, 0);
+        for kind in [RelationSignalKind::Transfer, RelationSignalKind::Completed] {
+            for stop in 0..SIGNAL_STOPS {
+                let (signalled, _) = render_signalled_tree(Some(kind), stop);
+                for y in calm.area.y..calm.area.y + calm.area.height {
+                    for x in calm.area.x..calm.area.x + calm.area.width {
+                        assert_eq!(
+                            calm[(x, y)].symbol(),
+                            signalled[(x, y)].symbol(),
+                            "a signal changed a character at ({x}, {y}); it may only change style, \
+                             so that a skipped or interrupted signal cannot leave a row wrong"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_transfer_and_a_completion_run_the_branch_line_in_opposite_directions() {
+        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS};
+
+        let (_, app) = render_signalled_tree(None, 0);
+        let child = app.view.workspace_card_areas[1].rect;
+        let accent = app.palette.accent;
+        let lit_cell = |kind, stop| {
+            let (buffer, _) = render_signalled_tree(Some(kind), stop);
+            (0..=CONNECTOR_CELLS).find(|cell| {
+                buffer[(child.x + 3 + u16::from(*cell), child.y)].style().bg == Some(accent)
+            })
+        };
+
+        let inbound: Vec<Option<u8>> = (0..CONNECTOR_CELLS)
+            .map(|stop| lit_cell(RelationSignalKind::Transfer, stop))
+            .collect();
+        let outbound: Vec<Option<u8>> = (1..=CONNECTOR_CELLS)
+            .map(|stop| lit_cell(RelationSignalKind::Completed, stop))
+            .collect();
+
+        assert_eq!(inbound, vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(outbound, vec![Some(2), Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn an_arriving_signal_emphasises_the_state_icon_without_recolouring_it() {
+        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS, SIGNAL_STOPS};
+
+        // A transfer lands on the icon at its last stop; a completion starts
+        // there, so both directions are covered by the same assertion.
+        for (kind, arrival) in [
+            (RelationSignalKind::Transfer, SIGNAL_STOPS - 1),
+            (RelationSignalKind::Completed, 0),
+        ] {
+            let (buffer, app) = render_signalled_tree(Some(kind), arrival);
+            let child = app.view.workspace_card_areas[1].rect;
+            let icon = &buffer[(child.x + 3 + u16::from(CONNECTOR_CELLS), child.y)];
+
+            let workspace = &app.workspaces[1];
+            let (state, seen) = workspace.aggregate_state(&app.terminals);
+            let (expected_symbol, expected_style) = state_dot(state, seen, &app.palette);
+
+            assert_eq!(icon.symbol(), expected_symbol);
+            assert_eq!(
+                icon.style().bg,
+                expected_style.fg,
+                "the arrival block has to be the state's own colour, because that colour is the \
+                 state and a decoration may not overwrite it"
+            );
+            assert!(icon.style().add_modifier.contains(Modifier::BOLD));
+        }
     }
 
     #[test]

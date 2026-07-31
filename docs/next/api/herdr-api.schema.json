@@ -4289,6 +4289,71 @@
           ],
           "type": "object"
         },
+        "WorkspaceReportSignalParams": {
+          "description": "A transient relation between two runtime entities.\n\nFire-and-forget: never persisted, never part of agent state, never part of\nseen/unseen. A report that is dropped costs a decoration and nothing else,\nwhich is why every reason to drop one — an unknown workspace, a replayed\n`seq`, a layout with nowhere to put it — answers success rather than an\nerror. A publisher can retry blindly and can never fail a turn on this call.",
+          "properties": {
+            "from_workspace_id": {
+              "description": "Required for `completed`; the origin of a `transfer`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/WorkspaceSignalKind"
+            },
+            "seq": {
+              "description": "Monotonic per source. A report at or below the last accepted value is\nignored, so retries are safe.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "source": {
+              "description": "Publisher identity, as in `workspace.report_metadata`. `seq` is tracked\nper source.",
+              "type": "string"
+            },
+            "to_workspace_id": {
+              "description": "Required for `transfer`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ttl_ms": {
+              "description": "How long the signal stays meaningful. Clamped by the server; omit to let\nHerdr choose.",
+              "format": "uint64",
+              "maximum": 86400000,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "WorkspaceSignalKind": {
+          "description": "What happened between two workspaces.\n\nDescribes the fleet, never the drawing: Herdr decides on its own whether a\nsignal becomes a moving mark on a branch line, a brief emphasis, or nothing\nat all on a layout that has no room for it.",
+          "oneOf": [
+            {
+              "const": "transfer",
+              "description": "Work moved from `from_workspace_id` to `to_workspace_id`.",
+              "type": "string"
+            },
+            {
+              "const": "completed",
+              "description": "`from_workspace_id` finished the work it was given.",
+              "type": "string"
+            }
+          ]
+        },
         "WorkspaceTarget": {
           "properties": {
             "workspace_id": {
@@ -4726,6 +4791,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkspaceReportMetadataParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.report_signal",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceReportSignalParams"
             }
           },
           "required": [
