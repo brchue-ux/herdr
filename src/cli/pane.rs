@@ -1293,7 +1293,7 @@ fn pane_release_agent(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+        eprintln!("usage: herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--clear-all-tokens] [--seq N] [--ttl-ms N]");
         return Ok(2);
     };
 
@@ -1308,6 +1308,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let mut clear_title = false;
     let mut clear_display_agent = false;
     let mut clear_state_labels = false;
+    let mut clear_all_tokens = false;
     let mut seq = None;
     let mut ttl_ms = None;
 
@@ -1401,6 +1402,10 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
                 tokens.insert(key, value);
                 index += 2;
             }
+            "--clear-all-tokens" => {
+                clear_all_tokens = true;
+                index += 1;
+            }
             "--clear-token" => {
                 let Some(key) = args.get(index + 1) else {
                     eprintln!("missing value for --clear-token");
@@ -1460,6 +1465,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
         && !clear_title
         && !clear_display_agent
         && !clear_state_labels
+        && !clear_all_tokens
     {
         eprintln!("missing metadata field to set or clear");
         return Ok(2);
@@ -1474,6 +1480,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
         display_agent,
         state_labels,
         tokens,
+        clear_all_tokens,
         clear_title,
         clear_display_agent,
         clear_state_labels,
@@ -1513,7 +1520,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
-    eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+    eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--clear-all-tokens] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr pane run <pane_id> <command>");
 }
 

@@ -13,7 +13,7 @@ use crate::api::schema::{
     ResponseResult,
 };
 use crate::app::App;
-pub(super) use manifest::normalize_plugin_id;
+pub(crate) use manifest::normalize_plugin_id;
 use manifest::{
     effective_platforms, ensure_platform_supported, normalize_action_id, normalize_plugin_source,
 };

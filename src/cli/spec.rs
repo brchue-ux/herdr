@@ -242,8 +242,13 @@ fn workspace_command() -> Command {
                 .arg(option("source", "ID").required(true))
                 .arg(repeatable_option("token", "NAME=VALUE"))
                 .arg(repeatable_option("clear-token", "NAME"))
+                .arg(flag("clear-all-tokens").help("Revoke every token on this workspace"))
                 .arg(option("seq", "N"))
-                .arg(option("ttl-ms", "N")),
+                .arg(
+                    option("ttl-ms", "N").help(
+                        "Expire after N ms (max 86400000); omit for a token that never expires",
+                    ),
+                ),
         )
         .subcommand(
             Command::new("report-signal")
@@ -464,6 +469,41 @@ fn agent_command() -> Command {
                 )
                 .after_help(
                     "The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait",
+                ),
+        )
+        .subcommand(
+            Command::new("view")
+                .about("Get, set, or clear the durable Agents panel view")
+                .subcommand(Command::new("get").about("Show the Agents view in force"))
+                .subcommand(
+                    Command::new("set")
+                        .about("Set the durable Agents view")
+                        .arg(
+                            option("source", "ID")
+                                .required(true)
+                                .help("Owning source; `config` and `ui` are reserved"),
+                        )
+                        .arg(option("label", "TEXT").help("Name shown in the panel header"))
+                        .arg(
+                            option("filter", "JSON")
+                                .help("Filter object as JSON, @PATH, or - for stdin"),
+                        )
+                        .arg(
+                            option("sort", "FIELD")
+                                .action(ArgAction::Append)
+                                .help("Sort key as FIELD[:asc|desc]; repeat for more than one"),
+                        )
+                        .after_help(
+                            "The view is written to the session file and reapplied at startup, so it survives a server restart.",
+                        ),
+                )
+                .subcommand(
+                    Command::new("clear")
+                        .about("Clear the durable Agents view")
+                        .arg(
+                            option("source", "ID")
+                                .help("Only clear when this source owns the view"),
+                        ),
                 ),
         )
         .subcommand(
@@ -707,8 +747,12 @@ fn report_metadata_command() -> Command {
         .arg(flag("clear-state-labels"))
         .arg(repeatable_option("token", "NAME=VALUE"))
         .arg(repeatable_option("clear-token", "NAME"))
+        .arg(flag("clear-all-tokens").help("Revoke every token on this pane"))
         .arg(option("seq", "N"))
-        .arg(option("ttl-ms", "N"))
+        .arg(
+            option("ttl-ms", "N")
+                .help("Expire after N ms (max 86400000); omit for a token that never expires"),
+        )
 }
 
 fn terminal_command() -> Command {

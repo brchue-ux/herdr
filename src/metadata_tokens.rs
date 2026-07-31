@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetadataToken {
@@ -13,6 +13,16 @@ pub(crate) struct MetadataTokens {
 }
 
 pub(crate) const MAX_SEQUENCE_SOURCES: usize = 32;
+
+/// Wall-clock milliseconds since the Unix epoch, or `None` for a clock that
+/// reads before the epoch.
+fn unix_millis(at: SystemTime) -> Option<u64> {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
 
 pub(crate) fn sequence_is_fresh(
     sequences: &HashMap<String, u64>,
@@ -66,6 +76,17 @@ impl MetadataTokens {
         changed
     }
 
+    /// Drop every token. Returns whether anything was there to drop.
+    ///
+    /// This is the revoke path for a token published without a TTL: it now
+    /// outlives both its publisher and the server, so there has to be a way to
+    /// clear it that does not require knowing its key.
+    pub(crate) fn clear(&mut self) -> bool {
+        let had_any = !self.entries.is_empty();
+        self.entries.clear();
+        had_any
+    }
+
     pub(crate) fn key_count_after_patch(&self, patch: &HashMap<String, Option<String>>) -> usize {
         let mut keys = self
             .values()
@@ -100,6 +121,92 @@ impl MetadataTokens {
         self.entries
             .retain(|_, token| token.expires_at.is_none_or(|deadline| deadline > now));
         self.entries.len() != before
+    }
+
+    /// Tokens in the form the session file stores them.
+    ///
+    /// A handoff carries the TTL that is *left*, because it hands one live
+    /// process straight to the next. A session file cannot: the gap between
+    /// save and load is unbounded, so a remaining-duration would resurrect a
+    /// token hours after it stopped meaning anything. Deadlines therefore
+    /// leave as an absolute wall-clock instant and are re-anchored on load,
+    /// which is what keeps the TTL honest across a cold restart.
+    ///
+    /// Already-expired tokens are dropped rather than written, for the same
+    /// reason `to_handoff` drops them: a token that was invisible before the
+    /// restart must not flicker back into a row.
+    pub(crate) fn to_persisted(
+        &self,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> Vec<crate::persist::PersistedMetadataToken> {
+        let mut tokens = self
+            .entries
+            .iter()
+            .filter_map(|(name, token)| {
+                let expires_at_ms = match token.expires_at {
+                    Some(deadline) if deadline <= now => return None,
+                    Some(deadline) => Some(unix_millis(
+                        wall_now.checked_add(deadline.saturating_duration_since(now))?,
+                    )?),
+                    None => None,
+                };
+                Some(crate::persist::PersistedMetadataToken {
+                    name: name.clone(),
+                    value: token.value.clone(),
+                    expires_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        // `session.json` is a file people read and diff; HashMap order is not
+        // stable, and a session file that reshuffles on every save is
+        // needlessly hard to inspect.
+        tokens.sort_by(|left, right| left.name.cmp(&right.name));
+        tokens
+    }
+
+    /// Rebuild persisted tokens against this process's clock.
+    ///
+    /// A token whose wall-clock deadline passed while the server was down is
+    /// dropped, so a TTL a publisher asked for is still respected even though
+    /// nothing was running to sweep it.
+    pub(crate) fn restore_persisted(
+        &mut self,
+        tokens: Vec<crate::persist::PersistedMetadataToken>,
+        now: Instant,
+        wall_now: SystemTime,
+    ) {
+        let wall_now_ms = unix_millis(wall_now);
+        for token in tokens {
+            let expires_at = match token.expires_at_ms {
+                None => None,
+                Some(deadline_ms) => {
+                    // No readable wall clock means no way to tell whether the
+                    // deadline has passed. Dropping the token is the choice
+                    // that cannot show a stale value.
+                    let Some(wall_now_ms) = wall_now_ms else {
+                        continue;
+                    };
+                    let Some(left) = deadline_ms
+                        .checked_sub(wall_now_ms)
+                        .filter(|left| *left > 0)
+                    else {
+                        continue;
+                    };
+                    let Some(deadline) = now.checked_add(Duration::from_millis(left)) else {
+                        continue;
+                    };
+                    Some(deadline)
+                }
+            };
+            self.entries.insert(
+                token.name,
+                MetadataToken {
+                    value: token.value,
+                    expires_at,
+                },
+            );
+        }
     }
 
     /// Tokens in the form a live handoff can carry to the next process.
@@ -283,6 +390,107 @@ mod tests {
             tokens.values(),
             HashMap::from([("summary".into(), "new".into())])
         );
+    }
+
+    #[test]
+    fn a_token_without_a_ttl_persists_with_no_deadline_and_comes_back_live() {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(patch(&[("owner", Some("firstmate"))]), None, now);
+
+        let persisted = tokens.to_persisted(now, wall_now);
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].expires_at_ms, None);
+
+        // A whole day later, in a new process, it is still there.
+        let mut restored = MetadataTokens::default();
+        let later = now + Duration::from_secs(86_400);
+        restored.restore_persisted(persisted, later, wall_now + Duration::from_secs(86_400));
+        assert_eq!(
+            restored.values(),
+            HashMap::from([("owner".into(), "firstmate".into())])
+        );
+        assert_eq!(restored.next_expiry(), None);
+    }
+
+    #[test]
+    fn a_ttl_survives_the_round_trip_as_the_same_wall_clock_moment() {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(
+            patch(&[("summary", Some("review"))]),
+            Some(Duration::from_secs(600)),
+            now,
+        );
+
+        let persisted = tokens.to_persisted(now, wall_now);
+        assert!(persisted[0].expires_at_ms.is_some());
+
+        // Down for 9 minutes: 1 minute of the TTL is left, not the full 10.
+        let restart = now + Duration::from_secs(540);
+        let mut restored = MetadataTokens::default();
+        restored.restore_persisted(persisted, restart, wall_now + Duration::from_secs(540));
+        assert_eq!(
+            restored.values(),
+            HashMap::from([("summary".into(), "review".into())])
+        );
+        assert!(!restored.expire_at(restart + Duration::from_secs(59)));
+        assert!(restored.expire_at(restart + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn a_ttl_that_passed_while_the_server_was_down_is_not_resurrected() {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(
+            patch(&[("summary", Some("stale"))]),
+            Some(Duration::from_secs(60)),
+            now,
+        );
+        let persisted = tokens.to_persisted(now, wall_now);
+
+        // Restart an hour later. Nothing was running to sweep it, so the
+        // deadline is only respected if the restore honours it.
+        let restart = now + Duration::from_secs(3_600);
+        let mut restored = MetadataTokens::default();
+        restored.restore_persisted(persisted, restart, wall_now + Duration::from_secs(3_600));
+        assert!(restored.values().is_empty());
+    }
+
+    #[test]
+    fn an_already_expired_token_is_never_written_to_the_session_file() {
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(
+            patch(&[("summary", Some("gone"))]),
+            Some(Duration::from_secs(1)),
+            now,
+        );
+
+        let capture_at = now + Duration::from_secs(5);
+        assert!(tokens
+            .to_persisted(capture_at, wall_now + Duration::from_secs(5))
+            .is_empty());
+    }
+
+    #[test]
+    fn clear_revokes_every_token_including_ones_that_never_expire() {
+        let now = Instant::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(
+            patch(&[("owner", Some("firstmate")), ("summary", Some("review"))]),
+            None,
+            now,
+        );
+
+        assert!(tokens.clear());
+        assert!(tokens.values().is_empty());
+        // Idempotent: a second revoke reports nothing changed.
+        assert!(!tokens.clear());
     }
 
     #[test]

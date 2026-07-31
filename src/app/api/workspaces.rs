@@ -243,9 +243,15 @@ impl App {
             Ok(ttl) => ttl,
             Err(message) => return encode_error(id, "invalid_metadata_ttl", message),
         };
-        let tokens = match super::super::api_helpers::normalize_metadata_tokens(params.tokens) {
-            Ok(tokens) => tokens,
-            Err(message) => return encode_error(id, "invalid_metadata_token", message),
+        // `clear_all_tokens` is a complete request on its own: revoking
+        // everything must not require naming a token to keep.
+        let tokens = if params.clear_all_tokens && params.tokens.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            match super::super::api_helpers::normalize_metadata_tokens(params.tokens) {
+                Ok(tokens) => tokens,
+                Err(message) => return encode_error(id, "invalid_metadata_token", message),
+            }
         };
         let Some(workspace) = self.state.workspaces.get_mut(index) else {
             return workspace_not_found(id, &params.workspace_id);
@@ -257,9 +263,14 @@ impl App {
         ) {
             return encode_success(id, ResponseResult::Ok {});
         }
-        if workspace.metadata_tokens.key_count_after_patch(&tokens)
-            > super::super::api_helpers::MAX_METADATA_TOKEN_KEYS_PER_RESOURCE
-        {
+        // A bulk clear replaces the token set, so the limit applies to what the
+        // patch sets rather than to what it is layered on top of.
+        let key_count_after = if params.clear_all_tokens {
+            tokens.values().filter(|value| value.is_some()).count()
+        } else {
+            workspace.metadata_tokens.key_count_after_patch(&tokens)
+        };
+        if key_count_after > super::super::api_helpers::MAX_METADATA_TOKEN_KEYS_PER_RESOURCE {
             return encode_error(
                 id,
                 "metadata_token_limit",
@@ -287,12 +298,18 @@ impl App {
                 );
             }
         }
+        let cleared = params.clear_all_tokens && workspace.metadata_tokens.clear();
         let changed = workspace
             .metadata_tokens
-            .patch(tokens, ttl, std::time::Instant::now());
+            .patch(tokens, ttl, std::time::Instant::now())
+            || cleared;
         if changed {
             self.sync_agent_metadata_deadline();
             self.emit_workspace_token_updated(index);
+            // Published tokens are durable now, so a token that changed and was
+            // never saved would come back as its previous value on the next
+            // restart.
+            self.state.mark_session_dirty();
         }
         encode_success(id, ResponseResult::Ok {})
     }
@@ -614,6 +631,7 @@ mod tests {
                         workspace_id: workspace_id.clone(),
                         source: "user:test".into(),
                         tokens,
+                        clear_all_tokens: false,
                         seq: None,
                         ttl_ms: None,
                     },
@@ -632,6 +650,62 @@ mod tests {
         )));
     }
 
+    /// The revoke path, workspace side. A token published with no TTL now
+    /// outlives its publisher and the server, so clearing it must not require
+    /// knowing its key.
+    #[test]
+    fn workspace_report_metadata_clear_all_tokens_revokes_tokens_that_never_expire() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        let workspace_id = app.public_workspace_id(0);
+
+        let response = app.handle_workspace_report_metadata(
+            "publish".into(),
+            WorkspaceReportMetadataParams {
+                workspace_id: workspace_id.clone(),
+                source: "user:test".into(),
+                tokens: std::collections::HashMap::from([
+                    ("jj_status".into(), Some("clean".into())),
+                    ("summary".into(), Some("review".into())),
+                ]),
+                clear_all_tokens: false,
+                seq: None,
+                ttl_ms: None,
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.workspaces[0]
+            .metadata_tokens
+            .next_expiry()
+            .is_none());
+
+        // Naming no keys, from a source that never published any of them.
+        app.state.session_dirty = false;
+        let response = app.handle_workspace_report_metadata(
+            "revoke".into(),
+            WorkspaceReportMetadataParams {
+                workspace_id,
+                source: "user:operator".into(),
+                tokens: std::collections::HashMap::new(),
+                clear_all_tokens: true,
+                seq: None,
+                ttl_ms: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        assert!(app.state.workspaces[0].metadata_tokens.values().is_empty());
+        assert!(app.state.session_dirty, "the revoke has to reach disk");
+    }
+
     #[test]
     fn workspace_token_ttl_expires_through_runtime_and_emits_update() {
         let event_hub = crate::api::EventHub::default();
@@ -648,6 +722,7 @@ mod tests {
                     "summary".into(),
                     Some("temporary".into()),
                 )]),
+                clear_all_tokens: false,
                 seq: None,
                 ttl_ms: Some(1),
             },

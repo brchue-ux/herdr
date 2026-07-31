@@ -1288,7 +1288,9 @@ impl App {
         let raw_display_agent_set = params.display_agent.is_some();
         let raw_state_labels_set = !params.state_labels.is_empty();
         let tokens = if params.tokens.is_empty() {
-            None
+            // A bulk clear is a token request even with no keys named, and has
+            // to take the same sequence and reporting path a patch does.
+            params.clear_all_tokens.then(std::collections::HashMap::new)
         } else {
             match normalize_metadata_tokens(params.tokens) {
                 Ok(tokens) => Some(tokens),
@@ -1376,9 +1378,14 @@ impl App {
             applies_to_source.as_deref(),
         );
         if let Some(tokens) = tokens.as_ref() {
-            if terminal.metadata_tokens.key_count_after_patch(tokens)
-                > MAX_METADATA_TOKEN_KEYS_PER_RESOURCE
-            {
+            // A bulk clear replaces the token set, so the limit applies to what
+            // the patch sets rather than to what it is layered on top of.
+            let key_count_after = if params.clear_all_tokens {
+                tokens.values().filter(|value| value.is_some()).count()
+            } else {
+                terminal.metadata_tokens.key_count_after_patch(tokens)
+            };
+            if key_count_after > MAX_METADATA_TOKEN_KEYS_PER_RESOURCE {
                 return encode_error(
                     id,
                     "metadata_token_limit",
@@ -1404,9 +1411,11 @@ impl App {
             }
         }
         let token_changed = tokens.is_some_and(|tokens| {
+            let cleared = params.clear_all_tokens && terminal.metadata_tokens.clear();
             let changed = terminal
                 .metadata_tokens
-                .patch(tokens, ttl, std::time::Instant::now());
+                .patch(tokens, ttl, std::time::Instant::now())
+                || cleared;
             if changed {
                 terminal.revision = terminal.revision.saturating_add(1);
             }
@@ -1432,6 +1441,10 @@ impl App {
         if token_changed {
             self.sync_agent_metadata_deadline();
             self.emit_pane_updated(ws_idx, pane_id);
+            // Published tokens are durable now, so a token that changed and was
+            // never saved would come back as its previous value on the next
+            // restart.
+            self.state.mark_session_dirty();
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1938,6 +1951,7 @@ mod tests {
             display_agent: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
+            clear_all_tokens: false,
             clear_title: false,
             clear_display_agent: false,
             clear_state_labels: false,
@@ -3980,6 +3994,77 @@ mod tests {
                 .get("generation")
                 .map(String::as_str),
             Some("new")
+        );
+    }
+
+    /// The revoke path for a token that never expires: a caller who does not
+    /// know the key, and cannot get the original publisher to cooperate, still
+    /// has to be able to clear it.
+    #[test]
+    fn pane_report_metadata_clear_all_tokens_revokes_a_token_that_never_expires() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        let mut published = metadata_params(public_pane_id.clone());
+        published.title = None;
+        published.tokens = std::collections::HashMap::from([
+            ("owner".into(), Some("firstmate".into())),
+            ("summary".into(), Some("review".into())),
+        ]);
+        let response = app.handle_pane_report_metadata("publish".into(), published);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        // No TTL was given, so nothing will ever sweep these on its own.
+        assert!(app.state.terminals[&terminal_id]
+            .metadata_tokens
+            .next_expiry()
+            .is_none());
+
+        // A different source, naming no keys at all, revokes the lot.
+        let mut revoke = metadata_params(public_pane_id);
+        revoke.title = None;
+        revoke.source = "user:operator".into();
+        revoke.clear_all_tokens = true;
+        let response = app.handle_pane_report_metadata("revoke".into(), revoke);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        assert!(app.state.terminals[&terminal_id]
+            .metadata_tokens
+            .values()
+            .is_empty());
+        assert!(app.state.session_dirty, "the revoke has to reach disk");
+    }
+
+    #[test]
+    fn pane_report_metadata_clear_all_tokens_replaces_rather_than_merges() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        let mut published = metadata_params(public_pane_id.clone());
+        published.title = None;
+        published.tokens =
+            std::collections::HashMap::from([("owner".into(), Some("stale".into()))]);
+        app.handle_pane_report_metadata("publish".into(), published);
+
+        let mut replace = metadata_params(public_pane_id);
+        replace.title = None;
+        replace.clear_all_tokens = true;
+        replace.tokens = std::collections::HashMap::from([("summary".into(), Some("new".into()))]);
+        let response = app.handle_pane_report_metadata("replace".into(), replace);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(
+            app.state.terminals[&terminal_id].metadata_tokens.values(),
+            std::collections::HashMap::from([("summary".into(), "new".into())])
         );
     }
 

@@ -143,7 +143,7 @@ fn workspace_rename(args: &[String]) -> std::io::Result<i32> {
 
 fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
-        eprintln!("usage: herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+        eprintln!("usage: herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--clear-all-tokens] [--seq N] [--ttl-ms N]");
         return Ok(2);
     };
     let workspace_id = super::normalize_workspace_id(raw_workspace_id);
@@ -151,6 +151,7 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let mut tokens = HashMap::new();
     let mut seq = None;
     let mut ttl_ms = None;
+    let mut clear_all_tokens = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -176,6 +177,10 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
                 };
                 tokens.insert(key, value);
                 index += 2;
+            }
+            "--clear-all-tokens" => {
+                clear_all_tokens = true;
+                index += 1;
             }
             "--clear-token" => {
                 let Some(key) = args.get(index + 1) else {
@@ -211,7 +216,7 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
         eprintln!("missing required --source");
         return Ok(2);
     };
-    if tokens.is_empty() {
+    if tokens.is_empty() && !clear_all_tokens {
         eprintln!("missing token to set or clear");
         return Ok(2);
     }
@@ -220,6 +225,7 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
             workspace_id,
             source,
             tokens,
+            clear_all_tokens,
             seq,
             ttl_ms,
         },
@@ -322,7 +328,7 @@ fn print_workspace_help() {
     eprintln!("  herdr workspace get <workspace_id>");
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
-    eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+    eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--clear-all-tokens] [--seq N] [--ttl-ms N]");
     eprintln!("  {REPORT_SIGNAL_USAGE}");
     eprintln!("  herdr workspace close <workspace_id>");
 }

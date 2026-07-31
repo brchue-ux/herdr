@@ -2,8 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, Method,
-    ReadFormat, ReadSource, Request,
+    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentViewClearParams, AgentViewFilter,
+    AgentViewSetParams, AgentViewSort, AgentViewSortField, AgentViewSortOrder, AgentWaitParams,
+    EmptyParams, Method, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -24,6 +25,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "explain" => agent_explain(&args[1..]),
+        "view" => agent_view(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
             Ok(0)
@@ -32,6 +34,219 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
             print_agent_help();
             Ok(2)
         }
+    }
+}
+
+/// `herdr agent view` — the Agents panel projection, from the shell.
+///
+/// The view set here is the API tier, which is written to `session.json` and
+/// reapplied at startup, so a script that wants the panel filtered says so once
+/// instead of re-asserting it on a timer.
+fn agent_view(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(String::as_str) {
+        Some("set") => agent_view_set(&args[1..]),
+        Some("clear") => agent_view_clear(&args[1..]),
+        Some("get") => agent_view_get(&args[1..]),
+        Some("help" | "--help" | "-h") => {
+            print_agent_view_help();
+            Ok(0)
+        }
+        _ => {
+            print_agent_view_help();
+            Ok(2)
+        }
+    }
+}
+
+fn print_agent_view_help() {
+    eprintln!("herdr agent view commands:");
+    eprintln!("  herdr agent view get");
+    eprintln!(
+        "  herdr agent view set --source ID [--label TEXT] [--filter JSON] [--sort FIELD[:asc|desc]]..."
+    );
+    eprintln!("  herdr agent view clear [--source ID]");
+    eprintln!("  --filter takes a filter object as JSON, @PATH to read a file, or - for stdin");
+    eprintln!("  --sort fields are builtin names or $token; repeat for more than one key");
+    eprintln!("  the view survives a restart; `config` and `ui` are reserved sources");
+}
+
+fn agent_view_set(args: &[String]) -> std::io::Result<i32> {
+    let mut source = None;
+    let mut label = None;
+    let mut filter_text = None;
+    let mut sort = Vec::new();
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" | "--label" | "--filter" | "--sort" => {
+                let flag = args[index].as_str();
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for {flag}");
+                    return Ok(2);
+                };
+                match flag {
+                    "--source" => source = Some(value.clone()),
+                    "--label" => label = Some(value.clone()),
+                    "--filter" => filter_text = Some(value.clone()),
+                    _ => match parse_agent_view_sort(value) {
+                        Ok(field) => sort.push(field),
+                        Err(message) => {
+                            eprintln!("{message}");
+                            return Ok(2);
+                        }
+                    },
+                }
+                index += 2;
+            }
+            "help" | "--help" | "-h" => {
+                print_agent_view_help();
+                return Ok(0);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(source) = source.filter(|source| !source.trim().is_empty()) else {
+        eprintln!("missing required --source");
+        return Ok(2);
+    };
+    let filter = match filter_text {
+        Some(text) => {
+            let text = match read_inline_json_argument(&text) {
+                Ok(text) => text,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return Ok(2);
+                }
+            };
+            match serde_json::from_str::<AgentViewFilter>(&text) {
+                Ok(filter) => Some(filter),
+                Err(err) => {
+                    eprintln!("invalid --filter: {err}");
+                    return Ok(2);
+                }
+            }
+        }
+        None => None,
+    };
+    if filter.is_none() && sort.is_empty() {
+        eprintln!("agent view set needs at least one of --filter or --sort");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:view:set".into(),
+        method: Method::AgentViewSet(AgentViewSetParams {
+            source,
+            label,
+            filter,
+            sort,
+        }),
+    })?)
+}
+
+fn agent_view_clear(args: &[String]) -> std::io::Result<i32> {
+    let mut source = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --source");
+                    return Ok(2);
+                };
+                source = Some(value.clone());
+                index += 2;
+            }
+            "help" | "--help" | "-h" => {
+                print_agent_view_help();
+                return Ok(0);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:view:clear".into(),
+        method: Method::AgentViewClear(AgentViewClearParams { source }),
+    })?)
+}
+
+/// Report the view in force. `session.snapshot` is the only place that names
+/// it, because a view can be owned by a tier no client ever set.
+fn agent_view_get(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr agent view get");
+        return Ok(2);
+    }
+
+    let response = super::send_request(&Request {
+        id: "cli:agent:view:get".into(),
+        method: Method::SessionSnapshot(EmptyParams::default()),
+    })?;
+    // `session.snapshot` answers as `{"result": {"type": ..., "snapshot": {...}}}`,
+    // so the view is one level below `result`. Reading `result.agent_view`
+    // directly always misses and reports every view as inactive.
+    let Some(snapshot) = response
+        .get("result")
+        .and_then(|result| result.get("snapshot"))
+    else {
+        return super::print_response(&response);
+    };
+    let view = snapshot.get("agent_view").cloned().unwrap_or(
+        // An absent view is a fact, not an error: nothing is filtering the
+        // panel. Say so in the same shape a set view is reported.
+        serde_json::json!({ "active": false }),
+    );
+    println!("{}", serde_json::to_string_pretty(&view)?);
+    Ok(0)
+}
+
+/// `field`, `field:asc`, or `field:desc`, where `field` is a builtin sort key
+/// or a `$token` published through pane metadata.
+fn parse_agent_view_sort(value: &str) -> Result<AgentViewSort, String> {
+    let (field, order) = match value.rsplit_once(':') {
+        Some((field, "asc")) => (field, AgentViewSortOrder::Asc),
+        Some((field, "desc")) => (field, AgentViewSortOrder::Desc),
+        Some((_, other)) => {
+            return Err(format!(
+                "invalid --sort order: {other} (expected asc or desc)"
+            ))
+        }
+        None => (value, AgentViewSortOrder::Asc),
+    };
+    let field = match field.strip_prefix('$') {
+        Some(token) => serde_json::json!({ "token": token }),
+        None => serde_json::Value::String(field.to_string()),
+    };
+    serde_json::from_value::<AgentViewSortField>(field)
+        .map(|field| AgentViewSort { field, order })
+        .map_err(|err| format!("invalid --sort field: {err}"))
+}
+
+/// A JSON argument given inline, as `@PATH`, or as `-` for stdin. Filters get
+/// long enough that quoting them into a shell command line stops being kind.
+fn read_inline_json_argument(value: &str) -> Result<String, String> {
+    match value {
+        "-" => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .map_err(|err| format!("failed to read JSON from stdin: {err}"))?;
+            Ok(text)
+        }
+        value => match value.strip_prefix('@') {
+            Some(path) => {
+                std::fs::read_to_string(path).map_err(|err| format!("failed to read {path}: {err}"))
+            }
+            None => Ok(value.to_string()),
+        },
     }
 }
 
@@ -804,6 +1019,7 @@ fn print_agent_help() {
     eprintln!(
         "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
     );
+    eprintln!("  herdr agent view get|set|clear   (durable Agents panel filter and sort)");
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));
 }
@@ -813,4 +1029,41 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+/// The `session.snapshot` traversal `agent view get` depends on.
+///
+/// This is a wire-shape contract, not an internal detail: the view sits at
+/// `result.snapshot.agent_view`, and reading `result.agent_view` silently
+/// reports every active view as inactive rather than failing.
+#[cfg(test)]
+mod agent_view_get_tests {
+    #[test]
+    fn the_view_is_read_from_result_snapshot_not_result() {
+        let response = serde_json::json!({
+            "id": "cli:agent:view:get",
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "agent_view": { "source": "workers-only", "label": "workers" }
+                }
+            }
+        });
+
+        let view = response
+            .get("result")
+            .and_then(|result| result.get("snapshot"))
+            .and_then(|snapshot| snapshot.get("agent_view"));
+
+        assert_eq!(
+            view.and_then(|view| view.get("source"))
+                .and_then(|s| s.as_str()),
+            Some("workers-only")
+        );
+        // The shape this test exists to pin down: one level up finds nothing.
+        assert!(response
+            .get("result")
+            .and_then(|result| result.get("agent_view"))
+            .is_none());
+    }
 }

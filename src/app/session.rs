@@ -4,9 +4,11 @@ use super::{App, SESSION_SAVE_DEBOUNCE};
 
 enum SessionSaveJob {
     Clear,
+    // Boxed because `Clear` carries nothing and the snapshot is large; this
+    // value is moved into a save thread on every debounce.
     Save {
-        snapshot: crate::persist::SessionSnapshot,
-        history: Option<crate::persist::SessionHistorySnapshot>,
+        snapshot: Box<crate::persist::SessionSnapshot>,
+        history: Option<Box<crate::persist::SessionHistorySnapshot>>,
     },
 }
 
@@ -49,11 +51,18 @@ impl App {
                 self.state.sidebar_width,
                 self.state.sidebar_section_split,
                 self.state.collapsed_space_keys.clone(),
+                self.state.agent_views.durable().cloned(),
             );
             let history = self.persist_pane_history.then(|| {
-                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+                Box::new(crate::persist::capture_history(
+                    &self.state.workspaces,
+                    &self.terminal_runtimes,
+                ))
             });
-            SessionSaveJob::Save { snapshot, history }
+            SessionSaveJob::Save {
+                snapshot: Box::new(snapshot),
+                history,
+            }
         }
     }
 
@@ -102,7 +111,7 @@ fn run_session_save_job(job: SessionSaveJob) {
     match job {
         SessionSaveJob::Clear => crate::persist::clear(),
         SessionSaveJob::Save { snapshot, history } => {
-            crate::persist::save(&snapshot, history.as_ref());
+            crate::persist::save(&snapshot, history.as_deref());
         }
     }
 }

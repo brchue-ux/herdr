@@ -9,6 +9,12 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
+///
+/// Durable metadata tokens and the durable Agents view were added without a
+/// bump on purpose: every field they introduce is optional and defaulted, so a
+/// version-3 file still loads, and a file written with them still loads on a
+/// build that predates them. Bumping would have bought nothing and would have
+/// made the older build reject the whole session rather than ignore two keys.
 pub(super) const SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable snapshot of the entire herdr session.
@@ -26,6 +32,28 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// The API-owned Agents view, so a projection a program set on purpose
+    /// outlives the server that was holding it. The config tier is already
+    /// durable through `config.toml`, and the UI tier is a momentary gesture,
+    /// so neither is stored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_view: Option<crate::api::schema::AgentViewSetParams>,
+}
+
+/// One durable metadata token published through `workspace.report_metadata` or
+/// `pane.report_metadata`.
+///
+/// Unlike [`crate::handoff_metadata::HandoffToken`], which carries the TTL that
+/// is *left*, the deadline here is absolute. See
+/// `MetadataTokens::to_persisted` for why the two formats differ.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedMetadataToken {
+    pub name: String,
+    pub value: String,
+    /// Wall-clock deadline in milliseconds since the Unix epoch. Absent when
+    /// the token was published without a TTL and therefore never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,6 +94,8 @@ pub struct WorkspaceSnapshot {
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_tokens: Vec<PersistedMetadataToken>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +137,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_tokens: Vec<PersistedMetadataToken>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +196,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             next_public_tab_number: 0,
             tabs: vec![tab],
             active_tab: 0,
+            metadata_tokens: Vec::new(),
         }
     }
 }
@@ -184,6 +217,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    agent_view: Option<crate::api::schema::AgentViewSetParams>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -199,6 +234,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        agent_view: raw.agent_view,
     })
 }
 
@@ -261,18 +297,42 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    agent_view: Option<crate::api::schema::AgentViewSetParams>,
 ) -> SessionSnapshot {
+    // One pair of clock reads for the whole snapshot: metadata deadlines are
+    // rewritten from monotonic to wall-clock time here, and two tokens that
+    // expire together must not drift apart just because they were captured a
+    // few microseconds apart.
+    let clock = MetadataClock::now();
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes, clock))
             .collect(),
         active,
         selected,
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        agent_view,
+    }
+}
+
+/// The monotonic and wall-clock readings a metadata deadline is converted
+/// between. See `MetadataTokens::to_persisted`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MetadataClock {
+    pub now: std::time::Instant,
+    pub wall_now: std::time::SystemTime,
+}
+
+impl MetadataClock {
+    pub(crate) fn now() -> Self {
+        Self {
+            now: std::time::Instant::now(),
+            wall_now: std::time::SystemTime::now(),
+        }
     }
 }
 
@@ -283,6 +343,7 @@ fn capture_workspace(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    clock: MetadataClock,
 ) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
@@ -302,9 +363,10 @@ fn capture_workspace(
         tabs: ws
             .tabs
             .iter()
-            .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
+            .map(|tab| capture_tab(tab, terminals, terminal_runtimes, clock))
             .collect(),
         active_tab: ws.active_tab,
+        metadata_tokens: ws.metadata_tokens.to_persisted(clock.now, clock.wall_now),
     }
 }
 
@@ -315,6 +377,7 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    clock: MetadataClock,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
@@ -338,6 +401,13 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        let metadata_tokens = terminal
+            .map(|terminal| {
+                terminal
+                    .metadata_tokens
+                    .to_persisted(clock.now, clock.wall_now)
+            })
+            .unwrap_or_default();
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -368,6 +438,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                metadata_tokens,
             },
         );
     }
@@ -541,6 +612,7 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            None,
         )
     }
 
@@ -605,6 +677,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            agent_view: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -648,6 +721,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                metadata_tokens: Vec::new(),
             },
         );
         panes.insert(
@@ -659,6 +733,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                metadata_tokens: Vec::new(),
             },
         );
 
@@ -686,12 +761,14 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            agent_view: None,
             version: SNAPSHOT_VERSION,
         };
 
@@ -877,6 +954,84 @@ mod tests {
         assert_eq!(snapshot.sidebar_width, Some(31));
         assert_eq!(snapshot.sidebar_section_split, Some(0.4));
         assert!(snapshot.collapsed_space_keys.contains("repo-key"));
+    }
+
+    /// Gap 1 in the report: nothing published at runtime reached the session
+    /// file, so a restart silently emptied every row that came from
+    /// `workspace.report_metadata` or `pane.report_metadata`.
+    #[test]
+    fn capture_contract_tracks_published_metadata_tokens() {
+        let mut state = state_with_workspaces(&["one"]);
+        let now = std::time::Instant::now();
+        state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([("jj_status".into(), Some("clean".into()))]),
+            None,
+            now,
+        );
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([("owner".into(), Some("firstmate".into()))]),
+                None,
+                now,
+            );
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(
+            snapshot.workspaces[0].metadata_tokens,
+            vec![PersistedMetadataToken {
+                name: "jj_status".into(),
+                value: "clean".into(),
+                expires_at_ms: None,
+            }]
+        );
+        assert_eq!(
+            snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()].metadata_tokens,
+            vec![PersistedMetadataToken {
+                name: "owner".into(),
+                value: "firstmate".into(),
+                expires_at_ms: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_contract_tracks_the_durable_agent_view() {
+        let state = state_with_workspaces(&["one"]);
+        let view = crate::api::schema::AgentViewSetParams {
+            source: "workers-only".into(),
+            label: Some("workers".into()),
+            filter: Some(crate::api::schema::AgentViewFilter::Exists {
+                field: crate::api::schema::AgentViewField::Token {
+                    token: "owner".into(),
+                },
+            }),
+            sort: Vec::new(),
+        };
+
+        let snapshot = capture(
+            &state.workspaces,
+            &state.terminals,
+            &TerminalRuntimeRegistry::new(),
+            state.active,
+            state.selected,
+            state.sidebar_width,
+            state.sidebar_section_split,
+            state.collapsed_space_keys.clone(),
+            Some(view.clone()),
+        );
+
+        assert_eq!(snapshot.agent_view, Some(view));
     }
 
     #[test]
@@ -1182,6 +1337,152 @@ mod tests {
         assert_eq!(snap.version, 0);
     }
 
+    /// The session file people already have on disk predates durable metadata
+    /// and the durable Agents view. It has to keep working untouched, which is
+    /// why neither addition bumped `SNAPSHOT_VERSION`.
+    #[test]
+    fn a_session_file_written_before_durable_metadata_still_loads() {
+        let json = r#"{
+            "version": 3,
+            "workspaces": [{
+                "id": "wproj",
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": {"Pane": 0},
+                    "panes": {"0": {"cwd": "/tmp"}},
+                    "zoomed": false
+                }],
+                "active_tab": 0
+            }],
+            "active": null,
+            "selected": 0
+        }"#;
+
+        let snap = parse_snapshot(json).unwrap();
+        assert_eq!(snap.version, 3);
+        assert!(snap.agent_view.is_none());
+        assert!(snap.workspaces[0].metadata_tokens.is_empty());
+        assert!(snap.workspaces[0].tabs[0].panes[&0]
+            .metadata_tokens
+            .is_empty());
+    }
+
+    /// The mirror of the above: a file this build writes must not carry the new
+    /// keys when there is nothing to say, so an older build reading it sees
+    /// exactly the file it wrote.
+    #[test]
+    fn empty_durable_state_is_not_written_to_the_session_file() {
+        let snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("wproj".into()),
+                custom_name: None,
+                identity_cwd: PathBuf::from("/tmp"),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: Vec::new(),
+                active_tab: 0,
+                metadata_tokens: Vec::new(),
+            }],
+            active: None,
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: std::collections::HashSet::new(),
+            agent_view: None,
+        };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("agent_view"), "{json}");
+        assert!(!json.contains("metadata_tokens"), "{json}");
+    }
+
+    #[test]
+    fn a_durable_agent_view_and_tokens_round_trip_through_the_session_file() {
+        let expires_at_ms = 1_900_000_000_000;
+        let snap = SessionSnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("wproj".into()),
+                custom_name: None,
+                identity_cwd: PathBuf::from("/tmp"),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        PaneSnapshot {
+                            cwd: PathBuf::from("/tmp"),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            metadata_tokens: vec![PersistedMetadataToken {
+                                name: "owner".into(),
+                                value: "firstmate".into(),
+                                expires_at_ms: None,
+                            }],
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+                metadata_tokens: vec![PersistedMetadataToken {
+                    name: "jj_status".into(),
+                    value: "clean".into(),
+                    expires_at_ms: Some(expires_at_ms),
+                }],
+            }],
+            active: None,
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: std::collections::HashSet::new(),
+            agent_view: Some(crate::api::schema::AgentViewSetParams {
+                source: "workers-only".into(),
+                label: Some("workers".into()),
+                filter: Some(crate::api::schema::AgentViewFilter::Exists {
+                    field: crate::api::schema::AgentViewField::Token {
+                        token: "owner".into(),
+                    },
+                }),
+                sort: Vec::new(),
+            }),
+        };
+
+        let restored = parse_snapshot(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .agent_view
+                .as_ref()
+                .map(|view| view.source.as_str()),
+            Some("workers-only")
+        );
+        assert_eq!(
+            restored.workspaces[0].metadata_tokens,
+            vec![PersistedMetadataToken {
+                name: "jj_status".into(),
+                value: "clean".into(),
+                expires_at_ms: Some(expires_at_ms),
+            }]
+        );
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&0].metadata_tokens[0].name,
+            "owner"
+        );
+    }
+
     #[test]
     fn future_version_is_rejected() {
         let json = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
@@ -1207,6 +1508,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                metadata_tokens: Vec::new(),
             },
         );
         panes.insert(
@@ -1220,6 +1522,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                metadata_tokens: Vec::new(),
             },
         );
 
@@ -1248,12 +1551,14 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            agent_view: None,
         };
 
         let json = serde_json::to_string(&snap).unwrap();

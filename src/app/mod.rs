@@ -264,6 +264,50 @@ fn config_agent_views(config: &crate::config::Config) -> crate::agent_view::Agen
     slots
 }
 
+/// Seed the view slots from config and from the session file.
+///
+/// The persisted view is re-validated rather than trusted: it was written by
+/// an earlier build, possibly with an older grammar, and a filter that no
+/// longer parses must leave the panel unfiltered instead of hiding rows for a
+/// reason nothing on screen can explain. A view owned by a plugin that is no
+/// longer installed or enabled is dropped for the same reason — the running
+/// server would already have cleared it the moment that plugin went away.
+fn restored_agent_views(
+    config: &crate::config::Config,
+    persisted: Option<crate::api::schema::AgentViewSetParams>,
+    installed_plugins: &state::InstalledPluginRegistry,
+) -> crate::agent_view::AgentViewSlots {
+    let mut slots = config_agent_views(config);
+    let Some(mut view) = persisted else {
+        return slots;
+    };
+    if let Err(err) = crate::agent_view::validate_agent_view(&mut view) {
+        tracing::warn!(err = %err, "dropping persisted agent view that no longer validates");
+        return slots;
+    }
+    if crate::agent_view::reserved_source_owner(&view.source).is_some() {
+        tracing::warn!(
+            source = %view.source,
+            "dropping persisted agent view that claims a reserved source"
+        );
+        return slots;
+    }
+    if let Some(plugin_id) = view.source.strip_prefix("plugin:") {
+        let still_enabled = crate::app::api::plugins::normalize_plugin_id(plugin_id)
+            .and_then(|plugin_id| installed_plugins.get(&plugin_id))
+            .is_some_and(|plugin| plugin.enabled);
+        if !still_enabled {
+            tracing::info!(
+                source = %view.source,
+                "dropping persisted agent view whose plugin is no longer installed or enabled"
+            );
+            return slots;
+        }
+    }
+    slots.set(crate::agent_view::AgentViewTier::Api, Some(view));
+    slots
+}
+
 fn agent_panel_sort_from_config(
     sort: crate::config::AgentPanelSortConfig,
 ) -> state::AgentPanelSort {
@@ -409,6 +453,7 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut restored_agent_view = None;
         let (
             workspaces,
             active,
@@ -448,6 +493,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            restored_agent_view = snap.agent_view.clone();
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (
@@ -519,6 +565,7 @@ impl App {
             "using pane scrollback configuration"
         );
 
+        let installed_plugins = load_plugin_registry(no_session);
         let latest_release_notes = crate::release_notes::load_latest();
         let update_available = latest_release_notes
             .as_ref()
@@ -654,7 +701,7 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
-            agent_views: config_agent_views(config),
+            agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,
@@ -709,7 +756,7 @@ impl App {
             agent_manifest_summaries,
             agent_manifest_update_status: crate::detect::manifest_update::load_status(),
             integration_install_messages: Vec::new(),
-            installed_plugins: load_plugin_registry(no_session),
+            installed_plugins,
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
@@ -4757,6 +4804,101 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.selected, 0);
         assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    fn workers_only_view(source: &str) -> crate::api::schema::AgentViewSetParams {
+        crate::api::schema::AgentViewSetParams {
+            source: source.to_string(),
+            label: Some("workers".to_string()),
+            filter: Some(crate::api::schema::AgentViewFilter::Exists {
+                field: crate::api::schema::AgentViewField::Token {
+                    token: "owner".to_string(),
+                },
+            }),
+            sort: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_persisted_agent_view_is_reapplied_at_startup_and_outranks_config() {
+        let config: crate::config::Config = toml::from_str(
+            "[ui.sidebar.agents.view]\nfilter = { op = \"eq\", field = \"status\", value = \"blocked\" }\n",
+        )
+        .unwrap();
+        let slots = restored_agent_views(
+            &config,
+            Some(workers_only_view("workers-only")),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(
+            slots.active().map(|view| view.source.as_str()),
+            Some("workers-only")
+        );
+        assert_eq!(
+            slots.active_tier(),
+            Some(crate::agent_view::AgentViewTier::Api)
+        );
+        // Clearing it still falls back to config rather than to nothing.
+        assert!(slots
+            .get(crate::agent_view::AgentViewTier::Config)
+            .is_some());
+    }
+
+    #[test]
+    fn a_persisted_agent_view_that_no_longer_validates_leaves_the_panel_unfiltered() {
+        let mut view = workers_only_view("workers-only");
+        view.filter = Some(crate::api::schema::AgentViewFilter::Any {
+            filters: Vec::new(),
+        });
+        let slots = restored_agent_views(
+            &crate::config::Config::default(),
+            Some(view),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(!slots.is_active());
+    }
+
+    #[test]
+    fn a_persisted_agent_view_whose_plugin_is_gone_is_dropped() {
+        let slots = restored_agent_views(
+            &crate::config::Config::default(),
+            Some(workers_only_view("plugin:reviewer")),
+            &std::collections::HashMap::new(),
+        );
+
+        assert!(!slots.is_active());
+    }
+
+    #[test]
+    fn a_persisted_agent_view_cannot_claim_a_reserved_source() {
+        for source in [
+            crate::agent_view::CONFIG_VIEW_SOURCE,
+            crate::agent_view::UI_VIEW_SOURCE,
+        ] {
+            let slots = restored_agent_views(
+                &crate::config::Config::default(),
+                Some(workers_only_view(source)),
+                &std::collections::HashMap::new(),
+            );
+            assert!(!slots.is_active(), "{source} claimed a reserved tier");
+        }
+    }
+
+    #[test]
+    fn a_ui_agent_view_is_not_durable_and_does_not_dirty_the_session() {
+        let mut app = test_app();
+        app.state.session_dirty = false;
+
+        app.replace_agent_view(
+            crate::agent_view::AgentViewTier::Ui,
+            Some(workers_only_view(crate::agent_view::UI_VIEW_SOURCE)),
+        );
+
+        assert!(app.state.agent_views.is_active());
+        assert!(app.state.agent_views.durable().is_none());
+        assert!(!app.state.session_dirty);
     }
 
     #[test]

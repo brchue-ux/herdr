@@ -107,9 +107,18 @@ impl App {
         tier: crate::agent_view::AgentViewTier,
         view: Option<AgentViewSetParams>,
     ) {
+        // Only the API tier is written to the session file, so only a change
+        // there is worth a save. Compare before setting: a plugin that
+        // re-publishes the same view every few seconds must not rewrite
+        // `session.json` every few seconds.
+        let durable_changed = tier == crate::agent_view::AgentViewTier::Api
+            && self.state.agent_views.durable() != view.as_ref();
         if self.state.agent_views.set(tier, view) {
             self.state.agent_panel_scroll = 0;
             self.state.mobile_switcher_scroll = 0;
+        }
+        if durable_changed {
+            self.state.mark_session_dirty();
         }
     }
 }
@@ -152,6 +161,23 @@ mod tests {
             .agent_views
             .active()
             .map(|view| view.source.as_str())
+    }
+
+    #[test]
+    fn setting_and_clearing_the_api_agent_view_marks_the_session_dirty() {
+        let mut app = test_app();
+        app.state.session_dirty = false;
+
+        app.handle_agent_view_set("set".to_string(), working_view("workers-only"));
+        assert!(app.state.session_dirty);
+
+        // Re-publishing the identical view is not a change worth a disk write.
+        app.state.session_dirty = false;
+        app.handle_agent_view_set("set".to_string(), working_view("workers-only"));
+        assert!(!app.state.session_dirty);
+
+        app.handle_agent_view_clear("clear".to_string(), AgentViewClearParams::default());
+        assert!(app.state.session_dirty);
     }
 
     #[test]

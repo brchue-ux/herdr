@@ -385,6 +385,13 @@ pub struct PaneReportMetadataParams {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_patch_schema")]
     pub tokens: HashMap<String, Option<String>>,
+    /// Drop every token on this pane before applying `tokens`.
+    ///
+    /// The revoke path for tokens published without a TTL, which never expire
+    /// and survive a restart: clearing one by name needs a key the caller may
+    /// not know, and cooperation from a publisher that may be long gone.
+    #[serde(default)]
+    pub clear_all_tokens: bool,
     #[serde(default)]
     pub clear_title: bool,
     #[serde(default)]
