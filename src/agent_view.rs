@@ -127,6 +127,16 @@ impl AgentViewSlots {
         before.as_ref() != self.active()
     }
 
+    /// The view the session file stores, so it comes back after a restart.
+    ///
+    /// Only the API tier is durable here. The config tier already survives a
+    /// restart by being read out of `config.toml` at startup, and the UI tier
+    /// is a gesture the user made in the moment — restoring that one would
+    /// bring a filtered panel back with nothing on screen explaining why.
+    pub(crate) fn durable(&self) -> Option<&AgentViewSetParams> {
+        self.get(AgentViewTier::Api)
+    }
+
     /// Clear the winning tier so the next tier down takes over. Returns the
     /// tier that was cleared.
     pub(crate) fn clear_active_tier(&mut self) -> Option<AgentViewTier> {

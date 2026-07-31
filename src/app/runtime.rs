@@ -477,11 +477,18 @@ impl App {
             self.emit_pane_state_update(&update);
         }
         let (panes, workspaces) = self.state.expire_metadata_tokens(now);
+        let expired_any_token = !panes.is_empty() || !workspaces.is_empty();
         for (ws_idx, pane_id) in panes {
             self.emit_pane_updated(ws_idx, pane_id);
         }
         for ws_idx in workspaces {
             self.emit_workspace_token_updated(ws_idx);
+        }
+        if expired_any_token {
+            // The session file holds absolute deadlines, so a sweep that is
+            // never saved is not incorrect — a restore would drop the same
+            // tokens. Saving anyway keeps the file honest about what is live.
+            self.state.mark_session_dirty();
         }
         self.sync_agent_metadata_deadline();
     }

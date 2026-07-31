@@ -2936,6 +2936,11 @@
                 "null"
               ]
             },
+            "clear_all_tokens": {
+              "default": false,
+              "description": "Drop every token on this pane before applying `tokens`.\n\nThe revoke path for tokens published without a TTL, which never expire\nand survive a restart: clearing one by name needs a key the caller may\nnot know, and cooperation from a publisher that may be long gone.",
+              "type": "boolean"
+            },
             "clear_display_agent": {
               "default": false,
               "type": "boolean"
@@ -4245,6 +4250,11 @@
         },
         "WorkspaceReportMetadataParams": {
           "properties": {
+            "clear_all_tokens": {
+              "default": false,
+              "description": "Drop every token on this workspace before applying `tokens`.\n\nThe revoke path for tokens published without a TTL, which never expire\nand survive a restart: clearing one by name needs a key the caller may\nnot know, and cooperation from a publisher that may be long gone.",
+              "type": "boolean"
+            },
             "seq": {
               "format": "uint64",
               "minimum": 0,

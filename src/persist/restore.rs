@@ -41,6 +41,9 @@ struct RestoreRuntimeContext<'a> {
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
+    /// Read once for the whole restore so every persisted metadata deadline is
+    /// re-anchored against the same pair of clock readings.
+    metadata_clock: crate::persist::MetadataClock,
 }
 
 type RestoredSession = (
@@ -272,6 +275,7 @@ fn restore_with_imports_and_failures(
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
+    let metadata_clock = crate::persist::MetadataClock::now();
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
@@ -280,6 +284,7 @@ fn restore_with_imports_and_failures(
             events: events.clone(),
             render_notify: render_notify.clone(),
             render_dirty: render_dirty.clone(),
+            metadata_clock,
         };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
@@ -404,6 +409,7 @@ fn restore_workspace(
 
     let worktree_space = restored_worktree_space_membership(snap.worktree_space.clone());
     let identity = crate::workspace::discover_workspace_git_identity(&snap.identity_cwd);
+    let metadata_tokens = restored_metadata_tokens(&snap.metadata_tokens, runtime_context);
 
     (
         Some(Workspace {
@@ -418,7 +424,12 @@ fn restore_workspace(
             cached_git_space: identity.space,
             worktree_space,
             derived_worktree_space: identity.derived_worktree_space,
-            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_tokens,
+            // Report sequences are deliberately not persisted. They are
+            // replay protection between live reporters, and a cold restart has
+            // no report in flight to replay; carrying them over would instead
+            // silently reject a publisher that restarted alongside the server
+            // and began its counter again.
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number,
@@ -431,6 +442,23 @@ fn restore_workspace(
         .map(|workspace| (workspace, terminals, terminal_runtimes)),
         failed_imports,
     )
+}
+
+/// Rebuild persisted tokens against this process's clock, dropping any whose
+/// wall-clock deadline passed while nothing was running to sweep it.
+fn restored_metadata_tokens(
+    tokens: &[crate::persist::PersistedMetadataToken],
+    runtime_context: &RestoreRuntimeContext<'_>,
+) -> crate::metadata_tokens::MetadataTokens {
+    let mut restored = crate::metadata_tokens::MetadataTokens::default();
+    if !tokens.is_empty() {
+        restored.restore_persisted(
+            tokens.to_vec(),
+            runtime_context.metadata_clock.now,
+            runtime_context.metadata_clock.wall_now,
+        );
+    }
+    restored
 }
 
 fn restored_worktree_space_membership(
@@ -496,6 +524,9 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        let saved_metadata_tokens = saved_pane
+            .map(|p| restored_metadata_tokens(&p.metadata_tokens, runtime_context))
+            .unwrap_or_default();
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -537,6 +568,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.metadata_tokens = saved_metadata_tokens;
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -626,6 +658,7 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                terminal.metadata_tokens = saved_metadata_tokens;
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1195,6 +1228,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            metadata_tokens: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -1202,12 +1236,14 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            agent_view: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1276,6 +1312,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                metadata_tokens: Vec::new(),
                             },
                         ),
                         (
@@ -1287,6 +1324,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                metadata_tokens: Vec::new(),
                             },
                         ),
                     ]),
@@ -1295,12 +1333,14 @@ mod tests {
                     root_pane: Some(10),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            agent_view: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1340,6 +1380,7 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    metadata_tokens: Vec::new(),
                 },
             )
         };
@@ -1355,6 +1396,7 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            metadata_tokens: Vec::new(),
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1402,12 +1444,14 @@ mod tests {
                     },
                 ],
                 active_tab: 3,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            agent_view: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1464,6 +1508,7 @@ mod tests {
                 root_pane: Some(10),
             }],
             active_tab: 0,
+            metadata_tokens: Vec::new(),
         };
         let mut next_public_pane_number = 1;
 
@@ -1506,6 +1551,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            metadata_tokens: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -1513,12 +1559,14 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            agent_view: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1667,6 +1715,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                metadata_tokens: Vec::new(),
             },
         );
         let history = SessionHistorySnapshot {
@@ -1707,12 +1756,14 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                metadata_tokens: Vec::new(),
             }],
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            agent_view: None,
         };
         (snapshot, history)
     }
