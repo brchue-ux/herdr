@@ -25,6 +25,9 @@ pub struct PaneDetail {
     pub last_agent_state_change_at: Option<Instant>,
     pub state_labels: HashMap<String, String>,
     pub tokens: HashMap<String, String>,
+    /// The pane's own handle, as set by `pane report-agent --name`. This is
+    /// what another pane's `owner` token refers to.
+    pub agent_name: Option<String>,
 }
 
 impl Tab {
@@ -69,6 +72,7 @@ impl Tab {
                     last_agent_state_change_at: terminal.last_agent_state_change_at,
                     state_labels: presentation.state_labels,
                     tokens: terminal.metadata_tokens.values(),
+                    agent_name: terminal.agent_name.clone(),
                 })
             })
             .collect()

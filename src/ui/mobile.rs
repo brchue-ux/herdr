@@ -1189,6 +1189,12 @@ mod tests {
             last_agent_state_change_at: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
+            agent_name: None,
+            owner: None,
+            depth: 0,
+            relation: crate::app::agent_tree::AgentRelation::FirstMate,
+            is_last_child: true,
+            ancestors_continue: Vec::new(),
         }
     }
 

@@ -9,6 +9,9 @@ use super::ScrollbarClickTarget;
 pub(super) enum AgentPanelHeaderAction {
     ToggleSort,
     ClearView,
+    /// A category tab was clicked. Selecting the selected one clears back to
+    /// the whole tree, so the selector can never strand the user in a filter.
+    SelectCategory(crate::ui::AgentCategory),
 }
 
 impl AppState {
@@ -410,6 +413,14 @@ impl AppState {
             {
                 return None;
             }
+            // The Agents panel header is by construction divider+1, so the
+            // category tabs live inside this grab band too. Without carving
+            // them out the same way the control above is carved out, every
+            // mouse-down on a tab becomes a divider drag and the selector
+            // silently does nothing.
+            if crate::ui::agent_category_tab_at(self, detail_area, col, row).is_some() {
+                return None;
+            }
         }
 
         Some(-(below as i16))
@@ -611,6 +622,12 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
+        // Tabs sit left of the control on the same row, so they are tested
+        // first; the control's rect is already excluded from their layout.
+        if let Some(category) = crate::ui::agent_category_tab_at(self, detail_area, col, row) {
+            return Some(AgentPanelHeaderAction::SelectCategory(category));
+        }
+
         let control = crate::ui::agent_panel_control(self, detail_area);
         let rect = control.rect;
         let hit = rect.width > 0
@@ -1014,6 +1031,108 @@ mod tests {
 
         assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
+    }
+
+    /// Drives the real `handle_mouse` entry point rather than
+    /// `agent_panel_header_action_at`. The Agents header is by construction
+    /// divider+1, so it sits inside `sidebar_section_divider_grab_at`'s band —
+    /// which runs first and returns early. Testing the handler in isolation
+    /// passes while every click actually starts a divider drag, which is
+    /// exactly how this shipped broken the first time.
+    #[test]
+    fn clicking_a_category_tab_selects_it_instead_of_dragging_the_divider() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let tabs = crate::ui::agent_category_tabs(
+            crate::ui::agent_panel_title_rect(detail_area),
+            app.state.agent_category,
+        );
+        let workers = tabs
+            .iter()
+            .find(|tab| tab.category == crate::ui::AgentCategory::Workers)
+            .expect("workers tab is drawn at width 26");
+
+        let split_before = app.state.sidebar_section_split;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            workers.rect.x,
+            workers.rect.y,
+        ));
+
+        assert_eq!(
+            app.state.agent_category,
+            Some(crate::ui::AgentCategory::Workers),
+            "clicking a tab must select it"
+        );
+        assert!(
+            app.state.drag.is_none(),
+            "clicking a tab must not start a divider drag"
+        );
+        assert_eq!(
+            app.state.sidebar_section_split, split_before,
+            "clicking a tab must not move the section divider"
+        );
+        // The selection reached the panel through the ui tier, not a private
+        // filter, so the API door can read it back.
+        assert_eq!(
+            app.state.agent_views.active_tier(),
+            Some(crate::agent_view::AgentViewTier::Ui)
+        );
+
+        // Clicking the selected tab again returns to the whole tree.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            workers.rect.x,
+            workers.rect.y,
+        ));
+        assert_eq!(app.state.agent_category, None);
+        assert_eq!(app.state.agent_views.active_tier(), None);
+    }
+
+    /// The carve-out must be exactly the tabs — the rest of that row is still
+    /// the divider's grab band.
+    #[test]
+    fn the_header_row_between_tabs_still_drags_the_divider() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let tabs = crate::ui::agent_category_tabs(
+            crate::ui::agent_panel_title_rect(detail_area),
+            app.state.agent_category,
+        );
+        let first = tabs.first().expect("tabs are drawn");
+
+        // Column 0 is left of the first tab, which starts one column in.
+        assert!(first.rect.x > 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            first.rect.y,
+        ));
+
+        assert_eq!(app.state.agent_category, None, "no tab should be selected");
+        assert!(
+            matches!(
+                app.state.drag.as_ref().map(|drag| &drag.target),
+                Some(DragTarget::SidebarSectionDivider { .. })
+            ),
+            "the rest of the header row must still grab the divider"
+        );
     }
 
     #[test]
@@ -2158,6 +2277,30 @@ mod tests {
         app
     }
 
+    /// First column of the section divider's header-row grab band that no
+    /// category tab and no panel control has claimed.
+    fn grab_band_column_on_header_row(app: &crate::app::state::AppState, section: Rect) -> u16 {
+        let (_, detail_area) =
+            crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+        (section.x..section.x + section.width)
+            .find(|col| {
+                app.sidebar_section_divider_grab_at(*col, section.y + 1)
+                    .is_some()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no grab band left on the header row; tabs at {:?}",
+                    crate::ui::agent_category_tabs(
+                        crate::ui::agent_panel_title_rect(detail_area),
+                        app.agent_category,
+                    )
+                    .iter()
+                    .map(|tab| tab.rect)
+                    .collect::<Vec<_>>()
+                )
+            })
+    }
+
     fn recompute(app: &mut crate::app::App) {
         crate::ui::compute_view(&mut app.state, DIVIDER_TEST_AREA);
     }
@@ -2259,10 +2402,38 @@ mod tests {
             app.state.sidebar_section_divider_grab_at(col, sep_row),
             Some(0)
         );
+
+        // The header row is still grab band wherever no control has claimed
+        // the cell...
+        let section = crate::ui::sidebar_section_divider_rect(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let free_col = grab_band_column_on_header_row(&app.state, section);
         assert_eq!(
-            app.state.sidebar_section_divider_grab_at(col, sep_row + 1),
+            app.state
+                .sidebar_section_divider_grab_at(free_col, sep_row + 1),
             Some(-1)
         );
+
+        // ...but not on a category tab, or the tab could never be clicked.
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            app.state.view.sidebar_rect,
+            app.state.sidebar_section_split,
+        );
+        let tabs = crate::ui::agent_category_tabs(
+            crate::ui::agent_panel_title_rect(detail_area),
+            app.state.agent_category,
+        );
+        for tab in &tabs {
+            assert_eq!(
+                app.state
+                    .sidebar_section_divider_grab_at(tab.rect.x, tab.rect.y),
+                None,
+                "tab {:?} is swallowed by the divider grab band",
+                tab.category
+            );
+        }
         // Not the workspace card row above, and not a second agent row below.
         assert_eq!(
             app.state.sidebar_section_divider_grab_at(col, sep_row - 1),
@@ -2616,10 +2787,14 @@ mod tests {
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
         );
+        // Row `section.y + 1` is the Agents panel header, which now carries the
+        // category tabs. Those are carved out of the grab band, so pick a
+        // column on that row that no tab covers rather than assuming one.
+        let grab_col = grab_band_column_on_header_row(&app.state, section);
         drag_divider(
             &mut app,
-            (section.x + 2, section.y + 1),
-            (section.x + 2, section.y + 6),
+            (grab_col, section.y + 1),
+            (grab_col, section.y + 6),
         );
         recompute(&mut app);
 

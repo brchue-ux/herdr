@@ -1,3 +1,4 @@
+pub(crate) mod category;
 mod tokens;
 
 use ratatui::{
@@ -41,6 +42,53 @@ pub(crate) struct AgentPanelEntry {
     pub last_agent_state_change_at: Option<std::time::Instant>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
+    /// This pane's own handle, the thing another pane's `owner` token names.
+    pub agent_name: Option<String>,
+    /// The `owner` metadata token, naming the pane that owns this one.
+    pub owner: Option<String>,
+    /// Depth in the ownership tree, stamped by
+    /// [`crate::app::agent_tree::arrange_agent_tree`]. 0 is a root.
+    pub depth: u8,
+    /// Where this pane sits in the ownership tree.
+    pub relation: crate::app::agent_tree::AgentRelation,
+    /// Whether this is the last child at its own depth, picking `└` over `├`.
+    pub is_last_child: bool,
+    /// For each ancestor level, whether that level still has a sibling below,
+    /// which is what decides between a `│` continuation and blank space.
+    pub ancestors_continue: Vec<bool>,
+}
+
+#[cfg(test)]
+impl AgentPanelEntry {
+    /// Minimal entry for tree and layout tests, which care only about the
+    /// name/owner pair and the fields the arranger stamps.
+    pub(crate) fn test_new(agent_name: &str) -> Self {
+        Self {
+            ws_idx: 0,
+            tab_idx: 0,
+            pane_id: crate::layout::PaneId::alloc(),
+            primary_label: String::new(),
+            primary_tab_label: None,
+            pane_label: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_label: Some(agent_name.to_string()),
+            agent_kind_label: None,
+            agent: None,
+            state: AgentState::Unknown,
+            seen: true,
+            last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
+            agent_name: Some(agent_name.to_string()),
+            owner: None,
+            depth: 0,
+            relation: crate::app::agent_tree::AgentRelation::FirstMate,
+            is_last_child: true,
+            ancestors_continue: Vec::new(),
+        }
+    }
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -80,6 +128,43 @@ pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect
 
     let (ws_h, _) = sidebar_section_heights(content.height, split_ratio);
     Rect::new(content.x, content.y + ws_h, content.width, 1)
+}
+
+/// The Agents panel's header row — the separator's row plus one.
+///
+/// Shared by the renderer and the click handler so a tab is always where the
+/// hit test says it is.
+pub(crate) fn agent_panel_title_rect(area: Rect) -> Rect {
+    if area.height < 3 || area.width == 0 {
+        return Rect::default();
+    }
+    Rect::new(area.x, area.y + 1, area.width, 1)
+}
+
+/// The category tab at `col`/`row`, if the selector is drawn and one is hit.
+pub(crate) fn agent_category_tab_at(
+    app: &AppState,
+    area: Rect,
+    col: u16,
+    row: u16,
+) -> Option<category::AgentCategory> {
+    let title_row = agent_panel_title_rect(area);
+    if title_row == Rect::default() {
+        return None;
+    }
+    let control_reserve = agent_panel_control(app, area).rect.width;
+    category::agent_category_tabs(
+        Rect::new(
+            title_row.x,
+            title_row.y,
+            title_row.width.saturating_sub(control_reserve),
+            1,
+        ),
+        app.agent_category,
+    )
+    .into_iter()
+    .find(|tab| row == tab.rect.y && col >= tab.rect.x && col < tab.rect.x + tab.rect.width)
+    .map(|tab| tab.category)
 }
 
 fn agent_panel_sort_label(sort: AgentPanelSort) -> &'static str {
@@ -227,7 +312,14 @@ fn agent_panel_entries_and_hidden_with_runtimes(
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
 ) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
     let mut entries = collect_agent_panel_entries_with_runtimes(app, terminal_runtimes);
+    // Classify against the whole fleet first: a view that filters on `relation`
+    // has to see what each pane is, not what is left after it filtered.
+    crate::app::agent_tree::classify_agent_relations(&mut entries);
     let hidden = crate::app::agent_view::apply_agent_view(app, &mut entries);
+    // After filtering and sorting, so a hidden parent re-parents its children
+    // onto the nearest survivor instead of leaving a connector pointing at a
+    // row that is not on screen.
+    crate::app::agent_tree::arrange_agent_tree(&mut entries);
     (entries, hidden)
 }
 
@@ -286,7 +378,17 @@ fn collect_agent_panel_entries_with_runtimes(
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
                         last_agent_state_change_at: detail.last_agent_state_change_at,
                         state_labels: detail.state_labels,
+                        owner: detail
+                            .tokens
+                            .get(crate::app::agent_tree::OWNER_TOKEN)
+                            .map(|owner| owner.trim().to_string())
+                            .filter(|owner| !owner.is_empty()),
                         tokens: detail.tokens,
+                        agent_name: detail.agent_name,
+                        depth: 0,
+                        relation: crate::app::agent_tree::AgentRelation::FirstMate,
+                        is_last_child: true,
+                        ancestors_continue: Vec::new(),
                     }
                 })
         })
@@ -1357,6 +1459,73 @@ fn resolved_token_spans(
 /// would be with no signal at all, so a row whose signal was skipped, cut
 /// short, or never scheduled draws the same characters in the same columns as
 /// one that never had a signal.
+/// Indent and connector for one Agents-panel row.
+///
+/// Deliberately the same vocabulary as the Spaces panel's child cards —
+/// `├─ `/`└─ ` on the first row, a `│` continuation while a level still has
+/// siblings below — because the user sees both panels at once and a second
+/// branch glyph would read as a second meaning. Returns the spans and the
+/// columns they consume, which the caller subtracts from the token budget.
+///
+/// The Spaces panel indents a child by three columns before its connector; the
+/// Agents panel starts one column in rather than three, so the same shape costs
+/// `3 * depth` columns here instead of `3 + 3 * depth`. Continuation rows sit
+/// two columns further right than their first row in both panels, which is what
+/// keeps wrapped text aligned under the name rather than under the state dot.
+fn agent_row_prefix(
+    depth: u8,
+    is_last_child: bool,
+    ancestors_continue: &[bool],
+    row_index: usize,
+    p: &Palette,
+) -> (Vec<Span<'static>>, usize) {
+    let depth = depth.min(crate::app::agent_tree::MAX_DISPLAY_DEPTH);
+    if depth == 0 {
+        // Byte-identical to the pre-tree panel, so a fleet with no declared
+        // ownership draws exactly as it did before.
+        return if row_index == 0 {
+            (vec![Span::raw(" ")], 1)
+        } else {
+            (vec![Span::raw("   ")], 3)
+        };
+    }
+
+    let line_style = Style::default().fg(p.overlay0);
+    let mut spans = vec![Span::raw(" ")];
+
+    // One spacer per intermediate ancestor level; level 0 is the root column,
+    // which carries no connector of its own.
+    for level in 1..depth {
+        let open = ancestors_continue
+            .get(level as usize)
+            .copied()
+            .unwrap_or(false);
+        if open {
+            spans.push(Span::styled("│", line_style));
+            spans.push(Span::raw("  "));
+        } else {
+            spans.push(Span::raw("   "));
+        }
+    }
+
+    if row_index == 0 {
+        let connector = if is_last_child { "└─ " } else { "├─ " };
+        for glyph in connector.chars() {
+            spans.push(Span::styled(glyph.to_string(), line_style));
+        }
+        (spans, 3 * depth as usize + 1)
+    } else {
+        if is_last_child {
+            spans.push(Span::raw("   "));
+        } else {
+            spans.push(Span::styled("│", line_style));
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::raw("  "));
+        (spans, 3 * depth as usize + 3)
+    }
+}
+
 fn connector_cell_style(
     base: Style,
     phase: Option<RelationSignalPhase>,
@@ -1741,13 +1910,38 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        )])),
-        Rect::new(area.x, area.y + 1, area.width, 1),
+    let title_row = agent_panel_title_rect(area);
+    let control_reserve = agent_panel_control(app, area).rect.width;
+    let tabs = category::agent_category_tabs(
+        Rect::new(
+            title_row.x,
+            title_row.y,
+            title_row.width.saturating_sub(control_reserve),
+            1,
+        ),
+        app.agent_category,
     );
+    if tabs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                " agents",
+                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+            )])),
+            title_row,
+        );
+    } else {
+        for tab in &tabs {
+            let style = if tab.selected {
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(tab.label.clone(), style)),
+                tab.rect,
+            );
+        }
+    }
     let (details, hidden) = agent_panel_entries_and_hidden_from(app, terminal_runtimes);
     let control = agent_panel_control_with_hidden(app, area, hidden);
     if control.rect != Rect::default() {
@@ -1814,7 +2008,13 @@ fn render_agent_detail(
         let state_icon = state_dot(detail.state, detail.seen, p);
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
-            let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
+            let (mut spans, prefix_width) = agent_row_prefix(
+                detail.depth,
+                detail.is_last_child,
+                &detail.ancestors_continue,
+                row_index,
+                p,
+            );
             spans.extend(resolved_token_spans(
                 resolved,
                 state_icon,
@@ -1824,8 +2024,7 @@ fn render_agent_detail(
                 agent_style,
                 p,
                 app.animation_tick,
-                body.width
-                    .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
+                (body.width as usize).saturating_sub(prefix_width),
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
@@ -1894,6 +2093,113 @@ mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// A first mate owning a second mate owning a worker, rendered at the
+    /// width the captain actually runs.
+    fn owned_fleet_sidebar_rows(width: u16) -> Vec<String> {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = Workspace::test_new("fleet");
+        let first = workspace.tabs[0].root_pane;
+        let second = workspace.test_split(ratatui::layout::Direction::Vertical);
+        let worker = workspace.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let now = std::time::Instant::now();
+        for (pane, name, owner) in [
+            (first, "firstmate", None),
+            (second, "secondmate", Some("firstmate")),
+            (worker, "worker", Some("secondmate")),
+        ] {
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            if let Some(owner) = owner {
+                terminal.metadata_tokens.patch(
+                    std::collections::HashMap::from([(
+                        "owner".to_string(),
+                        Some(owner.to_string()),
+                    )]),
+                    None,
+                    now,
+                );
+            }
+        }
+
+        let area = Rect::new(0, 0, width, 20);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    #[test]
+    fn a_worker_draws_beneath_its_second_mate_on_a_twenty_six_wide_sidebar() {
+        let rows = owned_fleet_sidebar_rows(26);
+        let screen = rows.join("\n");
+
+        // An agent entry is two rows: the connector leads the first row, the
+        // agent's name sits on the second.
+        let name_row = |name: &str| {
+            rows.iter()
+                .position(|row| row.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
+        };
+        let first_row = name_row("firstmate");
+        let second_row = name_row("secondmate");
+        let worker_row = name_row("worker");
+
+        // Ownership order top to bottom.
+        assert!(
+            first_row < second_row && second_row < worker_row,
+            "panes are not in ownership order:\n{screen}"
+        );
+
+        // Each owned pane's entry opens with a Spaces-style branch connector.
+        let connector_indent = |row: usize| {
+            let opener = &rows[row - 1];
+            opener
+                .find(['└', '├'])
+                .unwrap_or_else(|| panic!("no connector above row {row}:\n{screen}"))
+        };
+        let second_indent = connector_indent(second_row);
+        let worker_indent = connector_indent(worker_row);
+
+        // The first mate is a root, so it has no connector at all.
+        assert!(
+            !rows[first_row - 1].contains('└') && !rows[first_row - 1].contains('├'),
+            "the first mate should not be indented:\n{screen}"
+        );
+
+        // ...and the worker hangs one level deeper than its second mate.
+        assert!(
+            worker_indent > second_indent,
+            "worker is not nested under its second mate:\n{screen}"
+        );
+
+        // The name still survives the indent at the captain's width.
+        assert!(
+            rows[worker_row].trim_start().starts_with("worker"),
+            "worker name was indented off the panel:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn the_category_selector_fits_beside_the_panel_control_at_width_twenty_six() {
+        let rows = owned_fleet_sidebar_rows(26);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("1st") && row.contains("sub")),
+            "category tabs missing at width 26:\n{screen}"
+        );
+    }
 
     fn row_text(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> String {
         (0..width)

@@ -119,6 +119,11 @@ pub enum AgentViewBuiltinField {
     Agent,
     Seen,
     StateChangeSeq,
+    /// Where the pane sits in the ownership tree built from `owner` metadata
+    /// tokens: `first_mate`, `second_mate`, or `worker`. Derived from the whole
+    /// fleet before any filtering, so selecting one category cannot change what
+    /// another pane is.
+    Relation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

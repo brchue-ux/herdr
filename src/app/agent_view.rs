@@ -177,6 +177,9 @@ fn builtin_field_value(
         AgentViewBuiltinField::StateChangeSeq => {
             entry.last_agent_state_change_seq.map(EvalValue::Number)
         }
+        AgentViewBuiltinField::Relation => {
+            Some(EvalValue::String(entry.relation.as_str().to_string()))
+        }
     }
 }
 
