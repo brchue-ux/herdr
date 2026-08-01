@@ -897,6 +897,8 @@ mod tests {
             ws_idx: 0,
             rect: ratatui::layout::Rect::new(0, 0, 30, 2),
             indented: true,
+            entry_idx: 0,
+            agent: None,
         }];
     }
 

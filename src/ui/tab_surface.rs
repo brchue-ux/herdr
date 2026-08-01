@@ -302,14 +302,15 @@ mod tests {
         assert!(!app.view.split_borders.is_empty());
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
-        // The Agents panel header now carries the four-way category selector
-        // ("1st 2nd wrk sub") where it used to print a static " agents", which
-        // moved this digest. The Spaces panel is untouched — `render_workspace_list`
-        // is byte-identical — and the mobile digest below is unchanged, so the
-        // desktop sidebar header is the only thing that moved.
+        // The Agents panel is gone and the Spaces tree now owns the whole
+        // sidebar column, which moved this digest: the separator row, the
+        // panel header and every agent row below them are no longer drawn, and
+        // the Spaces list runs to the bottom instead of stopping at the split.
+        // The mobile digest below is unchanged, so the desktop sidebar is the
+        // only thing that moved.
         assert_eq!(
             frame_digest(&frame),
-            "3e16c70ac853af8c940ba7e26b8f20663e221ea02119b7403ac7db77b45cb783"
+            "8b1e76e2d1cfb7d19e729d6477a241732e8f9332fa27044f67fb65af4a379eb3"
         );
     }
 

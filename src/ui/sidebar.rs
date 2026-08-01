@@ -422,9 +422,67 @@ pub(crate) fn grouped_child_display_label(
         .to_string()
 }
 
+/// One row of the sidebar's single tree.
+///
+/// Spaces and owned agent panes are rows of the same list on purpose: a second
+/// mate is a Space and its workers are panes, and the captain's tree runs
+/// straight through that boundary. Every row carries the same three drawing
+/// facts so one prefix function serves both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
-    Workspace { ws_idx: usize, indented: bool },
+    Workspace {
+        ws_idx: usize,
+        /// Worktree-group child. A styling fact, not a depth: it also shortens
+        /// the label and suppresses git detail.
+        indented: bool,
+        depth: u8,
+        ancestors_continue: Vec<bool>,
+        is_last_child: bool,
+    },
+    /// An agent pane that named an owner. Indexes [`sidebar_agent_entries`].
+    Agent {
+        entry_idx: usize,
+        depth: u8,
+        ancestors_continue: Vec<bool>,
+        is_last_child: bool,
+    },
+}
+
+impl WorkspaceListEntry {
+    pub(crate) fn depth(&self) -> u8 {
+        match self {
+            Self::Workspace { depth, .. } | Self::Agent { depth, .. } => *depth,
+        }
+    }
+
+    pub(crate) fn ancestors_continue(&self) -> &[bool] {
+        match self {
+            Self::Workspace {
+                ancestors_continue, ..
+            }
+            | Self::Agent {
+                ancestors_continue, ..
+            } => ancestors_continue,
+        }
+    }
+
+    pub(crate) fn is_last_child(&self) -> bool {
+        match self {
+            Self::Workspace { is_last_child, .. } | Self::Agent { is_last_child, .. } => {
+                *is_last_child
+            }
+        }
+    }
+
+    fn workspace(ws_idx: usize, indented: bool) -> Self {
+        Self::Workspace {
+            ws_idx,
+            indented,
+            depth: 0,
+            ancestors_continue: Vec::new(),
+            is_last_child: true,
+        }
+    }
 }
 
 pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
@@ -459,6 +517,169 @@ pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceLi
     workspace_list_entries_inner(app, true)
 }
 
+/// The expanded list with the fleet's agent rows dropped, leaving Spaces only.
+///
+/// The mobile switcher lists Spaces and agents as separate blocks, so it wants
+/// the Space rows on their own rather than the interleaved tree the sidebar
+/// draws.
+pub(crate) fn workspace_list_spaces_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
+    let mut entries = workspace_list_entries_expanded(app);
+    entries.retain(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. }));
+    entries
+}
+
+/// A Space and the worktree children that always travel with it.
+///
+/// The worktree group is a fact about checkouts, not about ownership, so it is
+/// resolved before the ownership walk and re-emitted inside the block. That
+/// keeps the two kinds of nesting from competing for the same parent.
+struct SpaceBlock {
+    parent_idx: usize,
+    children: Vec<usize>,
+}
+
+/// The handle an `owner` token uses to name this Space.
+///
+/// It is the Space's own label, because that is already what a fleet writes
+/// into `owner` — `firstmate`, `2ndmate-explore` — so there is no second naming
+/// scheme to keep in sync. Resolved without terminal runtimes so the tree's
+/// shape cannot change with a terminal title.
+fn space_tree_name(app: &AppState, ws_idx: usize) -> Option<String> {
+    let ws = app.workspaces.get(ws_idx)?;
+    let name = ws.display_name_from(&app.terminals, &TerminalRuntimeRegistry::new());
+    (!name.trim().is_empty()).then_some(name)
+}
+
+/// Who this Space says owns it, from its own `owner` metadata token.
+///
+/// A Space publishes this with `workspace report-metadata --token owner=...`,
+/// the same token a pane uses. Nothing declares it by default, so a fleet that
+/// publishes nothing gets the flat list it has always had.
+fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
+    let ws = app.workspaces.get(ws_idx)?;
+    ws.metadata_tokens
+        .values()
+        .get(crate::app::agent_tree::OWNER_TOKEN)
+        .map(|owner| owner.trim().to_string())
+        .filter(|owner| !owner.is_empty())
+}
+
+/// The agent panes that belong in the sidebar tree: the ones that named an
+/// owner.
+///
+/// A pane with no owner is deliberately absent. In a fleet where the mates are
+/// Spaces, a mate's own pane declares no owner, so drawing every agent pane
+/// would draw each mate twice — once as its Space row and again as a child of
+/// itself. Owning is what makes a pane part of somebody's tree.
+///
+/// No Agents view is applied. This is the only place a worker is drawn now, and
+/// a filter here could hide the whole fleet from the only panel that shows it.
+pub(crate) fn sidebar_agent_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    let mut entries = all_agent_panel_entries(app);
+    // Classify against the whole fleet before dropping the unowned rows, so a
+    // pane's relation still reflects where it really sits.
+    crate::app::agent_tree::classify_agent_relations(&mut entries);
+    if matches!(
+        app.agent_panel_sort,
+        crate::app::state::AgentPanelSort::Priority
+    ) {
+        entries.sort_by_key(|entry| {
+            (
+                std::cmp::Reverse(workspace_attention_priority(entry.state, entry.seen)),
+                std::cmp::Reverse(entry.last_agent_state_change_seq),
+            )
+        });
+    }
+    entries.retain(|entry| entry.owner.is_some());
+    entries
+}
+
+/// Arrange `blocks` and the owned agent panes into one tree, then flatten it.
+///
+/// Both kinds of node go through [`crate::app::agent_tree::arrange_owner_tree`]
+/// together, so a worker nests under its second mate's Space by exactly the
+/// same rule that nests a second mate under the first mate.
+fn arrange_space_tree(
+    app: &AppState,
+    blocks: &[SpaceBlock],
+    agents: &[AgentPanelEntry],
+) -> Vec<WorkspaceListEntry> {
+    let space_names: Vec<Option<String>> = blocks
+        .iter()
+        .map(|block| space_tree_name(app, block.parent_idx))
+        .collect();
+    let space_owners: Vec<Option<String>> = blocks
+        .iter()
+        .map(|block| space_owner(app, block.parent_idx))
+        .collect();
+
+    let mut nodes: Vec<crate::app::agent_tree::OwnedNode<'_>> = space_names
+        .iter()
+        .zip(&space_owners)
+        .map(|(name, owner)| crate::app::agent_tree::OwnedNode {
+            name: name.as_deref(),
+            owner: owner.as_deref(),
+        })
+        .collect();
+    nodes.extend(
+        agents
+            .iter()
+            .map(|entry| crate::app::agent_tree::OwnedNode {
+                name: entry.agent_name.as_deref(),
+                owner: entry.owner.as_deref(),
+            }),
+    );
+
+    let placements = crate::app::agent_tree::arrange_owner_tree(&nodes);
+    // A block's worktree children draw as siblings of whatever it owns, so the
+    // last worktree child is only `└` when nothing owned follows it. In a
+    // depth-first flattening a node owns children exactly when the next row is
+    // one level deeper.
+    let owns_children: Vec<bool> = placements
+        .iter()
+        .enumerate()
+        .map(|(position, placement)| {
+            placements
+                .get(position + 1)
+                .is_some_and(|next| next.depth == placement.depth.saturating_add(1))
+        })
+        .collect();
+
+    let mut entries = Vec::with_capacity(placements.len());
+    for (position, placement) in placements.into_iter().enumerate() {
+        match blocks.get(placement.index) {
+            Some(block) => {
+                entries.push(WorkspaceListEntry::Workspace {
+                    ws_idx: block.parent_idx,
+                    indented: false,
+                    depth: placement.depth,
+                    ancestors_continue: placement.ancestors_continue.clone(),
+                    is_last_child: placement.is_last_child && block.children.is_empty(),
+                });
+                let mut child_ancestors = placement.ancestors_continue.clone();
+                child_ancestors.push(!placement.is_last_child);
+                let last = block.children.len().saturating_sub(1);
+                for (child_position, child_idx) in block.children.iter().enumerate() {
+                    entries.push(WorkspaceListEntry::Workspace {
+                        ws_idx: *child_idx,
+                        indented: true,
+                        depth: placement.depth.saturating_add(1),
+                        ancestors_continue: child_ancestors.clone(),
+                        is_last_child: child_position == last && !owns_children[position],
+                    });
+                }
+            }
+            None => entries.push(WorkspaceListEntry::Agent {
+                entry_idx: placement.index - blocks.len(),
+                depth: placement.depth,
+                ancestors_continue: placement.ancestors_continue,
+                is_last_child: placement.is_last_child,
+            }),
+        }
+    }
+    entries
+}
+
 fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
     let mut groups_by_key =
         std::collections::HashMap::<String, crate::app::state::WorktreeSpaceGroup>::new();
@@ -481,7 +702,7 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     };
 
     let mut emitted_groups = std::collections::HashSet::<String>::new();
-    let mut entries = Vec::new();
+    let mut blocks: Vec<SpaceBlock> = Vec::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
         // A workspace only joins a tree when it is that tree's main-checkout
         // parent or one of its linked worktrees. Anything else - including a
@@ -493,9 +714,9 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
                 .filter(|group| group.contains(ws_idx))
                 .map(|group| (space, group))
         }) else {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
+            blocks.push(SpaceBlock {
+                parent_idx: ws_idx,
+                children: Vec::new(),
             });
             continue;
         };
@@ -505,28 +726,21 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
         }
 
         let collapsed = !force_expanded && app.collapsed_space_keys.contains(&space.key);
-        entries.push(WorkspaceListEntry::Workspace {
-            ws_idx: group.parent_idx,
-            indented: false,
-        });
-
-        if collapsed {
-            if let Some(active_idx) = visible_group_idx.filter(|idx| group.children.contains(idx)) {
-                entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: active_idx,
-                    indented: true,
-                });
-            }
+        let children = if collapsed {
+            visible_group_idx
+                .filter(|idx| group.children.contains(idx))
+                .into_iter()
+                .collect()
         } else {
-            for child_idx in &group.children {
-                entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: *child_idx,
-                    indented: true,
-                });
-            }
-        }
+            group.children.clone()
+        };
+        blocks.push(SpaceBlock {
+            parent_idx: group.parent_idx,
+            children,
+        });
     }
-    entries
+
+    arrange_space_tree(app, &blocks, &sidebar_agent_entries(app))
 }
 
 pub(crate) fn workspace_list_rect(area: Rect) -> Rect {
@@ -545,6 +759,44 @@ pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect 
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
+/// Drawn height of one tree row, whichever kind it is.
+///
+/// Space rows and agent rows keep their own configured token rows, so the two
+/// keep the heights their `[ui.sidebar.spaces]` / `[ui.sidebar.agents]` blocks
+/// ask for even though they are now one list.
+fn list_entry_height(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+    body_height: u16,
+) -> u16 {
+    match entry {
+        WorkspaceListEntry::Workspace {
+            ws_idx, indented, ..
+        } => app
+            .workspaces
+            .get(*ws_idx)
+            .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height))
+            .unwrap_or(0),
+        WorkspaceListEntry::Agent { entry_idx, .. } => agents
+            .get(*entry_idx)
+            .map(|entry| agent_entry_height_in_body(app, entry, body_height))
+            .unwrap_or(0),
+    }
+}
+
+/// Gap after one tree row. Each kind keeps its own `row_gap`; the compact
+/// worktree-group packing is unchanged.
+fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
+    match entries.get(entry_idx) {
+        Some(WorkspaceListEntry::Workspace { indented, .. }) => {
+            workspace_entry_gap(app, entries, entry_idx, *indented)
+        }
+        Some(WorkspaceListEntry::Agent { .. }) => agent_entry_gap(app, entry_idx, entries.len()),
+        None => 0,
+    }
+}
+
 fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
     let body = workspace_list_body_rect(area, false);
     if body.width == 0 || body.height == 0 {
@@ -554,24 +806,20 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
     let mut used_rows = 0u16;
     let mut visible = 0usize;
     let entries = workspace_list_entries(app);
+    let agents = sidebar_agent_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let (row_height, gap) = match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
-                    continue;
-                };
-                (
-                    workspace_row_height_in_body(app, ws, *indented, body.height),
-                    workspace_entry_gap(app, &entries, entry_idx, *indented),
-                )
-            }
-        };
+        let row_height = list_entry_height(app, &agents, entry, body.height);
+        if row_height == 0 {
+            continue;
+        }
         if used_rows.saturating_add(row_height) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(row_height);
         visible += 1;
-        used_rows = used_rows.saturating_add(gap).min(body.height);
+        used_rows = used_rows
+            .saturating_add(list_entry_gap(app, &entries, entry_idx))
+            .min(body.height);
     }
     visible
 }
@@ -579,16 +827,15 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
 fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let body = workspace_list_body_rect(area, false);
     let entries = workspace_list_entries(app);
+    let agents = sidebar_agent_entries(app);
     let mut used_rows = 0u16;
     let mut start = entries.len();
     for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let WorkspaceListEntry::Workspace { ws_idx, indented } = entry;
-        let Some(workspace) = app.workspaces.get(*ws_idx) else {
+        let row_height = list_entry_height(app, &agents, entry, body.height);
+        if row_height == 0 {
             continue;
-        };
-        let gap = workspace_entry_gap(app, &entries, entry_idx, *indented);
-        let needed = workspace_row_height_in_body(app, workspace, *indented, body.height)
-            .saturating_add(gap);
+        }
+        let needed = row_height.saturating_add(list_entry_gap(app, &entries, entry_idx));
         if used_rows.saturating_add(needed) > body.height {
             break;
         }
@@ -678,28 +925,44 @@ pub(crate) fn compute_workspace_list_areas(
     let headers = Vec::new();
 
     let entries = workspace_list_entries(app);
+    let agents = sidebar_agent_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
+        let row_height = list_entry_height(app, &agents, entry, body.height);
+        if row_height == 0 {
+            continue;
+        }
+        if row_y.saturating_add(row_height) > body_bottom {
+            break;
+        }
+        let (ws_idx, indented, agent) = match entry {
+            WorkspaceListEntry::Workspace {
+                ws_idx, indented, ..
+            } => (*ws_idx, *indented, None),
+            WorkspaceListEntry::Agent { entry_idx, .. } => {
+                let Some(detail) = agents.get(*entry_idx) else {
                     continue;
                 };
-                let row_height = workspace_row_height_in_body(app, ws, *indented, body.height);
-                let gap = workspace_entry_gap(app, &entries, entry_idx, *indented);
-                if row_y.saturating_add(row_height) > body_bottom {
-                    break;
-                }
-                cards.push(crate::app::state::WorkspaceCardArea {
-                    ws_idx: *ws_idx,
-                    rect: Rect::new(body.x, row_y, body.width, row_height),
-                    indented: *indented,
-                });
-                row_y = row_y
-                    .saturating_add(row_height)
-                    .saturating_add(gap)
-                    .min(body_bottom);
+                (
+                    detail.ws_idx,
+                    false,
+                    Some(crate::app::state::AgentCardTarget {
+                        tab_idx: detail.tab_idx,
+                        pane_id: detail.pane_id,
+                    }),
+                )
             }
-        }
+        };
+        cards.push(crate::app::state::WorkspaceCardArea {
+            ws_idx,
+            rect: Rect::new(body.x, row_y, body.width, row_height),
+            indented,
+            entry_idx,
+            agent,
+        });
+        row_y = row_y
+            .saturating_add(row_height)
+            .saturating_add(list_entry_gap(app, &entries, entry_idx))
+            .min(body_bottom);
     }
 
     (cards, headers)
@@ -825,6 +1088,7 @@ pub(crate) fn workspace_drop_slots(
             )
         })
     };
+
     let block_root_at = |entry_idx: usize| {
         entries[..=entry_idx]
             .iter()
@@ -833,14 +1097,18 @@ pub(crate) fn workspace_drop_slots(
                 WorkspaceListEntry::Workspace {
                     ws_idx,
                     indented: false,
+                    ..
                 } => Some(*ws_idx),
-                WorkspaceListEntry::Workspace { .. } => None,
+                _ => None,
             })
     };
 
     let mut slots = Vec::new();
     let mut previous_root = None;
-    for card in cards {
+    // Agent rows share the card list but are not reorderable Spaces, so they
+    // anchor nothing: a drop above a worker would name a workspace the pointer
+    // is not over.
+    for card in cards.iter().filter(|card| card.agent.is_none()) {
         let Some(entry_idx) = entry_position(card.ws_idx) else {
             continue;
         };
@@ -859,7 +1127,7 @@ pub(crate) fn workspace_drop_slots(
         }
     }
 
-    let Some(last) = cards.last() else {
+    let Some(last) = cards.iter().filter(|card| card.agent.is_none()).next_back() else {
         return slots;
     };
     let Some(last_entry_idx) = entry_position(last.ws_idx) else {
@@ -876,7 +1144,11 @@ pub(crate) fn workspace_drop_slots(
         Some(WorkspaceListEntry::Workspace { ws_idx, .. }) => {
             crate::app::state::WorkspaceDropTarget::Before(*ws_idx)
         }
-        None => crate::app::state::WorkspaceDropTarget::End,
+        // A row that is not a Space cannot name a drop position, so the drag
+        // lands at the end rather than silently anchoring on a worker.
+        Some(WorkspaceListEntry::Agent { .. }) | None => {
+            crate::app::state::WorkspaceDropTarget::End
+        }
     };
     let row = last.rect.y.saturating_add(last.rect.height);
     if row < list_bottom
@@ -1183,6 +1455,108 @@ fn resolved_token_spans(
 /// `3 * depth` columns here instead of `3 + 3 * depth`. Continuation rows sit
 /// two columns further right than their first row in both panels, which is what
 /// keeps wrapped text aligned under the name rather than under the state dot.
+/// Vertical rails for `levels` ancestor levels, drawn before a row's own
+/// prefix. A level shows `│` while that ancestor still has a sibling below it.
+///
+/// Zero levels draws nothing, which is what keeps a fleet that declares no
+/// ownership rendering byte-identically to before the tree existed.
+fn ancestor_rail(
+    levels: u8,
+    ancestors_continue: &[bool],
+    p: &Palette,
+) -> (Vec<Span<'static>>, usize) {
+    let levels = levels.min(crate::app::agent_tree::MAX_DISPLAY_DEPTH);
+    let mut spans = Vec::new();
+    for level in 1..=levels {
+        if ancestors_continue
+            .get(level as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
+            spans.push(Span::raw("  "));
+        } else {
+            spans.push(Span::raw("   "));
+        }
+    }
+    (spans, 3 * levels as usize)
+}
+
+/// Draw one owned agent pane as a row of the Spaces tree.
+///
+/// It uses the same connector maths as every other row and its own
+/// `[ui.sidebar.agents]` token layout, so a worker reads as a branch of its
+/// mate rather than as a visitor from somewhere else.
+fn render_agent_row(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    entries: &[WorkspaceListEntry],
+    agents: &[AgentPanelEntry],
+    list_bottom: u16,
+) {
+    let Some(entry) = entries.get(card.entry_idx) else {
+        return;
+    };
+    let WorkspaceListEntry::Agent { entry_idx, .. } = entry else {
+        return;
+    };
+    let Some(detail) = agents.get(*entry_idx) else {
+        return;
+    };
+
+    let p = &app.palette;
+    let rows = resolved_agent_rows(app, detail);
+    let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+    let label_color = state_label_color(detail.state, detail.seen, p);
+    let row_style = if is_active {
+        Style::default().bg(p.surface_dim)
+    } else {
+        Style::default()
+    };
+    let name_style = if is_active {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+    };
+    let status_style = if is_active {
+        Style::default().fg(label_color)
+    } else {
+        Style::default().fg(label_color).add_modifier(Modifier::DIM)
+    };
+    let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
+    let state_icon = state_dot(detail.state, detail.seen, p);
+
+    for (row_index, resolved) in rows.iter().enumerate() {
+        let row_y = card.rect.y + row_index as u16;
+        if row_index as u16 >= card.rect.height || row_y >= list_bottom {
+            break;
+        }
+        let (mut spans, prefix_width) = agent_row_prefix(
+            entry.depth(),
+            entry.is_last_child(),
+            entry.ancestors_continue(),
+            row_index,
+            p,
+        );
+        spans.extend(resolved_token_spans(
+            resolved,
+            state_icon,
+            status_style,
+            name_style,
+            agent_style,
+            agent_style,
+            p,
+            app.animation_tick,
+            (card.rect.width as usize).saturating_sub(prefix_width),
+        ));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(row_style),
+            Rect::new(card.rect.x, row_y, card.rect.width, 1),
+        );
+    }
+}
+
 fn agent_row_prefix(
     depth: u8,
     is_last_child: bool,
@@ -1401,10 +1775,24 @@ fn render_workspace_list(
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
     let cards = &app.view.workspace_card_areas;
     let entries = workspace_list_entries(app);
+    let agents = sidebar_agent_entries(app);
 
     for card in cards {
+        if card.agent.is_some() {
+            render_agent_row(app, frame, card, &entries, &agents, list_bottom);
+            continue;
+        }
         let i = card.ws_idx;
         let ws = &app.workspaces[i];
+        let (own_depth, own_ancestors, own_is_last) = match entries.get(card.entry_idx) {
+            Some(entry) => (
+                entry.depth(),
+                entry.ancestors_continue().to_vec(),
+                entry.is_last_child(),
+            ),
+            None => (0, Vec::new(), true),
+        };
+        let own_ancestors = own_ancestors.as_slice();
         let row_y = card.rect.y;
         let row_height = card.rect.height;
         let selected = i == app.selected && is_navigating;
@@ -1497,35 +1885,65 @@ fn render_workspace_list(
             // is the only row a signal can travel and the only row it damages.
             let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
             let mut spans = Vec::new();
-            let prefix_width = if card.indented {
-                spans.push(Span::raw("   "));
-                if row_index == 0 {
-                    let connector = if is_last_child { "└─ " } else { "├─ " };
-                    let connector_style = Style::default().fg(p.overlay0);
-                    for (cell, glyph) in connector.chars().enumerate() {
-                        spans.push(Span::styled(
-                            glyph.to_string(),
-                            connector_cell_style(connector_style, row_signal_phase, cell as u8, p),
-                        ));
-                    }
-                    6
-                } else if is_last_child {
-                    spans.push(Span::raw("     "));
-                    8
+            // Only a worktree child needs a rail drawn for it: it brings its
+            // own legacy connector, so the ownership levels above it have to be
+            // laid down first. A Space row that is not a worktree child gets
+            // its whole prefix, rails included, from `agent_row_prefix` below.
+            // At depth 0 - a fleet that declares no `owner` anywhere - this is
+            // empty and the row draws exactly as it always has.
+            let (mut spans_prefix, rail_width) = ancestor_rail(
+                if card.indented {
+                    own_depth.saturating_sub(1)
                 } else {
-                    spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
-                    spans.push(Span::raw("    "));
-                    8
-                }
-            } else if row_index == 0 {
-                spans.push(Span::raw(" "));
-                1
-            } else {
-                spans.push(Span::raw("   "));
-                3
-            };
+                    0
+                },
+                own_ancestors,
+                p,
+            );
+            spans.append(&mut spans_prefix);
+            let prefix_width = rail_width
+                + if card.indented {
+                    spans.push(Span::raw("   "));
+                    if row_index == 0 {
+                        let connector = if is_last_child { "└─ " } else { "├─ " };
+                        let connector_style = Style::default().fg(p.overlay0);
+                        for (cell, glyph) in connector.chars().enumerate() {
+                            spans.push(Span::styled(
+                                glyph.to_string(),
+                                connector_cell_style(
+                                    connector_style,
+                                    row_signal_phase,
+                                    cell as u8,
+                                    p,
+                                ),
+                            ));
+                        }
+                        6
+                    } else if is_last_child {
+                        spans.push(Span::raw("     "));
+                        8
+                    } else {
+                        spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
+                        spans.push(Span::raw("    "));
+                        8
+                    }
+                } else if own_depth > 0 {
+                    // An owned Space takes the same connector a worker does:
+                    // the tree runs through the Space/pane boundary, so it must
+                    // not change shape at it.
+                    let (mut owned, width) =
+                        agent_row_prefix(own_depth, own_is_last, own_ancestors, row_index, p);
+                    spans.append(&mut owned);
+                    width
+                } else if row_index == 0 {
+                    spans.push(Span::raw(" "));
+                    1
+                } else {
+                    spans.push(Span::raw("   "));
+                    3
+                };
             let trailing_width = if row_index == 0 && parent_group.is_some() {
-                2
+                2usize
             } else {
                 0
             };
@@ -1541,9 +1959,7 @@ fn render_workspace_list(
                 branch_style,
                 p,
                 app.animation_tick,
-                card.rect
-                    .width
-                    .saturating_sub(prefix_width + trailing_width) as usize,
+                (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
@@ -1657,41 +2073,47 @@ mod tests {
 
     /// A first mate owning a second mate owning a worker, rendered at the
     /// width the captain actually runs.
+    /// The captain's fleet in miniature: the mates are Spaces, the worker is a
+    /// pane inside its mate's Space. Both kinds of ownership are published the
+    /// same way, with an `owner` metadata token.
     fn owned_fleet_sidebar_rows(width: u16) -> Vec<String> {
         let mut app = crate::app::state::AppState::test_new();
-        let mut workspace = Workspace::test_new("fleet");
-        let first = workspace.tabs[0].root_pane;
-        let second = workspace.test_split(ratatui::layout::Direction::Vertical);
-        let worker = workspace.test_split(ratatui::layout::Direction::Vertical);
-        app.workspaces = vec![workspace];
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
         app.ensure_test_terminals();
         app.active = Some(0);
+        // One row each, so a row carries exactly one entity and its connector.
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
 
         let now = std::time::Instant::now();
-        for (pane, name, owner) in [
-            (first, "firstmate", None),
-            (second, "secondmate", Some("firstmate")),
-            (worker, "worker", Some("secondmate")),
-        ] {
-            let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
-                .attached_terminal_id
-                .clone();
-            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
-            terminal.set_agent_name(name.to_string());
-            terminal.state = AgentState::Idle;
-            if let Some(owner) = owner {
-                terminal.metadata_tokens.patch(
-                    std::collections::HashMap::from([(
-                        "owner".to_string(),
-                        Some(owner.to_string()),
-                    )]),
-                    None,
-                    now,
-                );
-            }
-        }
+        // The second mate's Space names the first mate's Space as its owner.
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        // ...and the worker's pane names the second mate's Space as its owner.
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]),
+            None,
+            now,
+        );
 
         let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
         terminal
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
@@ -1705,60 +2127,45 @@ mod tests {
         let rows = owned_fleet_sidebar_rows(26);
         let screen = rows.join("\n");
 
-        // An agent entry is two rows: the connector leads the first row, the
-        // agent's name sits on the second.
-        let name_row = |name: &str| {
+        let row_of = |name: &str| {
             rows.iter()
                 .position(|row| row.contains(name))
                 .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
         };
-        let first_row = name_row("firstmate");
-        let second_row = name_row("secondmate");
-        let worker_row = name_row("worker");
+        let first_row = row_of("firstmate");
+        let second_row = row_of("2ndmate-explore");
+        let worker_row = row_of("worker");
 
-        // Ownership order top to bottom.
+        // Ownership order top to bottom: rank 0, rank 1, rank 2.
         assert!(
             first_row < second_row && second_row < worker_row,
-            "panes are not in ownership order:\n{screen}"
+            "the fleet is not in ownership order:\n{screen}"
         );
 
-        // Each owned pane's entry opens with a Spaces-style branch connector.
-        let connector_indent = |row: usize| {
-            let opener = &rows[row - 1];
-            opener
-                .find(['└', '├'])
-                .unwrap_or_else(|| panic!("no connector above row {row}:\n{screen}"))
-        };
-        let second_indent = connector_indent(second_row);
-        let worker_indent = connector_indent(worker_row);
-
-        // The first mate is a root, so it has no connector at all.
+        // The first mate is the root, so it carries no connector.
         assert!(
-            !rows[first_row - 1].contains('└') && !rows[first_row - 1].contains('├'),
+            !rows[first_row].contains('└') && !rows[first_row].contains('├'),
             "the first mate should not be indented:\n{screen}"
         );
 
-        // ...and the worker hangs one level deeper than its second mate.
+        let connector_indent = |row: usize| {
+            rows[row]
+                .find(['└', '├'])
+                .unwrap_or_else(|| panic!("no connector on row {row}:\n{screen}"))
+        };
+
+        // The worker hangs one level deeper than its second mate, and the tree
+        // does not change shape at the Space/pane boundary.
         assert!(
-            worker_indent > second_indent,
-            "worker is not nested under its second mate:\n{screen}"
+            connector_indent(worker_row) > connector_indent(second_row),
+            "the worker is not nested under its second mate:\n{screen}"
         );
 
-        // The name still survives the indent at the captain's width.
+        // The name still survives the indent at the captain's width, whole and
+        // directly after its connector rather than elided away by it.
         assert!(
-            rows[worker_row].trim_start().starts_with("worker"),
-            "worker name was indented off the panel:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn the_category_selector_fits_beside_the_panel_control_at_width_twenty_six() {
-        let rows = owned_fleet_sidebar_rows(26);
-        let screen = rows.join("\n");
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("1st") && row.contains("sub")),
-            "category tabs missing at width 26:\n{screen}"
+            rows[worker_row].contains("└─ worker"),
+            "the worker name was indented off the panel:\n{screen}"
         );
     }
 
@@ -2121,7 +2528,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]; 6];
-        let area = Rect::new(0, 0, 20, 10);
+        // A six-row layout in a five-row body, so the clip is what is under
+        // test rather than the row count.
+        let area = Rect::new(0, 0, 20, 8);
         let workspace_area = workspace_list_rect(area);
         let body = workspace_list_body_rect(workspace_area, false);
 
@@ -2282,6 +2691,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.selected = 0;
         app.mode = Mode::Terminal;
         app.view.workspace_card_areas = vec![crate::app::state::WorkspaceCardArea {
+            entry_idx: 0,
+            agent: None,
             ws_idx: 0,
             rect: Rect::new(0, 1, 15, 2),
             indented: false,
@@ -2611,7 +3022,10 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
         app.sidebar_spaces.row_gap = 0;
-        let area = Rect::new(0, 0, 30, 10);
+        // Two body rows: the third child is a real entry that is off screen,
+        // which is the whole point - the connector has to read the full list,
+        // not the cards that happened to fit.
+        let area = Rect::new(0, 0, 30, 5);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         assert_eq!(app.view.workspace_card_areas.len(), 2);
         let list_area = workspace_list_rect(area);
@@ -2751,19 +3165,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let entries = workspace_list_entries(&app);
 
-        assert_eq!(
-            entries,
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false
-                },
-            ]
-        );
+        assert_eq!(grouping(&entries), vec![(0, false), (1, false),]);
     }
 
     #[test]
@@ -2837,17 +3239,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: true,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (1, true),]
         );
     }
 
@@ -2861,21 +3254,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 2,
-                    indented: true,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (2, true), (1, false),]
         );
     }
 
@@ -2888,17 +3268,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (1, false),]
         );
     }
 
@@ -2912,21 +3283,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 2,
-                    indented: true,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (2, true), (1, false),]
         );
     }
 
@@ -2939,17 +3297,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (1, false),]
         );
     }
 
@@ -2965,28 +3314,13 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: true,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (1, true),]
         );
 
         app.active = None;
         app.mode = Mode::Terminal;
-        assert_eq!(
-            workspace_list_entries(&app),
-            vec![WorkspaceListEntry::Workspace {
-                ws_idx: 0,
-                indented: false,
-            }]
-        );
+        assert_eq!(grouping(&workspace_list_entries(&app)), vec![(0, false)]);
     }
 
     #[test]
@@ -3002,17 +3336,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_list_entries(&app),
-            vec![
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                },
-                WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: true,
-                },
-            ]
+            grouping(&workspace_list_entries(&app)),
+            vec![(0, false), (1, true),]
         );
     }
 
@@ -3030,18 +3355,28 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ws
     }
 
-    fn top_level(ws_idx: usize) -> WorkspaceListEntry {
-        WorkspaceListEntry::Workspace {
-            ws_idx,
-            indented: false,
-        }
+    /// Which Space a row draws and whether it is a worktree child. Connector
+    /// depth is layout the tree walk derives from the whole list, so grouping
+    /// tests compare identity rather than pinning the drawing to a shape they
+    /// are not about.
+    fn grouping(entries: &[WorkspaceListEntry]) -> Vec<(usize, bool)> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::Workspace {
+                    ws_idx, indented, ..
+                } => Some((*ws_idx, *indented)),
+                WorkspaceListEntry::Agent { .. } => None,
+            })
+            .collect()
     }
 
-    fn child(ws_idx: usize) -> WorkspaceListEntry {
-        WorkspaceListEntry::Workspace {
-            ws_idx,
-            indented: true,
-        }
+    fn top_level(ws_idx: usize) -> (usize, bool) {
+        (ws_idx, false)
+    }
+
+    fn child(ws_idx: usize) -> (usize, bool) {
+        (ws_idx, true)
     }
 
     /// A member of the `repo-key` space whose membership was derived from its
@@ -3073,7 +3408,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), child(1), child(2), top_level(3)]
         );
         assert_eq!(
@@ -3098,7 +3433,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(group.parent_idx, 0);
         assert_eq!(group.children, vec![1, 2]);
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), child(1), child(2)]
         );
     }
@@ -3118,7 +3453,10 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         });
         app.workspaces = vec![space_member("main", "/repo/herdr", false), child_ws];
 
-        assert_eq!(workspace_list_entries(&app), vec![top_level(0), child(1)]);
+        assert_eq!(
+            grouping(&workspace_list_entries(&app)),
+            vec![top_level(0), child(1)]
+        );
     }
 
     #[test]
@@ -3132,7 +3470,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         assert!(app.workspaces[2].worktree_space().is_none());
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), child(1), top_level(2)]
         );
     }
@@ -3150,7 +3488,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(group.parent_idx, 0);
         assert_eq!(group.children, vec![1]);
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), child(1), top_level(2)]
         );
     }
@@ -3166,7 +3504,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), child(1), child(3), top_level(2)]
         );
     }
@@ -3202,7 +3540,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), top_level(2)]
         );
     }
@@ -3216,7 +3554,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            grouping(&workspace_list_entries(&app)),
             vec![top_level(0), top_level(1)]
         );
         assert_eq!(workspace_parent_group_state(&app, 0), None);

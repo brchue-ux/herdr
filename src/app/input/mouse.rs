@@ -560,6 +560,15 @@ impl AppState {
                         }
                     }
 
+                    // Agent rows are tested first. They sit inside the same
+                    // card list as Spaces, so leaving them to the Space handler
+                    // would focus the workspace they live in instead of the
+                    // pane the user actually clicked.
+                    if let Some((ws_idx, pane_id)) = self.sidebar_agent_target_at(mouse.row) {
+                        self.mode = Mode::Terminal;
+                        return Some(MouseAction::FocusPane { ws_idx, pane_id });
+                    }
+
                     if let Some(idx) = self.workspace_at_row(mouse.row) {
                         self.workspace_press = Some(WorkspacePressState {
                             ws_idx: idx,

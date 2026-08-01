@@ -92,13 +92,26 @@ impl AppState {
         );
     }
 
+    /// The `new` / `menu` row at the bottom of the sidebar.
+    ///
+    /// One column short of the panel, because the collapse toggle draws in the
+    /// panel's last cell on this very row. With two sections the footer sat
+    /// mid-sidebar and the two never met; with one full-height panel they share
+    /// a row, and a right-aligned `menu` label that took the last cell would
+    /// both cover the toggle and swallow its clicks.
     pub(crate) fn sidebar_footer_rect(&self) -> Rect {
         let ws_area = self.workspace_list_rect();
         if ws_area == Rect::default() {
             return Rect::default();
         }
         let y = ws_area.y + ws_area.height.saturating_sub(1);
-        Rect::new(ws_area.x, y, ws_area.width, 1)
+        let toggle = crate::ui::expanded_sidebar_toggle_rect(self.view.sidebar_rect);
+        let width = if toggle.height > 0 && toggle.y == y {
+            ws_area.width.saturating_sub(1)
+        } else {
+            ws_area.width
+        };
+        Rect::new(ws_area.x, y, width, 1)
     }
 
     pub(crate) fn sidebar_new_button_rect(&self) -> Rect {
@@ -292,9 +305,9 @@ impl AppState {
         self.mark_session_dirty();
     }
 
-    pub(super) fn workspace_at_row(&self, row: u16) -> Option<usize> {
-        let footer = self.sidebar_footer_rect();
-        if footer == Rect::default() {
+    /// The tree row under `row`, Space or agent alike.
+    fn sidebar_card_at_row(&self, row: u16) -> Option<crate::app::state::WorkspaceCardArea> {
+        if self.sidebar_footer_rect() == Rect::default() {
             return None;
         }
 
@@ -304,9 +317,27 @@ impl AppState {
             self.view.workspace_card_areas.clone()
         };
 
-        cards.iter().find_map(|card| {
-            (row >= card.rect.y && row < card.rect.y + card.rect.height).then_some(card.ws_idx)
-        })
+        cards
+            .into_iter()
+            .find(|card| row >= card.rect.y && row < card.rect.y + card.rect.height)
+    }
+
+    /// The Space under `row`. An agent row is deliberately not one: it draws in
+    /// the same list but selecting it focuses a pane, and a workspace drag must
+    /// not pick it up.
+    pub(super) fn workspace_at_row(&self, row: u16) -> Option<usize> {
+        let card = self.sidebar_card_at_row(row)?;
+        card.agent.is_none().then_some(card.ws_idx)
+    }
+
+    /// The pane an agent row under `row` points at.
+    pub(super) fn sidebar_agent_target_at(
+        &self,
+        row: u16,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        let card = self.sidebar_card_at_row(row)?;
+        let agent = card.agent?;
+        Some((card.ws_idx, agent.pane_id))
     }
 
     pub(super) fn collapsed_workspace_at_row(&self, row: u16) -> Option<usize> {
@@ -364,8 +395,9 @@ impl AppState {
                 crate::ui::WorkspaceListEntry::Workspace {
                     ws_idx,
                     indented: false,
+                    ..
                 } => Some(ws_idx),
-                crate::ui::WorkspaceListEntry::Workspace { .. } => None,
+                _ => None,
             })
             .collect::<Vec<_>>();
         let source_pos = roots.iter().position(|ws_idx| *ws_idx == source_ws_idx)?;

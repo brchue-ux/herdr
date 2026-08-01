@@ -673,6 +673,22 @@ pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
     pub indented: bool,
+    /// Position of this row in the sidebar tree, so the renderer and the hit
+    /// tests read the same connector depth the layout used.
+    pub entry_idx: usize,
+    /// The pane this row draws, when the row is an agent rather than a Space.
+    ///
+    /// Agent rows share the card list because they share the layout, but they
+    /// are not Spaces: clicking one focuses its pane, and a workspace reorder
+    /// drag must not treat it as a drop anchor.
+    pub agent: Option<AgentCardTarget>,
+}
+
+/// The pane an agent row in the sidebar tree points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCardTarget {
+    pub tab_idx: usize,
+    pub pane_id: crate::layout::PaneId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
