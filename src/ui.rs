@@ -90,6 +90,14 @@ pub(crate) use self::{
     },
 };
 
+/// Header geometry the input tests need to click a category tab. Production
+/// code reaches these from inside `sidebar`, so they are test-only here.
+#[cfg(test)]
+pub(crate) use self::sidebar::{
+    agent_panel_title_rect,
+    category::{agent_category_tabs, AGENT_CATEGORIES},
+};
+
 pub(crate) use self::{
     keybind_help::keybind_help_lines,
     mobile::{

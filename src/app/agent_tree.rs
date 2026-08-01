@@ -15,6 +15,21 @@ use crate::ui::AgentPanelEntry;
 /// The metadata token a pane uses to name its owner.
 pub(crate) const OWNER_TOKEN: &str = "owner";
 
+/// The `relation` value for a sub agent.
+///
+/// It has no [`AgentRelation`] variant on purpose: a sub agent runs *inside*
+/// another agent's pane rather than owning one, so no pane can currently hold
+/// this relation. It is still legal to filter on — the Sub Agents tab does
+/// exactly that — and it starts matching by itself if sub agents ever get panes.
+pub(crate) const SUB_AGENT_RELATION: &str = "sub_agent";
+
+/// Every legal value of the view grammar's `relation` field.
+///
+/// One list so the validator, the evaluator, and the category selector cannot
+/// drift apart: a value that is not here is rejected at both doors.
+pub(crate) const RELATION_VALUES: [&str; 4] =
+    ["first_mate", "second_mate", "worker", SUB_AGENT_RELATION];
+
 /// How deep the panel will *draw* before it stops indenting.
 ///
 /// The captain's sketch is three levels (First Mate, Second Mate, Worker), and
@@ -465,6 +480,24 @@ mod tests {
                 AgentRelation::FirstMate,
             ]
         );
+    }
+
+    #[test]
+    fn every_relation_variant_is_a_legal_filter_value() {
+        // The validator checks against RELATION_VALUES; if a variant's wire
+        // name were missing from it, that relation would be unfilterable.
+        for relation in [
+            AgentRelation::FirstMate,
+            AgentRelation::SecondMate,
+            AgentRelation::Worker,
+        ] {
+            assert!(
+                RELATION_VALUES.contains(&relation.as_str()),
+                "{} is not a legal filter value",
+                relation.as_str()
+            );
+        }
+        assert!(RELATION_VALUES.contains(&SUB_AGENT_RELATION));
     }
 
     #[test]

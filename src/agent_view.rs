@@ -281,7 +281,8 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
                 | AgentViewBuiltinField::WorkspaceId
                 | AgentViewBuiltinField::TabId
                 | AgentViewBuiltinField::PaneId
-                | AgentViewBuiltinField::Agent,
+                | AgentViewBuiltinField::Agent
+                | AgentViewBuiltinField::Relation,
             )
             | AgentViewField::Token { .. },
             AgentViewValue::String(value),
@@ -294,6 +295,13 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
                 "idle" | "working" | "blocked" | "done" | "unknown"
             ) {
                 return Err(format!("unknown agent status `{value}`"));
+            }
+            if matches!(
+                field,
+                AgentViewField::Builtin(AgentViewBuiltinField::Relation)
+            ) && !crate::app::agent_tree::RELATION_VALUES.contains(&value.as_str())
+            {
+                return Err(format!("unknown agent relation `{value}`"));
             }
             Ok(())
         }
@@ -387,6 +395,59 @@ mod tests {
             }),
             ..view(source)
         }
+    }
+
+    fn relation_view(source: &str, relation: &str) -> AgentViewSetParams {
+        AgentViewSetParams {
+            filter: Some(AgentViewFilter::Eq {
+                field: AgentViewField::Builtin(AgentViewBuiltinField::Relation),
+                value: AgentViewValue::String(relation.to_string()),
+            }),
+            ..view(source)
+        }
+    }
+
+    #[test]
+    fn every_relation_value_passes_validation() {
+        // Both doors run this validator, so a value it rejects is a value the
+        // config key and the API cannot use — which is how `relation` shipped
+        // unusable the first time.
+        for relation in crate::app::agent_tree::RELATION_VALUES {
+            let mut spec = relation_view("example.views", relation);
+            validate_agent_view(&mut spec)
+                .unwrap_or_else(|err| panic!("relation `{relation}` rejected: {err}"));
+        }
+    }
+
+    #[test]
+    fn every_category_tab_installs_a_view_that_validates() {
+        // The click path builds these; if one failed validation the tab would
+        // silently do nothing.
+        for category in crate::ui::AGENT_CATEGORIES {
+            let mut spec = category.view();
+            validate_agent_view(&mut spec).unwrap_or_else(|err| {
+                panic!("category {:?} produced an invalid view: {err}", category)
+            });
+        }
+    }
+
+    #[test]
+    fn an_unknown_relation_is_rejected() {
+        let mut spec = relation_view("example.views", "captain");
+        let err = validate_agent_view(&mut spec).unwrap_err();
+        assert!(err.contains("unknown agent relation"), "{err}");
+    }
+
+    #[test]
+    fn a_relation_filter_still_rejects_a_non_string_value() {
+        let mut spec = AgentViewSetParams {
+            filter: Some(AgentViewFilter::Eq {
+                field: AgentViewField::Builtin(AgentViewBuiltinField::Relation),
+                value: AgentViewValue::Bool(true),
+            }),
+            ..view("example.views")
+        };
+        assert!(validate_agent_view(&mut spec).is_err());
     }
 
     #[test]

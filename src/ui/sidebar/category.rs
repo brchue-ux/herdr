@@ -72,7 +72,7 @@ impl AgentCategory {
             Self::FirstMate => AgentRelation::FirstMate.as_str(),
             Self::SecondMate => AgentRelation::SecondMate.as_str(),
             Self::Workers => AgentRelation::Worker.as_str(),
-            Self::SubAgents => "sub_agent",
+            Self::SubAgents => crate::app::agent_tree::SUB_AGENT_RELATION,
         }
     }
 
@@ -162,11 +162,13 @@ fn choose_labels(width: u16, selected: Option<AgentCategory>) -> Option<Vec<Stri
         .find(|labels| row_width(labels) <= width)
 }
 
-/// Columns a label set costs: one leading space, one between each pair.
+/// Columns a label set costs: one leading space, one between each pair, and one
+/// trailing column so the last tab cannot end flush against whatever the panel
+/// right-aligns next to it.
 fn row_width(labels: &[String]) -> u16 {
     let text: usize = labels.iter().map(|label| label.chars().count()).sum();
     let gaps = labels.len().saturating_sub(1);
-    (text + gaps + 1).min(u16::MAX as usize) as u16
+    (text + gaps + 2).min(u16::MAX as usize) as u16
 }
 
 #[cfg(test)]
@@ -238,13 +240,51 @@ mod tests {
 
     #[test]
     fn a_very_narrow_panel_abbreviates_rather_than_truncating() {
-        let tabs = agent_category_tabs(Rect::new(0, 0, 16, 1), Some(AgentCategory::SecondMate));
+        // 17 is the exact minimum: four 3-column labels, three gaps, plus one
+        // leading and one trailing column.
+        let tabs = agent_category_tabs(Rect::new(0, 0, 17, 1), Some(AgentCategory::SecondMate));
         assert_eq!(tabs.len(), 4);
         assert_eq!(
             tabs.iter()
                 .map(|tab| tab.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["1st", "2nd", "wrk", "sub"]
+        );
+
+        // One column narrower and the selector steps aside entirely rather
+        // than giving up the trailing gap and fusing with the control label.
+        assert!(
+            agent_category_tabs(Rect::new(0, 0, 16, 1), Some(AgentCategory::SecondMate)).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_last_tab_leaves_a_trailing_column() {
+        // Otherwise the last tab ends flush against whatever the panel
+        // right-aligns beside it and the two read as one word.
+        for width in [16u16, 25, 30, 60] {
+            let tabs = agent_category_tabs(Rect::new(0, 0, width, 1), None);
+            if let Some(last) = tabs.last() {
+                assert!(
+                    last.rect.x + last.rect.width < width,
+                    "tabs touch the right edge at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_captains_thirty_wide_sidebar_spells_out_the_selection() {
+        // His real width is 30, not 26. The panel is laid out inside width - 1,
+        // and the control label takes the right end, so this is the budget the
+        // selector actually gets.
+        let tabs = agent_category_tabs(Rect::new(0, 0, 29, 1), Some(AgentCategory::SecondMate));
+        assert_eq!(tabs.len(), 4);
+        assert_eq!(
+            tabs.iter()
+                .map(|tab| tab.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1st", "second mate", "wrk", "sub"]
         );
     }
 

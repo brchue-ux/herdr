@@ -616,11 +616,28 @@ impl AppState {
                                 // filter with no obvious way out.
                                 let next =
                                     (self.agent_category != Some(category)).then_some(category);
+                                // Through the same validator the API and config
+                                // doors use, so the click path cannot install a
+                                // view the grammar would reject and the two
+                                // doors cannot drift apart again.
+                                let view = match next.map(|category| category.view()) {
+                                    Some(mut view) => {
+                                        match crate::agent_view::validate_agent_view(&mut view) {
+                                            Ok(()) => Some(view),
+                                            Err(message) => {
+                                                tracing::error!(
+                                                    message,
+                                                    "agents category view failed validation"
+                                                );
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                    None => None,
+                                };
                                 self.agent_category = next;
-                                self.agent_views.set(
-                                    crate::agent_view::AgentViewTier::Ui,
-                                    next.map(|category| category.view()),
-                                );
+                                self.agent_views
+                                    .set(crate::agent_view::AgentViewTier::Ui, view);
                                 self.agent_panel_scroll = 0;
                                 self.mobile_switcher_scroll = 0;
                             }
