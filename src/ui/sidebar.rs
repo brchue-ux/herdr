@@ -2165,6 +2165,59 @@ mod tests {
         (0..20).map(|row| row_text(buffer, row, width)).collect()
     }
 
+    /// Three second mates on a 26-wide sidebar - the captain's width, and the
+    /// width the old tab row could not fit. A drop-down costs one control
+    /// however many mates exist, so the title keeps its own row and the list
+    /// keeps every mate's name whole.
+    #[test]
+    fn the_selector_and_the_spaces_title_share_the_header_at_width_twenty_six() {
+        let mut app = crate::app::state::AppState::test_new();
+        let now = std::time::Instant::now();
+        app.workspaces = vec![
+            Workspace::test_new("firstmate"),
+            Workspace::test_new("2ndmate-explore"),
+            Workspace::test_new("2ndmate-build"),
+            Workspace::test_new("2ndmate-homeauto"),
+        ];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        for idx in 1..app.workspaces.len() {
+            app.workspaces[idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        app.second_mate_selector_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let header = row_text(buffer, area.y, area.width);
+
+        // The title is not crowded off by the control, and the control is drawn.
+        assert!(header.contains("spaces"), "header: {header:?}");
+        assert!(header.contains('▾'), "header: {header:?}");
+
+        // Every live mate is listed, whole.
+        let listed = (1..4)
+            .map(|row| row_text(buffer, area.y + row, area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for mate in ["2ndmate-explore", "2ndmate-build", "2ndmate-homeauto"] {
+            assert!(listed.contains(mate), "{mate} missing from:\n{listed}");
+        }
+    }
+
     #[test]
     fn a_worker_draws_beneath_its_second_mate_on_a_twenty_six_wide_sidebar() {
         let rows = owned_fleet_sidebar_rows(26);
