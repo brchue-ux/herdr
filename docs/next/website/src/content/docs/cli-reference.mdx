@@ -247,6 +247,23 @@ herdr pane release-agent <pane_id> \
 
 `report-agent-session` updates native session identity without reporting lifecycle state. `release-agent` ends that source's lifecycle authority when its agent process exits.
 
+Declare which agent a pane hosts when Herdr's process probe cannot see it — for example an agent started behind a wrapper script or inside a terminal multiplexer:
+
+```bash
+herdr pane declare-agent <pane_id> --agent LABEL
+herdr pane declare-agent <pane_id> --clear
+```
+
+Unlike `report-agent`, this reports no state. It supplies identity only, and Herdr's normal screen detection then runs for that agent and produces live state. Process identity stays authoritative: the declaration is used only while the process probe finds no agent, so a directly launched agent is unaffected. The declaration is durable — it survives a server restart and a live handoff until it is cleared. `pane get` and `pane list` report it as `declared_agent`.
+
+When neither the process probe nor a declaration knows the agent, Herdr falls back to recognizing the agent from the pane's own screen using `[[identity]]` rules in the bundled manifests. Only agents whose manifest ships identity rules can be identified this way, an ambiguous screen yields nothing rather than a guess, and the answer must survive several consecutive scans before it is adopted. Check the rules against a captured screen with:
+
+```bash
+herdr agent identify --file PATH [--osc-title TEXT] [--osc-progress TEXT] [--json]
+```
+
+Capture the screen with `herdr agent read <pane> --source detection --format text` (or `herdr pane read`), and read the OSC title out of `herdr pane get <pane>`'s `terminal_title`.
+
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
 Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The existing `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.

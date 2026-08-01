@@ -2,12 +2,13 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneLayoutPane, PaneLayoutParams,
-    PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMoveDestination,
-    PaneMoveParams, PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult,
-    PaneProcessInfo, PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
-    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneDeclareAgentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
+    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
+    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
+    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
+    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
@@ -1489,6 +1490,55 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_pane_declare_agent(
+        &mut self,
+        id: String,
+        params: PaneDeclareAgentParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let declared_agent = match params.agent.as_deref() {
+            None => None,
+            Some(agent) => {
+                let Some(agent_label) = normalize_reported_agent_label(agent) else {
+                    return invalid_agent(id);
+                };
+                let Some(agent) = crate::detect::parse_agent_label(&agent_label) else {
+                    return encode_error(
+                        id,
+                        "unknown_agent",
+                        format!("no agent detection manifest is bundled for {agent_label}"),
+                    );
+                };
+                Some(agent)
+            }
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if terminal.set_declared_agent(declared_agent) {
+            if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
+                runtime.set_declared_agent(declared_agent);
+            }
+            self.state.mark_session_dirty();
+        }
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
@@ -2153,6 +2203,83 @@ mod tests {
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x0a]));
         assert!(rx.try_recv().is_err());
+    }
+
+    fn declared_agent_from_response(response: &str) -> Option<String> {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        match success.result {
+            crate::api::schema::ResponseResult::PaneInfo { pane } => pane.declared_agent,
+            other => panic!("expected pane info, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_declare_agent_records_and_clears_a_declaration() {
+        let (mut app, pane_id) = app_with_test_workspace();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneDeclareAgent(PaneDeclareAgentParams {
+                pane_id: pane_id.clone(),
+                agent: Some("claude".into()),
+            }),
+        });
+        assert_eq!(
+            declared_agent_from_response(&response).as_deref(),
+            Some("claude")
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneDeclareAgent(PaneDeclareAgentParams {
+                pane_id,
+                agent: None,
+            }),
+        });
+        assert_eq!(declared_agent_from_response(&response), None);
+    }
+
+    #[tokio::test]
+    async fn api_pane_declare_agent_accepts_an_alias_and_stores_the_canonical_label() {
+        let (mut app, pane_id) = app_with_test_workspace();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneDeclareAgent(PaneDeclareAgentParams {
+                pane_id,
+                agent: Some("claude-code".into()),
+            }),
+        });
+
+        assert_eq!(
+            declared_agent_from_response(&response).as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_declare_agent_rejects_an_agent_with_no_manifest() {
+        let (mut app, pane_id) = app_with_test_workspace();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneDeclareAgent(PaneDeclareAgentParams {
+                pane_id: pane_id.clone(),
+                agent: Some("not-an-agent".into()),
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "unknown_agent");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneDeclareAgent(PaneDeclareAgentParams {
+                pane_id,
+                agent: Some("   ".into()),
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_agent");
     }
 
     #[tokio::test]

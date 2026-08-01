@@ -527,6 +527,9 @@ fn restore_tab(
         let saved_metadata_tokens = saved_pane
             .map(|p| restored_metadata_tokens(&p.metadata_tokens, runtime_context))
             .unwrap_or_default();
+        let saved_declared_agent = saved_pane
+            .and_then(|pane| pane.declared_agent.as_deref())
+            .and_then(crate::detect::parse_canonical_agent_label);
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -582,6 +585,7 @@ fn restore_tab(
                 (Some(_), None) => {}
                 (None, _) => {}
             }
+            terminal.set_declared_agent(saved_declared_agent);
             if let Some(agent) = initial_restore_agent {
                 let _ = terminal.set_detected_state_with_screen_signals_at(
                     Some(agent),
@@ -679,6 +683,8 @@ fn restore_tab(
                     (Some(_), None) => {}
                     (None, _) => {}
                 }
+                terminal.set_declared_agent(saved_declared_agent);
+                runtime.set_declared_agent(saved_declared_agent);
                 if let Some(agent) = initial_restore_agent {
                     let _ = terminal.set_detected_state_with_screen_signals_at(
                         Some(agent),
@@ -1229,6 +1235,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
+                            declared_agent: None,
                         },
                     )]),
                     zoomed: false,
@@ -1313,6 +1320,7 @@ mod tests {
                                 agent_session: None,
                                 launch_argv: None,
                                 metadata_tokens: Vec::new(),
+                                declared_agent: None,
                             },
                         ),
                         (
@@ -1325,6 +1333,7 @@ mod tests {
                                 agent_session: None,
                                 launch_argv: None,
                                 metadata_tokens: Vec::new(),
+                                declared_agent: None,
                             },
                         ),
                     ]),
@@ -1368,6 +1377,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_restore_keeps_a_declared_agent() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::from([(0, 1)]),
+                next_public_pane_number: 2,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            metadata_tokens: Vec::new(),
+                            declared_agent: Some("claude".into()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+                metadata_tokens: Vec::new(),
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            agent_view: None,
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("workspace should restore");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = &workspace.tabs[0].panes[&root].attached_terminal_id;
+        assert_eq!(
+            terminals[terminal_id].declared_agent(),
+            Some(crate::detect::Agent::Claude)
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_restore_drops_an_unparseable_declared_agent() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::from([(0, 1)]),
+                next_public_pane_number: 2,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            metadata_tokens: Vec::new(),
+                            declared_agent: Some("an-agent-this-build-never-heard-of".into()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+                metadata_tokens: Vec::new(),
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            agent_view: None,
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("workspace should restore");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = &workspace.tabs[0].panes[&root].attached_terminal_id;
+        assert_eq!(terminals[terminal_id].declared_agent(), None);
+    }
+
+    #[tokio::test]
     async fn cold_restore_with_gapped_public_tab_numbers_drops_unmanaged_agent_name() {
         let cwd = std::env::current_dir().unwrap();
         let pane_snap = |id: &str| {
@@ -1381,6 +1525,7 @@ mod tests {
                     agent_session: None,
                     launch_argv: None,
                     metadata_tokens: Vec::new(),
+                    declared_agent: None,
                 },
             )
         };
@@ -1397,6 +1542,7 @@ mod tests {
             }),
             launch_argv: None,
             metadata_tokens: Vec::new(),
+            declared_agent: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1552,6 +1698,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
+                            declared_agent: None,
                         },
                     )]),
                     zoomed: false,
@@ -1716,6 +1863,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
+                declared_agent: None,
             },
         );
         let history = SessionHistorySnapshot {

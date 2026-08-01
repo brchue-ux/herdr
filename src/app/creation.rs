@@ -458,6 +458,9 @@ impl App {
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
+            declared_agent: terminal
+                .declared_agent()
+                .map(|agent| crate::detect::agent_label(agent).to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),

@@ -139,6 +139,11 @@ pub struct PaneSnapshot {
     pub launch_argv: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_tokens: Vec<PersistedMetadataToken>,
+    /// Canonical agent label the operator declared for this pane, if any.
+    /// Durable so a wrapped or multiplexed agent stays identified across a
+    /// restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +434,9 @@ fn capture_tab(
                     value: session.session_ref.value.clone(),
                 })
         });
+        let declared_agent = terminal
+            .and_then(|terminal| terminal.declared_agent())
+            .map(|agent| crate::detect::agent_label(agent).to_string());
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -439,6 +447,7 @@ fn capture_tab(
                 agent_session,
                 launch_argv,
                 metadata_tokens,
+                declared_agent,
             },
         );
     }
@@ -668,6 +677,55 @@ mod tests {
     }
 
     #[test]
+    fn declared_agent_is_captured_and_survives_a_snapshot_round_trip() {
+        let mut state = state_with_workspaces(&["declared-agent"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        assert!(state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_declared_agent(Some(crate::detect::Agent::Claude)));
+
+        let captured = capture_from_state(&state);
+        assert_eq!(
+            captured.workspaces[0].tabs[0].panes[&root.raw()]
+                .declared_agent
+                .as_deref(),
+            Some("claude")
+        );
+
+        let json = serde_json::to_string(&captured).unwrap();
+        let restored: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&root.raw()]
+                .declared_agent
+                .as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn cleared_declaration_is_not_serialized() {
+        let mut state = state_with_workspaces(&["declared-agent-cleared"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_declared_agent(Some(crate::detect::Agent::Claude));
+        assert!(terminal.set_declared_agent(None));
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        assert!(
+            !json.contains("declared_agent"),
+            "cleared declaration should leave no key behind: {json}"
+        );
+    }
+
+    #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -722,6 +780,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
+                declared_agent: None,
             },
         );
         panes.insert(
@@ -734,6 +793,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
+                declared_agent: None,
             },
         );
 
@@ -1431,6 +1491,7 @@ mod tests {
                                 value: "firstmate".into(),
                                 expires_at_ms: None,
                             }],
+                            declared_agent: None,
                         },
                     )]),
                     zoomed: false,
@@ -1509,6 +1570,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
+                declared_agent: None,
             },
         );
         panes.insert(
@@ -1523,6 +1585,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
+                declared_agent: None,
             },
         );
 

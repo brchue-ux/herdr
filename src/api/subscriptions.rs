@@ -666,6 +666,7 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             display_agent: None,
+            declared_agent: None,
             agent_status: AgentStatus::Unknown,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),

@@ -124,6 +124,7 @@ pub struct RuleEvidence {
 struct LoadedManifest {
     manifest: AgentManifest,
     compiled_rules: Vec<CompiledRule>,
+    compiled_identity_rules: Vec<CompiledRule>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -152,6 +153,36 @@ pub(crate) struct AgentManifest {
     transcript_region: Option<String>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
+    /// Optional rules that recognize this agent's UI on screen, used only when
+    /// the process probe cannot see the agent at all.
+    #[serde(default)]
+    identity: Vec<ManifestIdentityRule>,
+}
+
+/// A rule that answers "is this screen this agent's UI?".
+///
+/// Deliberately narrower than `ManifestRule`: it carries no state, no priority,
+/// and no visible-signal flags, because identification and state detection are
+/// separate questions. Identification runs before an agent is known, so a rule
+/// here must key on chrome the agent always draws, never on transient content.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct ManifestIdentityRule {
+    id: String,
+    #[serde(default = "default_region")]
+    region: String,
+    #[serde(default)]
+    all: Vec<ManifestGate>,
+    #[serde(default)]
+    any: Vec<ManifestGate>,
+    #[serde(default, rename = "not")]
+    not_gate: Vec<ManifestGate>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    regex: Vec<String>,
+    #[serde(default)]
+    line_regex: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -267,6 +298,7 @@ static MANIFEST_CACHE: OnceLock<RwLock<ManifestCache>> = OnceLock::new();
 static MANIFEST_RELOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const MAX_RULES_PER_MANIFEST: usize = 128;
+const MAX_IDENTITY_RULES_PER_MANIFEST: usize = 16;
 const MAX_GATE_DEPTH: usize = 8;
 const MAX_TOTAL_GATES: usize = 512;
 const MAX_MATCHERS_PER_GATE: usize = 32;
@@ -426,6 +458,55 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
         };
     };
     explain(agent, screen_content)
+}
+
+/// One agent whose `[[identity]]` rules recognize the given screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenIdentityCandidate {
+    pub agent: Agent,
+    pub rule_id: String,
+}
+
+/// Every agent whose identity rules recognize this screen, in manifest order.
+///
+/// Exposed for `herdr agent identify`, which is how identity rules are tuned
+/// against captured screens.
+pub fn screen_identity_candidates(input: DetectionInput<'_>) -> Vec<ScreenIdentityCandidate> {
+    let lock = manifest_cache();
+    let guard = match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .manifests
+        .iter()
+        .filter_map(|(agent, loaded)| {
+            let loaded = loaded.as_ref()?;
+            let rule = loaded
+                .manifest
+                .identity
+                .iter()
+                .zip(&loaded.compiled_identity_rules)
+                .find(|(rule, compiled)| {
+                    compiled_rule_matches(compiled, region(input, &rule.region))
+                })?;
+            Some(ScreenIdentityCandidate {
+                agent: *agent,
+                rule_id: rule.0.id.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Identify the agent that owns this screen, when the process probe cannot.
+///
+/// Returns `None` unless exactly one agent's identity rules match. Two agents
+/// matching the same screen is ambiguity, not a tie to break: an honest
+/// `unknown` is better than a confident wrong answer, because a misidentified
+/// pane runs another agent's state manifest and reports fiction.
+pub fn identify_agent_from_screen(input: DetectionInput<'_>) -> Option<ScreenIdentityCandidate> {
+    let mut candidates = screen_identity_candidates(input);
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 pub fn should_skip_state_update(agent: Agent, screen_content: &str) -> bool {
@@ -717,9 +798,11 @@ fn loaded_manifest(
     local_override_shadowing_remote: bool,
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?;
+    let compiled_identity_rules = compile_identity_rules(&manifest)?;
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
+        compiled_identity_rules,
         source,
         warning,
         cached_remote_version,
@@ -994,6 +1077,36 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
         }
     }
 
+    if manifest.identity.len() > MAX_IDENTITY_RULES_PER_MANIFEST {
+        return Err(format!(
+            "manifest contains {} identity rules, max is {MAX_IDENTITY_RULES_PER_MANIFEST}",
+            manifest.identity.len()
+        ));
+    }
+    if !manifest.identity.is_empty()
+        && manifest
+            .min_engine_version
+            .is_some_and(|version| version < IDENTITY_RULES_ENGINE_VERSION)
+    {
+        return Err(format!(
+            "manifest declares identity rules but min_engine_version is below {IDENTITY_RULES_ENGINE_VERSION}"
+        ));
+    }
+    for rule in &manifest.identity {
+        if rule.id.trim().is_empty() {
+            return Err("manifest identity rule id must not be empty".to_string());
+        }
+        validate_region_name(&rule.region)
+            .map_err(|err| format!("identity rule {} uses invalid region: {err}", rule.id))?;
+        validate_gate(
+            &manifest_gate_from_identity_rule(rule),
+            "identity rule",
+            0,
+            &mut complexity,
+        )
+        .map_err(|err| format!("identity rule {} has invalid matcher gates: {err}", rule.id))?;
+    }
+
     Ok(())
 }
 
@@ -1198,6 +1311,29 @@ fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Strin
         .collect()
 }
 
+fn manifest_gate_from_identity_rule(rule: &ManifestIdentityRule) -> ManifestGate {
+    ManifestGate {
+        all: rule.all.clone(),
+        any: rule.any.clone(),
+        not_gate: rule.not_gate.clone(),
+        contains: rule.contains.clone(),
+        regex: rule.regex.clone(),
+        line_regex: rule.line_regex.clone(),
+    }
+}
+
+fn compile_identity_rules(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
+    manifest
+        .identity
+        .iter()
+        .map(|rule| {
+            compile_gate(&manifest_gate_from_identity_rule(rule))
+                .map(|gate| CompiledRule { gate })
+                .map_err(|err| format!("identity rule {} could not be compiled: {err}", rule.id))
+        })
+        .collect()
+}
+
 fn compile_gate(gate: &ManifestGate) -> Result<CompiledGate, String> {
     Ok(CompiledGate {
         all: gate
@@ -1358,6 +1494,8 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
 
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
 const TRANSCRIPT_REGION_ENGINE_VERSION: u32 = 4;
+/// `[[identity]]` blocks were added in engine 5.
+const IDENTITY_RULES_ENGINE_VERSION: u32 = 5;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
 fn top_region_count(spec: &str) -> Option<usize> {

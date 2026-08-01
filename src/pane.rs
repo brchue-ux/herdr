@@ -38,7 +38,7 @@ use self::agent_detection::{
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    ScreenIdentityConfirmation, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
@@ -602,6 +602,69 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+fn read_declared_agent(declared_agent: &Mutex<Option<Agent>>) -> Option<Agent> {
+    declared_agent.lock().ok().and_then(|declared| *declared)
+}
+
+/// Resolve the agent identity a detection tick should work with.
+///
+/// Process identity stays authoritative. A pane's declared agent only fills the
+/// gap the process probe leaves behind, which is what happens when the agent
+/// runs behind a wrapper or a terminal multiplexer that the probe cannot see
+/// through. A pending graceful release outranks the declaration so releasing an
+/// agent is not immediately undone by it.
+fn resolve_probe_agent(
+    probed_agent: Option<Agent>,
+    declared_agent: Option<Agent>,
+    suppressed_agent: Option<Agent>,
+) -> Option<Agent> {
+    if probed_agent.is_some() || suppressed_agent.is_some() {
+        return probed_agent;
+    }
+    declared_agent
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScreenIdentificationInput<'a> {
+    current_agent: Option<Agent>,
+    suppressed_agent: Option<Agent>,
+    process_exited: bool,
+    content: &'a str,
+    osc_title: &'a str,
+    osc_progress: &'a str,
+}
+
+/// Identify the pane's agent from its screen, once the process probe and any
+/// declaration have both come up empty.
+///
+/// This is the last tier of identification and the only one that can be wrong,
+/// so it is gated three ways: it never runs while any other source knows the
+/// agent, only one agent's identity rules may match the screen, and the same
+/// answer has to survive several consecutive scans.
+fn confirm_screen_identified_agent(
+    input: ScreenIdentificationInput<'_>,
+    screen_identity: &mut ScreenIdentityConfirmation,
+) -> Option<Agent> {
+    if input.current_agent.is_some() || input.suppressed_agent.is_some() || input.process_exited {
+        screen_identity.clear();
+        return None;
+    }
+    screen_identity.observe(crate::detect::identify_agent_from_screen(
+        input.content,
+        input.osc_title,
+        input.osc_progress,
+    ))
+}
+
+/// The handles a spawned detection task hands back to its `PaneRuntime`.
+#[cfg(unix)]
+struct DetectionTaskHandles {
+    handle: tokio::task::AbortHandle,
+    detect_reset_notify: Arc<Notify>,
+    declaration_notify: Arc<Notify>,
+    pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+}
+
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -609,16 +672,16 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    declared_agent: Arc<Mutex<Option<Agent>>>,
     state_events: mpsc::Sender<AppEvent>,
-) -> (
-    tokio::task::AbortHandle,
-    Arc<Notify>,
-    Arc<Mutex<Option<PendingAgentRelease>>>,
-) {
+) -> DetectionTaskHandles {
     let detect_reset_notify = Arc::new(Notify::new());
     let detect_reset = detect_reset_notify.clone();
+    let declaration_notify = Arc::new(Notify::new());
+    let declaration_changed = declaration_notify.clone();
     let pending_release = Arc::new(Mutex::new(None));
     let pending_release_for_task = pending_release.clone();
+    let declared_agent_for_task = declared_agent;
 
     let handle = tokio::spawn(async move {
         let mut agent_presence = AgentDetectionPresence::from_agent(None);
@@ -639,6 +702,8 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let mut screen_identity = ScreenIdentityConfirmation::default();
+        let mut screen_identified_agent: Option<Agent> = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -646,8 +711,15 @@ fn spawn_basic_detection_task(
             } else {
                 std::time::Duration::from_millis(300)
             };
+            let mut force_process_check = false;
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
+                _ = declaration_changed.notified() => {
+                    // Keep the presence: the release when a declaration is
+                    // cleared is published by the normal previous -> new agent
+                    // transition below, which a reset would erase.
+                    force_process_check = true;
+                }
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
@@ -667,6 +739,8 @@ fn spawn_basic_detection_task(
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
+                    screen_identity.clear();
+                    screen_identified_agent = None;
                 }
             }
 
@@ -688,24 +762,31 @@ fn spawn_basic_detection_task(
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
-            let should_check_process = pid > 0 && {
-                let process_probe_input = ProcessProbeInput {
-                    current_agent: agent,
-                    suppressed_agent,
-                    foreground_pgid,
-                    last_foreground_pgid,
-                    has_process_probe,
-                    acquisition_age: acquisition_started_at
-                        .map(|started| now.duration_since(started)),
-                    pending_foreground_shell_clear,
-                    pending_restore_probe: false,
-                    elapsed_since_process_check: now.duration_since(last_process_check),
-                };
-                !should_skip_process_probe_for_lifecycle_authority(
-                    lifecycle_authority_active,
-                    process_probe_input,
-                ) && should_probe_foreground_job(process_probe_input)
-            };
+            if process_group_changed {
+                // A new foreground job may be an entirely different program, so
+                // a screen identification made for the old one is void.
+                screen_identity.clear();
+                screen_identified_agent = None;
+            }
+            let should_check_process = pid > 0
+                && (force_process_check || {
+                    let process_probe_input = ProcessProbeInput {
+                        current_agent: agent,
+                        suppressed_agent,
+                        foreground_pgid,
+                        last_foreground_pgid,
+                        has_process_probe,
+                        acquisition_age: acquisition_started_at
+                            .map(|started| now.duration_since(started)),
+                        pending_foreground_shell_clear,
+                        pending_restore_probe: false,
+                        elapsed_since_process_check: now.duration_since(last_process_check),
+                    };
+                    !should_skip_process_probe_for_lifecycle_authority(
+                        lifecycle_authority_active,
+                        process_probe_input,
+                    ) && should_probe_foreground_job(process_probe_input)
+                });
 
             if should_check_process {
                 last_process_check = now;
@@ -722,6 +803,11 @@ fn spawn_basic_detection_task(
                         *pending_release = None;
                     }
                 }
+                new_agent = resolve_probe_agent(
+                    new_agent,
+                    read_declared_agent(&declared_agent_for_task).or(screen_identified_agent),
+                    suppressed_agent,
+                );
                 let previous_agent = agent_presence.current_agent();
                 let foreground_action = foreground_shell_agent_action(
                     previous_agent,
@@ -832,6 +918,32 @@ fn spawn_basic_detection_task(
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let content_changed = content != last_detection_text;
             last_detection_text.clone_from(&content);
+            let osc_title = terminal.agent_osc_title();
+            let osc_progress = terminal.agent_osc_progress();
+            if let Some(identified) = confirm_screen_identified_agent(
+                ScreenIdentificationInput {
+                    current_agent: agent,
+                    suppressed_agent,
+                    process_exited,
+                    content: &content,
+                    osc_title: &osc_title,
+                    osc_progress: &osc_progress,
+                },
+                &mut screen_identity,
+            ) {
+                screen_identified_agent = Some(identified);
+                if agent_presence.observe_process_probe(Some(identified)) {
+                    agent = agent_presence.current_agent();
+                    agent_changed = true;
+                    last_screen_scan_detection_content_seq = None;
+                    pending_idle.clear();
+                    info!(
+                        pane = pane_id.raw(),
+                        agent = ?identified,
+                        "agent identified from screen"
+                    );
+                }
+            }
             if !process_exited && crate::detect::should_skip_state_update(agent, &content) {
                 pending_idle.clear();
                 continue;
@@ -846,8 +958,6 @@ fn spawn_basic_detection_task(
                 &mut last_content_change_at,
             );
 
-            let osc_title = terminal.agent_osc_title();
-            let osc_progress = terminal.agent_osc_progress();
             let Some(screen_detection) = detection_update_for_publish_with_osc(
                 agent,
                 &content,
@@ -905,7 +1015,12 @@ fn spawn_basic_detection_task(
         }
     });
 
-    (handle.abort_handle(), detect_reset_notify, pending_release)
+    DetectionTaskHandles {
+        handle: handle.abort_handle(),
+        detect_reset_notify,
+        declaration_notify,
+        pending_release,
+    }
 }
 
 impl AgentDetectionPresence {
@@ -976,6 +1091,16 @@ pub struct PaneRuntime {
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+    /// Explicit per-pane agent declaration. Shared with the detection task so a
+    /// declaration takes effect on the next tick without respawning it.
+    declared_agent: Arc<Mutex<Option<Agent>>>,
+    /// Wakes the detection task after a declaration changes.
+    ///
+    /// Deliberately not `detect_reset_notify`: a reset wipes the detected-agent
+    /// presence, which is exactly the state the loop needs in order to publish
+    /// the release when a declaration is cleared. This only forces the next
+    /// process probe to run now instead of on its own schedule.
+    declaration_notify: Arc<Notify>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
@@ -1868,12 +1993,19 @@ impl PaneRuntime {
         };
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
-        let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
+        let declared_agent = Arc::new(Mutex::new(None));
+        let DetectionTaskHandles {
+            handle: detect_handle,
+            detect_reset_notify,
+            declaration_notify,
+            pending_release,
+        } = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            declared_agent.clone(),
             events,
         );
 
@@ -1890,6 +2022,8 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            declared_agent,
+            declaration_notify,
             preserve_processes_on_drop: true,
             detect_handle: Some(detect_handle),
         })
@@ -2034,370 +2168,433 @@ impl PaneRuntime {
         };
 
         // --- Detection task ---
-        let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
-            == AgentDetection::Enabled
-        {
-            use crate::detect;
-            use std::time::{Duration, Instant};
+        let declared_agent: Arc<Mutex<Option<Agent>>> = Arc::new(Mutex::new(None));
+        let (detect_handle, detect_reset_notify, declaration_notify, pending_release) =
+            if agent_detection == AgentDetection::Enabled {
+                use crate::detect;
+                use std::time::{Duration, Instant};
 
-            const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
-            const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
-            const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
+                const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
+                const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
+                const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
-            let child_pid = child_pid.clone();
-            let terminal = terminal.clone();
-            let state_events = events.clone();
-            let detection_content_seq = detection_content_seq.clone();
-            let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
-            let render_notify = render_notify.clone();
-            let render_dirty = render_dirty.clone();
-            let detect_reset_notify = Arc::new(Notify::new());
-            let detect_reset = detect_reset_notify.clone();
-            let pending_release = Arc::new(Mutex::new(None));
-            let pending_release_for_task = pending_release.clone();
+                let child_pid = child_pid.clone();
+                let terminal = terminal.clone();
+                let state_events = events.clone();
+                let detection_content_seq = detection_content_seq.clone();
+                let full_lifecycle_authority_active_for_task =
+                    full_lifecycle_authority_active.clone();
+                let render_notify = render_notify.clone();
+                let render_dirty = render_dirty.clone();
+                let detect_reset_notify = Arc::new(Notify::new());
+                let detect_reset = detect_reset_notify.clone();
+                let declaration_notify = Arc::new(Notify::new());
+                let declaration_changed = declaration_notify.clone();
+                let pending_release = Arc::new(Mutex::new(None));
+                let pending_release_for_task = pending_release.clone();
+                let declared_agent_for_task = declared_agent.clone();
 
-            let handle = tokio::spawn(async move {
-                let mut agent_presence =
-                    AgentDetectionPresence::from_agent(initial_state.detected_agent);
-                let mut state = AgentState::Idle;
-                let mut last_visible_idle = initial_state.detected_agent.is_some();
-                let mut last_process_check = Instant::now();
-                let mut last_foreground_pgid = None;
-                let mut has_process_probe = false;
-                let mut acquisition_started_at = None;
-                let mut last_content_change_at = None;
-                let mut pending_foreground_shell_clear = false;
-                let mut foreground_shell_exit_reported = false;
-                let mut release_was_active = false;
-                let mut pending_restore_probe = initial_state.detected_agent.is_some();
-                let mut last_visible_blocker = false;
-                let mut last_visible_working = false;
-                let mut last_visible_signal_refresh = None;
-                let mut last_detection_text = String::new();
-                let mut last_screen_scan_detection_content_seq = None;
-                let mut agent_startup_grace_until = None;
-                let mut pending_idle = PendingIdleConfirmation::default();
+                let handle = tokio::spawn(async move {
+                    let mut agent_presence =
+                        AgentDetectionPresence::from_agent(initial_state.detected_agent);
+                    let mut state = AgentState::Idle;
+                    let mut last_visible_idle = initial_state.detected_agent.is_some();
+                    let mut last_process_check = Instant::now();
+                    let mut last_foreground_pgid = None;
+                    let mut has_process_probe = false;
+                    let mut acquisition_started_at = None;
+                    let mut last_content_change_at = None;
+                    let mut pending_foreground_shell_clear = false;
+                    let mut foreground_shell_exit_reported = false;
+                    let mut release_was_active = false;
+                    let mut pending_restore_probe = initial_state.detected_agent.is_some();
+                    let mut last_visible_blocker = false;
+                    let mut last_visible_working = false;
+                    let mut last_visible_signal_refresh = None;
+                    let mut last_detection_text = String::new();
+                    let mut last_screen_scan_detection_content_seq = None;
+                    let mut agent_startup_grace_until = None;
+                    let mut pending_idle = PendingIdleConfirmation::default();
+                    let mut screen_identity = ScreenIdentityConfirmation::default();
+                    let mut screen_identified_agent: Option<Agent> = None;
 
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
 
-                loop {
-                    let now_for_tick = Instant::now();
-                    let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
-                        .is_some()
-                        || terminal.has_transient_default_color_override()
-                    {
-                        TICK_PENDING_RELEASE
-                    } else if pending_idle.active() {
-                        AGENT_PENDING_IDLE_RECHECK
-                    } else if agent_presence.current_agent().is_none() {
-                        TICK_UNIDENTIFIED
-                    } else {
-                        TICK_IDENTIFIED
-                    };
-                    tokio::select! {
-                        _ = tokio::time::sleep(tick) => {}
-                        _ = detect_reset.notified() => {
-                            agent_presence = AgentDetectionPresence::from_agent(None);
-                            state = AgentState::Unknown;
-                            last_visible_idle = false;
-                            last_foreground_pgid = None;
+                    loop {
+                        let now_for_tick = Instant::now();
+                        let tick =
+                            if active_pending_release(&pending_release_for_task, now_for_tick)
+                                .is_some()
+                                || terminal.has_transient_default_color_override()
+                            {
+                                TICK_PENDING_RELEASE
+                            } else if pending_idle.active() {
+                                AGENT_PENDING_IDLE_RECHECK
+                            } else if agent_presence.current_agent().is_none() {
+                                TICK_UNIDENTIFIED
+                            } else {
+                                TICK_IDENTIFIED
+                            };
+                        let mut force_process_check = false;
+                        tokio::select! {
+                            _ = tokio::time::sleep(tick) => {}
+                            _ = declaration_changed.notified() => {
+                                // Keep the presence: the release when a declaration
+                                // is cleared is published by the normal previous ->
+                                // new agent transition below, which a reset would
+                                // erase.
+                                force_process_check = true;
+                            }
+                            _ = detect_reset.notified() => {
+                                agent_presence = AgentDetectionPresence::from_agent(None);
+                                state = AgentState::Unknown;
+                                last_visible_idle = false;
+                                last_foreground_pgid = None;
+                                has_process_probe = false;
+                                acquisition_started_at = None;
+                                last_content_change_at = None;
+                                pending_foreground_shell_clear = false;
+                                foreground_shell_exit_reported = false;
+                                release_was_active = false;
+                                pending_restore_probe = false;
+                                last_visible_blocker = false;
+                                last_visible_working = false;
+                                last_visible_signal_refresh = None;
+                                last_detection_text.clear();
+                                last_screen_scan_detection_content_seq = None;
+                                agent_startup_grace_until = None;
+                                pending_idle.clear();
+                                screen_identity.clear();
+                                screen_identified_agent = None;
+                            }
+                        }
+
+                        let now = Instant::now();
+                        let suppressed_agent =
+                            active_pending_release(&pending_release_for_task, now);
+                        if suppressed_agent.is_none() && release_was_active {
                             has_process_probe = false;
                             acquisition_started_at = None;
                             last_content_change_at = None;
-                            pending_foreground_shell_clear = false;
-                            foreground_shell_exit_reported = false;
-                            release_was_active = false;
-                            pending_restore_probe = false;
-                            last_visible_blocker = false;
-                            last_visible_working = false;
-                            last_visible_signal_refresh = None;
-                            last_detection_text.clear();
-                            last_screen_scan_detection_content_seq = None;
-                            agent_startup_grace_until = None;
-                            pending_idle.clear();
                         }
-                    }
+                        release_was_active = suppressed_agent.is_some();
+                        let pid = child_pid.load(Ordering::Acquire);
+                        let mut agent = agent_presence.current_agent();
+                        let lifecycle_authority_active =
+                            full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
+                        let foreground_pgid = (pid > 0)
+                            .then(|| detect::foreground_process_group_id(pid))
+                            .flatten();
+                        let process_group_changed =
+                            foreground_group_changed(foreground_pgid, last_foreground_pgid);
+                        if process_group_changed {
+                            // A new foreground job may be an entirely different
+                            // program, so a screen identification made for the old
+                            // one is void.
+                            screen_identity.clear();
+                            screen_identified_agent = None;
+                        }
+                        let should_check_process = pid > 0
+                            && (force_process_check || {
+                                let process_probe_input = ProcessProbeInput {
+                                    current_agent: agent,
+                                    suppressed_agent,
+                                    foreground_pgid,
+                                    last_foreground_pgid,
+                                    has_process_probe,
+                                    acquisition_age: acquisition_started_at
+                                        .map(|started| now.duration_since(started)),
+                                    pending_foreground_shell_clear,
+                                    pending_restore_probe,
+                                    elapsed_since_process_check: now
+                                        .duration_since(last_process_check),
+                                };
+                                !should_skip_process_probe_for_lifecycle_authority(
+                                    lifecycle_authority_active,
+                                    process_probe_input,
+                                ) && should_probe_foreground_job(process_probe_input)
+                            });
 
-                    let now = Instant::now();
-                    let suppressed_agent = active_pending_release(&pending_release_for_task, now);
-                    if suppressed_agent.is_none() && release_was_active {
-                        has_process_probe = false;
-                        acquisition_started_at = None;
-                        last_content_change_at = None;
-                    }
-                    release_was_active = suppressed_agent.is_some();
-                    let pid = child_pid.load(Ordering::Acquire);
-                    let mut agent = agent_presence.current_agent();
-                    let lifecycle_authority_active =
-                        full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
-                    let foreground_pgid = (pid > 0)
-                        .then(|| detect::foreground_process_group_id(pid))
-                        .flatten();
-                    let process_group_changed =
-                        foreground_group_changed(foreground_pgid, last_foreground_pgid);
-                    let should_check_process = pid > 0 && {
-                        let process_probe_input = ProcessProbeInput {
-                            current_agent: agent,
-                            suppressed_agent,
-                            foreground_pgid,
-                            last_foreground_pgid,
-                            has_process_probe,
-                            acquisition_age: acquisition_started_at
-                                .map(|started| now.duration_since(started)),
-                            pending_foreground_shell_clear,
-                            pending_restore_probe,
-                            elapsed_since_process_check: now.duration_since(last_process_check),
-                        };
-                        !should_skip_process_probe_for_lifecycle_authority(
-                            lifecycle_authority_active,
-                            process_probe_input,
-                        ) && should_probe_foreground_job(process_probe_input)
-                    };
+                        let mut agent_changed = false;
+                        if should_check_process {
+                            last_process_check = now;
+                            let had_process_probe = has_process_probe;
+                            has_process_probe = true;
+                            if pid > 0 {
+                                let probe = probe_foreground_process(pid, foreground_pgid);
+                                let process_name = probe.process_name;
+                                let process_group_id = probe.process_group_id;
+                                let foreground_is_pane_shell = probe.foreground_is_pane_shell;
+                                let mut new_agent = probe.agent;
 
-                    let mut agent_changed = false;
-                    if should_check_process {
-                        last_process_check = now;
-                        let had_process_probe = has_process_probe;
-                        has_process_probe = true;
-                        if pid > 0 {
-                            let probe = probe_foreground_process(pid, foreground_pgid);
-                            let process_name = probe.process_name;
-                            let process_group_id = probe.process_group_id;
-                            let foreground_is_pane_shell = probe.foreground_is_pane_shell;
-                            let mut new_agent = probe.agent;
-
-                            if let Some(suppressed_agent) = suppressed_agent {
-                                if new_agent == Some(suppressed_agent) {
-                                    new_agent = None;
-                                } else if let Ok(mut pending_release) =
-                                    pending_release_for_task.lock()
-                                {
-                                    *pending_release = None;
-                                }
-                            }
-
-                            let previous_agent = agent_presence.current_agent();
-                            let foreground_action = foreground_shell_agent_action(
-                                previous_agent,
-                                new_agent,
-                                foreground_is_pane_shell,
-                                foreground_shell_exit_reported,
-                            );
-                            let changed = apply_foreground_shell_agent_action(
-                                &mut agent_presence,
-                                foreground_action,
-                                previous_agent,
-                                new_agent,
-                                &mut pending_foreground_shell_clear,
-                                &mut foreground_shell_exit_reported,
-                            );
-                            if new_agent.is_some() {
-                                last_foreground_pgid = process_group_id;
-                                acquisition_started_at = None;
-                                last_content_change_at = None;
-                                pending_restore_probe = false;
-                            } else if agent_presence.current_agent().is_none() {
-                                last_foreground_pgid = process_group_id.or(foreground_pgid);
-                                if had_process_probe && process_group_changed {
-                                    acquisition_started_at = Some(now);
-                                }
-                                pending_restore_probe = false;
-                            } else {
-                                last_foreground_pgid = process_group_id.or(foreground_pgid);
-                            }
-                            if changed {
-                                agent = agent_presence.current_agent();
-                                if agent != previous_agent
-                                    || foreground_action
-                                        == ForegroundShellAgentAction::ReportReplacementProcess
-                                {
-                                    pending_idle.clear();
-                                    last_screen_scan_detection_content_seq = None;
-                                    // A new foreground agent must not inherit OSC
-                                    // title/progress evidence from the previous process.
-                                    terminal.clear_agent_osc_state();
-                                    if agent.is_some() {
-                                        agent_startup_grace_until =
-                                            Some(now + AGENT_STARTUP_GRACE_WINDOW);
-                                        state = AgentState::Idle;
-                                        last_visible_idle = true;
-                                        last_visible_blocker = false;
-                                        last_visible_working = false;
-                                        last_visible_signal_refresh = None;
-                                        publish_state_changed_event(
-                                            state_events.clone(),
-                                            pane_id,
-                                            agent,
-                                            AgentState::Idle,
-                                            false,
-                                            false,
-                                            false,
-                                            now,
-                                        )
-                                        .await;
-                                    } else {
-                                        agent_startup_grace_until = None;
+                                if let Some(suppressed_agent) = suppressed_agent {
+                                    if new_agent == Some(suppressed_agent) {
+                                        new_agent = None;
+                                    } else if let Ok(mut pending_release) =
+                                        pending_release_for_task.lock()
+                                    {
+                                        *pending_release = None;
                                     }
                                 }
-                                if let Some(process_name) = process_name {
-                                    info!(
-                                        pane = pane_id.raw(),
-                                        previous_agent = ?previous_agent,
-                                        ?agent,
-                                        process = %process_name,
-                                        pgid = ?process_group_id,
-                                        "agent changed"
-                                    );
+                                new_agent = resolve_probe_agent(
+                                    new_agent,
+                                    read_declared_agent(&declared_agent_for_task)
+                                        .or(screen_identified_agent),
+                                    suppressed_agent,
+                                );
+
+                                let previous_agent = agent_presence.current_agent();
+                                let foreground_action = foreground_shell_agent_action(
+                                    previous_agent,
+                                    new_agent,
+                                    foreground_is_pane_shell,
+                                    foreground_shell_exit_reported,
+                                );
+                                let changed = apply_foreground_shell_agent_action(
+                                    &mut agent_presence,
+                                    foreground_action,
+                                    previous_agent,
+                                    new_agent,
+                                    &mut pending_foreground_shell_clear,
+                                    &mut foreground_shell_exit_reported,
+                                );
+                                if new_agent.is_some() {
+                                    last_foreground_pgid = process_group_id;
+                                    acquisition_started_at = None;
+                                    last_content_change_at = None;
+                                    pending_restore_probe = false;
+                                } else if agent_presence.current_agent().is_none() {
+                                    last_foreground_pgid = process_group_id.or(foreground_pgid);
+                                    if had_process_probe && process_group_changed {
+                                        acquisition_started_at = Some(now);
+                                    }
+                                    pending_restore_probe = false;
                                 } else {
-                                    info!(
-                                        pane = pane_id.raw(),
-                                        previous_agent = ?previous_agent,
-                                        ?agent,
-                                        pgid = ?process_group_id,
-                                        "agent changed"
-                                    );
+                                    last_foreground_pgid = process_group_id.or(foreground_pgid);
                                 }
-                                agent_changed = true;
+                                if changed {
+                                    agent = agent_presence.current_agent();
+                                    if agent != previous_agent
+                                        || foreground_action
+                                            == ForegroundShellAgentAction::ReportReplacementProcess
+                                    {
+                                        pending_idle.clear();
+                                        last_screen_scan_detection_content_seq = None;
+                                        // A new foreground agent must not inherit OSC
+                                        // title/progress evidence from the previous process.
+                                        terminal.clear_agent_osc_state();
+                                        if agent.is_some() {
+                                            agent_startup_grace_until =
+                                                Some(now + AGENT_STARTUP_GRACE_WINDOW);
+                                            state = AgentState::Idle;
+                                            last_visible_idle = true;
+                                            last_visible_blocker = false;
+                                            last_visible_working = false;
+                                            last_visible_signal_refresh = None;
+                                            publish_state_changed_event(
+                                                state_events.clone(),
+                                                pane_id,
+                                                agent,
+                                                AgentState::Idle,
+                                                false,
+                                                false,
+                                                false,
+                                                now,
+                                            )
+                                            .await;
+                                        } else {
+                                            agent_startup_grace_until = None;
+                                        }
+                                    }
+                                    if let Some(process_name) = process_name {
+                                        info!(
+                                            pane = pane_id.raw(),
+                                            previous_agent = ?previous_agent,
+                                            ?agent,
+                                            process = %process_name,
+                                            pgid = ?process_group_id,
+                                            "agent changed"
+                                        );
+                                    } else {
+                                        info!(
+                                            pane = pane_id.raw(),
+                                            previous_agent = ?previous_agent,
+                                            ?agent,
+                                            pgid = ?process_group_id,
+                                            "agent changed"
+                                        );
+                                    }
+                                    agent_changed = true;
+                                }
                             }
                         }
-                    }
 
-                    let pid = child_pid.load(Ordering::Acquire);
-                    // Keep the terminal restore side effect separate from render notification state.
-                    #[allow(clippy::collapsible_if)]
-                    if pid > 0 && terminal.maybe_restore_host_terminal_theme(pane_id, pid) {
-                        if render_dirty.request_pty(pane_id) {
-                            render_notify.notify_one();
-                        }
-                    }
-
-                    let process_exited = pending_foreground_shell_clear
-                        && agent.is_some()
-                        && !foreground_shell_exit_reported;
-
-                    if lifecycle_authority_active && !process_exited {
-                        pending_idle.clear();
-                        continue;
-                    }
-
-                    if let Some(until) = agent_startup_grace_until {
-                        if process_exited {
-                            agent_startup_grace_until = None;
-                            last_screen_scan_detection_content_seq = None;
-                            pending_idle.clear();
-                        } else {
-                            if now < until {
-                                pending_idle.clear();
-                                continue;
+                        let pid = child_pid.load(Ordering::Acquire);
+                        // Keep the terminal restore side effect separate from render notification state.
+                        #[allow(clippy::collapsible_if)]
+                        if pid > 0 && terminal.maybe_restore_host_terminal_theme(pane_id, pid) {
+                            if render_dirty.request_pty(pane_id) {
+                                render_notify.notify_one();
                             }
-                            agent_startup_grace_until = None;
+                        }
+
+                        let process_exited = pending_foreground_shell_clear
+                            && agent.is_some()
+                            && !foreground_shell_exit_reported;
+
+                        if lifecycle_authority_active && !process_exited {
                             pending_idle.clear();
                             continue;
                         }
-                    }
 
-                    let current_detection_content_seq = if agent.is_some() {
-                        Some(detection_content_seq.load(Ordering::Relaxed))
-                    } else {
-                        None
-                    };
-                    match decide_detection_screen_read(DetectionScreenReadInput {
-                        state,
-                        agent,
-                        pending_idle_active: pending_idle.active(),
-                        agent_changed,
-                        process_exited,
-                        current_detection_content_seq,
-                        last_screen_scan_detection_content_seq,
-                    }) {
-                        DetectionScreenReadDecision::Read => {}
-                        DetectionScreenReadDecision::Skip => continue,
-                    }
+                        if let Some(until) = agent_startup_grace_until {
+                            if process_exited {
+                                agent_startup_grace_until = None;
+                                last_screen_scan_detection_content_seq = None;
+                                pending_idle.clear();
+                            } else {
+                                if now < until {
+                                    pending_idle.clear();
+                                    continue;
+                                }
+                                agent_startup_grace_until = None;
+                                pending_idle.clear();
+                                continue;
+                            }
+                        }
 
-                    let content = terminal.detection_text();
-                    last_screen_scan_detection_content_seq = current_detection_content_seq;
-                    let content_changed = content != last_detection_text;
-                    last_detection_text.clone_from(&content);
-                    if detect::should_skip_state_update(agent, &content) {
-                        pending_idle.clear();
-                        continue;
-                    }
-                    sync_content_change_acquisition(
-                        agent_presence.current_agent(),
-                        suppressed_agent,
-                        process_group_changed,
-                        content_changed,
-                        now,
-                        &mut acquisition_started_at,
-                        &mut last_content_change_at,
-                    );
-
-                    let osc_title = terminal.agent_osc_title();
-                    let osc_progress = terminal.agent_osc_progress();
-                    let Some(screen_detection) = detection_update_for_publish_with_osc(
-                        agent,
-                        &content,
-                        &osc_title,
-                        &osc_progress,
-                        process_exited,
-                    ) else {
-                        pending_idle.clear();
-                        continue;
-                    };
-                    match decide_screen_detection_publish(
-                        ScreenDetectionPublishInput {
-                            screen_detection,
-                            current_state: state,
-                            last_visible_idle,
-                            last_visible_blocker,
-                            last_visible_working,
-                            last_visible_signal_refresh,
-                            process_exited,
+                        let current_detection_content_seq = if agent.is_some() {
+                            Some(detection_content_seq.load(Ordering::Relaxed))
+                        } else {
+                            None
+                        };
+                        match decide_detection_screen_read(DetectionScreenReadInput {
+                            state,
+                            agent,
+                            pending_idle_active: pending_idle.active(),
                             agent_changed,
+                            process_exited,
+                            current_detection_content_seq,
+                            last_screen_scan_detection_content_seq,
+                        }) {
+                            DetectionScreenReadDecision::Read => {}
+                            DetectionScreenReadDecision::Skip => continue,
+                        }
+
+                        let content = terminal.detection_text();
+                        last_screen_scan_detection_content_seq = current_detection_content_seq;
+                        let content_changed = content != last_detection_text;
+                        last_detection_text.clone_from(&content);
+                        let osc_title = terminal.agent_osc_title();
+                        let osc_progress = terminal.agent_osc_progress();
+                        if let Some(identified) = confirm_screen_identified_agent(
+                            ScreenIdentificationInput {
+                                current_agent: agent,
+                                suppressed_agent,
+                                process_exited,
+                                content: &content,
+                                osc_title: &osc_title,
+                                osc_progress: &osc_progress,
+                            },
+                            &mut screen_identity,
+                        ) {
+                            screen_identified_agent = Some(identified);
+                            if agent_presence.observe_process_probe(Some(identified)) {
+                                agent = agent_presence.current_agent();
+                                agent_changed = true;
+                                last_screen_scan_detection_content_seq = None;
+                                pending_idle.clear();
+                                info!(
+                                    pane = pane_id.raw(),
+                                    agent = ?identified,
+                                    "agent identified from screen"
+                                );
+                            }
+                        }
+                        if detect::should_skip_state_update(agent, &content) {
+                            pending_idle.clear();
+                            continue;
+                        }
+                        sync_content_change_acquisition(
+                            agent_presence.current_agent(),
+                            suppressed_agent,
+                            process_group_changed,
+                            content_changed,
                             now,
-                        },
-                        &mut pending_idle,
-                    ) {
-                        DetectionPublishDecision::NoPublish => {}
-                        DetectionPublishDecision::Publish {
-                            state: new_state,
-                            visible_idle,
-                            visible_blocker,
-                            visible_working,
-                            process_exited: publish_process_exited,
-                        } => {
-                            apply_agent_detection_publish_update(
-                                state_events.clone(),
-                                pane_id,
-                                agent,
-                                AgentDetectionPublishUpdate {
-                                    state: new_state,
-                                    visible_idle,
-                                    visible_blocker,
-                                    visible_working,
-                                    process_exited: publish_process_exited,
-                                },
+                            &mut acquisition_started_at,
+                            &mut last_content_change_at,
+                        );
+
+                        let Some(screen_detection) = detection_update_for_publish_with_osc(
+                            agent,
+                            &content,
+                            &osc_title,
+                            &osc_progress,
+                            process_exited,
+                        ) else {
+                            pending_idle.clear();
+                            continue;
+                        };
+                        match decide_screen_detection_publish(
+                            ScreenDetectionPublishInput {
+                                screen_detection,
+                                current_state: state,
+                                last_visible_idle,
+                                last_visible_blocker,
+                                last_visible_working,
+                                last_visible_signal_refresh,
+                                process_exited,
+                                agent_changed,
                                 now,
-                                &mut state,
-                                &mut last_visible_idle,
-                                &mut last_visible_blocker,
-                                &mut last_visible_working,
-                                &mut last_visible_signal_refresh,
-                                &mut foreground_shell_exit_reported,
-                            )
-                            .await;
+                            },
+                            &mut pending_idle,
+                        ) {
+                            DetectionPublishDecision::NoPublish => {}
+                            DetectionPublishDecision::Publish {
+                                state: new_state,
+                                visible_idle,
+                                visible_blocker,
+                                visible_working,
+                                process_exited: publish_process_exited,
+                            } => {
+                                apply_agent_detection_publish_update(
+                                    state_events.clone(),
+                                    pane_id,
+                                    agent,
+                                    AgentDetectionPublishUpdate {
+                                        state: new_state,
+                                        visible_idle,
+                                        visible_blocker,
+                                        visible_working,
+                                        process_exited: publish_process_exited,
+                                    },
+                                    now,
+                                    &mut state,
+                                    &mut last_visible_idle,
+                                    &mut last_visible_blocker,
+                                    &mut last_visible_working,
+                                    &mut last_visible_signal_refresh,
+                                    &mut foreground_shell_exit_reported,
+                                )
+                                .await;
+                            }
                         }
                     }
-                }
-            });
-            (
-                Some(handle.abort_handle()),
-                detect_reset_notify,
-                pending_release,
-            )
-        } else {
-            (None, Arc::new(Notify::new()), Arc::new(Mutex::new(None)))
-        };
+                });
+                (
+                    Some(handle.abort_handle()),
+                    detect_reset_notify,
+                    declaration_notify,
+                    pending_release,
+                )
+            } else {
+                (
+                    None,
+                    Arc::new(Notify::new()),
+                    Arc::new(Notify::new()),
+                    Arc::new(Mutex::new(None)),
+                )
+            };
 
         Ok(Self {
             pane_id,
@@ -2412,9 +2609,27 @@ impl PaneRuntime {
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
+            declared_agent,
+            declaration_notify,
             preserve_processes_on_drop: false,
             detect_handle,
         })
+    }
+
+    /// Declare which agent this pane hosts, or clear the declaration.
+    ///
+    /// The detection task picks it up on its next tick and only uses it when the
+    /// process probe found nothing. Clearing a declaration that was the only
+    /// thing identifying the pane releases the agent through the same
+    /// process-exit path a real agent takes when it quits.
+    pub fn set_declared_agent(&self, agent: Option<Agent>) {
+        if let Ok(mut declared_agent) = self.declared_agent.lock() {
+            if *declared_agent == agent {
+                return;
+            }
+            *declared_agent = agent;
+        }
+        self.declaration_notify.notify_one();
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
@@ -2895,7 +3110,9 @@ impl PaneRuntime {
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
+                declaration_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
+                declared_agent: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -3403,7 +3620,9 @@ mod tests {
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
+            declaration_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            declared_agent: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -3434,7 +3653,9 @@ mod tests {
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
+            declaration_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            declared_agent: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -4005,6 +4226,154 @@ mod tests {
             elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
             ..process_probe_input()
         }));
+    }
+
+    #[test]
+    fn declared_agent_only_fills_a_probe_that_found_nothing() {
+        // Process identity stays authoritative.
+        assert_eq!(
+            resolve_probe_agent(Some(Agent::Codex), Some(Agent::Claude), None),
+            Some(Agent::Codex)
+        );
+        assert_eq!(
+            resolve_probe_agent(None, Some(Agent::Claude), None),
+            Some(Agent::Claude)
+        );
+        assert_eq!(resolve_probe_agent(None, None, None), None);
+    }
+
+    #[test]
+    fn clearing_a_declaration_releases_the_agent_through_the_process_exit_path() {
+        // A cleared declaration must not leave the pane claiming an agent
+        // nothing attests to any more. The release rides the same
+        // previous -> new transition a real agent takes when it quits, which is
+        // why a declaration change must not reset the detection presence.
+        let mut presence = AgentDetectionPresence::from_agent(Some(Agent::Claude));
+        let previous_agent = presence.current_agent();
+        let new_agent = resolve_probe_agent(None, None, None);
+        assert_eq!(new_agent, None);
+
+        let action = foreground_shell_agent_action(previous_agent, new_agent, true, false);
+        assert_eq!(action, ForegroundShellAgentAction::ReportProcessExit);
+
+        // The exit is published first, then identity is cleared.
+        let mut pending_clear = false;
+        let mut exit_reported = false;
+        apply_foreground_shell_agent_action(
+            &mut presence,
+            action,
+            previous_agent,
+            new_agent,
+            &mut pending_clear,
+            &mut exit_reported,
+        );
+        assert!(pending_clear);
+        assert_eq!(presence.current_agent(), Some(Agent::Claude));
+
+        exit_reported = true;
+        let action = foreground_shell_agent_action(previous_agent, new_agent, true, exit_reported);
+        assert_eq!(action, ForegroundShellAgentAction::ClearAgent);
+        assert!(apply_foreground_shell_agent_action(
+            &mut presence,
+            action,
+            previous_agent,
+            new_agent,
+            &mut pending_clear,
+            &mut exit_reported,
+        ));
+        assert_eq!(presence.current_agent(), None);
+    }
+
+    #[test]
+    fn a_pending_release_outranks_the_declaration() {
+        // Otherwise releasing an agent would be undone on the next tick.
+        assert_eq!(
+            resolve_probe_agent(None, Some(Agent::Claude), Some(Agent::Claude)),
+            None
+        );
+        assert_eq!(
+            resolve_probe_agent(None, Some(Agent::Claude), Some(Agent::Codex)),
+            None
+        );
+    }
+
+    fn screen_identification_input(
+        current_agent: Option<Agent>,
+    ) -> ScreenIdentificationInput<'static> {
+        ScreenIdentificationInput {
+            current_agent,
+            suppressed_agent: None,
+            process_exited: false,
+            content: "",
+            osc_title: "\u{2733} Claude Code",
+            osc_progress: "",
+        }
+    }
+
+    #[test]
+    fn screen_identification_adopts_an_agent_only_after_repeated_agreement() {
+        let mut screen_identity = ScreenIdentityConfirmation::default();
+        let input = screen_identification_input(None);
+
+        assert_eq!(
+            confirm_screen_identified_agent(input, &mut screen_identity),
+            None
+        );
+        assert_eq!(
+            confirm_screen_identified_agent(input, &mut screen_identity),
+            None
+        );
+        assert_eq!(
+            confirm_screen_identified_agent(input, &mut screen_identity),
+            Some(Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn screen_identification_never_runs_while_another_source_knows_the_agent() {
+        let mut screen_identity = ScreenIdentityConfirmation::default();
+
+        for _ in 0..5 {
+            assert_eq!(
+                confirm_screen_identified_agent(
+                    screen_identification_input(Some(Agent::Codex)),
+                    &mut screen_identity,
+                ),
+                None
+            );
+        }
+
+        let mut released = screen_identification_input(None);
+        released.suppressed_agent = Some(Agent::Claude);
+        for _ in 0..5 {
+            assert_eq!(
+                confirm_screen_identified_agent(released, &mut screen_identity),
+                None
+            );
+        }
+
+        let mut exited = screen_identification_input(None);
+        exited.process_exited = true;
+        for _ in 0..5 {
+            assert_eq!(
+                confirm_screen_identified_agent(exited, &mut screen_identity),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn screen_identification_stays_silent_for_a_shell_title() {
+        let mut screen_identity = ScreenIdentityConfirmation::default();
+        let mut input = screen_identification_input(None);
+        input.osc_title = "bchue@homeserver: ~/.treehouse/herdr";
+
+        for _ in 0..6 {
+            assert_eq!(
+                confirm_screen_identified_agent(input, &mut screen_identity),
+                None
+            );
+        }
     }
 
     #[test]

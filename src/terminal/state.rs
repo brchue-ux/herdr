@@ -120,6 +120,12 @@ pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
+    /// Explicit operator declaration of which agent this terminal hosts.
+    ///
+    /// Process identity stays authoritative; this only fills the gap the
+    /// process probe leaves for wrapped or multiplexed agents. It is durable:
+    /// it survives restart and live handoff until it is cleared.
+    declared_agent: Option<Agent>,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
@@ -165,6 +171,7 @@ impl TerminalState {
             id,
             cwd,
             detected_agent: None,
+            declared_agent: None,
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
             fallback_observed_at: None,
@@ -192,6 +199,23 @@ impl TerminalState {
             recent_agent_process_exit: None,
             pending_agent_resume_plan: None,
         }
+    }
+
+    pub fn declared_agent(&self) -> Option<Agent> {
+        self.declared_agent
+    }
+
+    /// Record or clear the operator's agent declaration for this terminal.
+    ///
+    /// Returns whether the declaration changed, so callers can skip persisting
+    /// and re-publishing a no-op.
+    pub fn set_declared_agent(&mut self, agent: Option<Agent>) -> bool {
+        if self.declared_agent == agent {
+            return false;
+        }
+        self.declared_agent = agent;
+        self.revision = self.revision.wrapping_add(1);
+        true
     }
 
     pub(crate) fn terminal_title_stripped(&self) -> Option<String> {

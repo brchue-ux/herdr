@@ -521,6 +521,14 @@ fn agent_command() -> Command {
                         .action(ArgAction::SetTrue),
                 ),
         )
+        .subcommand(
+            Command::new("identify")
+                .about("Identify an agent from a captured screen using manifest identity rules")
+                .arg(path_option("file", "PATH").required(true))
+                .arg(option("osc-title", "TEXT"))
+                .arg(option("osc-progress", "TEXT"))
+                .arg(json_flag()),
+        )
 }
 
 pub(super) fn agent_kind_values() -> Vec<&'static str> {
@@ -695,6 +703,7 @@ fn pane_command() -> Command {
         .subcommand(report_agent_command())
         .subcommand(report_agent_session_command())
         .subcommand(release_agent_command())
+        .subcommand(declare_agent_command())
         .subcommand(report_metadata_command())
 }
 
@@ -730,6 +739,14 @@ fn release_agent_command() -> Command {
         .arg(option("source", "ID").required(true))
         .arg(option("agent", "LABEL").required(true))
         .arg(option("seq", "N"))
+}
+
+fn declare_agent_command() -> Command {
+    Command::new("declare-agent")
+        .about("Declare which agent a pane hosts, or clear the declaration")
+        .arg(required("pane_id", "PANE_ID"))
+        .arg(option("agent", "LABEL"))
+        .arg(flag("clear"))
 }
 
 fn report_metadata_command() -> Command {

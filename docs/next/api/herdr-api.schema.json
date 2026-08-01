@@ -800,6 +800,13 @@
                 "null"
               ]
             },
+            "declared_agent": {
+              "description": "Agent label explicitly declared for this pane, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "display_agent": {
               "type": [
                 "string",
@@ -2474,6 +2481,25 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "PaneDeclareAgentParams": {
+          "description": "Declare which agent a pane hosts when the process probe cannot see it.\n\nThe declaration is durable: it survives restart and live handoff until it is\ncleared with a null `agent`.",
+          "properties": {
+            "agent": {
+              "description": "Agent label to declare, or null to clear the declaration.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
           "type": "object"
         },
         "PaneDirection": {
@@ -5708,6 +5734,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.declare_agent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneDeclareAgentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.close",
               "type": "string"
             },
@@ -7598,6 +7640,13 @@
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
             "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "declared_agent": {
+              "description": "Agent label explicitly declared for this pane, if any.",
               "type": [
                 "string",
                 "null"

@@ -215,6 +215,11 @@ impl TerminalRuntime {
         self.0.begin_graceful_release(agent);
     }
 
+    /// Declare which agent this terminal hosts, or clear the declaration.
+    pub fn set_declared_agent(&self, agent: Option<crate::detect::Agent>) {
+        self.0.set_declared_agent(agent);
+    }
+
     pub fn reset_agent_detection(&self) {
         self.0.reset_agent_detection();
     }

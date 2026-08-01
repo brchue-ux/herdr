@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio`, `layout.arrange` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -701,6 +701,49 @@ Session-only official integrations report native session references with `pane.r
   }
 }
 ```
+
+## Declaring which agent a pane hosts
+
+Herdr identifies a pane's agent from its process tree. A wrapper script, a
+launcher, or a terminal multiplexer can hide the agent process, leaving the pane
+`unknown` even though an agent is plainly running in it.
+
+Two things close that gap, in this order:
+
+1. **The declaration.** `pane.declare_agent` states the answer outright. It
+   reports no state — only identity — after which Herdr's normal screen
+   detection runs for that agent and produces live state. Send `agent: null` to
+   clear it.
+
+   ```json
+   {
+     "id": "req_1",
+     "method": "pane.declare_agent",
+     "params": { "pane_id": "w1:p1", "agent": "claude" }
+   }
+   ```
+
+   Process identity stays authoritative: the declaration is consulted only while
+   the process probe finds no agent, so a directly launched agent is unaffected.
+   A pending `pane.release_agent` outranks it. The declaration is durable — it
+   survives a server restart and a live handoff until cleared — and `pane.get`
+   and `pane.list` report it as `declared_agent`.
+
+2. **Screen identification.** When neither the process probe nor a declaration
+   knows the agent, Herdr tries to recognize the agent from the pane's own
+   screen, using `[[identity]]` rules in the bundled agent manifests. This needs
+   no cooperation from the agent and no configuration.
+
+   It is deliberately conservative, because a misidentified pane reports another
+   agent's state as fact: only agents whose manifest ships identity rules can be
+   identified at all, two agents matching the same screen is treated as
+   ambiguous and yields nothing, and the same answer has to survive several
+   consecutive scans before it is adopted. An identification is discarded as
+   soon as the pane's foreground process group changes.
+
+   `herdr agent identify --file PATH [--osc-title TEXT]` runs the same rules
+   against a captured screen, which is how identity rules are written and
+   checked.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` expose a read-only `agent_session` object when Herdr has a stored native session reference:
 

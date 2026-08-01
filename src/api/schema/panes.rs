@@ -368,6 +368,18 @@ pub struct PaneReportAgentSessionParams {
     pub session_start_source: Option<String>,
 }
 
+/// Declare which agent a pane hosts when the process probe cannot see it.
+///
+/// The declaration is durable: it survives restart and live handoff until it is
+/// cleared with a null `agent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneDeclareAgentParams {
+    pub pane_id: String,
+    /// Agent label to declare, or null to clear the declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportMetadataParams {
     pub pane_id: String,
@@ -446,6 +458,9 @@ pub struct PaneInfo {
     pub terminal_title_stripped: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
+    /// Agent label explicitly declared for this pane, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_agent: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,

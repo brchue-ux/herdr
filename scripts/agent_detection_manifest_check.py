@@ -26,7 +26,9 @@ MANIFEST_KEYS = {
     "aliases",
     "rules",
     "transcript_region",
+    "identity",
 }
+IDENTITY_RULE_KEYS = {"id", "region", "all", "any", "not", "contains", "regex", "line_regex"}
 RULE_KEYS = {
     "id",
     "state",
@@ -57,6 +59,9 @@ REGION_COUNT_RE = re.compile(r"\(([1-9][0-9]*)\)$")
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 MAX_TOP_REGION_LINE_COUNT = 65_535
 MAX_RULES_PER_MANIFEST = 128
+MAX_IDENTITY_RULES_PER_MANIFEST = 16
+# `[[identity]]` blocks were added in engine 5.
+IDENTITY_RULES_ENGINE_VERSION = 5
 MAX_GATE_DEPTH = 8
 MAX_TOTAL_GATES = 512
 MAX_MATCHERS_PER_GATE = 32
@@ -73,6 +78,10 @@ MAX_MATCHER_CHARS = 512
 # engine floor, which is exactly how the Grok entry broke when transcript
 # regions took the engine to 4. Remove an entry once the website publishes the
 # bundled manifest.
+#
+# Claude is staged one engine further for the same reason: the bundled manifest
+# carries `[[identity]]` rules, which need engine 5. Publishing it would make
+# every client below engine 5 reject the remote manifest outright.
 STAGED_WEBSITE_MANIFESTS = {
     "grok": (
         "2026.07.16.2",
@@ -81,10 +90,10 @@ STAGED_WEBSITE_MANIFESTS = {
         3,
     ),
     "claude": (
-        "2026.07.31.1",
+        "2026.07.31.2",
         "2026.07.13.1",
         "d7b3e653a6d84024d1cca5b35bfa8a1d59afd9ce6bbfe06275d38315f18c2dc8",
-        4,
+        5,
     ),
     "codex": (
         "2026.07.31.1",
@@ -216,7 +225,47 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
                 f"{path}: rule {rule['id']} region {region!r} requires min_engine_version 3"
             )
 
+    identity = manifest.get("identity", [])
+    if not isinstance(identity, list):
+        raise CheckError(f"{path}: identity must be an array")
+    if len(identity) > MAX_IDENTITY_RULES_PER_MANIFEST:
+        raise CheckError(
+            f"{path}: manifest exceeds max identity rule count {MAX_IDENTITY_RULES_PER_MANIFEST}"
+        )
+    if identity and min_engine < IDENTITY_RULES_ENGINE_VERSION:
+        raise CheckError(
+            f"{path}: identity rules require min_engine_version {IDENTITY_RULES_ENGINE_VERSION}"
+        )
+    for index, rule in enumerate(identity):
+        validate_identity_rule(path, index, rule, complexity)
+
     return manifest
+
+
+def validate_identity_rule(
+    path: Path, index: int, rule: object, complexity: dict[str, int]
+) -> None:
+    if not isinstance(rule, dict):
+        raise CheckError(f"{path}: identity rule {index} must be a table")
+    unknown = sorted(set(rule) - IDENTITY_RULE_KEYS)
+    if unknown:
+        raise CheckError(
+            f"{path}: identity rule {index} has unknown field(s): {', '.join(unknown)}"
+        )
+    rule_id = rule.get("id")
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise CheckError(f"{path}: identity rule {index} id must be a non-empty string")
+    region = rule.get("region", "whole_recent")
+    if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+        raise CheckError(f"{path}: identity rule {rule_id} has invalid region {region!r}")
+    validate_gate(
+        path,
+        f"identity rule {rule_id}",
+        rule,
+        require_positive=True,
+        depth=0,
+        complexity=complexity,
+    )
 
 
 def validate_rule(path: Path, index: int, rule: object, complexity: dict[str, int]) -> None:
@@ -262,7 +311,13 @@ def validate_gate(
     complexity["gates"] += 1
     if complexity["gates"] > MAX_TOTAL_GATES:
         raise CheckError(f"{path}: manifest exceeds max gate count {MAX_TOTAL_GATES}")
-    unknown = sorted(set(gate) - (RULE_KEYS if label.startswith("rule ") else GATE_KEYS))
+    if label.startswith("rule "):
+        allowed = RULE_KEYS
+    elif label.startswith("identity rule "):
+        allowed = IDENTITY_RULE_KEYS
+    else:
+        allowed = GATE_KEYS
+    unknown = sorted(set(gate) - allowed)
     if unknown:
         raise CheckError(f"{path}: {label} has unknown gate field(s): {', '.join(unknown)}")
     matcher_count = 0

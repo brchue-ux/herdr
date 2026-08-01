@@ -203,6 +203,8 @@ pub enum Method {
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams),
     #[serde(rename = "pane.release_agent")]
     PaneReleaseAgent(PaneReleaseAgentParams),
+    #[serde(rename = "pane.declare_agent")]
+    PaneDeclareAgent(PaneDeclareAgentParams),
     #[serde(rename = "pane.close")]
     PaneClose(PaneTarget),
     #[serde(rename = "popup.close")]
