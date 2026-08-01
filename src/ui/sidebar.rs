@@ -1112,7 +1112,7 @@ pub(crate) fn workspace_drop_slots(
         }
     }
 
-    let Some(last) = cards.iter().filter(|card| card.agent.is_none()).next_back() else {
+    let Some(last) = cards.iter().rfind(|card| card.agent.is_none()) else {
         return slots;
     };
     let Some(last_entry_idx) = entry_position(last.ws_idx) else {
