@@ -300,7 +300,6 @@ pub fn capture(
     active: Option<usize>,
     selected: usize,
     sidebar_width: u16,
-    sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
     agent_view: Option<crate::api::schema::AgentViewSetParams>,
 ) -> SessionSnapshot {
@@ -318,7 +317,10 @@ pub fn capture(
         active,
         selected,
         sidebar_width: Some(sidebar_width),
-        sidebar_section_split: Some(sidebar_section_split),
+        // Retired with the Agents panel: the sidebar is one section, so there is
+        // no split to size. Kept on the wire, always `None`, so a snapshot
+        // written by an older build still parses instead of failing restore.
+        sidebar_section_split: None,
         collapsed_space_keys,
         agent_view,
     }
@@ -619,7 +621,6 @@ mod tests {
             state.active,
             state.selected,
             state.sidebar_width,
-            state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
             None,
         )
@@ -1007,13 +1008,14 @@ mod tests {
     fn capture_contract_tracks_sidebar_state() {
         let mut state = state_with_workspaces(&["one"]);
         state.sidebar_width = 31;
-        state.sidebar_section_split = 0.4;
         state.collapsed_space_keys.insert("repo-key".into());
 
         let snapshot = capture_from_state(&state);
         assert_eq!(snapshot.sidebar_width, Some(31));
-        assert_eq!(snapshot.sidebar_section_split, Some(0.4));
         assert!(snapshot.collapsed_space_keys.contains("repo-key"));
+        // The sidebar is one section now, so there is no split to carry. The
+        // field survives only so a file written by an older build still parses.
+        assert_eq!(snapshot.sidebar_section_split, None);
     }
 
     /// Gap 1 in the report: nothing published at runtime reached the session
@@ -1086,7 +1088,6 @@ mod tests {
             state.active,
             state.selected,
             state.sidebar_width,
-            state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
             Some(view.clone()),
         );

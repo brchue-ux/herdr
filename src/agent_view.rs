@@ -420,18 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn every_category_tab_installs_a_view_that_validates() {
-        // The click path builds these; if one failed validation the tab would
-        // silently do nothing.
-        for category in crate::ui::AGENT_CATEGORIES {
-            let mut spec = category.view();
-            validate_agent_view(&mut spec).unwrap_or_else(|err| {
-                panic!("category {:?} produced an invalid view: {err}", category)
-            });
-        }
-    }
-
-    #[test]
     fn an_unknown_relation_is_rejected() {
         let mut spec = relation_view("example.views", "captain");
         let err = validate_agent_view(&mut spec).unwrap_err();

@@ -1214,9 +1214,6 @@ pub(crate) enum DragTarget {
     WorkspaceListScrollbar {
         grab_row_offset: u16,
     },
-    AgentPanelScrollbar {
-        grab_row_offset: u16,
-    },
     PaneSplit {
         path: Vec<bool>,
         direction: Direction,
@@ -1237,9 +1234,6 @@ pub(crate) enum DragTarget {
         grab_row_offset: u16,
     },
     SidebarDivider {
-        grab_offset: i16,
-    },
-    SidebarSectionDivider {
         grab_offset: i16,
     },
 }
@@ -1526,7 +1520,6 @@ pub struct AppState {
     pub navigator: NavigatorState,
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
-    pub agent_panel_scroll: usize,
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
     pub mobile_switcher_scroll: usize,
@@ -1562,19 +1555,12 @@ pub struct AppState {
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
-    /// Ratio of sidebar height allocated to the workspaces section.
-    pub sidebar_section_split: f32,
+    /// Order agent rows take within their owner in the sidebar tree.
     pub agent_panel_sort: AgentPanelSort,
-    /// Which Agents category tab is selected, or `None` for the whole tree.
-    ///
-    /// `None` is the resting state on purpose: the panel is meant to be the
-    /// always-on truth, so it opens showing every pane rather than opening
-    /// pre-filtered to one category. Selecting a tab installs a `ui`-tier view;
-    /// selecting the selected tab again clears it.
-    pub agent_category: Option<crate::ui::AgentCategory>,
-    /// Every source that currently wants to own the built-in Agents view. Only
-    /// the winning tier is projected onto the panel; see [`crate::agent_view`]
-    /// for the precedence rule.
+    /// Every source that currently wants to own the built-in Agents view. It
+    /// projects onto the mobile switcher and `agent view get`; the sidebar tree
+    /// is deliberately never filtered by it, because it is the only place a
+    /// mate or worker is drawn and a filter there could hide the whole fleet.
     pub agent_views: crate::agent_view::AgentViewSlots,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
@@ -2069,7 +2055,6 @@ impl AppState {
             navigator: NavigatorState::default(),
             copy_mode: None,
             workspace_scroll: 0,
-            agent_panel_scroll: 0,
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
@@ -2115,9 +2100,7 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
-            sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
-            agent_category: None,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),

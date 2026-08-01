@@ -114,7 +114,6 @@ impl App {
         let durable_changed = tier == crate::agent_view::AgentViewTier::Api
             && self.state.agent_views.durable() != view.as_ref();
         if self.state.agent_views.set(tier, view) {
-            self.state.agent_panel_scroll = 0;
             self.state.mobile_switcher_scroll = 0;
         }
         if durable_changed {

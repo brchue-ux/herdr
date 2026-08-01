@@ -4,33 +4,13 @@ use crate::app::state::{AppState, ViewLayout};
 
 use super::ScrollbarClickTarget;
 
-/// Click outcome for the single control in the Agents panel header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AgentPanelHeaderAction {
-    ToggleSort,
-    ClearView,
-    /// A category tab was clicked. Selecting the selected one clears back to
-    /// the whole tree, so the selector can never strand the user in a filter.
-    SelectCategory(crate::ui::AgentCategory),
-}
-
 impl AppState {
     pub(super) fn workspace_list_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
-        crate::ui::workspace_list_rect(sidebar, self.sidebar_section_split)
-    }
-
-    pub(super) fn agent_panel_rect(&self) -> Rect {
-        let sidebar = self.view.sidebar_rect;
-        if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
-            return Rect::default();
-        }
-        let (_, detail_area) =
-            crate::ui::expanded_sidebar_sections(sidebar, self.sidebar_section_split);
-        detail_area
+        crate::ui::workspace_list_rect(sidebar)
     }
 
     pub(super) fn workspace_list_scrollbar_target_at(
@@ -110,69 +90,6 @@ impl AppState {
             self.view.sidebar_rect,
             self.workspace_scroll,
         );
-    }
-
-    pub(super) fn agent_panel_scrollbar_target_at(
-        &self,
-        col: u16,
-        row: u16,
-    ) -> Option<ScrollbarClickTarget> {
-        let area = self.agent_panel_rect();
-        let metrics = crate::ui::agent_panel_scroll_metrics(self, area);
-        let track = crate::ui::agent_panel_scrollbar_rect(self, area)?;
-        if col < track.x
-            || col >= track.x + track.width
-            || row < track.y
-            || row >= track.y + track.height
-        {
-            return None;
-        }
-        if let Some(grab_row_offset) = crate::ui::scrollbar_thumb_grab_offset(metrics, track, row) {
-            Some(ScrollbarClickTarget::Thumb { grab_row_offset })
-        } else {
-            Some(ScrollbarClickTarget::Track {
-                offset_from_bottom: crate::ui::scrollbar_offset_from_row(metrics, track, row),
-            })
-        }
-    }
-
-    pub(super) fn agent_panel_offset_for_drag_row(
-        &self,
-        row: u16,
-        grab_row_offset: u16,
-    ) -> Option<usize> {
-        let area = self.agent_panel_rect();
-        let metrics = crate::ui::agent_panel_scroll_metrics(self, area);
-        let track = crate::ui::agent_panel_scrollbar_rect(self, area)?;
-        Some(crate::ui::scrollbar_offset_from_drag_row(
-            metrics,
-            track,
-            row,
-            grab_row_offset,
-        ))
-    }
-
-    pub(super) fn set_agent_panel_offset_from_bottom(&mut self, offset_from_bottom: usize) {
-        let area = self.agent_panel_rect();
-        let metrics = crate::ui::agent_panel_scroll_metrics(self, area);
-        self.agent_panel_scroll = metrics
-            .max_offset_from_bottom
-            .saturating_sub(offset_from_bottom);
-    }
-
-    pub(super) fn scroll_agent_panel(&mut self, delta: i16) {
-        let area = self.agent_panel_rect();
-        let max_scroll = crate::ui::agent_panel_scroll_metrics(self, area).max_offset_from_bottom;
-        if delta.is_negative() {
-            self.agent_panel_scroll = self
-                .agent_panel_scroll
-                .saturating_sub(delta.unsigned_abs() as usize);
-        } else {
-            self.agent_panel_scroll = self
-                .agent_panel_scroll
-                .saturating_add(delta as usize)
-                .min(max_scroll);
-        }
     }
 
     pub(crate) fn sidebar_footer_rect(&self) -> Rect {
@@ -318,18 +235,18 @@ impl AppState {
         Some(offset as i16)
     }
 
-    /// Whether either sidebar panel draws a scrollbar track over this cell.
-    /// Both tracks only exist while their panel overflows, so this is false
-    /// whenever the panels fit and the band is at full width.
+    /// Whether the sidebar draws a scrollbar track over this cell. The track
+    /// only exists while the tree overflows, so this is false whenever it fits
+    /// and the band is at full width.
     fn sidebar_scrollbar_track_at(&self, col: u16, row: u16) -> bool {
-        let workspaces = crate::ui::workspace_list_scrollbar_rect(self, self.workspace_list_rect());
-        let agents = crate::ui::agent_panel_scrollbar_rect(self, self.agent_panel_rect());
-        [workspaces, agents].into_iter().flatten().any(|track| {
-            col >= track.x
-                && col < track.x + track.width
-                && row >= track.y
-                && row < track.y + track.height
-        })
+        crate::ui::workspace_list_scrollbar_rect(self, self.workspace_list_rect()).is_some_and(
+            |track| {
+                col >= track.x
+                    && col < track.x + track.width
+                    && row >= track.y
+                    && row < track.y + track.height
+            },
+        )
     }
 
     /// The workspace whose group chevron occupies this cell, when that chevron
@@ -375,69 +292,6 @@ impl AppState {
         self.mark_session_dirty();
     }
 
-    /// Where the Spaces/Agents separator sits relative to a press, or `None`
-    /// when the press is outside the grab band. Adding the returned offset to
-    /// the press row gives the separator row.
-    ///
-    /// The band extends down, onto the agent panel's ` agents` header row. That
-    /// row carries no click target except the sort toggle, which is carved back
-    /// out, so this side costs almost nothing. Extending up would take clicks
-    /// from workspace cards instead.
-    pub(super) fn sidebar_section_divider_grab_at(&self, col: u16, row: u16) -> Option<i16> {
-        if self.sidebar_collapsed {
-            return None;
-        }
-        let sidebar = self.view.sidebar_rect;
-        let rect = crate::ui::sidebar_section_divider_rect(sidebar, self.sidebar_section_split);
-        if rect.width == 0 || col < rect.x || col >= rect.x + rect.width {
-            return None;
-        }
-
-        let below = row.checked_sub(rect.y)?;
-        if below > Self::DIVIDER_GRAB_TOLERANCE {
-            return None;
-        }
-
-        if below > 0 {
-            if row >= sidebar.y + sidebar.height {
-                return None;
-            }
-            let (_, detail_area) =
-                crate::ui::expanded_sidebar_sections(sidebar, self.sidebar_section_split);
-            let toggle = crate::ui::agent_panel_control(self, detail_area).rect;
-            if toggle.width > 0
-                && col >= toggle.x
-                && col < toggle.x + toggle.width
-                && row >= toggle.y
-                && row < toggle.y + toggle.height
-            {
-                return None;
-            }
-            // The Agents panel header is by construction divider+1, so the
-            // category tabs live inside this grab band too. Without carving
-            // them out the same way the control above is carved out, every
-            // mouse-down on a tab becomes a divider drag and the selector
-            // silently does nothing.
-            if crate::ui::agent_category_tab_at(self, detail_area, col, row).is_some() {
-                return None;
-            }
-        }
-
-        Some(-(below as i16))
-    }
-
-    pub(super) fn set_sidebar_section_split(&mut self, row: u16) {
-        let sidebar = self.view.sidebar_rect;
-        let content_height = sidebar.height;
-        if content_height < 6 {
-            return;
-        }
-        let relative_y = row.saturating_sub(sidebar.y);
-        let ratio = (relative_y as f32) / (content_height as f32);
-        self.sidebar_section_split = ratio.clamp(0.1, 0.9);
-        self.mark_session_dirty();
-    }
-
     pub(super) fn workspace_at_row(&self, row: u16) -> Option<usize> {
         let footer = self.sidebar_footer_rect();
         if footer == Rect::default() {
@@ -460,41 +314,13 @@ impl AppState {
             return None;
         }
 
-        let (ws_area, _, _) = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
+        let ws_area = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
         if ws_area == Rect::default() || row < ws_area.y || row >= ws_area.y + ws_area.height {
             return None;
         }
 
         let idx = (row - ws_area.y) as usize;
         (idx < self.workspaces.len()).then_some(idx)
-    }
-
-    pub(super) fn collapsed_agent_detail_target_at(
-        &self,
-        row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
-        if !self.sidebar_collapsed {
-            return None;
-        }
-
-        let (_, _, detail_area) = crate::ui::collapsed_sidebar_sections(self.view.sidebar_rect);
-        let detail_content_area = Rect::new(
-            detail_area.x,
-            detail_area.y,
-            detail_area.width,
-            detail_area.height.saturating_sub(1),
-        );
-        if detail_content_area == Rect::default()
-            || row < detail_content_area.y
-            || row >= detail_content_area.y + detail_content_area.height
-        {
-            return None;
-        }
-
-        let detail_idx = (row - detail_content_area.y) as usize;
-        let details = crate::ui::agent_panel_entries(self);
-        let detail = details.get(detail_idx)?;
-        Some((detail.ws_idx, detail.tab_idx, detail.pane_id))
     }
 
     pub(super) fn workspace_drop_target_at_row(
@@ -602,85 +428,6 @@ impl AppState {
             workspace_ids,
             before_workspace_id,
         })
-    }
-
-    /// What clicking the Agents panel header control at `col`/`row` should do.
-    ///
-    /// The control doubles as the escape hatch from a sticky view: while one is
-    /// active it names the owning tier and clears it on click, so the user can
-    /// always get back to the unfiltered panel.
-    pub(super) fn agent_panel_header_action_at(
-        &self,
-        col: u16,
-        row: u16,
-    ) -> Option<AgentPanelHeaderAction> {
-        if self.sidebar_collapsed {
-            return None;
-        }
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
-        // Tabs sit left of the control on the same row, so they are tested
-        // first; the control's rect is already excluded from their layout.
-        if let Some(category) = crate::ui::agent_category_tab_at(self, detail_area, col, row) {
-            return Some(AgentPanelHeaderAction::SelectCategory(category));
-        }
-
-        let control = crate::ui::agent_panel_control(self, detail_area);
-        let rect = control.rect;
-        let hit = rect.width > 0
-            && col >= rect.x
-            && col < rect.x + rect.width
-            && row >= rect.y
-            && row < rect.y + rect.height;
-        if !hit {
-            return None;
-        }
-        Some(if control.clears_view {
-            AgentPanelHeaderAction::ClearView
-        } else {
-            AgentPanelHeaderAction::ToggleSort
-        })
-    }
-
-    pub(super) fn agent_detail_target_at(
-        &self,
-        row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
-        if self.sidebar_collapsed {
-            return None;
-        }
-
-        let detail_area = self.agent_panel_rect();
-        let metrics = crate::ui::agent_panel_scroll_metrics(self, detail_area);
-        let body = crate::ui::agent_panel_body_rect(
-            detail_area,
-            crate::ui::should_show_scrollbar(metrics),
-        );
-        if body.height == 0 || row < body.y || row >= body.y + body.height {
-            return None;
-        }
-
-        let mut row_y = body.y;
-        let body_bottom = body.y + body.height;
-        let entries = crate::ui::agent_panel_entries(self);
-        let scroll = self.agent_panel_scroll.min(metrics.max_offset_from_bottom);
-        for (index, detail) in entries.iter().enumerate().skip(scroll) {
-            let height = crate::ui::agent_entry_height_in_body(self, detail, body.height);
-            if row_y.saturating_add(height) > body_bottom {
-                break;
-            }
-            if row >= row_y && row < row_y.saturating_add(height) {
-                return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
-            }
-            row_y = row_y
-                .saturating_add(height)
-                .saturating_add(crate::ui::agent_entry_gap(self, index, entries.len()))
-                .min(body_bottom);
-        }
-        None
     }
 }
 
@@ -859,603 +606,6 @@ mod tests {
                 "what's new",
                 "detach"
             ]
-        );
-    }
-
-    #[test]
-    fn clicking_agent_detail_row_switches_to_correct_tab_and_pane() {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("test");
-        ws.tabs[0].set_custom_name("main".into());
-        let first_pane = ws.tabs[0].root_pane;
-        let first_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[first_tab].root_pane;
-        app.state.workspaces = vec![ws];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&first_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Pi);
-        let second_terminal_id = app.state.workspaces[0].tabs[first_tab].panes[&second_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&second_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Claude);
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 16));
-
-        assert_eq!(app.state.workspaces[0].active_tab, 1);
-        assert_eq!(
-            app.state.workspaces[0].tabs[1].layout.focused(),
-            second_pane
-        );
-        assert_eq!(app.state.mode, Mode::Terminal);
-        let snapshot = capture_snapshot(&app.state);
-        assert_eq!(snapshot.workspaces[0].active_tab, first_tab);
-        assert_eq!(
-            snapshot.workspaces[0].tabs[first_tab].focused,
-            Some(second_pane.raw())
-        );
-    }
-
-    #[test]
-    fn per_agent_row_heights_preserve_card_gaps_and_trailing_mouse_targets() {
-        let mut app = app_for_mouse_test();
-        let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
-        let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
-        app.state.workspaces = vec![first, second];
-        app.state.ensure_test_terminals();
-        for (ws_idx, pane_id, agent) in
-            [(0, first_pane, Agent::Pi), (1, second_pane, Agent::Claude)]
-        {
-            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
-                .attached_terminal_id
-                .clone();
-            app.state
-                .terminals
-                .get_mut(&terminal_id)
-                .unwrap()
-                .detected_agent = Some(agent);
-        }
-        app.state.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
-        app.state.sidebar_agents.rows_by_agent.insert(
-            "claude".into(),
-            vec![
-                vec![crate::config::AgentSidebarToken::Agent],
-                vec![crate::config::AgentSidebarToken::Workspace],
-            ],
-        );
-        app.state.sidebar_agents.row_gap = 1;
-        let detail_area = app.state.agent_panel_rect();
-        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
-        let body = crate::ui::agent_panel_body_rect(
-            detail_area,
-            crate::ui::should_show_scrollbar(metrics),
-        );
-
-        assert_eq!(
-            app.state.agent_detail_target_at(body.y),
-            Some((0, 0, first_pane))
-        );
-        assert_eq!(app.state.agent_detail_target_at(body.y + 1), None);
-        assert_eq!(
-            app.state.agent_detail_target_at(body.y + 3),
-            Some((1, 0, second_pane))
-        );
-
-        app.state.sidebar_agents.row_gap = 0;
-        assert_eq!(
-            app.state.agent_detail_target_at(body.y + 1),
-            Some((1, 0, second_pane))
-        );
-    }
-
-    #[test]
-    fn agent_hit_testing_clamps_scroll_after_dynamic_filter_shrink() {
-        let mut app = app_for_mouse_test();
-        let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
-        let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
-        app.state.workspaces = vec![first, second];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        for (ws_idx, pane_id) in [(0, first_pane), (1, second_pane)] {
-            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
-                .attached_terminal_id
-                .clone();
-            app.state
-                .terminals
-                .get_mut(&terminal_id)
-                .unwrap()
-                .detected_agent = Some(Agent::Claude);
-        }
-        app.state.agent_views.set(
-            crate::agent_view::AgentViewTier::Api,
-            Some(crate::api::schema::AgentViewSetParams {
-                source: "example.views".to_string(),
-                label: None,
-                filter: Some(crate::api::schema::AgentViewFilter::Eq {
-                    field: crate::api::schema::AgentViewField::Builtin(
-                        crate::api::schema::AgentViewBuiltinField::WorkspaceId,
-                    ),
-                    value: crate::api::schema::AgentViewValue::Context {
-                        context: crate::api::schema::AgentViewContext::CurrentWorkspaceId,
-                    },
-                }),
-                sort: Vec::new(),
-            }),
-        );
-        app.state.agent_panel_scroll = 10;
-        let detail_area = app.state.agent_panel_rect();
-        let body = crate::ui::agent_panel_body_rect(detail_area, false);
-
-        assert_eq!(
-            app.state.agent_detail_target_at(body.y),
-            Some((0, 0, first_pane))
-        );
-    }
-
-    #[test]
-    fn clicking_agent_panel_toggle_switches_sort() {
-        let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("test")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scroll = 3;
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let toggle = crate::ui::agent_panel_control(&app.state, detail_area).rect;
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            toggle.x,
-            toggle.y,
-        ));
-
-        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
-        assert_eq!(app.state.agent_panel_scroll, 0);
-    }
-
-    /// Drives the real `handle_mouse` entry point rather than
-    /// `agent_panel_header_action_at`. The Agents header is by construction
-    /// divider+1, so it sits inside `sidebar_section_divider_grab_at`'s band —
-    /// which runs first and returns early. Testing the handler in isolation
-    /// passes while every click actually starts a divider drag, which is
-    /// exactly how this shipped broken the first time.
-    #[test]
-    fn clicking_a_category_tab_selects_it_instead_of_dragging_the_divider() {
-        let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("test")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let tabs = crate::ui::agent_category_tabs(
-            crate::ui::agent_panel_title_rect(detail_area),
-            app.state.agent_category,
-        );
-        let workers = tabs
-            .iter()
-            .find(|tab| tab.category == crate::ui::AgentCategory::Workers)
-            .expect("workers tab is drawn at width 26");
-
-        let split_before = app.state.sidebar_section_split;
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            workers.rect.x,
-            workers.rect.y,
-        ));
-
-        assert_eq!(
-            app.state.agent_category,
-            Some(crate::ui::AgentCategory::Workers),
-            "clicking a tab must select it"
-        );
-        assert!(
-            app.state.drag.is_none(),
-            "clicking a tab must not start a divider drag"
-        );
-        assert_eq!(
-            app.state.sidebar_section_split, split_before,
-            "clicking a tab must not move the section divider"
-        );
-        // The selection reached the panel through the ui tier, not a private
-        // filter, so the API door can read it back.
-        assert_eq!(
-            app.state.agent_views.active_tier(),
-            Some(crate::agent_view::AgentViewTier::Ui)
-        );
-
-        // Clicking the selected tab again returns to the whole tree.
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            workers.rect.x,
-            workers.rect.y,
-        ));
-        assert_eq!(app.state.agent_category, None);
-        assert_eq!(app.state.agent_views.active_tier(), None);
-    }
-
-    /// The carve-out must be exactly the tabs — the rest of that row is still
-    /// the divider's grab band.
-    #[test]
-    fn the_header_row_between_tabs_still_drags_the_divider() {
-        let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("test")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let tabs = crate::ui::agent_category_tabs(
-            crate::ui::agent_panel_title_rect(detail_area),
-            app.state.agent_category,
-        );
-        let first = tabs.first().expect("tabs are drawn");
-
-        // Column 0 is left of the first tab, which starts one column in.
-        assert!(first.rect.x > 0);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            0,
-            first.rect.y,
-        ));
-
-        assert_eq!(app.state.agent_category, None, "no tab should be selected");
-        assert!(
-            matches!(
-                app.state.drag.as_ref().map(|drag| &drag.target),
-                Some(DragTarget::SidebarSectionDivider { .. })
-            ),
-            "the rest of the header row must still grab the divider"
-        );
-    }
-
-    #[test]
-    fn clicking_the_header_of_a_filtered_panel_clears_one_tier_at_a_time() {
-        let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("test")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let blocked_only = |source: &str| crate::api::schema::AgentViewSetParams {
-            source: source.to_string(),
-            label: None,
-            filter: Some(crate::api::schema::AgentViewFilter::Eq {
-                field: crate::api::schema::AgentViewField::Builtin(
-                    crate::api::schema::AgentViewBuiltinField::Status,
-                ),
-                value: crate::api::schema::AgentViewValue::String("blocked".to_string()),
-            }),
-            sort: Vec::new(),
-        };
-        app.state.agent_views.set(
-            crate::agent_view::AgentViewTier::Config,
-            Some(blocked_only(crate::agent_view::CONFIG_VIEW_SOURCE)),
-        );
-        app.state.agent_views.set(
-            crate::agent_view::AgentViewTier::Api,
-            Some(blocked_only("plugin:agents")),
-        );
-
-        let click = |app: &mut crate::app::App| {
-            let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-                app.state.view.sidebar_rect,
-                app.state.sidebar_section_split,
-            );
-            let control = crate::ui::agent_panel_control(&app.state, detail_area);
-            assert!(control.clears_view, "header should offer to clear the view");
-            app.handle_mouse(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                control.rect.x,
-                control.rect.y,
-            ));
-        };
-
-        click(&mut app);
-        assert_eq!(
-            app.state.agent_views.active_tier(),
-            Some(crate::agent_view::AgentViewTier::Config)
-        );
-
-        click(&mut app);
-        assert!(!app.state.agent_views.is_active());
-        // With nothing filtering the panel the header is a sort toggle again.
-        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Spaces);
-    }
-
-    #[test]
-    fn clicking_all_workspaces_agent_row_switches_to_correct_workspace() {
-        let mut app = app_for_mouse_test();
-        let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
-
-        let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
-
-        app.state.workspaces = vec![first, second];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&first_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Pi);
-        let second_terminal_id = app.state.workspaces[1].tabs[0].panes[&second_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&second_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Claude);
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            detail_area.x + 2,
-            detail_area.y + 6,
-        ));
-
-        assert_eq!(app.state.active, Some(1));
-        assert_eq!(app.state.selected, 1);
-        assert_eq!(app.state.workspaces[1].active_tab, 0);
-        assert_eq!(
-            app.state.workspaces[1].tabs[0].layout.focused(),
-            second_pane
-        );
-    }
-
-    #[test]
-    fn scrolling_agent_panel_with_wheel_updates_agent_panel_scroll() {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
-
-        let mut tabs = Vec::new();
-        for (tab_name, agent) in [
-            ("logs", Agent::Claude),
-            ("review", Agent::Codex),
-            ("ops", Agent::Gemini),
-        ] {
-            let tab_idx = ws.test_add_tab(Some(tab_name));
-            let pane_id = ws.tabs[tab_idx].root_pane;
-            tabs.push((tab_idx, pane_id, agent));
-        }
-
-        app.state.workspaces = vec![ws];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&first_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Pi);
-        for (tab_idx, pane_id, agent) in tabs {
-            let terminal_id = app.state.workspaces[0].tabs[tab_idx].panes[&pane_id]
-                .attached_terminal_id
-                .clone();
-            app.state
-                .terminals
-                .get_mut(&terminal_id)
-                .unwrap()
-                .detected_agent = Some(agent);
-        }
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-
-        let detail_area = app.state.agent_panel_rect();
-        assert!(crate::ui::should_show_scrollbar(
-            crate::ui::agent_panel_scroll_metrics(&app.state, detail_area)
-        ));
-
-        app.handle_mouse(mouse(
-            MouseEventKind::ScrollDown,
-            detail_area.x + 1,
-            detail_area.y + 4,
-        ));
-
-        assert_eq!(app.state.agent_panel_scroll, 1);
-        assert_eq!(app.state.selected, 0);
-    }
-
-    #[test]
-    fn clicking_scrolled_agent_detail_row_switches_to_correct_tab_and_pane() {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
-        let second_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[second_tab].root_pane;
-        let mut extra_tabs = Vec::new();
-        for (tab_name, agent) in [("review", Agent::Codex), ("ops", Agent::Gemini)] {
-            let tab_idx = ws.test_add_tab(Some(tab_name));
-            let pane_id = ws.tabs[tab_idx].root_pane;
-            extra_tabs.push((tab_idx, pane_id, agent));
-        }
-
-        app.state.workspaces = vec![ws];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&first_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Pi);
-        let second_terminal_id = app.state.workspaces[0].tabs[second_tab].panes[&second_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&second_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Claude);
-        for (tab_idx, pane_id, agent) in extra_tabs {
-            let terminal_id = app.state.workspaces[0].tabs[tab_idx].panes[&pane_id]
-                .attached_terminal_id
-                .clone();
-            app.state
-                .terminals
-                .get_mut(&terminal_id)
-                .unwrap()
-                .detected_agent = Some(agent);
-        }
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
-        app.state.sidebar_agents.rows_by_agent.insert(
-            "claude".into(),
-            vec![
-                vec![crate::config::AgentSidebarToken::Agent],
-                vec![crate::config::AgentSidebarToken::Workspace],
-            ],
-        );
-        app.state.agent_panel_scroll = 1;
-
-        let detail_area = app.state.agent_panel_rect();
-        let body = crate::ui::agent_panel_body_rect(detail_area, true);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            body.x + 1,
-            body.y + 1,
-        ));
-
-        assert_eq!(app.state.workspaces[0].active_tab, second_tab);
-        assert_eq!(
-            app.state.workspaces[0].tabs[second_tab].layout.focused(),
-            second_pane
-        );
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn clicking_collapsed_agent_row_switches_to_correct_tab_and_pane() {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("test");
-        let first_pane = ws.tabs[0].root_pane;
-        let second_tab = ws.test_add_tab(Some("logs"));
-        let second_pane = ws.tabs[second_tab].root_pane;
-        app.state.workspaces = vec![ws];
-        app.state.ensure_test_terminals();
-        let first_terminal_id = app.state.workspaces[0].tabs[0].panes[&first_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&first_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Pi);
-        let second_terminal_id = app.state.workspaces[0].tabs[second_tab].panes[&second_pane]
-            .attached_terminal_id
-            .clone();
-        app.state
-            .terminals
-            .get_mut(&second_terminal_id)
-            .unwrap()
-            .detected_agent = Some(Agent::Claude);
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.sidebar_collapsed = true;
-        app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
-        app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
-
-        let (_, _, detail_area) =
-            crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            detail_area.x,
-            detail_area.y + 1,
-        ));
-
-        assert_eq!(app.state.workspaces[0].active_tab, 1);
-        assert_eq!(
-            app.state.workspaces[0].tabs[1].layout.focused(),
-            second_pane
-        );
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn clicking_collapsed_priority_agent_row_switches_to_matching_workspace() {
-        let mut app = app_for_mouse_test();
-        let first = Workspace::test_new("one");
-        let first_pane = first.tabs[0].root_pane;
-        let second = Workspace::test_new("two");
-        let second_pane = second.tabs[0].root_pane;
-
-        app.state.workspaces = vec![first, second];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.sidebar_collapsed = true;
-        app.state.agent_panel_sort = AgentPanelSort::Priority;
-        app.state.view.sidebar_rect = Rect::new(0, 0, 4, 20);
-        app.state.view.terminal_area = Rect::new(4, 0, 80, 20);
-
-        let set_state = |app: &mut crate::app::App, ws_idx: usize, pane_id, state| {
-            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
-                .attached_terminal_id
-                .clone();
-            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-            terminal.detected_agent = Some(Agent::Claude);
-            terminal.state = state;
-        };
-        set_state(&mut app, 0, first_pane, AgentState::Working);
-        set_state(&mut app, 1, second_pane, AgentState::Blocked);
-
-        let (_, _, detail_area) =
-            crate::ui::collapsed_sidebar_sections(app.state.view.sidebar_rect);
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            detail_area.x,
-            detail_area.y,
-        ));
-
-        assert_eq!(app.state.active, Some(1));
-        assert_eq!(app.state.selected, 1);
-        assert_eq!(
-            app.state.workspaces[1].tabs[0].layout.focused(),
-            second_pane
         );
     }
 
@@ -2169,26 +1319,6 @@ mod tests {
     }
 
     #[test]
-    fn dragging_sidebar_bottom_divider_still_sets_manual_width() {
-        let mut app = app_for_mouse_test();
-        let divider_col = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width - 1;
-        let bottom_row = app.state.view.sidebar_rect.y + app.state.view.sidebar_rect.height - 1;
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            divider_col,
-            bottom_row,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            divider_col + 5,
-            bottom_row,
-        ));
-
-        assert_eq!(app.state.sidebar_width, 31);
-    }
-
-    #[test]
     fn dragging_past_max_clamps_to_configured_max() {
         let mut app = app_for_mouse_test();
         app.state.sidebar_max_width = 30;
@@ -2208,33 +1338,6 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 5));
 
         assert_eq!(app.state.sidebar_width, 22);
-    }
-
-    #[test]
-    fn dragging_sidebar_section_divider_sets_split_ratio() {
-        let mut app = app_for_mouse_test();
-        let divider = crate::ui::sidebar_section_divider_rect(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            divider.x + 1,
-            divider.y,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            divider.x + 1,
-            divider.y + 4,
-        ));
-
-        assert!(app.state.sidebar_section_split > 0.5);
-        let snapshot = capture_snapshot(&app.state);
-        assert_eq!(
-            snapshot.sidebar_section_split,
-            Some(app.state.sidebar_section_split)
-        );
     }
 
     #[test]
@@ -2277,30 +1380,6 @@ mod tests {
         app
     }
 
-    /// First column of the section divider's header-row grab band that no
-    /// category tab and no panel control has claimed.
-    fn grab_band_column_on_header_row(app: &crate::app::state::AppState, section: Rect) -> u16 {
-        let (_, detail_area) =
-            crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
-        (section.x..section.x + section.width)
-            .find(|col| {
-                app.sidebar_section_divider_grab_at(*col, section.y + 1)
-                    .is_some()
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no grab band left on the header row; tabs at {:?}",
-                    crate::ui::agent_category_tabs(
-                        crate::ui::agent_panel_title_rect(detail_area),
-                        app.agent_category,
-                    )
-                    .iter()
-                    .map(|tab| tab.rect)
-                    .collect::<Vec<_>>()
-                )
-            })
-    }
-
     fn recompute(app: &mut crate::app::App) {
         crate::ui::compute_view(&mut app.state, DIVIDER_TEST_AREA);
     }
@@ -2308,7 +1387,7 @@ mod tests {
     /// Renders the app and returns the column of the sidebar's vertical bar and
     /// the row of the horizontal separator between the two sidebar panels, read
     /// back out of the drawn buffer rather than from geometry helpers.
-    fn drawn_divider_cells(app: &mut crate::app::App) -> (Option<u16>, Option<u16>) {
+    fn drawn_divider_cells(app: &mut crate::app::App) -> Option<u16> {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             DIVIDER_TEST_AREA.width,
             DIVIDER_TEST_AREA.height,
@@ -2320,13 +1399,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         let probe_row = DIVIDER_TEST_AREA.y + 4;
-        let bar_col =
-            (0..DIVIDER_TEST_AREA.width).find(|col| buffer[(*col, probe_row)].symbol() == "│");
-        let sep_row = (0..DIVIDER_TEST_AREA.height).find(|row| {
-            buffer[(DIVIDER_TEST_AREA.x + 1, *row)].symbol() == "─"
-                && buffer[(DIVIDER_TEST_AREA.x + 2, *row)].symbol() == "─"
-        });
-        (bar_col, sep_row)
+        (0..DIVIDER_TEST_AREA.width).find(|col| buffer[(*col, probe_row)].symbol() == "│")
     }
 
     fn drag_divider(app: &mut crate::app::App, from: (u16, u16), to: (u16, u16)) {
@@ -2342,7 +1415,7 @@ mod tests {
     #[test]
     fn sidebar_divider_grab_band_covers_the_drawn_bar_and_one_cell_left() {
         let mut app = app_for_divider_test();
-        let (bar_col, _) = drawn_divider_cells(&mut app);
+        let bar_col = drawn_divider_cells(&mut app);
         let bar_col = bar_col.expect("sidebar bar is drawn");
         let row = DIVIDER_TEST_AREA.y + 4;
 
@@ -2391,91 +1464,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidebar_section_divider_grab_band_covers_the_separator_and_the_agents_header() {
-        let mut app = app_for_divider_test();
-        let (_, sep_row) = drawn_divider_cells(&mut app);
-        let sep_row = sep_row.expect("section separator is drawn");
-        let col = app.state.view.sidebar_rect.x + 2;
-
-        assert_eq!(
-            app.state.sidebar_section_divider_grab_at(col, sep_row),
-            Some(0)
-        );
-
-        // The header row is still grab band wherever no control has claimed
-        // the cell...
-        let section = crate::ui::sidebar_section_divider_rect(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let free_col = grab_band_column_on_header_row(&app.state, section);
-        assert_eq!(
-            app.state
-                .sidebar_section_divider_grab_at(free_col, sep_row + 1),
-            Some(-1)
-        );
-
-        // ...but not on a category tab, or the tab could never be clicked.
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let tabs = crate::ui::agent_category_tabs(
-            crate::ui::agent_panel_title_rect(detail_area),
-            app.state.agent_category,
-        );
-        for tab in &tabs {
-            assert_eq!(
-                app.state
-                    .sidebar_section_divider_grab_at(tab.rect.x, tab.rect.y),
-                None,
-                "tab {:?} is swallowed by the divider grab band",
-                tab.category
-            );
-        }
-        // Not the workspace card row above, and not a second agent row below.
-        assert_eq!(
-            app.state.sidebar_section_divider_grab_at(col, sep_row - 1),
-            None
-        );
-        assert_eq!(
-            app.state.sidebar_section_divider_grab_at(col, sep_row + 2),
-            None
-        );
-    }
-
-    #[test]
-    fn agent_panel_sort_toggle_is_carved_out_of_the_section_divider_band() {
-        let mut app = app_for_divider_test();
-        let sidebar = app.state.view.sidebar_rect;
-        let (_, detail_area) =
-            crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
-        let toggle = crate::ui::agent_panel_control(&app.state, detail_area).rect;
-        assert!(toggle.width > 0, "fixture should render a sort toggle");
-
-        assert_eq!(
-            app.state
-                .sidebar_section_divider_grab_at(toggle.x, toggle.y),
-            None
-        );
-
-        // The toggle still switches sort rather than starting a divider drag.
-        let sort_before = app.state.agent_panel_sort;
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            toggle.x,
-            toggle.y,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            toggle.x,
-            toggle.y,
-        ));
-        assert!(app.state.drag.is_none());
-        assert_ne!(app.state.agent_panel_sort, sort_before);
-    }
-
     /// A divider-test app whose Spaces list and Agents panel both overflow, so
     /// both sidebar scrollbars are actually drawn. Both tracks live in the
     /// vertical divider's tolerance column, which is what these tests pin.
@@ -2512,35 +1500,29 @@ mod tests {
     }
 
     /// Both sidebar scrollbar tracks, asserted to be drawn.
-    fn sidebar_scrollbar_tracks(app: &crate::app::App) -> (Rect, Rect) {
-        let workspaces =
-            crate::ui::workspace_list_scrollbar_rect(&app.state, app.state.workspace_list_rect())
-                .expect("fixture should overflow the Spaces list");
-        let agents =
-            crate::ui::agent_panel_scrollbar_rect(&app.state, app.state.agent_panel_rect())
-                .expect("fixture should overflow the Agents panel");
-        (workspaces, agents)
+    fn sidebar_scrollbar_track(app: &crate::app::App) -> Rect {
+        crate::ui::workspace_list_scrollbar_rect(&app.state, app.state.workspace_list_rect())
+            .expect("fixture should overflow the Spaces list")
     }
 
     #[test]
-    fn both_sidebar_scrollbar_tracks_sit_in_the_divider_tolerance_column() {
+    fn the_sidebar_scrollbar_track_sits_in_the_divider_tolerance_column() {
         let app = app_for_sidebar_scroll_test();
         let sidebar = app.state.view.sidebar_rect;
         let bar_col = sidebar.x + sidebar.width - 1;
-        let (workspaces, agents) = sidebar_scrollbar_tracks(&app);
+        let workspaces = sidebar_scrollbar_track(&app);
 
-        // Both panels are laid out inside `sidebar.width - 1`, so their last
-        // column - where the scrollbar is drawn - is exactly the one cell of
-        // divider tolerance. Neither is on the bar itself.
+        // The panel is laid out inside `sidebar.width - 1`, so its last column
+        // - where the scrollbar is drawn - is exactly the one cell of divider
+        // tolerance, never the bar itself.
         assert_eq!(workspaces.x, bar_col - 1);
-        assert_eq!(agents.x, bar_col - 1);
     }
 
     #[test]
     fn pressing_the_workspace_list_scrollbar_scrolls_instead_of_resizing_the_sidebar() {
         let mut app = app_for_sidebar_scroll_test();
         let width_before = app.state.sidebar_width;
-        let (track, _) = sidebar_scrollbar_tracks(&app);
+        let track = sidebar_scrollbar_track(&app);
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -2561,7 +1543,7 @@ mod tests {
     #[test]
     fn dragging_the_workspace_list_scrollbar_thumb_moves_the_list() {
         let mut app = app_for_sidebar_scroll_test();
-        let (track, _) = sidebar_scrollbar_tracks(&app);
+        let track = sidebar_scrollbar_track(&app);
         assert_eq!(app.state.workspace_scroll, 0);
 
         app.handle_mouse(mouse(
@@ -2585,57 +1567,9 @@ mod tests {
     }
 
     #[test]
-    fn pressing_the_agent_panel_scrollbar_scrolls_instead_of_resizing_the_sidebar() {
+    fn the_wheel_scrolls_the_tree_from_over_its_scrollbar_column() {
         let mut app = app_for_sidebar_scroll_test();
-        let width_before = app.state.sidebar_width;
-        let (_, track) = sidebar_scrollbar_tracks(&app);
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            track.x,
-            track.y,
-        ));
-
-        assert!(
-            matches!(
-                app.state.drag.as_ref().map(|drag| &drag.target),
-                Some(DragTarget::AgentPanelScrollbar { .. })
-            ),
-            "a press on the Agents scrollbar must start a scroll drag"
-        );
-        assert_eq!(app.state.sidebar_width, width_before);
-    }
-
-    #[test]
-    fn dragging_the_agent_panel_scrollbar_thumb_moves_the_panel() {
-        let mut app = app_for_sidebar_scroll_test();
-        let (_, track) = sidebar_scrollbar_tracks(&app);
-        assert_eq!(app.state.agent_panel_scroll, 0);
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            track.x,
-            track.y,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            track.x,
-            track.y + track.height - 1,
-        ));
-        app.handle_mouse(mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            track.x,
-            track.y + track.height - 1,
-        ));
-
-        assert!(app.state.agent_panel_scroll > 0);
-        assert_eq!(app.state.sidebar_width, 26);
-    }
-
-    #[test]
-    fn the_wheel_scrolls_both_panels_from_over_their_scrollbar_column() {
-        let mut app = app_for_sidebar_scroll_test();
-        let (workspaces, agents) = sidebar_scrollbar_tracks(&app);
+        let workspaces = sidebar_scrollbar_track(&app);
 
         app.handle_mouse(mouse(
             MouseEventKind::ScrollDown,
@@ -2645,11 +1579,6 @@ mod tests {
         assert_eq!(app.state.workspace_scroll, 1);
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, workspaces.x, workspaces.y));
         assert_eq!(app.state.workspace_scroll, 0);
-
-        app.handle_mouse(mouse(MouseEventKind::ScrollDown, agents.x, agents.y));
-        assert_eq!(app.state.agent_panel_scroll, 1);
-        app.handle_mouse(mouse(MouseEventKind::ScrollUp, agents.x, agents.y));
-        assert_eq!(app.state.agent_panel_scroll, 0);
     }
 
     #[test]
@@ -2657,7 +1586,7 @@ mod tests {
         let mut app = app_for_sidebar_scroll_test();
         let sidebar = app.state.view.sidebar_rect;
         let bar_col = sidebar.x + sidebar.width - 1;
-        let (workspaces, _) = sidebar_scrollbar_tracks(&app);
+        let workspaces = sidebar_scrollbar_track(&app);
 
         // The bar itself stays grabbable on every row, including the rows a
         // scrollbar track covers.
@@ -2698,20 +1627,6 @@ mod tests {
             sidebar.y + 4,
         ));
         assert_eq!(app.state.sidebar_width, width_before);
-
-        let mut app = app_for_divider_test();
-        let section = crate::ui::sidebar_section_divider_rect(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        let split_before = app.state.sidebar_section_split;
-
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            section.x + 2,
-            section.y + 1,
-        ));
-        assert_eq!(app.state.sidebar_section_split, split_before);
     }
 
     #[test]
@@ -2779,37 +1694,17 @@ mod tests {
         recompute(&mut app);
 
         assert_eq!(app.state.view.sidebar_rect.width, sidebar.width + 6);
-        let (drawn_bar, _) = drawn_divider_cells(&mut app);
+        let drawn_bar = drawn_divider_cells(&mut app);
         assert_eq!(drawn_bar, Some(bar_col + 6));
-
-        let mut app = app_for_divider_test();
-        let section = crate::ui::sidebar_section_divider_rect(
-            app.state.view.sidebar_rect,
-            app.state.sidebar_section_split,
-        );
-        // Row `section.y + 1` is the Agents panel header, which now carries the
-        // category tabs. Those are carved out of the grab band, so pick a
-        // column on that row that no tab covers rather than assuming one.
-        let grab_col = grab_band_column_on_header_row(&app.state, section);
-        drag_divider(
-            &mut app,
-            (grab_col, section.y + 1),
-            (grab_col, section.y + 6),
-        );
-        recompute(&mut app);
-
-        let (_, drawn_sep) = drawn_divider_cells(&mut app);
-        assert_eq!(drawn_sep, Some(section.y + 5));
     }
 
     #[test]
-    fn dragging_sidebar_divider_widens_both_panels_and_shrinks_terminal() {
+    fn dragging_sidebar_divider_widens_the_panel_and_shrinks_terminal() {
         let mut app = app_for_divider_test();
         let sidebar = app.state.view.sidebar_rect;
         let divider_col = sidebar.x + sidebar.width - 1;
         let terminal_before = app.state.view.terminal_area.width;
-        let (ws_before, agents_before) =
-            crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
+        let ws_before = crate::ui::sidebar_content_rect(sidebar);
 
         drag_divider(
             &mut app,
@@ -2819,15 +1714,13 @@ mod tests {
         recompute(&mut app);
 
         let sidebar_after = app.state.view.sidebar_rect;
-        let (ws_after, agents_after) =
-            crate::ui::expanded_sidebar_sections(sidebar_after, app.state.sidebar_section_split);
+        let ws_after = crate::ui::sidebar_content_rect(sidebar_after);
 
         assert_eq!(sidebar_after.width, sidebar.width + 6);
         assert_eq!(ws_after.width, ws_before.width + 6);
-        assert_eq!(agents_after.width, agents_before.width + 6);
         assert_eq!(app.state.view.terminal_area.width, terminal_before - 6);
 
-        let (bar_col, _) = drawn_divider_cells(&mut app);
+        let bar_col = drawn_divider_cells(&mut app);
         assert_eq!(bar_col, Some(divider_col + 6));
     }
 
@@ -2868,94 +1761,25 @@ mod tests {
             assert!(sidebar_after.width <= app.state.sidebar_max_width);
             assert!(app.state.view.terminal_area.width > 0);
 
-            let (_, agents_after) = crate::ui::expanded_sidebar_sections(
-                sidebar_after,
-                app.state.sidebar_section_split,
-            );
-            assert!(agents_after.width > 0, "agent panel must stay visible");
+            let content_after = crate::ui::sidebar_content_rect(sidebar_after);
+            assert!(content_after.width > 0, "the tree must stay visible");
         }
     }
 
     #[test]
-    fn dragging_sidebar_section_divider_moves_the_split_and_keeps_both_panels() {
-        let mut app = app_for_divider_test();
-        let sidebar = app.state.view.sidebar_rect;
-        let divider =
-            crate::ui::sidebar_section_divider_rect(sidebar, app.state.sidebar_section_split);
-        let (ws_before, agents_before) =
-            crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
-
-        drag_divider(
-            &mut app,
-            (divider.x + 2, divider.y),
-            (divider.x + 2, divider.y + 6),
-        );
-        recompute(&mut app);
-
-        let (ws_after, agents_after) =
-            crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
-        assert!(ws_after.height > ws_before.height, "spaces panel grows");
-        assert!(
-            agents_after.height < agents_before.height,
-            "agents panel shrinks"
-        );
-        assert!(agents_after.height > 0);
-
-        let (_, sep_row) = drawn_divider_cells(&mut app);
-        assert_eq!(sep_row, Some(ws_after.y + ws_after.height));
-    }
-
-    #[test]
-    fn dragging_sidebar_section_divider_to_either_extreme_keeps_both_panels() {
-        for target_row in [0u16, DIVIDER_TEST_AREA.height - 1] {
-            let mut app = app_for_divider_test();
-            let sidebar = app.state.view.sidebar_rect;
-            let divider =
-                crate::ui::sidebar_section_divider_rect(sidebar, app.state.sidebar_section_split);
-
-            drag_divider(
-                &mut app,
-                (divider.x + 2, divider.y),
-                (divider.x + 2, target_row),
-            );
-            recompute(&mut app);
-
-            let (ws_after, agents_after) =
-                crate::ui::expanded_sidebar_sections(sidebar, app.state.sidebar_section_split);
-            assert!(
-                (0.1..=0.9).contains(&app.state.sidebar_section_split),
-                "split ratio stays clamped"
-            );
-            assert!(ws_after.height > 0, "spaces panel must stay visible");
-            assert!(agents_after.height > 0, "agents panel must stay visible");
-        }
-    }
-
-    #[test]
-    fn both_dragged_divider_positions_survive_a_session_snapshot() {
+    fn the_dragged_divider_position_survives_a_session_snapshot() {
         let mut app = app_for_divider_test();
         let sidebar = app.state.view.sidebar_rect;
         let divider_col = sidebar.x + sidebar.width - 1;
-        let section =
-            crate::ui::sidebar_section_divider_rect(sidebar, app.state.sidebar_section_split);
 
         drag_divider(
             &mut app,
             (divider_col, sidebar.y + 4),
             (divider_col + 5, sidebar.y + 4),
         );
-        drag_divider(
-            &mut app,
-            (section.x + 2, section.y),
-            (section.x + 2, section.y + 5),
-        );
 
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.sidebar_width, Some(app.state.sidebar_width));
-        assert_eq!(
-            snapshot.sidebar_section_split,
-            Some(app.state.sidebar_section_split)
-        );
     }
 
     #[test]
@@ -2970,20 +1794,14 @@ mod tests {
             recompute(&mut app);
 
             let width_before = app.state.sidebar_width;
-            let split_before = app.state.sidebar_section_split;
 
             for col in 0..DIVIDER_TEST_AREA.width.min(8) {
                 for row in 0..DIVIDER_TEST_AREA.height.min(8) {
                     assert!(!app.state.on_sidebar_divider(col, row));
-                    assert!(app
-                        .state
-                        .sidebar_section_divider_grab_at(col, row)
-                        .is_none());
                 }
             }
 
             assert_eq!(app.state.sidebar_width, width_before);
-            assert_eq!(app.state.sidebar_section_split, split_before);
         }
     }
 
@@ -2994,15 +1812,12 @@ mod tests {
         crate::ui::compute_view(&mut app.state, mobile_area);
 
         let width_before = app.state.sidebar_width;
-        let split_before = app.state.sidebar_section_split;
 
         for col in 0..mobile_area.width {
             assert!(!app.state.on_sidebar_divider(col, 4));
-            assert!(app.state.sidebar_section_divider_grab_at(col, 4).is_none());
         }
 
         assert_eq!(app.state.sidebar_width, width_before);
-        assert_eq!(app.state.sidebar_section_split, split_before);
     }
 
     #[test]
@@ -3010,9 +1825,8 @@ mod tests {
         let mut before = app_for_divider_test();
         let sidebar = before.state.view.sidebar_rect;
         let terminal_area = before.state.view.terminal_area;
-        let sections =
-            crate::ui::expanded_sidebar_sections(sidebar, before.state.sidebar_section_split);
-        let (bar_col, sep_row) = drawn_divider_cells(&mut before);
+        let content = crate::ui::sidebar_content_rect(sidebar);
+        let bar_col = drawn_divider_cells(&mut before);
 
         let mut after = app_for_divider_test();
         // Ordinary clicks inside the sidebar and inside the terminal area, next
@@ -3032,13 +1846,10 @@ mod tests {
         assert_eq!(after.state.view.sidebar_rect, sidebar);
         assert_eq!(after.state.view.terminal_area, terminal_area);
         assert_eq!(
-            crate::ui::expanded_sidebar_sections(
-                after.state.view.sidebar_rect,
-                after.state.sidebar_section_split
-            ),
-            sections
+            crate::ui::sidebar_content_rect(after.state.view.sidebar_rect),
+            content
         );
-        assert_eq!(drawn_divider_cells(&mut after), (bar_col, sep_row));
+        assert_eq!(drawn_divider_cells(&mut after), bar_col);
         assert_eq!(
             after.state.sidebar_width_source,
             crate::app::state::SidebarWidthSource::ConfigDefault

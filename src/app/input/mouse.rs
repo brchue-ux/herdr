@@ -5,9 +5,8 @@ use tracing::warn;
 
 use crate::{
     app::state::{
-        AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget, MenuListState, Mode,
+        RightClickPassthroughGesture, TabPressState, ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -22,7 +21,6 @@ use super::{
         modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
     },
     settings::SettingsAction,
-    sidebar::AgentPanelHeaderAction,
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
@@ -434,19 +432,6 @@ impl AppState {
                     return None;
                 }
 
-                if let Some(grab_offset) =
-                    self.sidebar_section_divider_grab_at(mouse.column, mouse.row)
-                {
-                    self.drag = Some(DragState {
-                        target: DragTarget::SidebarSectionDivider { grab_offset },
-                    });
-                    self.set_sidebar_section_split(AppState::divider_pos_from_grab(
-                        mouse.row,
-                        grab_offset,
-                    ));
-                    return None;
-                }
-
                 if !in_sidebar {
                     if let Some(border) = self.find_border_at(mouse.column, mouse.row) {
                         let grab_offset = match border.direction {
@@ -533,12 +518,6 @@ impl AppState {
                             return Some(MouseAction::FocusWorkspace { ws_idx: idx });
                         }
 
-                        if let Some((ws_idx, _tab_idx, pane_id)) =
-                            self.collapsed_agent_detail_target_at(mouse.row)
-                        {
-                            self.mode = Mode::Terminal;
-                            return Some(MouseAction::FocusPane { ws_idx, pane_id });
-                        }
                         return None;
                     }
 
@@ -588,84 +567,6 @@ impl AppState {
                             start_row: mouse.row,
                         });
                         return None;
-                    }
-
-                    if let Some(action) = self.agent_panel_header_action_at(mouse.column, mouse.row)
-                    {
-                        match action {
-                            AgentPanelHeaderAction::ToggleSort => {
-                                self.agent_panel_sort = match self.agent_panel_sort {
-                                    AgentPanelSort::Spaces => AgentPanelSort::Priority,
-                                    AgentPanelSort::Priority => AgentPanelSort::Spaces,
-                                };
-                                self.agent_panel_scroll = 0;
-                                self.mark_session_dirty();
-                            }
-                            AgentPanelHeaderAction::ClearView => {
-                                // Clearing the winner reveals the next tier down;
-                                // a config-declared view returns on the next config
-                                // reload or restart.
-                                self.agent_views.clear_active_tier();
-                                self.agent_category = None;
-                                self.agent_panel_scroll = 0;
-                                self.mobile_switcher_scroll = 0;
-                            }
-                            AgentPanelHeaderAction::SelectCategory(category) => {
-                                // Re-clicking the selected tab returns to the
-                                // whole tree rather than leaving the user in a
-                                // filter with no obvious way out.
-                                let next =
-                                    (self.agent_category != Some(category)).then_some(category);
-                                // Through the same validator the API and config
-                                // doors use, so the click path cannot install a
-                                // view the grammar would reject and the two
-                                // doors cannot drift apart again.
-                                let view = match next.map(|category| category.view()) {
-                                    Some(mut view) => {
-                                        match crate::agent_view::validate_agent_view(&mut view) {
-                                            Ok(()) => Some(view),
-                                            Err(message) => {
-                                                tracing::error!(
-                                                    message,
-                                                    "agents category view failed validation"
-                                                );
-                                                return None;
-                                            }
-                                        }
-                                    }
-                                    None => None,
-                                };
-                                self.agent_category = next;
-                                self.agent_views
-                                    .set(crate::agent_view::AgentViewTier::Ui, view);
-                                self.agent_panel_scroll = 0;
-                                self.mobile_switcher_scroll = 0;
-                            }
-                        }
-                        return None;
-                    }
-
-                    if let Some(target) =
-                        self.agent_panel_scrollbar_target_at(mouse.column, mouse.row)
-                    {
-                        match target {
-                            ScrollbarClickTarget::Thumb { grab_row_offset } => {
-                                self.drag = Some(DragState {
-                                    target: DragTarget::AgentPanelScrollbar { grab_row_offset },
-                                });
-                            }
-                            ScrollbarClickTarget::Track { offset_from_bottom } => {
-                                self.set_agent_panel_offset_from_bottom(offset_from_bottom);
-                            }
-                        }
-                        return None;
-                    }
-
-                    if let Some((ws_idx, _tab_idx, pane_id)) =
-                        self.agent_detail_target_at(mouse.row)
-                    {
-                        self.mode = Mode::Terminal;
-                        return Some(MouseAction::FocusPane { ws_idx, pane_id });
                     }
                 } else if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
                     if self.mode != Mode::Terminal {
@@ -777,13 +678,6 @@ impl AppState {
                                 self.set_workspace_list_offset_from_bottom(offset_from_bottom);
                             }
                         }
-                        DragTarget::AgentPanelScrollbar { grab_row_offset } => {
-                            if let Some(offset_from_bottom) =
-                                self.agent_panel_offset_for_drag_row(mouse.row, *grab_row_offset)
-                            {
-                                self.set_agent_panel_offset_from_bottom(offset_from_bottom);
-                            }
-                        }
                         DragTarget::PaneSplit {
                             path,
                             direction,
@@ -832,12 +726,6 @@ impl AppState {
                         DragTarget::SidebarDivider { grab_offset } => {
                             self.set_manual_sidebar_width(AppState::divider_pos_from_grab(
                                 mouse.column,
-                                *grab_offset,
-                            ));
-                        }
-                        DragTarget::SidebarSectionDivider { grab_offset } => {
-                            self.set_sidebar_section_split(AppState::divider_pos_from_grab(
-                                mouse.row,
                                 *grab_offset,
                             ));
                         }
@@ -1010,38 +898,20 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
-                let agent_area = self.agent_panel_rect();
-                let over_agent_panel = agent_area != Rect::default()
-                    && mouse.row >= agent_area.y
-                    && mouse.row < agent_area.y + agent_area.height;
-                if over_agent_panel {
-                    if crate::ui::should_show_scrollbar(crate::ui::agent_panel_scroll_metrics(
-                        self, agent_area,
-                    )) {
-                        self.scroll_agent_panel(-1);
-                    }
-                } else if crate::ui::should_show_scrollbar(
-                    crate::ui::workspace_list_scroll_metrics(self, self.workspace_list_rect()),
-                ) {
+                if crate::ui::should_show_scrollbar(crate::ui::workspace_list_scroll_metrics(
+                    self,
+                    self.workspace_list_rect(),
+                )) {
                     self.scroll_workspace_list(-1);
                 } else {
                     self.move_selected_workspace_by_visible_delta(-1);
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
-                let agent_area = self.agent_panel_rect();
-                let over_agent_panel = agent_area != Rect::default()
-                    && mouse.row >= agent_area.y
-                    && mouse.row < agent_area.y + agent_area.height;
-                if over_agent_panel {
-                    if crate::ui::should_show_scrollbar(crate::ui::agent_panel_scroll_metrics(
-                        self, agent_area,
-                    )) {
-                        self.scroll_agent_panel(1);
-                    }
-                } else if crate::ui::should_show_scrollbar(
-                    crate::ui::workspace_list_scroll_metrics(self, self.workspace_list_rect()),
-                ) {
+                if crate::ui::should_show_scrollbar(crate::ui::workspace_list_scroll_metrics(
+                    self,
+                    self.workspace_list_rect(),
+                )) {
                     self.scroll_workspace_list(1);
                 } else {
                     self.move_selected_workspace_by_visible_delta(1);
