@@ -389,7 +389,7 @@ impl AppState {
             return None;
         }
 
-        let roots = crate::ui::workspace_list_entries_expanded(self)
+        let roots = crate::ui::workspace_list_spaces_expanded(self)
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace {
@@ -472,9 +472,9 @@ mod tests {
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
-        app::state::{AgentPanelSort, DragTarget, Mode},
+        app::state::{DragTarget, Mode},
         config::SidebarCollapsedModeConfig,
-        detect::{Agent, AgentState},
+        detect::Agent,
         workspace::Workspace,
     };
 

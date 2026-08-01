@@ -1291,7 +1291,7 @@ impl AppState {
         // Mobile always shows the worktree tree expanded, so its visible order
         // must ignore collapse state to match what the switcher renders.
         let entries = if self.view.layout == ViewLayout::Mobile {
-            crate::ui::workspace_list_entries_expanded(self)
+            crate::ui::workspace_list_spaces_expanded(self)
         } else {
             crate::ui::workspace_list_entries(self)
         };

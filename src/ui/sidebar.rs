@@ -152,12 +152,6 @@ pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
 }
 
-pub(crate) fn agent_panel_entries_and_hidden(
-    app: &AppState,
-) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
-    agent_panel_entries_and_hidden_with_runtimes(app, None)
-}
-
 pub(crate) fn agent_panel_entries_and_hidden_from(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -471,16 +465,6 @@ impl WorkspaceListEntry {
             Self::Workspace { is_last_child, .. } | Self::Agent { is_last_child, .. } => {
                 *is_last_child
             }
-        }
-    }
-
-    fn workspace(ws_idx: usize, indented: bool) -> Self {
-        Self::Workspace {
-            ws_idx,
-            indented,
-            depth: 0,
-            ancestors_continue: Vec::new(),
-            is_last_child: true,
         }
     }
 }
