@@ -317,6 +317,32 @@ pub(super) fn render_panes(
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
+
+            // SPIKE: pane materialisation. Runs as a post-pass over the already-drawn
+            // content, exactly like the dim pass below. Touches no resize call site.
+            if let Some(behaviour) = super::water::configured_behaviour() {
+                let duration = super::water::configured_duration();
+                if let Some(t) = super::water::progress(
+                    u64::from(info.id.raw()),
+                    std::time::Instant::now(),
+                    duration,
+                ) {
+                    let inner = info.inner_rect;
+                    let field = super::water::CoverageField::sample(
+                        inner.width,
+                        inner.height,
+                        behaviour,
+                        t,
+                    );
+                    super::water::paint(
+                        frame.buffer_mut(),
+                        inner,
+                        &field,
+                        &super::water::WaterStyle::default(),
+                    );
+                }
+            }
+
             render_pane_scrollbar(app, frame, info, rt);
 
             let should_dim = !info.is_focused && multi_pane && !terminal_active;

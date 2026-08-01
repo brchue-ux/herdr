@@ -4318,6 +4318,13 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
+        // SPIKE: keep frames coming while a pane is materialising.
+        if crate::ui::water::configured_behaviour().is_some()
+            && crate::ui::water::any_active(now, crate::ui::water::configured_duration())
+        {
+            changed = true;
+        }
+
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
 

@@ -581,7 +581,15 @@ impl App {
             None
         };
 
+        // SPIKE: a 16 ms deadline while a pane is materialising. The existing
+        // ANIMATION_INTERVAL (100 ms / 200 ms headless) is far too slow for this.
+        let water_deadline = crate::ui::water::configured_behaviour().and_then(|_| {
+            crate::ui::water::any_active(now, crate::ui::water::configured_duration())
+                .then(|| now + std::time::Duration::from_millis(16))
+        });
+
         [
+            water_deadline,
             include_resize_poll.then_some(self.next_resize_poll),
             self.config_diagnostic_deadline,
             self.toast_deadline,

@@ -20,6 +20,7 @@ mod status;
 mod tab_surface;
 mod tabs;
 mod text;
+pub(crate) mod water;
 mod widgets;
 
 use self::dialogs::{
