@@ -302,9 +302,14 @@ mod tests {
         assert!(!app.view.split_borders.is_empty());
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
+        // The Agents panel header now carries the four-way category selector
+        // ("1st 2nd wrk sub") where it used to print a static " agents", which
+        // moved this digest. The Spaces panel is untouched — `render_workspace_list`
+        // is byte-identical — and the mobile digest below is unchanged, so the
+        // desktop sidebar header is the only thing that moved.
         assert_eq!(
             frame_digest(&frame),
-            "ce383feeaac30922502b7c4f8af53b5ca30e816ec4503ca6d015738b584da487"
+            "3e16c70ac853af8c940ba7e26b8f20663e221ea02119b7403ac7db77b45cb783"
         );
     }
 

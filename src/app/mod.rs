@@ -6,6 +6,7 @@
 
 pub(crate) mod actions;
 mod agent_resume;
+pub(crate) mod agent_tree;
 pub(crate) mod agent_view;
 mod agents;
 mod api;
@@ -603,6 +604,7 @@ impl App {
 
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
+            agent_category: None,
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),

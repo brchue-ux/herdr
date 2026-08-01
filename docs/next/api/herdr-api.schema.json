@@ -1411,16 +1411,25 @@
           "type": "object"
         },
         "AgentViewBuiltinField": {
-          "enum": [
-            "status",
-            "workspace_id",
-            "tab_id",
-            "pane_id",
-            "agent",
-            "seen",
-            "state_change_seq"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "status",
+                "workspace_id",
+                "tab_id",
+                "pane_id",
+                "agent",
+                "seen",
+                "state_change_seq"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "relation",
+              "description": "Where the pane sits in the ownership tree built from `owner` metadata\ntokens: `first_mate`, `second_mate`, or `worker`. Derived from the whole\nfleet before any filtering, so selecting one category cannot change what\nanother pane is.",
+              "type": "string"
+            }
+          ]
         },
         "AgentViewBuiltinSortField": {
           "enum": [

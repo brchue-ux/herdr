@@ -1565,6 +1565,13 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
+    /// Which Agents category tab is selected, or `None` for the whole tree.
+    ///
+    /// `None` is the resting state on purpose: the panel is meant to be the
+    /// always-on truth, so it opens showing every pane rather than opening
+    /// pre-filtered to one category. Selecting a tab installs a `ui`-tier view;
+    /// selecting the selected tab again clears it.
+    pub agent_category: Option<crate::ui::AgentCategory>,
     /// Every source that currently wants to own the built-in Agents view. Only
     /// the winning tier is projected onto the panel; see [`crate::agent_view`]
     /// for the precedence rule.
@@ -2110,6 +2117,7 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
+            agent_category: None,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),

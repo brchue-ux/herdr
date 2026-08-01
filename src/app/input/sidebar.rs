@@ -9,6 +9,9 @@ use super::ScrollbarClickTarget;
 pub(super) enum AgentPanelHeaderAction {
     ToggleSort,
     ClearView,
+    /// A category tab was clicked. Selecting the selected one clears back to
+    /// the whole tree, so the selector can never strand the user in a filter.
+    SelectCategory(crate::ui::AgentCategory),
 }
 
 impl AppState {
@@ -611,6 +614,12 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
+        // Tabs sit left of the control on the same row, so they are tested
+        // first; the control's rect is already excluded from their layout.
+        if let Some(category) = crate::ui::agent_category_tab_at(self, detail_area, col, row) {
+            return Some(AgentPanelHeaderAction::SelectCategory(category));
+        }
+
         let control = crate::ui::agent_panel_control(self, detail_area);
         let rect = control.rect;
         let hit = rect.width > 0

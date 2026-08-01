@@ -606,6 +606,21 @@ impl AppState {
                                 // a config-declared view returns on the next config
                                 // reload or restart.
                                 self.agent_views.clear_active_tier();
+                                self.agent_category = None;
+                                self.agent_panel_scroll = 0;
+                                self.mobile_switcher_scroll = 0;
+                            }
+                            AgentPanelHeaderAction::SelectCategory(category) => {
+                                // Re-clicking the selected tab returns to the
+                                // whole tree rather than leaving the user in a
+                                // filter with no obvious way out.
+                                let next =
+                                    (self.agent_category != Some(category)).then_some(category);
+                                self.agent_category = next;
+                                self.agent_views.set(
+                                    crate::agent_view::AgentViewTier::Ui,
+                                    next.map(|category| category.view()),
+                                );
                                 self.agent_panel_scroll = 0;
                                 self.mobile_switcher_scroll = 0;
                             }
