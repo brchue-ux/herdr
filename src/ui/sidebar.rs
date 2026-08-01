@@ -1,3 +1,4 @@
+pub(crate) mod mates;
 mod tokens;
 
 use ratatui::{
@@ -1754,6 +1755,7 @@ fn render_workspace_list(
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
+    render_second_mate_selector(app, frame, area);
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
@@ -1977,6 +1979,8 @@ fn render_workspace_list(
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
     }
 
+    render_second_mate_menu(app, frame, area);
+
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
         frame.render_widget(
@@ -1999,6 +2003,61 @@ fn render_workspace_list(
         frame.render_widget(
             Paragraph::new(menu_line).alignment(Alignment::Right),
             menu_rect,
+        );
+    }
+}
+
+/// The closed second-mate control on the Spaces header row.
+///
+/// Nothing is drawn when no second mate is live, which is the whole point: with
+/// only the First Mate open there is nowhere else to go, so there is no control
+/// to say so.
+fn render_second_mate_selector(app: &AppState, frame: &mut Frame, area: Rect) {
+    let rect = mates::selector_rect(app, area);
+    if rect == Rect::default() {
+        return;
+    }
+    let p = &app.palette;
+    let style = if mates::selected_mate(app).is_some() {
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(mates::selector_label(app, area), style))
+            .alignment(Alignment::Right),
+        rect,
+    );
+}
+
+/// The open drop-down, drawn over the tree it hangs above.
+fn render_second_mate_menu(app: &AppState, frame: &mut Frame, area: Rect) {
+    let rect = mates::menu_rect(app, area);
+    if rect == Rect::default() {
+        return;
+    }
+    let p = &app.palette;
+    {
+        let buf = frame.buffer_mut();
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                buf[(x, y)].set_symbol(" ");
+                buf[(x, y)].set_style(Style::default().bg(p.surface0));
+            }
+        }
+    }
+    for (index, (label, marked)) in mates::menu_rows(app, area).into_iter().enumerate() {
+        let style = if marked {
+            Style::default()
+                .fg(p.accent)
+                .bg(p.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text).bg(p.surface0)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(label, style)),
+            Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
         );
     }
 }

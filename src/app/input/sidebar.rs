@@ -92,6 +92,27 @@ impl AppState {
         );
     }
 
+    /// The second mate the drop-down offers at `col`/`row`, if its list is open
+    /// and one is under the pointer.
+    pub(super) fn second_mate_menu_entry_at(&self, col: u16, row: u16) -> Option<String> {
+        if self.sidebar_collapsed {
+            return None;
+        }
+        crate::ui::second_mate_menu_entry_at(self, self.workspace_list_rect(), col, row)
+    }
+
+    /// Whether `col`/`row` is on the closed second-mate control.
+    pub(super) fn on_second_mate_selector(&self, col: u16, row: u16) -> bool {
+        !self.sidebar_collapsed
+            && crate::ui::hits_second_mate_selector(self, self.workspace_list_rect(), col, row)
+    }
+
+    /// Whether the second-mate control or its open list owns `col`/`row`.
+    pub(super) fn second_mate_selector_owns_cell(&self, col: u16, row: u16) -> bool {
+        !self.sidebar_collapsed
+            && crate::ui::second_mate_selector_owns_cell(self, self.workspace_list_rect(), col, row)
+    }
+
     /// The `new` / `menu` row at the bottom of the sidebar.
     ///
     /// One column short of the panel, because the collapse toggle draws in the
@@ -232,6 +253,15 @@ impl AppState {
         // Worktree group chevrons sit in the tolerance column too; they keep
         // their clicks.
         if offset > 0 && self.workspace_group_chevron_at(col, row).is_some() {
+            return None;
+        }
+
+        // So does the second-mate drop-down: it is right-aligned on the header
+        // row, so its last cell is the tolerance column, and its open list
+        // hangs down over more of it. A press the band swallowed would become a
+        // resize drag and the control would silently do nothing - which is
+        // exactly how the previous selector shipped dead.
+        if offset > 0 && self.second_mate_selector_owns_cell(col, row) {
             return None;
         }
 
@@ -477,6 +507,137 @@ mod tests {
         detect::Agent,
         workspace::Workspace,
     };
+
+    /// A fleet with a First Mate Space, `mates` second-mate Spaces owned by it,
+    /// and one worker pane under the first second mate.
+    fn app_with_second_mates(mates: usize) -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        let now = std::time::Instant::now();
+        let mut workspaces = vec![crate::workspace::Workspace::test_new("firstmate")];
+        for index in 0..mates {
+            workspaces.push(crate::workspace::Workspace::test_new(&format!(
+                "2ndmate-{index}"
+            )));
+        }
+        app.state.workspaces = workspaces;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        for index in 0..mates {
+            app.state.workspaces[index + 1].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        app.state.view.workspace_card_areas =
+            crate::ui::compute_workspace_card_areas(&app.state, app.state.view.sidebar_rect);
+        app
+    }
+
+    #[test]
+    fn the_selector_is_absent_until_a_second_mate_is_live() {
+        // Only the First Mate: nothing to go to, so no control at all.
+        let app = app_with_second_mates(0);
+        let list = app.state.workspace_list_rect();
+        assert_eq!(crate::ui::second_mates(&app.state), Vec::<String>::new());
+        assert_eq!(
+            crate::ui::second_mate_selector_rect(&app.state, list),
+            Rect::default()
+        );
+
+        // One second mate: one entry, and the control appears.
+        let app = app_with_second_mates(1);
+        assert_eq!(crate::ui::second_mates(&app.state), vec!["2ndmate-0"]);
+        assert_ne!(
+            crate::ui::second_mate_selector_rect(&app.state, app.state.workspace_list_rect()),
+            Rect::default()
+        );
+
+        // A session start: every mate that came up is selectable.
+        let app = app_with_second_mates(7);
+        assert_eq!(crate::ui::second_mates(&app.state).len(), 7);
+    }
+
+    /// Driven through `handle_mouse`, not the handlers: the sidebar's divider
+    /// grab band runs over the column this control is right-aligned in, and it
+    /// commits to a drag before any sidebar control handler sees the press.
+    #[test]
+    fn clicking_the_selector_opens_it_and_picking_a_mate_selects_it() {
+        let mut app = app_with_second_mates(3);
+        let list = app.state.workspace_list_rect();
+        let control = crate::ui::second_mate_selector_rect(&app.state, list);
+        assert_ne!(control, Rect::default());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            control.x,
+            control.y,
+        ));
+        assert!(
+            app.state.second_mate_selector_open,
+            "the control did not open; a divider drag probably swallowed the press"
+        );
+        assert!(app.state.drag.is_none(), "the press started a drag");
+
+        let menu = crate::ui::second_mate_menu_rect(&app.state, list);
+        assert_ne!(menu, Rect::default());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x,
+            menu.y + 1,
+        ));
+
+        assert_eq!(app.state.selected_second_mate.as_deref(), Some("2ndmate-1"));
+        assert!(!app.state.second_mate_selector_open);
+        // The selection is observable: the closed control names it.
+        assert!(
+            crate::ui::second_mate_selector_label(&app.state, app.state.workspace_list_rect())
+                .contains("2ndmate-1")
+        );
+    }
+
+    #[test]
+    fn a_second_mate_that_leaves_the_fleet_takes_the_selection_with_it() {
+        let mut app = app_with_second_mates(2);
+        app.state.selected_second_mate = Some("2ndmate-1".to_string());
+        assert_eq!(
+            crate::ui::selected_second_mate(&app.state).as_deref(),
+            Some("2ndmate-1")
+        );
+
+        app.state.workspaces.pop();
+        // The control falls back to naming no one rather than pointing at a
+        // mate that is not on screen.
+        assert_eq!(crate::ui::selected_second_mate(&app.state), None);
+    }
+
+    #[test]
+    fn a_press_below_the_open_selector_closes_it_instead_of_falling_through() {
+        let mut app = app_with_second_mates(3);
+        let list = app.state.workspace_list_rect();
+        let control = crate::ui::second_mate_selector_rect(&app.state, list);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            control.x,
+            control.y,
+        ));
+        assert!(app.state.second_mate_selector_open);
+
+        let menu = crate::ui::second_mate_menu_rect(&app.state, list);
+        let below = menu.y + menu.height;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            list.x,
+            below,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), list.x, below));
+
+        assert!(!app.state.second_mate_selector_open);
+        assert_eq!(app.state.selected_second_mate, None);
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {

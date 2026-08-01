@@ -1573,6 +1573,12 @@ pub struct AppState {
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Order agent rows take within their owner in the sidebar tree.
     pub agent_panel_sort: AgentPanelSort,
+    /// Whether the second-mate drop-down is showing its list.
+    pub second_mate_selector_open: bool,
+    /// The second mate the selector names, by its tree handle rather than its
+    /// position, so a mate that comes and goes cannot hand the selection to
+    /// whoever took its row. Resolved against the live fleet on every read.
+    pub selected_second_mate: Option<String>,
     /// Every source that currently wants to own the built-in Agents view. It
     /// projects onto the mobile switcher and `agent view get`; the sidebar tree
     /// is deliberately never filtered by it, because it is the only place a
@@ -2117,6 +2123,8 @@ impl AppState {
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             agent_panel_sort: AgentPanelSort::Spaces,
+            second_mate_selector_open: false,
+            selected_second_mate: None,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
