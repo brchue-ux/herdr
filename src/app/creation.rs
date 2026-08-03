@@ -434,6 +434,13 @@ impl App {
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
+        let activity = self.state.pane_activity.get(&terminal.id).map(|activity| {
+            crate::api::schema::PaneActivityInfo {
+                level_percent: activity.level_percent(),
+                bytes_per_sec: activity.bytes_per_sec.round().max(0.0) as u64,
+                output_bytes: activity.output_bytes,
+            }
+        });
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -466,6 +473,7 @@ impl App {
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
             scroll,
+            activity,
             revision: terminal.revision,
         })
     }

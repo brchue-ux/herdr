@@ -37,6 +37,16 @@ impl TerminalRuntimeRegistry {
         self.runtimes.values()
     }
 
+    /// Every live terminal's lifetime PTY output byte count.
+    ///
+    /// The one reading the activity sampler needs, in one pass, on every
+    /// platform: a relaxed atomic load per terminal and no lock on the parser.
+    pub(crate) fn output_byte_counts(&self) -> impl Iterator<Item = (&TerminalId, u64)> {
+        self.runtimes
+            .iter()
+            .map(|(id, runtime)| (id, runtime.output_bytes()))
+    }
+
     #[cfg(unix)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&TerminalId, &TerminalRuntime)> {
         self.runtimes.iter()

@@ -36,9 +36,10 @@ mod xtgettcap;
 use self::agent_detection::{
     decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    ScreenIdentityConfirmation, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    observe_detection_content_change, observe_output_bytes, DetectionPublishDecision,
+    DetectionScreenReadDecision, DetectionScreenReadInput, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, ScreenIdentityConfirmation, AGENT_PENDING_IDLE_RECHECK,
+    AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
@@ -1088,6 +1089,15 @@ pub struct PaneRuntime {
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Lifetime count of PTY output bytes this runtime has read.
+    ///
+    /// Incremented on the reader thread, read by the app loop's activity
+    /// sampler. It is deliberately a raw byte total rather than anything
+    /// screen-derived: it is the only work-volume evidence that survives an
+    /// alternate-screen application, which repaints in place and grows no
+    /// scrollback at all. Wrapping is not a practical concern — a pane would
+    /// have to emit 16 exabytes.
+    output_bytes: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -1928,6 +1938,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_bytes = Arc::new(AtomicU64::new(0));
 
         let io = {
             let terminal = terminal.clone();
@@ -1935,6 +1946,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let read_output_bytes = output_bytes.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1944,6 +1956,7 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                observe_output_bytes(bytes, &read_output_bytes);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 if result.request_render && render_dirty.request_pty(pane_id) {
                     render_notify.notify_one();
@@ -2019,6 +2032,7 @@ impl PaneRuntime {
             child_wait_completed: None,
             kitty_keyboard_flags,
             detection_content_seq,
+            output_bytes,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2074,6 +2088,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_bytes = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -2115,6 +2130,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let read_output_bytes = output_bytes.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2123,6 +2139,7 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
+                observe_output_bytes(bytes, &read_output_bytes);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
                 }
@@ -2606,6 +2623,7 @@ impl PaneRuntime {
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detection_content_seq,
+            output_bytes,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2721,6 +2739,15 @@ impl PaneRuntime {
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         self.terminal.scroll_metrics()
+    }
+
+    /// Lifetime count of PTY output bytes this runtime has read.
+    ///
+    /// Monotonic for the life of the runtime and reset by anything that builds
+    /// a new one, so a consumer differencing it has to treat a decrease as "no
+    /// activity" rather than as negative work.
+    pub fn output_bytes(&self) -> u64 {
+        self.output_bytes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn search_text_matches(
@@ -3108,6 +3135,7 @@ impl PaneRuntime {
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_bytes: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 declaration_notify: Arc::new(Notify::new()),
@@ -3618,6 +3646,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_bytes: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             declaration_notify: Arc::new(Notify::new()),
@@ -3651,6 +3680,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_bytes: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             declaration_notify: Arc::new(Notify::new()),

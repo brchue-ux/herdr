@@ -1645,6 +1645,15 @@ pub struct AppState {
     /// correct, so a client that attaches late, or a server that restarts, is
     /// right to show the settled row and nothing else.
     pub(crate) relation_signals: crate::app::relation_signal::RelationSignals,
+    /// Live per-terminal work volume, sampled by Herdr's own loop.
+    ///
+    /// Deliberately absent from both `persist::SessionSnapshot` and the live
+    /// handoff manifest, for the same reason `relation_signals` is: it is a
+    /// pure function of output happening *now*, so a restored or handed-off
+    /// server is right to start every pane at rest and re-derive the level from
+    /// the next few samples rather than resurrect a rate that has stopped
+    /// being true.
+    pub(crate) pane_activity: crate::app::pane_activity::PaneActivityMap,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1810,6 +1819,38 @@ impl AppState {
             .filter_map(|terminal| terminal.state_age(now))
             .map(|age| now + crate::state_age::next_change_after(age))
             .min()
+    }
+
+    /// How hard the terminal behind `pane_id` is working, in `0.0..=1.0`.
+    ///
+    /// The accessor a paint pass binds to. Reading it is pure: the level is
+    /// sampled and smoothed by the loop, never here, so drawing can consult it
+    /// as often as it likes without changing what anyone else sees. A pane with
+    /// no runtime, no terminal, or no samples yet is `0.0` — quiet, not absent,
+    /// so a caller never has to branch on "unknown".
+    // The published in-process contract for the still-unbuilt cell-grid
+    // animation engine, which is what this sampler exists to feed. Nothing
+    // paints with it yet; the API's `pane.activity` is what observes it today.
+    // Remove this allow when the first paint pass binds to it.
+    #[allow(dead_code)]
+    pub(crate) fn pane_activity_level(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> f32 {
+        self.workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map_or(0.0, |pane| {
+                self.pane_activity.level(&pane.attached_terminal_id)
+            })
+    }
+
+    /// The same level, addressed by the terminal that produces the output.
+    ///
+    /// Prefer this where a terminal id is already in hand: the terminal is what
+    /// the sampler actually keys on, so this skips a workspace lookup that can
+    /// only fail.
+    // Same reason as `pane_activity_level` above.
+    #[allow(dead_code)]
+    pub(crate) fn terminal_activity_level(&self, terminal_id: &crate::terminal::TerminalId) -> f32 {
+        self.pane_activity.level(terminal_id)
     }
 
     /// True when at least one live relation signal is travelling a row the
@@ -2158,6 +2199,7 @@ impl AppState {
             animation_tick: 0,
             state_age_now: Instant::now(),
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
+            pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {

@@ -773,8 +773,48 @@
           ],
           "type": "string"
         },
+        "PaneActivityInfo": {
+          "description": "How much work a pane is doing right now, sampled and smoothed by the server\non its own loop.\n\nReported rather than pushed: this is a continuously varying analog value on\na fixed sample cadence, so a subscriber that wants it reads it, and it never\nbecomes an event stream that scales with how loud a pane is. It is also not\npersisted — a server that just started reports every pane at rest and\nre-derives the level from the next few samples.",
+          "properties": {
+            "bytes_per_sec": {
+              "description": "Smoothed PTY output rate in bytes per second, the raw input\n`level_percent` is derived from. Exposed for tuning and diagnosis.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "level_percent": {
+              "description": "Smoothed work volume as whole percent, `0..=100`.\n\nThis is the value to bind to. It is deliberately unitless: the mapping\nfrom output rate onto this scale is a Herdr-side feel decision that can\nbe re-tuned without a consumer changing.",
+              "format": "uint8",
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "output_bytes": {
+              "description": "Lifetime PTY output bytes for the terminal behind this pane.\n\nResets when a new runtime takes over the terminal, so treat a decrease\nas a restart rather than as negative work.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "level_percent",
+            "bytes_per_sec",
+            "output_bytes"
+          ],
+          "type": "object"
+        },
         "PaneInfo": {
           "properties": {
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneActivityInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "agent": {
               "type": [
                 "string",
@@ -7546,6 +7586,36 @@
           ],
           "type": "string"
         },
+        "PaneActivityInfo": {
+          "description": "How much work a pane is doing right now, sampled and smoothed by the server\non its own loop.\n\nReported rather than pushed: this is a continuously varying analog value on\na fixed sample cadence, so a subscriber that wants it reads it, and it never\nbecomes an event stream that scales with how loud a pane is. It is also not\npersisted — a server that just started reports every pane at rest and\nre-derives the level from the next few samples.",
+          "properties": {
+            "bytes_per_sec": {
+              "description": "Smoothed PTY output rate in bytes per second, the raw input\n`level_percent` is derived from. Exposed for tuning and diagnosis.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "level_percent": {
+              "description": "Smoothed work volume as whole percent, `0..=100`.\n\nThis is the value to bind to. It is deliberately unitless: the mapping\nfrom output rate onto this scale is a Herdr-side feel decision that can\nbe re-tuned without a consumer changing.",
+              "format": "uint8",
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "output_bytes": {
+              "description": "Lifetime PTY output bytes for the terminal behind this pane.\n\nResets when a new runtime takes over the terminal, so treat a decrease\nas a restart rather than as negative work.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "level_percent",
+            "bytes_per_sec",
+            "output_bytes"
+          ],
+          "type": "object"
+        },
         "PaneDirection": {
           "enum": [
             "left",
@@ -7629,6 +7699,16 @@
         },
         "PaneInfo": {
           "properties": {
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneActivityInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "agent": {
               "type": [
                 "string",

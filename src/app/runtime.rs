@@ -310,6 +310,7 @@ impl App {
         }
         // The app's own loop is by definition its viewer.
         changed |= self.advance_relation_signals(now, true);
+        changed |= self.sample_pane_activity(now);
 
         if self
             .selection_autoscroll_deadline
@@ -377,6 +378,26 @@ impl App {
         let damaged_before = has_viewers && self.state.relation_signal_damage();
         let advanced = self.state.relation_signals.advance(now);
         advanced && (damaged_before || (has_viewers && self.state.relation_signal_damage()))
+    }
+
+    /// Take one work-volume reading from every live terminal and advance the
+    /// activity signal.
+    ///
+    /// Runs on every loop iteration — the same rule relation signals follow —
+    /// and deliberately *not* gated on whether anyone is looking. The level is a
+    /// runtime fact about the session, published on the API the same way a
+    /// pane's scroll position is, so a detached server answering `pane get`
+    /// must report the truth rather than a number frozen at whatever it was
+    /// when the last client left. What that costs is bounded by the sampler
+    /// itself: once every pane has settled at zero it asks for no deadline, so
+    /// a Herdr with nothing happening still parks indefinitely.
+    pub(crate) fn sample_pane_activity(&mut self, now: Instant) -> bool {
+        let changed = self
+            .state
+            .pane_activity
+            .observe(now, self.terminal_runtimes.output_byte_counts());
+        self.next_activity_sample = self.state.pane_activity.next_deadline(now);
+        changed
     }
 
     pub(crate) fn sync_animation_timer(&mut self, now: Instant) {
@@ -647,6 +668,7 @@ impl App {
             self.copy_feedback_deadline,
             self.next_animation_tick,
             self.next_state_age_tick,
+            self.next_activity_sample,
             self.state.relation_signals.next_deadline(),
             include_git_refresh
                 .then(|| self.git_refresh_deadline())

@@ -365,6 +365,20 @@ pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_s
     }
 }
 
+/// Accumulate the raw work-volume evidence for one PTY read.
+///
+/// Sits beside the detection counter because both are pure byte observations
+/// made on the reader thread, but they answer different questions: the
+/// detection seq counts *reads* so the detector can tell whether a screen scan
+/// is still current, while this counts *bytes* so the app loop can derive how
+/// hard a pane is working. A chunk count would make a chatty spinner and a
+/// bulk build log look identical.
+pub(super) fn observe_output_bytes(bytes: &[u8], output_bytes: &AtomicU64) {
+    if !bytes.is_empty() {
+        output_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }
+}
+
 pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) {
     detection_content_seq.fetch_add(1, Ordering::Relaxed);
 }

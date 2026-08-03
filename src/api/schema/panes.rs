@@ -471,6 +471,8 @@ pub struct PaneInfo {
     pub agent_session: Option<AgentSessionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<PaneActivityInfo>,
     pub revision: u64,
 }
 
@@ -479,6 +481,33 @@ pub struct PaneScrollInfo {
     pub offset_from_bottom: u64,
     pub max_offset_from_bottom: u64,
     pub viewport_rows: u64,
+}
+
+/// How much work a pane is doing right now, sampled and smoothed by the server
+/// on its own loop.
+///
+/// Reported rather than pushed: this is a continuously varying analog value on
+/// a fixed sample cadence, so a subscriber that wants it reads it, and it never
+/// becomes an event stream that scales with how loud a pane is. It is also not
+/// persisted — a server that just started reports every pane at rest and
+/// re-derives the level from the next few samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneActivityInfo {
+    /// Smoothed work volume as whole percent, `0..=100`.
+    ///
+    /// This is the value to bind to. It is deliberately unitless: the mapping
+    /// from output rate onto this scale is a Herdr-side feel decision that can
+    /// be re-tuned without a consumer changing.
+    #[schemars(range(min = 0, max = 100))]
+    pub level_percent: u8,
+    /// Smoothed PTY output rate in bytes per second, the raw input
+    /// `level_percent` is derived from. Exposed for tuning and diagnosis.
+    pub bytes_per_sec: u64,
+    /// Lifetime PTY output bytes for the terminal behind this pane.
+    ///
+    /// Resets when a new runtime takes over the terminal, so treat a decrease
+    /// as a restart rather than as negative work.
+    pub output_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
