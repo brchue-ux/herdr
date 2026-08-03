@@ -143,11 +143,23 @@ impl Stage {
 ///
 /// Every phase is optional. A lifecycle with nothing in it is legal and costs
 /// nothing: the element exists, holds still, and arms no deadline.
+///
+/// `idle` is a *list* rather than one name because one element is routinely
+/// drawn several ways at once — a sidebar row whose state icon shimmers while
+/// its branch name pulses is one row, one arrival, two steady behaviours. Each
+/// declared behaviour gets its own accumulated phase, which is what stops two
+/// behaviours with different periods, or different live rate drives, from being
+/// forced to run at each other's tempo. Declaring them up front is also what
+/// lets [`Animator::advance`] accumulate for a behaviour that is only named
+/// later, at draw time.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Lifecycle {
     pub(crate) mount: Option<Stage>,
-    /// Played for as long as the element exists, looping on its own period.
-    pub(crate) idle: Option<String>,
+    /// Every steady behaviour this element can be asked to draw. A name the
+    /// caller later asks for that is not in here simply does not play — the
+    /// element has no phase for it, and freezing one mid-effect would look far
+    /// more broken than leaving it settled.
+    pub(crate) idle: Vec<String>,
     pub(crate) dismount: Option<Stage>,
 }
 
@@ -158,7 +170,10 @@ impl Lifecycle {
     }
 
     pub(crate) fn with_idle(mut self, behaviour: impl Into<String>) -> Self {
-        self.idle = Some(behaviour.into());
+        let behaviour = behaviour.into();
+        if !self.idle.contains(&behaviour) {
+            self.idle.push(behaviour);
+        }
         self
     }
 
@@ -179,6 +194,18 @@ impl Lifecycle {
             Phase::Dismount => self.dismount.as_ref(),
             Phase::Idle | Phase::Retired => None,
         }
+    }
+
+    /// Which declared idle behaviour a caller's request resolves to.
+    ///
+    /// No override means the first declared behaviour, so an element with
+    /// exactly one — the common case — needs no name at the call site.
+    fn idle_slot(&self, requested: Option<&str>) -> Option<(usize, &str)> {
+        let index = match requested {
+            None => 0,
+            Some(name) => self.idle.iter().position(|declared| declared == name)?,
+        };
+        self.idle.get(index).map(|name| (index, name.as_str()))
     }
 }
 
@@ -230,10 +257,14 @@ struct Element {
     /// on demand, which is what makes [`Animator::frame`] a pure read: two
     /// consumers asking in the same frame can never be told different things.
     progress: f32,
-    /// Accumulated turns through the idle loop. Integrated rather than derived
-    /// from elapsed time so a changing rate bends the loop instead of jumping
-    /// it — see this module's header.
-    cycles: f32,
+    /// Accumulated turns through each declared idle behaviour's own loop, in
+    /// the order [`Lifecycle::idle`] declares them.
+    ///
+    /// Integrated rather than derived from elapsed time so a changing rate
+    /// bends the loop instead of jumping it — see this module's header. One per
+    /// behaviour so two behaviours on the same element keep their own periods
+    /// and their own live rates.
+    cycles: Vec<f32>,
     inputs: DriveInputs,
     /// Quantized position last published, for the per-frame diff.
     position: u32,
@@ -245,6 +276,14 @@ pub(crate) struct Animator {
     catalogue: Catalogue,
     elements: HashMap<ElementId, Element>,
     last_advanced_at: Option<Instant>,
+    /// Floor under every behaviour's declared frame interval.
+    ///
+    /// A host that cannot afford a behaviour's natural cadence — a server
+    /// drawing for a remote client over a socket — raises this and gets the
+    /// same animations at a coarser step. It never changes a behaviour's
+    /// *period*, so nothing runs at a different speed there, only at a
+    /// different resolution.
+    frame_floor: Duration,
 }
 
 impl Default for Animator {
@@ -253,11 +292,31 @@ impl Default for Animator {
             catalogue: Catalogue::built_in(),
             elements: HashMap::new(),
             last_advanced_at: None,
+            frame_floor: Duration::ZERO,
         }
     }
 }
 
 impl Animator {
+    pub(crate) fn set_frame_floor(&mut self, floor: Duration) {
+        self.frame_floor = floor;
+    }
+
+    /// Drop every element without playing anything out.
+    ///
+    /// For a host that has stopped drawing entirely. The engine holds
+    /// presentation state only, so forgetting it loses nothing true — the next
+    /// pass that publishes a membership set rebuilds it, and every element
+    /// arrives settled rather than replaying an arrival nobody saw.
+    ///
+    /// Returns whether there was anything to forget.
+    pub(crate) fn forget_all(&mut self) -> bool {
+        let had_any = !self.elements.is_empty();
+        self.elements.clear();
+        self.last_advanced_at = None;
+        had_any
+    }
+
     /// The behaviour catalogue, for a subsystem registering its own.
     pub(crate) fn catalogue_mut(&mut self) -> &mut Catalogue {
         &mut self.catalogue
@@ -348,7 +407,7 @@ impl Animator {
                     element.phase = opening_phase(&element.lifecycle);
                     element.entered_at = now;
                     element.progress = 0.0;
-                    element.cycles = 0.0;
+                    element.cycles.fill(0.0);
                     return true;
                 }
                 false
@@ -361,10 +420,10 @@ impl Animator {
                     id,
                     Element {
                         phase: opening_phase(lifecycle),
+                        cycles: vec![0.0; lifecycle.idle.len()],
                         lifecycle: lifecycle.clone(),
                         entered_at: now,
                         progress: 0.0,
-                        cycles: 0.0,
                         inputs,
                         position: 0,
                     },
@@ -426,12 +485,18 @@ impl Animator {
             };
 
             if element.phase == Phase::Idle {
-                if let Some(behaviour) = self.catalogue.get_of(&element.lifecycle.idle) {
+                for (index, name) in element.lifecycle.idle.iter().enumerate() {
+                    let Some(behaviour) = self.catalogue.get(name) else {
+                        continue;
+                    };
+                    let Some(cycles) = element.cycles.get_mut(index) else {
+                        continue;
+                    };
                     let period = behaviour.effective_period(element.inputs);
-                    element.cycles += elapsed.as_secs_f32() / period.as_secs_f32();
-                    // Kept small so a long-lived element never loses resolution
-                    // to floating-point magnitude.
-                    element.cycles = element.cycles.rem_euclid(1.0);
+                    // Kept inside one turn so a long-lived element never loses
+                    // resolution to floating-point magnitude.
+                    *cycles =
+                        (*cycles + elapsed.as_secs_f32() / period.as_secs_f32()).rem_euclid(1.0);
                 }
             }
 
@@ -461,11 +526,13 @@ impl Animator {
         let (behaviour, progress) = match element.lifecycle.stage(element.phase) {
             Some(stage) => (self.catalogue.get(&stage.behaviour), element.progress),
             None if element.phase == Phase::Idle => {
-                let name = idle_override.or(element.lifecycle.idle.as_deref());
-                (
-                    name.and_then(|name| self.catalogue.get(name)),
-                    element.cycles,
-                )
+                match element.lifecycle.idle_slot(idle_override) {
+                    Some((index, name)) => (
+                        self.catalogue.get(name),
+                        element.cycles.get(index).copied().unwrap_or(0.0),
+                    ),
+                    None => (None, 0.0),
+                }
             }
             None => (None, 1.0),
         };
@@ -517,20 +584,29 @@ impl Animator {
     }
 
     /// How often this element needs a frame, or `None` when it is holding still.
+    ///
+    /// The finest any of its declared behaviours asked for: an element drawn
+    /// two ways at once has to satisfy the smoother of them.
     fn frame_interval(&self, element: &Element) -> Option<Duration> {
-        let behaviour = match element.lifecycle.stage(element.phase) {
-            Some(stage) => self.catalogue.get(&stage.behaviour),
-            None if element.phase == Phase::Idle => self.catalogue.get_of(&element.lifecycle.idle),
+        let interval = match element.lifecycle.stage(element.phase) {
+            Some(stage) => self
+                .catalogue
+                .get(&stage.behaviour)
+                .map(|behaviour| behaviour.frame_interval)
+                // A bounded phase still has to end even when its behaviour is
+                // missing, or an element with an unregistered mount name would
+                // sit in Mount forever.
+                .or(Some(crate::app::ANIMATION_INTERVAL)),
+            None if element.phase == Phase::Idle => element
+                .lifecycle
+                .idle
+                .iter()
+                .filter_map(|name| self.catalogue.get(name))
+                .map(|behaviour| behaviour.frame_interval)
+                .min(),
             None => None,
         };
-        // A bounded phase still has to end even when its behaviour is missing,
-        // or an element with an unregistered mount name would sit in Mount
-        // forever.
-        match behaviour {
-            Some(behaviour) => Some(behaviour.frame_interval),
-            None if element.phase.is_bounded() => Some(crate::app::ANIMATION_INTERVAL),
-            None => None,
-        }
+        interval.map(|interval| interval.max(self.frame_floor))
     }
 }
 
@@ -567,20 +643,21 @@ fn quantize_position(element: &Element) -> u32 {
         Phase::Dismount => 2,
         Phase::Retired => 3,
     };
-    let position = if element.phase.is_bounded() {
-        element.progress
-    } else {
-        element.cycles
-    };
-    let step = (position.clamp(0.0, 1.0) * POSITION_STEPS) as u32;
-    step << 2 | phase_bits
+    if element.phase.is_bounded() {
+        return step(element.progress) << 2 | phase_bits;
+    }
+    // Every declared behaviour folds in, not just the first: an element drawn
+    // two ways at once must repaint when *either* of them moves, or the second
+    // one silently stops animating.
+    let cycles = element
+        .cycles
+        .iter()
+        .fold(0u32, |acc, cycle| acc.rotate_left(9) ^ step(*cycle));
+    cycles << 2 | phase_bits
 }
 
-impl Catalogue {
-    /// Look up an optional name, which is what a lifecycle phase holds.
-    fn get_of(&self, name: &Option<String>) -> Option<&Behaviour> {
-        name.as_deref().and_then(|name| self.get(name))
-    }
+fn step(position: f32) -> u32 {
+    (position.clamp(0.0, 1.0) * POSITION_STEPS) as u32
 }
 
 #[cfg(test)]
@@ -608,6 +685,7 @@ mod tests {
         Lifecycle::still()
             .with_mount(Stage::new(names::WIPE, Duration::from_millis(400)))
             .with_idle(names::PULSE)
+            .with_idle(names::SHIMMER)
     }
 
     #[test]
@@ -890,11 +968,44 @@ mod tests {
         let idle_frame = anim.frame(&row("a"), Some(names::SHIMMER)).expect("live");
         assert_eq!(idle_frame.phase, Phase::Idle);
         assert_eq!(idle_frame.behaviour, anim.catalogue().get(names::SHIMMER));
-        // And with no override it is the lifecycle's own idle.
+        // And with no override it is the first behaviour the row declared.
         assert_eq!(
             anim.frame(&row("a"), None).expect("live").behaviour,
             anim.catalogue().get(names::PULSE)
         );
+        // A behaviour the row never declared has no phase of its own, so it is
+        // left settled rather than frozen at whatever another one had reached.
+        assert!(anim
+            .frame(&row("a"), Some(names::WAVE))
+            .expect("live")
+            .behaviour
+            .is_none());
+    }
+
+    #[test]
+    fn two_behaviours_on_one_element_keep_their_own_periods() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        // `pulse` loops over 1600ms and `shimmer` over 1400ms, so after the
+        // same elapsed time they must not be at the same place.
+        let life = Lifecycle::still()
+            .with_idle(names::PULSE)
+            .with_idle(names::SHIMMER);
+        anim.observe(now, Family::WorkspaceRow, &life, quiet(&["a"]));
+        anim.advance(now + Duration::from_millis(700));
+
+        let pulse = anim.frame(&row("a"), Some(names::PULSE)).expect("live");
+        let shimmer = anim.frame(&row("a"), Some(names::SHIMMER)).expect("live");
+        assert!(
+            (pulse.progress - shimmer.progress).abs() > 0.01,
+            "behaviours with different periods must not share a phase:              {} vs {}",
+            pulse.progress,
+            shimmer.progress
+        );
+
+        // And the element repaints when either of them moves, not only the
+        // first: the finer behaviour sets the clock.
+        assert!(anim.advance(now + Duration::from_millis(750)));
     }
 
     #[test]

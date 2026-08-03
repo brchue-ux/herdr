@@ -93,23 +93,69 @@ impl<'de> Deserialize<'de> for SidebarTokenColor {
     }
 }
 
-/// Optional animated emphasis for one styled sidebar token occurrence.
+/// Which named animation behaviour a sidebar element plays.
 ///
-/// Emphasis is opt-in: an omitted or `none` value renders exactly like an
+/// Every variant but `None` names a behaviour in the animation engine's
+/// catalogue (`crate::anim::behaviour::names`), which is what actually decides
+/// how it looks. This enum exists only so a config typo is a parse error
+/// listing the valid names rather than a silently dead animation; adding a
+/// behaviour is a variant here and a row in that catalogue, and touches no
+/// render code.
+///
+/// Animation is opt-in: an omitted or `none` value renders exactly like an
 /// unstyled token and keeps the sidebar animation clock disarmed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum SidebarTokenEmphasis {
     /// No animation. The calm default.
     #[default]
     None,
-    /// Ramp the token foreground toward the panel background and back.
+    /// Ramp the foreground toward the panel background and back.
     Pulse,
+    /// A bright band travels across the element.
+    Shimmer,
+    /// A phase-shifted ripple along the element.
+    Wave,
+    /// Brightness and tempo follow how hard this element's pane is working.
+    Activity,
+    /// A band whose speed follows how hard this element's pane is working.
+    ActivityShimmer,
+    /// Arrive everywhere at once.
+    Fade,
+    /// Arrive one cell at a time, left to right.
+    Typewriter,
+    /// A soft edge sweeps left to right.
+    Wipe,
+    /// Arrive top row first.
+    DropIn,
+    /// Cells arrive in a stable scatter.
+    Dissolve,
+    /// Close inward from the edges toward the centre.
+    Collapse,
 }
 
 impl SidebarTokenEmphasis {
     fn animates(self) -> bool {
-        matches!(self, Self::Pulse)
+        self.behaviour().is_some()
+    }
+
+    /// The catalogue name this resolves to, or `None` for the calm default.
+    pub(crate) fn behaviour(self) -> Option<&'static str> {
+        use crate::anim::behaviour::names;
+        Some(match self {
+            Self::None => return None,
+            Self::Pulse => names::PULSE,
+            Self::Shimmer => names::SHIMMER,
+            Self::Wave => names::WAVE,
+            Self::Activity => names::ACTIVITY,
+            Self::ActivityShimmer => names::ACTIVITY_SHIMMER,
+            Self::Fade => names::FADE,
+            Self::Typewriter => names::TYPEWRITER,
+            Self::Wipe => names::WIPE,
+            Self::DropIn => names::DROP_IN,
+            Self::Dissolve => names::DISSOLVE,
+            Self::Collapse => names::COLLAPSE,
+        })
     }
 }
 
@@ -663,6 +709,22 @@ impl AgentsSidebarConfig {
             })
     }
 
+    /// Every distinct behaviour a configured Agent row asks for, including
+    /// per-agent overrides.
+    ///
+    /// The animation engine has to be told up front which behaviours a row can
+    /// be asked to draw, because it accumulates a separate phase for each one.
+    /// See `crate::anim::Lifecycle::idle`.
+    pub(crate) fn animated_behaviours(&self) -> Vec<&'static str> {
+        collect_behaviours(
+            std::iter::once(&self.rows)
+                .chain(self.rows_by_agent.values())
+                .flatten()
+                .flatten()
+                .filter_map(|token| token.parts().1.emphasis),
+        )
+    }
+
     /// Whether any configured Agent row, including per-agent overrides, draws
     /// an elapsed time. Nothing else may arm the repaint clock that keeps one
     /// current, so an unconfigured Herdr never wakes up for it.
@@ -720,6 +782,17 @@ impl SpacesSidebarConfig {
             .any(|token| token.parts().1.animates())
     }
 
+    /// Every distinct behaviour a configured Space row asks for. Same contract
+    /// as the Agent panel's version above.
+    pub(crate) fn animated_behaviours(&self) -> Vec<&'static str> {
+        collect_behaviours(
+            self.rows
+                .iter()
+                .flatten()
+                .filter_map(|token| token.parts().1.emphasis),
+        )
+    }
+
     /// Whether any configured Space row draws an elapsed time.
     pub(crate) fn uses_state_age(&self) -> bool {
         self.rows
@@ -741,11 +814,76 @@ impl Default for SpacesSidebarConfig {
     }
 }
 
+/// Distinct behaviour names from a run of configured emphases, in the order
+/// they were first configured.
+///
+/// Deduplicated because the engine keeps one phase per declared behaviour, and
+/// two tokens asking for the same behaviour genuinely are one behaviour — they
+/// should stay in step, not drift apart.
+fn collect_behaviours(emphases: impl Iterator<Item = SidebarTokenEmphasis>) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for name in emphases.filter_map(SidebarTokenEmphasis::behaviour) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
+    pub animation: SidebarAnimationConfig,
+}
+
+/// How long a row's arrival runs when one is configured.
+///
+/// Short enough that a row is readable almost immediately, long enough that the
+/// arrival is a movement rather than a flicker.
+const DEFAULT_ROW_ENTER_MS: u64 = 320;
+/// Bounds on a configured arrival. A publisher of config cannot make a row
+/// unreadable for a second and a half, and cannot ask for a duration too short
+/// to resolve a single frame.
+const MIN_ROW_ENTER_MS: u64 = 60;
+const MAX_ROW_ENTER_MS: u64 = 1_500;
+
+/// Lifecycle animation for sidebar rows themselves, as opposed to the tokens
+/// drawn inside them.
+///
+/// A row's arrival is a property of the row, so it lives here rather than on any
+/// one token: every token on an arriving row arrives with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarAnimationConfig {
+    /// Behaviour a row plays as it arrives. `none` — the default — means rows
+    /// appear the way they always have, fully drawn on their first frame.
+    pub row_enter: SidebarTokenEmphasis,
+    /// How long that arrival takes, in milliseconds.
+    pub row_enter_ms: u64,
+}
+
+impl Default for SidebarAnimationConfig {
+    fn default() -> Self {
+        Self {
+            row_enter: SidebarTokenEmphasis::None,
+            row_enter_ms: DEFAULT_ROW_ENTER_MS,
+        }
+    }
+}
+
+impl SidebarAnimationConfig {
+    /// The arrival stage, or `None` when rows are configured to just appear.
+    pub(crate) fn row_enter_stage(&self) -> Option<crate::anim::Stage> {
+        let behaviour = self.row_enter.behaviour()?;
+        Some(crate::anim::Stage::new(
+            behaviour,
+            std::time::Duration::from_millis(
+                self.row_enter_ms.clamp(MIN_ROW_ENTER_MS, MAX_ROW_ENTER_MS),
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]

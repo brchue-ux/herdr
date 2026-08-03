@@ -16,7 +16,6 @@ use crate::app::agent_view::AgentViewHidden;
 use crate::app::relation_signal::RelationSignalPhase;
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
-use crate::config::SidebarTokenEmphasis;
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
 
@@ -1555,7 +1554,7 @@ fn resolved_token_spans(
     secondary_style: Style,
     custom_style: Style,
     p: &Palette,
-    animation_tick: u32,
+    anim: &RowAnimation<'_>,
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let fixed_widths = resolved
@@ -1673,16 +1672,22 @@ fn resolved_token_spans(
             // middle keeps both anchors, so what survives is what actually tells
             // two rows apart.
             ResolvedTokenKind::StateIcon => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     state_icon.0.to_string(),
-                    apply_token_style(state_icon.1, token.style, p, animation_tick),
-                ));
+                    state_icon.1,
+                    token.style,
+                    anim,
+                );
             }
             ResolvedTokenKind::StateText(text) => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     truncate_end(text, budgets[index]),
-                    apply_token_style(state_text_style, token.style, p, animation_tick),
-                ));
+                    state_text_style,
+                    token.style,
+                    anim,
+                );
             }
             // Drawn in the state's own colour, dimmed. The age qualifies the
             // state rather than competing with it, and dimming is how the row
@@ -1690,69 +1695,75 @@ fn resolved_token_spans(
             // the styling changes as the number grows, because the runtime has
             // no evidence that a long state is a bad one.
             ResolvedTokenKind::StateAge(text) => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     text.clone(),
-                    apply_token_style(
-                        state_text_style.add_modifier(Modifier::DIM),
-                        token.style,
-                        p,
-                        animation_tick,
-                    ),
-                ));
+                    state_text_style.add_modifier(Modifier::DIM),
+                    token.style,
+                    anim,
+                );
             }
             ResolvedTokenKind::Workspace(text) => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     middle_elide(text, budgets[index]),
-                    apply_token_style(workspace_style, token.style, p, animation_tick),
-                ));
+                    workspace_style,
+                    token.style,
+                    anim,
+                );
             }
             ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::Branch(text) => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     middle_elide(text, budgets[index]),
-                    apply_token_style(secondary_style, token.style, p, animation_tick),
-                ));
+                    secondary_style,
+                    token.style,
+                    anim,
+                );
             }
             ResolvedTokenKind::GitStatus { ahead, behind } => {
                 if *ahead > 0 {
-                    spans.push(Span::styled(
+                    push_token_span(
+                        &mut spans,
                         format!("↑{ahead}"),
-                        apply_token_style(
-                            Style::default().fg(p.green),
-                            token.style,
-                            p,
-                            animation_tick,
-                        ),
-                    ));
+                        Style::default().fg(p.green),
+                        token.style,
+                        anim,
+                    );
                 }
                 if *ahead > 0 && *behind > 0 {
-                    spans.push(Span::styled(
-                        " ",
-                        apply_token_style(Style::default(), token.style, p, animation_tick),
-                    ));
+                    push_token_span(
+                        &mut spans,
+                        " ".to_string(),
+                        Style::default(),
+                        token.style,
+                        anim,
+                    );
                 }
                 if *behind > 0 {
-                    spans.push(Span::styled(
+                    push_token_span(
+                        &mut spans,
                         format!("↓{behind}"),
-                        apply_token_style(
-                            Style::default().fg(p.red),
-                            token.style,
-                            p,
-                            animation_tick,
-                        ),
-                    ));
+                        Style::default().fg(p.red),
+                        token.style,
+                        anim,
+                    );
                 }
             }
             ResolvedTokenKind::GitDirty(dirty) => {
                 for (index, (lane, text)) in tokens::git_dirty_parts(*dirty).into_iter().enumerate()
                 {
                     if index > 0 {
-                        spans.push(Span::styled(
-                            " ",
-                            apply_token_style(Style::default(), token.style, p, animation_tick),
-                        ));
+                        push_token_span(
+                            &mut spans,
+                            " ".to_string(),
+                            Style::default(),
+                            token.style,
+                            anim,
+                        );
                     }
                     let color = match lane {
                         tokens::DirtyLane::Staged => p.green,
@@ -1762,15 +1773,13 @@ fn resolved_token_spans(
                         // third bright one competing with the real edits.
                         tokens::DirtyLane::Untracked => p.overlay1,
                     };
-                    spans.push(Span::styled(
+                    push_token_span(
+                        &mut spans,
                         text,
-                        apply_token_style(
-                            Style::default().fg(color),
-                            token.style,
-                            p,
-                            animation_tick,
-                        ),
-                    ));
+                        Style::default().fg(color),
+                        token.style,
+                        anim,
+                    );
                 }
             }
             ResolvedTokenKind::PullRequests {
@@ -1784,16 +1793,22 @@ fn resolved_token_spans(
                 } else {
                     p.blue
                 };
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     tokens::pull_requests_text(*open),
-                    apply_token_style(Style::default().fg(color), token.style, p, animation_tick),
-                ));
+                    Style::default().fg(color),
+                    token.style,
+                    anim,
+                );
             }
             ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
-                spans.push(Span::styled(
+                push_token_span(
+                    &mut spans,
                     truncate_end(text, budgets[index]),
-                    apply_token_style(custom_style, token.style, p, animation_tick),
-                ));
+                    custom_style,
+                    token.style,
+                    anim,
+                );
             }
         }
     }
@@ -1927,7 +1942,10 @@ fn render_agent_row(
             agent_style,
             agent_style,
             p,
-            app.animation_tick,
+            &RowAnimation::for_workspace(
+                app,
+                app.workspaces.get(detail.ws_idx).map(|ws| ws.id.as_str()),
+            ),
             (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
         ));
         frame.render_widget(
@@ -2060,52 +2078,87 @@ fn arrived_state_icon_style(base: Style, phase: Option<RelationSignalPhase>, p: 
     base.fg(p.panel_bg).bg(ink).add_modifier(Modifier::BOLD)
 }
 
-/// Frames in each half of one pulse cycle. The full cycle is twice this, so at
-/// `ANIMATION_INTERVAL` the pulse breathes over about 1.6 seconds.
-const PULSE_HALF_CYCLE_FRAMES: u32 = 8;
-/// Blend fraction toward the panel background at the dimmest point of a pulse.
-/// Deliberately partial: the token stays readable at its trough.
-const PULSE_MAX_FADE: f32 = 0.6;
-
-/// Triangle ramp from `0.0` at the pulse peak to `PULSE_MAX_FADE` at its
-/// trough. Tick `0` is the peak, so a freshly armed pulse starts out looking
-/// exactly like the same token without emphasis.
-fn pulse_fade(tick: u32) -> f32 {
-    let period = PULSE_HALF_CYCLE_FRAMES * 2;
-    let phase = tick % period;
-    let distance_from_peak = phase.min(period - phase);
-    PULSE_MAX_FADE * distance_from_peak as f32 / PULSE_HALF_CYCLE_FRAMES as f32
+/// One row's place in its own lifecycle, carried through the token pass.
+///
+/// The row owns the life; each token names its own idle behaviour through its
+/// configured `emphasis`. That split is what lets one row's tokens animate
+/// differently while still sharing one arrival — and why the *row's* arrival
+/// always wins over a token's emphasis, which is a rule the engine enforces
+/// rather than this pass.
+struct RowAnimation<'a> {
+    anim: &'a crate::anim::Animator,
+    id: Option<crate::anim::ElementId>,
+    palette: &'a Palette,
+    host: &'a crate::terminal_theme::TerminalTheme,
 }
 
-fn rgb_parts(color: ratatui::style::Color) -> Option<(u8, u8, u8)> {
-    match color {
-        ratatui::style::Color::Rgb(r, g, b) => Some((r, g, b)),
-        _ => None,
+impl<'a> RowAnimation<'a> {
+    fn for_workspace(app: &'a AppState, workspace_id: Option<&str>) -> Self {
+        Self {
+            anim: &app.anim,
+            id: workspace_id.map(crate::anim::ElementId::workspace_row),
+            palette: &app.palette,
+            host: &app.host_terminal_theme,
+        }
+    }
+
+    /// The frame this token should draw with, or `None` when nothing is
+    /// animating it — which is the settled path every unconfigured Herdr takes.
+    fn frame(
+        &self,
+        patch: crate::config::SidebarTokenStyle,
+    ) -> Option<crate::anim::ElementFrame<'a>> {
+        let idle = patch
+            .emphasis
+            .and_then(crate::config::SidebarTokenEmphasis::behaviour);
+        let frame = self.anim.frame(self.id.as_ref()?, idle)?;
+        frame.behaviour.is_some().then_some(frame)
     }
 }
 
-fn blend_channel(from: u8, to: u8, mix: f32) -> u8 {
-    (f32::from(from) + (f32::from(to) - f32::from(from)) * mix).round() as u8
-}
-
-/// Ramps `fg` toward `bg` by `mix`. This is how emphasis animates: a brightness
-/// ramp we draw ourselves, never SGR blink.
-fn blend_toward(fg: ratatui::style::Color, bg: ratatui::style::Color, mix: f32) -> Option<Style> {
-    let (fr, fg_, fb) = rgb_parts(fg)?;
-    let (br, bg_, bb) = rgb_parts(bg)?;
-    Some(Style::default().fg(ratatui::style::Color::Rgb(
-        blend_channel(fr, br, mix),
-        blend_channel(fg_, bg_, mix),
-        blend_channel(fb, bb, mix),
-    )))
-}
-
-fn apply_token_style(
-    mut style: Style,
+/// Draw one token's text with the row's animation reaching each of its cells.
+///
+/// Emits exactly one span when the animation is uniform across the token — the
+/// common case, and the only shape this pass produced before the engine existed
+/// — and one span per cell only when a behaviour genuinely differs cell to
+/// cell. A token nothing is animating takes the first branch and is byte-for-
+/// byte what it always was.
+fn push_token_span(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    base: Style,
     patch: crate::config::SidebarTokenStyle,
-    p: &Palette,
-    animation_tick: u32,
-) -> Style {
+    anim: &RowAnimation<'_>,
+) {
+    use crate::anim::cell::{CellExtent, CellPos, InkPalette};
+
+    let style = apply_token_style(base, patch);
+    let width = crate::ui::text::display_width_u16(&text);
+    let Some(frame) = anim.frame(patch).filter(|_| width > 0) else {
+        spans.push(Span::styled(text, style));
+        return;
+    };
+
+    let extent = CellExtent::row(width);
+    let ink = InkPalette::resolve(style, anim.palette, anim.host);
+    if frame.is_uniform() {
+        let paint = frame.cell(CellPos::col(0), extent, ink);
+        spans.push(Span::styled(text, paint.text_style(style, ink)));
+        return;
+    }
+
+    let mut col = 0u16;
+    for ch in text.chars() {
+        let paint = frame.cell(CellPos::col(col), extent, ink);
+        spans.push(Span::styled(ch.to_string(), paint.text_style(style, ink)));
+        col = col.saturating_add(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16);
+    }
+}
+
+/// Apply a token's own static styling. Animation is layered on top of this by
+/// [`push_token_span`], never folded into it: the settled style has to stay
+/// recoverable, because that is what every frame returns to.
+fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) -> Style {
     if let Some(fg) = patch.fg {
         style = style.fg(fg.ratatui());
     }
@@ -2146,16 +2199,6 @@ fn apply_token_style(
         } else {
             style.remove_modifier(Modifier::REVERSED)
         };
-    }
-    match patch.emphasis {
-        Some(SidebarTokenEmphasis::Pulse) => {
-            let fade = pulse_fade(animation_tick);
-            let target = patch.bg.map_or(p.panel_bg, |bg| bg.ratatui());
-            if let Some(faded) = style.fg.and_then(|fg| blend_toward(fg, target, fade)) {
-                style = style.patch(faded);
-            }
-        }
-        Some(SidebarTokenEmphasis::None) | None => {}
     }
     style
 }
@@ -2394,7 +2437,7 @@ fn render_workspace_list(
                 branch_style,
                 branch_style,
                 p,
-                app.animation_tick,
+                &RowAnimation::for_workspace(app, Some(ws.id.as_str())),
                 (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
             ));
             frame.render_widget(
@@ -3560,11 +3603,32 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         assert_eq!(separator.bg, Some(app.palette.surface_dim));
     }
 
+    /// Runs the animation engine forward `elapsed_ms` for every workspace row,
+    /// standing in for the app loop a render-only test does not have.
+    fn advance_row_animation(app: &mut crate::app::state::AppState, elapsed_ms: u64) {
+        let start = std::time::Instant::now();
+        let lifecycle = app.sidebar_row_lifecycle();
+        let live: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    crate::anim::ElementId::workspace_row(&workspace.id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(start, crate::anim::Family::WorkspaceRow, &lifecycle, live);
+        app.anim
+            .advance(start + std::time::Duration::from_millis(elapsed_ms));
+    }
+
     /// Renders one Space row whose sole token carries `style_table`, and returns
     /// the drawn style of the metadata value plus the app it rendered from.
     fn render_styled_space_token(
         style_table: &str,
-        animation_tick: u32,
+        elapsed_ms: u64,
     ) -> (ratatui::style::Style, crate::app::state::AppState) {
         let config: crate::config::Config =
             toml::from_str(&format!("[ui.sidebar.spaces]\nrows = [[{style_table}]]\n"))
@@ -3574,7 +3638,7 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
         app.mode = Mode::Terminal;
-        app.animation_tick = animation_tick;
+        advance_row_animation(&mut app, elapsed_ms);
         app.workspaces[0].metadata_tokens.patch(
             std::collections::HashMap::from([("dot".into(), Some("Z".into()))]),
             None,
@@ -3620,11 +3684,13 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
 
     #[test]
     fn pulse_emphasis_ramps_the_token_color_toward_the_panel_background() {
+        // The pulse loops over 1600ms, so its trough is half of that in.
+        const HALF_CYCLE_MS: u64 = 800;
         let pulse = r##"{ token = "$dot", fg = "#a6e3a1", emphasis = "pulse" }"##;
         let (peak, app) = render_styled_space_token(pulse, 0);
-        let (trough, _) = render_styled_space_token(pulse, PULSE_HALF_CYCLE_FRAMES);
-        let (mid, _) = render_styled_space_token(pulse, PULSE_HALF_CYCLE_FRAMES / 2);
-        let (returned, _) = render_styled_space_token(pulse, PULSE_HALF_CYCLE_FRAMES * 2);
+        let (trough, _) = render_styled_space_token(pulse, HALF_CYCLE_MS);
+        let (mid, _) = render_styled_space_token(pulse, HALF_CYCLE_MS / 2);
+        let (returned, _) = render_styled_space_token(pulse, HALF_CYCLE_MS * 2);
         let (calm, _) = render_styled_space_token(r##"{ token = "$dot", fg = "#a6e3a1" }"##, 0);
 
         // The peak of the pulse is the token's own configured color, so a
@@ -3668,28 +3734,13 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
     }
 
     #[test]
-    fn pulse_fade_is_a_symmetric_ramp_peaking_at_tick_zero() {
-        assert_eq!(pulse_fade(0), 0.0);
-        assert_eq!(pulse_fade(PULSE_HALF_CYCLE_FRAMES), PULSE_MAX_FADE);
-        assert_eq!(pulse_fade(PULSE_HALF_CYCLE_FRAMES * 2), 0.0);
-        for offset in 1..PULSE_HALF_CYCLE_FRAMES {
-            assert_eq!(
-                pulse_fade(PULSE_HALF_CYCLE_FRAMES - offset),
-                pulse_fade(PULSE_HALF_CYCLE_FRAMES + offset),
-                "ramp is not symmetric at offset {offset}"
-            );
-        }
-        const { assert!(PULSE_MAX_FADE < 1.0, "a pulse must never fully vanish") };
-    }
-
-    #[test]
     fn calm_configurations_render_identically_as_the_clock_advances() {
-        let render_at = |tick: u32| {
+        let render_at = |elapsed_ms: u64| {
             let mut app = crate::app::state::AppState::test_new();
             app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
             app.active = Some(0);
             app.mode = Mode::Terminal;
-            app.animation_tick = tick;
+            advance_row_animation(&mut app, elapsed_ms);
             app.ensure_test_terminals();
 
             let area = Rect::new(0, 0, 26, 20);
@@ -3702,11 +3753,11 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
         };
 
         let baseline = render_at(0);
-        for tick in [1, PULSE_HALF_CYCLE_FRAMES, 12345] {
+        for elapsed_ms in [100, 800, 1_234_567] {
             assert_eq!(
-                render_at(tick),
+                render_at(elapsed_ms),
                 baseline,
-                "default sidebar changed at animation tick {tick}"
+                "default sidebar changed {elapsed_ms}ms into the clock"
             );
         }
     }
@@ -3733,7 +3784,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             Style::default(),
             Style::default(),
             &crate::app::state::AppState::test_new().palette,
-            0,
+            &RowAnimation::for_workspace(&crate::app::state::AppState::test_new(), None),
             20,
         );
 
@@ -4938,7 +4989,7 @@ rows = [
     /// Render one configured row at `max_width` and return the drawn text, so a
     /// narrow row can be asserted on the way the captain actually reads it.
     fn narrow_row(resolved: &[tokens::ResolvedToken], max_width: usize) -> String {
-        let palette = crate::app::state::Palette::catppuccin();
+        let app = crate::app::state::AppState::test_new();
         resolved_token_spans(
             resolved,
             ("●", Style::default()),
@@ -4946,8 +4997,8 @@ rows = [
             Style::default(),
             Style::default(),
             Style::default(),
-            &palette,
-            0,
+            &app.palette,
+            &RowAnimation::for_workspace(&app, None),
             max_width,
         )
         .iter()

@@ -1608,6 +1608,7 @@ pub struct AppState {
     pub session_status: Option<String>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
+    pub sidebar_animation: crate::config::SidebarAnimationConfig,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1654,17 +1655,12 @@ pub struct AppState {
     pub local_sound_playback: bool,
     pub toast_config: ToastConfig,
     pub keybinds: Keybinds,
-    /// Frame counter for sidebar token emphasis animation (wraps around).
-    ///
-    /// Only advanced while a sidebar token opts into animated emphasis, so a
-    /// calm configuration leaves it at `0` forever.
-    pub animation_tick: u32,
     /// The clock the sidebar's elapsed-time tokens are rendered against.
     ///
     /// Render stays pure by taking its `now` from state rather than reading
-    /// the system clock mid-draw, the same way animated emphasis takes its
-    /// frame from `animation_tick`. The runtime refreshes this every loop
-    /// iteration; a test can set it and get a deterministic render.
+    /// the system clock mid-draw, the same way animated elements take their
+    /// position from `anim`. The runtime refreshes this every loop iteration;
+    /// a test can set it and get a deterministic render.
     pub state_age_now: Instant,
     /// Fleet relation signals currently travelling a sidebar row.
     ///
@@ -1682,6 +1678,15 @@ pub struct AppState {
     /// the next few samples rather than resurrect a rate that has stopped
     /// being true.
     pub(crate) pane_activity: crate::app::pane_activity::PaneActivityMap,
+    /// Every visual element's place in its own lifecycle, and the named
+    /// behaviours they can play.
+    ///
+    /// Presentation state: it decides how something is drawn, never what is
+    /// true about the session, so it is deliberately absent from both
+    /// `persist::SessionSnapshot` and the live handoff manifest. A client that
+    /// attaches late is right to draw every element settled rather than replay
+    /// arrivals it was not there for.
+    pub(crate) anim: crate::anim::Animator,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1809,15 +1814,53 @@ impl AppState {
         self.session_dirty = true;
     }
 
-    /// True when a visible sidebar token opts into animated emphasis.
+    /// True when a visible sidebar element opts into animation.
     ///
-    /// Drives whether the animation clock runs at all. The collapsed sidebar
-    /// renders its own compact layout without configured token rows, so a
-    /// collapsed sidebar never animates.
+    /// Drives whether the engine tracks sidebar rows at all. The collapsed
+    /// sidebar renders its own compact layout without configured token rows, so
+    /// a collapsed sidebar never animates.
     pub(crate) fn sidebar_animation_active(&self) -> bool {
         !self.sidebar_collapsed
             && (self.sidebar_agents.has_animated_tokens()
-                || self.sidebar_spaces.has_animated_tokens())
+                || self.sidebar_spaces.has_animated_tokens()
+                || self.sidebar_animation.row_enter_stage().is_some())
+    }
+
+    /// The life a sidebar row is given when it arrives.
+    ///
+    /// The arrival is the row's own; every steady behaviour comes from the
+    /// tokens configured on it, and the render pass names the one it wants
+    /// through [`crate::anim::Animator::frame`]'s override. Declaring them all
+    /// here is what lets one row carry several tokens animating differently —
+    /// each keeps its own period and its own live rate — while still sharing
+    /// one arrival.
+    pub(crate) fn sidebar_row_lifecycle(&self) -> crate::anim::Lifecycle {
+        let mut lifecycle = crate::anim::Lifecycle::still();
+        lifecycle.mount = self.sidebar_animation.row_enter_stage();
+        for behaviour in self
+            .sidebar_agents
+            .animated_behaviours()
+            .into_iter()
+            .chain(self.sidebar_spaces.animated_behaviours())
+        {
+            lifecycle = lifecycle.with_idle(behaviour);
+        }
+        lifecycle
+    }
+
+    /// How hard the busiest terminal in this workspace is working, in
+    /// `0.0..=1.0`.
+    ///
+    /// The busiest rather than the mean: a row stands for whatever is happening
+    /// under it, and averaging a working pane against three idle ones would
+    /// report a quiet row for a workspace that is plainly busy.
+    pub(crate) fn workspace_activity_level(&self, workspace: &Workspace) -> f32 {
+        workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.values())
+            .map(|pane| self.pane_activity.level(&pane.attached_terminal_id))
+            .fold(0.0, f32::max)
     }
 
     /// True when a visible sidebar token draws an elapsed time.
@@ -1856,11 +1899,10 @@ impl AppState {
     /// as often as it likes without changing what anyone else sees. A pane with
     /// no runtime, no terminal, or no samples yet is `0.0` — quiet, not absent,
     /// so a caller never has to branch on "unknown".
-    // The published in-process contract for the still-unbuilt cell-grid
-    // animation engine, which is what this sampler exists to feed. Nothing
-    // paints with it yet; the API's `pane.activity` is what observes it today.
-    // Remove this allow when the first paint pass binds to it.
-    #[allow(dead_code)]
+    // Addressed by pane for callers that have a pane id rather than a
+    // workspace; the sidebar's own binding goes through
+    // `workspace_activity_level` above.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pane_activity_level(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> f32 {
         self.workspaces
             .get(ws_idx)
@@ -1876,7 +1918,7 @@ impl AppState {
     /// the sampler actually keys on, so this skips a workspace lookup that can
     /// only fail.
     // Same reason as `pane_activity_level` above.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn terminal_activity_level(&self, terminal_id: &crate::terminal::TerminalId) -> f32 {
         self.pane_activity.level(terminal_id)
     }
@@ -2191,6 +2233,7 @@ impl AppState {
             session_status: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
+            sidebar_animation: crate::config::SidebarAnimationConfig::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,
@@ -2226,10 +2269,10 @@ impl AppState {
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
-            animation_tick: 0,
             state_age_now: Instant::now(),
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
+            anim: crate::anim::Animator::default(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {
