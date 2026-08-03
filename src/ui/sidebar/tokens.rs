@@ -355,6 +355,8 @@ mod tests {
             state_text: "blocked",
             state_age,
             ahead_behind: None,
+            dirty: None,
+            pull_requests: None,
             terminal_title: None,
             terminal_title_stripped: None,
             tokens: &tokens,
@@ -374,6 +376,159 @@ mod tests {
             )[0][1],
             ResolvedToken::unstyled(ResolvedTokenKind::StateAge("3h".into()))
         );
+    }
+
+    fn outstanding_work_context<'a>(
+        tokens: &'a std::collections::HashMap<String, String>,
+        dirty: Option<crate::workspace::GitDirtyCounts>,
+        pull_requests: Option<crate::forge::PullRequestCounts>,
+        suppress_git_details: bool,
+    ) -> SpaceTokenContext<'a> {
+        SpaceTokenContext {
+            workspace: "repo",
+            branch: None,
+            state_text: "idle",
+            state_age: None,
+            ahead_behind: None,
+            dirty,
+            pull_requests,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens,
+            suppress_git_details,
+        }
+    }
+
+    fn outstanding_work_config() -> SpacesSidebarConfig {
+        SpacesSidebarConfig {
+            rows: vec![vec![
+                SpaceSidebarToken::GitDirty,
+                SpaceSidebarToken::PullRequests,
+            ]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nothing_outstanding_renders_no_row_at_all() {
+        // A clean tree and an empty queue must not draw `+0` and `pr0`; the row
+        // exists to say work is waiting, so silence is the correct rendering.
+        let tokens = std::collections::HashMap::new();
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(crate::workspace::GitDirtyCounts::default()),
+                Some(crate::forge::PullRequestCounts::default()),
+                false,
+            ),
+        );
+
+        assert!(rows.is_empty(), "clean state should render nothing");
+    }
+
+    #[test]
+    fn outstanding_work_renders_both_counters() {
+        let tokens = std::collections::HashMap::new();
+        let dirty = crate::workspace::GitDirtyCounts {
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+        };
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(dirty),
+                Some(crate::forge::PullRequestCounts {
+                    open: 4,
+                    draft: 1,
+                    review_requested: 2,
+                }),
+                false,
+            ),
+        );
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::GitDirty(dirty)),
+                ResolvedToken::unstyled(ResolvedTokenKind::PullRequests {
+                    open: 4,
+                    review_requested: 2,
+                }),
+            ]]
+        );
+    }
+
+    #[test]
+    fn dirty_parts_omit_empty_lanes_and_keep_gits_own_marks() {
+        assert_eq!(
+            git_dirty_parts(crate::workspace::GitDirtyCounts {
+                staged: 0,
+                unstaged: 2,
+                untracked: 0,
+            }),
+            vec![(DirtyLane::Unstaged, "~2".to_string())]
+        );
+        assert_eq!(
+            git_dirty_parts(crate::workspace::GitDirtyCounts {
+                staged: 1,
+                unstaged: 2,
+                untracked: 3,
+            }),
+            vec![
+                (DirtyLane::Staged, "+1".to_string()),
+                (DirtyLane::Unstaged, "~2".to_string()),
+                (DirtyLane::Untracked, "?3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_grouped_child_row_suppresses_both_counters() {
+        // Indented worktree children already inherit the parent's Git details;
+        // repeating them per child would spend scarce columns saying the same
+        // thing, and the pull request count is a whole-repository fact anyway.
+        let tokens = std::collections::HashMap::new();
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(crate::workspace::GitDirtyCounts {
+                    staged: 1,
+                    unstaged: 0,
+                    untracked: 0,
+                }),
+                Some(crate::forge::PullRequestCounts {
+                    open: 2,
+                    draft: 0,
+                    review_requested: 0,
+                }),
+                true,
+            ),
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn counters_hug_the_token_before_them_like_the_ahead_behind_pair() {
+        let workspace = ResolvedToken::unstyled(ResolvedTokenKind::Workspace("repo".into()));
+        let dirty = ResolvedToken::unstyled(ResolvedTokenKind::GitDirty(
+            crate::workspace::GitDirtyCounts {
+                staged: 1,
+                unstaged: 0,
+                untracked: 0,
+            },
+        ));
+        let pulls = ResolvedToken::unstyled(ResolvedTokenKind::PullRequests {
+            open: 2,
+            review_requested: 0,
+        });
+
+        assert_eq!(separator(&workspace, &dirty), " ");
+        assert_eq!(separator(&dirty, &pulls), " ");
     }
 
     #[test]
@@ -541,6 +696,8 @@ mod tests {
                     branch: Some("worktree/feature"),
                     state_text: "idle",
                     ahead_behind: Some((2, 1)),
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
@@ -576,6 +733,8 @@ mod tests {
                     branch: None,
                     state_text: "working",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
@@ -617,6 +776,8 @@ mod tests {
                     branch: None,
                     state_text: "unknown",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
@@ -649,6 +810,8 @@ mod tests {
                     branch: Some("worktree/feature"),
                     state_text: "working",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
@@ -679,6 +842,8 @@ mod tests {
                     branch: None,
                     state_text: "idle",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &tokens,

@@ -345,6 +345,7 @@ mod tests {
                 GitStatusRefreshDemand {
                     branch: true,
                     ahead_behind: false,
+                    dirty: false,
                 },
             ),
             (
@@ -352,6 +353,7 @@ mod tests {
                 GitStatusRefreshDemand {
                     branch: false,
                     ahead_behind: true,
+                    dirty: false,
                 },
             ),
         ];

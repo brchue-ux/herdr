@@ -4144,6 +4144,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
+                dirty: None,
                 space: None,
             }],
         );
@@ -4173,6 +4174,7 @@ mod tests {
                 auto_label: "stale".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
+                dirty: None,
                 space: None,
             }],
         );
@@ -4200,10 +4202,12 @@ mod tests {
                 demand: crate::workspace::GitStatusRefreshDemand {
                     branch: false,
                     ahead_behind: true,
+                    dirty: false,
                 },
                 auto_label: "one".into(),
                 branch: Some("new".into()),
                 ahead_behind: None,
+                dirty: None,
                 space: None,
             }],
         );
@@ -4231,6 +4235,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: None,
                 ahead_behind: None,
+                dirty: None,
                 space: None,
             }],
         );
@@ -4259,6 +4264,7 @@ mod tests {
                 auto_label: "other".into(),
                 branch: Some("scratch".into()),
                 ahead_behind: None,
+                dirty: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),

@@ -212,7 +212,7 @@ mod tests {
         let workspace_id = app.state.workspaces[0].id.clone();
         app.pull_request_refresh_in_flight = true;
 
-        app.handle_internal_event(AppEvent::PullRequestsRefreshed {
+        app.handle_internal_event_with_prefix_sync(AppEvent::PullRequestsRefreshed {
             results: vec![WorkspacePullRequests {
                 workspace_id,
                 remote_url: Some("git@github.com:owner/name.git".into()),
@@ -245,7 +245,7 @@ mod tests {
             review_requested: 1,
         });
 
-        app.handle_internal_event(AppEvent::PullRequestsRefreshed {
+        app.handle_internal_event_with_prefix_sync(AppEvent::PullRequestsRefreshed {
             results: vec![WorkspacePullRequests {
                 workspace_id,
                 remote_url: Some("git@github.com:owner/name.git".into()),
@@ -272,7 +272,7 @@ mod tests {
             review_requested: 1,
         });
 
-        app.handle_internal_event(AppEvent::PullRequestsRefreshed {
+        app.handle_internal_event_with_prefix_sync(AppEvent::PullRequestsRefreshed {
             results: vec![WorkspacePullRequests {
                 workspace_id,
                 remote_url: None,

@@ -16,7 +16,7 @@ pub(crate) fn temp_test_dir(name: &str) -> PathBuf {
     path
 }
 
-fn init_repo_with_commit(repo: &Path) {
+pub(super) fn init_repo_with_commit(repo: &Path) {
     std::fs::create_dir_all(repo).unwrap();
     run_git(repo, &["init", "--quiet"]);
     run_git(repo, &["config", "user.email", "herdr@example.invalid"]);
