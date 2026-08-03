@@ -500,8 +500,14 @@ pub struct PaneActivityInfo {
     /// be re-tuned without a consumer changing.
     #[schemars(range(min = 0, max = 100))]
     pub level_percent: u8,
-    /// Smoothed PTY output rate in bytes per second, the raw input
-    /// `level_percent` is derived from. Exposed for tuning and diagnosis.
+    /// The PTY output rate `level_percent` currently stands for, in bytes per
+    /// second. Exposed so the curve can be re-tuned without guessing what the
+    /// percentage means.
+    ///
+    /// Derived from `level_percent` rather than measured beside it, so the two
+    /// can never disagree — a pane emitting short bursts leaves most individual
+    /// sample windows empty, and reporting the last window's raw rate would
+    /// show `0` next to a level that is correctly well above it.
     pub bytes_per_sec: u64,
     /// Lifetime PTY output bytes for the terminal behind this pane.
     ///

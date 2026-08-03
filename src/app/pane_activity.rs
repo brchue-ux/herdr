@@ -79,10 +79,6 @@ const LEVEL_FLOOR: f32 = 0.004;
 pub(crate) struct PaneActivity {
     /// Smoothed work volume in `0.0..=1.0`. This is the contract value.
     pub(crate) level: f32,
-    /// PTY output rate measured over the most recent sample window, in bytes
-    /// per second. Unsmoothed on purpose: it is the raw evidence, so that a
-    /// consumer tuning the curve can see what the smoothing was given.
-    pub(crate) bytes_per_sec: f64,
     /// Lifetime PTY output bytes as of the last committed sample.
     pub(crate) output_bytes: u64,
 }
@@ -97,6 +93,22 @@ impl PaneActivity {
         // saturate or wrap.
         (self.level * 100.0).round().clamp(0.0, 100.0) as u8
     }
+
+    /// The output rate this level stands for, in bytes per second.
+    ///
+    /// Derived from `level` rather than reported alongside it, so the two can
+    /// never disagree. Publishing the most recent window's measured rate
+    /// instead was tried against a real running Herdr and was actively
+    /// misleading: an agent emitting short bursts leaves most individual
+    /// windows empty, so the raw rate read `0` while the level correctly read
+    /// a fifth of full scale, which looks like a broken field rather than like
+    /// smoothing working.
+    pub(crate) fn bytes_per_sec(&self) -> f64 {
+        if self.level <= 0.0 {
+            return 0.0;
+        }
+        (f64::from(self.level) * FULL_SCALE_BYTES_PER_SEC.ln_1p()).exp_m1()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +117,6 @@ struct Entry {
     committed_bytes: u64,
     /// Most recent byte counter reading, committed or not.
     latest_bytes: u64,
-    bytes_per_sec: f64,
     level: f32,
 }
 
@@ -114,7 +125,6 @@ impl Entry {
         Self {
             committed_bytes: bytes,
             latest_bytes: bytes,
-            bytes_per_sec: 0.0,
             level: 0.0,
         }
     }
@@ -198,13 +208,13 @@ impl PaneActivityMap {
             // terminal, not negative work. Same for the `clear` that resets a
             // pane's scrollback: neither is evidence of anything undone.
             let delta = entry.latest_bytes.saturating_sub(entry.committed_bytes);
-            entry.bytes_per_sec = delta as f64 / elapsed_secs;
+            let rate = delta as f64 / elapsed_secs;
             // Smoothed in level space, not in bytes-per-second space. Decaying
             // the rate exponentially would decay the *level* linearly, because
             // the level is its logarithm — so a loud burst would leave a long
             // flat trail instead of fading. Smoothing what the consumer sees
             // also makes the time constants above mean what they say.
-            entry.level = smooth(entry.level, normalize(entry.bytes_per_sec), elapsed);
+            entry.level = smooth(entry.level, normalize(rate), elapsed);
             entry.committed_bytes = entry.latest_bytes;
             changed |= quantize(entry.level) != before;
         }
@@ -232,7 +242,6 @@ impl PaneActivityMap {
     pub(crate) fn get(&self, terminal_id: &TerminalId) -> Option<PaneActivity> {
         self.entries.get(terminal_id).map(|entry| PaneActivity {
             level: entry.level,
-            bytes_per_sec: entry.bytes_per_sec,
             output_bytes: entry.latest_bytes,
         })
     }
@@ -318,6 +327,45 @@ mod tests {
             None,
             "a settled pane must not keep the loop awake"
         );
+    }
+
+    #[test]
+    fn the_published_rate_never_contradicts_the_published_level() {
+        let now = Instant::now();
+        let id = terminal("term_bursty");
+        let mut map = PaneActivityMap::default();
+        map.observe(now, [(&id, 0)]);
+
+        // Bursty output: one loud window, then several empty ones. This is the
+        // shape a real agent produces, and the shape that made a raw
+        // last-window rate read zero against a plainly non-zero level.
+        let mut total = 0u64;
+        for step in 1..=6u32 {
+            if step == 1 {
+                total += 262_144;
+            }
+            map.observe(now + SAMPLE_INTERVAL * step, [(&id, total)]);
+        }
+
+        let activity = map.get(&id).expect("sampled");
+        assert!(activity.level_percent() > 0, "{activity:?}");
+        assert!(
+            activity.bytes_per_sec() > 0.0,
+            "a non-zero level must never report a zero rate: {activity:?}"
+        );
+
+        // And the two agree: the rate round-trips back to the same level.
+        assert_eq!(normalize(activity.bytes_per_sec()), activity.level);
+    }
+
+    #[test]
+    fn a_resting_pane_reports_no_rate_at_all() {
+        let activity = PaneActivity {
+            level: 0.0,
+            output_bytes: 4_096,
+        };
+        assert_eq!(activity.level_percent(), 0);
+        assert_eq!(activity.bytes_per_sec(), 0.0);
     }
 
     #[test]
@@ -434,7 +482,7 @@ mod tests {
         assert!(map.observe(restart, [(&id, 0)]) || true);
         let activity = map.get(&id).expect("sampled");
         assert!(
-            activity.bytes_per_sec >= 0.0 && activity.level >= 0.0,
+            activity.bytes_per_sec() >= 0.0 && activity.level >= 0.0,
             "a restarted counter must not drive the level negative: {activity:?}"
         );
         assert!((0.0..=1.0).contains(&activity.level));

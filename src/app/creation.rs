@@ -437,7 +437,7 @@ impl App {
         let activity = self.state.pane_activity.get(&terminal.id).map(|activity| {
             crate::api::schema::PaneActivityInfo {
                 level_percent: activity.level_percent(),
-                bytes_per_sec: activity.bytes_per_sec.round().max(0.0) as u64,
+                bytes_per_sec: activity.bytes_per_sec().round().max(0.0) as u64,
                 output_bytes: activity.output_bytes,
             }
         });

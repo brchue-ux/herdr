@@ -777,7 +777,7 @@
           "description": "How much work a pane is doing right now, sampled and smoothed by the server\non its own loop.\n\nReported rather than pushed: this is a continuously varying analog value on\na fixed sample cadence, so a subscriber that wants it reads it, and it never\nbecomes an event stream that scales with how loud a pane is. It is also not\npersisted — a server that just started reports every pane at rest and\nre-derives the level from the next few samples.",
           "properties": {
             "bytes_per_sec": {
-              "description": "Smoothed PTY output rate in bytes per second, the raw input\n`level_percent` is derived from. Exposed for tuning and diagnosis.",
+              "description": "The PTY output rate `level_percent` currently stands for, in bytes per\nsecond. Exposed so the curve can be re-tuned without guessing what the\npercentage means.\n\nDerived from `level_percent` rather than measured beside it, so the two\ncan never disagree — a pane emitting short bursts leaves most individual\nsample windows empty, and reporting the last window's raw rate would\nshow `0` next to a level that is correctly well above it.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -7590,7 +7590,7 @@
           "description": "How much work a pane is doing right now, sampled and smoothed by the server\non its own loop.\n\nReported rather than pushed: this is a continuously varying analog value on\na fixed sample cadence, so a subscriber that wants it reads it, and it never\nbecomes an event stream that scales with how loud a pane is. It is also not\npersisted — a server that just started reports every pane at rest and\nre-derives the level from the next few samples.",
           "properties": {
             "bytes_per_sec": {
-              "description": "Smoothed PTY output rate in bytes per second, the raw input\n`level_percent` is derived from. Exposed for tuning and diagnosis.",
+              "description": "The PTY output rate `level_percent` currently stands for, in bytes per\nsecond. Exposed so the curve can be re-tuned without guessing what the\npercentage means.\n\nDerived from `level_percent` rather than measured beside it, so the two\ncan never disagree — a pane emitting short bursts leaves most individual\nsample windows empty, and reporting the last window's raw rate would\nshow `0` next to a level that is correctly well above it.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
