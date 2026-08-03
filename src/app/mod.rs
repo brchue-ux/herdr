@@ -714,6 +714,9 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             agent_panel_sort,
             agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
+            // Never restored: a status is a claim about the world right now,
+            // and its publisher republishes on its own clock.
+            session_status: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,

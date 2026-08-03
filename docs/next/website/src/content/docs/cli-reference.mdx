@@ -113,6 +113,24 @@ herdr session delete <name> [--json]
 
 Use `default` as the session name when you need to stop the default session explicitly.
 
+### Session status
+
+```bash
+herdr api status get
+herdr api status set <text>
+herdr api status clear
+```
+
+The status is one line of your own text about the session. Herdr never composes or interprets it — whatever you publish is what the sidebar shows, on the header row above the first Space in its tree. A script on a timer can put a quota readout, a deploy banner, or a build number there without Herdr learning about any of them:
+
+```bash
+herdr api status set "7d 62% · 5h 18%"
+```
+
+Nothing is drawn until something sets a status, `clear` returns the row to empty, and a long status elides on a narrow sidebar rather than pushing the tree around.
+
+It sits under `herdr api` rather than `herdr session` for the same reason `herdr api snapshot` does: `herdr session` is the session manager, where every subcommand names a session to act on, while this acts on the session the global `--session` flag already selected.
+
 ## Workspaces
 
 ```bash

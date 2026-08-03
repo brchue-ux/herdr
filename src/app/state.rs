@@ -1596,6 +1596,16 @@ pub struct AppState {
     /// is deliberately never filtered by it, because it is the only place a
     /// mate or worker is drawn and a filter there could hide the whole fleet.
     pub agent_views: crate::agent_view::AgentViewSlots,
+    /// One caller-supplied line of text about this session, published through
+    /// `session.status.set` and shown on the sidebar's reserved header row.
+    ///
+    /// Herdr neither composes nor interprets it. The slot exists so an outside
+    /// publisher - a timer, a plugin, a shell script - owns both the content
+    /// and the refresh cadence; nothing here knows or cares whether it is a
+    /// quota readout, a branch name, or a deploy banner. It is deliberately
+    /// not persisted: a status restored from a session file would be a stale
+    /// claim about the world, and the publisher republishes anyway.
+    pub session_status: Option<String>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub next_agent_state_change_seq: u64,
@@ -2178,6 +2188,7 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             agent_panel_sort: AgentPanelSort::Spaces,
             agent_views: crate::agent_view::AgentViewSlots::default(),
+            session_status: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             next_agent_state_change_seq: 0,

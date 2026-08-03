@@ -813,6 +813,57 @@ fn list_entry_content_width(
     }
 }
 
+/// The reserved row above the tree, the session status draws on.
+///
+/// It is the panel's own content column narrowed to a single row, so a status
+/// that fits here fits the tree below it and nothing on it can reach the
+/// divider bar. Empty whenever the panel is too short to hold a tree at all:
+/// the row exists to sit above cards, and with no cards there is no "above".
+pub(crate) fn workspace_list_header_rect(area: Rect) -> Rect {
+    if area.width == 0
+        || area.height <= WORKSPACE_SECTION_HEADER_ROWS + WORKSPACE_SECTION_FOOTER_ROWS
+    {
+        return Rect::default();
+    }
+    Rect::new(area.x, area.y, area.width, WORKSPACE_SECTION_HEADER_ROWS)
+}
+
+/// Below this many columns the header row stays empty.
+///
+/// A status elided down to a glyph and an ellipsis is not a shorter readout,
+/// it is a different one that happens to look like text, and the row reads
+/// better blank than wrong.
+const MIN_SESSION_STATUS_WIDTH: u16 = 6;
+
+/// Draw the session status on the panel's reserved header row.
+///
+/// Right-aligned on purpose. Every row below it is left-aligned and carries
+/// the indent guides and connectors that spell out ownership, so a left-hung
+/// status would read as another root of the tree; against the right edge it
+/// reads as panel chrome instead, and it lands in the same column the
+/// scrollbar track occupies further down rather than inventing a new one.
+///
+/// Nothing is drawn when no status is set, which leaves the row exactly as
+/// empty as it was before the slot existed.
+fn render_session_status(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(status) = app.session_status.as_deref() else {
+        return;
+    };
+    let header = workspace_list_header_rect(area);
+    if header.width < MIN_SESSION_STATUS_WIDTH || header.height == 0 {
+        return;
+    }
+    let text = truncate_end(status, usize::from(header.width));
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::default().fg(app.palette.overlay0),
+        ))
+        .alignment(Alignment::Right),
+        header,
+    );
+}
+
 /// Drawn height of one tree row, whichever kind it is.
 ///
 /// Space rows and agent rows keep their own configured token rows, so the two
@@ -2134,6 +2185,8 @@ fn render_workspace_list(
     let list_bottom = area.y + area.height.saturating_sub(1);
     let fold_width = row_fold_width(area);
 
+    render_session_status(app, frame, area);
+
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
     let cards = &app.view.workspace_card_areas;
@@ -3001,13 +3054,10 @@ mod tests {
         );
     }
 
-    /// The header row is empty. Neither the `spaces` title nor the second-mate
-    /// drop-down beside it is drawn any more - both were removed once every
-    /// mate rendered live in the tree and could be reached by clicking it -
-    /// but the row itself stays, because the tree's drop-slot grid needs a row
-    /// above the first card and the usage readout is proposed to live there.
-    #[test]
-    fn the_header_row_is_empty_above_the_tree() {
+    /// A first mate owning three second mates, drawn with whatever session
+    /// status is in force. `None` is the default state, in which nothing has
+    /// published a status and the header row has nothing to draw.
+    fn mate_fleet_sidebar_rows(width: u16, status: Option<&str>) -> Vec<String> {
         let mut app = crate::app::state::AppState::test_new();
         let now = std::time::Instant::now();
         app.workspaces = vec![
@@ -3019,6 +3069,7 @@ mod tests {
         app.ensure_test_terminals();
         app.active = Some(0);
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.session_status = status.map(str::to_string);
         for idx in 1..app.workspaces.len() {
             app.workspaces[idx].metadata_tokens.patch(
                 std::collections::HashMap::from([(
@@ -3030,7 +3081,7 @@ mod tests {
             );
         }
 
-        let area = Rect::new(0, 0, 26, 20);
+        let area = Rect::new(0, 0, width, 20);
         app.view.sidebar_rect = area;
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -3038,9 +3089,19 @@ mod tests {
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let rows = (0..area.height)
+        (0..area.height)
             .map(|row| row_text(buffer, area.y + row, area.width))
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// The header row is empty until something publishes a session status.
+    /// Neither the `spaces` title nor the second-mate drop-down beside it is
+    /// drawn any more - both were removed once every mate rendered live in the
+    /// tree and could be reached by clicking it - but the row itself stays,
+    /// because the tree's drop-slot grid needs a row above the first card.
+    #[test]
+    fn the_header_row_is_empty_above_the_tree_until_a_status_is_set() {
+        let rows = mate_fleet_sidebar_rows(26, None);
         let screen = rows.join("\n");
 
         // Only the sidebar divider draws on the header row; nothing else does.
@@ -3065,6 +3126,110 @@ mod tests {
         for mate in ["2ndmate-explore", "2ndmate-build", "2ndmate-homeauto"] {
             assert!(screen.contains(mate), "{mate} missing from:\n{screen}");
         }
+    }
+
+    /// A published status lands on that same row, right-aligned, and the tree
+    /// below it does not move.
+    #[test]
+    fn a_session_status_draws_on_the_header_row_above_the_first_mate() {
+        let status = "7d 62% 5h 18%";
+        let rows = mate_fleet_sidebar_rows(26, Some(status));
+        let screen = rows.join("\n");
+
+        assert!(
+            rows[0].contains(status),
+            "the status is not on the header row:\n{screen}"
+        );
+        assert!(
+            !rows[0].contains('…'),
+            "the status was elided at a width it fits:\n{screen}"
+        );
+        // Right-aligned: the last content column, one left of the divider bar.
+        let divider = usize::from(26u16 - 1);
+        assert_eq!(
+            rows[0].char_indices().nth(divider).map(|(_, ch)| ch),
+            Some('│'),
+            "the status overran the divider column:\n{screen}"
+        );
+        assert!(
+            rows[0].trim_end_matches('│').ends_with(status),
+            "the status is not right-aligned:\n{screen}"
+        );
+
+        // Setting a status is not allowed to disturb the tree it sits above.
+        let without = mate_fleet_sidebar_rows(26, None);
+        assert_eq!(
+            rows[1..],
+            without[1..],
+            "the tree moved when a status was set:\n{screen}"
+        );
+    }
+
+    /// Clearing it puts the row back exactly as it was.
+    #[test]
+    fn clearing_the_session_status_empties_the_header_row_again() {
+        let set = mate_fleet_sidebar_rows(26, Some("7d 62% 5h 18%"));
+        let cleared = mate_fleet_sidebar_rows(26, None);
+
+        assert_ne!(
+            set[0], cleared[0],
+            "the status never drew in the first place"
+        );
+        assert!(
+            cleared[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
+            "the header row did not go back to empty:\n{}",
+            cleared.join("\n")
+        );
+    }
+
+    /// At the narrowest sidebar the status gives ground instead of taking it:
+    /// it elides inside its own row, stays clear of the divider bar, and the
+    /// tree keeps every column it had.
+    #[test]
+    fn a_long_session_status_elides_on_a_narrow_sidebar() {
+        let width = 18;
+        let rows = mate_fleet_sidebar_rows(width, Some("7d 62% · 5h 18% · $41.20"));
+        let screen = rows.join("\n");
+
+        assert_eq!(
+            display_width(&rows[0]),
+            usize::from(width),
+            "the header row is not exactly one sidebar wide:\n{screen}"
+        );
+        assert!(
+            rows[0].contains('…'),
+            "the status did not elide at 18 columns:\n{screen}"
+        );
+        assert!(
+            rows[0].starts_with("7d"),
+            "eliding dropped the leading window:\n{screen}"
+        );
+        let divider = usize::from(width - 1);
+        assert_eq!(
+            rows[0].char_indices().nth(divider).map(|(_, ch)| ch),
+            Some('│'),
+            "the elided status overran the divider column:\n{screen}"
+        );
+
+        let without = mate_fleet_sidebar_rows(width, None);
+        assert_eq!(
+            rows[1..],
+            without[1..],
+            "the tree reflowed to make room for the status:\n{screen}"
+        );
+    }
+
+    /// Narrower than a status can say anything, the row goes back to empty
+    /// rather than showing a stub the reader would have to guess at.
+    #[test]
+    fn a_session_status_is_dropped_when_the_sidebar_is_too_narrow_to_read_it() {
+        let rows = mate_fleet_sidebar_rows(5, Some("7d 62% 5h 18%"));
+
+        assert!(
+            rows[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
+            "a stub status drew at 5 columns:\n{}",
+            rows.join("\n")
+        );
     }
 
     #[test]

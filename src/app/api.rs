@@ -994,6 +994,12 @@ impl App {
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
+            Method::SessionStatusSet(params) => {
+                return self.handle_session_status_set(request.id, params);
+            }
+            Method::SessionStatusClear(_) => {
+                return self.handle_session_status_clear(request.id);
+            }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
