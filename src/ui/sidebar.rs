@@ -34,6 +34,14 @@ const WORKSPACE_SECTION_FOOTER_ROWS: u16 = 1;
 /// the usage readout is proposed to occupy.
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
 
+/// Columns a state mark occupies, whatever state it is reporting.
+///
+/// The layout has to know how wide a row's icon is before it knows which icon
+/// the row will draw — the height a row reserves is decided from the tokens
+/// alone, one pass before the palette and the aggregate state are resolved.
+/// `state_marks_are_one_column_wide` is the check that keeps this honest.
+const STATE_MARK_WIDTH: usize = 1;
+
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
@@ -248,7 +256,12 @@ fn space_state_age(
         .map(|at| app.state_age_now.saturating_duration_since(at))
 }
 
-fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
+fn workspace_row_height(
+    app: &AppState,
+    ws: &crate::workspace::Workspace,
+    indented: bool,
+    content_width: usize,
+) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if indented {
         grouped_child_display_label(
@@ -261,7 +274,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
     };
     let token_values = ws.metadata_tokens.values();
     let terminal_title = space_terminal_title(app, ws);
-    tokens::space_rows(
+    let rows = tokens::space_rows(
         &app.sidebar_spaces,
         SpaceTokenContext {
             workspace: &label,
@@ -276,10 +289,11 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             tokens: &token_values,
             suppress_git_details: indented,
         },
-    )
-    .len()
-    .max(1)
-    .min(u16::MAX as usize) as u16
+    );
+    fold_token_lines(rows, content_width, None)
+        .len()
+        .max(1)
+        .min(u16::MAX as usize) as u16
 }
 
 fn workspace_row_height_in_body(
@@ -287,8 +301,9 @@ fn workspace_row_height_in_body(
     workspace: &crate::workspace::Workspace,
     indented: bool,
     body_height: u16,
+    content_width: usize,
 ) -> u16 {
-    workspace_row_height(app, workspace, indented).min(body_height)
+    workspace_row_height(app, workspace, indented, content_width).min(body_height)
 }
 
 fn workspace_entry_gap(
@@ -700,28 +715,129 @@ pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect 
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
+/// Columns one tree row spends on rails and connector before its first token.
+///
+/// The single place the prefix is measured. The layout subtracts it to decide
+/// how many lines a row needs and the renderer subtracts it again to decide how
+/// much each line may draw, so the two cannot disagree about how much room the
+/// row had - which is the whole reason a row's height may depend on its width
+/// at all.
+fn tree_prefix_width(depth: u8, indented: bool, row_index: usize) -> usize {
+    use crate::app::agent_tree::display_depth;
+    if indented {
+        // A worktree child brings its own legacy connector, so the ownership
+        // rails above it are laid down first and its connector sits after them.
+        3 * display_depth(depth.saturating_sub(1)) as usize + if row_index == 0 { 6 } else { 8 }
+    } else {
+        let depth = display_depth(depth) as usize;
+        match (depth, row_index) {
+            (0, 0) => 1,
+            (0, _) => 3,
+            (_, 0) => 3 * depth + 1,
+            (_, _) => 3 * depth + 3,
+        }
+    }
+}
+
+/// The panel width every fold decision is measured against.
+///
+/// Deliberately the narrow one, as though the scrollbar were always showing.
+/// Whether it *is* showing depends on how tall the rows are, so a fold that
+/// measured the real width would be feeding its own input: one folded row frees
+/// a line, which can retire the scrollbar, which widens the panel, which folds
+/// another row. Measuring against the narrow width costs at most one column of
+/// slack and makes the layout a fixed point.
+fn row_fold_width(list_area: Rect) -> u16 {
+    workspace_list_body_rect(list_area, true).width
+}
+
+/// Columns a row has for its tokens once its prefix and any trailing control
+/// are taken out.
+fn row_content_width(fold_width: u16, depth: u8, indented: bool, trailing_width: usize) -> usize {
+    (fold_width as usize)
+        .saturating_sub(tree_prefix_width(depth, indented, 0))
+        .saturating_sub(trailing_width)
+}
+
+/// Columns reserved at the right edge of a Space row's first line for the
+/// worktree group chevron, which is drawn over the row rather than laid out in
+/// it.
+fn space_trailing_width(app: &AppState, ws_idx: usize, indented: bool) -> usize {
+    2 * usize::from(!indented && workspace_parent_group_state(app, ws_idx).is_some())
+}
+
+/// Columns row 0 of this entry gives up to a worker-summary badge.
+///
+/// Zero for every row that owns no worker with a published summary, which is
+/// every row in a fleet that never calls `pane report-metadata --token summary`.
+fn entry_badge_width(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+    fold_width: u16,
+) -> usize {
+    let Some(name) = entry_tree_name(app, agents, entry) else {
+        return 0;
+    };
+    let count = crate::app::worker_summary::summary_count_for_owner(agents, &name);
+    if count == 0 {
+        return 0;
+    }
+    usize::from(worker_summary_badge_width(count, fold_width))
+}
+
+/// Columns one tree row has for its tokens, from the entry alone.
+///
+/// Every control drawn *over* the row rather than laid out in it - the worktree
+/// chevron, the worker-summary badge - is subtracted here, because the fold is
+/// only allowed to buy a row back, never to spend a character.
+fn list_entry_content_width(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+    fold_width: u16,
+) -> usize {
+    let badge = entry_badge_width(app, agents, entry, fold_width);
+    match entry {
+        WorkspaceListEntry::Workspace {
+            ws_idx, indented, ..
+        } => row_content_width(
+            fold_width,
+            entry.depth(),
+            *indented,
+            space_trailing_width(app, *ws_idx, *indented) + badge,
+        ),
+        WorkspaceListEntry::Agent { .. } => {
+            row_content_width(fold_width, entry.depth(), false, badge)
+        }
+    }
+}
+
 /// Drawn height of one tree row, whichever kind it is.
 ///
 /// Space rows and agent rows keep their own configured token rows, so the two
 /// keep the heights their `[ui.sidebar.spaces]` / `[ui.sidebar.agents]` blocks
-/// ask for even though they are now one list.
+/// ask for even though they are now one list - minus whatever those rows can
+/// fold onto one line at this width.
 fn list_entry_height(
     app: &AppState,
     agents: &[AgentPanelEntry],
     entry: &WorkspaceListEntry,
     body_height: u16,
+    fold_width: u16,
 ) -> u16 {
+    let content_width = list_entry_content_width(app, agents, entry, fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
             ws_idx, indented, ..
         } => app
             .workspaces
             .get(*ws_idx)
-            .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height))
+            .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height, content_width))
             .unwrap_or(0),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents
             .get(*entry_idx)
-            .map(|entry| agent_entry_height_in_body(app, entry, body_height))
+            .map(|entry| agent_entry_height_in_body(app, entry, body_height, content_width))
             .unwrap_or(0),
     }
 }
@@ -744,12 +860,13 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
         return 0;
     }
 
+    let fold_width = row_fold_width(area);
     let mut used_rows = 0u16;
     let mut visible = 0usize;
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
         if row_height == 0 {
             continue;
         }
@@ -767,12 +884,13 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
 
 fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let body = workspace_list_body_rect(area, false);
+    let fold_width = row_fold_width(area);
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
     let mut used_rows = 0u16;
     let mut start = entries.len();
     for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let row_height = list_entry_height(app, &agents, entry, body.height);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
         if row_height == 0 {
             continue;
         }
@@ -828,8 +946,9 @@ pub(crate) fn agent_entry_height_in_body(
     app: &AppState,
     entry: &AgentPanelEntry,
     body_height: u16,
+    content_width: usize,
 ) -> u16 {
-    (resolved_agent_rows(app, entry)
+    (fold_token_lines(resolved_agent_rows(app, entry), content_width, None)
         .len()
         .max(1)
         .min(u16::MAX as usize) as u16)
@@ -860,6 +979,7 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     let scroll = app.workspace_scroll;
+    let fold_width = row_fold_width(ws_area);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
@@ -868,7 +988,7 @@ pub(crate) fn compute_workspace_list_areas(
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
         if row_height == 0 {
             continue;
         }
@@ -947,11 +1067,11 @@ pub(crate) fn worker_summary_badge_rect(
     card: &crate::app::state::WorkspaceCardArea,
     count: usize,
 ) -> Rect {
-    let label_width = display_width_u16(&worker_summary_badge_label(count));
-    let width = label_width.saturating_add(1);
-    // Needs the badge, the reserved chevron cell, and something left over for
-    // the row's own name; below that the row is better off with just a name.
-    if card.rect.width <= width + 1 || card.rect.height == 0 || label_width == 0 {
+    if card.rect.height == 0 {
+        return Rect::default();
+    }
+    let width = worker_summary_badge_width(count, card.rect.width);
+    if width == 0 {
         return Rect::default();
     }
     Rect::new(
@@ -960,6 +1080,24 @@ pub(crate) fn worker_summary_badge_rect(
         width,
         1,
     )
+}
+
+/// Columns a badge for `count` workers takes on a row `width` wide, or 0 when
+/// the row is too narrow to carry one.
+///
+/// The badge is drawn *over* row 0 rather than laid out in it, so the fold has
+/// to reserve it exactly as the renderer does - a merged line the layout sized
+/// without it would be elided by a control the layout never saw. Both read this
+/// one function so they cannot drift.
+fn worker_summary_badge_width(count: usize, width: u16) -> u16 {
+    let label_width = display_width_u16(&worker_summary_badge_label(count));
+    let badge = label_width.saturating_add(1);
+    // Needs the badge, the reserved chevron cell, and something left over for
+    // the row's own name; below that the row is better off with just a name.
+    if width <= badge + 1 || label_width == 0 {
+        return 0;
+    }
+    badge
 }
 
 /// The tree handle this card's row answers to, the name a worker's `owner`
@@ -975,7 +1113,19 @@ fn card_tree_name(
     agents: &[AgentPanelEntry],
     card: &crate::app::state::WorkspaceCardArea,
 ) -> Option<String> {
-    match entries.get(card.entry_idx)? {
+    entry_tree_name(app, agents, entries.get(card.entry_idx)?)
+}
+
+/// The same handle, resolved from the entry alone.
+///
+/// The layout has entries but no cards yet, and it has to know whether a row
+/// earns a badge before it can decide how wide that row's content is.
+fn entry_tree_name(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<String> {
+    match entry {
         WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents.get(*entry_idx)?.agent_name.clone(),
     }
@@ -1228,6 +1378,124 @@ pub(super) fn render_sidebar(
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
+/// Columns a token spends that no budget is allowed to reclaim.
+///
+/// The state icon, the elapsed time and the git counters share this lane: at
+/// two to four columns there is nothing to give back, and a truncated age is a
+/// wrong age - `4` out of `47m` reads as four of something.
+fn fixed_token_width(token: &ResolvedToken, state_icon_width: usize) -> usize {
+    match &token.kind {
+        ResolvedTokenKind::StateIcon => state_icon_width,
+        ResolvedTokenKind::StateAge(text) => display_width(text),
+        ResolvedTokenKind::GitStatus { ahead, behind } => {
+            usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
+                + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
+                + usize::from(*ahead > 0 && *behind > 0)
+        }
+        // Fixed for the same reason as the ahead/behind counters: a truncated
+        // count is a wrong count, and there is nothing to reclaim from two or
+        // three columns anyway.
+        ResolvedTokenKind::GitDirty(dirty) => {
+            let parts = tokens::git_dirty_parts(*dirty);
+            let separators = parts.len().saturating_sub(1);
+            parts
+                .iter()
+                .map(|(_, text)| display_width(text))
+                .sum::<usize>()
+                + separators
+        }
+        ResolvedTokenKind::PullRequests { open, .. } => {
+            display_width(&tokens::pull_requests_text(*open))
+        }
+        _ => 0,
+    }
+}
+
+/// Columns a token would spend on text it is willing to give back.
+fn flexible_token_width(token: &ResolvedToken) -> usize {
+    match &token.kind {
+        ResolvedTokenKind::StateText(text)
+        | ResolvedTokenKind::Workspace(text)
+        | ResolvedTokenKind::Tab(text)
+        | ResolvedTokenKind::Pane(text)
+        | ResolvedTokenKind::Agent(text)
+        | ResolvedTokenKind::TerminalTitle(text)
+        | ResolvedTokenKind::Branch(text)
+        | ResolvedTokenKind::Custom(text) => display_width(text),
+        _ => 0,
+    }
+}
+
+/// Columns one line needs to draw every token whole, with the decorated
+/// separators it uses while it still fits.
+///
+/// This is the measure the fold decision is made with, and it is deliberately
+/// the *un*compacted one: a line the layout judged to fit is a line the
+/// renderer draws having given nothing up, so folding can never be the reason a
+/// name is elided.
+fn natural_line_width(line: &[ResolvedToken]) -> usize {
+    line.iter()
+        .map(|token| fixed_token_width(token, STATE_MARK_WIDTH) + flexible_token_width(token))
+        .sum::<usize>()
+        + line
+            .windows(2)
+            .map(|pair| display_width(tokens::separator(&pair[0], &pair[1])))
+            .sum::<usize>()
+}
+
+/// Width of `previous` and `next` drawn as one line, separator included.
+fn merged_line_width(previous: &[ResolvedToken], next: &[ResolvedToken]) -> Option<usize> {
+    let joint = display_width(tokens::separator(previous.last()?, next.first()?));
+    Some(natural_line_width(previous) + joint + natural_line_width(next))
+}
+
+/// Lay a row's configured token lines out against the width the row actually
+/// has.
+///
+/// A sidebar layout is written as a stack of lines, but a stack is a decision
+/// made for the narrowest sidebar it will ever be drawn in. Widen the panel and
+/// that decision stops paying: a Space spends two rows saying what fits on one,
+/// and the tree runs off the bottom of the panel long before it runs out of
+/// width. So consecutive lines are merged while the merged line still draws
+/// every token whole. The trade is one-way by construction - folding buys back
+/// a row and can never cost a character - which is what lets the same layout
+/// serve an 18-column panel and a 54-column one without the user retuning it.
+///
+/// `max_lines` is the height the layout reserved for this row. Anything past it
+/// is merged whether or not it fits, because a row that overflowed its
+/// reservation used to lose its tail outright; an elided tail says more than a
+/// missing one.
+fn fold_token_lines(
+    lines: Vec<Vec<ResolvedToken>>,
+    content_width: usize,
+    max_lines: Option<u16>,
+) -> Vec<Vec<ResolvedToken>> {
+    let mut folded: Vec<Vec<ResolvedToken>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let fits = folded
+            .last()
+            .and_then(|previous| merged_line_width(previous, &line))
+            .is_some_and(|width| width <= content_width);
+        match folded.last_mut().filter(|_| fits) {
+            Some(previous) => previous.extend(line),
+            None => folded.push(line),
+        }
+    }
+
+    if let Some(max) = max_lines.map(usize::from).filter(|max| *max > 0) {
+        while folded.len() > max {
+            let Some(tail) = folded.pop() else { break };
+            let Some(previous) = folded.last_mut() else {
+                folded.push(tail);
+                break;
+            };
+            previous.extend(tail);
+        }
+    }
+
+    folded
+}
+
 fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
@@ -1241,49 +1509,11 @@ fn resolved_token_spans(
 ) -> Vec<Span<'static>> {
     let fixed_widths = resolved
         .iter()
-        .map(|token| match &token.kind {
-            ResolvedTokenKind::StateIcon => display_width(state_icon.0),
-            // Fixed, not flexible: at two to four columns there is nothing to
-            // reclaim, and a truncated age is a wrong age - `4` out of `47m`
-            // reads as four of something. It shares the fixed lane with the
-            // state icon and the git counters for the same reason.
-            ResolvedTokenKind::StateAge(text) => display_width(text),
-            ResolvedTokenKind::GitStatus { ahead, behind } => {
-                usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
-                    + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
-                    + usize::from(*ahead > 0 && *behind > 0)
-            }
-            // Fixed for the same reason as the ahead/behind counters: a
-            // truncated count is a wrong count, and there is nothing to reclaim
-            // from two or three columns anyway.
-            ResolvedTokenKind::GitDirty(dirty) => {
-                let parts = tokens::git_dirty_parts(*dirty);
-                let separators = parts.len().saturating_sub(1);
-                parts
-                    .iter()
-                    .map(|(_, text)| display_width(text))
-                    .sum::<usize>()
-                    + separators
-            }
-            ResolvedTokenKind::PullRequests { open, .. } => {
-                display_width(&tokens::pull_requests_text(*open))
-            }
-            _ => 0,
-        })
+        .map(|token| fixed_token_width(token, display_width(state_icon.0)))
         .collect::<Vec<_>>();
     let flexible_widths = resolved
         .iter()
-        .map(|token| match &token.kind {
-            ResolvedTokenKind::StateText(text)
-            | ResolvedTokenKind::Workspace(text)
-            | ResolvedTokenKind::Tab(text)
-            | ResolvedTokenKind::Pane(text)
-            | ResolvedTokenKind::Agent(text)
-            | ResolvedTokenKind::TerminalTitle(text)
-            | ResolvedTokenKind::Branch(text)
-            | ResolvedTokenKind::Custom(text) => display_width(text),
-            _ => 0,
-        })
+        .map(flexible_token_width)
         .collect::<Vec<_>>();
     // Every token at its full width, with decorated separators. When even this
     // fits there is nothing to reclaim and the row renders exactly as before.
@@ -1578,6 +1808,7 @@ fn render_agent_row(
     entries: &[WorkspaceListEntry],
     agents: &[AgentPanelEntry],
     list_bottom: u16,
+    fold_width: u16,
 ) {
     let Some(entry) = entries.get(card.entry_idx) else {
         return;
@@ -1590,7 +1821,11 @@ fn render_agent_row(
     };
 
     let p = &app.palette;
-    let rows = resolved_agent_rows(app, detail);
+    let rows = fold_token_lines(
+        resolved_agent_rows(app, detail),
+        list_entry_content_width(app, agents, entry, fold_width),
+        Some(card.rect.height),
+    );
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
     let label_color = state_label_color(detail.state, detail.seen, p);
     let row_style = if is_active {
@@ -1897,6 +2132,7 @@ fn render_workspace_list(
     };
 
     let list_bottom = area.y + area.height.saturating_sub(1);
+    let fold_width = row_fold_width(area);
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
@@ -1906,7 +2142,7 @@ fn render_workspace_list(
 
     for card in cards {
         if card.agent.is_some() {
-            render_agent_row(app, frame, card, &entries, &agents, list_bottom);
+            render_agent_row(app, frame, card, &entries, &agents, list_bottom, fold_width);
             continue;
         }
         let i = card.ws_idx;
@@ -2006,6 +2242,14 @@ fn render_workspace_list(
                 suppress_git_details: card.indented,
             },
         );
+        // The same call the layout made when it decided this row's height, so
+        // the reserved height and the drawn lines cannot disagree about the
+        // chevron or the badge.
+        let content_width = entries
+            .get(card.entry_idx)
+            .map(|entry| list_entry_content_width(app, &agents, entry, fold_width))
+            .unwrap_or_else(|| row_content_width(fold_width, own_depth, card.indented, 0));
+        let rows = fold_token_lines(rows, content_width, Some(row_height));
 
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
@@ -2434,6 +2678,329 @@ mod tests {
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
 
+    /// The branch every fixture Space reports, so the second configured Space
+    /// line has content at a fixed width on any checkout.
+    const FIXTURE_BRANCH: &str = "fm/herdr-dynamic-sidebar-width";
+
+    /// A realistic captain fleet rendered with the *default* sidebar layout
+    /// (two token rows per Space and per agent), so the dump shows what a user
+    /// who never edited `[ui.sidebar]` actually sees.
+    fn default_layout_fleet_rows(width: u16, height: u16) -> Vec<String> {
+        default_layout_fleet(width, height, None).1
+    }
+
+    /// The same fleet, optionally with one worker having published a summary so
+    /// its owning mate earns a badge over row 0.
+    fn default_layout_fleet(
+        width: u16,
+        height: u16,
+        summary: Option<&str>,
+    ) -> (crate::app::state::AppState, Vec<String>) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut explore = Workspace::test_new("2ndmate-explore");
+        let worker_a = explore.test_split(ratatui::layout::Direction::Vertical);
+        let worker_b = explore.test_split(ratatui::layout::Direction::Vertical);
+        let root_pane = *explore.tabs[0]
+            .panes
+            .keys()
+            .find(|pane| **pane != worker_a && **pane != worker_b)
+            .expect("original pane present");
+        app.workspaces = vec![
+            Workspace::test_new("firstmate"),
+            explore,
+            Workspace::test_new("2ndmate-homeautomation"),
+        ];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        // `Workspace::test_new` resolves `cached_git_branch` from the real
+        // checkout, so an unpinned fixture inherits whatever branch the tree
+        // happens to be on - and renders one line per Space instead of two on a
+        // detached HEAD. That is not hypothetical: `actions/checkout` builds a
+        // pull request from a detached `refs/pull/N/merge`, and a rebase detaches
+        // too. Pin it so the fold is measured against a fixed layout.
+        for workspace in app.workspaces.iter_mut() {
+            workspace.cached_git_branch = Some(FIXTURE_BRANCH.to_string());
+        }
+
+        let now = std::time::Instant::now();
+        for idx in [1usize, 2] {
+            app.workspaces[idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+
+        for (pane, name, state) in [
+            (
+                root_pane,
+                "herdr-dynamic-sidebar-width",
+                AgentState::Working,
+            ),
+            (worker_a, "herdr-divider-grab", AgentState::Blocked),
+            (worker_b, "wall-panel-narrowing", AgentState::Idle),
+        ] {
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("every test pane has a terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = state;
+            let mut tokens = std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]);
+            if let (Some(summary), true) = (summary, pane == worker_b) {
+                tokens.insert("summary".to_string(), Some(summary.to_string()));
+            }
+            terminal.metadata_tokens.patch(tokens, None, now);
+        }
+
+        let area = Rect::new(0, 0, width, height);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..height)
+            .map(|row| row_text(buffer, row, width))
+            .collect();
+        (app, rows)
+    }
+
+    /// The rows of the tree, in order, with the sidebar divider and the blank
+    /// tail below the last row dropped.
+    fn tree_rows(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .skip(usize::from(WORKSPACE_SECTION_HEADER_ROWS))
+            .map(|row| row.strip_suffix('│').unwrap_or(row).to_string())
+            .take_while(|row| !row.trim().is_empty())
+            .collect()
+    }
+
+    /// Every state mark is one column, which is what lets [`STATE_MARK_WIDTH`]
+    /// stand in for the real icon while a row's height is being decided - one
+    /// pass before the palette and the aggregate state are resolved.
+    #[test]
+    fn state_marks_are_one_column_wide() {
+        for state in [
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Unknown,
+        ] {
+            for seen in [true, false] {
+                assert_eq!(
+                    display_width(crate::ui::status::state_mark(state, seen)),
+                    STATE_MARK_WIDTH,
+                    "{state:?} seen={seen} does not fit the assumed mark width"
+                );
+            }
+        }
+    }
+
+    /// [`tree_prefix_width`] is what the layout subtracts before deciding how
+    /// many lines a row needs; [`agent_row_prefix`] is what the renderer
+    /// actually draws. A disagreement would let a row fold on a budget it does
+    /// not have, so they are checked against each other directly.
+    #[test]
+    fn the_measured_prefix_matches_the_drawn_one() {
+        let p = Palette::catppuccin();
+        for depth in 0u8..5 {
+            for row_index in [0usize, 1] {
+                for is_last_child in [true, false] {
+                    let ancestors = vec![true; depth as usize + 1];
+                    let (_, drawn) =
+                        agent_row_prefix(depth, is_last_child, &ancestors, row_index, &p);
+                    assert_eq!(
+                        drawn,
+                        tree_prefix_width(depth, false, row_index),
+                        "depth {depth} row {row_index} last={is_last_child}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The narrow end is the regression bar: at the widths the captain runs a
+    /// sidebar at today, every row still spends the lines its layout asked for
+    /// and the tree keeps its connectors.
+    #[test]
+    fn a_narrow_sidebar_still_stacks_every_configured_line() {
+        for width in [18u16, 22, 26, 30, 36, 44] {
+            let rows = default_layout_fleet_rows(width, 24);
+            let screen = rows.join("\n");
+            let tree = tree_rows(&rows);
+
+            // Three Spaces and three workers, two configured lines each.
+            assert_eq!(
+                tree.len(),
+                12,
+                "a row folded at {width} columns, where its layout does not fit on one line:\n{screen}"
+            );
+            // Nesting and connectors are untouched by the fold machinery.
+            assert!(
+                tree[0].contains("firstmate") && !tree[0].contains(['├', '└']),
+                "the root grew a connector at {width}:\n{screen}"
+            );
+            assert!(
+                tree[2].contains("├─ ") && tree[10].contains("└─ "),
+                "the second mates lost their connectors at {width}:\n{screen}"
+            );
+            assert!(
+                tree[4].contains("│  ├─ ") && tree[8].contains("│  └─ "),
+                "the workers lost their rail or connector at {width}:\n{screen}"
+            );
+        }
+    }
+
+    /// The whole point: widen the sidebar and a row gives a line back rather
+    /// than sitting in a stack sized for a panel half as wide.
+    #[test]
+    fn a_wide_sidebar_folds_a_rows_configured_lines_onto_one() {
+        let rows = default_layout_fleet_rows(70, 24);
+        let screen = rows.join("\n");
+        let tree = tree_rows(&rows);
+
+        // Six entities, one line each, where twelve lines were spent before.
+        assert_eq!(
+            tree.len(),
+            6,
+            "the tree did not fold at 70 columns:\n{screen}"
+        );
+        assert!(
+            tree[0].contains("firstmate") && tree[0].contains("fm/herdr-dynamic-sidebar-width"),
+            "the first mate's branch did not join its name:\n{screen}"
+        );
+        assert!(
+            tree[3].contains("├─ ") && tree[3].contains("herdr-divider-grab"),
+            "a folded worker lost its connector:\n{screen}"
+        );
+        assert!(
+            tree[4].contains("│  └─ ") && tree[4].contains("wall-panel-narrowing"),
+            "the last worker lost its rail or its closing connector:\n{screen}"
+        );
+    }
+
+    /// Folding is only ever allowed to buy a row back, never to spend a
+    /// character: a line the layout judged foldable is a line that draws whole.
+    #[test]
+    fn folding_never_elides_what_it_folded() {
+        for width in [46u16, 54, 62, 70, 90] {
+            let rows = default_layout_fleet_rows(width, 24);
+            let screen = rows.join("\n");
+            for row in tree_rows(&rows) {
+                // A line carrying both configured tokens is a folded one.
+                if row.contains(" · ") && row.contains("herdr") {
+                    assert!(
+                        !row.contains('…'),
+                        "a folded line was elided at {width}:\n{screen}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A row that earns a summary badge has to fold against the width the badge
+    /// leaves it, not the width it would have had alone.
+    ///
+    /// The badge is painted over row 0 after the tokens are drawn, so a fold
+    /// that reserved only the chevron would merge two lines that then get
+    /// elided to fit under it - the one character the fold promises never to
+    /// spend. #34 added the badge and this pins it against the fold.
+    #[test]
+    fn a_folded_row_never_runs_under_its_summary_badge() {
+        // Swept densely on purpose. The window where an unreserved badge does
+        // damage is only as wide as the badge itself - the merged line has to
+        // fit the row but not the row minus the badge - so a handful of sampled
+        // widths steps straight over it.
+        let mut ever_folded = false;
+        for width in 40u16..=90 {
+            let (_, rows) = default_layout_fleet(width, 24, Some("rebased and green"));
+            let screen = rows.join("\n");
+            let badged = tree_rows(&rows)
+                .into_iter()
+                .find(|row| row.contains(WORKER_SUMMARY_BADGE_GLYPH))
+                .unwrap_or_else(|| panic!("no badge drawn at {width}:\n{screen}"));
+
+            // The badge keeps a pad cell of its own, folded or not. Text in it
+            // means the row was laid out against a width the badge had already
+            // taken.
+            let badge_at = badged
+                .find(WORKER_SUMMARY_BADGE_GLYPH)
+                .expect("the row was found by this glyph");
+            assert!(
+                badged[..badge_at].ends_with(' '),
+                "row text ran into the badge's pad at {width} columns:\n{screen}"
+            );
+
+            // The branch reaching row 0 is the tell that this row folded.
+            if !badged.contains(FIXTURE_BRANCH) {
+                continue;
+            }
+            ever_folded = true;
+            // Folding may only ever buy a row back. A budget that had to
+            // compact the decorated separator down to a bare space, or elide,
+            // means the fold spent characters to fit under the badge.
+            assert!(
+                badged.contains(" · "),
+                "the badged row folded and then had to compact its separator to \
+                 fit under the badge at {width} columns:\n{screen}"
+            );
+            assert!(
+                !badged.contains('…'),
+                "the badged row folded and was then elided under its badge at \
+                 {width} columns:\n{screen}"
+            );
+        }
+        assert!(
+            ever_folded,
+            "no width folded the badged row, so nothing was actually exercised"
+        );
+    }
+
+    /// Resizing has to be monotonic to feel like resizing: no width may cost
+    /// the tree rows that a narrower one could show.
+    #[test]
+    fn widening_the_sidebar_never_costs_the_tree_a_row() {
+        let mut previous = usize::MAX;
+        for width in 18u16..=90 {
+            let lines = tree_rows(&default_layout_fleet_rows(width, 24)).len();
+            assert!(
+                lines <= previous,
+                "widening to {width} columns grew the tree from {previous} lines to {lines}"
+            );
+            previous = lines;
+        }
+    }
+
+    /// A row that cannot have every line it asked for used to lose the tail
+    /// outright. It is folded onto what it does have instead, so the token
+    /// budget elides it rather than the layout dropping it.
+    #[test]
+    fn a_row_squeezed_below_its_line_count_keeps_its_tail() {
+        // Four body rows for three Spaces and three workers: nothing has room
+        // for a second line.
+        let rows = default_layout_fleet_rows(54, 6);
+        let screen = rows.join("\n");
+        let tree = tree_rows(&rows);
+
+        assert!(!tree.is_empty(), "nothing rendered:\n{screen}");
+        assert!(
+            tree[0].contains("firstmate") && tree[0].contains("fm/herdr-"),
+            "the first mate's second line was dropped instead of folded:\n{screen}"
+        );
+    }
+
     /// The header row is empty. Neither the `spaces` title nor the second-mate
     /// drop-down beside it is drawn any more - both were removed once every
     /// mate rendered live in the tree and could be reached by clicking it -
@@ -2731,7 +3298,10 @@ rows = [["state_icon", "workspace"], ["terminal_title_stripped"]]
         pane_terminal.state = AgentState::Working;
         pane_terminal.set_terminal_title(Some("⠋ shipping the token".into()));
 
-        let area = Rect::new(0, 0, 30, 20);
+        // Narrow enough that `◐ one · shipping the token` does not fit on one
+        // line, so the two configured lines stay stacked and the title row is
+        // a row of its own to assert on.
+        let area = Rect::new(0, 0, 26, 20);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         let titled = app.view.workspace_card_areas[0].rect;
         let untitled = app.view.workspace_card_areas[1].rect;
@@ -3017,7 +3587,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     #[test]
     fn oversized_space_layout_is_clipped_to_the_section_body() {
         let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        // Names long enough that no two of the six lines fit on one, so the
+        // layout still asks for all six rows at this width.
+        app.workspaces = vec![
+            Workspace::test_new("space-one"),
+            Workspace::test_new("space-two"),
+        ];
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]; 6];
         // A six-row layout in a five-row body, so the clip is what is under
         // test rather than the row count.
@@ -3694,8 +4269,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.mode = Mode::Terminal;
 
         // One body row, so the metric has to come from the display entries
-        // rather than the three raw workspaces.
-        let ws_area = Rect::new(0, 0, 30, 5);
+        // rather than the three raw workspaces. At 30 columns each entry folds
+        // its name and branch onto that single line.
+        let ws_area = Rect::new(0, 0, 30, 3);
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         assert_eq!(metrics.viewport_rows, 1);
@@ -4166,7 +4742,9 @@ rows = [
     fn two_row_styled_space_config_renders_both_rows_with_inline_styles() {
         let mut app = app_with_two_row_styled_config();
 
-        let area = Rect::new(0, 0, 40, 24);
+        // Narrow enough that `● Doing · Ctx · one` does not fit on one line, so
+        // the styled row and the name row stay stacked.
+        let area = Rect::new(0, 0, 20, 24);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         let card = app.view.workspace_card_areas[0].rect;
         let mut renderer = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
