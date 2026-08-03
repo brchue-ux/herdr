@@ -695,8 +695,6 @@ impl App {
             sidebar_collapsed: config.ui.sidebar_start_collapsed,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             agent_panel_sort,
-            second_mate_selector_open: false,
-            selected_second_mate: None,
             agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),

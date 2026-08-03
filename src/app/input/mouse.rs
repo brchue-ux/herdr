@@ -521,24 +521,6 @@ impl AppState {
                         return None;
                     }
 
-                    // The drop-down is tested before anything under it: while
-                    // it is open it covers tree rows, and a press it did not
-                    // claim would focus whatever row is behind it.
-                    if let Some(mate) = self.second_mate_menu_entry_at(mouse.column, mouse.row) {
-                        self.selected_second_mate = Some(mate);
-                        self.second_mate_selector_open = false;
-                        return None;
-                    }
-
-                    if self.on_second_mate_selector(mouse.column, mouse.row) {
-                        self.second_mate_selector_open = !self.second_mate_selector_open;
-                        return None;
-                    }
-
-                    // A press anywhere else closes the list rather than leaving
-                    // it hanging over rows the user is trying to reach.
-                    self.second_mate_selector_open = false;
-
                     let new_button = self.sidebar_new_button_rect();
                     let on_new_button = mouse.row >= new_button.y
                         && mouse.row < new_button.y + new_button.height

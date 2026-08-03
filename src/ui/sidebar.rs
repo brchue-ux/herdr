@@ -1,4 +1,3 @@
-pub(crate) mod mates;
 mod tokens;
 
 use ratatui::{
@@ -21,7 +20,19 @@ use crate::config::SidebarTokenEmphasis;
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
 
-const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
+/// The bottom row of the workspace panel, kept clear of the tree for the `new`
+/// button and the collapse toggle.
+const WORKSPACE_SECTION_FOOTER_ROWS: u16 = 1;
+
+/// One row above the tree, drawn empty.
+///
+/// The `spaces` title and the second-mate drop-down that used to share this
+/// space are gone, but the row itself is not free to reclaim: the tree's
+/// drop-slot grid anchors "drop before this Space" on the row *above* a card,
+/// so a tree flush to the panel's top edge has no row that means "above
+/// everything" and cannot be reordered to first position. It is also the row
+/// the usage readout is proposed to occupy.
+const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
 
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
@@ -734,13 +745,17 @@ pub(crate) fn workspace_list_rect(area: Rect) -> Rect {
     sidebar_content_rect(area)
 }
 
+/// The tree owns every row of the panel between the empty header row and the
+/// footer the `new` button and the collapse toggle sit on.
 pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
-    if area.width == 0 || area.height <= WORKSPACE_SECTION_HEADER_ROWS {
+    if area.width == 0
+        || area.height <= WORKSPACE_SECTION_HEADER_ROWS + WORKSPACE_SECTION_FOOTER_ROWS
+    {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
-    let footer_y = area.y + area.height.saturating_sub(1);
+    let footer_y = area.y + area.height.saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS);
     let body_height = footer_y.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
@@ -1748,16 +1763,6 @@ fn render_workspace_list(
     };
 
     let list_bottom = area.y + area.height.saturating_sub(1);
-    if area.height > 0 {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " spaces",
-                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-            )])),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-    }
-    render_second_mate_selector(app, frame, area);
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
@@ -1981,8 +1986,6 @@ fn render_workspace_list(
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
     }
 
-    render_second_mate_menu(app, frame, area);
-
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
         frame.render_widget(
@@ -2005,61 +2008,6 @@ fn render_workspace_list(
         frame.render_widget(
             Paragraph::new(menu_line).alignment(Alignment::Right),
             menu_rect,
-        );
-    }
-}
-
-/// The closed second-mate control on the Spaces header row.
-///
-/// Nothing is drawn when no second mate is live, which is the whole point: with
-/// only the First Mate open there is nowhere else to go, so there is no control
-/// to say so.
-fn render_second_mate_selector(app: &AppState, frame: &mut Frame, area: Rect) {
-    let rect = mates::selector_rect(app, area);
-    if rect == Rect::default() {
-        return;
-    }
-    let p = &app.palette;
-    let style = if mates::selected_mate(app).is_some() {
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)
-    };
-    frame.render_widget(
-        Paragraph::new(Span::styled(mates::selector_label(app, area), style))
-            .alignment(Alignment::Right),
-        rect,
-    );
-}
-
-/// The open drop-down, drawn over the tree it hangs above.
-fn render_second_mate_menu(app: &AppState, frame: &mut Frame, area: Rect) {
-    let rect = mates::menu_rect(app, area);
-    if rect == Rect::default() {
-        return;
-    }
-    let p = &app.palette;
-    {
-        let buf = frame.buffer_mut();
-        for y in rect.y..rect.y + rect.height {
-            for x in rect.x..rect.x + rect.width {
-                buf[(x, y)].set_symbol(" ");
-                buf[(x, y)].set_style(Style::default().bg(p.surface0));
-            }
-        }
-    }
-    for (index, (label, marked)) in mates::menu_rows(app, area).into_iter().enumerate() {
-        let style = if marked {
-            Style::default()
-                .fg(p.accent)
-                .bg(p.surface0)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(p.text).bg(p.surface0)
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(label, style)),
-            Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
         );
     }
 }
@@ -2167,12 +2115,13 @@ mod tests {
         (0..20).map(|row| row_text(buffer, row, width)).collect()
     }
 
-    /// Three second mates on a 26-wide sidebar - the captain's width, and the
-    /// width the old tab row could not fit. A drop-down costs one control
-    /// however many mates exist, so the title keeps its own row and the list
-    /// keeps every mate's name whole.
+    /// The header row is empty. Neither the `spaces` title nor the second-mate
+    /// drop-down beside it is drawn any more - both were removed once every
+    /// mate rendered live in the tree and could be reached by clicking it -
+    /// but the row itself stays, because the tree's drop-slot grid needs a row
+    /// above the first card and the usage readout is proposed to live there.
     #[test]
-    fn the_selector_and_the_spaces_title_share_the_header_at_width_twenty_six() {
+    fn the_header_row_is_empty_above_the_tree() {
         let mut app = crate::app::state::AppState::test_new();
         let now = std::time::Instant::now();
         app.workspaces = vec![
@@ -2198,25 +2147,37 @@ mod tests {
         let area = Rect::new(0, 0, 26, 20);
         app.view.sidebar_rect = area;
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
-        app.second_mate_selector_open = true;
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let header = row_text(buffer, area.y, area.width);
-
-        // The title is not crowded off by the control, and the control is drawn.
-        assert!(header.contains("spaces"), "header: {header:?}");
-        assert!(header.contains('▾'), "header: {header:?}");
-
-        // Every live mate is listed, whole.
-        let listed = (1..4)
+        let rows = (0..area.height)
             .map(|row| row_text(buffer, area.y + row, area.width))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let screen = rows.join("\n");
+
+        // Only the sidebar divider draws on the header row; nothing else does.
+        assert!(
+            rows[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
+            "the header row is not empty:\n{screen}"
+        );
+        assert!(
+            rows[1].contains("firstmate"),
+            "the tree does not start below the header row:\n{screen}"
+        );
+        assert!(
+            !screen.contains("spaces"),
+            "the removed header title is still drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains('▾'),
+            "the removed second-mate selector is still drawn:\n{screen}"
+        );
+        // The mates still render live in the tree, which is why the drop-down
+        // is not needed to reach them.
         for mate in ["2ndmate-explore", "2ndmate-build", "2ndmate-homeauto"] {
-            assert!(listed.contains(mate), "{mate} missing from:\n{listed}");
+            assert!(screen.contains(mate), "{mate} missing from:\n{screen}");
         }
     }
 
@@ -2741,7 +2702,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]; 6];
         // A six-row layout in a five-row body, so the clip is what is under
         // test rather than the row count.
-        let area = Rect::new(0, 0, 20, 8);
+        let area = Rect::new(0, 0, 20, 7);
         let workspace_area = workspace_list_rect(area);
         let body = workspace_list_body_rect(workspace_area, false);
 
@@ -3236,7 +3197,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         // Two body rows: the third child is a real entry that is off screen,
         // which is the whole point - the connector has to read the full list,
         // not the cards that happened to fit.
-        let area = Rect::new(0, 0, 30, 5);
+        let area = Rect::new(0, 0, 30, 4);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         assert_eq!(app.view.workspace_card_areas.len(), 2);
         let list_area = workspace_list_rect(area);
@@ -3305,7 +3266,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             spacious[3].rect.y,
             spacious[2].rect.y + spacious[2].rect.height + 2
         );
-        let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 7));
+        let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 6));
         assert_eq!(spacious_metrics.viewport_rows, 2);
         assert_eq!(spacious_metrics.max_offset_from_bottom, 2);
 
@@ -3413,7 +3374,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.active = None;
         app.mode = Mode::Terminal;
 
-        let ws_area = Rect::new(0, 0, 30, 6);
+        // One body row, so the metric has to come from the display entries
+        // rather than the three raw workspaces.
+        let ws_area = Rect::new(0, 0, 30, 5);
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         assert_eq!(metrics.viewport_rows, 1);

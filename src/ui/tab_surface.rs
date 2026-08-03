@@ -306,11 +306,14 @@ mod tests {
         // sidebar column, which moved this digest: the separator row, the
         // panel header and every agent row below them are no longer drawn, and
         // the Spaces list runs to the bottom instead of stopping at the split.
+        // It moved again when the `spaces` title and the second-mate drop-down
+        // were removed: the header row is still there but is now empty, so
+        // every tree row draws one row higher than it did.
         // The mobile digest below is unchanged, so the desktop sidebar is the
         // only thing that moved.
         assert_eq!(
             frame_digest(&frame),
-            "8b1e76e2d1cfb7d19e729d6477a241732e8f9332fa27044f67fb65af4a379eb3"
+            "be6991df9bbbb10fcac5e4b3f59fe71ddc15892df1f909b795a7e488d9b99f95"
         );
     }
 

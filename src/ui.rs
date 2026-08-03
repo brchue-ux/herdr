@@ -86,16 +86,6 @@ pub(crate) use self::{
     },
 };
 
-pub(crate) use self::sidebar::mates::{
-    hits_selector as hits_second_mate_selector, menu_entry_at as second_mate_menu_entry_at,
-    owns_cell as second_mate_selector_owns_cell,
-};
-/// Selector geometry and derived fleet state the input tests drive against.
-#[cfg(test)]
-pub(crate) use self::sidebar::mates::{
-    menu_rect as second_mate_menu_rect, second_mates, selected_mate as selected_second_mate,
-    selector_label as second_mate_selector_label, selector_rect as second_mate_selector_rect,
-};
 /// The sidebar's one content column. Production code reaches it from inside
 /// `sidebar`; the layout tests assert against it directly.
 #[cfg(test)]
