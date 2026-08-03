@@ -349,7 +349,7 @@ impl Behaviour {
         inputs: DriveInputs,
         palette: InkPalette,
     ) -> CellPaint {
-        let progress = if progress > 1.0 || progress < 0.0 {
+        let progress = if !(0.0..=1.0).contains(&progress) {
             Self::loop_progress(progress)
         } else {
             progress

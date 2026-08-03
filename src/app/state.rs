@@ -1859,7 +1859,7 @@ impl AppState {
             .tabs
             .iter()
             .flat_map(|tab| tab.panes.values())
-            .map(|pane| self.pane_activity.level(&pane.attached_terminal_id))
+            .map(|pane| self.terminal_activity_level(&pane.attached_terminal_id))
             .fold(0.0, f32::max)
     }
 
@@ -1899,10 +1899,11 @@ impl AppState {
     /// as often as it likes without changing what anyone else sees. A pane with
     /// no runtime, no terminal, or no samples yet is `0.0` — quiet, not absent,
     /// so a caller never has to branch on "unknown".
-    // Addressed by pane for callers that have a pane id rather than a
-    // workspace; the sidebar's own binding goes through
-    // `workspace_activity_level` above.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Addressed by pane for callers that have a pane id rather than a terminal.
+    // The sidebar animates whole rows, so its own binding rolls up through
+    // `workspace_activity_level` above; this is the per-pane form the queued
+    // pane-level animation work needs, kept beside it rather than re-derived.
+    #[allow(dead_code)]
     pub(crate) fn pane_activity_level(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> f32 {
         self.workspaces
             .get(ws_idx)
@@ -1917,8 +1918,6 @@ impl AppState {
     /// Prefer this where a terminal id is already in hand: the terminal is what
     /// the sampler actually keys on, so this skips a workspace lookup that can
     /// only fail.
-    // Same reason as `pane_activity_level` above.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn terminal_activity_level(&self, terminal_id: &crate::terminal::TerminalId) -> f32 {
         self.pane_activity.level(terminal_id)
     }

@@ -822,7 +822,7 @@ mod tests {
         let life = Lifecycle::still().with_idle(names::ACTIVITY);
         let id = row("a");
 
-        let mut at = |anim: &mut Animator, offset_ms: u64, activity: f32| {
+        let at = |anim: &mut Animator, offset_ms: u64, activity: f32| {
             anim.observe(
                 now + Duration::from_millis(offset_ms),
                 Family::WorkspaceRow,
