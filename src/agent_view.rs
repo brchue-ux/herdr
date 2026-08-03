@@ -105,12 +105,20 @@ impl AgentViewSlots {
     }
 
     /// The tier that owns the winning view.
+    ///
+    /// Only the deleted Agents panel and its narrow-screen twin ever rendered
+    /// which tier won; the one tree does not. Kept as the accessor tests assert
+    /// tier precedence through, so the resolution rule stays covered.
+    #[cfg(test)]
     pub(crate) fn active_tier(&self) -> Option<AgentViewTier> {
         [AgentViewTier::Api, AgentViewTier::Ui, AgentViewTier::Config]
             .into_iter()
             .find(|tier| self.slot(*tier).is_some())
     }
 
+    /// Whether any tier has set a view. See [`Self::active_tier`] for why this
+    /// is test-only now.
+    #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.active().is_some()
     }

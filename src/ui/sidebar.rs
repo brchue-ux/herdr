@@ -117,60 +117,8 @@ pub(crate) fn sidebar_content_rect(area: Rect) -> Rect {
     content
 }
 
-/// Header label candidates for an active view, widest first.
-///
-/// A view that hides rows has to say so even in an 18-column surface. Every
-/// candidate keeps the hidden count; only the owner name and the word "hidden"
-/// are given up as space runs out.
-fn agent_view_label_candidates(app: &AppState, hidden: AgentViewHidden) -> Vec<String> {
-    let Some(tier) = app.agent_views.active_tier() else {
-        return Vec::new();
-    };
-    let owner = tier.label();
-    let name = app
-        .agent_views
-        .active()
-        .and_then(|view| view.label.as_deref());
-    let qualified = match name {
-        Some(name) => format!("{owner}:{name}"),
-        None => owner.to_string(),
-    };
-    let short = name.unwrap_or(owner).to_string();
-
-    let mut candidates = if hidden.any() {
-        let mark = if hidden.hidden_blocked > 0 { " !" } else { "" };
-        let count = hidden.hidden;
-        vec![
-            format!("{qualified} · {count} hidden{mark}"),
-            format!("{short} · {count} hidden{mark}"),
-            format!("{short} ·{count}{mark}"),
-            format!("{count} hidden{mark}"),
-            format!("{count}{mark}"),
-        ]
-    } else {
-        vec![qualified, short]
-    };
-    candidates.dedup();
-    candidates
-}
-
-/// Label for the mobile switcher's agents section title.
-pub(crate) fn mobile_agents_title(app: &AppState, hidden: AgentViewHidden) -> String {
-    let Some(label) = agent_view_label_candidates(app, hidden).into_iter().next() else {
-        return "agents".to_string();
-    };
-    format!("agents · {label}")
-}
-
 pub(crate) fn agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     agent_panel_entries_with_runtimes(app, None)
-}
-
-pub(crate) fn agent_panel_entries_and_hidden_from(
-    app: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> (Vec<AgentPanelEntry>, AgentViewHidden) {
-    agent_panel_entries_and_hidden_with_runtimes(app, Some(terminal_runtimes))
 }
 
 fn agent_panel_entries_and_hidden_with_runtimes(
@@ -513,17 +461,6 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
 /// always shows the full worktree tree.
 pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
     workspace_list_entries_inner(app, true)
-}
-
-/// The expanded list with the fleet's agent rows dropped, leaving Spaces only.
-///
-/// The mobile switcher lists Spaces and agents as separate blocks, so it wants
-/// the Space rows on their own rather than the interleaved tree the sidebar
-/// draws.
-pub(crate) fn workspace_list_spaces_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
-    let mut entries = workspace_list_entries_expanded(app);
-    entries.retain(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. }));
-    entries
 }
 
 /// A Space and the worktree children that always travel with it.
@@ -2799,7 +2736,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let mut runtime_registry = TerminalRuntimeRegistry::new();
         runtime_registry.insert(terminal_id, runtime);
-        let entries = agent_panel_entries_and_hidden_from(&app, &runtime_registry).0;
+        let entries = agent_panel_entries_with_runtimes(&app, Some(&runtime_registry));
         let primary_label = entries[0].primary_label.clone();
 
         for (_, runtime) in runtime_registry.drain() {
