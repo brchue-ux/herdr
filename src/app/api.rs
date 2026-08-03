@@ -64,6 +64,9 @@ impl App {
                 results,
                 cache_updates,
             } => self.handle_git_status_refreshed(results, cache_updates),
+            AppEvent::PullRequestsRefreshed { results } => {
+                self.handle_pull_requests_refreshed(results)
+            }
             ev => {
                 self.handle_internal_event(ev);
                 true
@@ -89,6 +92,20 @@ impl App {
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        if changed {
+            self.render_dirty.request_generic();
+            self.render_notify.notify_one();
+        }
+        changed
+    }
+
+    fn handle_pull_requests_refreshed(
+        &mut self,
+        results: Vec<crate::app::WorkspacePullRequests>,
+    ) -> bool {
+        self.pull_request_refresh_in_flight = false;
+        self.last_pull_request_refresh = Instant::now();
+        let changed = self.state.apply_workspace_pull_requests(results);
         if changed {
             self.render_dirty.request_generic();
             self.render_notify.notify_one();

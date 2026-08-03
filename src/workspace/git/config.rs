@@ -54,6 +54,48 @@ pub(super) fn read_branch_config_with_user_paths(
     (!config.remote.is_empty() && !config.merge_ref.is_empty()).then_some(config)
 }
 
+/// Every `remote.<name>.url` visible from this checkout.
+///
+/// Reuses the same include-aware walk `read_branch_config` uses, so a URL behind
+/// an `[include]` or a conditional `[includeIf]` is found exactly as git would
+/// find it.
+pub(super) fn read_remote_urls(info: &GitWorktreeInfo, branch: &str) -> Vec<(String, String)> {
+    let config_paths = git_user_config_paths()
+        .into_iter()
+        .chain(std::iter::once(info.git_common_dir.join("config")))
+        .collect::<Vec<_>>();
+    let mut remote_urls = Vec::new();
+    for path in &config_paths {
+        let mut include_stack = Vec::new();
+        collect_remote_urls(path, info, branch, &mut remote_urls, &mut include_stack);
+    }
+    remote_urls
+}
+
+/// The remote URL whose repository this checkout's work is destined for.
+///
+/// Prefers the remote the current branch tracks, because that names where this
+/// branch's pull request would be opened. `origin` is only a fallback, and it is
+/// deliberately not preferred: a checkout of a fork usually has `origin` pointing
+/// at the upstream project, whose pull requests are somebody else's to answer.
+pub(super) fn read_push_remote_url(info: &GitWorktreeInfo, branch: Option<&str>) -> Option<String> {
+    let remote_urls = read_remote_urls(info, branch.unwrap_or_default());
+    let tracked = branch
+        .and_then(|branch| read_branch_config(info, branch))
+        .map(|config| config.remote);
+
+    let pick = |wanted: &str| {
+        remote_urls
+            .iter()
+            .find(|(remote, url)| remote == wanted && !url.trim().is_empty())
+            .map(|(_, url)| url.clone())
+    };
+
+    tracked
+        .and_then(|remote| pick(&remote))
+        .or_else(|| pick("origin"))
+}
+
 fn git_user_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {

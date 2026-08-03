@@ -2711,8 +2711,48 @@ impl AppState {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
+            if result.demand.dirty && ws.cached_git_dirty != result.dirty {
+                ws.cached_git_dirty = result.dirty;
+                changed = true;
+            }
             if ws.cached_git_space != result.space {
                 ws.cached_git_space = result.space;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Applies fetched pull request counts to the workspaces that asked for them.
+    ///
+    /// A `None` count is only allowed to clear the row when the checkout stopped
+    /// naming a repository at all. A fetch that merely failed keeps whatever was
+    /// last known, because blanking the counter would read as "nothing is open"
+    /// rather than "we could not ask".
+    pub fn apply_workspace_pull_requests(
+        &mut self,
+        results: Vec<crate::app::WorkspacePullRequests>,
+    ) -> bool {
+        let mut changed = false;
+        for result in results {
+            let Some(ws) = self
+                .workspaces
+                .iter_mut()
+                .find(|ws| ws.id == result.workspace_id)
+            else {
+                continue;
+            };
+
+            if ws.cached_remote_url != result.remote_url {
+                ws.cached_remote_url = result.remote_url.clone();
+            }
+            let next = match (result.remote_url.is_some(), result.counts) {
+                (_, Some(counts)) => Some(counts),
+                (true, None) => ws.cached_pull_requests,
+                (false, None) => None,
+            };
+            if ws.cached_pull_requests != next {
+                ws.cached_pull_requests = next;
                 changed = true;
             }
         }
@@ -2945,6 +2985,10 @@ impl AppState {
             } => {
                 let _ = results;
                 let _ = cache_updates;
+                Vec::new()
+            }
+            AppEvent::PullRequestsRefreshed { results } => {
+                let _ = results;
                 Vec::new()
             }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),

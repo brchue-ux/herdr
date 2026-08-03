@@ -105,6 +105,7 @@ impl App {
             match token.parts().0 {
                 crate::config::SpaceSidebarToken::Branch => demand.branch = true,
                 crate::config::SpaceSidebarToken::GitStatus => demand.ahead_behind = true,
+                crate::config::SpaceSidebarToken::GitDirty => demand.dirty = true,
                 _ => {}
             }
         }

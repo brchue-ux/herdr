@@ -66,6 +66,7 @@ mod client;
 mod config;
 mod detect;
 mod events;
+mod forge;
 mod ghostty;
 // Live handoff is a Unix-only path; the whole transfer form goes with it.
 #[cfg(unix)]

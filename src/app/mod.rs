@@ -17,6 +17,7 @@ mod git_refresh;
 mod ids;
 mod input;
 mod popup;
+mod pull_requests;
 pub(crate) mod relation_signal;
 mod runtime;
 mod runtime_mutations;
@@ -45,6 +46,12 @@ pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often open pull request counts are re-fetched from the forge.
+///
+/// Two minutes keeps a repo well inside GitHub's 5000-requests-per-hour core
+/// budget even with many Spaces open, and pull requests do not appear fast
+/// enough for a tighter loop to tell the reader anything new.
+const PULL_REQUEST_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -65,6 +72,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+pub use pull_requests::WorkspacePullRequests;
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 pub(crate) fn load_plugin_manifest(
@@ -122,6 +130,8 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    pub(crate) last_pull_request_refresh: Instant,
+    pub(crate) pull_request_refresh_in_flight: bool,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -815,6 +825,10 @@ impl App {
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            // Due immediately, so a Space that renders the token shows a count
+            // on the first tick rather than after the first full interval.
+            last_pull_request_refresh: Instant::now() - PULL_REQUEST_REFRESH_INTERVAL,
+            pull_request_refresh_in_flight: false,
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),

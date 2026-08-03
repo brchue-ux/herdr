@@ -21,7 +21,15 @@ pub(super) enum ResolvedTokenKind {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
-    GitStatus { ahead: usize, behind: usize },
+    GitStatus {
+        ahead: usize,
+        behind: usize,
+    },
+    GitDirty(crate::workspace::GitDirtyCounts),
+    PullRequests {
+        open: usize,
+        review_requested: usize,
+    },
     Custom(String),
 }
 
@@ -103,6 +111,8 @@ pub(super) struct SpaceTokenContext<'a> {
     /// How long the pane behind this row's state icon has held that state.
     pub state_age: Option<std::time::Duration>,
     pub ahead_behind: Option<(usize, usize)>,
+    pub dirty: Option<crate::workspace::GitDirtyCounts>,
+    pub pull_requests: Option<crate::forge::PullRequestCounts>,
     /// Terminal titles of the pane that also decides this space's state icon.
     pub terminal_title: Option<&'a str>,
     pub terminal_title_stripped: Option<&'a str>,
@@ -143,6 +153,22 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        // A clean tree renders nothing at all rather than a zero:
+                        // this counter exists to say work is outstanding, and
+                        // "nothing outstanding" is best said with silence.
+                        SpaceSidebarToken::GitDirty if !context.suppress_git_details => context
+                            .dirty
+                            .filter(|dirty| !dirty.is_clean())
+                            .map(ResolvedTokenKind::GitDirty),
+                        SpaceSidebarToken::GitDirty => None,
+                        SpaceSidebarToken::PullRequests if !context.suppress_git_details => context
+                            .pull_requests
+                            .filter(|counts| counts.open > 0)
+                            .map(|counts| ResolvedTokenKind::PullRequests {
+                                open: counts.open,
+                                review_requested: counts.review_requested,
+                            }),
+                        SpaceSidebarToken::PullRequests => None,
                         SpaceSidebarToken::TerminalTitle => context
                             .terminal_title
                             .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
@@ -164,6 +190,41 @@ pub(super) fn space_rows(
         .collect()
 }
 
+/// Which lane of uncommitted work a `git_dirty` component counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirtyLane {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+/// The pieces a `git_dirty` token draws, in order, zero lanes omitted.
+///
+/// Width measurement and painting both read this one function, so the two can
+/// never disagree about how wide the token is. The marks are git's own porcelain
+/// vocabulary rather than invented glyphs, so they survive any font and read
+/// correctly to anyone who has run `git status`.
+pub(super) fn git_dirty_parts(dirty: crate::workspace::GitDirtyCounts) -> Vec<(DirtyLane, String)> {
+    [
+        (DirtyLane::Staged, '+', dirty.staged),
+        (DirtyLane::Unstaged, '~', dirty.unstaged),
+        (DirtyLane::Untracked, '?', dirty.untracked),
+    ]
+    .into_iter()
+    .filter(|(_, _, count)| *count > 0)
+    .map(|(lane, mark, count)| (lane, format!("{mark}{count}")))
+    .collect()
+}
+
+/// The text a `pull_requests` token draws.
+///
+/// Spelled `pr` rather than drawn as a glyph on purpose: a misread counter is
+/// silent, and there is no established one-cell mark for "pull request" the way
+/// there is for ahead/behind.
+pub(super) fn pull_requests_text(open: usize) -> String {
+    format!("pr{open}")
+}
+
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
     // An elapsed time straight after the state it belongs to is not a second
     // value on the row, it is the rest of the same phrase: `working 47m`. A
@@ -172,7 +233,12 @@ pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
     let age_qualifies_the_state = matches!(previous.kind, ResolvedTokenKind::StateText(_))
         && matches!(current.kind, ResolvedTokenKind::StateAge(_));
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
-        || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+        || matches!(
+            current.kind,
+            ResolvedTokenKind::GitStatus { .. }
+                | ResolvedTokenKind::GitDirty(_)
+                | ResolvedTokenKind::PullRequests { .. }
+        )
         || age_qualifies_the_state
     {
         " "

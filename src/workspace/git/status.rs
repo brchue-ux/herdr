@@ -12,10 +12,19 @@ use super::{
     },
 };
 
+/// How long a working-tree scan is reused before another one is run.
+///
+/// The surrounding refresh loop ticks every 1.5s, which is the right cadence for
+/// reading refs out of `.git` but far too hot for `git status`, whose cost scales
+/// with the size of the checkout rather than with a handful of ref files. Dirty
+/// counts therefore carry their own deadline and are reused in between.
+const GIT_DIRTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GitStatusRefreshDemand {
     pub branch: bool,
     pub ahead_behind: bool,
+    pub dirty: bool,
 }
 
 impl GitStatusRefreshDemand {
@@ -23,10 +32,25 @@ impl GitStatusRefreshDemand {
     pub const ALL: Self = Self {
         branch: true,
         ahead_behind: true,
+        dirty: true,
     };
 
     pub fn is_empty(self) -> bool {
-        !self.branch && !self.ahead_behind
+        !self.branch && !self.ahead_behind && !self.dirty
+    }
+}
+
+/// Uncommitted work in one checkout, kept atomic so the renderer can abbreviate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GitDirtyCounts {
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+}
+
+impl GitDirtyCounts {
+    pub fn is_clean(self) -> bool {
+        self.staged == 0 && self.unstaged == 0 && self.untracked == 0
     }
 }
 
@@ -34,6 +58,9 @@ impl GitStatusRefreshDemand {
 pub struct GitStatusCacheEntry {
     pub fingerprint: Option<GitStatusFingerprint>,
     pub retry_after: Option<Instant>,
+    /// Working-tree dirtiness changes no ref, so the ref fingerprint cannot
+    /// decide whether it is still valid. It carries its own deadline instead.
+    pub dirty_refresh_after: Option<Instant>,
     pub snapshot: WorkspaceGitStatusSnapshot,
 }
 
@@ -100,6 +127,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             auto_label: fallback_label_from_cwd(cwd),
             branch: None,
             ahead_behind: None,
+            dirty: None,
             space: None,
         };
         return (
@@ -107,12 +135,14 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             Some(GitStatusCacheEntry {
                 fingerprint: None,
                 retry_after: Some(Instant::now() + Duration::from_secs(30)),
+                dirty_refresh_after: None,
                 snapshot,
             }),
         );
     };
     let auto_label = automatic_workspace_label(cwd, &info.repo_root);
     let space = git_space_metadata_from_info(&info);
+    let (dirty, dirty_refresh_after) = resolve_dirty(&info, cached, demand);
 
     if !demand.ahead_behind {
         let branch = demand
@@ -124,15 +154,23 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 })
             })
             .flatten();
-        return (
-            WorkspaceGitStatusSnapshot {
-                auto_label,
-                branch,
-                ahead_behind: None,
-                space: Some(space),
-            },
-            None,
-        );
+        let snapshot = WorkspaceGitStatusSnapshot {
+            auto_label,
+            branch,
+            ahead_behind: None,
+            dirty,
+            space: Some(space),
+        };
+        // Nothing here is fingerprint-backed, so the entry exists only to carry
+        // the dirty scan's deadline. Without it a `git_dirty` row configured on
+        // its own would rescan the whole checkout on every 1.5s tick.
+        let entry = dirty_refresh_after.map(|deadline| GitStatusCacheEntry {
+            fingerprint: None,
+            retry_after: None,
+            dirty_refresh_after: Some(deadline),
+            snapshot: snapshot.clone(),
+        });
+        return (snapshot, entry);
     }
 
     let Some(fingerprint) = git_status_fingerprint_from_info(&info) else {
@@ -141,6 +179,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 auto_label,
                 branch: None,
                 ahead_behind: None,
+                dirty,
                 space: Some(space),
             },
             None,
@@ -153,6 +192,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             auto_label,
             branch,
             ahead_behind: cached.snapshot.ahead_behind,
+            dirty,
             space: Some(space),
         };
         return (
@@ -160,6 +200,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             Some(GitStatusCacheEntry {
                 fingerprint: Some(fingerprint),
                 retry_after: None,
+                dirty_refresh_after,
                 snapshot,
             }),
         );
@@ -173,6 +214,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         auto_label,
         branch,
         ahead_behind,
+        dirty,
         space: Some(space),
     };
     (
@@ -180,9 +222,96 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         Some(GitStatusCacheEntry {
             fingerprint: Some(fingerprint),
             retry_after: None,
+            dirty_refresh_after,
             snapshot,
         }),
     )
+}
+
+/// Returns this checkout's dirty counts and the deadline they stay valid until.
+///
+/// A cached scan is reused while its deadline holds; the ref fingerprint is
+/// deliberately not consulted, because editing a tracked file moves no ref.
+fn resolve_dirty(
+    info: &GitWorktreeInfo,
+    cached: Option<&GitStatusCacheEntry>,
+    demand: GitStatusRefreshDemand,
+) -> (Option<GitDirtyCounts>, Option<Instant>) {
+    if !demand.dirty {
+        return (None, None);
+    }
+
+    let now = Instant::now();
+    if let Some(cached) = cached.filter(|entry| {
+        entry
+            .dirty_refresh_after
+            .is_some_and(|deadline| deadline > now)
+    }) {
+        return (cached.snapshot.dirty, cached.dirty_refresh_after);
+    }
+
+    (
+        git_dirty_counts(&info.repo_root),
+        Some(now + GIT_DIRTY_REFRESH_INTERVAL),
+    )
+}
+
+/// Counts uncommitted entries in a checkout.
+///
+/// `--no-renames` keeps every record a fixed two-status-bytes-then-path shape, so
+/// the NUL-separated stream needs no rename-specific second field. A rename still
+/// counts, just as the add and delete it is made of.
+fn git_dirty_counts(repo_root: &Path) -> Option<GitDirtyCounts> {
+    let output = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--no-renames",
+            "-z",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut counts = GitDirtyCounts::default();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        // Two status bytes, a space, then the path.
+        if record.len() < 3 {
+            continue;
+        }
+        match (record[0], record[1]) {
+            (b'?', b'?') => counts.untracked += 1,
+            (staged, unstaged) => {
+                if staged != b' ' {
+                    counts.staged += 1;
+                }
+                if unstaged != b' ' {
+                    counts.unstaged += 1;
+                }
+            }
+        }
+    }
+
+    Some(counts)
+}
+
+/// The remote URL whose pull requests belong to this checkout, if any.
+///
+/// Runs off the render path with the rest of the Git refresh work.
+pub fn git_remote_url_for_checkout(cwd: &Path) -> Option<String> {
+    let info = git_worktree_info(cwd)?;
+    let branch = read_head_identity(&info).and_then(|head| match head {
+        GitHeadIdentity::Branch { short_name, .. } => Some(short_name),
+        GitHeadIdentity::Detached { .. } => None,
+    });
+    super::config::read_push_remote_url(&info, branch.as_deref())
 }
 
 #[cfg(test)]
