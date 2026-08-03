@@ -1657,9 +1657,14 @@ mod tests {
         );
     }
 
-    /// A divider-test app whose Spaces list and Agents panel both overflow, so
-    /// both sidebar scrollbars are actually drawn. Both tracks live in the
-    /// vertical divider's tolerance column, which is what these tests pin.
+    /// A divider-test app whose Spaces list overflows, so the sidebar scrollbar
+    /// is actually drawn. The track lives in the vertical divider's tolerance
+    /// column, which is what these tests pin.
+    ///
+    /// The space count has to beat the body in *rows*, not in cards: a card is
+    /// as tall as the rows that resolve to something, and a token that comes up
+    /// empty - a git branch on a detached checkout, say - takes a row away. One
+    /// space per body row plus a margin overflows however few of them resolve.
     fn app_for_sidebar_scroll_test() -> crate::app::App {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("alpha");
@@ -1667,7 +1672,7 @@ mod tests {
             ws.test_add_tab(Some(&format!("tab-{idx:02}")));
         }
         let mut workspaces = vec![ws];
-        for idx in 0..24 {
+        for idx in 0..DIVIDER_TEST_AREA.height {
             workspaces.push(Workspace::test_new(&format!("space-{idx:02}")));
         }
         app.state.workspaces = workspaces;
@@ -1692,10 +1697,21 @@ mod tests {
         app
     }
 
-    /// Both sidebar scrollbar tracks, asserted to be drawn.
+    /// The Spaces scrollbar track, asserted to be drawn.
     fn sidebar_scrollbar_track(app: &crate::app::App) -> Rect {
-        crate::ui::workspace_list_scrollbar_rect(&app.state, app.state.workspace_list_rect())
-            .expect("fixture should overflow the Spaces list")
+        let area = app.state.workspace_list_rect();
+        match crate::ui::workspace_list_scrollbar_rect(&app.state, area) {
+            Some(track) => track,
+            // Report the geometry: the fixture overflows by row count, and a
+            // card that renders shorter here than it does elsewhere is exactly
+            // how this stops being true without the fixture changing.
+            None => panic!(
+                "fixture should overflow the Spaces list: {} spaces in {area:?}, \
+                 scroll metrics {:?}",
+                app.state.workspaces.len(),
+                crate::ui::workspace_list_scroll_metrics(&app.state, area),
+            ),
+        }
     }
 
     #[test]
