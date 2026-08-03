@@ -4056,8 +4056,6 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
-        self.app
-            .sync_headless_animation_timer(now, self.has_app_viewers());
         self.app.refresh_state_age_clock(now);
 
         // No resize polling needed — server has no terminal.
@@ -4109,20 +4107,6 @@ impl HeadlessServer {
         {
             self.app.copy_feedback_deadline = None;
             self.app.state.copy_feedback = None;
-            changed = true;
-        }
-
-        if self
-            .app
-            .next_animation_tick
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.app.state.animation_tick = self
-                .app
-                .state
-                .animation_tick
-                .wrapping_add(app::HEADLESS_ANIMATION_TICK_STEP);
-            self.app.next_animation_tick = Some(now + app::HEADLESS_ANIMATION_INTERVAL);
             changed = true;
         }
 
@@ -4201,9 +4185,8 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
-        self.app
-            .sync_headless_animation_timer(now, self.has_app_viewers());
         let has_viewers = self.has_app_viewers();
+        changed |= self.app.advance_headless_animations(now, has_viewers);
         self.app.sync_state_age_timer(now, has_viewers);
         changed
     }
@@ -6287,12 +6270,15 @@ next_tab = ""
     #[test]
     fn headless_sidebar_pulse_ticks_in_coarse_steps_and_only_when_configured() {
         let mut server = test_headless_server();
+        // The engine animates rows, so there has to be a row.
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        server.app.state.active = Some(0);
         let now = Instant::now();
 
         // A calm sidebar leaves the server with no animation deadline at all.
         assert!(!server.handle_scheduled_tasks_headless(now, false));
-        assert_eq!(server.app.next_animation_tick, None);
-        assert_eq!(server.app.state.animation_tick, 0);
+        assert_eq!(server.app.state.anim.next_deadline(now), None);
+        assert!(server.app.state.anim.is_empty());
 
         let config: crate::config::Config = toml::from_str(
             "[ui.sidebar.spaces]\nrows = [[{ token = \"workspace\", emphasis = \"pulse\" }]]\n",
@@ -6302,7 +6288,7 @@ next_tab = ""
 
         // Still nothing: no client is rendering the app yet.
         assert!(!server.handle_scheduled_tasks_headless(now, false));
-        assert_eq!(server.app.next_animation_tick, None);
+        assert_eq!(server.app.state.anim.next_deadline(now), None);
 
         let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
@@ -6319,28 +6305,41 @@ next_tab = ""
         );
         assert!(server.has_app_viewers());
 
-        assert!(!server.handle_scheduled_tasks_headless(now, false));
+        // A viewer appearing is what brings the rows into existence, so this
+        // pass reports a change of its own.
+        assert!(server.handle_scheduled_tasks_headless(now, false));
         let armed = server
             .app
-            .next_animation_tick
+            .state
+            .anim
+            .next_deadline(now)
             .expect("pulse arms the clock");
-        assert_eq!(armed, now + app::HEADLESS_ANIMATION_INTERVAL);
+        assert_eq!(
+            armed,
+            now + app::HEADLESS_ANIMATION_INTERVAL,
+            "the server must not wake on the local TUI's finer cadence"
+        );
 
         assert!(server.handle_scheduled_tasks_headless(armed, false));
         assert_eq!(
-            server.app.state.animation_tick,
-            app::HEADLESS_ANIMATION_TICK_STEP
-        );
-        assert_eq!(
-            server.app.next_animation_tick,
+            server.app.state.anim.next_deadline(armed),
             Some(armed + app::HEADLESS_ANIMATION_INTERVAL)
         );
 
         // A detaching client disarms the clock again.
         server.clients.clear();
-        assert!(!server
-            .handle_scheduled_tasks_headless(armed + app::HEADLESS_ANIMATION_INTERVAL, false));
-        assert_eq!(server.app.next_animation_tick, None);
+        assert!(
+            server.handle_scheduled_tasks_headless(armed + app::HEADLESS_ANIMATION_INTERVAL, false)
+        );
+        assert_eq!(
+            server
+                .app
+                .state
+                .anim
+                .next_deadline(armed + app::HEADLESS_ANIMATION_INTERVAL),
+            None
+        );
+        assert!(server.app.state.anim.is_empty());
     }
 
     #[tokio::test]

@@ -718,7 +718,7 @@
           "key": "ui.sidebar.agents.rows",
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]",
-          "description": "Default expanded Agent sidebar layout. Entries may be token strings or inline { token, fg, bg, bold, dim, italic, underline, reverse, emphasis } style tables. emphasis is none by default, or pulse to animate that occurrence. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
+          "description": "Default expanded Agent sidebar layout. Entries may be token strings or inline { token, fg, bg, bold, dim, italic, underline, reverse, emphasis } style tables. emphasis is none by default, or one of pulse, shimmer, wave, activity, activity-shimmer, fade, typewriter, wipe, drop-in, dissolve, collapse to animate that occurrence. Supports built-in and $name metadata tokens; at most 16 rows and 16 tokens per row."
         },
         {
           "key": "ui.sidebar.agents.rows_by_agent",
@@ -754,7 +754,19 @@
           "key": "ui.sidebar.spaces.rows",
           "type": "list of token rows",
           "default": "[[\"state_icon\", \"workspace\"], [\"branch\", \"git_status\"]]",
-          "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bg, bold, dim, italic, underline, reverse, emphasis } style tables. emphasis is none by default, or pulse to animate that occurrence. Supports built-in and $name metadata tokens, including terminal_title and terminal_title_stripped rolled up from the pane the state icon describes; at most 16 rows and 16 tokens per row."
+          "description": "Expanded Space sidebar layout. Entries may be token strings or inline { token, fg, bg, bold, dim, italic, underline, reverse, emphasis } style tables. emphasis is none by default, or one of pulse, shimmer, wave, activity, activity-shimmer, fade, typewriter, wipe, drop-in, dissolve, collapse to animate that occurrence. Supports built-in and $name metadata tokens, including terminal_title and terminal_title_stripped rolled up from the pane the state icon describes; at most 16 rows and 16 tokens per row."
+        },
+        {
+          "key": "ui.sidebar.animation.row_enter",
+          "type": "string",
+          "default": "\"none\"",
+          "description": "Animation a sidebar row plays as it arrives. none (the default) draws rows fully on their first frame. Accepts any behaviour name emphasis accepts; the arrival behaviours are fade, typewriter, wipe, drop-in, dissolve, and collapse."
+        },
+        {
+          "key": "ui.sidebar.animation.row_enter_ms",
+          "type": "integer",
+          "default": "320",
+          "description": "How long a configured row arrival takes, in milliseconds. Clamped to 60-1500."
         },
         {
           "key": "ui.accent",

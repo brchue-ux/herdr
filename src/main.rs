@@ -56,6 +56,14 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
 
 mod agent_resume;
 mod agent_view;
+// The animation engine deliberately publishes a wider surface than its first
+// consumer binds to. Four queued follow-ons — animation quality, live tree
+// expansion, view transitions, and the notification bar — build on it, and the
+// lifecycle half in particular is complete and tested with only its mount phase
+// wired so far. Narrowing it to today's single call site would mean deleting
+// the contract those tasks were told to expect.
+#[allow(dead_code)]
+mod anim;
 mod api;
 mod app;
 mod build_info;

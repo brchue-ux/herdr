@@ -37,13 +37,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
-/// Frame interval for sidebar token emphasis on a locally attached TUI.
+/// Cheapest frame interval the animation engine will schedule on a locally
+/// attached TUI, and the one a behaviour gets when it does not ask for
+/// anything smoother.
 pub(crate) const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
-/// Slower frame interval for the headless server, which repaints for every
-/// connected client. `HEADLESS_ANIMATION_TICK_STEP` keeps the pulse cycle the
-/// same wall-clock length at the lower frame rate.
+/// Floor under every behaviour's frame interval on the headless server, which
+/// repaints for every connected client over a socket. Behaviours keep their own
+/// periods, so a headless server draws the same animation at a coarser step
+/// rather than at a different speed.
 pub(crate) const HEADLESS_ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
-pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = 2;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -142,7 +144,6 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
-    pub(crate) next_animation_tick: Option<Instant>,
     /// When the sidebar's elapsed-time tokens next need a repaint.
     pub(crate) next_state_age_tick: Option<Instant>,
     /// When the pane activity signal next needs a smoothing step.
@@ -719,6 +720,7 @@ impl App {
             session_status: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
+            sidebar_animation: config.ui.sidebar.animation,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -753,10 +755,10 @@ impl App {
             local_sound_playback: true,
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
-            animation_tick: 0,
             state_age_now: Instant::now(),
             relation_signals: relation_signal::RelationSignals::default(),
             pane_activity: pane_activity::PaneActivityMap::default(),
+            anim: crate::anim::Animator::default(),
             palette: theme_palette,
             theme_name,
             theme_runtime,
@@ -849,7 +851,6 @@ impl App {
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
-            next_animation_tick: None,
             next_state_age_tick: None,
             next_activity_sample: None,
             next_auto_update_check: version_check_enabled
@@ -1235,7 +1236,6 @@ impl App {
             }
 
             let now = Instant::now();
-            self.sync_animation_timer(now);
             self.refresh_state_age_clock(now);
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
             self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
@@ -1654,6 +1654,7 @@ impl App {
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
+                self.state.sidebar_animation = config.ui.sidebar.animation;
                 // A reload re-owns the config tier only. A plugin- or UI-set
                 // view keeps the panel until its own owner gives it up.
                 self.replace_agent_view(

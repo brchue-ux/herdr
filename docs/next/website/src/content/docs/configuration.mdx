@@ -404,7 +404,7 @@ rows = [
 
 Terminal support for `italic`, `underline`, and `reverse` varies. Herdr emits the standard attributes and leaves the rest to your terminal.
 
-`emphasis` adds animation to one occurrence. It is off by default:
+`emphasis` names an animation behaviour for one occurrence. It is off by default:
 
 ```toml
 [ui.sidebar.agents]
@@ -413,12 +413,36 @@ rows = [
 ]
 ```
 
+Steady behaviours, which loop for as long as the row is on screen:
+
 - `none` — the default. Renders exactly like a token without `emphasis`.
 - `pulse` — breathes the token's foreground toward the panel background and back over about 1.6 seconds.
+- `shimmer` — a bright band travels across the token, tinted toward the accent color.
+- `wave` — a ripple along the token, each cell a little behind the one before it.
+- `activity` — brightness *and* tempo follow how hard that row's busiest pane is working right now. A quiet row keeps a calm trace of its own color; a pane producing heavy output reads bright and fast.
+- `activity-shimmer` — a travelling band whose speed follows the same work-volume signal.
 
-`pulse` is drawn as a color ramp, not with terminal blink, so it stays legible at its dimmest point and works on terminals that ignore blink. It ramps toward the occurrence's own `bg` when one is set, otherwise toward the panel background, so a `pulse` on a token with no foreground color has nothing to ramp and stays static.
+Arrival behaviours, which run once and settle. Set as `emphasis` they loop instead, which is usually not what you want — see `[ui.sidebar.animation]` below for where they belong:
 
-Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for `pulse`, so a configuration without `emphasis` repaints exactly as often as before. When a `pulse` is configured, a locally attached Herdr repaints the sidebar about 10 times a second and a Herdr server about 5 times a second for as long as the sidebar stays expanded. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one pulsing token over several.
+- `fade`, `typewriter`, `wipe`, `drop-in`, `dissolve`, `collapse`.
+
+Every behaviour is drawn as a per-cell color ramp, not with terminal blink, so it stays legible throughout and works on terminals that ignore blink. Behaviours that tint ramp toward the occurrence's own `bg` when one is set, otherwise toward the panel background, so a tint on a token with no foreground color has nothing to ramp and stays static.
+
+`activity` and `activity-shimmer` read the same per-pane work-volume level the socket API publishes as `pane.activity.level_percent`. It is sampled and smoothed inside Herdr on its own clock — nothing external has to publish it, and a pane that goes quiet settles back to rest on its own.
+
+### Row arrivals
+
+A whole sidebar row can animate as it appears:
+
+```toml
+[ui.sidebar.animation]
+row_enter = "wipe"
+row_enter_ms = 320
+```
+
+`row_enter` takes any of the behaviour names above and defaults to `none`, which is how rows have always appeared: fully drawn on their first frame. `row_enter_ms` is clamped to 60–1500 ms. A row's arrival always wins over its tokens' own `emphasis`, so a token cannot start shimmering while the row under it is still arriving.
+
+Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
 
 `row_gap` controls the blank terminal rows between entries, independently for the Agent and Space panels. It defaults to `0`, which packs entries together; set it to `1` to restore the previous spacing. It does not add spacing between the content lines declared in `rows`. Consecutive indented worktree children remain packed as one Space group.
 
