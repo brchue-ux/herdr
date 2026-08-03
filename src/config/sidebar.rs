@@ -158,6 +158,10 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    /// Uncommitted work in this Space's checkout.
+    GitDirty,
+    /// Open pull requests on the forge repository this Space pushes to.
+    PullRequests,
     TerminalTitle,
     TerminalTitleStripped,
     Custom(String),
@@ -356,6 +360,8 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::GitDirty => "git_dirty".into(),
+        SpaceSidebarToken::PullRequests => "pull_requests".into(),
         SpaceSidebarToken::TerminalTitle => "terminal_title".into(),
         SpaceSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
@@ -446,6 +452,8 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("git_dirty", Self::GitDirty),
+                ("pull_requests", Self::PullRequests),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],

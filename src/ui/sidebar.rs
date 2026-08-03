@@ -269,6 +269,8 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             state_text: state_label(state, seen),
             state_age: space_state_age(app, ws),
             ahead_behind: ws.git_ahead_behind(),
+            dirty: ws.git_dirty(),
+            pull_requests: ws.pull_requests(),
             terminal_title: terminal_title.raw.as_deref(),
             terminal_title_stripped: terminal_title.stripped.as_deref(),
             tokens: &token_values,
@@ -1167,6 +1169,21 @@ fn resolved_token_spans(
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
                     + usize::from(*ahead > 0 && *behind > 0)
             }
+            // Fixed for the same reason as the ahead/behind counters: a
+            // truncated count is a wrong count, and there is nothing to reclaim
+            // from two or three columns anyway.
+            ResolvedTokenKind::GitDirty(dirty) => {
+                let parts = tokens::git_dirty_parts(*dirty);
+                let separators = parts.len().saturating_sub(1);
+                parts
+                    .iter()
+                    .map(|(_, text)| display_width(text))
+                    .sum::<usize>()
+                    + separators
+            }
+            ResolvedTokenKind::PullRequests { open, .. } => {
+                display_width(&tokens::pull_requests_text(*open))
+            }
             _ => 0,
         })
         .collect::<Vec<_>>();
@@ -1362,6 +1379,50 @@ fn resolved_token_spans(
                         ),
                     ));
                 }
+            }
+            ResolvedTokenKind::GitDirty(dirty) => {
+                for (index, (lane, text)) in tokens::git_dirty_parts(*dirty).into_iter().enumerate()
+                {
+                    if index > 0 {
+                        spans.push(Span::styled(
+                            " ",
+                            apply_token_style(Style::default(), token.style, p, animation_tick),
+                        ));
+                    }
+                    let color = match lane {
+                        tokens::DirtyLane::Staged => p.green,
+                        tokens::DirtyLane::Unstaged => p.yellow,
+                        // Untracked files are the weakest claim on attention of
+                        // the three, so they get the muted colour rather than a
+                        // third bright one competing with the real edits.
+                        tokens::DirtyLane::Untracked => p.overlay1,
+                    };
+                    spans.push(Span::styled(
+                        text,
+                        apply_token_style(
+                            Style::default().fg(color),
+                            token.style,
+                            p,
+                            animation_tick,
+                        ),
+                    ));
+                }
+            }
+            ResolvedTokenKind::PullRequests {
+                open,
+                review_requested,
+            } => {
+                // A PR that named the viewer as a reviewer is the one figure here
+                // that implies an action, so it is the only one emphasised.
+                let color = if *review_requested > 0 {
+                    p.peach
+                } else {
+                    p.blue
+                };
+                spans.push(Span::styled(
+                    tokens::pull_requests_text(*open),
+                    apply_token_style(Style::default().fg(color), token.style, p, animation_tick),
+                ));
             }
             ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
                 spans.push(Span::styled(
@@ -1800,6 +1861,8 @@ fn render_workspace_list(
                 state_text: state_label(display_state, display_seen),
                 state_age: display_state_age,
                 ahead_behind: ws.git_ahead_behind(),
+                dirty: ws.git_dirty(),
+                pull_requests: ws.pull_requests(),
                 terminal_title: terminal_title.raw.as_deref(),
                 terminal_title_stripped: terminal_title.stripped.as_deref(),
                 tokens: &token_values,

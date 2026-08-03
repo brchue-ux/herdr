@@ -21,7 +21,15 @@ pub(super) enum ResolvedTokenKind {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
-    GitStatus { ahead: usize, behind: usize },
+    GitStatus {
+        ahead: usize,
+        behind: usize,
+    },
+    GitDirty(crate::workspace::GitDirtyCounts),
+    PullRequests {
+        open: usize,
+        review_requested: usize,
+    },
     Custom(String),
 }
 
@@ -103,6 +111,8 @@ pub(super) struct SpaceTokenContext<'a> {
     /// How long the pane behind this row's state icon has held that state.
     pub state_age: Option<std::time::Duration>,
     pub ahead_behind: Option<(usize, usize)>,
+    pub dirty: Option<crate::workspace::GitDirtyCounts>,
+    pub pull_requests: Option<crate::forge::PullRequestCounts>,
     /// Terminal titles of the pane that also decides this space's state icon.
     pub terminal_title: Option<&'a str>,
     pub terminal_title_stripped: Option<&'a str>,
@@ -143,6 +153,22 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        // A clean tree renders nothing at all rather than a zero:
+                        // this counter exists to say work is outstanding, and
+                        // "nothing outstanding" is best said with silence.
+                        SpaceSidebarToken::GitDirty if !context.suppress_git_details => context
+                            .dirty
+                            .filter(|dirty| !dirty.is_clean())
+                            .map(ResolvedTokenKind::GitDirty),
+                        SpaceSidebarToken::GitDirty => None,
+                        SpaceSidebarToken::PullRequests if !context.suppress_git_details => context
+                            .pull_requests
+                            .filter(|counts| counts.open > 0)
+                            .map(|counts| ResolvedTokenKind::PullRequests {
+                                open: counts.open,
+                                review_requested: counts.review_requested,
+                            }),
+                        SpaceSidebarToken::PullRequests => None,
                         SpaceSidebarToken::TerminalTitle => context
                             .terminal_title
                             .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
@@ -164,6 +190,41 @@ pub(super) fn space_rows(
         .collect()
 }
 
+/// Which lane of uncommitted work a `git_dirty` component counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirtyLane {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+/// The pieces a `git_dirty` token draws, in order, zero lanes omitted.
+///
+/// Width measurement and painting both read this one function, so the two can
+/// never disagree about how wide the token is. The marks are git's own porcelain
+/// vocabulary rather than invented glyphs, so they survive any font and read
+/// correctly to anyone who has run `git status`.
+pub(super) fn git_dirty_parts(dirty: crate::workspace::GitDirtyCounts) -> Vec<(DirtyLane, String)> {
+    [
+        (DirtyLane::Staged, '+', dirty.staged),
+        (DirtyLane::Unstaged, '~', dirty.unstaged),
+        (DirtyLane::Untracked, '?', dirty.untracked),
+    ]
+    .into_iter()
+    .filter(|(_, _, count)| *count > 0)
+    .map(|(lane, mark, count)| (lane, format!("{mark}{count}")))
+    .collect()
+}
+
+/// The text a `pull_requests` token draws.
+///
+/// Spelled `pr` rather than drawn as a glyph on purpose: a misread counter is
+/// silent, and there is no established one-cell mark for "pull request" the way
+/// there is for ahead/behind.
+pub(super) fn pull_requests_text(open: usize) -> String {
+    format!("pr{open}")
+}
+
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
     // An elapsed time straight after the state it belongs to is not a second
     // value on the row, it is the rest of the same phrase: `working 47m`. A
@@ -172,7 +233,12 @@ pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
     let age_qualifies_the_state = matches!(previous.kind, ResolvedTokenKind::StateText(_))
         && matches!(current.kind, ResolvedTokenKind::StateAge(_));
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
-        || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+        || matches!(
+            current.kind,
+            ResolvedTokenKind::GitStatus { .. }
+                | ResolvedTokenKind::GitDirty(_)
+                | ResolvedTokenKind::PullRequests { .. }
+        )
         || age_qualifies_the_state
     {
         " "
@@ -289,6 +355,8 @@ mod tests {
             state_text: "blocked",
             state_age,
             ahead_behind: None,
+            dirty: None,
+            pull_requests: None,
             terminal_title: None,
             terminal_title_stripped: None,
             tokens: &tokens,
@@ -308,6 +376,159 @@ mod tests {
             )[0][1],
             ResolvedToken::unstyled(ResolvedTokenKind::StateAge("3h".into()))
         );
+    }
+
+    fn outstanding_work_context<'a>(
+        tokens: &'a std::collections::HashMap<String, String>,
+        dirty: Option<crate::workspace::GitDirtyCounts>,
+        pull_requests: Option<crate::forge::PullRequestCounts>,
+        suppress_git_details: bool,
+    ) -> SpaceTokenContext<'a> {
+        SpaceTokenContext {
+            workspace: "repo",
+            branch: None,
+            state_text: "idle",
+            state_age: None,
+            ahead_behind: None,
+            dirty,
+            pull_requests,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            tokens,
+            suppress_git_details,
+        }
+    }
+
+    fn outstanding_work_config() -> SpacesSidebarConfig {
+        SpacesSidebarConfig {
+            rows: vec![vec![
+                SpaceSidebarToken::GitDirty,
+                SpaceSidebarToken::PullRequests,
+            ]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn nothing_outstanding_renders_no_row_at_all() {
+        // A clean tree and an empty queue must not draw `+0` and `pr0`; the row
+        // exists to say work is waiting, so silence is the correct rendering.
+        let tokens = std::collections::HashMap::new();
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(crate::workspace::GitDirtyCounts::default()),
+                Some(crate::forge::PullRequestCounts::default()),
+                false,
+            ),
+        );
+
+        assert!(rows.is_empty(), "clean state should render nothing");
+    }
+
+    #[test]
+    fn outstanding_work_renders_both_counters() {
+        let tokens = std::collections::HashMap::new();
+        let dirty = crate::workspace::GitDirtyCounts {
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+        };
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(dirty),
+                Some(crate::forge::PullRequestCounts {
+                    open: 4,
+                    draft: 1,
+                    review_requested: 2,
+                }),
+                false,
+            ),
+        );
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::GitDirty(dirty)),
+                ResolvedToken::unstyled(ResolvedTokenKind::PullRequests {
+                    open: 4,
+                    review_requested: 2,
+                }),
+            ]]
+        );
+    }
+
+    #[test]
+    fn dirty_parts_omit_empty_lanes_and_keep_gits_own_marks() {
+        assert_eq!(
+            git_dirty_parts(crate::workspace::GitDirtyCounts {
+                staged: 0,
+                unstaged: 2,
+                untracked: 0,
+            }),
+            vec![(DirtyLane::Unstaged, "~2".to_string())]
+        );
+        assert_eq!(
+            git_dirty_parts(crate::workspace::GitDirtyCounts {
+                staged: 1,
+                unstaged: 2,
+                untracked: 3,
+            }),
+            vec![
+                (DirtyLane::Staged, "+1".to_string()),
+                (DirtyLane::Unstaged, "~2".to_string()),
+                (DirtyLane::Untracked, "?3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_grouped_child_row_suppresses_both_counters() {
+        // Indented worktree children already inherit the parent's Git details;
+        // repeating them per child would spend scarce columns saying the same
+        // thing, and the pull request count is a whole-repository fact anyway.
+        let tokens = std::collections::HashMap::new();
+        let rows = space_rows(
+            &outstanding_work_config(),
+            outstanding_work_context(
+                &tokens,
+                Some(crate::workspace::GitDirtyCounts {
+                    staged: 1,
+                    unstaged: 0,
+                    untracked: 0,
+                }),
+                Some(crate::forge::PullRequestCounts {
+                    open: 2,
+                    draft: 0,
+                    review_requested: 0,
+                }),
+                true,
+            ),
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn counters_hug_the_token_before_them_like_the_ahead_behind_pair() {
+        let workspace = ResolvedToken::unstyled(ResolvedTokenKind::Workspace("repo".into()));
+        let dirty = ResolvedToken::unstyled(ResolvedTokenKind::GitDirty(
+            crate::workspace::GitDirtyCounts {
+                staged: 1,
+                unstaged: 0,
+                untracked: 0,
+            },
+        ));
+        let pulls = ResolvedToken::unstyled(ResolvedTokenKind::PullRequests {
+            open: 2,
+            review_requested: 0,
+        });
+
+        assert_eq!(separator(&workspace, &dirty), " ");
+        assert_eq!(separator(&dirty, &pulls), " ");
     }
 
     #[test]
@@ -475,6 +696,8 @@ mod tests {
                     branch: Some("worktree/feature"),
                     state_text: "idle",
                     ahead_behind: Some((2, 1)),
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
@@ -510,6 +733,8 @@ mod tests {
                     branch: None,
                     state_text: "working",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
@@ -551,6 +776,8 @@ mod tests {
                     branch: None,
                     state_text: "unknown",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
@@ -583,6 +810,8 @@ mod tests {
                     branch: Some("worktree/feature"),
                     state_text: "working",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
@@ -613,6 +842,8 @@ mod tests {
                     branch: None,
                     state_text: "idle",
                     ahead_behind: None,
+                    dirty: None,
+                    pull_requests: None,
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &tokens,

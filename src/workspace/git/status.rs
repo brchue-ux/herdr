@@ -12,10 +12,19 @@ use super::{
     },
 };
 
+/// How long a working-tree scan is reused before another one is run.
+///
+/// The surrounding refresh loop ticks every 1.5s, which is the right cadence for
+/// reading refs out of `.git` but far too hot for `git status`, whose cost scales
+/// with the size of the checkout rather than with a handful of ref files. Dirty
+/// counts therefore carry their own deadline and are reused in between.
+const GIT_DIRTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GitStatusRefreshDemand {
     pub branch: bool,
     pub ahead_behind: bool,
+    pub dirty: bool,
 }
 
 impl GitStatusRefreshDemand {
@@ -23,10 +32,25 @@ impl GitStatusRefreshDemand {
     pub const ALL: Self = Self {
         branch: true,
         ahead_behind: true,
+        dirty: true,
     };
 
     pub fn is_empty(self) -> bool {
-        !self.branch && !self.ahead_behind
+        !self.branch && !self.ahead_behind && !self.dirty
+    }
+}
+
+/// Uncommitted work in one checkout, kept atomic so the renderer can abbreviate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GitDirtyCounts {
+    pub staged: usize,
+    pub unstaged: usize,
+    pub untracked: usize,
+}
+
+impl GitDirtyCounts {
+    pub fn is_clean(self) -> bool {
+        self.staged == 0 && self.unstaged == 0 && self.untracked == 0
     }
 }
 
@@ -34,6 +58,9 @@ impl GitStatusRefreshDemand {
 pub struct GitStatusCacheEntry {
     pub fingerprint: Option<GitStatusFingerprint>,
     pub retry_after: Option<Instant>,
+    /// Working-tree dirtiness changes no ref, so the ref fingerprint cannot
+    /// decide whether it is still valid. It carries its own deadline instead.
+    pub dirty_refresh_after: Option<Instant>,
     pub snapshot: WorkspaceGitStatusSnapshot,
 }
 
@@ -100,6 +127,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             auto_label: fallback_label_from_cwd(cwd),
             branch: None,
             ahead_behind: None,
+            dirty: None,
             space: None,
         };
         return (
@@ -107,12 +135,14 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             Some(GitStatusCacheEntry {
                 fingerprint: None,
                 retry_after: Some(Instant::now() + Duration::from_secs(30)),
+                dirty_refresh_after: None,
                 snapshot,
             }),
         );
     };
     let auto_label = automatic_workspace_label(cwd, &info.repo_root);
     let space = git_space_metadata_from_info(&info);
+    let (dirty, dirty_refresh_after) = resolve_dirty(&info, cached, demand);
 
     if !demand.ahead_behind {
         let branch = demand
@@ -124,15 +154,23 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 })
             })
             .flatten();
-        return (
-            WorkspaceGitStatusSnapshot {
-                auto_label,
-                branch,
-                ahead_behind: None,
-                space: Some(space),
-            },
-            None,
-        );
+        let snapshot = WorkspaceGitStatusSnapshot {
+            auto_label,
+            branch,
+            ahead_behind: None,
+            dirty,
+            space: Some(space),
+        };
+        // Nothing here is fingerprint-backed, so the entry exists only to carry
+        // the dirty scan's deadline. Without it a `git_dirty` row configured on
+        // its own would rescan the whole checkout on every 1.5s tick.
+        let entry = dirty_refresh_after.map(|deadline| GitStatusCacheEntry {
+            fingerprint: None,
+            retry_after: None,
+            dirty_refresh_after: Some(deadline),
+            snapshot: snapshot.clone(),
+        });
+        return (snapshot, entry);
     }
 
     let Some(fingerprint) = git_status_fingerprint_from_info(&info) else {
@@ -141,6 +179,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 auto_label,
                 branch: None,
                 ahead_behind: None,
+                dirty,
                 space: Some(space),
             },
             None,
@@ -153,6 +192,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             auto_label,
             branch,
             ahead_behind: cached.snapshot.ahead_behind,
+            dirty,
             space: Some(space),
         };
         return (
@@ -160,6 +200,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             Some(GitStatusCacheEntry {
                 fingerprint: Some(fingerprint),
                 retry_after: None,
+                dirty_refresh_after,
                 snapshot,
             }),
         );
@@ -173,6 +214,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         auto_label,
         branch,
         ahead_behind,
+        dirty,
         space: Some(space),
     };
     (
@@ -180,9 +222,96 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         Some(GitStatusCacheEntry {
             fingerprint: Some(fingerprint),
             retry_after: None,
+            dirty_refresh_after,
             snapshot,
         }),
     )
+}
+
+/// Returns this checkout's dirty counts and the deadline they stay valid until.
+///
+/// A cached scan is reused while its deadline holds; the ref fingerprint is
+/// deliberately not consulted, because editing a tracked file moves no ref.
+fn resolve_dirty(
+    info: &GitWorktreeInfo,
+    cached: Option<&GitStatusCacheEntry>,
+    demand: GitStatusRefreshDemand,
+) -> (Option<GitDirtyCounts>, Option<Instant>) {
+    if !demand.dirty {
+        return (None, None);
+    }
+
+    let now = Instant::now();
+    if let Some(cached) = cached.filter(|entry| {
+        entry
+            .dirty_refresh_after
+            .is_some_and(|deadline| deadline > now)
+    }) {
+        return (cached.snapshot.dirty, cached.dirty_refresh_after);
+    }
+
+    (
+        git_dirty_counts(&info.repo_root),
+        Some(now + GIT_DIRTY_REFRESH_INTERVAL),
+    )
+}
+
+/// Counts uncommitted entries in a checkout.
+///
+/// `--no-renames` keeps every record a fixed two-status-bytes-then-path shape, so
+/// the NUL-separated stream needs no rename-specific second field. A rename still
+/// counts, just as the add and delete it is made of.
+fn git_dirty_counts(repo_root: &Path) -> Option<GitDirtyCounts> {
+    let output = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--no-renames",
+            "-z",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut counts = GitDirtyCounts::default();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        // Two status bytes, a space, then the path.
+        if record.len() < 3 {
+            continue;
+        }
+        match (record[0], record[1]) {
+            (b'?', b'?') => counts.untracked += 1,
+            (staged, unstaged) => {
+                if staged != b' ' {
+                    counts.staged += 1;
+                }
+                if unstaged != b' ' {
+                    counts.unstaged += 1;
+                }
+            }
+        }
+    }
+
+    Some(counts)
+}
+
+/// The remote URL whose pull requests belong to this checkout, if any.
+///
+/// Runs off the render path with the rest of the Git refresh work.
+pub fn git_remote_url_for_checkout(cwd: &Path) -> Option<String> {
+    let info = git_worktree_info(cwd)?;
+    let branch = read_head_identity(&info).and_then(|head| match head {
+        GitHeadIdentity::Branch { short_name, .. } => Some(short_name),
+        GitHeadIdentity::Detached { .. } => None,
+    });
+    super::config::read_push_remote_url(&info, branch.as_deref())
 }
 
 #[cfg(test)]
@@ -336,8 +465,211 @@ mod tests {
     use super::*;
     use crate::workspace::git::{
         git_space_metadata,
-        test_support::{run_git, temp_test_dir, write_fake_tracked_repo},
+        test_support::{init_repo_with_commit, run_git, temp_test_dir, write_fake_tracked_repo},
     };
+
+    #[test]
+    fn dirty_counts_separate_staged_unstaged_and_untracked_work() {
+        let root = temp_test_dir("dirty-counts");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("tracked.txt"), "one").unwrap();
+        std::fs::write(root.join("edited.txt"), "one").unwrap();
+        run_git(&root, &["add", "tracked.txt", "edited.txt"]);
+        run_git(&root, &["commit", "--quiet", "-m", "add files"]);
+
+        // One staged addition, one unstaged edit to a tracked file, one file git
+        // has never seen.
+        std::fs::write(root.join("staged.txt"), "new").unwrap();
+        run_git(&root, &["add", "staged.txt"]);
+        std::fs::write(root.join("edited.txt"), "changed").unwrap();
+        std::fs::write(root.join("untracked.txt"), "loose").unwrap();
+
+        let counts = git_dirty_counts(&root).expect("dirty counts for a real repo");
+
+        assert_eq!(counts.staged, 1, "staged");
+        assert_eq!(counts.unstaged, 1, "unstaged");
+        assert_eq!(counts.untracked, 1, "untracked");
+        assert!(!counts.is_clean());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_both_staged_and_edited_again_counts_in_both_lanes() {
+        let root = temp_test_dir("dirty-both-lanes");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("file.txt"), "staged").unwrap();
+        run_git(&root, &["add", "file.txt"]);
+        std::fs::write(root.join("file.txt"), "and then edited").unwrap();
+
+        let counts = git_dirty_counts(&root).expect("dirty counts for a real repo");
+
+        assert_eq!(counts.staged, 1);
+        assert_eq!(counts.unstaged, 1);
+        assert_eq!(counts.untracked, 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_clean_checkout_reports_clean_rather_than_nothing() {
+        // `Some(clean)` and `None` mean different things to the renderer: the
+        // first is "asked, nothing outstanding", the second is "never asked".
+        let root = temp_test_dir("dirty-clean");
+        init_repo_with_commit(&root);
+
+        let counts = git_dirty_counts(&root).expect("dirty counts for a real repo");
+
+        assert!(counts.is_clean());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dirty_is_not_scanned_unless_it_is_demanded() {
+        let root = temp_test_dir("dirty-undemanded");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("untracked.txt"), "loose").unwrap();
+
+        let (snapshot, _) = git_status_snapshot_for_cwd_with_demand(
+            &root,
+            None,
+            GitStatusRefreshDemand {
+                branch: true,
+                ahead_behind: false,
+                dirty: false,
+            },
+        );
+
+        assert_eq!(snapshot.dirty, None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_dirty_only_refresh_still_caches_its_scan_deadline() {
+        // Without a cache entry on this path the 1.5s refresh loop would rerun
+        // `git status` over the whole checkout on every single tick.
+        let root = temp_test_dir("dirty-only-throttle");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("untracked.txt"), "loose").unwrap();
+
+        let demand = GitStatusRefreshDemand {
+            branch: false,
+            ahead_behind: false,
+            dirty: true,
+        };
+        let (snapshot, entry) = git_status_snapshot_for_cwd_with_demand(&root, None, demand);
+
+        assert_eq!(snapshot.dirty.map(|d| d.untracked), Some(1));
+        let entry = entry.expect("a dirty-only refresh must carry its deadline");
+        assert!(entry.dirty_refresh_after.is_some());
+        // No fingerprint was computed on this path, so nothing may claim one.
+        assert!(entry.fingerprint.is_none());
+        // `retry_after` is the non-Git backoff; setting it here would make the
+        // next refresh short-circuit and reuse this snapshot wholesale.
+        assert!(entry.retry_after.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cached_dirty_scan_is_reused_until_its_deadline_passes() {
+        let root = temp_test_dir("dirty-reuse");
+        init_repo_with_commit(&root);
+
+        let demand = GitStatusRefreshDemand {
+            branch: false,
+            ahead_behind: false,
+            dirty: true,
+        };
+        let (_, entry) = git_status_snapshot_for_cwd_with_demand(&root, None, demand);
+        let entry = entry.expect("first scan caches");
+
+        // The working tree goes dirty, but the deadline has not passed.
+        std::fs::write(root.join("untracked.txt"), "loose").unwrap();
+        let (snapshot, _) = git_status_snapshot_for_cwd_with_demand(&root, Some(&entry), demand);
+        assert_eq!(snapshot.dirty.map(|d| d.untracked), Some(0));
+
+        // Once it has, the next refresh sees the new file.
+        let expired = GitStatusCacheEntry {
+            dirty_refresh_after: Some(Instant::now() - Duration::from_secs(1)),
+            ..entry
+        };
+        let (snapshot, _) = git_status_snapshot_for_cwd_with_demand(&root, Some(&expired), demand);
+        assert_eq!(snapshot.dirty.map(|d| d.untracked), Some(1));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_push_remote_is_preferred_over_origin() {
+        // A fork checkout usually has `origin` pointing at the upstream project,
+        // whose pull requests are somebody else's to answer.
+        let root = temp_test_dir("push-remote");
+        init_repo_with_commit(&root);
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/upstream/herdr.git",
+            ],
+        );
+        run_git(
+            &root,
+            &["remote", "add", "fork", "git@github.com:captain/herdr.git"],
+        );
+
+        // With no upstream configured the branch falls back to `origin`.
+        assert_eq!(
+            git_remote_url_for_checkout(&root).as_deref(),
+            Some("https://github.com/upstream/herdr.git")
+        );
+
+        let branch = run_git_stdout(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        run_git(
+            &root,
+            &["config", &format!("branch.{branch}.remote"), "fork"],
+        );
+        run_git(
+            &root,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+
+        assert_eq!(
+            git_remote_url_for_checkout(&root).as_deref(),
+            Some("git@github.com:captain/herdr.git")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_checkout_with_no_remote_names_no_repository() {
+        let root = temp_test_dir("no-remote");
+        init_repo_with_commit(&root);
+
+        assert_eq!(git_remote_url_for_checkout(&root), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn run_git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -413,6 +745,7 @@ mod tests {
             GitStatusRefreshDemand {
                 branch: true,
                 ahead_behind: false,
+                dirty: false,
             },
         );
 
@@ -431,10 +764,12 @@ mod tests {
         let cached = GitStatusCacheEntry {
             fingerprint: Some(fingerprint),
             retry_after: None,
+            dirty_refresh_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
+                dirty: None,
                 space: git_space_metadata(&root),
             },
         };
@@ -456,10 +791,12 @@ mod tests {
         let cached = GitStatusCacheEntry {
             fingerprint: Some(fingerprint),
             retry_after: None,
+            dirty_refresh_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((4, 0)),
+                dirty: None,
                 space: git_space_metadata(&root),
             },
         };
@@ -491,10 +828,12 @@ mod tests {
         let cached = GitStatusCacheEntry {
             fingerprint: Some(fingerprint),
             retry_after: None,
+            dirty_refresh_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 3)),
+                dirty: None,
                 space: git_space_metadata(&root),
             },
         };

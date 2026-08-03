@@ -4157,6 +4157,7 @@ impl HeadlessServer {
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
+            self.app.start_pull_request_refresh_if_due(now);
         }
 
         if self
@@ -5899,6 +5900,7 @@ next_tab = ""
                 auto_label: "cached".into(),
                 branch: None,
                 ahead_behind: None,
+                dirty: None,
                 space: None,
             }],
             cache_updates: Vec::new(),
@@ -5925,6 +5927,7 @@ next_tab = ""
                 auto_label: "one".into(),
                 branch: Some("changed".into()),
                 ahead_behind: None,
+                dirty: None,
                 space: None,
             }],
             cache_updates: Vec::new(),

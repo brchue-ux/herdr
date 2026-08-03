@@ -323,6 +323,7 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
+        self.start_pull_request_refresh_if_due(now);
 
         if self
             .next_auto_update_check
@@ -672,6 +673,9 @@ impl App {
             self.state.relation_signals.next_deadline(),
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
+                .flatten(),
+            include_git_refresh
+                .then(|| self.pull_request_refresh_deadline())
                 .flatten(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,

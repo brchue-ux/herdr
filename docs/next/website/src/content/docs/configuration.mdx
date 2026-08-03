@@ -324,9 +324,35 @@ Space rows accept these built-in tokens:
 - `workspace` — workspace name.
 - `branch` — Git branch when available.
 - `git_status` — Git ahead and behind counts when nonzero.
+- `git_dirty` — uncommitted work in the checkout: `+` staged, `~` unstaged, `?` untracked.
+- `pull_requests` — open pull requests on the repository this checkout pushes to, as `pr3`.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
 - `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
+
+`git_dirty` and `pull_requests` both count outstanding work, so both stay silent
+when there is none: a clean checkout draws no `git_dirty`, and a repository with
+nothing open draws no `pull_requests`. Neither ever truncates. A shortened count
+is a wrong count, so like `git_status` they keep their full width and let a long
+branch name on the same row give way instead.
+
+Both are acquired only for rows that ask for them, so a layout naming neither
+costs nothing. `git_dirty` rides the existing Git refresh but rescans a checkout
+at most once every five seconds, because its cost scales with the size of the
+checkout rather than with a handful of ref files.
+
+`pull_requests` crosses the network and refreshes every two minutes. It reads the
+repository named by the remote the current branch tracks — falling back to
+`origin` only when the branch tracks nothing — so a fork's checkout counts the
+fork's pull requests rather than the upstream project's.
+
+Only `github.com` is queried. The request carries a bearer token, and a remote's
+hostname is no evidence that the host behind it speaks GitHub's API, so a
+checkout pointing anywhere else draws no counter rather than being probed for
+one. Herdr finds a token the way `gh` does, checking `HERDR_FORGE_TOKEN`,
+`GH_TOKEN`, and `GITHUB_TOKEN`, then `gh`'s own configuration; with no token it
+draws nothing and asks for none. When a fetch fails the previous count stays on
+the row, because "we could not ask" is not "there is nothing open".
 
 `state_age` reports elapsed time and nothing else. It is not a stall warning:
 nothing about it changes colour or shape as the number grows, because Herdr has
