@@ -4140,6 +4140,9 @@ impl HeadlessServer {
         changed |= self
             .app
             .advance_relation_signals(now, self.has_app_viewers());
+        // Not gated on viewers: the activity level is a runtime fact the API
+        // answers with, not decoration, so a detached server keeps it truthful.
+        changed |= self.app.sample_pane_activity(now);
 
         if self
             .app

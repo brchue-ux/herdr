@@ -145,6 +145,22 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 客户端可以把 `offset_from_bottom == 0` 视为位于底部。
 
+窗格至少被采样一次后,`PaneInfo` 包含 `activity`:
+
+```json
+{
+  "level_percent": 42,
+  "bytes_per_sec": 8192,
+  "output_bytes": 1048576
+}
+```
+
+`level_percent` 表示窗格当前的工作强度,取值范围 `0..=100`。Herdr 在自己的循环中采样每个窗格的终端输出并做平滑处理,因此输出开始时该值迅速上升,输出停止后在几秒内回落到 `0`。它刻意不带单位:从输出速率映射到该尺度是 Herdr 侧的呈现决策,可能在版本之间调整,所以请绑定 `level_percent`,不要根据速率自行推导尺度。
+
+`bytes_per_sec` 是最近一个采样窗口内测得的原始输出速率(未平滑),`output_bytes` 是该窗格终端的累计计数。两者都用于调优和诊断。当新进程接管终端时 `output_bytes` 会重置,因此数值下降应视为重启,而不是负的工作量。
+
+这是拉取而非推送:没有 activity 事件,因为把固定采样周期上连续变化的值变成事件,会得到一条随窗格喧闹程度而膨胀的事件流。请按需要的频率轮询 `pane.get` 或 `pane.list`。它同样不会被持久化——刚启动的服务器在接下来几次采样落地前会把所有窗格报告为静止状态,而从未产生输出的窗格根本没有 `activity` 对象。
+
 ### 实验性窗格图形
 
 窗格图形允许插件在窗格上放置图像数据。它们只在 `[experimental].kitty_graphics = true` 时可用;否则所有窗格图形方法都返回 `feature_disabled`。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。

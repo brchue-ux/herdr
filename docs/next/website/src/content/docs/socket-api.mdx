@@ -166,6 +166,37 @@ pane.
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
 
+`PaneInfo` includes `activity` once the pane has been sampled at least once:
+
+```json
+{
+  "level_percent": 42,
+  "bytes_per_sec": 8192,
+  "output_bytes": 1048576
+}
+```
+
+`level_percent` is how hard the pane is working right now, on a `0..=100`
+scale. Herdr samples every pane's terminal output on its own loop and smooths
+the result, so the value rises quickly when output starts and eases back to `0`
+over a few seconds after it stops. It is unitless on purpose: the curve from
+output rate onto this scale is a Herdr-side presentation decision and can be
+re-tuned between releases, so bind to `level_percent` rather than deriving your
+own scale from the rate.
+
+`bytes_per_sec` is the raw output rate measured over the most recent sample
+window, unsmoothed, and `output_bytes` is a lifetime counter for the pane's
+terminal. Both are there for tuning and diagnosis. `output_bytes` restarts when
+a new process takes over the terminal, so treat a decrease as a restart rather
+than as negative work.
+
+This is reported rather than pushed: there is no activity event, because a
+continuously varying value on a fixed sample cadence would turn into an event
+stream that scales with how loud a pane is. Poll `pane.get` or `pane.list` at
+whatever rate you need. It is also not persisted — a freshly started server
+reports every pane at rest until its next few samples land, and a pane that has
+never produced output has no `activity` object at all.
+
 ### Experimental pane graphics
 
 Pane graphics let a plugin place image data over a pane. They are available

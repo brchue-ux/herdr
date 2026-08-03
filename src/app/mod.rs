@@ -16,6 +16,7 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+pub(crate) mod pane_activity;
 mod popup;
 pub(crate) mod relation_signal;
 mod runtime;
@@ -133,6 +134,11 @@ pub struct App {
     pub(crate) next_animation_tick: Option<Instant>,
     /// When the sidebar's elapsed-time tokens next need a repaint.
     pub(crate) next_state_age_tick: Option<Instant>,
+    /// When the pane activity signal next needs a smoothing step.
+    ///
+    /// `None` once every pane has settled at rest, which is what lets an idle
+    /// Herdr sleep instead of waking four times a second to measure silence.
+    pub(crate) next_activity_sample: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -735,6 +741,7 @@ impl App {
             animation_tick: 0,
             state_age_now: Instant::now(),
             relation_signals: relation_signal::RelationSignals::default(),
+            pane_activity: pane_activity::PaneActivityMap::default(),
             palette: theme_palette,
             theme_name,
             theme_runtime,
@@ -825,6 +832,7 @@ impl App {
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
             next_state_age_tick: None,
+            next_activity_sample: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -4947,6 +4955,34 @@ mod tests {
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             None
         );
+    }
+
+    #[test]
+    fn a_due_activity_sample_keeps_the_loop_awake_for_itself() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_resize_poll = now + Duration::from_secs(5);
+        app.session_save_deadline = Some(now + Duration::from_secs(2));
+        app.next_auto_update_check = Some(now + Duration::from_secs(6));
+        app.next_activity_sample = Some(now + Duration::from_millis(50));
+
+        assert_eq!(app.next_loop_deadline(now, false), app.next_activity_sample);
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
+            app.next_activity_sample,
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_terminals_arms_no_activity_sample() {
+        let mut app = test_app();
+        app.next_activity_sample = Some(Instant::now() + Duration::from_secs(1));
+
+        // Nothing is producing output, so the sampler must hand the deadline
+        // back rather than wake four times a second to measure silence.
+        app.handle_scheduled_tasks(Instant::now(), false);
+
+        assert_eq!(app.next_activity_sample, None);
     }
 
     #[test]

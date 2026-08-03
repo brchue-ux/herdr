@@ -880,6 +880,7 @@ mod tests {
             tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
+            activity: None,
             revision: 0,
         }
     }

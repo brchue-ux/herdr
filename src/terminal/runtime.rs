@@ -269,6 +269,11 @@ impl TerminalRuntime {
         self.0.scroll_metrics()
     }
 
+    /// Lifetime count of PTY output bytes this terminal has produced.
+    pub fn output_bytes(&self) -> u64 {
+        self.0.output_bytes()
+    }
+
     pub(crate) fn search_text_matches(
         &self,
         query: &str,
