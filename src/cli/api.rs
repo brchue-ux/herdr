@@ -1,6 +1,6 @@
 const API_SCHEMA_JSON: &str = include_str!("../../docs/next/api/herdr-api.schema.json");
 
-use crate::api::schema::{EmptyParams, Method, Request};
+use crate::api::schema::{EmptyParams, Method, Request, SessionStatusSetParams};
 
 pub(super) fn run_api_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(String::as_str) else {
@@ -11,6 +11,7 @@ pub(super) fn run_api_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "schema" => api_schema(&args[1..]),
         "snapshot" => api_snapshot(&args[1..]),
+        "status" => api_status(&args[1..]),
         "help" | "--help" | "-h" => {
             print_api_help();
             Ok(0)
@@ -65,6 +66,95 @@ fn api_snapshot(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+/// `herdr api status ...`.
+///
+/// It lives under `api` rather than `session` for the same reason
+/// `herdr api snapshot` does: `herdr session` is the session *manager*, where
+/// every subcommand names a session to act on, while this acts on whichever
+/// session the global `--session` flag already selected.
+fn api_status(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(String::as_str) {
+        Some("get") => api_status_get(&args[1..]),
+        Some("set") => api_status_set(&args[1..]),
+        Some("clear") => api_status_clear(&args[1..]),
+        Some("help" | "--help" | "-h") => {
+            print_api_status_help();
+            Ok(0)
+        }
+        _ => {
+            print_api_status_help();
+            Ok(2)
+        }
+    }
+}
+
+fn api_status_get(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr api status get");
+        return Ok(2);
+    }
+
+    let response = super::send_request(&Request {
+        id: "cli:api:status:get".into(),
+        method: Method::SessionSnapshot(EmptyParams::default()),
+    })?;
+    // `session.snapshot` answers as `{"result": {"type": ..., "snapshot": {...}}}`,
+    // so the status is one level below `result`; reading `result.status`
+    // directly always misses and reports every session as unset.
+    let Some(snapshot) = response
+        .get("result")
+        .and_then(|result| result.get("snapshot"))
+    else {
+        return super::print_response(&response);
+    };
+    // An absent status is a fact, not an error, and is reported in the same
+    // shape a set one is.
+    let status = snapshot.get("status").cloned();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "set": status.is_some(),
+            "status": status,
+        }))?
+    );
+    Ok(0)
+}
+
+fn api_status_set(args: &[String]) -> std::io::Result<i32> {
+    let [status] = args else {
+        eprintln!("usage: herdr api status set <text>");
+        return Ok(2);
+    };
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:api:status:set".into(),
+        method: Method::SessionStatusSet(SessionStatusSetParams {
+            status: status.clone(),
+        }),
+    })?)
+}
+
+fn api_status_clear(args: &[String]) -> std::io::Result<i32> {
+    if !args.is_empty() {
+        eprintln!("usage: herdr api status clear");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:api:status:clear".into(),
+        method: Method::SessionStatusClear(EmptyParams::default()),
+    })?)
+}
+
+fn print_api_status_help() {
+    eprintln!("herdr api status commands:");
+    eprintln!("  herdr api status get");
+    eprintln!("  herdr api status set <text>");
+    eprintln!("  herdr api status clear");
+    eprintln!("  one line of your own text about this session, drawn on the sidebar's");
+    eprintln!("  header row above the first Space; Herdr never interprets it");
+}
+
 fn write_schema_file(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::write(path, API_SCHEMA_JSON)
 }
@@ -100,6 +190,7 @@ fn print_api_help() {
     eprintln!("herdr api commands:");
     eprintln!("  herdr api snapshot");
     eprintln!("  herdr api schema [--json | --output PATH]");
+    eprintln!("  herdr api status get|set <text>|clear");
 }
 
 fn print_api_schema_help() {

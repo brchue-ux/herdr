@@ -51,6 +51,12 @@ pub enum ResponseResult {
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
     },
+    /// The session status left in force by `session.status.set` or
+    /// `session.status.clear`. Absent means nothing is set.
+    SessionStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
     },

@@ -3771,6 +3771,18 @@
           },
           "type": "object"
         },
+        "SessionStatusSetParams": {
+          "description": "Params for `session.status.set`.\n\nThe status is one caller-supplied line of text about this session. Herdr\nnever interprets it and never composes it: whatever the caller publishes is\nwhat a client shows, so the same slot carries a quota readout, a build\nnumber, or a deploy banner without Herdr learning about any of them.",
+          "properties": {
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -4744,6 +4756,38 @@
           "properties": {
             "method": {
               "const": "session.snapshot",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.status.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SessionStatusSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "session.status.clear",
               "type": "string"
             },
             "params": {
@@ -9004,6 +9048,25 @@
               "type": "object"
             },
             {
+              "description": "The session status left in force by `session.status.set` or\n`session.status.clear`. Absent means nothing is set.",
+              "properties": {
+                "status": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "session_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "workspace_info",
@@ -10138,6 +10201,13 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "status": {
+              "description": "The session status string in force, if any. Absent when nothing has set\none, which is the default.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "tabs": {
               "items": {

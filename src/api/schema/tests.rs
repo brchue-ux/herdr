@@ -339,6 +339,27 @@ fn agent_view_requests_round_trip() {
 }
 
 #[test]
+fn session_status_requests_round_trip() {
+    let set_json = serde_json::json!({
+        "id": "status-set",
+        "method": "session.status.set",
+        "params": {"status": "7d 62% · 5h 18%"}
+    });
+    let request: Request = serde_json::from_value(set_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::SessionStatusSet(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), set_json);
+
+    let clear_json = serde_json::json!({
+        "id": "status-clear",
+        "method": "session.status.clear",
+        "params": {}
+    });
+    let request: Request = serde_json::from_value(clear_json.clone()).unwrap();
+    assert!(matches!(request.method, Method::SessionStatusClear(_)));
+    assert_eq!(serde_json::to_value(request).unwrap(), clear_json);
+}
+
+#[test]
 fn unknown_method_is_rejected() {
     let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
     let err = serde_json::from_str::<Request>(json)
@@ -676,6 +697,7 @@ fn session_snapshot_request_and_response_round_trip() {
                     source: "config".into(),
                     label: Some("blocked".into()),
                 }),
+                status: Some("7d 62% · 5h 18%".into()),
             }),
         },
     };

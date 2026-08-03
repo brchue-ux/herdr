@@ -24,4 +24,19 @@ pub struct SessionSnapshot {
     /// reordering the agent list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_view: Option<AgentViewInfo>,
+    /// The session status string in force, if any. Absent when nothing has set
+    /// one, which is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Params for `session.status.set`.
+///
+/// The status is one caller-supplied line of text about this session. Herdr
+/// never interprets it and never composes it: whatever the caller publishes is
+/// what a client shows, so the same slot carries a quota readout, a build
+/// number, or a deploy banner without Herdr learning about any of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionStatusSetParams {
+    pub status: String,
 }

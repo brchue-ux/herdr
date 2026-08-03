@@ -1,9 +1,55 @@
-use crate::api::schema::{ResponseResult, SessionSnapshot};
+use crate::api::schema::{ResponseResult, SessionSnapshot, SessionStatusSetParams};
 use crate::app::App;
 
 use super::responses::encode_success;
 
+/// Ceiling on a stored session status, in characters.
+///
+/// The sidebar row it renders on is at most a few dozen columns wide, so this
+/// is not a display budget - rendering truncates on its own. It only stops a
+/// runaway publisher from parking an unbounded string in session state.
+const MAX_SESSION_STATUS_CHARS: usize = 200;
+
+/// Strip anything that would escape the one row the status is drawn on.
+///
+/// Control characters, and the OSC terminators in particular, would otherwise
+/// let a published string move the cursor or reprogram the host terminal when
+/// it reaches a client. A status that sanitizes down to nothing is the same as
+/// no status at all, which is why this returns `Option`.
+fn sanitize_session_status(value: &str) -> Option<String> {
+    let sanitized = value
+        .chars()
+        .filter(|ch| !matches!(*ch, '\u{1b}' | '\u{7}' | '\u{9c}') && !ch.is_control())
+        .take(MAX_SESSION_STATUS_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 impl App {
+    pub(super) fn handle_session_status_set(
+        &mut self,
+        id: String,
+        params: SessionStatusSetParams,
+    ) -> String {
+        // A status that sanitizes down to nothing clears the slot rather than
+        // parking an empty string there, so the row is empty in exactly one
+        // state instead of two that render alike but compare differently.
+        self.state.session_status = sanitize_session_status(&params.status);
+        encode_success(
+            id,
+            ResponseResult::SessionStatus {
+                status: self.state.session_status.clone(),
+            },
+        )
+    }
+
+    pub(super) fn handle_session_status_clear(&mut self, id: String) -> String {
+        self.state.session_status = None;
+        encode_success(id, ResponseResult::SessionStatus { status: None })
+    }
+
     pub(super) fn handle_session_snapshot(&mut self, id: String) -> String {
         encode_success(
             id,
@@ -59,6 +105,7 @@ impl App {
                     label: view.label.clone(),
                 }
             }),
+            status: self.state.session_status.clone(),
         }
     }
 }
@@ -113,6 +160,100 @@ mod tests {
         assert_eq!(
             snapshot.focused_pane_id.as_deref(),
             Some(snapshot.panes[0].pane_id.as_str())
+        );
+    }
+
+    fn set_status(app: &mut crate::app::App, status: &str) -> Option<String> {
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_status_set".into(),
+            method: Method::SessionStatusSet(crate::api::schema::SessionStatusSetParams {
+                status: status.to_string(),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::SessionStatus { status } = success.result else {
+            panic!("expected session status response");
+        };
+        status
+    }
+
+    fn snapshot_status(app: &mut crate::app::App) -> Option<String> {
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_snapshot".into(),
+            method: Method::SessionSnapshot(EmptyParams::default()),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::SessionSnapshot { snapshot } = success.result else {
+            panic!("expected session snapshot response");
+        };
+        snapshot.status
+    }
+
+    #[test]
+    fn setting_a_session_status_stores_it_and_reports_it_back() {
+        let mut app = app_with_two_tabs();
+        assert_eq!(snapshot_status(&mut app), None);
+
+        assert_eq!(
+            set_status(&mut app, "7d 62% · 5h 18%"),
+            Some("7d 62% · 5h 18%".to_string())
+        );
+        assert_eq!(
+            snapshot_status(&mut app),
+            Some("7d 62% · 5h 18%".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_a_session_status_leaves_the_slot_unset() {
+        let mut app = app_with_two_tabs();
+        set_status(&mut app, "7d 62%");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_status_clear".into(),
+            method: Method::SessionStatusClear(EmptyParams::default()),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::SessionStatus { status } = success.result else {
+            panic!("expected session status response");
+        };
+
+        assert_eq!(status, None);
+        assert_eq!(snapshot_status(&mut app), None);
+    }
+
+    /// Control characters would let a published status escape its one row and
+    /// reprogram whatever terminal ends up drawing it.
+    #[test]
+    fn a_session_status_is_stripped_of_control_characters() {
+        let mut app = app_with_two_tabs();
+
+        assert_eq!(
+            set_status(&mut app, "  7d\n62%\u{1b}]0;pwned\u{7}  "),
+            Some("7d62%]0;pwned".to_string())
+        );
+    }
+
+    /// A status that sanitizes down to nothing is the same fact as no status,
+    /// so it clears the slot rather than parking an empty string in it.
+    #[test]
+    fn a_blank_session_status_clears_the_slot() {
+        let mut app = app_with_two_tabs();
+        set_status(&mut app, "7d 62%");
+
+        assert_eq!(set_status(&mut app, "   \u{7} "), None);
+        assert_eq!(snapshot_status(&mut app), None);
+    }
+
+    #[test]
+    fn a_runaway_session_status_is_capped() {
+        let mut app = app_with_two_tabs();
+
+        let stored = set_status(&mut app, &"x".repeat(super::MAX_SESSION_STATUS_CHARS * 3));
+
+        assert_eq!(
+            stored.map(|status| status.chars().count()),
+            Some(super::MAX_SESSION_STATUS_CHARS)
         );
     }
 }

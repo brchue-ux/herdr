@@ -204,13 +204,27 @@ fn server_command() -> Command {
 
 fn api_command() -> Command {
     Command::new("api")
-        .about("Inspect socket API metadata and live runtime state")
+        .about("Inspect socket API metadata and session-wide runtime state")
         .subcommand(Command::new("snapshot").about("Print the live session snapshot"))
         .subcommand(
             Command::new("schema")
                 .about("Print or write the bundled API schema")
                 .arg(json_flag())
                 .arg(path_option("output", "PATH")),
+        )
+        .subcommand(
+            Command::new("status")
+                .about("Get, set, or clear this session's status string")
+                .subcommand(Command::new("get").about("Show the session status in force"))
+                .subcommand(
+                    Command::new("set")
+                        .about("Set the session status")
+                        .arg(required("status", "TEXT")),
+                )
+                .subcommand(Command::new("clear").about("Clear the session status"))
+                .after_help(
+                    "The status is one line of caller-supplied text about this session, shown on the sidebar's header row above the first Space. Herdr never composes or interprets it.\n\nIt lives here rather than under `herdr session` for the same reason `herdr api snapshot` does: `session` is the session manager, and every subcommand there names a session, while this acts on the session the global `--session` flag already selected.",
+                ),
         )
 }
 
