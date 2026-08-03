@@ -583,7 +583,9 @@ mod tests {
 
         // A new runtime behind the same terminal restarts the counter at zero.
         let restart = now + SAMPLE_INTERVAL * 5;
-        assert!(map.observe(restart, [(&id, 0)]) || true);
+        // Whether this reports a change is not the point: the level may
+        // legitimately have decayed a whole percent on this same step.
+        let _ = map.observe(restart, [(&id, 0)]);
         let activity = map.get(&id).expect("sampled");
         assert!(
             activity.bytes_per_sec() >= 0.0 && activity.level >= 0.0,
