@@ -44,6 +44,15 @@ pub(crate) const RELATION_VALUES: [&str; 4] =
 /// runaway `owner` chain can never indent a name off the panel.
 pub(crate) const MAX_DISPLAY_DEPTH: u8 = 2;
 
+/// The column a node at `depth` is actually drawn in.
+///
+/// The one place the cap is applied, so the connector maths here and the glyph
+/// drawing in [`crate::ui::sidebar`] cannot disagree about which rows share a
+/// column.
+pub(crate) fn display_depth(depth: u8) -> u8 {
+    depth.min(MAX_DISPLAY_DEPTH)
+}
+
 /// Where a pane sits in the ownership tree.
 ///
 /// This is derived, never stored: it is recomputed from `agent_name` and the
@@ -101,7 +110,14 @@ pub(crate) struct Placement {
     /// For each ancestor level, whether that level still has a sibling below,
     /// which is what decides between a `│` continuation and blank space.
     pub ancestors_continue: Vec<bool>,
-    /// Whether this is the last child at its own depth, picking `└` over `├`.
+    /// Whether this is the last row drawn in its own column before that column
+    /// closes, picking `└` over `├`.
+    ///
+    /// Decided on [`display_depth`], not [`Self::depth`]: past
+    /// [`MAX_DISPLAY_DEPTH`] a whole subtree flattens into the cap column, and a
+    /// glyph that ignored that would put two `└` in one column — the deepest row
+    /// of a clamped subtree closing the column, then a later true sibling of its
+    /// parent closing it again.
     pub is_last_child: bool,
 }
 
@@ -143,7 +159,14 @@ pub(crate) fn walk_tree(children: &[Vec<usize>], roots: &[usize]) -> Vec<Placeme
         );
     }
 
-    let depths: Vec<u8> = order.iter().map(|(_, depth, _)| *depth).collect();
+    // The scan runs on drawn columns rather than logical depths, because that
+    // is what the glyph describes. Below the cap the two are the same walk; at
+    // the cap a clamped child sits in its parent's own column, so it has to
+    // count as a later row in that column instead of closing it early.
+    let columns: Vec<u8> = order
+        .iter()
+        .map(|(_, depth, _)| display_depth(*depth))
+        .collect();
     order
         .into_iter()
         .enumerate()
@@ -151,12 +174,15 @@ pub(crate) fn walk_tree(children: &[Vec<usize>], roots: &[usize]) -> Vec<Placeme
             index,
             depth,
             ancestors_continue: ancestors,
-            // "No later sibling at my own depth before my parent ends", which
-            // the flattened order makes a single forward scan.
-            is_last_child: depths[position + 1..]
-                .iter()
-                .take_while(|next| **next >= depth)
-                .all(|next| *next > depth),
+            // "Nothing later lands in my column before it closes", which the
+            // flattened order makes a single forward scan.
+            is_last_child: {
+                let column = columns[position];
+                columns[position + 1..]
+                    .iter()
+                    .take_while(|next| **next >= column)
+                    .all(|next| *next > column)
+            },
         })
         .collect()
 }
@@ -564,6 +590,86 @@ mod tests {
             );
         }
         assert!(RELATION_VALUES.contains(&SUB_AGENT_RELATION));
+    }
+
+    #[test]
+    fn a_clamped_row_does_not_close_the_column_its_parent_still_shares() {
+        // `sub` is a rank past the cap, so it draws in `worker`'s own column.
+        let mut entries = vec![
+            entry("first", None),
+            entry("second", Some("first")),
+            entry("worker", Some("second")),
+            entry("sub", Some("worker")),
+            entry("worker2", Some("second")),
+        ];
+
+        arrange_agent_tree(&mut entries);
+
+        assert_eq!(
+            shape(&entries),
+            vec![
+                ("first".to_string(), 0, true),
+                ("second".to_string(), 1, true),
+                // `worker` keeps `├` because rows still follow it in its column.
+                ("worker".to_string(), 2, false),
+                // `sub` is the last child of `worker`, but `worker2` still lands
+                // in the same column below it, so it must not draw `└`.
+                ("sub".to_string(), 3, false),
+                ("worker2".to_string(), 2, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_capped_column_closes_exactly_once() {
+        let mut entries = vec![
+            entry("first", None),
+            entry("second", Some("first")),
+            entry("worker", Some("second")),
+            entry("sub_a", Some("worker")),
+            entry("sub_b", Some("worker")),
+            entry("deeper", Some("sub_b")),
+            entry("worker2", Some("second")),
+            entry("sub_c", Some("worker2")),
+        ];
+
+        arrange_agent_tree(&mut entries);
+
+        let closers: Vec<&str> = entries
+            .iter()
+            .filter(|entry| display_depth(entry.depth) == MAX_DISPLAY_DEPTH && entry.is_last_child)
+            .filter_map(|entry| entry.agent_name.as_deref())
+            .collect();
+        // One `└` for the whole flattened run, on its genuinely final row.
+        assert_eq!(closers, vec!["sub_c"]);
+    }
+
+    #[test]
+    fn clamping_leaves_every_shallow_row_untouched() {
+        // The same fleet with and without a past-the-cap descendant: adding one
+        // must not move a `└` anywhere above the cap.
+        let fleet = || {
+            vec![
+                entry("first", None),
+                entry("a", Some("first")),
+                entry("a_child", Some("a")),
+                entry("b", Some("first")),
+            ]
+        };
+        let mut shallow = fleet();
+        let mut deep = fleet();
+        deep.push(entry("past_cap", Some("a_child")));
+
+        arrange_agent_tree(&mut shallow);
+        arrange_agent_tree(&mut deep);
+
+        let above_cap = |entries: &[AgentPanelEntry]| -> Vec<(String, u8, bool)> {
+            shape(entries)
+                .into_iter()
+                .filter(|(_, depth, _)| *depth < MAX_DISPLAY_DEPTH)
+                .collect()
+        };
+        assert_eq!(above_cap(&shallow), above_cap(&deep));
     }
 
     #[test]
