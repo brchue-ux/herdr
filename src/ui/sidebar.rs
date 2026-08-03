@@ -50,7 +50,9 @@ pub(crate) struct AgentPanelEntry {
     pub depth: u8,
     /// Where this pane sits in the ownership tree.
     pub relation: crate::app::agent_tree::AgentRelation,
-    /// Whether this is the last child at its own depth, picking `└` over `├`.
+    /// Whether this is the last row drawn in its own column, picking `└` over
+    /// `├`. See [`crate::app::agent_tree::Placement::is_last_child`] for how a
+    /// row past [`crate::app::agent_tree::MAX_DISPLAY_DEPTH`] counts here.
     pub is_last_child: bool,
     /// For each ancestor level, whether that level still has a sibling below,
     /// which is what decides between a `│` continuation and blank space.
@@ -1450,7 +1452,7 @@ fn ancestor_rail(
     ancestors_continue: &[bool],
     p: &Palette,
 ) -> (Vec<Span<'static>>, usize) {
-    let levels = levels.min(crate::app::agent_tree::MAX_DISPLAY_DEPTH);
+    let levels = crate::app::agent_tree::display_depth(levels);
     let mut spans = Vec::new();
     for level in 1..=levels {
         if ancestors_continue
@@ -1549,7 +1551,7 @@ fn agent_row_prefix(
     row_index: usize,
     p: &Palette,
 ) -> (Vec<Span<'static>>, usize) {
-    let depth = depth.min(crate::app::agent_tree::MAX_DISPLAY_DEPTH);
+    let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
         // Byte-identical to the pre-tree panel, so a fleet with no declared
         // ownership draws exactly as it did before.
@@ -2262,6 +2264,119 @@ mod tests {
         assert!(
             rows[worker_row].contains("└─ worker"),
             "the worker name was indented off the panel:\n{screen}"
+        );
+    }
+
+    /// A fleet with a rank past the display cap: `worker` owns `sub`, and
+    /// `worker2` is a genuine sibling of `worker` below it. `sub` has nowhere
+    /// deeper to draw, so it shares `worker`'s column.
+    fn capped_fleet_sidebar_rows(width: u16) -> Vec<String> {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let sub_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let worker2_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let worker_pane = *second_mate.tabs[0]
+            .panes
+            .keys()
+            .find(|pane| **pane != sub_pane && **pane != worker2_pane)
+            .expect("the original pane is still present");
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        for (pane, name, owner) in [
+            (worker_pane, "worker", "2ndmate-explore"),
+            (sub_pane, "sub", "worker"),
+            (worker2_pane, "worker2", "2ndmate-explore"),
+        ] {
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("every test pane has a terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+
+        let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    /// A row clamped at the display cap used to draw `└`, closing a column that
+    /// its parent's own later siblings still had rows in - so the flattened run
+    /// showed two `└` and the clamped row read as the end of the branch.
+    #[test]
+    fn a_row_clamped_at_the_display_cap_does_not_close_its_parents_column() {
+        let rows = capped_fleet_sidebar_rows(26);
+        let screen = rows.join("\n");
+
+        let row_of = |name: &str| {
+            rows.iter()
+                .position(|row| row.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
+        };
+        let connector_indent = |row: usize| {
+            rows[row]
+                .find(['└', '├'])
+                .unwrap_or_else(|| panic!("no connector on row {row}:\n{screen}"))
+        };
+
+        // `worker` is drawn above `worker2`, so the first match is the right one.
+        let worker = row_of("worker");
+        let sub = row_of("sub");
+        let worker2 = row_of("worker2");
+        assert!(
+            worker < sub && sub < worker2,
+            "the fleet is not in ownership order:\n{screen}"
+        );
+
+        // The cap is not extended: every rank-2 row shares one column.
+        assert_eq!(
+            connector_indent(sub),
+            connector_indent(worker),
+            "the clamped row was indented past the cap:\n{screen}"
+        );
+        assert_eq!(
+            connector_indent(worker2),
+            connector_indent(worker),
+            "a true sibling left the shared column:\n{screen}"
+        );
+
+        // Exactly one row closes that column, and it is the genuinely last one.
+        assert!(
+            rows[sub].contains("├─ sub"),
+            "the clamped row closed a column that continues below it:\n{screen}"
+        );
+        assert!(
+            rows[worker].contains("├─ worker"),
+            "the parent of a clamped row closed its own column:\n{screen}"
+        );
+        assert!(
+            rows[worker2].contains("└─ worker2"),
+            "the last row in the column did not close it:\n{screen}"
         );
     }
 
