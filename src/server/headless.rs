@@ -1168,7 +1168,6 @@ impl HeadlessServer {
             self.app.state.active,
             self.app.state.selected,
             self.app.state.sidebar_width,
-            self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
             self.app.state.agent_views.durable().cloned(),
         );
@@ -4855,6 +4854,21 @@ mod tests {
             .get_mut(&terminal_id)
             .unwrap()
             .detected_agent = Some(crate::detect::Agent::Claude);
+        // The sidebar tree draws the panes that named an owner, so give this
+        // one its Space as owner to put it on screen. An agent pane that owns
+        // nobody and is owned by nobody has no row of its own.
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([("owner".to_string(), Some("one".to_string()))]),
+                None,
+                std::time::Instant::now(),
+            );
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
         runtime.test_process_pty_bytes(b"\x1b]0;\xe2\xa0\x8b task\x07");
         server

@@ -136,14 +136,6 @@ impl AgentViewSlots {
     pub(crate) fn durable(&self) -> Option<&AgentViewSetParams> {
         self.get(AgentViewTier::Api)
     }
-
-    /// Clear the winning tier so the next tier down takes over. Returns the
-    /// tier that was cleared.
-    pub(crate) fn clear_active_tier(&mut self) -> Option<AgentViewTier> {
-        let tier = self.active_tier()?;
-        *self.slot_mut(tier) = None;
-        Some(tier)
-    }
 }
 
 pub(crate) fn validate_agent_view(spec: &mut AgentViewSetParams) -> Result<(), String> {
@@ -420,18 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn every_category_tab_installs_a_view_that_validates() {
-        // The click path builds these; if one failed validation the tab would
-        // silently do nothing.
-        for category in crate::ui::AGENT_CATEGORIES {
-            let mut spec = category.view();
-            validate_agent_view(&mut spec).unwrap_or_else(|err| {
-                panic!("category {:?} produced an invalid view: {err}", category)
-            });
-        }
-    }
-
-    #[test]
     fn an_unknown_relation_is_rejected() {
         let mut spec = relation_view("example.views", "captain");
         let err = validate_agent_view(&mut spec).unwrap_err();
@@ -530,28 +510,6 @@ mod tests {
             slots.active().map(|view| view.source.as_str()),
             Some("plugin:agents")
         );
-    }
-
-    #[test]
-    fn clearing_a_tier_falls_back_to_the_next_one_down() {
-        let mut slots = AgentViewSlots::default();
-        slots.set(
-            AgentViewTier::Config,
-            Some(status_view(CONFIG_VIEW_SOURCE, "working")),
-        );
-        slots.set(AgentViewTier::Ui, Some(status_view(UI_VIEW_SOURCE, "idle")));
-        slots.set(
-            AgentViewTier::Api,
-            Some(status_view("plugin:agents", "blocked")),
-        );
-
-        assert_eq!(slots.clear_active_tier(), Some(AgentViewTier::Api));
-        assert_eq!(slots.active_tier(), Some(AgentViewTier::Ui));
-        assert_eq!(slots.clear_active_tier(), Some(AgentViewTier::Ui));
-        assert_eq!(slots.active_tier(), Some(AgentViewTier::Config));
-        assert_eq!(slots.clear_active_tier(), Some(AgentViewTier::Config));
-        assert!(!slots.is_active());
-        assert_eq!(slots.clear_active_tier(), None);
     }
 
     #[test]

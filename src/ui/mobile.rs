@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::sidebar::{
     agent_panel_entries, agent_panel_entries_and_hidden_from, grouped_child_display_label,
-    mobile_agents_title, next_entry_is_indented_workspace, workspace_list_entries_expanded,
+    mobile_agents_title, next_entry_is_indented_workspace, workspace_list_spaces_expanded,
     AgentPanelEntry, WorkspaceListEntry,
 };
 use super::status::{state_dot, state_mark};
@@ -111,9 +111,11 @@ pub(crate) fn mobile_switcher_workspace_doc_range(
 ) -> std::ops::Range<usize> {
     // Spaces render in grouped order, so a workspace's row position is its index
     // in the entry list, not its raw array index.
-    let pos = workspace_list_entries_expanded(app)
+    let pos = workspace_list_spaces_expanded(app)
         .iter()
-        .position(|WorkspaceListEntry::Workspace { ws_idx, .. }| *ws_idx == idx)
+        .position(
+            |entry| matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx),
+        )
         .unwrap_or(idx);
     // spaces sit after the agents block, then a title + "new workspace" row.
     let start = mobile_agents_block_height(app) + 2 + pos * 2;
@@ -172,13 +174,16 @@ pub(crate) fn mobile_switcher_target_at(
     cursor += 1;
     // Spaces render in grouped (worktree-tree) order, which differs from raw
     // array order, so map the clicked row to the entry's real workspace index.
-    let space_entries = workspace_list_entries_expanded(app);
+    let space_entries = workspace_list_spaces_expanded(app);
     let spaces_end = cursor + space_entries.len() * 2;
     if doc_row >= cursor && doc_row < spaces_end {
         let entry_idx = (doc_row - cursor) / 2;
-        return space_entries.get(entry_idx).map(
-            |WorkspaceListEntry::Workspace { ws_idx, .. }| MobileSwitcherTarget::Workspace(*ws_idx),
-        );
+        return space_entries.get(entry_idx).and_then(|entry| match entry {
+            WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                Some(MobileSwitcherTarget::Workspace(*ws_idx))
+            }
+            WorkspaceListEntry::Agent { .. } => None,
+        });
     }
     cursor = spaces_end;
 
@@ -454,7 +459,7 @@ fn render_close_button(app: &AppState, frame: &mut Frame, area: Rect) {
 fn mobile_switcher_content_height(app: &AppState) -> usize {
     // Derive spaces height from the same entry list the render/hit-test use so
     // the three never disagree.
-    let spaces_h = 2 + workspace_list_entries_expanded(app).len() * 2;
+    let spaces_h = 2 + workspace_list_spaces_expanded(app).len() * 2;
     let tabs_h = app
         .active
         .and_then(|idx| app.workspaces.get(idx))
@@ -582,10 +587,14 @@ fn render_mobile_switcher_content(
         p,
     );
     doc_y += 1;
-    let space_entries = workspace_list_entries_expanded(app);
-    for (entry_idx, WorkspaceListEntry::Workspace { ws_idx, indented }) in
-        space_entries.iter().enumerate()
-    {
+    let space_entries = workspace_list_spaces_expanded(app);
+    for (entry_idx, entry) in space_entries.iter().enumerate() {
+        let WorkspaceListEntry::Workspace {
+            ws_idx, indented, ..
+        } = entry
+        else {
+            continue;
+        };
         let Some(ws) = app.workspaces.get(*ws_idx) else {
             continue;
         };
