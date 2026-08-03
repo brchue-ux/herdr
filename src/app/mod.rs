@@ -27,6 +27,7 @@ pub mod state;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod worker_summary;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -645,6 +646,7 @@ impl App {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            worker_summaries: None,
             worktree_directory,
             collapsed_space_keys,
             request_complete_onboarding: false,
@@ -1976,6 +1978,9 @@ impl App {
             }
             Mode::KeybindHelp => {
                 input::handle_keybind_help_key(&mut self.state, key);
+            }
+            Mode::WorkerSummaries => {
+                self.handle_worker_summaries_key(key_event);
             }
             Mode::GlobalMenu => {
                 input::handle_global_menu_key(&mut self.state, key_event);

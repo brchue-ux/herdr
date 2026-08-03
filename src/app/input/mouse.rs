@@ -546,6 +546,14 @@ impl AppState {
                         return None;
                     }
 
+                    // Ahead of both row handlers: the badge sits inside a card,
+                    // so leaving it to them would focus the mate's pane instead
+                    // of opening the summaries the user aimed at.
+                    if let Some(owner) = self.worker_summary_badge_at(mouse.column, mouse.row) {
+                        self.open_worker_summaries(owner);
+                        return None;
+                    }
+
                     if let Some(ws_idx) = self.workspace_group_chevron_at(mouse.column, mouse.row) {
                         if let Some((key, collapsed)) =
                             crate::ui::workspace_parent_group_state(self, ws_idx)

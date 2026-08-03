@@ -46,6 +46,7 @@ mod selection;
 mod settings;
 mod sidebar;
 mod terminal;
+mod worker_summary;
 
 pub(crate) use self::{
     modal::{
@@ -115,6 +116,7 @@ impl App {
                 Mode::Navigator => {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
+                Mode::WorkerSummaries => self.handle_worker_summaries_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -292,6 +294,9 @@ impl App {
 
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
+            return;
+        }
+        if self.handle_worker_summaries_mouse(mouse) {
             return;
         }
         if self.handle_overlay_mouse(mouse) {

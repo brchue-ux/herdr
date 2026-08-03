@@ -881,6 +881,8 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// One second mate's finished workers and what they said they did.
+    WorkerSummaries,
 }
 
 impl Mode {
@@ -911,8 +913,22 @@ impl Mode {
                 | Mode::ContextMenu
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
+                | Mode::WorkerSummaries
         )
     }
+}
+
+/// The open summary view: one second mate's workers, never the fleet.
+///
+/// The owner handle is kept rather than a row index because rows move — a
+/// worker finishing re-sorts the tree under `AgentPanelSort::Priority` — and
+/// the view must keep describing the mate the user actually clicked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerSummariesState {
+    /// The second mate's tree handle, as its workers' `owner` tokens spell it.
+    pub owner: String,
+    /// Rows scrolled off the top of the body.
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1525,6 +1541,8 @@ pub struct AppState {
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
+    /// The open worker-summary view, scoped to one second mate.
+    pub(crate) worker_summaries: Option<WorkerSummariesState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
     pub request_complete_onboarding: bool,
@@ -2101,6 +2119,7 @@ impl AppState {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            worker_summaries: None,
             worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
             request_complete_onboarding: false,

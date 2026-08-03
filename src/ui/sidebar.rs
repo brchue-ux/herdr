@@ -11,7 +11,7 @@ use ratatui::{
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
-use super::text::{display_width, middle_elide, truncate_end};
+use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
 use crate::app::relation_signal::RelationSignalPhase;
 use crate::app::state::Palette;
@@ -916,6 +916,90 @@ pub(crate) fn compute_workspace_card_areas(
     compute_workspace_list_areas(app, area).0
 }
 
+/// The glyph marking "these workers reported back".
+const WORKER_SUMMARY_BADGE_GLYPH: &str = "▤";
+
+/// What the badge prints for `count` finished workers.
+///
+/// Two digits is the widest it ever gets, so the badge cannot eat an
+/// unbounded slice of a 26-wide sidebar however large a mate's crew grows.
+pub(crate) fn worker_summary_badge_label(count: usize) -> String {
+    if count > 9 {
+        format!("{WORKER_SUMMARY_BADGE_GLYPH}9+")
+    } else {
+        format!("{WORKER_SUMMARY_BADGE_GLYPH}{count}")
+    }
+}
+
+/// The clickable summary badge on a second mate's row.
+///
+/// It sits one cell left of [`workspace_group_chevron_rect`], which stays
+/// reserved whether or not this Space draws a chevron, so the two controls can
+/// never land on the same cell as a Space gains or loses worktree children.
+/// That also keeps the badge at offset 2 or more from the divider column, well
+/// outside the one-cell grab band in
+/// [`crate::app::AppState::sidebar_divider_grab_at`], so unlike the chevron it
+/// needs no carve-out there.
+///
+/// The rect is one cell wider than the glyphs: a two-character badge is a mean
+/// mouse target, and the pad column is dead space on the row anyway.
+pub(crate) fn worker_summary_badge_rect(
+    card: &crate::app::state::WorkspaceCardArea,
+    count: usize,
+) -> Rect {
+    let label_width = display_width_u16(&worker_summary_badge_label(count));
+    let width = label_width.saturating_add(1);
+    // Needs the badge, the reserved chevron cell, and something left over for
+    // the row's own name; below that the row is better off with just a name.
+    if card.rect.width <= width + 1 || card.rect.height == 0 || label_width == 0 {
+        return Rect::default();
+    }
+    Rect::new(
+        card.rect.x + card.rect.width.saturating_sub(1 + width),
+        card.rect.y,
+        width,
+        1,
+    )
+}
+
+/// The tree handle this card's row answers to, the name a worker's `owner`
+/// token would have to spell to nest under it.
+///
+/// Spaces and agent panes name themselves differently — a Space by its label, a
+/// pane by `agent rename` — so this is the one place that difference is
+/// resolved, and both kinds of row become eligible for a badge by the same
+/// rule.
+fn card_tree_name(
+    app: &AppState,
+    entries: &[WorkspaceListEntry],
+    agents: &[AgentPanelEntry],
+    card: &crate::app::state::WorkspaceCardArea,
+) -> Option<String> {
+    match entries.get(card.entry_idx)? {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
+        WorkspaceListEntry::Agent { entry_idx, .. } => agents.get(*entry_idx)?.agent_name.clone(),
+    }
+}
+
+/// The badge this card should draw, if any: the mate's handle and how many of
+/// its workers have reported back.
+///
+/// A row earns a badge purely by owning workers that published a summary, so
+/// the badge appears exactly where the tree already groups those workers. It is
+/// deliberately not gated on `relation`: the scoping handle is the ownership
+/// edge itself, and gating on a derived depth would make the badge vanish the
+/// moment a fleet nests one level deeper than the display cap.
+pub(crate) fn worker_summary_badge(
+    app: &AppState,
+    entries: &[WorkspaceListEntry],
+    agents: &[AgentPanelEntry],
+    card: &crate::app::state::WorkspaceCardArea,
+) -> Option<(String, usize)> {
+    let name = card_tree_name(app, entries, agents, card)?;
+    let count = crate::app::worker_summary::summary_count_for_owner(agents, &name);
+    (count > 0).then_some((name, count))
+}
+
 pub(crate) fn workspace_group_chevron_rect(card: &crate::app::state::WorkspaceCardArea) -> Rect {
     if card.rect.width == 0 || card.rect.height == 0 {
         return Rect::default();
@@ -1526,12 +1610,22 @@ fn render_agent_row(
     };
     let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
     let state_icon = state_dot(detail.state, detail.seen, p);
+    let summary_badge = worker_summary_badge(app, entries, agents, card);
 
     for (row_index, resolved) in rows.iter().enumerate() {
         let row_y = card.rect.y + row_index as u16;
         if row_index as u16 >= card.rect.height || row_y >= list_bottom {
             break;
         }
+        // Only row 0 carries the badge, so only row 0 gives up the width.
+        let trailing_width = if row_index == 0 {
+            summary_badge
+                .as_ref()
+                .map(|(_, count)| usize::from(worker_summary_badge_rect(card, *count).width))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (mut spans, prefix_width) = agent_row_prefix(
             entry.depth(),
             entry.is_last_child(),
@@ -1548,13 +1642,55 @@ fn render_agent_row(
             agent_style,
             p,
             app.animation_tick,
-            (card.rect.width as usize).saturating_sub(prefix_width),
+            (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
         ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(row_style),
             Rect::new(card.rect.x, row_y, card.rect.width, 1),
         );
     }
+
+    if let Some((owner, count)) = &summary_badge {
+        render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
+    }
+}
+
+/// Draw the summary badge at the right edge of a mate's first row.
+///
+/// Accent while at least one of those workers has finished without being
+/// looked at — the same "done" distinction the row's own state dot already
+/// makes — and muted once they have all been seen. The colour is the whole
+/// signal: it is a static style, never a pulse, so the badge reads the same in
+/// a still capture as it does on screen and does not wait on an animation
+/// primitive Herdr has not settled yet.
+fn render_worker_summary_badge(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    agents: &[AgentPanelEntry],
+    owner: &str,
+    count: usize,
+    list_bottom: u16,
+) {
+    let rect = worker_summary_badge_rect(card, count);
+    if rect.width == 0 || rect.y >= list_bottom {
+        return;
+    }
+    let fresh = crate::app::worker_summary::summaries_for_owner(agents, owner)
+        .iter()
+        .any(|summary| summary.is_unseen_finish());
+    let style = if fresh {
+        Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.palette.overlay0)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(worker_summary_badge_label(count), style))
+            .alignment(Alignment::Right),
+        rect,
+    );
 }
 
 fn agent_row_prefix(
@@ -1851,6 +1987,7 @@ fn render_workspace_list(
         } else {
             p.overlay0
         });
+        let summary_badge = worker_summary_badge(app, &entries, &agents, card);
         let token_values = ws.metadata_tokens.values();
         let terminal_title = space_terminal_title(app, ws);
         let rows = tokens::space_rows(
@@ -1935,8 +2072,17 @@ fn render_workspace_list(
                     spans.push(Span::raw("   "));
                     3
                 };
-            let trailing_width = if row_index == 0 && parent_group.is_some() {
-                2usize
+            // Row 0 keeps the chevron cell clear, and the badge's own width on
+            // top of it, so a mate's name is truncated instead of being drawn
+            // under either control.
+            let trailing_width = if row_index == 0 {
+                usize::from(parent_group.is_some()) * 2
+                    + summary_badge
+                        .as_ref()
+                        .map(|(_, count)| {
+                            usize::from(worker_summary_badge_rect(card, *count).width)
+                        })
+                        .unwrap_or(0)
             } else {
                 0
             };
@@ -1958,6 +2104,10 @@ fn render_workspace_list(
                 Paragraph::new(Line::from(spans)),
                 Rect::new(card.rect.x, row_y + row_index as u16, card.rect.width, 1),
             );
+        }
+
+        if let Some((owner, count)) = &summary_badge {
+            render_worker_summary_badge(app, frame, card, &agents, owner, *count, list_bottom);
         }
 
         if let Some((_, collapsed)) = parent_group {
@@ -2113,6 +2263,175 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    /// The same miniature fleet, but the worker has finished and published a
+    /// summary the way a real one does — `pane report-metadata --token
+    /// summary=...`, which lands in the pane's metadata tokens.
+    ///
+    /// Returns the built state so a test can hit-test the badge as well as
+    /// read the rows back.
+    fn summary_fleet(
+        width: u16,
+        summary: Option<&str>,
+    ) -> (crate::app::state::AppState, Vec<String>) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        let mut tokens = std::collections::HashMap::from([(
+            "owner".to_string(),
+            Some("2ndmate-explore".to_string()),
+        )]);
+        if let Some(summary) = summary {
+            tokens.insert("summary".to_string(), Some(summary.to_string()));
+        }
+        terminal.metadata_tokens.patch(tokens, None, now);
+
+        let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..20).map(|row| row_text(buffer, row, width)).collect();
+        (app, rows)
+    }
+
+    /// The row that owns the finished worker grows a badge, and it is the
+    /// mate's row rather than the worker's own.
+    #[test]
+    fn a_second_mate_with_a_finished_worker_draws_a_summary_badge() {
+        let (_, rows) = summary_fleet(26, Some("rebased and green"));
+        let screen = rows.join("\n");
+        let mate_row = rows
+            .iter()
+            .find(|row| row.contains("2ndmate-explore"))
+            .unwrap_or_else(|| panic!("no mate row in:\n{screen}"));
+        assert!(
+            mate_row.contains(WORKER_SUMMARY_BADGE_GLYPH),
+            "the mate's row carries no summary badge:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches(WORKER_SUMMARY_BADGE_GLYPH).count(),
+            1,
+            "the badge is drawn on more than the owning mate's row:\n{screen}"
+        );
+    }
+
+    /// No summary published, no badge. The affordance only exists once there
+    /// is something behind it to read.
+    #[test]
+    fn a_mate_whose_workers_published_nothing_draws_no_badge() {
+        let (_, rows) = summary_fleet(26, None);
+        let screen = rows.join("\n");
+        assert!(
+            !screen.contains(WORKER_SUMMARY_BADGE_GLYPH),
+            "a badge was drawn with no summary to open:\n{screen}"
+        );
+    }
+
+    /// The badge must not move the tree. Everything left of the badge cells -
+    /// every connector, every indent, every name - has to render exactly as it
+    /// did before a summary existed, so #27/#28's tree behaviour is untouched.
+    #[test]
+    fn publishing_a_summary_does_not_disturb_the_tree_it_hangs_off() {
+        let (app, with) = summary_fleet(26, Some("rebased and green"));
+        let (_, without) = summary_fleet(26, None);
+
+        let mate_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| {
+                matches!(
+                    workspace_list_entries(&app).get(card.entry_idx),
+                    Some(WorkspaceListEntry::Workspace { ws_idx, .. }) if *ws_idx == 1
+                )
+            })
+            .expect("the mate has a card");
+        let badge = worker_summary_badge_rect(mate_card, 1);
+        assert!(badge.width > 0, "the badge has no rect to reserve");
+
+        for (row_idx, (a, b)) in with.iter().zip(without.iter()).enumerate() {
+            let a: String = a.chars().take(usize::from(badge.x)).collect();
+            let b: String = b.chars().take(usize::from(badge.x)).collect();
+            assert_eq!(
+                a,
+                b,
+                "row {row_idx} changed left of the badge:\n{}\n{}",
+                with.join("\n"),
+                without.join("\n")
+            );
+        }
+    }
+
+    /// The badge never lands on the chevron cell or inside the divider's
+    /// one-cell grab band, whether or not a scrollbar is pushing the cards
+    /// left.
+    #[test]
+    fn the_badge_clears_the_chevron_cell_and_the_divider_grab_band() {
+        let (app, _) = summary_fleet(26, Some("rebased and green"));
+        for card in &app.view.workspace_card_areas {
+            let badge = worker_summary_badge_rect(card, 1);
+            if badge.width == 0 {
+                continue;
+            }
+            let chevron = workspace_group_chevron_rect(card);
+            assert!(
+                badge.x + badge.width <= chevron.x,
+                "badge {badge:?} overlaps chevron {chevron:?}"
+            );
+            let divider_col = app.view.sidebar_rect.x + app.view.sidebar_rect.width - 1;
+            assert!(
+                badge.x + badge.width - 1 < divider_col - 1,
+                "badge {badge:?} reaches into the divider grab band at {divider_col}"
+            );
+        }
+    }
+
+    /// A crowded mate still gets a bounded badge rather than one that grows
+    /// with the crew.
+    #[test]
+    fn the_badge_label_is_capped_at_two_characters_of_count() {
+        assert_eq!(worker_summary_badge_label(3), "▤3");
+        assert_eq!(worker_summary_badge_label(9), "▤9");
+        assert_eq!(worker_summary_badge_label(10), "▤9+");
+        assert_eq!(worker_summary_badge_label(400), "▤9+");
+    }
+
+    /// A sidebar too narrow to hold a name beside the badge draws no badge,
+    /// rather than a badge with nothing left of it.
+    #[test]
+    fn a_too_narrow_row_drops_the_badge_instead_of_the_name() {
+        let card = crate::app::state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 4, 1),
+            indented: false,
+            entry_idx: 0,
+            agent: None,
+        };
+        assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
 
     /// The header row is empty. Neither the `spaces` title nor the second-mate

@@ -22,6 +22,7 @@ mod tab_surface;
 mod tabs;
 mod text;
 mod widgets;
+mod worker_summary;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_new_linked_worktree_overlay,
@@ -64,6 +65,7 @@ pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };
 use self::tabs::render_tab_bar;
+use self::worker_summary::render_worker_summaries_overlay;
 pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
@@ -79,10 +81,16 @@ pub(crate) use self::{
     sidebar::{
         agent_panel_entries, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_toggle_rect,
-        normalized_workspace_scroll, workspace_drop_slots, workspace_group_chevron_rect,
+        normalized_workspace_scroll, sidebar_agent_entries, worker_summary_badge,
+        worker_summary_badge_rect, workspace_drop_slots, workspace_group_chevron_rect,
         workspace_list_entries, workspace_list_entries_expanded, workspace_list_rect,
         workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
         AgentPanelEntry, WorkspaceListEntry,
+    },
+    worker_summary::{
+        worker_summaries_action_row, worker_summaries_close_button_rect,
+        worker_summaries_inner_rect, worker_summaries_popup_rect, worker_summaries_total_rows,
+        worker_summaries_visible_rows,
     },
 };
 
@@ -440,6 +448,7 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::WorkerSummaries => render_worker_summaries_overlay(app, frame, frame.area()),
         Mode::Terminal => {}
     }
 }
