@@ -419,7 +419,7 @@ impl AppState {
             return None;
         }
 
-        let roots = crate::ui::workspace_list_spaces_expanded(self)
+        let roots = crate::ui::workspace_list_entries_expanded(self)
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace {
