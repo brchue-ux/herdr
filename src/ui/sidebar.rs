@@ -766,8 +766,38 @@ fn space_trailing_width(app: &AppState, ws_idx: usize, indented: bool) -> usize 
     2 * usize::from(!indented && workspace_parent_group_state(app, ws_idx).is_some())
 }
 
+/// Columns row 0 of this entry gives up to a worker-summary badge.
+///
+/// Zero for every row that owns no worker with a published summary, which is
+/// every row in a fleet that never calls `pane report-metadata --token summary`.
+fn entry_badge_width(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+    fold_width: u16,
+) -> usize {
+    let Some(name) = entry_tree_name(app, agents, entry) else {
+        return 0;
+    };
+    let count = crate::app::worker_summary::summary_count_for_owner(agents, &name);
+    if count == 0 {
+        return 0;
+    }
+    usize::from(worker_summary_badge_width(count, fold_width))
+}
+
 /// Columns one tree row has for its tokens, from the entry alone.
-fn list_entry_content_width(app: &AppState, entry: &WorkspaceListEntry, fold_width: u16) -> usize {
+///
+/// Every control drawn *over* the row rather than laid out in it - the worktree
+/// chevron, the worker-summary badge - is subtracted here, because the fold is
+/// only allowed to buy a row back, never to spend a character.
+fn list_entry_content_width(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+    fold_width: u16,
+) -> usize {
+    let badge = entry_badge_width(app, agents, entry, fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
             ws_idx, indented, ..
@@ -775,9 +805,11 @@ fn list_entry_content_width(app: &AppState, entry: &WorkspaceListEntry, fold_wid
             fold_width,
             entry.depth(),
             *indented,
-            space_trailing_width(app, *ws_idx, *indented),
+            space_trailing_width(app, *ws_idx, *indented) + badge,
         ),
-        WorkspaceListEntry::Agent { .. } => row_content_width(fold_width, entry.depth(), false, 0),
+        WorkspaceListEntry::Agent { .. } => {
+            row_content_width(fold_width, entry.depth(), false, badge)
+        }
     }
 }
 
@@ -794,7 +826,7 @@ fn list_entry_height(
     body_height: u16,
     fold_width: u16,
 ) -> u16 {
-    let content_width = list_entry_content_width(app, entry, fold_width);
+    let content_width = list_entry_content_width(app, agents, entry, fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
             ws_idx, indented, ..
@@ -1035,11 +1067,11 @@ pub(crate) fn worker_summary_badge_rect(
     card: &crate::app::state::WorkspaceCardArea,
     count: usize,
 ) -> Rect {
-    let label_width = display_width_u16(&worker_summary_badge_label(count));
-    let width = label_width.saturating_add(1);
-    // Needs the badge, the reserved chevron cell, and something left over for
-    // the row's own name; below that the row is better off with just a name.
-    if card.rect.width <= width + 1 || card.rect.height == 0 || label_width == 0 {
+    if card.rect.height == 0 {
+        return Rect::default();
+    }
+    let width = worker_summary_badge_width(count, card.rect.width);
+    if width == 0 {
         return Rect::default();
     }
     Rect::new(
@@ -1048,6 +1080,24 @@ pub(crate) fn worker_summary_badge_rect(
         width,
         1,
     )
+}
+
+/// Columns a badge for `count` workers takes on a row `width` wide, or 0 when
+/// the row is too narrow to carry one.
+///
+/// The badge is drawn *over* row 0 rather than laid out in it, so the fold has
+/// to reserve it exactly as the renderer does - a merged line the layout sized
+/// without it would be elided by a control the layout never saw. Both read this
+/// one function so they cannot drift.
+fn worker_summary_badge_width(count: usize, width: u16) -> u16 {
+    let label_width = display_width_u16(&worker_summary_badge_label(count));
+    let badge = label_width.saturating_add(1);
+    // Needs the badge, the reserved chevron cell, and something left over for
+    // the row's own name; below that the row is better off with just a name.
+    if width <= badge + 1 || label_width == 0 {
+        return 0;
+    }
+    badge
 }
 
 /// The tree handle this card's row answers to, the name a worker's `owner`
@@ -1063,7 +1113,19 @@ fn card_tree_name(
     agents: &[AgentPanelEntry],
     card: &crate::app::state::WorkspaceCardArea,
 ) -> Option<String> {
-    match entries.get(card.entry_idx)? {
+    entry_tree_name(app, agents, entries.get(card.entry_idx)?)
+}
+
+/// The same handle, resolved from the entry alone.
+///
+/// The layout has entries but no cards yet, and it has to know whether a row
+/// earns a badge before it can decide how wide that row's content is.
+fn entry_tree_name(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<String> {
+    match entry {
         WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents.get(*entry_idx)?.agent_name.clone(),
     }
@@ -1761,7 +1823,7 @@ fn render_agent_row(
     let p = &app.palette;
     let rows = fold_token_lines(
         resolved_agent_rows(app, detail),
-        list_entry_content_width(app, entry, fold_width),
+        list_entry_content_width(app, agents, entry, fold_width),
         Some(card.rect.height),
     );
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
@@ -2180,14 +2242,14 @@ fn render_workspace_list(
                 suppress_git_details: card.indented,
             },
         );
-        // `parent_group` is only ever set for a card that is not itself a
-        // worktree child, so this matches what the layout reserved.
-        let chevron_width = 2 * usize::from(parent_group.is_some());
-        let rows = fold_token_lines(
-            rows,
-            row_content_width(fold_width, own_depth, card.indented, chevron_width),
-            Some(row_height),
-        );
+        // The same call the layout made when it decided this row's height, so
+        // the reserved height and the drawn lines cannot disagree about the
+        // chevron or the badge.
+        let content_width = entries
+            .get(card.entry_idx)
+            .map(|entry| list_entry_content_width(app, &agents, entry, fold_width))
+            .unwrap_or_else(|| row_content_width(fold_width, own_depth, card.indented, 0));
+        let rows = fold_token_lines(rows, content_width, Some(row_height));
 
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
@@ -2624,6 +2686,16 @@ mod tests {
     /// (two token rows per Space and per agent), so the dump shows what a user
     /// who never edited `[ui.sidebar]` actually sees.
     fn default_layout_fleet_rows(width: u16, height: u16) -> Vec<String> {
+        default_layout_fleet(width, height, None).1
+    }
+
+    /// The same fleet, optionally with one worker having published a summary so
+    /// its owning mate earns a badge over row 0.
+    fn default_layout_fleet(
+        width: u16,
+        height: u16,
+        summary: Option<&str>,
+    ) -> (crate::app::state::AppState, Vec<String>) {
         let mut app = crate::app::state::AppState::test_new();
         let mut explore = Workspace::test_new("2ndmate-explore");
         let worker_a = explore.test_split(ratatui::layout::Direction::Vertical);
@@ -2681,14 +2753,14 @@ mod tests {
                 .expect("every test pane has a terminal");
             terminal.set_agent_name(name.to_string());
             terminal.state = state;
-            terminal.metadata_tokens.patch(
-                std::collections::HashMap::from([(
-                    "owner".to_string(),
-                    Some("2ndmate-explore".to_string()),
-                )]),
-                None,
-                now,
-            );
+            let mut tokens = std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]);
+            if let (Some(summary), true) = (summary, pane == worker_b) {
+                tokens.insert("summary".to_string(), Some(summary.to_string()));
+            }
+            terminal.metadata_tokens.patch(tokens, None, now);
         }
 
         let area = Rect::new(0, 0, width, height);
@@ -2699,9 +2771,10 @@ mod tests {
             .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        (0..height)
+        let rows = (0..height)
             .map(|row| row_text(buffer, row, width))
-            .collect()
+            .collect();
+        (app, rows)
     }
 
     /// The rows of the tree, in order, with the sidebar divider and the blank
@@ -2835,6 +2908,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A row that earns a summary badge has to fold against the width the badge
+    /// leaves it, not the width it would have had alone.
+    ///
+    /// The badge is painted over row 0 after the tokens are drawn, so a fold
+    /// that reserved only the chevron would merge two lines that then get
+    /// elided to fit under it - the one character the fold promises never to
+    /// spend. #34 added the badge and this pins it against the fold.
+    #[test]
+    fn a_folded_row_never_runs_under_its_summary_badge() {
+        // Swept densely on purpose. The window where an unreserved badge does
+        // damage is only as wide as the badge itself - the merged line has to
+        // fit the row but not the row minus the badge - so a handful of sampled
+        // widths steps straight over it.
+        let mut ever_folded = false;
+        for width in 40u16..=90 {
+            let (_, rows) = default_layout_fleet(width, 24, Some("rebased and green"));
+            let screen = rows.join("\n");
+            let badged = tree_rows(&rows)
+                .into_iter()
+                .find(|row| row.contains(WORKER_SUMMARY_BADGE_GLYPH))
+                .unwrap_or_else(|| panic!("no badge drawn at {width}:\n{screen}"));
+
+            // The badge keeps a pad cell of its own, folded or not. Text in it
+            // means the row was laid out against a width the badge had already
+            // taken.
+            let badge_at = badged
+                .find(WORKER_SUMMARY_BADGE_GLYPH)
+                .expect("the row was found by this glyph");
+            assert!(
+                badged[..badge_at].ends_with(' '),
+                "row text ran into the badge's pad at {width} columns:\n{screen}"
+            );
+
+            // The branch reaching row 0 is the tell that this row folded.
+            if !badged.contains(FIXTURE_BRANCH) {
+                continue;
+            }
+            ever_folded = true;
+            // Folding may only ever buy a row back. A budget that had to
+            // compact the decorated separator down to a bare space, or elide,
+            // means the fold spent characters to fit under the badge.
+            assert!(
+                badged.contains(" · "),
+                "the badged row folded and then had to compact its separator to \
+                 fit under the badge at {width} columns:\n{screen}"
+            );
+            assert!(
+                !badged.contains('…'),
+                "the badged row folded and was then elided under its badge at \
+                 {width} columns:\n{screen}"
+            );
+        }
+        assert!(
+            ever_folded,
+            "no width folded the badged row, so nothing was actually exercised"
+        );
     }
 
     /// Resizing has to be monotonic to feel like resizing: no width may cost
