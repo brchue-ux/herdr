@@ -1045,7 +1045,11 @@ mod tests {
 
         assert!(line1.starts_with(" · one"));
         assert!(!line1.contains("1 one"));
-        assert_eq!(line2, "   main");
+        // At the default 36-column maximum the name and the branch fit on one
+        // line, so the row folds onto it and gives the second line back.
+        assert!(line1.contains("main"), "line1: {line1:?}");
+        assert_eq!(card.height, 1);
+        assert_eq!(line2.trim(), "");
 
         std::fs::remove_dir_all(repo).ok();
     }
