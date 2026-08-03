@@ -1084,6 +1084,10 @@ mod tests {
         app.state.sidebar_spaces.row_gap = 1;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
+        // The empty header row and the first card's own row both mean "above
+        // everything"; the gap row below that card is the first row that names
+        // the second Space. Removing the `spaces` title moved every row up by
+        // one without changing which slot owns it.
         assert_eq!(
             app.state.workspace_drop_target_at_row(0),
             Some(crate::app::state::WorkspaceDropTarget::Before(0))
@@ -1094,7 +1098,7 @@ mod tests {
         );
         assert_eq!(
             app.state.workspace_drop_target_at_row(2),
-            Some(crate::app::state::WorkspaceDropTarget::Before(0))
+            Some(crate::app::state::WorkspaceDropTarget::Before(1))
         );
         assert_eq!(
             app.state.workspace_drop_target_at_row(3),

@@ -24,6 +24,16 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// button and the collapse toggle.
 const WORKSPACE_SECTION_FOOTER_ROWS: u16 = 1;
 
+/// One row above the tree, drawn empty.
+///
+/// The `spaces` title and the second-mate drop-down that used to share this
+/// space are gone, but the row itself is not free to reclaim: the tree's
+/// drop-slot grid anchors "drop before this Space" on the row *above* a card,
+/// so a tree flush to the panel's top edge has no row that means "above
+/// everything" and cannot be reordered to first position. It is also the row
+/// the usage readout is proposed to occupy.
+const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
+
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
@@ -733,15 +743,16 @@ pub(crate) fn workspace_list_rect(area: Rect) -> Rect {
     sidebar_content_rect(area)
 }
 
-/// The tree owns every row of the panel except the footer the `new` button and
-/// the collapse toggle sit on. There is no header above it: the tree is the
-/// panel's only content, so a title row would have named the obvious.
+/// The tree owns every row of the panel between the empty header row and the
+/// footer the `new` button and the collapse toggle sit on.
 pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
-    if area.width == 0 || area.height <= WORKSPACE_SECTION_FOOTER_ROWS {
+    if area.width == 0
+        || area.height <= WORKSPACE_SECTION_HEADER_ROWS + WORKSPACE_SECTION_FOOTER_ROWS
+    {
         return Rect::default();
     }
 
-    let body_y = area.y;
+    let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
     let footer_y = area.y + area.height.saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS);
     let body_height = footer_y.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
@@ -2102,12 +2113,13 @@ mod tests {
         (0..20).map(|row| row_text(buffer, row, width)).collect()
     }
 
-    /// The panel has no header. The tree is its only content, so the fleet
-    /// starts on the panel's very first row: no `spaces` title, and no
-    /// second-mate drop-down beside it. Both were removed once every mate
-    /// rendered live in the tree and could be reached by clicking it.
+    /// The header row is empty. Neither the `spaces` title nor the second-mate
+    /// drop-down beside it is drawn any more - both were removed once every
+    /// mate rendered live in the tree and could be reached by clicking it -
+    /// but the row itself stays, because the tree's drop-slot grid needs a row
+    /// above the first card and the usage readout is proposed to live there.
     #[test]
-    fn the_tree_starts_on_the_panels_first_row_with_no_header() {
+    fn the_header_row_is_empty_above_the_tree() {
         let mut app = crate::app::state::AppState::test_new();
         let now = std::time::Instant::now();
         app.workspaces = vec![
@@ -2143,9 +2155,14 @@ mod tests {
             .collect::<Vec<_>>();
         let screen = rows.join("\n");
 
+        // Only the sidebar divider draws on the header row; nothing else does.
         assert!(
-            rows[0].contains("firstmate"),
-            "the tree does not start on the first row:\n{screen}"
+            rows[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
+            "the header row is not empty:\n{screen}"
+        );
+        assert!(
+            rows[1].contains("firstmate"),
+            "the tree does not start below the header row:\n{screen}"
         );
         assert!(
             !screen.contains("spaces"),
@@ -2570,7 +2587,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]; 6];
         // A six-row layout in a five-row body, so the clip is what is under
         // test rather than the row count.
-        let area = Rect::new(0, 0, 20, 8);
+        let area = Rect::new(0, 0, 20, 7);
         let workspace_area = workspace_list_rect(area);
         let body = workspace_list_body_rect(workspace_area, false);
 
@@ -3065,7 +3082,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         // Two body rows: the third child is a real entry that is off screen,
         // which is the whole point - the connector has to read the full list,
         // not the cards that happened to fit.
-        let area = Rect::new(0, 0, 30, 5);
+        let area = Rect::new(0, 0, 30, 4);
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
         assert_eq!(app.view.workspace_card_areas.len(), 2);
         let list_area = workspace_list_rect(area);
@@ -3134,7 +3151,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             spacious[3].rect.y,
             spacious[2].rect.y + spacious[2].rect.height + 2
         );
-        let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 7));
+        let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 6));
         assert_eq!(spacious_metrics.viewport_rows, 2);
         assert_eq!(spacious_metrics.max_offset_from_bottom, 2);
 
@@ -3242,7 +3259,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         app.active = None;
         app.mode = Mode::Terminal;
 
-        let ws_area = Rect::new(0, 0, 30, 6);
+        // One body row, so the metric has to come from the display entries
+        // rather than the three raw workspaces.
+        let ws_area = Rect::new(0, 0, 30, 5);
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         assert_eq!(metrics.viewport_rows, 1);
