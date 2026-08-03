@@ -82,17 +82,16 @@ impl RepoSlug {
         })
     }
 
-    /// The REST base for this slug, honouring GitHub Enterprise's `/api/v3` path.
-    fn api_base(&self) -> String {
-        if self.host == "github.com" {
-            "https://api.github.com".to_string()
-        } else {
-            format!("https://{}/api/v3", self.host)
-        }
-    }
-
-    pub fn is_github(&self) -> bool {
-        self.host == "github.com" || self.host.ends_with(".github.com")
+    /// The REST base for this repository, when Herdr can name one at all.
+    ///
+    /// Deliberately an allowlist of exactly `github.com`. The fetch carries a
+    /// bearer token, and a hostname on its own is no evidence that some other
+    /// forge speaks GitHub's REST API - guessing would send the user's
+    /// credential to a host they never authorised for it. A self-hosted GitHub
+    /// Enterprise install therefore draws no counter rather than being probed
+    /// for one.
+    fn api_base(&self) -> Option<&'static str> {
+        (self.host == "github.com").then_some("https://api.github.com")
     }
 }
 
@@ -224,18 +223,14 @@ fn gh_cli_token(host: &str) -> Option<String> {
 /// other than the expected array; callers keep their previous counts rather than
 /// rendering a zero, because "we could not ask" is not "there is nothing open".
 pub fn fetch_pull_request_counts(slug: &RepoSlug, auth: &ForgeAuth) -> Option<PullRequestCounts> {
-    if !slug.is_github() {
-        return None;
-    }
+    let api_base = slug.api_base()?;
 
     // The plain pulls listing, not the search API: it costs one request against
     // the 5000/hour core budget instead of the search endpoint's 30/minute, and
     // it already carries the draft flag and requested reviewers.
     let url = format!(
-        "{}/repos/{}/{}/pulls?state=open&per_page=100",
-        slug.api_base(),
-        slug.owner,
-        slug.name
+        "{api_base}/repos/{}/{}/pulls?state=open&per_page=100",
+        slug.owner, slug.name
     );
 
     let output = crate::noninteractive_process::curl_command()
@@ -381,14 +376,24 @@ mod tests {
     }
 
     #[test]
-    fn enterprise_hosts_use_the_v3_api_path() {
-        let slug = RepoSlug::parse("https://ghe.example.com/o/n").expect("should parse");
-        assert_eq!(slug.api_base(), "https://ghe.example.com/api/v3");
-        assert!(!slug.is_github());
-
+    fn only_github_com_resolves_to_an_endpoint_the_token_may_be_sent_to() {
         let slug = RepoSlug::parse("https://github.com/o/n").expect("should parse");
-        assert_eq!(slug.api_base(), "https://api.github.com");
-        assert!(slug.is_github());
+        assert_eq!(slug.api_base(), Some("https://api.github.com"));
+
+        // Parsing a self-hosted forge's URL is fine; sending it a GitHub token
+        // on the strength of its hostname is not.
+        for url in [
+            "https://ghe.example.com/o/n",
+            "https://gitlab.com/o/n",
+            "https://notgithub.com/o/n",
+        ] {
+            let slug = RepoSlug::parse(url).unwrap_or_else(|| panic!("should parse {url}"));
+            assert_eq!(
+                slug.api_base(),
+                None,
+                "must not resolve an endpoint for {url}"
+            );
+        }
     }
 
     #[test]
