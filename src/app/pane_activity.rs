@@ -45,6 +45,23 @@ use crate::terminal::TerminalId;
 /// output rate into the loop's wake rate.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How many sample windows the output rate is measured across.
+///
+/// The rate is deliberately *not* taken from the single window the smoothing
+/// step just closed. Agents emit in bursts, so consecutive windows alternate
+/// between a whole burst and nothing at all, and a one-window rate turns that
+/// into a target flipping between full scale and zero several times a second.
+/// Measured against a real running Herdr, a pane under steady load oscillated
+/// between 65% and 83% at 2Hz — the smoothing cannot damp that out, because
+/// the input really is alternating and the asymmetric time constants below are
+/// built to follow real starts and stops quickly.
+///
+/// Summing bytes and elapsed time across a second of windows spans the gaps
+/// between bursts, so sustained work reads as one steady rate. Bounded rather
+/// than exponential on purpose: a burst leaves the average completely once it
+/// falls out the back, instead of trailing behind the pane forever.
+const RATE_WINDOW_SAMPLES: usize = 4;
+
 /// Time constant used while the rate is climbing.
 ///
 /// Deliberately much shorter than `FALL_TAU`: work starting is the event worth
@@ -118,6 +135,13 @@ struct Entry {
     /// Most recent byte counter reading, committed or not.
     latest_bytes: u64,
     level: f32,
+    /// The most recent windows' byte deltas and the time each covered, as a
+    /// ring. A fixed array rather than a deque: it is read on every loop pass,
+    /// and this way a terminal's whole history costs no allocation.
+    window_bytes: [u64; RATE_WINDOW_SAMPLES],
+    window_secs: [f64; RATE_WINDOW_SAMPLES],
+    window_next: usize,
+    window_len: usize,
 }
 
 impl Entry {
@@ -126,7 +150,36 @@ impl Entry {
             committed_bytes: bytes,
             latest_bytes: bytes,
             level: 0.0,
+            window_bytes: [0; RATE_WINDOW_SAMPLES],
+            window_secs: [0.0; RATE_WINDOW_SAMPLES],
+            window_next: 0,
+            window_len: 0,
         }
+    }
+
+    /// Record one closed window's bytes and the time it covered.
+    fn push_window(&mut self, bytes: u64, secs: f64) {
+        self.window_bytes[self.window_next] = bytes;
+        self.window_secs[self.window_next] = secs;
+        self.window_next = (self.window_next + 1) % RATE_WINDOW_SAMPLES;
+        self.window_len = (self.window_len + 1).min(RATE_WINDOW_SAMPLES);
+    }
+
+    /// Output rate across the whole trailing window, in bytes per second.
+    ///
+    /// Totals rather than an average of per-window rates, so windows that
+    /// covered different amounts of time weigh in proportion to the time they
+    /// actually covered — the loop wakes irregularly, and a short window must
+    /// not count as much as a long one.
+    fn windowed_rate(&self) -> f64 {
+        // Slots fill from index 0 before the ring wraps, so the first
+        // `window_len` entries are exactly the live ones in both cases.
+        let bytes: u64 = self.window_bytes.iter().take(self.window_len).sum();
+        let secs: f64 = self.window_secs.iter().take(self.window_len).sum();
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        bytes as f64 / secs
     }
 
     /// True when this entry still has something to do: either a level to decay
@@ -208,7 +261,11 @@ impl PaneActivityMap {
             // terminal, not negative work. Same for the `clear` that resets a
             // pane's scrollback: neither is evidence of anything undone.
             let delta = entry.latest_bytes.saturating_sub(entry.committed_bytes);
-            let rate = delta as f64 / elapsed_secs;
+            entry.push_window(delta, elapsed_secs);
+            // Measured across the trailing window rather than this one closed
+            // window, so the gaps between an agent's bursts do not read as the
+            // rate itself alternating. See `RATE_WINDOW_SAMPLES`.
+            let rate = entry.windowed_rate();
             // Smoothed in level space, not in bytes-per-second space. Decaying
             // the rate exponentially would decay the *level* linearly, because
             // the level is its logarithm — so a loud burst would leave a long
@@ -359,6 +416,44 @@ mod tests {
     }
 
     #[test]
+    fn steady_bursty_output_holds_a_steady_level() {
+        // The shape a real agent produces, and the one the live lab caught: a
+        // whole burst lands in one sample window and the next window is empty.
+        // Rated one window at a time, this pane oscillated between 65% and 83%
+        // several times a second while its actual throughput never changed —
+        // a flicker for anything bound to the level.
+        let now = Instant::now();
+        let id = terminal("term_steady_burst");
+        let mut map = PaneActivityMap::default();
+        map.observe(now, [(&id, 0)]);
+
+        let mut total = 0u64;
+        let mut levels = Vec::new();
+        for step in 1..=24u32 {
+            if step % 2 == 0 {
+                total += 44_000;
+            }
+            map.observe(now + SAMPLE_INTERVAL * step, [(&id, total)]);
+            // Sample only after the trailing window has filled and the rise has
+            // converged; the ramp up from rest is supposed to move.
+            if step >= 12 {
+                levels.push(map.get(&id).expect("sampled").level_percent());
+            }
+        }
+
+        let min = levels.iter().copied().min().expect("levels");
+        let max = levels.iter().copied().max().expect("levels");
+        assert!(
+            max - min <= 2,
+            "unchanging throughput must not read as an oscillating level: {levels:?}"
+        );
+        assert!(
+            min > 50,
+            "sustained heavy output must still read as busy: {levels:?}"
+        );
+    }
+
+    #[test]
     fn a_resting_pane_reports_no_rate_at_all() {
         let activity = PaneActivity {
             level: 0.0,
@@ -405,20 +500,29 @@ mod tests {
         let mut map = PaneActivityMap::default();
         map.observe(now, [(&id, 0)]);
 
-        // One step of output, then one step of silence, from the same start.
-        run(&mut map, &id, now, 1, 65_536);
-        let after_one_busy_step = map.level(&id);
-        let peak = after_one_busy_step;
+        // Output for a span, then silence for the same span. Both halves are
+        // longer than the rate window on purpose: over a single step this
+        // measures the window filling and draining, not the envelope, and a
+        // lone quiet step after a burst is correctly not yet a fall.
+        const STEPS: u32 = RATE_WINDOW_SAMPLES as u32 * 2;
 
-        run(&mut map, &id, now + SAMPLE_INTERVAL, 1, 0);
-        let after_one_quiet_step = map.level(&id);
+        run(&mut map, &id, now, STEPS, 65_536);
+        let peak = map.level(&id);
 
-        assert!(after_one_busy_step > 0.0);
+        run(&mut map, &id, now + SAMPLE_INTERVAL * STEPS, STEPS, 0);
+        let after = map.level(&id);
+
+        assert!(peak > 0.5, "sustained output should read as busy: {peak}");
+        assert!(after < peak, "silence must bring the level down: {after}");
+        // The rise covered all of `peak` from rest. Silence got the same number
+        // of steps to give it back, and must not have managed it: that gap is
+        // the asymmetry, and it is what keeps the pauses inside an agent's work
+        // from reading as the pane stopping.
         assert!(
-            after_one_quiet_step > peak * 0.5,
-            "release should be gentle: {after_one_quiet_step} fell too far from {peak}"
+            after > peak * 0.15,
+            "release must be gentler than attack: gave back all but {after} of \
+             {peak} in the same {STEPS} steps it took to gain it"
         );
-        assert!(after_one_quiet_step < peak);
     }
 
     #[test]
