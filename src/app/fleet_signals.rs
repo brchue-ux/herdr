@@ -342,7 +342,7 @@ impl FleetSignalDemand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::text::display_width;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn the_eight_are_distinct_and_stay_in_one_order() {
@@ -373,7 +373,7 @@ mod tests {
         for signal in FleetSignal::ALL {
             let mark = signal.mark();
             assert_eq!(
-                display_width(mark),
+                mark.width(),
                 1,
                 "{signal:?} draws {mark:?}, which is not one cell wide"
             );

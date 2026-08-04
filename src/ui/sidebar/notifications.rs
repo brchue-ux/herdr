@@ -25,7 +25,7 @@
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
@@ -98,12 +98,26 @@ fn slot_text(signal: FleetSignal, tier: Tier) -> String {
 
 /// The colour a slot draws in while its signal is live.
 ///
-/// Eight signals, eight distinct palette roles, so no two live slots are told
-/// apart by position alone. The four that restate something the tree already
+/// Eight signals, eight different palette roles. The ones that restate
+/// something the tree already
 /// says take the tree's own colour for it — `review` is the teal Herdr already
 /// uses for a done-but-unseen pane, `ask` the red it uses for blocked, `busy`
 /// the yellow it uses for working — so the bar and the rows under it never
 /// disagree about what a colour means.
+///
+/// Deliberately not `accent`. The palette has six hues plus `text`, and
+/// `accent` is a *copy* of one of them — `blue` in every bundled theme — so a
+/// slot drawn in it would be indistinguishable from `push`. It is user-settable
+/// on top of that, so any slot bound to it could be made to collide with any
+/// other at will. `pr` takes the bright neutral instead.
+///
+/// Two live slots *may* share a colour, and on some bundled themes they do:
+/// `dracula` gives `blue` and `teal` the same value, `vesper` does the same to
+/// `peach` and `yellow`. That is survivable for exactly the reason Herdr's own
+/// state dots are: a slot is identified by its mark and its fixed position, and
+/// colour only has to say live-or-resting. What is *not* survivable is a live
+/// slot that draws in the resting grey, which is what `terminal` would do to
+/// `report` — see [`live_style`].
 fn live_color(signal: FleetSignal, p: &Palette) -> Color {
     match signal {
         FleetSignal::Review => p.teal,
@@ -113,8 +127,26 @@ fn live_color(signal: FleetSignal, p: &Palette) -> Color {
         FleetSignal::Stopped => p.peach,
         FleetSignal::Dirty => p.green,
         FleetSignal::Push => p.blue,
-        FleetSignal::Pr => p.accent,
+        FleetSignal::Pr => p.text,
     }
+}
+
+/// How a live slot is drawn, as against [`resting_style`].
+///
+/// Bold as well as coloured. Bold is the one distinction from the resting state
+/// that no palette can take away, and some can: the `terminal` theme resolves
+/// `mauve` to the same value as `overlay0`, which would leave a live `report`
+/// looking exactly like a quiet one. The colour falls back to `text` whenever it
+/// would land on the resting grey, and the weight covers whatever is left.
+fn live_style(signal: FleetSignal, p: &Palette) -> Style {
+    let color = live_color(signal, p);
+    let color = if color == p.overlay0 { p.text } else { color };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// How a quiet slot is drawn: named, muted, and holding still.
+fn resting_style(p: &Palette) -> Style {
+    Style::default().fg(p.overlay0)
 }
 
 /// Columns the bar will occupy on a header row `available` wide.
@@ -170,14 +202,11 @@ fn push_slot(
 ) {
     let text = slot_text(signal, tier);
     if !signals.is_live(signal) {
-        spans.push(Span::styled(
-            text,
-            Style::default().fg(app.palette.overlay0),
-        ));
+        spans.push(Span::styled(text, resting_style(&app.palette)));
         return;
     }
 
-    let style = Style::default().fg(live_color(signal, &app.palette));
+    let style = live_style(signal, &app.palette);
     let frame = app
         .anim
         .frame(&signal.element_id(), None)
@@ -255,21 +284,52 @@ mod tests {
         }
     }
 
+    /// A live slot must never be drawable as a resting one. Colour alone
+    /// cannot promise that: the `terminal` theme resolves `mauve` to the same
+    /// value as `overlay0`, and `test_new` collapses the whole palette, so the
+    /// live style falls back to `text` and carries bold on top.
+    ///
+    /// Note what is *not* asserted: that no two live signals share a colour.
+    /// `dracula` gives `blue` and `teal` one value and `vesper` does the same to
+    /// `peach` and `yellow`, so on those themes two slots genuinely match. That
+    /// is the same trade Herdr's own state dots make - identity is carried by a
+    /// distinct one-cell mark in a fixed position (see
+    /// `every_mark_is_one_cell_and_no_two_are_the_same`), and colour only has to
+    /// say live-or-resting.
     #[test]
-    fn no_two_live_signals_share_a_colour_and_none_is_the_resting_grey() {
-        let p = Palette::catppuccin();
-        let mut used: Vec<Color> = Vec::new();
-        for signal in FleetSignal::ALL {
-            let color = live_color(signal, &p);
-            assert_ne!(
-                color, p.overlay0,
-                "{signal:?} is the same colour live as it is at rest"
-            );
-            assert!(
-                !used.contains(&color),
-                "{signal:?} reuses a colour another signal already has"
-            );
-            used.push(color);
+    fn a_live_slot_is_never_drawn_the_way_a_resting_one_is() {
+        for (name, p) in [
+            ("catppuccin", Palette::catppuccin()),
+            ("catppuccin_latte", Palette::catppuccin_latte()),
+            ("terminal", Palette::terminal()),
+            ("tokyo_night", Palette::tokyo_night()),
+            ("tokyo_night_day", Palette::tokyo_night_day()),
+            ("dracula", Palette::dracula()),
+            ("nord", Palette::nord()),
+            ("gruvbox", Palette::gruvbox()),
+            ("gruvbox_light", Palette::gruvbox_light()),
+            ("one_dark", Palette::one_dark()),
+            ("one_light", Palette::one_light()),
+            ("solarized", Palette::solarized()),
+            ("solarized_light", Palette::solarized_light()),
+            ("kanagawa", Palette::kanagawa()),
+            ("kanagawa_lotus", Palette::kanagawa_lotus()),
+            ("rose_pine", Palette::rose_pine()),
+            ("rose_pine_dawn", Palette::rose_pine_dawn()),
+            ("vesper", Palette::vesper()),
+        ] {
+            let resting = resting_style(&p);
+            for signal in FleetSignal::ALL {
+                let live = live_style(signal, &p);
+                assert_ne!(
+                    live, resting,
+                    "{signal:?} is drawn identically live and at rest on {name}"
+                );
+                assert!(
+                    live.add_modifier.contains(Modifier::BOLD),
+                    "{signal:?} is not bold when live on {name}"
+                );
+            }
         }
     }
 }
