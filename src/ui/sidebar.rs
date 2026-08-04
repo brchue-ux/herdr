@@ -1,8 +1,11 @@
 mod card;
+pub(crate) mod image_card;
 mod notifications;
 mod tokens;
 pub(crate) mod tray;
 pub(crate) mod tray_art;
+
+pub(crate) use self::image_card::SidebarCardLayer;
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -1333,6 +1336,16 @@ fn list_entry_height(
     body_height: u16,
     fold_width: u16,
 ) -> u16 {
+    // The pixel card is a skin over this row's cells, so it does not get to
+    // move the row — but it does get to say how many cells the row is, because
+    // a card drawn shorter than its rect would leave a band of the character
+    // card showing under it. Taken here, above the Space/agent split, because
+    // both kinds of row are drawn by the same card: a mate is a Space and a
+    // worker is a pane, and a tree that skinned one and not the other would be
+    // two designs stacked on each other.
+    if let Some(rows) = image_card::row_height_cells(app, entry.depth(), fold_width) {
+        return rows.min(body_height);
+    }
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
     let shell = RowShell::for_fold_width(fold_width);
     match entry {

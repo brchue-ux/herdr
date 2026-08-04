@@ -443,8 +443,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false
 # Experimental local Kitty graphics rendering for attached clients.
-# Requires a Kitty graphics-compatible outer terminal.
+# Requires a Kitty graphics-compatible outer terminal. Also draws the sidebar
+# tree's rows as rendered cards rather than as box-drawing characters.
 # kitty_graphics = false
+# Proportional font the sidebar's rendered cards are set in. Empty searches the
+# usual system font directories; when nothing is found the sidebar keeps its
+# character cards. Read once at startup.
+# sidebar_card_font = ""
 # Save recent pane screen history across full server restarts.
 pane_history = false
 # While prefix mode is active, temporarily switch the host input source to

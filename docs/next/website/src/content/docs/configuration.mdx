@@ -714,6 +714,23 @@ kitty_graphics = true
 
 Enable it only when testing terminal image behavior.
 
+With it on, the sidebar tree also draws its rows as rendered cards instead of as
+box-drawing characters, on any panel at least 34 columns wide. The card is set in
+a proportional face taken from the machine — Ubuntu Sans, DejaVu Sans, Liberation
+Sans, Noto Sans and Free Sans on Linux, the system UI face on macOS, Segoe UI on
+Windows. If none of those is installed the sidebar keeps its character cards.
+Point it at a specific font with:
+
+```toml
+[experimental]
+kitty_graphics = true
+sidebar_card_font = "/usr/share/fonts/truetype/ubuntu/UbuntuSans[wdth,wght].ttf"
+```
+
+The path is read once at startup. Below 34 columns, with `kitty_graphics = false`,
+or on a direct attach — where graphics are disabled anyway — the sidebar renders
+its character cards exactly as before.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:

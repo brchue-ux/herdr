@@ -93,6 +93,15 @@ enum HostSurfaceId {
     /// identity rather than a share of `Sidebar`, so a client publishing to the
     /// sidebar and the tray redrawing cannot evict one another.
     SignalTray,
+    /// The sidebar tree's own rasterised cards.
+    ///
+    /// A separate identity from [`Self::Sidebar`] rather than a second layer on
+    /// it, because the two have different owners: `Sidebar` is whatever an API
+    /// client put there, and this is the TUI drawing its own rows. Sharing one
+    /// identity would make either of them silently replace the other's image,
+    /// and a client painting a backdrop under the tree is exactly the case that
+    /// has to work.
+    SidebarCards,
 }
 
 impl HostSurfaceId {
@@ -104,6 +113,7 @@ impl HostSurfaceId {
             Self::Pane(pane_id) => pane_id.raw().hash(hasher),
             Self::Sidebar => "surface.sidebar".hash(hasher),
             Self::SignalTray => "surface.signal-tray".hash(hasher),
+            Self::SidebarCards => "surface.sidebar.cards".hash(hasher),
         }
     }
 }
@@ -673,12 +683,13 @@ fn collect_visible_placements(
 /// named surface to the rect the layout put it at, so the layer travels the same
 /// clipping, caching, signature and delete-by-id path a pane layer does.
 ///
-/// Two owners feed it. API clients publish onto
+/// Three owners feed it. API clients publish onto
 /// [`crate::api::schema::GraphicsSurface`]; the notification tray publishes its
-/// own badge artwork, which is Herdr's own drawing rather than a client's. They
-/// are separate [`HostSurfaceId`]s on purpose — sharing one would mean a client
-/// setting a sidebar image erased the tray, and the tray redrawing erased the
-/// client's image.
+/// own badge artwork, and the sidebar tree publishes its rasterised cards, both
+/// of which are Herdr's own drawing rather than a client's. They are separate
+/// [`HostSurfaceId`]s on purpose — sharing one would mean a client setting a
+/// sidebar image erased the tray or the cards, and either of those redrawing
+/// erased the client's image.
 fn surface_layer_placement_targets(
     app: &AppState,
 ) -> impl Iterator<Item = (HostSurfaceId, Rect, &crate::app::state::GraphicsLayer)> {
@@ -696,6 +707,16 @@ fn surface_layer_placement_targets(
                 layer,
             )
         }))
+        // The TUI's own sidebar cards join here rather than through the API
+        // map, so they travel the same clipping, dedup, signature and
+        // delete-by-id path as a client's layer without being reachable — or
+        // clearable — by `surface.graphics.*`. Their rect is the tree's, not
+        // the sidebar's: the sheet is only as large as the cards it holds.
+        .chain(
+            app.sidebar_card_layer
+                .as_ref()
+                .map(|cards| (HostSurfaceId::SidebarCards, cards.rect, &cards.layer)),
+        )
 }
 
 /// Builds the host placement for one API-owned image layer over `area`.
@@ -1466,6 +1487,134 @@ mod tests {
                 &test_placement(0, 0).placement,
             )
         );
+    }
+
+    fn sidebar_card_layer(rect: Rect) -> crate::ui::sidebar::SidebarCardLayer {
+        crate::ui::sidebar::SidebarCardLayer {
+            rect,
+            signature: 1,
+            layer: crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                u32::from(rect.width) * test_cell_size().width_px,
+                u32::from(rect.height) * test_cell_size().height_px,
+                vec![3; 8],
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    grid_cols: u32::from(rect.width),
+                    grid_rows: u32::from(rect.height),
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+
+    /// The TUI's own cards and a client's sidebar layer are two placements on
+    /// one rect, not one placement fighting over it.
+    ///
+    /// They have different owners — `surface.graphics.set` owns one and the
+    /// sidebar renderer owns the other — so a client painting a backdrop under
+    /// the tree has to survive the tree drawing itself on top. Sharing a
+    /// surface identity would make each one's upload delete the other's.
+    #[test]
+    fn the_sidebar_cards_are_a_second_placement_beside_a_client_layer() {
+        let mut app = app_with_sidebar(
+            Rect::new(0, 0, 26, 20),
+            crate::api::schema::PaneGraphicsPlacementParams {
+                z: crate::api::schema::GRAPHICS_Z_BELOW_BACKGROUND,
+                ..Default::default()
+            },
+        );
+        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(1, 2, 20, 12)));
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+        assert_eq!(placements.len(), 2);
+
+        let cards = placements
+            .iter()
+            .find(|placement| placement.surface == HostSurfaceId::SidebarCards)
+            .expect("the sidebar's own cards reach the pipeline");
+        assert_eq!(
+            cards.source_key,
+            HostSourceKey::Layer {
+                surface: HostSurfaceId::SidebarCards,
+            }
+        );
+        // The tree's rect, not the whole panel's: the sheet is only as large as
+        // the cards it holds.
+        let (clipped, _) = clipped_placement(cards).expect("the cards are visible");
+        assert_eq!((clipped.x, clipped.y), (1, 2));
+        assert_eq!((clipped.cols, clipped.rows), (20, 12));
+
+        // Two surfaces, two host images, two placement ids. Either colliding
+        // would make one layer's upload delete the other's.
+        let client = placements
+            .iter()
+            .find(|placement| placement.surface == HostSurfaceId::Sidebar)
+            .expect("the client's own layer is still there");
+        assert_ne!(
+            host_image_id(cards.surface, &cards.placement),
+            host_image_id(client.surface, &client.placement)
+        );
+        assert_ne!(
+            host_placement_id(cards.source_key, &cards.placement),
+            host_placement_id(client.source_key, &client.placement)
+        );
+    }
+
+    /// Chrome exists whether or not a tab does, and the retained fast path has
+    /// to agree with the collector about that or it skips a repaint it owed.
+    #[test]
+    fn the_sidebar_cards_are_visible_without_an_active_workspace() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.active = None;
+        app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(0, 1, 24, 10)));
+
+        assert!(has_visible_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+        ));
+    }
+
+    #[test]
+    fn dropping_the_sidebar_cards_deletes_their_host_image() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(0, 1, 24, 10)));
+
+        let mut cache = HostGraphicsCache::default();
+        let runtimes = TerminalRuntimeRegistry::new();
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
+        let host_id = *cache.images.keys().next().expect("uploaded host image");
+
+        // A panel that stopped drawing pixel cards — narrowed past the card
+        // shell, or graphics turned off — leaves nothing behind on the host.
+        app.sidebar_card_layer = None;
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
+        assert!(cache.is_empty());
     }
 
     #[test]
