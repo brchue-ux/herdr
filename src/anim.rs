@@ -78,8 +78,17 @@ pub(crate) enum ElementId {
     AgentRow(crate::layout::PaneId),
     /// One terminal's own surface, by the id the work-volume sampler keys on.
     Terminal(crate::terminal::TerminalId),
-    /// A singleton surface a subsystem names for itself — a notification bar, a
-    /// view transition, an overlay.
+    /// The sidebar tree's own view, as a whole.
+    ///
+    /// A family of exactly one, and deliberately not [`Self::Named`]: a
+    /// subsystem that reconciles `Named` by membership — the fleet signal bar
+    /// does — would retire any other named element it did not publish, which
+    /// mid-switch means the incoming view is told to leave the moment it
+    /// arrives. Driven by [`Animator::enter`]/[`Animator::leave`] rather than
+    /// by a membership set, because there is nothing to enumerate.
+    TreeView,
+    /// A singleton surface a subsystem names for itself — a notification bar,
+    /// an overlay.
     Named(&'static str),
 }
 
@@ -89,6 +98,7 @@ pub(crate) enum Family {
     WorkspaceRow,
     AgentRow,
     Terminal,
+    TreeView,
     Named,
 }
 
@@ -98,6 +108,7 @@ impl ElementId {
             Self::WorkspaceRow(_) => Family::WorkspaceRow,
             Self::AgentRow(_) => Family::AgentRow,
             Self::Terminal(_) => Family::Terminal,
+            Self::TreeView => Family::TreeView,
             Self::Named(_) => Family::Named,
         }
     }

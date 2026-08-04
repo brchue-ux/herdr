@@ -323,6 +323,10 @@ impl App {
             }
         }
 
+        if self.handle_tree_view_click(mouse) {
+            return;
+        }
+
         if self.handle_modified_url_click(source_id, mouse) {
             return;
         }
@@ -542,6 +546,53 @@ impl App {
             tracing::warn!(err = %err, url = %url, "failed to open pane URL");
         }
         true
+    }
+
+    /// Re-root the sidebar tree from a click, if this click asked for it.
+    ///
+    /// Two gestures, both mouse-first and neither costing a column of a panel
+    /// that has none to spare: double-clicking a row that owns a subtree drills
+    /// into it, and the header row's breadcrumb comes back out. Double-click
+    /// rather than a single click because a single click on a Space already
+    /// focuses it, and drilling in is a different intent from going there.
+    ///
+    /// Returns whether the click was consumed. The first click of a pair is
+    /// deliberately *not* consumed: it should still focus the row it landed on,
+    /// so the gesture adds to what a click already did rather than replacing it.
+    fn handle_tree_view_click(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !mouse.modifiers.is_empty()
+        {
+            return false;
+        }
+        let now = std::time::Instant::now();
+
+        if self
+            .state
+            .on_sidebar_tree_breadcrumb(mouse.column, mouse.row)
+        {
+            self.last_sidebar_row_click = None;
+            self.state
+                .select_tree_root(crate::app::tree_view::TreeRoot::Fleet, now);
+            return true;
+        }
+
+        let Some(target) = self.state.tree_root_drill_target(mouse.column, mouse.row) else {
+            self.last_sidebar_row_click = None;
+            return false;
+        };
+        let is_double_click = self
+            .last_sidebar_row_click
+            .as_ref()
+            .is_some_and(|(previous, at)| {
+                *previous == target && now.duration_since(*at) <= super::SIDEBAR_DOUBLE_CLICK_WINDOW
+            });
+        if !is_double_click {
+            self.last_sidebar_row_click = Some((target, now));
+            return false;
+        }
+        self.last_sidebar_row_click = None;
+        self.state.select_tree_root(target, now)
     }
 
     fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {

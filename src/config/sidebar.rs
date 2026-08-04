@@ -930,6 +930,18 @@ const MAX_ROW_ENTER_MS: u64 = 1_500;
 /// eye has to find, a departure is releasing something it has already read.
 const DEFAULT_ROW_EXIT_MS: u64 = 220;
 
+/// How long each half of a tree view switch takes by default.
+///
+/// Unlike a row arrival this is on out of the box, because the switch itself is
+/// the behaviour: re-rooting the tree with no transition is a hard cut from one
+/// set of rows to another, which is precisely the jumbling the transition
+/// exists to avoid. Fast enough that drilling into a mate feels like a
+/// navigation rather than a wait, and the same on the way out so the motion
+/// reads the same in both directions.
+const DEFAULT_VIEW_SWITCH_MS: u64 = 220;
+const MIN_VIEW_SWITCH_MS: u64 = 60;
+const MAX_VIEW_SWITCH_MS: u64 = 1_500;
+
 /// Lifecycle animation for sidebar rows themselves, as opposed to the tokens
 /// drawn inside them.
 ///
@@ -953,6 +965,22 @@ pub struct SidebarAnimationConfig {
     pub row_exit: SidebarTokenEmphasis,
     /// How long that departure takes, in milliseconds.
     pub row_exit_ms: u64,
+    /// Behaviour the whole tree plays when it is re-rooted onto one second
+    /// mate, and again on the way back out.
+    ///
+    /// One name for both halves for the same reason a row's exit reuses its
+    /// entry: the engine plays a dismount as its mount reversed, so the view
+    /// comes apart exactly the way it formed. Unlike `row_enter` this is on out
+    /// of the box, because re-rooting with no transition is a hard cut from one
+    /// set of rows to another — precisely the jumbling the transition exists to
+    /// avoid. `none` restores that hard cut.
+    pub view_switch: SidebarTokenEmphasis,
+    /// How long each half of that switch takes, in milliseconds.
+    ///
+    /// The view being left dematerializes for this long, the new root is
+    /// adopted at the instant nothing is on screen, and the view being arrived
+    /// at materializes for the same again.
+    pub view_switch_ms: u64,
 }
 
 impl Default for SidebarAnimationConfig {
@@ -962,6 +990,8 @@ impl Default for SidebarAnimationConfig {
             row_enter_ms: DEFAULT_ROW_ENTER_MS,
             row_exit: SidebarTokenEmphasis::None,
             row_exit_ms: DEFAULT_ROW_EXIT_MS,
+            view_switch: SidebarTokenEmphasis::Dissolve,
+            view_switch_ms: DEFAULT_VIEW_SWITCH_MS,
         }
     }
 }
@@ -986,6 +1016,24 @@ impl SidebarAnimationConfig {
         Some(crate::anim::Stage::new(
             behaviour,
             std::time::Duration::from_millis(ms.clamp(MIN_ROW_ENTER_MS, MAX_ROW_ENTER_MS)),
+        ))
+    }
+
+    /// The stage a whole view plays as it forms, and — reversed by the engine —
+    /// as it comes apart.
+    ///
+    /// One stage serves both halves, so the duration the loop waits before
+    /// adopting the incoming root is by construction the same duration the
+    /// outgoing view spends leaving. They cannot disagree about when the panel
+    /// is empty.
+    pub(crate) fn view_switch_stage(&self) -> Option<crate::anim::Stage> {
+        let behaviour = self.view_switch.behaviour()?;
+        Some(crate::anim::Stage::new(
+            behaviour,
+            std::time::Duration::from_millis(
+                self.view_switch_ms
+                    .clamp(MIN_VIEW_SWITCH_MS, MAX_VIEW_SWITCH_MS),
+            ),
         ))
     }
 }

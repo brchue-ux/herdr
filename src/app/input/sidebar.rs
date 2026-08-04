@@ -280,6 +280,65 @@ impl AppState {
         })
     }
 
+    /// The tree row this cell sits on, whatever kind it is, or `None` when the
+    /// cell is outside the panel entirely.
+    ///
+    /// Unlike [`Self::workspace_at_row`] this checks the column as well: it is
+    /// called from the client's own input pass, before the sidebar/pane split
+    /// the panel's other handlers can already assume.
+    fn sidebar_card_at(&self, col: u16, row: u16) -> Option<crate::app::state::WorkspaceCardArea> {
+        let sidebar = self.view.sidebar_rect;
+        if self.sidebar_collapsed
+            || sidebar.width == 0
+            || col < sidebar.x
+            || col >= sidebar.x.saturating_add(sidebar.width)
+        {
+            return None;
+        }
+        self.sidebar_card_at_row(row)
+    }
+
+    /// The root a double-click on this cell would move the tree to.
+    ///
+    /// Drilling in is only offered on a row that has a subtree to drill into: a
+    /// leaf worker would re-root onto a view holding nothing but itself, which
+    /// is a dead end the user then has to back out of. The row already at rank
+    /// 0 goes the other way and returns to the whole fleet, so the gesture is
+    /// its own inverse.
+    pub(crate) fn tree_root_drill_target(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::app::tree_view::TreeRoot> {
+        // The controls painted *over* a row keep their own cells. Both already
+        // do something on a click, and doing that twice while also re-rooting
+        // is not what either of them was aimed at.
+        if self.workspace_group_chevron_at(col, row).is_some()
+            || self.worker_summary_badge_at(col, row).is_some()
+        {
+            return None;
+        }
+        let card = self.sidebar_card_at(col, row)?;
+        let entries = crate::ui::workspace_list_entries(self);
+        let entry = entries.get(card.entry_idx)?;
+        if entry.depth() == 0 {
+            return (!self.tree_root.is_fleet()).then_some(crate::app::tree_view::TreeRoot::Fleet);
+        }
+        let owns_children = entries
+            .get(card.entry_idx.saturating_add(1))
+            .is_some_and(|next| next.depth() > entry.depth());
+        if !owns_children {
+            return None;
+        }
+        crate::ui::sidebar_tree_handle(self, entry).map(crate::app::tree_view::TreeRoot::Node)
+    }
+
+    /// Whether this cell is the header row's way back out of a re-rooted tree.
+    pub(super) fn on_sidebar_tree_breadcrumb(&self, col: u16, row: u16) -> bool {
+        let rect = crate::ui::sidebar_tree_breadcrumb_rect(self, self.workspace_list_rect());
+        rect.width > 0 && row == rect.y && col >= rect.x && col < rect.x.saturating_add(rect.width)
+    }
+
     pub(super) fn on_sidebar_divider(&self, col: u16, row: u16) -> bool {
         self.sidebar_divider_grab_at(col, row).is_some()
     }
@@ -430,7 +489,7 @@ impl AppState {
             return None;
         }
 
-        let roots = crate::ui::workspace_list_entries_expanded(self)
+        let roots = crate::ui::workspace_list_entries_whole_fleet(self)
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace {
@@ -680,6 +739,196 @@ mod tests {
                 "detach"
             ]
         );
+    }
+
+    /// The captain's fleet in miniature, laid out so a test can click a row:
+    /// `firstmate` owns `2nd-a` and `2nd-b`, each with one worker pane.
+    fn app_with_owned_fleet() -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        let mut mate_a = Workspace::test_new("2nd-a");
+        let worker_a = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let mut mate_b = Workspace::test_new("2nd-b");
+        let worker_b = mate_b.test_split(ratatui::layout::Direction::Vertical);
+        app.state.workspaces = vec![Workspace::test_new("firstmate"), mate_a, mate_b];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        // One line per row so a row's y is exactly its position in the tree,
+        // and so nothing here depends on the checkout's own git branch.
+        app.state.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.state.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        for ws_idx in [1, 2] {
+            app.state.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        for (ws_idx, pane, name, owner) in [
+            (1usize, worker_a, "worker-a", "2nd-a"),
+            (2, worker_b, "worker-b", "2nd-b"),
+        ] {
+            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = crate::detect::AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        app
+    }
+
+    /// The screen row a named node's card starts on.
+    fn tree_row_of(app: &crate::app::App, name: &str) -> u16 {
+        let entries = crate::ui::workspace_list_entries(&app.state);
+        let entry_idx = entries
+            .iter()
+            .position(|entry| {
+                crate::ui::sidebar_tree_handle(&app.state, entry).as_deref() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("{name} is not in the tree"));
+        app.state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.entry_idx == entry_idx)
+            .unwrap_or_else(|| panic!("{name} was not laid out"))
+            .rect
+            .y
+    }
+
+    /// One click still means "go there". Drilling in is a separate intent, so
+    /// it takes a separate gesture.
+    #[test]
+    fn a_single_click_on_a_mate_does_not_re_root_the_tree() {
+        let mut app = app_with_owned_fleet();
+        let row = tree_row_of(&app, "2nd-a");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+
+        assert_eq!(app.state.tree_root, crate::app::tree_view::TreeRoot::Fleet);
+        assert_eq!(app.state.next_tree_view_commit_deadline(), None);
+    }
+
+    #[test]
+    fn double_clicking_a_mate_re_roots_the_tree_onto_it() {
+        let mut app = app_with_owned_fleet();
+        let row = tree_row_of(&app, "2nd-a");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+
+        // Held, not applied: the outgoing view has to come apart first.
+        assert_eq!(app.state.tree_root, crate::app::tree_view::TreeRoot::Fleet);
+        let commit = app
+            .state
+            .next_tree_view_commit_deadline()
+            .expect("a switch is in flight");
+        assert!(app.state.advance_tree_view(commit));
+        assert_eq!(
+            app.state.tree_root,
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string())
+        );
+    }
+
+    /// The real gesture a terminal delivers is press, release, press, release —
+    /// not two bare presses. A release in the middle must not disarm the pair.
+    #[test]
+    fn a_full_press_release_pair_still_re_roots_the_tree() {
+        let mut app = app_with_owned_fleet();
+        let row = tree_row_of(&app, "2nd-a");
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(mouse(kind, 2, row));
+        }
+
+        let commit = app
+            .state
+            .next_tree_view_commit_deadline()
+            .expect("a switch is in flight");
+        assert!(app.state.advance_tree_view(commit));
+        assert_eq!(
+            app.state.tree_root,
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string())
+        );
+    }
+
+    /// A worker has nothing under it, so drilling into it would be a dead end.
+    #[test]
+    fn double_clicking_a_leaf_worker_leaves_the_tree_alone() {
+        let mut app = app_with_owned_fleet();
+        let row = tree_row_of(&app, "worker-a");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+
+        assert_eq!(app.state.tree_root, crate::app::tree_view::TreeRoot::Fleet);
+        assert_eq!(app.state.next_tree_view_commit_deadline(), None);
+    }
+
+    /// The header row's breadcrumb is the way back out, and it takes one click
+    /// because leaving is not an ambiguous intent the way entering is.
+    #[test]
+    fn clicking_the_breadcrumb_returns_to_the_whole_fleet() {
+        let mut app = app_with_owned_fleet();
+        app.state.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let rect = crate::ui::sidebar_tree_breadcrumb_rect(
+            &app.state,
+            crate::ui::workspace_list_rect(app.state.view.sidebar_rect),
+        );
+        assert!(rect.width > 0, "a re-rooted tree draws a way back");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x,
+            rect.y,
+        ));
+
+        let commit = app
+            .state
+            .next_tree_view_commit_deadline()
+            .expect("a switch is in flight");
+        assert!(app.state.advance_tree_view(commit));
+        assert_eq!(app.state.tree_root, crate::app::tree_view::TreeRoot::Fleet);
+    }
+
+    /// The gesture is its own inverse: the row already at rank 0 goes back up.
+    #[test]
+    fn double_clicking_the_root_row_goes_back_to_the_fleet() {
+        let mut app = app_with_owned_fleet();
+        app.state.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let row = tree_row_of(&app, "2nd-a");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+
+        let commit = app
+            .state
+            .next_tree_view_commit_deadline()
+            .expect("a switch is in flight");
+        assert!(app.state.advance_tree_view(commit));
+        assert_eq!(app.state.tree_root, crate::app::tree_view::TreeRoot::Fleet);
     }
 
     #[test]
