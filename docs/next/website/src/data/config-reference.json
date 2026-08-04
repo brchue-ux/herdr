@@ -809,6 +809,58 @@
           "description": "How long a configured row departure takes, in milliseconds. Clamped to 60-1500."
         },
         {
+          "key": "ui.sidebar.notifications.enabled",
+          "type": "boolean",
+          "default": "false",
+          "description": "Draw the fleet signal bar on the row above the Spaces tree: eight fixed slots (review, ask, report, busy, stopped, dirty, push, pr), each named and grey while quiet and coloured and animated while its signal is live. Switching it on also arms the git status and pull request refreshes its dirty, push and pr slots read."
+        },
+        {
+          "key": "ui.sidebar.notifications.emphasis",
+          "type": "enum",
+          "default": "\"pulse\"",
+          "description": "What a signal slot does while it is live. Accepts any behaviour name emphasis accepts; none leaves a live slot coloured but still.",
+          "values": [
+            "none",
+            "pulse",
+            "shimmer",
+            "wave",
+            "activity",
+            "activity-shimmer",
+            "fade",
+            "typewriter",
+            "wipe",
+            "drop-in",
+            "dissolve",
+            "collapse"
+          ]
+        },
+        {
+          "key": "ui.sidebar.notifications.enter",
+          "type": "enum",
+          "default": "\"fade\"",
+          "description": "Animation a signal slot plays as it goes live. none draws it fully on its first frame.",
+          "values": [
+            "none",
+            "pulse",
+            "shimmer",
+            "wave",
+            "activity",
+            "activity-shimmer",
+            "fade",
+            "typewriter",
+            "wipe",
+            "drop-in",
+            "dissolve",
+            "collapse"
+          ]
+        },
+        {
+          "key": "ui.sidebar.notifications.enter_ms",
+          "type": "integer",
+          "default": "220",
+          "description": "How long a signal slot's arrival takes, in milliseconds. Clamped to 60-1500."
+        },
+        {
           "key": "ui.accent",
           "type": "color",
           "default": "\"cyan\"",

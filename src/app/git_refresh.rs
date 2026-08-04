@@ -109,6 +109,14 @@ impl App {
                 _ => {}
             }
         }
+        // A configured signal bar reads the same two counts, so it carries the
+        // same demand. Without this its `dirty` and `push` slots would be drawn
+        // over counts nothing ever refreshed and could never go live.
+        if self.state.sidebar_notifications.enabled {
+            let signals = crate::app::fleet_signals::FleetSignalDemand::for_all_signals();
+            demand.dirty |= signals.git_dirty;
+            demand.ahead_behind |= signals.git_ahead_behind;
+        }
         demand
     }
 

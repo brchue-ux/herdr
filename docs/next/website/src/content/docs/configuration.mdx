@@ -450,6 +450,45 @@ This is what makes an ownership tree read as live. Each worker and sub agent row
 
 A row that is still leaving is drawn but is no longer a target: its pane has already closed, so clicking it does nothing.
 
+### The fleet signal bar
+
+Eight fixed slots on the row above the Spaces tree, saying what the fleet is waiting on:
+
+```toml
+[ui.sidebar.notifications]
+enabled = true
+emphasis = "pulse"
+enter = "fade"
+enter_ms = 220
+```
+
+The eight, in the order they always draw:
+
+| Slot | Live when |
+| --- | --- |
+| `●review` | an agent finished while you were looking somewhere else |
+| `◉ask` | an agent is blocked waiting on your answer |
+| `≡report` | a worker has published a `summary` token that is still standing |
+| `◐busy` | something in the fleet is producing output right now |
+| `⊘stopped` | a pane a mate owns is no longer running an agent |
+| `~dirty` | some checkout has uncommitted work |
+| `↑push` | some branch and its upstream have diverged, either way |
+| `⋔pr` | some checkout's remote has open pull requests |
+
+Every slot is drawn in every frame. A quiet slot is its own name in the panel's muted grey; a live one takes its own colour, turns bold, and animates until the signal clears. The resting bar is the legend for the alerting bar, which is why it never hides a slot for being quiet. Two live slots may share a colour on themes that give two palette roles the same value, so a slot is identified by its mark and its fixed position — colour only tells you live from resting.
+
+The bar gives up detail rather than slots as the panel narrows. The header row is one column narrower than the sidebar, so the three forms need a sidebar of:
+
+- **53 columns** for the named form above — 45 columns of marks and names, plus a space between slots.
+- **16 columns** for the marks alone, one space apart: `● ◉ ≡ ◐ ⊘ ~ ↑ ⋔`.
+- **9 columns** for the marks with no gaps: `●◉≡◐⊘~↑⋔`.
+
+Narrower than one column per signal it draws nothing rather than a prefix of itself: a bar showing five of eight marks gives you no way to know which five, which is worse than no bar. Note that `ui.sidebar_max_width` defaults to `36`, so the named form is out of reach until you raise it.
+
+The bar hangs on the left of that row and any `herdr api status set` text right-aligns in whatever is left.
+
+`enabled` defaults to `false`. Three of the slots read counts that cost a `git status` scan or a request to the forge, and Herdr only pays for those while something is drawing them — so switching the bar on is also what arms those refreshes, exactly as configuring a `git_dirty` or `pull_requests` token does. `emphasis` takes any behaviour name above and defaults to `pulse`; set it to `none` for a bar that changes colour without moving. `enter`/`enter_ms` are the arrival a slot plays as it goes live, clamped to 60–1500 ms. A slot has no exit: it never leaves, it just goes back to grey.
+
 Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
 
 `row_gap` controls the blank terminal rows between entries, independently for the Agent and Space panels. It defaults to `0`, which packs entries together; set it to `1` to restore the previous spacing. It does not add spacing between the content lines declared in `rows`. Consecutive indented worktree children remain packed as one Space group.

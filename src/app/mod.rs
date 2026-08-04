@@ -13,6 +13,7 @@ mod api;
 mod api_helpers;
 mod config_io;
 mod creation;
+pub(crate) mod fleet_signals;
 mod git_refresh;
 mod ids;
 mod input;
@@ -722,6 +723,7 @@ impl App {
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             sidebar_animation: config.ui.sidebar.animation,
+            sidebar_notifications: config.ui.sidebar.notifications,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -1657,6 +1659,7 @@ impl App {
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_animation = config.ui.sidebar.animation;
+                self.state.sidebar_notifications = config.ui.sidebar.notifications;
                 // A reload re-owns the config tier only. A plugin- or UI-set
                 // view keeps the panel until its own owner gives it up.
                 self.replace_agent_view(

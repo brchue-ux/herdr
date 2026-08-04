@@ -56,12 +56,13 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
 
 mod agent_resume;
 mod agent_view;
-// The animation engine deliberately publishes a wider surface than its first
-// consumer binds to. Four queued follow-ons — animation quality, live tree
-// expansion, view transitions, and the notification bar — build on it, and the
-// lifecycle half in particular is complete and tested with only its mount phase
-// wired so far. Narrowing it to today's single call site would mean deleting
-// the contract those tasks were told to expect.
+// The animation engine deliberately publishes a wider surface than its
+// consumers bind to. The sidebar's token emphasis and the fleet signal bar are
+// wired; animation quality, live tree expansion, and view transitions are
+// queued and build on the same surface — the dismount phase in particular is
+// complete and tested with no consumer drawing it yet. Narrowing it to today's
+// call sites would mean deleting the contract those tasks were told to
+// expect.
 #[allow(dead_code)]
 mod anim;
 mod api;
@@ -377,6 +378,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Blank rows between space entries. Set to 1 to restore the previous spacing.
 # row_gap = 0
 # rows = [["state_icon", "workspace"], ["branch", "git_status"]]
+
+# [ui.sidebar.notifications]
+# Eight fixed slots on the row above the tree, saying what the fleet is waiting
+# on: review, ask, report, busy, stopped, dirty, push, pr. Each is named and
+# grey while quiet, and coloured and animated while its signal is live.
+# Off by default: the dirty, push, and pr slots are what arm the git status and
+# pull request refreshes they read.
+# enabled = false
+# emphasis = "pulse"
+# enter = "fade"
+# enter_ms = 220
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)

@@ -102,6 +102,15 @@ impl MetadataTokens {
         keys.len()
     }
 
+    /// One token's value, without materialising the whole map.
+    ///
+    /// [`Self::values`] clones every key and value, which is the right shape
+    /// for a consumer that needs the map but pure waste for one asking about a
+    /// single token on every pane on every frame.
+    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+        self.entries.get(key).map(|token| token.value.as_str())
+    }
+
     pub(crate) fn values(&self) -> HashMap<String, String> {
         self.entries
             .iter()

@@ -59,17 +59,24 @@ impl App {
     }
 
     fn pull_requests_are_rendered(&self) -> bool {
-        self.state
-            .sidebar_spaces
-            .rows
-            .iter()
-            .flatten()
-            .any(|token| {
-                matches!(
-                    token.parts().0,
-                    crate::config::SpaceSidebarToken::PullRequests
-                )
-            })
+        // The signal bar's `pr` slot is a second renderer of the same count, so
+        // it arms the same fetch. Nothing else does: the fetch crosses the
+        // network, so it stays gated on something actually drawing the answer.
+        let bar_reads_them = self.state.sidebar_notifications.enabled
+            && crate::app::fleet_signals::FleetSignalDemand::for_all_signals().pull_requests;
+        bar_reads_them
+            || self
+                .state
+                .sidebar_spaces
+                .rows
+                .iter()
+                .flatten()
+                .any(|token| {
+                    matches!(
+                        token.parts().0,
+                        crate::config::SpaceSidebarToken::PullRequests
+                    )
+                })
     }
 
     fn pull_request_refresh_items(&self) -> Vec<PullRequestRefreshItem> {
