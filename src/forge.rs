@@ -18,6 +18,13 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Open pull requests on one forge repository, kept atomic so the renderer can
 /// abbreviate at narrow widths rather than being handed a finished string.
+///
+/// The first three counters are a reading of *every* open pull request; the
+/// last three are deliberately scoped to the ones the authenticated user
+/// authored, because "a check is red" is only an action item when the pull
+/// request it is red on is yours. A caller with no known login gets zeroes in
+/// those three rather than the repository's totals — see [`count_pull_requests`]
+/// and [`merge_check_signals`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullRequestCounts {
     /// Open pull requests that are not drafts.
@@ -26,6 +33,16 @@ pub struct PullRequestCounts {
     pub draft: usize,
     /// Open pull requests that name the authenticated user as a reviewer.
     pub review_requested: usize,
+    /// Pull requests the authenticated user authored whose review decision is
+    /// `CHANGES_REQUESTED` — a review that is waiting on the author, which is
+    /// the one way an *authored* pull request can be asking for you.
+    pub changes_requested: usize,
+    /// Authored pull requests whose head commit's check rollup is red.
+    pub checks_failing: usize,
+    /// Authored pull requests whose head commit's check rollup has not
+    /// finished. Counted apart from `checks_failing` because "still running" is
+    /// a thing you wait on and "failed" is a thing you fix.
+    pub checks_pending: usize,
 }
 
 /// A repository on a forge, as named by a git remote URL.
@@ -217,42 +234,37 @@ fn gh_cli_token(host: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Fetches open pull request counts for one repository.
+/// One `curl` round trip to a forge, with the bearer token kept off argv.
 ///
-/// Returns `None` when the forge could not be reached or answered with anything
-/// other than the expected array; callers keep their previous counts rather than
-/// rendering a zero, because "we could not ask" is not "there is nothing open".
-pub fn fetch_pull_request_counts(slug: &RepoSlug, auth: &ForgeAuth) -> Option<PullRequestCounts> {
-    let api_base = slug.api_base()?;
-
-    // The plain pulls listing, not the search API: it costs one request against
-    // the 5000/hour core budget instead of the search endpoint's 30/minute, and
-    // it already carries the draft flag and requested reviewers.
-    let url = format!(
-        "{api_base}/repos/{}/{}/pulls?state=open&per_page=100",
-        slug.owner, slug.name
-    );
-
-    let output = crate::noninteractive_process::curl_command()
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--max-time",
-            &FETCH_TIMEOUT.as_secs().to_string(),
-            "--header",
-            "Accept: application/vnd.github+json",
-            "--header",
-            "X-GitHub-Api-Version: 2022-11-28",
-            "--header",
-            &format!("User-Agent: herdr/{}", env!("CARGO_PKG_VERSION")),
-            // Passed via a header file on stdin so the token never appears in
-            // this process's argv, where any other user on the box could read it.
-            "--header",
-            "@-",
-            &url,
-        ])
+/// The token is written to stdin and read back by `--header @-`, so it never
+/// appears in this process's argv where any other user on the box could read
+/// it. `body` is an optional request body, which turns the call into a POST.
+/// The body *does* go on argv, and may: it is a GraphQL document naming a
+/// repository that is already visible in the remote URL. Only the credential is
+/// hidden, and stdin is already spent hiding it.
+fn github_request(url: &str, auth: &ForgeAuth, body: Option<&str>) -> Option<Vec<u8>> {
+    let mut command = crate::noninteractive_process::curl_command();
+    command.args([
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--max-time",
+        &FETCH_TIMEOUT.as_secs().to_string(),
+        "--header",
+        "Accept: application/vnd.github+json",
+        "--header",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "--header",
+        &format!("User-Agent: herdr/{}", env!("CARGO_PKG_VERSION")),
+        "--header",
+        "@-",
+    ]);
+    if let Some(body) = body {
+        command.args(["--request", "POST", "--data-binary", body]);
+    }
+    let output = command
+        .arg(url)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -268,12 +280,124 @@ pub fn fetch_pull_request_counts(slug: &RepoSlug, auth: &ForgeAuth) -> Option<Pu
             child.wait_with_output().ok()
         })?;
 
-    if !output.status.success() {
-        return None;
-    }
+    output.status.success().then_some(output.stdout)
+}
 
-    let pulls: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
-    Some(count_pull_requests(&pulls, auth.login.as_deref()))
+/// Fetches open pull request counts for one repository.
+///
+/// Returns `None` when the forge could not be reached or answered with anything
+/// other than the expected array; callers keep their previous counts rather than
+/// rendering a zero, because "we could not ask" is not "there is nothing open".
+///
+/// The check-run rollup is a *second*, best-effort request on top of the
+/// listing. It is best-effort on purpose: a repository whose GraphQL endpoint
+/// refuses the token still gets its open/draft/review counts, with the three
+/// check counters left at zero. A zero there reads as "nothing outstanding",
+/// which is the same way every other never-answered source in Herdr reads.
+pub fn fetch_pull_request_counts(slug: &RepoSlug, auth: &ForgeAuth) -> Option<PullRequestCounts> {
+    let api_base = slug.api_base()?;
+
+    // The plain pulls listing, not the search API: it costs one request against
+    // the 5000/hour core budget instead of the search endpoint's 30/minute, and
+    // it already carries the draft flag and requested reviewers.
+    let url = format!(
+        "{api_base}/repos/{}/{}/pulls?state=open&per_page=100",
+        slug.owner, slug.name
+    );
+
+    let body = github_request(&url, auth, None)?;
+    let pulls: Vec<serde_json::Value> = serde_json::from_slice(&body).ok()?;
+    let mut counts = count_pull_requests(&pulls, auth.login.as_deref());
+
+    if let Some(login) = auth.login.as_deref() {
+        if let Some(nodes) = fetch_authored_pull_request_states(api_base, slug, auth) {
+            merge_check_signals(&mut counts, &nodes, login);
+        }
+    }
+    Some(counts)
+}
+
+/// The GraphQL document behind [`fetch_authored_pull_request_states`].
+///
+/// Deliberately GraphQL rather than a REST fan-out: the REST answer to "is this
+/// pull request's CI red" is one `commits/{sha}/check-runs` request *per* pull
+/// request, so a repository with ten open pull requests would cost ten requests
+/// on every refresh. This is one request that costs one point, and it carries
+/// the review decision beside the rollup so the `pr` and `checks` readings come
+/// from a single consistent snapshot rather than two that can disagree.
+const AUTHORED_PULL_REQUEST_QUERY: &str = "\
+query($owner:String!,$name:String!){\
+repository(owner:$owner,name:$name){\
+pullRequests(states:OPEN,first:50,orderBy:{field:UPDATED_AT,direction:DESC}){\
+nodes{isDraft author{login} reviewDecision \
+commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}";
+
+/// Open pull requests with their review decision and head check rollup.
+///
+/// `None` whenever the endpoint could not be reached or answered with something
+/// other than the expected shape. Never an error the caller has to handle: the
+/// counters this feeds are additions to an answer that is already useful.
+fn fetch_authored_pull_request_states(
+    api_base: &str,
+    slug: &RepoSlug,
+    auth: &ForgeAuth,
+) -> Option<Vec<serde_json::Value>> {
+    let body = serde_json::json!({
+        "query": AUTHORED_PULL_REQUEST_QUERY,
+        "variables": { "owner": slug.owner, "name": slug.name },
+    })
+    .to_string();
+
+    let response = github_request(&format!("{api_base}/graphql"), auth, Some(&body))?;
+    let value: serde_json::Value = serde_json::from_slice(&response).ok()?;
+    value
+        .pointer("/data/repository/pullRequests/nodes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+}
+
+/// Folds the authored-pull-request states into the counts the tray reads.
+///
+/// Three rules, each of which exists to keep a slot from lighting on something
+/// its owner cannot act on:
+///
+/// - Only pull requests `login` authored are counted. Someone else's red CI is
+///   not your action item.
+/// - Drafts are skipped, the same way [`count_pull_requests`] skips them: a
+///   draft's checks are expected to be in flux.
+/// - `EXPECTED` and `PENDING` are pending, `ERROR` and `FAILURE` are failing,
+///   and a missing rollup is neither. A repository with no CI at all must not
+///   read as eternally pending.
+fn merge_check_signals(counts: &mut PullRequestCounts, nodes: &[serde_json::Value], login: &str) {
+    for node in nodes {
+        if node.get("isDraft").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        let authored = node
+            .pointer("/author/login")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case(login));
+        if !authored {
+            continue;
+        }
+
+        if node
+            .get("reviewDecision")
+            .and_then(serde_json::Value::as_str)
+            == Some("CHANGES_REQUESTED")
+        {
+            counts.changes_requested += 1;
+        }
+
+        match node
+            .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("ERROR" | "FAILURE") => counts.checks_failing += 1,
+            Some("EXPECTED" | "PENDING") => counts.checks_pending += 1,
+            _ => {}
+        }
+    }
 }
 
 /// Reduces a pulls listing to the atomic counters the sidebar renders.
@@ -435,6 +559,90 @@ mod tests {
         assert_eq!(counts.open, 0);
         assert_eq!(counts.draft, 1);
         assert_eq!(counts.review_requested, 0);
+    }
+
+    fn nodes(value: &serde_json::Value) -> Vec<serde_json::Value> {
+        value.as_array().expect("array of nodes").clone()
+    }
+
+    #[test]
+    fn only_your_own_pull_requests_can_have_red_checks_you_must_act_on() {
+        let value = serde_json::json!([
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}},
+            // Someone else's red CI is their problem, not an item in your tray.
+            {"isDraft": false, "author": {"login": "someone"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}},
+        ]);
+        let mut counts = PullRequestCounts::default();
+        merge_check_signals(&mut counts, &nodes(&value), "captain");
+
+        assert_eq!(counts.checks_failing, 1);
+        assert_eq!(counts.checks_pending, 0);
+    }
+
+    #[test]
+    fn a_run_still_going_is_counted_apart_from_one_that_failed() {
+        let value = serde_json::json!([
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING"}}}]}},
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "EXPECTED"}}}]}},
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "ERROR"}}}]}},
+        ]);
+        let mut counts = PullRequestCounts::default();
+        merge_check_signals(&mut counts, &nodes(&value), "CAPTAIN");
+
+        assert_eq!(counts.checks_pending, 2);
+        assert_eq!(counts.checks_failing, 1);
+    }
+
+    /// A repository with no CI configured at all reports no rollup. That has to
+    /// read as "nothing outstanding", not as a slot stuck pending forever.
+    #[test]
+    fn a_repository_with_no_checks_at_all_is_quiet() {
+        let value = serde_json::json!([
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": null,
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": null}}]}},
+            {"isDraft": false, "author": {"login": "captain"}, "reviewDecision": "APPROVED",
+             "commits": {"nodes": []}},
+        ]);
+        let mut counts = PullRequestCounts::default();
+        merge_check_signals(&mut counts, &nodes(&value), "captain");
+
+        assert_eq!(counts.checks_failing, 0);
+        assert_eq!(counts.checks_pending, 0);
+        assert_eq!(counts.changes_requested, 0);
+    }
+
+    #[test]
+    fn a_review_asking_for_changes_on_your_own_pull_request_is_yours_to_answer() {
+        let value = serde_json::json!([
+            {"isDraft": false, "author": {"login": "captain"},
+             "reviewDecision": "CHANGES_REQUESTED", "commits": {"nodes": []}},
+            {"isDraft": false, "author": {"login": "someone"},
+             "reviewDecision": "CHANGES_REQUESTED", "commits": {"nodes": []}},
+        ]);
+        let mut counts = PullRequestCounts::default();
+        merge_check_signals(&mut counts, &nodes(&value), "captain");
+
+        assert_eq!(counts.changes_requested, 1);
+    }
+
+    /// A draft is work in progress by definition; its checks are expected to be
+    /// in flux and its reviews are not waiting on anybody yet.
+    #[test]
+    fn a_draft_of_your_own_is_not_an_action_item() {
+        let value = serde_json::json!([
+            {"isDraft": true, "author": {"login": "captain"},
+             "reviewDecision": "CHANGES_REQUESTED",
+             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}},
+        ]);
+        let mut counts = PullRequestCounts::default();
+        merge_check_signals(&mut counts, &nodes(&value), "captain");
+
+        assert_eq!(counts, PullRequestCounts::default());
     }
 
     #[test]

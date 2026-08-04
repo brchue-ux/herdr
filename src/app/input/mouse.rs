@@ -556,6 +556,22 @@ impl AppState {
                         return None;
                     }
 
+                    // The tray owns rows the tree was never laid out over, so
+                    // this cannot steal a click from a row. It is tested before
+                    // the tree anyway, for the same reason the summary badge is:
+                    // a hit here is unambiguous and a fall-through would focus
+                    // whatever the tree happens to think is at that row.
+                    if let Some(signal) =
+                        crate::ui::signal_tray_badge_at(self, mouse.column, mouse.row)
+                    {
+                        self.open_signal_tray_popup(signal);
+                        return None;
+                    }
+                    if crate::ui::signal_tray_menu_at(self, mouse.column, mouse.row) {
+                        self.open_signal_tray_legend();
+                        return None;
+                    }
+
                     if let Some(ws_idx) = self.workspace_group_chevron_at(mouse.column, mouse.row) {
                         if let Some((key, collapsed)) =
                             crate::ui::workspace_parent_group_state(self, ws_idx)
@@ -1151,7 +1167,7 @@ impl AppState {
         );
     }
 
-    pub(super) fn screen_rect(&self) -> Rect {
+    pub(crate) fn screen_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
         let terminal = self.view.terminal_area;
         let x = sidebar.x.min(terminal.x);

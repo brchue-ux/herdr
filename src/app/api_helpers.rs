@@ -34,7 +34,7 @@ pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: 
     }
 }
 
-pub(super) fn encode_api_keys(
+pub(crate) fn encode_api_keys(
     runtime: &crate::terminal::TerminalRuntime,
     keys: &[String],
 ) -> Result<Vec<Vec<u8>>, String> {

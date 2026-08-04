@@ -17,6 +17,7 @@ mod release_notes;
 mod scrollbar;
 mod settings;
 pub(crate) mod sidebar;
+pub(crate) mod signal_tray_popup;
 mod status;
 mod tab_surface;
 mod tabs;
@@ -100,6 +101,25 @@ pub(crate) use self::{
 /// `sidebar`; the layout tests assert against it directly.
 #[cfg(test)]
 pub(crate) use self::sidebar::sidebar_content_rect;
+
+/// The notification tray's geometry, its badge artwork, and the hit tests over
+/// it. Named `signal_tray_*` outside the sidebar module because "tray" alone
+/// says nothing about which surface it belongs to.
+pub(crate) use self::sidebar::tray::{
+    active as signal_tray_active, badge_at as signal_tray_badge_at, image as signal_tray_image,
+    menu_at as signal_tray_menu_at,
+};
+
+/// Where the tray's badge artwork is composited.
+///
+/// Resolved from the live sidebar rect on every pass, so a divider drag moves
+/// the image with the badges rather than leaving it behind.
+pub(crate) fn signal_tray_graphics_rect(
+    app: &crate::app::state::AppState,
+) -> ratatui::layout::Rect {
+    let area = self::sidebar::sidebar_content_rect(app.view.sidebar_rect);
+    self::sidebar::tray::grid_rect(self::sidebar::tray::tray_rect(app, area))
+}
 
 pub(crate) use self::{
     keybind_help::keybind_help_lines,
@@ -451,6 +471,7 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::WorkerSummaries => render_worker_summaries_overlay(app, frame, frame.area()),
+        Mode::SignalTray => self::signal_tray_popup::render(app, frame),
         Mode::Terminal => {}
     }
 }

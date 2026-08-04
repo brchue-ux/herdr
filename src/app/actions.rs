@@ -2761,6 +2761,17 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
+            AppEvent::SignalTrayCommandFinished {
+                signal_name,
+                ok,
+                message,
+            } => {
+                if !ok {
+                    tracing::warn!(signal = signal_name, %message, "a tray command failed");
+                }
+                self.set_tray_outcome(crate::app::signal_tray::TrayOutcome { ok, message });
+                Vec::new()
+            }
             AppEvent::PaneDied { pane_id, exit } => {
                 if matches!(
                     self.toast_config.delivery,

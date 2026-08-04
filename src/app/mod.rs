@@ -24,6 +24,7 @@ pub(crate) mod relation_signal;
 mod runtime;
 mod runtime_mutations;
 mod session;
+pub(crate) mod signal_tray;
 pub mod state;
 mod terminal_targets;
 mod terminal_titles;
@@ -733,6 +734,7 @@ impl App {
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             sidebar_animation: config.ui.sidebar.animation,
             sidebar_notifications: config.ui.sidebar.notifications,
+            sidebar_signal_tray: config.ui.sidebar.signal_tray,
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -791,6 +793,9 @@ impl App {
             integration_install_messages: Vec::new(),
             installed_plugins,
             plugin_panes: std::collections::HashMap::new(),
+            signal_tray: crate::app::signal_tray::SignalTrayState::default(),
+            signal_tray_graphics: None,
+            signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
@@ -1676,6 +1681,7 @@ impl App {
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_animation = config.ui.sidebar.animation;
                 self.state.sidebar_notifications = config.ui.sidebar.notifications;
+                self.state.sidebar_signal_tray = config.ui.sidebar.signal_tray;
                 // A reload re-owns the config tier only. A plugin- or UI-set
                 // view keeps the panel until its own owner gives it up.
                 self.replace_agent_view(
@@ -2007,6 +2013,9 @@ impl App {
             }
             Mode::WorkerSummaries => {
                 self.handle_worker_summaries_key(key_event);
+            }
+            Mode::SignalTray => {
+                self.handle_signal_tray_key(key_event);
             }
             Mode::GlobalMenu => {
                 input::handle_global_menu_key(&mut self.state, key_event);

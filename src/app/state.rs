@@ -918,6 +918,8 @@ pub enum Mode {
     Navigator,
     /// One second mate's finished workers and what they said they did.
     WorkerSummaries,
+    /// The notification tray's popover: one badge's contents, or the legend.
+    SignalTray,
 }
 
 impl Mode {
@@ -949,6 +951,7 @@ impl Mode {
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
                 | Mode::WorkerSummaries
+                | Mode::SignalTray
         )
     }
 }
@@ -1654,6 +1657,8 @@ pub struct AppState {
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub sidebar_animation: crate::config::SidebarAnimationConfig,
     pub sidebar_notifications: crate::config::SidebarNotificationsConfig,
+    /// The notification tray at the foot of the panel.
+    pub sidebar_signal_tray: crate::config::SidebarSignalTrayConfig,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1779,6 +1784,17 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// The notification tray's memory: escalation history and the question a
+    /// blocked pane is showing. See [`crate::app::signal_tray`].
+    pub(crate) signal_tray: crate::app::signal_tray::SignalTrayState,
+    /// The tray's badge artwork, rasterised by the app loop and composited over
+    /// the sidebar. `None` whenever the host cannot show images, the tray is
+    /// off, or the panel is too small to hold it.
+    pub(crate) signal_tray_graphics: Option<GraphicsLayer>,
+    /// What the artwork above was drawn for: the eight states, the grid rect and
+    /// the cell size, folded into one number. Rasterising eight badges is not
+    /// free, so it is redone when this moves and not once per frame.
+    pub(crate) signal_tray_graphics_key: u64,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
     /// The same layers, anchored to a named non-pane region of the client
@@ -2445,6 +2461,7 @@ impl AppState {
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             sidebar_animation: crate::config::SidebarAnimationConfig::default(),
             sidebar_notifications: crate::config::SidebarNotificationsConfig::default(),
+            sidebar_signal_tray: crate::config::SidebarSignalTrayConfig::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,
@@ -2512,6 +2529,9 @@ impl AppState {
             integration_install_messages: Vec::new(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
+            signal_tray: crate::app::signal_tray::SignalTrayState::default(),
+            signal_tray_graphics: None,
+            signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),

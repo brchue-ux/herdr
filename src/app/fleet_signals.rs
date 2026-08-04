@@ -2,25 +2,31 @@
 //! already holds.
 //!
 //! Every signal here is a *reading* of an existing source, never a new one.
-//! `review`, `ask` and `stopped` read the per-pane agent state the detector
+//! `ask`, `review` and `stopped` read the per-pane agent state the detector
 //! already publishes; `report` reads the summary tokens
-//! [`crate::app::worker_summary`] groups; `busy` reads the work-volume level
-//! [`crate::app::pane_activity`] samples; `dirty`, `push` and `pr` read the
-//! counts the background Git and forge refreshes already cache on each
+//! [`crate::app::worker_summary`] groups; `push`, `sync`, `pr` and `checks`
+//! read the counts the background Git and forge refreshes already cache on each
 //! [`crate::workspace::Workspace`]. Nothing in this module runs a subprocess,
 //! touches the network, or keeps a clock of its own — which is what makes the
 //! whole roll-up a pure function of [`AppState`] and testable without a PTY.
 //!
-//! Three properties this module is responsible for holding:
+//! Four properties this module is responsible for holding:
 //!
 //! - **The eight are a fixed, ordered set.** [`FleetSignal::ALL`] is the order
 //!   they are always read in, so a reader learns the positions once and a
 //!   signal never moves under them. Adding a ninth is an explicit edit here,
 //!   not something a caller can do by publishing a new name.
-//! - **A signal is live or it is not.** [`FleetSignals::is_live`] is a
-//!   boolean, and the only continuously varying quantity — how hard the fleet
-//!   is working — is carried separately in [`FleetSignals::intensity`]. That
-//!   split is what stops a renderer from having to invent a threshold.
+//! - **Every one of the eight is an action item.** A signal earns its slot by
+//!   having an owner, a clearing act and a destination. That test is why the
+//!   set is what it is: `busy` has no owner and clears itself, and `dirty` is
+//!   lit in every session anyone actually works in and is only the precondition
+//!   for `push`, so neither is a signal. How hard the fleet is working is still
+//!   read here — as [`FleetSignals::activity`], the tray's own tint — but it is
+//!   not one of the eight things you can act on.
+//! - **A signal is live or it is not.** [`FleetSignals::is_live`] is a boolean.
+//!   The only continuously varying quantity in the whole roll-up is
+//!   [`FleetSignals::activity`], and keeping it off the eight is what stops a
+//!   renderer from having to invent a threshold.
 //! - **A source that has never answered is quiet, not alarming.** The Git and
 //!   forge caches are `None` until their first refresh lands, and `None` reads
 //!   as "nothing outstanding" rather than as an alert, so a Herdr that has just
@@ -31,42 +37,52 @@ use crate::detect::AgentState;
 
 /// One of the eight things the fleet can be waiting on.
 ///
-/// Ordered by who is being waited on: the three that want the captain come
-/// first, then the fleet's own pulse and the worker that has stopped answering,
-/// then the three counts of work that is outstanding somewhere else.
+/// Two rows of four, and the split is the whole ordering: the first four are
+/// the fleet waiting on the captain, the last four are the repository waiting
+/// on him. Within each row they run from the most immediate to the most
+/// deferrable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FleetSignal {
+    /// An agent is blocked on a human answer — [`AgentState::Blocked`].
+    ///
+    /// The flagship: the only one of the eight that is already waiting the
+    /// instant it goes live, and the only one whose answer is a yes or a no.
+    Ask,
     /// An agent finished while the captain was looking somewhere else.
     ///
     /// Herdr's own `done` state: a pane that is idle and whose
     /// [`crate::pane::PaneState::seen`] flag is still false.
     Review,
-    /// An agent is blocked on a human answer — [`AgentState::Blocked`].
-    Ask,
     /// A worker has published a completion summary that is still standing.
     ///
     /// The same `summary` token family the worker-summary badge counts, so the
     /// bar and the badge can never disagree about whether a report exists.
     Report,
-    /// Something in the fleet is producing output right now.
-    ///
-    /// The only analog signal of the eight: its [`FleetSignals::intensity`] is
-    /// the busiest pane's smoothed work volume, which is what lets a
-    /// work-volume-driven behaviour breathe at the fleet's own tempo.
-    Busy,
     /// A pane the fleet owns is no longer running an agent.
     ///
     /// Owned means a mate published an `owner` token for it, so this is a
     /// worker that was launched to do something and is now back at a bare
     /// prompt — not any shell pane the captain happens to have open.
     Stopped,
-    /// Uncommitted work in some checkout.
-    Dirty,
-    /// Commits that have not moved between a branch and its upstream, in
-    /// either direction.
+    /// Commits on a branch that have not left the machine — `ahead > 0`.
     Push,
-    /// Open pull requests on some checkout's remote.
+    /// Commits on the upstream that this checkout does not have — `behind > 0`.
+    ///
+    /// Split from [`Self::Push`] rather than sharing its slot because the two
+    /// are opposite actions with opposite risk: one publishes work, the other
+    /// rewrites the branch it lands on. A slot whose click did one of two
+    /// contradictory things would be worse than no slot.
+    Sync,
+    /// A pull request is waiting on the captain specifically: a review has been
+    /// requested of him, or one of his own has been sent back for changes.
+    ///
+    /// Not "a pull request is open". Open pull requests are the steady state of
+    /// a working repository and reading them as an alert lights the slot
+    /// permanently.
     Pr,
+    /// A check run on one of the captain's own pull requests is red or has not
+    /// finished.
+    Checks,
 }
 
 impl FleetSignal {
@@ -77,15 +93,22 @@ impl FleetSignal {
 
     /// Every signal, in the fixed order they are always read in.
     pub(crate) const ALL: [Self; Self::COUNT] = [
-        Self::Review,
         Self::Ask,
+        Self::Review,
         Self::Report,
-        Self::Busy,
         Self::Stopped,
-        Self::Dirty,
         Self::Push,
+        Self::Sync,
         Self::Pr,
+        Self::Checks,
     ];
+
+    /// How many slots one row of the tray holds.
+    ///
+    /// Four, so [`Self::ALL`] read in order fills row one and then row two. The
+    /// tray's two rows mean different things — see the type docs — so this is a
+    /// property of the set, not of the layout that draws it.
+    pub(crate) const PER_ROW: usize = 4;
 
     /// The word this signal answers to.
     ///
@@ -94,34 +117,55 @@ impl FleetSignal {
     /// job is to say what the eight things are.
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::Review => "review",
             Self::Ask => "ask",
+            Self::Review => "review",
             Self::Report => "report",
-            Self::Busy => "busy",
             Self::Stopped => "stopped",
-            Self::Dirty => "dirty",
             Self::Push => "push",
+            Self::Sync => "sync",
             Self::Pr => "pr",
+            Self::Checks => "checks",
+        }
+    }
+
+    /// One line saying what this signal means, for the tray's legend.
+    ///
+    /// Phrased as the fact that is true while the slot is lit, not as the
+    /// action — the action is on the button in the popup, where it belongs.
+    pub(crate) fn meaning(self) -> &'static str {
+        match self {
+            Self::Ask => "agent blocked on you",
+            Self::Review => "finished, not looked at",
+            Self::Report => "a summary is standing",
+            Self::Stopped => "owned worker went away",
+            Self::Push => "commits not on the remote",
+            Self::Sync => "remote has commits you lack",
+            Self::Pr => "a pull request wants you",
+            Self::Checks => "ci or a bot review needs you",
         }
     }
 
     /// The one-cell mark that stands in for the name when the panel is narrow.
     ///
-    /// Reused from Herdr's own vocabulary wherever one exists — `●` and `◉` and
-    /// `◐` are the marks the state dot already draws for done, blocked and
-    /// working, and `~` and `↑` are git's own porcelain marks, already drawn by
-    /// the `git_dirty` and `git_status` tokens. A reader who knows the tree
-    /// already knows most of the bar.
+    /// Reused from Herdr's own vocabulary wherever one exists — `●` and `◉` are
+    /// the marks the state dot already draws for done and blocked, and `↑` and
+    /// `↓` are git's own porcelain marks, already drawn by the `git_status`
+    /// token. A reader who knows the tree already knows most of the bar.
+    ///
+    /// These marks are the *fallback*, not the design. The tray draws the eight
+    /// as images (see [`crate::ui::sidebar::tray`]); one cell of a font Herdr
+    /// does not control cannot carry a mark with an interior detail, which is
+    /// exactly what tells `report` and `checks` apart.
     pub(crate) fn mark(self) -> &'static str {
         match self {
-            Self::Review => "●",
             Self::Ask => "◉",
+            Self::Review => "●",
             Self::Report => "≡",
-            Self::Busy => "◐",
             Self::Stopped => "⊘",
-            Self::Dirty => "~",
             Self::Push => "↑",
+            Self::Sync => "↓",
             Self::Pr => "⋔",
+            Self::Checks => "✓",
         }
     }
 
@@ -132,14 +176,14 @@ impl FleetSignal {
     /// traffic can grow the engine's element table.
     pub(crate) fn element_key(self) -> &'static str {
         match self {
-            Self::Review => "fleet-signal.review",
             Self::Ask => "fleet-signal.ask",
+            Self::Review => "fleet-signal.review",
             Self::Report => "fleet-signal.report",
-            Self::Busy => "fleet-signal.busy",
             Self::Stopped => "fleet-signal.stopped",
-            Self::Dirty => "fleet-signal.dirty",
             Self::Push => "fleet-signal.push",
+            Self::Sync => "fleet-signal.sync",
             Self::Pr => "fleet-signal.pr",
+            Self::Checks => "fleet-signal.checks",
         }
     }
 
@@ -149,22 +193,30 @@ impl FleetSignal {
     }
 
     /// True when answering this signal costs a `git status` scan.
+    ///
+    /// None of the eight *light* on a dirty tree — that is exactly why `dirty`
+    /// is not one of them. `sync` reads it anyway, because a rebase over
+    /// uncommitted work is the one thing in this tray that could destroy
+    /// something, and the refusal has to be able to see the tree to make it.
+    /// A source that is never refreshed reads as `None`, and `sync` treats
+    /// `None` as "refuse" — so without this demand the slot would be honest but
+    /// permanently useless.
     fn needs_git_dirty(self) -> bool {
-        matches!(self, Self::Dirty)
+        matches!(self, Self::Sync)
     }
 
     /// True when answering this signal costs a read of the branch's upstream.
     fn needs_git_ahead_behind(self) -> bool {
-        matches!(self, Self::Push)
+        matches!(self, Self::Push | Self::Sync)
     }
 
     /// True when answering this signal costs a network round trip to the forge.
     fn needs_pull_requests(self) -> bool {
-        matches!(self, Self::Pr)
+        matches!(self, Self::Pr | Self::Checks)
     }
 }
 
-/// Which of the eight are live right now, plus the one analog level.
+/// Which of the eight are live right now, plus the fleet's own pulse.
 ///
 /// A plain value rather than a borrow of [`AppState`]: a render pass resolves
 /// it once per frame and every consumer of that frame — the layout, the
@@ -185,20 +237,21 @@ impl FleetSignals {
         };
 
         for workspace in &app.workspaces {
-            if workspace.git_dirty().is_some_and(|dirty| !dirty.is_clean()) {
-                signals.set(FleetSignal::Dirty);
+            if let Some((ahead, behind)) = workspace.git_ahead_behind() {
+                if ahead > 0 {
+                    signals.set(FleetSignal::Push);
+                }
+                if behind > 0 {
+                    signals.set(FleetSignal::Sync);
+                }
             }
-            if workspace
-                .git_ahead_behind()
-                .is_some_and(|(ahead, behind)| ahead > 0 || behind > 0)
-            {
-                signals.set(FleetSignal::Push);
-            }
-            if workspace
-                .pull_requests()
-                .is_some_and(|counts| counts.open > 0)
-            {
-                signals.set(FleetSignal::Pr);
+            if let Some(counts) = workspace.pull_requests() {
+                if counts.review_requested > 0 || counts.changes_requested > 0 {
+                    signals.set(FleetSignal::Pr);
+                }
+                if counts.checks_failing > 0 || counts.checks_pending > 0 {
+                    signals.set(FleetSignal::Checks);
+                }
             }
 
             for pane in workspace.tabs.iter().flat_map(|tab| tab.panes.values()) {
@@ -231,9 +284,6 @@ impl FleetSignals {
             }
         }
 
-        if signals.fleet_activity > 0.0 {
-            signals.set(FleetSignal::Busy);
-        }
         signals
     }
 
@@ -256,19 +306,23 @@ impl FleetSignals {
 
     /// How strongly this signal is asserting itself, in `0.0..=1.0`.
     ///
-    /// This is what an animated behaviour's live drive binds to. Seven of the
-    /// eight are yes-or-no facts, so a live one is fully asserted at `1.0`;
-    /// only [`FleetSignal::Busy`] has a real analog level behind it, and it
-    /// reports the busiest pane's own smoothed work volume so the mark breathes
-    /// at the tempo the fleet is actually working at.
+    /// This is what an animated behaviour's live drive binds to. All eight are
+    /// yes-or-no facts, so a live one is fully asserted at `1.0` — the fleet's
+    /// analog pulse is [`Self::activity`], which is a property of the tray as a
+    /// whole rather than of any one slot.
     pub(crate) fn intensity(&self, signal: FleetSignal) -> f32 {
-        if !self.is_live(signal) {
-            return 0.0;
-        }
-        match signal {
-            FleetSignal::Busy => self.fleet_activity.clamp(0.0, 1.0),
-            _ => 1.0,
-        }
+        f32::from(u8::from(self.is_live(signal)))
+    }
+
+    /// How hard the fleet is working, in `0.0..=1.0`.
+    ///
+    /// The busiest pane's smoothed work volume. This used to be a ninth thing
+    /// in the list, called `busy`, and it does not belong there: nobody owns
+    /// it, it clears itself, and it points at every pane at once rather than
+    /// at one. It is a genuinely good ambient reading all the same, so the tray
+    /// takes it as its own tint rather than as one of the eight slots.
+    pub(crate) fn activity(&self) -> f32 {
+        self.fleet_activity.clamp(0.0, 1.0)
     }
 
     /// The signals that are live, as animation elements with their live drives.
@@ -328,13 +382,29 @@ pub(crate) struct FleetSignalDemand {
 }
 
 impl FleetSignalDemand {
-    /// What the whole bar needs. Every signal is always drawn, so a bar that is
-    /// on needs every source that any of the eight reads.
+    /// What a surface that only *reads* all eight needs.
+    ///
+    /// Every signal is always drawn, so a bar that is on needs every source any
+    /// of the eight lights from. Deliberately not the `git status` scan: none
+    /// of the eight lights on a dirty tree, and that scan's cost scales with
+    /// the size of the checkout, so a readout must not arm it.
     pub(crate) fn for_all_signals() -> Self {
         Self {
-            git_dirty: FleetSignal::ALL.iter().any(|s| s.needs_git_dirty()),
+            git_dirty: false,
             git_ahead_behind: FleetSignal::ALL.iter().any(|s| s.needs_git_ahead_behind()),
             pull_requests: FleetSignal::ALL.iter().any(|s| s.needs_pull_requests()),
+        }
+    }
+
+    /// What a surface that can be *acted on* needs, which is strictly more.
+    ///
+    /// The tray's `sync` refuses on a dirty tree, and a refusal that cannot see
+    /// the tree is a refusal that always fires. Nothing else in the eight costs
+    /// a source the readout did not already arm.
+    pub(crate) fn for_tray() -> Self {
+        Self {
+            git_dirty: FleetSignal::ALL.iter().any(|s| s.needs_git_dirty()),
+            ..Self::for_all_signals()
         }
     }
 }
@@ -357,11 +427,29 @@ mod tests {
         assert_eq!(seen.len(), FleetSignal::COUNT);
 
         // The order is the contract: a reader learns the positions once, so a
-        // signal must never move under them.
+        // signal must never move under them. It is also the tray's reading
+        // order — the first four are the fleet waiting on you, the last four
+        // are the repository waiting on you.
         assert_eq!(
             FleetSignal::ALL.map(FleetSignal::name),
-            ["review", "ask", "report", "busy", "stopped", "dirty", "push", "pr"]
+            ["ask", "review", "report", "stopped", "push", "sync", "pr", "checks"]
         );
+        assert_eq!(FleetSignal::COUNT, FleetSignal::PER_ROW * 2);
+    }
+
+    #[test]
+    fn every_signal_says_what_it_means_in_one_line() {
+        // The legend is what stops the tray being eight pictures nobody can
+        // name, so a slot with no meaning is a slot that cannot ship.
+        for signal in FleetSignal::ALL {
+            let meaning = signal.meaning();
+            assert!(!meaning.trim().is_empty(), "{signal:?} has no meaning line");
+            assert!(
+                meaning.len() <= 32,
+                "{signal:?}'s meaning is {} columns, too wide for the legend",
+                meaning.len()
+            );
+        }
     }
 
     /// The compact tier draws marks alone, one column each. A mark two cells
@@ -423,39 +511,123 @@ mod tests {
         assert!(!FleetSignals::resolve(&app).any_live());
     }
 
+    /// The whole reason `pr` was recut. Open pull requests are the steady state
+    /// of a working repository; a slot that lights on them is lit forever and
+    /// says nothing. What is actionable is a pull request that wants *you*.
     #[test]
-    fn outstanding_git_and_forge_work_light_their_own_slots() {
+    fn open_pull_requests_alone_are_not_an_action_item() {
+        let mut app = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("one");
+        workspace.cached_pull_requests = Some(crate::forge::PullRequestCounts {
+            open: 7,
+            draft: 2,
+            ..Default::default()
+        });
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+
+        assert!(!FleetSignals::resolve(&app).is_live(FleetSignal::Pr));
+    }
+
+    #[test]
+    fn a_pull_request_that_wants_you_lights_pr_either_way_round() {
+        for counts in [
+            crate::forge::PullRequestCounts {
+                open: 1,
+                review_requested: 1,
+                ..Default::default()
+            },
+            crate::forge::PullRequestCounts {
+                open: 1,
+                changes_requested: 1,
+                ..Default::default()
+            },
+        ] {
+            let mut app = AppState::test_new();
+            let mut workspace = crate::workspace::Workspace::test_new("one");
+            workspace.cached_pull_requests = Some(counts);
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+
+            let signals = FleetSignals::resolve(&app);
+            assert!(
+                signals.is_live(FleetSignal::Pr),
+                "{counts:?} did not light pr"
+            );
+            assert_eq!(signals.intensity(FleetSignal::Pr), 1.0);
+        }
+    }
+
+    #[test]
+    fn red_and_unfinished_checks_both_light_the_checks_slot() {
+        for counts in [
+            crate::forge::PullRequestCounts {
+                checks_failing: 1,
+                ..Default::default()
+            },
+            crate::forge::PullRequestCounts {
+                checks_pending: 2,
+                ..Default::default()
+            },
+        ] {
+            let mut app = AppState::test_new();
+            let mut workspace = crate::workspace::Workspace::test_new("one");
+            workspace.cached_pull_requests = Some(counts);
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+
+            assert!(FleetSignals::resolve(&app).is_live(FleetSignal::Checks));
+        }
+    }
+
+    /// `push` and `sync` are opposite actions with opposite risk, so they must
+    /// never light together off one comparison. A branch that is ahead has work
+    /// to publish; a branch that is behind has work to take in.
+    #[test]
+    fn ahead_and_behind_light_different_slots() {
+        let cases = [
+            ((3, 0), true, false),
+            ((0, 4), false, true),
+            ((2, 5), true, true),
+            ((0, 0), false, false),
+        ];
+        for ((ahead, behind), expect_push, expect_sync) in cases {
+            let mut app = AppState::test_new();
+            let mut workspace = crate::workspace::Workspace::test_new("one");
+            workspace.cached_git_ahead_behind = Some((ahead, behind));
+            app.workspaces = vec![workspace];
+            app.ensure_test_terminals();
+
+            let signals = FleetSignals::resolve(&app);
+            assert_eq!(
+                signals.is_live(FleetSignal::Push),
+                expect_push,
+                "push for ahead={ahead} behind={behind}"
+            );
+            assert_eq!(
+                signals.is_live(FleetSignal::Sync),
+                expect_sync,
+                "sync for ahead={ahead} behind={behind}"
+            );
+        }
+    }
+
+    /// A dirty tree is the precondition for `push`, not a signal of its own: in
+    /// a fleet where every crewmate leaves a dirty worktree it would be lit in
+    /// every session that is actually being used.
+    #[test]
+    fn a_dirty_tree_alone_lights_nothing() {
         let mut app = AppState::test_new();
         let mut workspace = crate::workspace::Workspace::test_new("one");
         workspace.cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
             staged: 0,
             unstaged: 2,
-            untracked: 0,
-        });
-        workspace.cached_pull_requests = Some(crate::forge::PullRequestCounts {
-            open: 3,
-            draft: 1,
-            review_requested: 0,
+            untracked: 1,
         });
         app.workspaces = vec![workspace];
         app.ensure_test_terminals();
 
-        let signals = FleetSignals::resolve(&app);
-        assert!(signals.is_live(FleetSignal::Dirty));
-        assert!(signals.is_live(FleetSignal::Pr));
-        assert!(!signals.is_live(FleetSignal::Push), "nothing is ahead");
-        assert_eq!(signals.intensity(FleetSignal::Dirty), 1.0);
-    }
-
-    #[test]
-    fn a_branch_behind_its_upstream_counts_as_unmoved_work_too() {
-        let mut app = AppState::test_new();
-        let mut workspace = crate::workspace::Workspace::test_new("one");
-        workspace.cached_git_ahead_behind = Some((0, 4));
-        app.workspaces = vec![workspace];
-        app.ensure_test_terminals();
-
-        assert!(FleetSignals::resolve(&app).is_live(FleetSignal::Push));
+        assert!(!FleetSignals::resolve(&app).any_live());
     }
 
     /// Sets the agent state of the first pane of the first workspace, and
@@ -554,24 +726,37 @@ mod tests {
         assert!(FleetSignals::resolve(&app).is_live(FleetSignal::Report));
     }
 
-    /// `busy` is the one signal with a real analog level behind it; the other
-    /// seven are yes-or-no and assert fully when they assert at all.
+    /// The eight are all yes-or-no now. The fleet's analog pulse is carried
+    /// apart from them, because it is a property of the tray rather than a
+    /// thing anybody can act on.
     #[test]
-    fn only_busy_reports_a_partial_intensity() {
+    fn every_signal_is_a_yes_or_no_and_the_pulse_is_carried_apart() {
         let mut signals = FleetSignals::default();
-        signals.set(FleetSignal::Busy);
         signals.set(FleetSignal::Ask);
         signals.fleet_activity = 0.25;
 
-        assert_eq!(signals.intensity(FleetSignal::Busy), 0.25);
         assert_eq!(signals.intensity(FleetSignal::Ask), 1.0);
-        assert_eq!(signals.intensity(FleetSignal::Dirty), 0.0);
+        assert_eq!(signals.intensity(FleetSignal::Push), 0.0);
+        assert_eq!(signals.activity(), 0.25);
+        // A busy fleet with nothing outstanding lights no slot at all.
+        assert!(!signals.is_live(FleetSignal::Review));
+    }
+
+    /// The pulse is a reading, not a signal: it must never make a slot live.
+    #[test]
+    fn a_working_fleet_with_nothing_outstanding_lights_no_slot() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+
+        let signals = FleetSignals::resolve(&app);
+        assert!(!signals.any_live());
     }
 
     #[test]
     fn only_live_signals_reach_the_animation_membership_set() {
         let mut signals = FleetSignals::default();
-        signals.set(FleetSignal::Dirty);
+        signals.set(FleetSignal::Push);
         signals.set(FleetSignal::Review);
 
         let membership: Vec<_> = signals.animation_membership().collect();
@@ -582,7 +767,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 FleetSignal::Review.element_id(),
-                FleetSignal::Dirty.element_id(),
+                FleetSignal::Push.element_id(),
             ],
             "membership must follow the fixed order, live entries only"
         );
@@ -590,11 +775,23 @@ mod tests {
     }
 
     /// The bar draws all eight, so it needs every source any of the eight
-    /// reads. A demand that missed one would render a slot that could never
-    /// light up, which is worse than not drawing it.
+    /// lights from. A demand that missed one would render a slot that could
+    /// never light up, which is worse than not drawing it.
     #[test]
-    fn a_configured_bar_demands_every_source_its_slots_read() {
+    fn a_configured_bar_demands_every_source_its_slots_light_from() {
         let demand = FleetSignalDemand::for_all_signals();
+        assert!(demand.git_ahead_behind);
+        assert!(demand.pull_requests);
+        // The `git status` scan costs the whole checkout and lights nothing.
+        assert!(!demand.git_dirty);
+    }
+
+    /// The tray can be clicked, and `sync` refuses on a dirty tree. A refusal
+    /// that cannot see the tree is a refusal that always fires, so the tray
+    /// arms the scan the readout deliberately does not.
+    #[test]
+    fn a_tray_additionally_demands_what_its_refusals_read() {
+        let demand = FleetSignalDemand::for_tray();
         assert!(demand.git_dirty);
         assert!(demand.git_ahead_behind);
         assert!(demand.pull_requests);

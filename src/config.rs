@@ -29,8 +29,8 @@ pub use self::{
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarAnimationConfig, SidebarConfig,
-        SidebarNotificationsConfig, SidebarTokenEmphasis, SidebarTokenStyle, SpaceSidebarToken,
-        SpacesSidebarConfig,
+        SidebarNotificationsConfig, SidebarSignalTrayConfig, SidebarTokenEmphasis,
+        SidebarTokenStyle, SpaceSidebarToken, SpacesSidebarConfig,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
