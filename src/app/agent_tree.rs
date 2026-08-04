@@ -135,16 +135,31 @@ impl AgentRelation {
     }
 }
 
-/// What one entity says about its place in the tree, and nothing else.
+/// What one entity says about its place in the tree, plus any place it holds
+/// by construction rather than by publication.
 ///
-/// Both fields are what the entity *published*, not what it turned out to be:
-/// resolving them against the rest of the fleet is this module's whole job.
+/// [`Self::name`] and [`Self::owner`] are what the entity *published*, not what
+/// it turned out to be: resolving them against the rest of the fleet is this
+/// module's whole job.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OwnedNode<'a> {
     /// The handle another entity's `owner` token names.
     pub name: Option<&'a str>,
     /// The `owner` token, naming whoever owns this entity.
     pub owner: Option<&'a str>,
+    /// A parent this node already has structurally, as an index into the same
+    /// slice.
+    ///
+    /// Worktree membership is the only such edge today: a Space that is a
+    /// linked worktree of another Space belongs to that checkout as a fact of
+    /// the repository, not as something either Space asked for. Recording it
+    /// by *index* is the point — two Spaces that happen to display the same
+    /// label cannot swap children, which a name lookup would let them do.
+    ///
+    /// It outranks [`Self::owner`] because a fact outranks a preference, and it
+    /// still goes through the same cycle-breaking, so a structural edge can no
+    /// more strand a node than a published one can.
+    pub parent: Option<usize>,
 }
 
 /// Where one node landed once the tree was walked.
@@ -256,6 +271,10 @@ fn agent_nodes(entries: &[AgentPanelEntry]) -> Vec<OwnedNode<'_>> {
         .map(|entry| OwnedNode {
             name: entry.agent_name.as_deref(),
             owner: entry.owner.as_deref(),
+            // A pane holds no structural place of its own: everything it knows
+            // about its owner it published, including the `created_by` edge,
+            // which `resolve_owner` has already turned into a name by here.
+            parent: None,
         })
         .collect()
 }
@@ -306,6 +325,11 @@ pub(crate) fn arrange_agent_tree(entries: &mut Vec<AgentPanelEntry>) {
 /// pane answers to, or sits on a cycle. Falling back to "root" rather than
 /// dropping the entry is deliberate: an unreachable pane is a pane the user
 /// cannot rescue.
+///
+/// [`OwnedNode::parent`] short-circuits the name lookup for the nodes that
+/// carry one, so a structural edge is resolved without ever entering the name
+/// namespace — but it joins the same cycle scan below, so it degrades to a root
+/// on a loop exactly as a published edge does.
 fn resolve_parents(nodes: &[OwnedNode<'_>]) -> Vec<Option<usize>> {
     let mut by_name: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (idx, node) in nodes.iter().enumerate() {
@@ -320,8 +344,13 @@ fn resolve_parents(nodes: &[OwnedNode<'_>]) -> Vec<Option<usize>> {
         .iter()
         .enumerate()
         .map(|(idx, node)| {
-            let parent = *by_name.get(node.owner?)?;
-            (parent != idx).then_some(parent)
+            let parent = match node.parent {
+                Some(parent) => parent,
+                None => *by_name.get(node.owner?)?,
+            };
+            // A structural index is caller-supplied, so it is bounds-checked
+            // here rather than trusted into the cycle scan below.
+            (parent != idx && parent < nodes.len()).then_some(parent)
         })
         .collect();
 

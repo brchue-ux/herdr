@@ -494,7 +494,7 @@ impl AppState {
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace {
                     ws_idx,
-                    indented: false,
+                    worktree_child: false,
                     ..
                 } => Some(ws_idx),
                 _ => None,
