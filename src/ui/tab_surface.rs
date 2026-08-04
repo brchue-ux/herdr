@@ -309,11 +309,14 @@ mod tests {
         // It moved again when the `spaces` title and the second-mate drop-down
         // were removed: the header row is still there but is now empty, so
         // every tree row draws one row higher than it did.
+        // It moved once more when the sidebar divider grew an at-rest grip:
+        // three rows in the middle of the bar now carry a lighter foreground.
+        // The glyphs are untouched, so this is purely a style move.
         // The mobile digest below is unchanged, so the desktop sidebar is the
         // only thing that moved.
         assert_eq!(
             frame_digest(&frame),
-            "be6991df9bbbb10fcac5e4b3f59fe71ddc15892df1f909b795a7e488d9b99f95"
+            "0de4de07a51fe35d919cd8054b9c1d6952f2069e2cda858cc604fd00601841d1"
         );
     }
 

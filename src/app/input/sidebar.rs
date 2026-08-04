@@ -284,6 +284,38 @@ impl AppState {
         self.sidebar_divider_grab_at(col, row).is_some()
     }
 
+    /// Modes whose sidebar is the thing under the pointer. In every other mode
+    /// a modal owns the screen, so a pointer passing over the divider's columns
+    /// is not hovering the divider and must not light it up behind the overlay.
+    fn sidebar_divider_is_reachable(&self) -> bool {
+        matches!(
+            self.mode,
+            crate::app::Mode::Terminal | crate::app::Mode::Navigate | crate::app::Mode::Resize
+        )
+    }
+
+    /// Records whether the divider is under the pointer so the renderer can
+    /// show it is grabbable before the grab. Mirrors the hit test exactly, so
+    /// the highlight can never promise a drag the press would not start.
+    ///
+    /// A live divider drag keeps the highlight on regardless of where the
+    /// pointer has been dragged to; every other event just re-reads the
+    /// pointer's current cell.
+    pub(super) fn track_sidebar_divider_hover(&mut self, mouse: crossterm::event::MouseEvent) {
+        let hovered = if matches!(
+            self.drag.as_ref().map(|drag| &drag.target),
+            Some(crate::app::state::DragTarget::SidebarDivider { .. })
+        ) {
+            true
+        } else {
+            self.sidebar_divider_is_reachable()
+                && self
+                    .sidebar_divider_grab_at(mouse.column, mouse.row)
+                    .is_some()
+        };
+        self.sidebar_divider_hover = hovered;
+    }
+
     pub(super) fn on_sidebar_toggle(&self, col: u16, row: u16) -> bool {
         let rect = if self.sidebar_collapsed {
             crate::ui::collapsed_sidebar_toggle_rect(self.view.sidebar_rect)
@@ -1498,6 +1530,96 @@ mod tests {
                 .sidebar_divider_grab_at(bar_col, sidebar.y + sidebar.height),
             None
         );
+    }
+
+    /// The hover flag has to agree with the hit test cell for cell, or the
+    /// divider lights up somewhere a press would not actually grab it.
+    #[test]
+    fn hovering_the_divider_grab_band_marks_it_and_leaving_clears_it() {
+        let mut app = app_for_divider_test();
+        let bar_col = drawn_divider_cells(&mut app).expect("sidebar bar is drawn");
+        let row = DIVIDER_TEST_AREA.y + 4;
+
+        assert!(
+            !app.state.sidebar_divider_hover,
+            "the divider starts unhovered"
+        );
+
+        for col in [bar_col, bar_col - 1] {
+            app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+            assert!(
+                app.state.sidebar_divider_hover,
+                "column {col} is in the grab band but did not mark the divider"
+            );
+        }
+
+        for col in [bar_col + 1, bar_col - 2] {
+            app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+            assert!(
+                !app.state.sidebar_divider_hover,
+                "column {col} is outside the grab band but marked the divider"
+            );
+        }
+    }
+
+    /// The collapse toggle keeps its clicks, so it must not look grabbable
+    /// either - a highlight there would promise a drag the press never starts.
+    #[test]
+    fn hovering_a_carved_out_cell_does_not_mark_the_divider() {
+        let mut app = app_for_divider_test();
+        let sidebar = app.state.view.sidebar_rect;
+        let toggle = crate::ui::expanded_sidebar_toggle_rect(sidebar);
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, toggle.x, toggle.y));
+
+        assert!(!app.state.sidebar_divider_hover);
+    }
+
+    /// Dragging the divider pulls the pointer well off the bar, and the bar has
+    /// to keep looking held for as long as the drag lasts.
+    #[test]
+    fn a_live_divider_drag_keeps_the_divider_marked_away_from_the_bar() {
+        let mut app = app_for_divider_test();
+        let bar_col = drawn_divider_cells(&mut app).expect("sidebar bar is drawn");
+        let row = DIVIDER_TEST_AREA.y + 4;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar_col, row));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            bar_col + 12,
+            row,
+        ));
+        assert!(
+            app.state.sidebar_divider_hover,
+            "the divider stopped looking held mid-drag"
+        );
+
+        recompute(&mut app);
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            bar_col + 12,
+            row,
+        ));
+        recompute(&mut app);
+        app.handle_mouse(mouse(MouseEventKind::Moved, bar_col + 12, row));
+        assert!(
+            !app.state.sidebar_divider_hover,
+            "the divider stayed marked after the drag was released"
+        );
+    }
+
+    /// A collapsed sidebar cannot be dragged, so it must not offer a hover.
+    #[test]
+    fn a_collapsed_sidebar_divider_never_marks_as_hovered() {
+        let mut app = app_for_divider_test();
+        let bar_col = drawn_divider_cells(&mut app).expect("sidebar bar is drawn");
+        let row = DIVIDER_TEST_AREA.y + 4;
+        app.state.sidebar_collapsed = true;
+        recompute(&mut app);
+
+        app.handle_mouse(mouse(MouseEventKind::Moved, bar_col, row));
+
+        assert!(!app.state.sidebar_divider_hover);
     }
 
     /// A divider-test app whose Spaces list overflows, so the sidebar scrollbar

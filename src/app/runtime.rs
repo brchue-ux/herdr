@@ -168,13 +168,17 @@ impl App {
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 let changes_view = !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved)
                     || self.state.mode.mouse_motion_changes_view();
+                let divider_hover_before = self.state.sidebar_divider_hover;
                 if self.state.popup_pane.is_some() || self.state.mouse_capture {
                     self.handle_mouse(mouse);
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                 }
-                changes_view
+                // The divider's hover state is drawn, so a motion that crosses
+                // into or out of its grab band is not the render-neutral motion
+                // the mode-level check above assumes.
+                changes_view || self.state.sidebar_divider_hover != divider_hover_before
             }
             crate::raw_input::RawInputEvent::OuterFocusGained => {
                 self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);
