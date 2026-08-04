@@ -284,31 +284,43 @@ impl TrayBadge {
         if self.signal != FleetSignal::Sync {
             return None;
         }
-        let TrayTarget::Checkout { ws_idx } = self.item(index)?.target else {
+        let Some(item) = self.item(index) else {
+            // No item to act on is itself a reason not to act.
+            return Some("that checkout is gone — nothing to sync".to_string());
+        };
+        let TrayTarget::Checkout { ws_idx } = item.target else {
             return None;
         };
-        match app.workspaces.get(ws_idx)?.git_dirty() {
-            Some(dirty) if dirty.is_clean() => None,
-            Some(_) => Some("the tree has uncommitted work — open it instead".to_string()),
-            None => Some("the tree has not been read yet — open it instead".to_string()),
+        // Every arm below refuses except the one that has *seen* a clean tree.
+        // A missing workspace refuses too: the Space can be closed while its own
+        // popup is open, and "we cannot find it" must fail the way "it is dirty"
+        // does rather than falling through to no refusal at all.
+        match app.workspaces.get(ws_idx).map(|w| w.git_dirty()) {
+            Some(Some(dirty)) if dirty.is_clean() => None,
+            Some(Some(_)) => Some("the tree has uncommitted work — open it instead".to_string()),
+            Some(None) => Some("the tree has not been read yet — open it instead".to_string()),
+            None => Some("that checkout is gone — nothing to sync".to_string()),
         }
     }
 }
 
 /// The eight badges as they stand right now.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// An array rather than a `Vec`, and deliberately not `Default`: the eight are
+/// a fixed, ordered set, so a reading that held some other number of them would
+/// be a reading of something that is not this tray. That is also what makes
+/// [`Self::badge`] total — it indexes by the signal's own fixed position rather
+/// than searching and needing something to fall back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrayReading {
-    badges: Vec<TrayBadge>,
+    badges: [TrayBadge; FleetSignal::COUNT],
     /// The fleet's own pulse, `0.0..=1.0` — the tray's tint, not a slot.
     activity_permille: u16,
 }
 
 impl TrayReading {
     pub(crate) fn badge(&self, signal: FleetSignal) -> &TrayBadge {
-        self.badges
-            .iter()
-            .find(|badge| badge.signal == signal)
-            .unwrap_or_else(|| &self.badges[0])
+        &self.badges[index_of(signal)]
     }
 
     pub(crate) fn badges(&self) -> impl Iterator<Item = &TrayBadge> {
@@ -502,25 +514,22 @@ pub(crate) fn resolve(app: &AppState) -> TrayReading {
     let signals = FleetSignals::resolve(app);
     let items = collect_items(app);
 
-    let badges = FleetSignal::ALL
-        .into_iter()
-        .map(|signal| {
-            let items = items.get(&index_of(signal)).cloned().unwrap_or_default();
-            let state = if !signals.is_live(signal) || items.is_empty() {
-                BadgeState::Idle
-            } else if app.signal_tray.escalated(signal) {
-                BadgeState::Attention
-            } else {
-                BadgeState::Active
-            };
-            TrayBadge {
-                signal,
-                state,
-                action: tray_action(signal),
-                items,
-            }
-        })
-        .collect();
+    let badges = FleetSignal::ALL.map(|signal| {
+        let items = items.get(&index_of(signal)).cloned().unwrap_or_default();
+        let state = if !signals.is_live(signal) || items.is_empty() {
+            BadgeState::Idle
+        } else if app.signal_tray.escalated(signal) {
+            BadgeState::Attention
+        } else {
+            BadgeState::Active
+        };
+        TrayBadge {
+            signal,
+            state,
+            action: tray_action(signal),
+            items,
+        }
+    });
 
     TrayReading {
         badges,
@@ -829,6 +838,47 @@ mod tests {
 
     /// A dirty tree must never stop a `push`: pushing publishes commits that
     /// are already made and touches nothing in the working tree.
+    /// Every arm of the refusal refuses except the one that has *seen* a clean
+    /// tree. A Space can be closed while its own popup is open, and "we cannot
+    /// find it" has to fail the way "it is dirty" does — a `None` there would
+    /// have been read as "nothing to refuse".
+    #[test]
+    fn a_checkout_that_has_gone_refuses_rather_than_falling_through() {
+        let app = app_with_workspace();
+        let badge = TrayBadge {
+            signal: FleetSignal::Sync,
+            state: BadgeState::Active,
+            action: tray_action(FleetSignal::Sync),
+            items: vec![TrayItem {
+                label: "gone".into(),
+                detail: Vec::new(),
+                // An index past the end of the workspace list: the Space this
+                // badge was resolved against has since been closed.
+                target: TrayTarget::Checkout { ws_idx: 99 },
+            }],
+        };
+        assert!(badge.refusal(&app, 0).is_some());
+        assert_eq!(badge.command(&app, 0, true), None);
+
+        // And a badge with no items at all refuses rather than answering None.
+        let empty = TrayBadge {
+            items: Vec::new(),
+            ..badge
+        };
+        assert!(empty.refusal(&app, 0).is_some());
+    }
+
+    /// The reading holds exactly the eight, so looking one up is total: there is
+    /// no empty reading for a lookup to fall off the end of.
+    #[test]
+    fn every_signal_resolves_to_its_own_badge() {
+        let app = app_with_workspace();
+        let reading = resolve(&app);
+        for signal in FleetSignal::ALL {
+            assert_eq!(reading.badge(signal).signal, signal);
+        }
+    }
+
     #[test]
     fn push_is_not_refused_by_a_dirty_tree() {
         let mut app = app_with_workspace();
