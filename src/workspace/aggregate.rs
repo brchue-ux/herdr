@@ -28,6 +28,10 @@ pub struct PaneDetail {
     /// The pane's own handle, as set by `pane report-agent --name`. This is
     /// what another pane's `owner` token refers to.
     pub agent_name: Option<String>,
+    /// Which pane asked Herdr to create this one, if a pane did. The panel
+    /// turns this into an owner edge; see
+    /// [`crate::terminal::TerminalState::created_by`].
+    pub created_by: Option<crate::api::schema::PaneOrigin>,
 }
 
 impl Tab {
@@ -73,6 +77,7 @@ impl Tab {
                     state_labels: presentation.state_labels,
                     tokens: terminal.metadata_tokens.values(),
                     agent_name: terminal.agent_name.clone(),
+                    created_by: terminal.created_by.clone(),
                 })
             })
             .collect()

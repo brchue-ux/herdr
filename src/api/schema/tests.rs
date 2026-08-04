@@ -54,6 +54,7 @@ fn request_uses_dot_method_names() {
             focus: true,
             label: Some("api".into()),
             env: Default::default(),
+            caller_pane_id: None,
         }),
     };
 
@@ -776,6 +777,8 @@ fn worktree_request_and_response_round_trip() {
                 scroll: None,
                 activity: None,
                 revision: 0,
+                created_by: None,
+                owner: None,
             },
             worktree: WorktreeInfo {
                 path: "/worktrees/herdr/worktree-api".into(),
@@ -1233,6 +1236,8 @@ fn create_response_round_trips_with_root_pane() {
                 scroll: None,
                 activity: None,
                 revision: 0,
+                created_by: None,
+                owner: None,
             },
         },
     };

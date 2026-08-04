@@ -1173,6 +1173,7 @@ impl App {
                         focus: true,
                         label: None,
                         env: Default::default(),
+                        caller_pane_id: None,
                     },
                 );
                 needs_render = true;
@@ -1189,6 +1190,7 @@ impl App {
                         focus: true,
                         label,
                         env: Default::default(),
+                        caller_pane_id: None,
                     },
                 );
                 needs_render = true;
@@ -1212,6 +1214,7 @@ impl App {
                         focus: true,
                         label: None,
                         env: Default::default(),
+                        caller_pane_id: None,
                     },
                 );
                 needs_render = true;
@@ -4458,6 +4461,7 @@ mod tests {
                 cwd: None,
                 focus: false,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4538,6 +4542,7 @@ mod tests {
                 cwd: None,
                 focus: true,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4584,6 +4589,7 @@ mod tests {
                 cwd: None,
                 focus: false,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4630,6 +4636,7 @@ mod tests {
                 cwd: None,
                 focus: false,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

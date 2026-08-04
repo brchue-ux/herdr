@@ -620,6 +620,10 @@ fn parse_pane_split_args(
         cwd,
         focus,
         env,
+        // Always the pane running this command, never the split target: the two
+        // differ whenever `--pane` names somebody else, and it is the caller
+        // Herdr records as the new pane's origin.
+        caller_pane_id: env_pane_id.map(super::normalize_pane_id),
     })
 }
 

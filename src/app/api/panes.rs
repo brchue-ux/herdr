@@ -50,6 +50,8 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        // Resolved before the split, while the caller is certainly still live.
+        let origin = self.resolve_pane_origin(params.caller_pane_id.as_deref());
         let (rows, cols) = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
             let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
@@ -94,11 +96,12 @@ impl App {
                 params.focus,
             ),
         };
-        let (target_tab_idx, new_pane) = match split_result {
+        let (target_tab_idx, mut new_pane) = match split_result {
             Some(Ok(result)) => result,
             Some(Err(err)) => return encode_error(id, "pane_split_failed", err.to_string()),
             None => return encode_error(id, "pane_not_found", "pane not found"),
         };
+        new_pane.terminal.created_by = origin;
         if params.focus {
             self.state.switch_workspace_tab(ws_idx, target_tab_idx);
             self.state
@@ -2376,6 +2379,44 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    /// A caller that says nothing gets no origin. Creation still succeeds —
+    /// the field is optional on purpose, so a script that predates it keeps
+    /// working — it just produces an unowned pane.
+    #[test]
+    fn an_absent_caller_records_no_origin() {
+        let app = app_with_linked_worktree();
+        assert_eq!(app.resolve_pane_origin(None), None);
+        assert_eq!(app.resolve_pane_origin(Some("")), None);
+        assert_eq!(app.resolve_pane_origin(Some("   ")), None);
+    }
+
+    /// The ordinary case: the caller names a live pane, and the record carries
+    /// both that pane and the Space it was standing in.
+    #[test]
+    fn a_live_caller_records_its_pane_and_its_workspace() {
+        let mut app = app_with_linked_worktree();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.ensure_test_terminals();
+        let root_public = app.public_pane_id(0, root).unwrap();
+
+        let origin = app
+            .resolve_pane_origin(Some(&root_public))
+            .expect("a live caller resolves");
+
+        assert_eq!(origin.pane_id, root_public);
+        assert_eq!(origin.workspace_id, app.public_workspace_id(0));
+    }
+
+    /// The case that must not be papered over: a caller naming a pane that has
+    /// already closed records **nothing**. A dangling parent is worse than no
+    /// parent, because the tree would nest rows under something absent.
+    #[test]
+    fn a_stale_caller_records_nothing_rather_than_a_dangling_parent() {
+        let app = app_with_linked_worktree();
+        assert_eq!(app.resolve_pane_origin(Some("w9:p9")), None);
+        assert_eq!(app.resolve_pane_origin(Some("p_4242")), None);
     }
 
     #[test]

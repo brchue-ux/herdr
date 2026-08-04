@@ -836,6 +836,22 @@ pub(super) fn normalize_pane_id(value: &str) -> String {
     value.to_string()
 }
 
+/// The pane this CLI process is running inside, from the identity Herdr itself
+/// injected when it launched the pane.
+///
+/// Sent on every creation verb with no flag to opt into, because the fact is
+/// ambient and free: a script that spawns a worker should not have to know that
+/// ownership exists, let alone name a label for it. Outside a Herdr pane the
+/// variable is absent and creation records no origin, which is the honest
+/// answer rather than a guess.
+pub(super) fn ambient_caller_pane_id() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_pane_id(&value))
+}
+
 pub(super) fn parse_split_direction(value: &str) -> std::io::Result<SplitDirection> {
     match value {
         "right" => Ok(SplitDirection::Right),

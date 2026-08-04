@@ -8,6 +8,25 @@ pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
 use super::agents::AgentSessionInfo;
 use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};
 
+/// Which pane asked Herdr to create another pane, and where it was standing.
+///
+/// Herdr forks every pane itself, so it is the new pane's parent process and
+/// the requesting agent is never an ancestor of it. This record is the only
+/// place that edge survives: it is written once, in the same mutation that
+/// creates the pane, and never recomputed, so it cannot drift and there is no
+/// interval in which the pane exists and its origin is unknown.
+///
+/// The workspace is captured alongside the pane because the pane may move or
+/// close later, and the structural question — was the creator standing in this
+/// same Space? — has to stay answerable either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneOrigin {
+    /// Public id of the pane that requested this one.
+    pub pane_id: String,
+    /// Public id of the workspace that pane was in at the time.
+    pub workspace_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSplitParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +42,12 @@ pub struct PaneSplitParams {
     pub focus: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// The pane making this request, so Herdr can record who the new pane
+    /// belongs to. The CLI fills it from its own ambient `HERDR_PANE_ID`; a
+    /// caller that omits it or names a pane that no longer exists simply gets
+    /// no origin recorded, never a dangling one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -473,6 +498,20 @@ pub struct PaneInfo {
     pub scroll: Option<PaneScrollInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<PaneActivityInfo>,
+    /// Which pane asked Herdr to create this one. Absent for a pane a human
+    /// made — a keyboard split, or the first pane of a workspace Herdr opened
+    /// for itself — and for every pane that predates this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<PaneOrigin>,
+    /// Who owns this pane in the sidebar tree, resolved the same way the panel
+    /// resolves it: a published `owner` token wins, otherwise the Space of the
+    /// pane that created this one, and only when that pane was in this Space.
+    ///
+    /// Read-only and derived. It exists so a fleet can assert "every live
+    /// worker has an owner" from a script instead of noticing by eye that rows
+    /// went missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub revision: u64,
 }
 

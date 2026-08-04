@@ -16,6 +16,10 @@ pub struct TabCreateParams {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// The pane making this request. See
+    /// [`crate::api::schema::PaneSplitParams::caller_pane_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

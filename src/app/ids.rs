@@ -37,6 +37,30 @@ impl App {
         ))
     }
 
+    /// Turn a caller's claimed pane id into the origin record a new pane
+    /// carries for life.
+    ///
+    /// Resolved against live state on the spot, which is what keeps the record
+    /// honest: a caller that names a pane that has already closed, or a pane in
+    /// a session this server does not have, gets `None` and the new pane is
+    /// simply unowned. A dangling parent is worse than no parent, because the
+    /// tree would nest rows under something that is not there.
+    ///
+    /// Both ids are re-emitted in their public form rather than echoed back, so
+    /// the record holds the canonical id no matter which of the accepted id
+    /// spellings — alias, `p_` raw, `w1:p2` — the caller used.
+    pub(super) fn resolve_pane_origin(
+        &self,
+        caller_pane_id: Option<&str>,
+    ) -> Option<crate::api::schema::PaneOrigin> {
+        let caller_pane_id = caller_pane_id.map(str::trim).filter(|id| !id.is_empty())?;
+        let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
+        Some(crate::api::schema::PaneOrigin {
+            pane_id: self.public_pane_id(ws_idx, pane_id)?,
+            workspace_id: self.public_workspace_id(ws_idx),
+        })
+    }
+
     pub(super) fn pane_launch_env(
         &self,
         ws_idx: usize,

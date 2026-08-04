@@ -15,7 +15,7 @@ use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
-mod aggregate;
+pub(crate) mod aggregate;
 mod git;
 mod tab;
 

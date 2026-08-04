@@ -132,6 +132,14 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    /// Which pane asked Herdr to create this one, and the workspace that pane
+    /// was in. See [`crate::api::schema::PaneOrigin`].
+    ///
+    /// Durable like the facts around it: it is persisted, it survives a live
+    /// handoff, and it is written exactly once — at creation — so nothing can
+    /// recompute it into a different answer later. Only programmatic creation
+    /// sets it; a keyboard split is a person acting, not a pane delegating.
+    pub created_by: Option<crate::api::schema::PaneOrigin>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
@@ -178,6 +186,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            created_by: None,
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,

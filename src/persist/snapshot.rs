@@ -144,6 +144,13 @@ pub struct PaneSnapshot {
     /// restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_agent: Option<String>,
+    /// Which pane asked for this one. Durable because the alternative — env,
+    /// cwd, process ancestry — does not survive a restart, and a tree that
+    /// re-derives itself from a spawn-time fact would silently flatten every
+    /// time the server came back. A live handoff carries a `SessionSnapshot`
+    /// too, so this rides that path as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<crate::api::schema::PaneOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +446,7 @@ fn capture_tab(
         let declared_agent = terminal
             .and_then(|terminal| terminal.declared_agent())
             .map(|agent| crate::detect::agent_label(agent).to_string());
+        let created_by = terminal.and_then(|terminal| terminal.created_by.clone());
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -450,6 +458,7 @@ fn capture_tab(
                 launch_argv,
                 metadata_tokens,
                 declared_agent,
+                created_by,
             },
         );
     }
@@ -782,6 +791,7 @@ mod tests {
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
+                created_by: None,
             },
         );
         panes.insert(
@@ -795,6 +805,7 @@ mod tests {
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
+                created_by: None,
             },
         );
 
@@ -1065,6 +1076,50 @@ mod tests {
                 expires_at_ms: None,
             }]
         );
+    }
+
+    /// The record has to be durable or the tree flattens every time the server
+    /// comes back — which is precisely why it lives here and not in the pane's
+    /// launch environment, which does not survive a restart at all.
+    #[test]
+    fn capture_contract_tracks_which_pane_asked_for_this_one() {
+        let mut state = state_with_workspaces(&["one"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let origin = crate::api::schema::PaneOrigin {
+            pane_id: "w6M:p2".into(),
+            workspace_id: "w6M".into(),
+        };
+        state.terminals.get_mut(&terminal_id).unwrap().created_by = Some(origin.clone());
+
+        let snapshot = capture_from_state(&state);
+        let captured = &snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()];
+        assert_eq!(captured.created_by.as_ref(), Some(&origin));
+
+        // And it round-trips through the on-disk form, which is what a cold
+        // restart and a live handoff both read back.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.workspaces[0].tabs[0].panes[&pane_id.raw()]
+                .created_by
+                .as_ref(),
+            Some(&origin)
+        );
+    }
+
+    /// A pane nobody asked for writes nothing, so a session file from a fleet
+    /// that never uses this stays byte-identical.
+    #[test]
+    fn a_pane_with_no_origin_writes_no_origin_field() {
+        let state = state_with_workspaces(&["one"]);
+        let snapshot = capture_from_state(&state);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("created_by"), "{json}");
     }
 
     #[test]
@@ -1493,6 +1548,7 @@ mod tests {
                                 expires_at_ms: None,
                             }],
                             declared_agent: None,
+                            created_by: None,
                         },
                     )]),
                     zoomed: false,
@@ -1572,6 +1628,7 @@ mod tests {
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
+                created_by: None,
             },
         );
         panes.insert(
@@ -1587,6 +1644,7 @@ mod tests {
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
+                created_by: None,
             },
         );
 
