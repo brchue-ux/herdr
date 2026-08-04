@@ -81,11 +81,12 @@ pub(crate) use self::{
     sidebar::{
         agent_panel_entries, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_toggle_rect,
-        normalized_workspace_scroll, sidebar_agent_entries, worker_summary_badge,
-        worker_summary_badge_rect, workspace_drop_slots, workspace_group_chevron_rect,
-        workspace_list_entries, workspace_list_entries_expanded, workspace_list_rect,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        AgentPanelEntry, WorkspaceListEntry,
+        normalized_workspace_scroll, rows_with_departing, sidebar_agent_entries,
+        sidebar_agent_live_entries, worker_summary_badge, worker_summary_badge_rect,
+        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
+        workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
+        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
+        WorkspaceListEntry,
     },
     worker_summary::{
         worker_summaries_action_row, worker_summaries_close_button_rect,

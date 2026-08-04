@@ -41,6 +41,11 @@ const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
 /// `state_marks_are_one_column_wide` is the check that keeps this honest.
 const STATE_MARK_WIDTH: usize = 1;
 
+/// Cloneable because a row that has left is still drawn while it leaves: the
+/// runtime keeps the last pass's rows in
+/// [`crate::app::state::AppState::sidebar_tree_row_memory`] so a pane closing
+/// does not take the only copy of its row with it.
+#[derive(Clone)]
 pub(crate) struct AgentPanelEntry {
     pub ws_idx: usize,
     pub tab_idx: usize,
@@ -525,7 +530,20 @@ fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
 ///
 /// No Agents view is applied. This is the only place a worker is drawn now, and
 /// a filter here could hide the whole fleet from the only panel that shows it.
+///
+/// Rows that are still *leaving* are re-inserted by [`rows_with_departing`], so
+/// the group a worker belonged to contracts when its exit finishes rather than
+/// the instant its pane closes.
 pub(crate) fn sidebar_agent_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    rows_with_departing(app, sidebar_agent_live_entries(app))
+}
+
+/// The rows a pane that exists right now would draw.
+///
+/// Live membership and nothing else: this is what the runtime publishes to the
+/// animation engine, so a row that has left this list is exactly a row the
+/// engine should start dismounting.
+pub(crate) fn sidebar_agent_live_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     let mut entries = all_agent_panel_entries(app);
     // Classify against the whole fleet before dropping the unowned rows, so a
     // pane's relation still reflects where it really sits.
@@ -543,6 +561,51 @@ pub(crate) fn sidebar_agent_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     }
     entries.retain(|entry| entry.owner.is_some());
     entries
+}
+
+/// Put the rows that are mid-exit back among the live ones.
+///
+/// A sidebar group grows and shrinks because its rows arrive and leave, and a
+/// row that leaves has to still be somewhere to be seen leaving. The rows the
+/// last loop pass drew are kept in
+/// [`crate::app::state::AppState::sidebar_tree_row_memory`]; a remembered row
+/// whose pane is gone comes back here for exactly as long as the engine still
+/// has a dismount to play for it, at the index it was standing in — so it
+/// fades out of its own place in its own second mate's group instead of
+/// jumping to the end of it first.
+///
+/// It still carries its `owner`, so the tree walk nests it under the same
+/// second mate it always had: one group contracts and the others do not move.
+///
+/// With no row exit configured, memory is never published and this is the
+/// identity function — an unconfigured Herdr draws exactly the rows it always
+/// did.
+pub(crate) fn rows_with_departing(
+    app: &AppState,
+    mut live: Vec<AgentPanelEntry>,
+) -> Vec<AgentPanelEntry> {
+    if app.sidebar_tree_row_memory.is_empty() {
+        return live;
+    }
+    let present: std::collections::HashSet<crate::layout::PaneId> =
+        live.iter().map(|entry| entry.pane_id).collect();
+    for (position, remembered) in app.sidebar_tree_row_memory.iter().enumerate() {
+        if present.contains(&remembered.pane_id) {
+            continue;
+        }
+        // The engine is the authority on whether this row has anything left to
+        // play: it drops an element the moment its dismount finishes, and it
+        // holds none at all when nothing is configured to animate.
+        if app
+            .anim
+            .frame(&crate::anim::ElementId::agent_row(remembered.pane_id), None)
+            .is_none()
+        {
+            continue;
+        }
+        live.insert(position.min(live.len()), remembered.clone());
+    }
+    live
 }
 
 /// Arrange `blocks` and the owned agent panes into one tree, then flatten it.
@@ -1963,6 +2026,10 @@ fn render_agent_row(
     let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
     let state_icon = state_dot(detail.state, detail.seen, p);
     let summary_badge = worker_summary_badge(app, entries, agents, card);
+    // This row's own life, not its Space's: a worker arrives when it starts and
+    // leaves when it finishes, which is what makes its second mate's group grow
+    // and shrink around it.
+    let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
 
     for (row_index, resolved) in rows.iter().enumerate() {
         let row_y = card.rect.y + row_index as u16;
@@ -1988,6 +2055,7 @@ fn render_agent_row(
             // workspace, so there is nothing here for a charge to belong to.
             None,
         );
+        animate_row_spans(&mut spans, &row_anim);
         spans.extend(resolved_token_spans(
             resolved,
             state_icon,
@@ -1996,10 +2064,7 @@ fn render_agent_row(
             agent_style,
             agent_style,
             p,
-            &RowAnimation::for_workspace(
-                app,
-                app.workspaces.get(detail.ws_idx).map(|ws| ws.id.as_str()),
-            ),
+            &row_anim,
             (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
         ));
         frame.render_widget(
@@ -2312,6 +2377,22 @@ impl<'a> RowAnimation<'a> {
         }
     }
 
+    /// A worker or sub agent row's own life, not its Space's.
+    ///
+    /// The distinction is the whole point of this task: a worker's row arrives
+    /// when that worker starts and leaves when it finishes, while the Space it
+    /// runs in was there before and stays after. Borrowing the Space's element
+    /// gave every row in a group one shared arrival that had already happened,
+    /// so nothing under a second mate could ever be seen appearing.
+    fn for_agent_row(app: &'a AppState, pane_id: crate::layout::PaneId) -> Self {
+        Self {
+            anim: &app.anim,
+            id: Some(crate::anim::ElementId::agent_row(pane_id)),
+            palette: &app.palette,
+            host: &app.host_terminal_theme,
+        }
+    }
+
     /// The frame this token should draw with, or `None` when nothing is
     /// animating it — which is the settled path every unconfigured Herdr takes.
     fn frame(
@@ -2323,6 +2404,52 @@ impl<'a> RowAnimation<'a> {
             .and_then(crate::config::SidebarTokenEmphasis::behaviour);
         let frame = self.anim.frame(self.id.as_ref()?, idle)?;
         frame.behaviour.is_some().then_some(frame)
+    }
+
+    /// The row's own arrival or departure, ignoring every steady behaviour.
+    ///
+    /// The tree connector belongs to the row rather than to any token on it, so
+    /// it arrives and leaves with the row and never picks up a token's idle
+    /// emphasis: a `├─` that pulsed because the branch name beside it was
+    /// configured to would be drawing attention to scaffolding.
+    fn lifecycle_frame(&self) -> Option<crate::anim::ElementFrame<'a>> {
+        let frame = self.anim.frame(self.id.as_ref()?, None)?;
+        (frame.behaviour.is_some()
+            && matches!(
+                frame.phase,
+                crate::anim::Phase::Mount | crate::anim::Phase::Dismount
+            ))
+        .then_some(frame)
+    }
+}
+
+/// Fold a row's arrival or departure into spans that are already styled.
+///
+/// For the parts of a row that are not tokens — the tree connectors — so a row
+/// growing into a group or leaving it moves as one thing rather than as text
+/// that fades beside scaffolding that blinks in and out.
+fn animate_row_spans(spans: &mut [Span<'static>], anim: &RowAnimation<'_>) {
+    use crate::anim::cell::{CellExtent, CellPos, InkPalette};
+
+    let Some(frame) = anim.lifecycle_frame() else {
+        return;
+    };
+    let total: u16 = spans
+        .iter()
+        .map(|span| crate::ui::text::display_width_u16(&span.content))
+        .sum();
+    if total == 0 {
+        return;
+    }
+    let extent = CellExtent::row(total);
+    let mut col = 0u16;
+    for span in spans {
+        let width = crate::ui::text::display_width_u16(&span.content);
+        let ink = InkPalette::resolve(span.style, anim.palette, anim.host);
+        span.style = frame
+            .cell(CellPos::col(col), extent, ink)
+            .text_style(span.style, ink);
+        col = col.saturating_add(width);
     }
 }
 

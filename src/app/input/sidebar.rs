@@ -363,12 +363,21 @@ impl AppState {
     }
 
     /// The pane an agent row under `row` points at.
+    ///
+    /// A row that is still leaving is deliberately not a target: it is drawn
+    /// only so its group can be seen contracting, and its pane is already gone
+    /// from the session, so a click on it has nowhere to go. Answering `None`
+    /// lets the press fall through the way a click on empty list space does,
+    /// rather than switching to a pane that has closed.
     pub(super) fn sidebar_agent_target_at(
         &self,
         row: u16,
     ) -> Option<(usize, crate::layout::PaneId)> {
         let card = self.sidebar_card_at_row(row)?;
         let agent = card.agent?;
+        self.workspaces
+            .get(card.ws_idx)?
+            .pane_state(agent.pane_id)?;
         Some((card.ws_idx, agent.pane_id))
     }
 

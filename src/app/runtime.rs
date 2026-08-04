@@ -409,10 +409,13 @@ impl App {
     /// have seen anyway.
     pub(crate) fn advance_animations(&mut self, now: Instant, has_viewers: bool) -> bool {
         if !has_viewers || !self.state.sidebar_animation_active() {
-            return self.state.anim.forget_all();
+            let forgotten = self.state.anim.forget_all();
+            let remembered = !self.state.sidebar_tree_row_memory.is_empty();
+            self.state.sidebar_tree_row_memory.clear();
+            return forgotten || remembered;
         }
         let lifecycle = self.state.sidebar_row_lifecycle();
-        let live: Vec<_> = self
+        let spaces: Vec<_> = self
             .state
             .workspaces
             .iter()
@@ -425,9 +428,56 @@ impl App {
                 )
             })
             .collect();
-        self.state
+        let changed =
+            self.state
+                .anim
+                .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
+        self.observe_agent_rows(now, &lifecycle) || changed
+    }
+
+    /// Publish the owned agent rows that exist right now, so each second mate's
+    /// group grows and shrinks on its own.
+    ///
+    /// Every worker and sub agent row is its own element, keyed by pane id, so
+    /// a pane opening under one second mate mounts exactly one row and a pane
+    /// closing dismounts exactly one — the other second mates' groups are not
+    /// even looked at. That is the whole of "independently": there is no group
+    /// object to rebuild, only rows that arrive and leave under the owner they
+    /// already name.
+    ///
+    /// The rows are then remembered, because a departing row's pane is gone
+    /// from the session and the tree could not otherwise draw it for the length
+    /// of its exit. Only worth remembering when an exit is configured; without
+    /// one the engine retires a departed row on the spot and memory would be a
+    /// copy nobody reads.
+    fn observe_agent_rows(&mut self, now: Instant, lifecycle: &crate::anim::Lifecycle) -> bool {
+        let live = crate::ui::sidebar_agent_live_entries(&self.state);
+        let rows: Vec<_> = live
+            .iter()
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs {
+                        activity: self.state.pane_activity_level(entry.ws_idx, entry.pane_id),
+                    },
+                )
+            })
+            .collect();
+        let changed = self
+            .state
             .anim
-            .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, live)
+            .observe(now, crate::anim::Family::AgentRow, lifecycle, rows);
+        if lifecycle.dismount.is_none() {
+            let remembered = !self.state.sidebar_tree_row_memory.is_empty();
+            self.state.sidebar_tree_row_memory.clear();
+            return changed || remembered;
+        }
+        // Observed first, so a row that has just left is already dismounting and
+        // survives this refresh; one whose exit finished is not, and is dropped.
+        let drawn = crate::ui::rows_with_departing(&self.state, live);
+        let moved = drawn.len() != self.state.sidebar_tree_row_memory.len();
+        self.state.sidebar_tree_row_memory = drawn;
+        changed || moved
     }
 
     /// Move the clock the sidebar renders elapsed times against.
@@ -1356,5 +1406,171 @@ mod tests {
             .pending_agent_resume_plan
             .is_some());
         assert!(app.pending_agent_resume_deadline.is_none());
+    }
+
+    /// Two second mates, each owning its own workers, under one first mate.
+    ///
+    /// The shape the captain's fleet actually has, and the only shape in which
+    /// "only that group moved" means anything.
+    fn fleet_app(
+        exit: &str,
+    ) -> (
+        super::super::App,
+        crate::layout::PaneId,
+        crate::layout::PaneId,
+    ) {
+        let config: crate::config::Config = toml::from_str(&format!(
+            "[ui.sidebar.animation]\nrow_exit = \"{exit}\"\nrow_exit_ms = 200\n"
+        ))
+        .expect("row exit config");
+        let mut app = super::super::App::new(
+            &config,
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+
+        let mut left = Workspace::test_new("2ndmate-left");
+        let left_second = left.test_split(ratatui::layout::Direction::Vertical);
+        let left_first = left.tabs[0]
+            .panes
+            .keys()
+            .copied()
+            .find(|pane| *pane != left_second)
+            .expect("the original pane is still present");
+        let right = Workspace::test_new("2ndmate-right");
+        let right_only = right.tabs[0].root_pane;
+
+        app.state.workspaces = vec![Workspace::test_new("firstmate"), left, right];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+
+        let now = Instant::now();
+        for ws_idx in [1, 2] {
+            app.state.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        for (ws_idx, pane, name, owner) in [
+            (1, left_first, "left-worker-1", "2ndmate-left"),
+            (1, left_second, "left-worker-2", "2ndmate-left"),
+            (2, right_only, "right-worker", "2ndmate-right"),
+        ] {
+            let terminal_id = app.state.workspaces[ws_idx]
+                .terminal_id(pane)
+                .cloned()
+                .expect("every test pane has a terminal");
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("every test pane has a terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+
+        (app, left_second, right_only)
+    }
+
+    /// The agent rows the sidebar tree would draw, by agent name, in order.
+    fn tree_worker_names(app: &super::super::App) -> Vec<String> {
+        let agents = crate::ui::sidebar_agent_entries(&app.state);
+        crate::ui::workspace_list_entries(&app.state)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Agent { entry_idx, .. } => agents
+                    .get(entry_idx)
+                    .and_then(|agent| agent.agent_name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_worker_leaving_contracts_only_its_own_second_mates_group() {
+        let (mut app, leaving, _) = fleet_app("fade");
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        assert_eq!(
+            tree_worker_names(&app),
+            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            "the fleet did not start in ownership order"
+        );
+
+        // The worker finishes: its pane closes and it is gone from the session.
+        // `close_pane` reports whether the *workspace* emptied, not whether it
+        // did anything, so the pane going is what to assert on.
+        app.state.workspaces[1].close_pane(leaving);
+        assert!(app.state.workspaces[1].pane_state(leaving).is_none());
+        app.advance_animations(now + Duration::from_millis(10), true);
+
+        // It is still drawn, still in its own place, under its own second mate.
+        // The other second mate's group never entered into it.
+        assert_eq!(
+            tree_worker_names(&app),
+            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            "the row was dropped before it could be seen leaving"
+        );
+
+        // And when the exit finishes, that group - and only that group -
+        // contracts.
+        app.advance_animations(now + Duration::from_millis(400), true);
+        assert_eq!(
+            tree_worker_names(&app),
+            vec!["left-worker-1", "right-worker"],
+            "the group did not contract once the exit was over"
+        );
+        assert_eq!(
+            app.state.sidebar_tree_row_memory.len(),
+            2,
+            "a finished exit must not be remembered"
+        );
+    }
+
+    #[test]
+    fn without_a_configured_exit_a_finished_worker_is_gone_on_the_next_frame() {
+        let (mut app, leaving, _) = fleet_app("none");
+        let now = Instant::now();
+        // Nothing is configured to animate at all, so the engine tracks nothing
+        // and there is nothing to remember.
+        app.advance_animations(now, true);
+        assert!(app.state.sidebar_tree_row_memory.is_empty());
+
+        app.state.workspaces[1].close_pane(leaving);
+        app.advance_animations(now + Duration::from_millis(10), true);
+        assert_eq!(
+            tree_worker_names(&app),
+            vec!["left-worker-1", "right-worker"],
+            "an unconfigured Herdr must drop a closed worker's row at once"
+        );
+    }
+
+    #[test]
+    fn a_detached_server_forgets_the_rows_it_was_remembering() {
+        let (mut app, leaving, _) = fleet_app("fade");
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        app.state.workspaces[1].close_pane(leaving);
+        app.advance_animations(now + Duration::from_millis(10), true);
+        assert!(!app.state.sidebar_tree_row_memory.is_empty());
+
+        // Nobody is looking, so there is no exit to play and nothing to hold a
+        // departed pane's row for.
+        app.advance_animations(now + Duration::from_millis(20), false);
+        assert!(app.state.sidebar_tree_row_memory.is_empty());
+        assert_eq!(
+            tree_worker_names(&app),
+            vec!["left-worker-1", "right-worker"]
+        );
     }
 }

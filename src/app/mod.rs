@@ -760,6 +760,7 @@ impl App {
             relation_signals: relation_signal::RelationSignals::default(),
             pane_activity: pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
+            sidebar_tree_row_memory: Vec::new(),
             palette: theme_palette,
             theme_name,
             theme_runtime,

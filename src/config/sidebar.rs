@@ -849,11 +849,21 @@ const DEFAULT_ROW_ENTER_MS: u64 = 320;
 const MIN_ROW_ENTER_MS: u64 = 60;
 const MAX_ROW_ENTER_MS: u64 = 1_500;
 
+/// How long a row's departure runs when one is configured.
+///
+/// Shorter than the arrival on purpose: an arrival is introducing something the
+/// eye has to find, a departure is releasing something it has already read.
+const DEFAULT_ROW_EXIT_MS: u64 = 220;
+
 /// Lifecycle animation for sidebar rows themselves, as opposed to the tokens
 /// drawn inside them.
 ///
 /// A row's arrival is a property of the row, so it lives here rather than on any
-/// one token: every token on an arriving row arrives with it.
+/// one token: every token on an arriving row arrives with it. Its departure is
+/// the same property read the other way, and is deliberately the same set of
+/// behaviour names — the engine plays an exit as its entry reversed, so a fleet
+/// that wants a group to close the way it opened writes one name twice rather
+/// than hunting for a mirror-image behaviour that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SidebarAnimationConfig {
@@ -862,6 +872,12 @@ pub struct SidebarAnimationConfig {
     pub row_enter: SidebarTokenEmphasis,
     /// How long that arrival takes, in milliseconds.
     pub row_enter_ms: u64,
+    /// Behaviour a row plays as it leaves. `none` — the default — means a row
+    /// whose pane is gone stops being drawn on the very next frame, exactly as
+    /// it always has.
+    pub row_exit: SidebarTokenEmphasis,
+    /// How long that departure takes, in milliseconds.
+    pub row_exit_ms: u64,
 }
 
 impl Default for SidebarAnimationConfig {
@@ -869,6 +885,8 @@ impl Default for SidebarAnimationConfig {
         Self {
             row_enter: SidebarTokenEmphasis::None,
             row_enter_ms: DEFAULT_ROW_ENTER_MS,
+            row_exit: SidebarTokenEmphasis::None,
+            row_exit_ms: DEFAULT_ROW_EXIT_MS,
         }
     }
 }
@@ -876,12 +894,23 @@ impl Default for SidebarAnimationConfig {
 impl SidebarAnimationConfig {
     /// The arrival stage, or `None` when rows are configured to just appear.
     pub(crate) fn row_enter_stage(&self) -> Option<crate::anim::Stage> {
-        let behaviour = self.row_enter.behaviour()?;
+        Self::stage(self.row_enter, self.row_enter_ms)
+    }
+
+    /// The departure stage, or `None` when rows are configured to just vanish.
+    ///
+    /// This is the one thing that decides whether a row that has left is still
+    /// drawn: with no exit stage a departing row is retired on the spot, so
+    /// nothing downstream has to know an exit was configured.
+    pub(crate) fn row_exit_stage(&self) -> Option<crate::anim::Stage> {
+        Self::stage(self.row_exit, self.row_exit_ms)
+    }
+
+    fn stage(emphasis: SidebarTokenEmphasis, ms: u64) -> Option<crate::anim::Stage> {
+        let behaviour = emphasis.behaviour()?;
         Some(crate::anim::Stage::new(
             behaviour,
-            std::time::Duration::from_millis(
-                self.row_enter_ms.clamp(MIN_ROW_ENTER_MS, MAX_ROW_ENTER_MS),
-            ),
+            std::time::Duration::from_millis(ms.clamp(MIN_ROW_ENTER_MS, MAX_ROW_ENTER_MS)),
         ))
     }
 }
@@ -889,6 +918,47 @@ impl SidebarAnimationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_exit_parses_and_is_clamped_like_an_arrival() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.animation]
+row_enter = "wipe"
+row_exit = "wipe"
+row_exit_ms = 5
+"#,
+        )
+        .expect("row exit config");
+
+        let animation = config.ui.sidebar.animation;
+        assert_eq!(animation.row_exit, SidebarTokenEmphasis::Wipe);
+        let exit = animation.row_exit_stage().expect("a named exit is a stage");
+        assert_eq!(
+            exit.duration,
+            std::time::Duration::from_millis(MIN_ROW_ENTER_MS),
+            "an exit too short to resolve a frame is clamped, same as an arrival"
+        );
+        // The same name in both directions is the point: the engine plays the
+        // exit as the arrival reversed rather than needing a mirror behaviour.
+        assert_eq!(
+            exit.behaviour,
+            animation
+                .row_enter_stage()
+                .expect("a named arrival is a stage")
+                .behaviour
+        );
+    }
+
+    #[test]
+    fn rows_neither_arrive_nor_leave_unless_asked_to() {
+        let animation = SidebarAnimationConfig::default();
+        assert!(animation.row_enter_stage().is_none());
+        assert!(
+            animation.row_exit_stage().is_none(),
+            "an unconfigured Herdr must drop a closed pane's row on the next frame"
+        );
+    }
 
     #[test]
     fn defaults_match_the_compact_agent_and_existing_space_layouts() {

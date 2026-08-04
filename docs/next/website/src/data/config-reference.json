@@ -758,15 +758,55 @@
         },
         {
           "key": "ui.sidebar.animation.row_enter",
-          "type": "string",
+          "type": "enum",
           "default": "\"none\"",
-          "description": "Animation a sidebar row plays as it arrives. none (the default) draws rows fully on their first frame. Accepts any behaviour name emphasis accepts; the arrival behaviours are fade, typewriter, wipe, drop-in, dissolve, and collapse."
+          "description": "Animation a sidebar row plays as it arrives. none (the default) draws rows fully on their first frame. Accepts any behaviour name emphasis accepts; the arrival behaviours are fade, typewriter, wipe, drop-in, dissolve, and collapse.",
+          "values": [
+            "none",
+            "pulse",
+            "shimmer",
+            "wave",
+            "activity",
+            "activity-shimmer",
+            "fade",
+            "typewriter",
+            "wipe",
+            "drop-in",
+            "dissolve",
+            "collapse"
+          ]
         },
         {
           "key": "ui.sidebar.animation.row_enter_ms",
           "type": "integer",
           "default": "320",
           "description": "How long a configured row arrival takes, in milliseconds. Clamped to 60-1500."
+        },
+        {
+          "key": "ui.sidebar.animation.row_exit",
+          "type": "enum",
+          "default": "\"none\"",
+          "description": "Animation a sidebar row plays as it leaves, played as its arrival reversed. none (the default) drops a row on the frame after its pane closes. Accepts the same behaviour names as row_enter. A worker or sub agent row leaving is how its second mate's group contracts, so this is what makes an ownership tree read as live rather than as a redraw.",
+          "values": [
+            "none",
+            "pulse",
+            "shimmer",
+            "wave",
+            "activity",
+            "activity-shimmer",
+            "fade",
+            "typewriter",
+            "wipe",
+            "drop-in",
+            "dissolve",
+            "collapse"
+          ]
+        },
+        {
+          "key": "ui.sidebar.animation.row_exit_ms",
+          "type": "integer",
+          "default": "220",
+          "description": "How long a configured row departure takes, in milliseconds. Clamped to 60-1500."
         },
         {
           "key": "ui.accent",
