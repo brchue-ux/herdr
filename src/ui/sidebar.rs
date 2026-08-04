@@ -1019,6 +1019,28 @@ fn row_fold_width(list_area: Rect) -> u16 {
     workspace_list_body_rect(list_area, true).width
 }
 
+/// The narrowest sidebar that draws cards rather than bare lines.
+///
+/// Derived by asking the real geometry rather than by naming a number: the
+/// panel's fold width is its own width less the content inset and the
+/// scrollbar, and a change to either would otherwise leave a hardcoded
+/// threshold pointing at the wrong column. The drag detent in
+/// [`crate::app::AppState::set_manual_sidebar_width`] is anchored on this, so
+/// the column the width sticks at is always the column the shell changes at.
+pub(crate) fn card_shell_min_sidebar_width() -> u16 {
+    // A tall probe rect, so the body is never the thing that limits the width.
+    (1..=MAX_PROBE_SIDEBAR_WIDTH)
+        .find(|width| {
+            row_fold_width(workspace_list_rect(Rect::new(0, 0, *width, 24))) >= card::MIN_FOLD_WIDTH
+        })
+        .unwrap_or(card::MIN_FOLD_WIDTH)
+}
+
+/// Upper bound for the [`card_shell_min_sidebar_width`] probe. Far wider than
+/// any sidebar the bounds allow, so the search always terminates on the real
+/// answer rather than on the limit.
+const MAX_PROBE_SIDEBAR_WIDTH: u16 = 512;
+
 /// Columns a row has for its tokens once its prefix, its shell and any trailing
 /// control are taken out.
 fn row_content_width(fold_width: u16, depth: u8, trailing_width: usize) -> usize {
@@ -1833,31 +1855,42 @@ fn sidebar_divider_grip_rows(area: Rect) -> std::ops::Range<u16> {
 /// exactly (see `track_sidebar_divider_hover`), so the bar can never light up
 /// on a cell where a press would be swallowed by a scrollbar track, a worktree
 /// chevron, or the collapse toggle.
+///
+/// A fourth state sits on top of those three: while a drag is held at the
+/// card/line shell boundary the whole bar goes heavy and accented, not just the
+/// grip. The width has stopped following the pointer at that moment, and
+/// without something to see, a divider that ignores the hand reads as a stuck
+/// drag. Lighting the full height says the resistance is the boundary rather
+/// than a fault, and it resolves the instant the detent commits.
 fn render_sidebar_divider(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
     let p = &app.palette;
     let active = app.sidebar_divider_hover;
-    let bar_style = if active {
+    let detent = app.sidebar_divider_detent;
+    let bar_style = if detent {
+        Style::default().fg(p.accent)
+    } else if active {
         Style::default().fg(p.overlay1)
     } else if is_navigating {
         Style::default().fg(p.accent)
     } else {
         Style::default().fg(p.surface_dim)
     };
-    let grip_style = if active {
+    let grip_style = if active || detent {
         Style::default().fg(p.accent)
     } else if is_navigating {
         Style::default().fg(p.text)
     } else {
         Style::default().fg(p.overlay0)
     };
-    let grip_symbol = if active { "┃" } else { "│" };
+    let grip_symbol = if active || detent { "┃" } else { "│" };
+    let bar_symbol = if detent { "┃" } else { "│" };
 
     let grip = sidebar_divider_grip_rows(area);
     let sep_x = area.x + area.width.saturating_sub(1);
     let buf = frame.buffer_mut();
     for y in area.y..area.y + area.height {
         let is_grip = grip.contains(&y);
-        buf[(sep_x, y)].set_symbol(if is_grip { grip_symbol } else { "│" });
+        buf[(sep_x, y)].set_symbol(if is_grip { grip_symbol } else { bar_symbol });
         buf[(sep_x, y)].set_style(if is_grip { grip_style } else { bar_style });
     }
 }

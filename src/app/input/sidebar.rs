@@ -361,10 +361,16 @@ impl AppState {
     /// pointer has been dragged to; every other event just re-reads the
     /// pointer's current cell.
     pub(super) fn track_sidebar_divider_hover(&mut self, mouse: crossterm::event::MouseEvent) {
-        let hovered = if matches!(
+        let dragging_divider = matches!(
             self.drag.as_ref().map(|drag| &drag.target),
             Some(crate::app::state::DragTarget::SidebarDivider { .. })
-        ) {
+        );
+        // The detent describes a live drag, so it cannot outlive one: a release
+        // inside the band would otherwise leave the divider lit as caught.
+        if !dragging_divider {
+            self.sidebar_divider_detent = false;
+        }
+        let hovered = if dragging_divider {
             true
         } else {
             self.sidebar_divider_is_reachable()
@@ -388,12 +394,86 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
+    /// Columns the pointer must push past the shell boundary before the panel
+    /// is allowed to change shell.
+    ///
+    /// Three is enough to be felt as a notch and short enough that the release
+    /// still lands where the pointer is pointing. It is deliberately not a
+    /// fraction of the width: the thing being resisted is one specific column,
+    /// so the resistance is measured in columns too.
+    pub(super) const SHELL_DETENT_COLUMNS: u16 = 3;
+
+    /// Sets the sidebar width from a divider drag, with a detent at the one
+    /// column where the tree changes shell.
+    ///
+    /// Everywhere else the width tracks the pointer exactly, because a resize
+    /// that lags or steps stops reading as dragging. But the card/line boundary
+    /// is not an ordinary column: crossing it swaps every row between a
+    /// bordered card and a bare line, which at a realistic fleet is a dozen
+    /// rows appearing or vanishing from one column of pointer travel. Tracking
+    /// the pointer through it exactly means a hand that wobbles by one column
+    /// strobes the whole panel, which reads as a rendering fault rather than as
+    /// the deliberate threshold it is.
+    ///
+    /// So the width sticks to the boundary until the pointer has pushed
+    /// [`Self::SHELL_DETENT_COLUMNS`] past it, then releases to where the
+    /// pointer actually is. Because the commit point sits that far *beyond* the
+    /// boundary on each side, the column that drops to lines and the column
+    /// that lifts back to cards are different columns — the hysteresis is what
+    /// kills the strobe, and the stick is what makes the swap feel chosen.
+    /// [`crate::app::state::AppState::sidebar_divider_detent`] reports the
+    /// hold so the divider can show it is caught rather than stuck.
+    ///
+    /// The detent never traps the drag: a pointer at either configured bound
+    /// commits immediately, so bounds that sit inside the detent band (a
+    /// `sidebar_min_width` above the drop column, say) still resize.
     pub(super) fn set_manual_sidebar_width(&mut self, divider_col: u16) {
         let sidebar = self.view.sidebar_rect;
-        let width = divider_col.saturating_sub(sidebar.x).saturating_add(1);
-        self.sidebar_width = width.clamp(self.sidebar_min_width, self.sidebar_max_width);
+        let raw = divider_col
+            .saturating_sub(sidebar.x)
+            .saturating_add(1)
+            .clamp(self.sidebar_min_width, self.sidebar_max_width);
+
+        let (width, detained) = self.sidebar_width_with_shell_detent(raw);
+        self.sidebar_width = width;
+        self.sidebar_divider_detent = detained;
         self.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
         self.mark_session_dirty();
+    }
+
+    /// Applies the shell detent to an already-clamped pointer width, answering
+    /// the width to draw and whether the boundary is currently holding it.
+    fn sidebar_width_with_shell_detent(&self, raw: u16) -> (u16, bool) {
+        let narrowest_card = crate::ui::sidebar::card_shell_min_sidebar_width();
+        let widest_line = narrowest_card.saturating_sub(1);
+
+        // At either bound there is nowhere further to push, so holding would
+        // make the width unreachable rather than deliberate.
+        if raw <= self.sidebar_min_width || raw >= self.sidebar_max_width {
+            return (raw, false);
+        }
+
+        let was_card = self.sidebar_width >= narrowest_card;
+        let wants_card = raw >= narrowest_card;
+        if was_card == wants_card {
+            return (raw, false);
+        }
+
+        if was_card {
+            let commits_at = narrowest_card.saturating_sub(Self::SHELL_DETENT_COLUMNS);
+            if raw <= commits_at {
+                (raw, false)
+            } else {
+                (narrowest_card, true)
+            }
+        } else {
+            let commits_at = widest_line.saturating_add(Self::SHELL_DETENT_COLUMNS);
+            if raw >= commits_at {
+                (raw, false)
+            } else {
+                (widest_line, true)
+            }
+        }
     }
 
     /// The tree row under `row`, Space or agent alike.
@@ -2292,5 +2372,151 @@ mod tests {
             after.state.sidebar_width_source,
             crate::app::state::SidebarWidthSource::ConfigDefault
         );
+    }
+
+    /// The detent is anchored on the column the renderer actually changes
+    /// shell at, so pin that column: every expectation below is relative to it,
+    /// and a geometry change that moved it would otherwise silently move the
+    /// notch too.
+    #[test]
+    fn the_shell_boundary_is_the_column_the_renderer_changes_shell_at() {
+        assert_eq!(crate::ui::sidebar::card_shell_min_sidebar_width(), 34);
+    }
+
+    /// Narrowing out of the card shell sticks at the boundary and only lets go
+    /// once the pointer has pushed the full detent past it.
+    #[test]
+    fn narrowing_holds_at_the_shell_boundary_before_dropping_to_lines() {
+        let mut app = app_for_mouse_test();
+
+        // Into the card shell first, by dragging, so the divider is grabbed at
+        // the column it is actually drawn on.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5));
+        assert_eq!(app.state.sidebar_width, 36);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 32, 5));
+
+        assert_eq!(
+            app.state.sidebar_width, 34,
+            "the width left the card shell without being pushed past the detent"
+        );
+        assert!(
+            app.state.sidebar_divider_detent,
+            "the divider did not report that it was being held"
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 5));
+
+        assert_eq!(app.state.sidebar_width, 31, "the detent did not commit");
+        assert!(!app.state.sidebar_divider_detent);
+    }
+
+    /// And the same in reverse, out of the line shell.
+    #[test]
+    fn widening_holds_at_the_shell_boundary_before_lifting_to_cards() {
+        let mut app = app_for_mouse_test();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 5));
+        assert_eq!(app.state.sidebar_width, 31);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 34, 5));
+
+        assert_eq!(
+            app.state.sidebar_width, 33,
+            "the width entered the card shell without being pushed past the detent"
+        );
+        assert!(app.state.sidebar_divider_detent);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5));
+
+        assert_eq!(app.state.sidebar_width, 36, "the detent did not commit");
+        assert!(!app.state.sidebar_divider_detent);
+    }
+
+    /// The point of the detent: the column that drops to lines and the column
+    /// that lifts back to cards are different columns, so a hand that wobbles
+    /// on the boundary cannot strobe the panel between two whole layouts.
+    #[test]
+    fn the_shell_flips_at_different_columns_in_each_direction() {
+        let drop_at = {
+            let mut app = app_for_mouse_test();
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5));
+            (18..35)
+                .rev()
+                .find(|col| {
+                    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), *col, 5));
+                    app.state.sidebar_width < 34
+                })
+                .expect("narrowing never left the card shell")
+        };
+        let lift_at = {
+            let mut app = app_for_mouse_test();
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+            (26..42)
+                .find(|col| {
+                    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), *col, 5));
+                    app.state.sidebar_width >= 34
+                })
+                .expect("widening never reached the card shell")
+        };
+
+        assert!(
+            lift_at > drop_at,
+            "the shell flipped at the same column in both directions \
+             (drop at {drop_at}, lift at {lift_at}), so the boundary still strobes"
+        );
+    }
+
+    /// Away from the boundary the width is still exactly the pointer's, because
+    /// a resize that lags anywhere else stops reading as a drag.
+    #[test]
+    fn the_detent_does_not_slow_the_rest_of_the_drag() {
+        let mut app = app_for_mouse_test();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+
+        for col in [19u16, 22, 26, 29, 37, 40, 38, 36] {
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col, 5));
+            assert_eq!(
+                app.state.sidebar_width,
+                col + 1,
+                "the width did not track the pointer at column {col}"
+            );
+            assert!(!app.state.sidebar_divider_detent);
+        }
+    }
+
+    /// A bound sitting inside the detent band must not make the far shell
+    /// unreachable: there is nowhere left to push, so the bound commits.
+    #[test]
+    fn a_bound_inside_the_detent_band_still_resizes() {
+        let mut app = app_for_mouse_test();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5));
+        app.state.sidebar_min_width = 32;
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 5));
+
+        assert_eq!(app.state.sidebar_width, 32, "the detent trapped the drag");
+        assert!(!app.state.sidebar_divider_detent);
+    }
+
+    /// The held look describes a live drag, so releasing inside the band must
+    /// not leave the divider lit as caught.
+    #[test]
+    fn releasing_inside_the_detent_clears_the_held_look() {
+        let mut app = app_for_mouse_test();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 35, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 32, 5));
+        assert!(app.state.sidebar_divider_detent);
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 32, 5));
+
+        assert!(!app.state.sidebar_divider_detent);
+        assert_eq!(app.state.sidebar_width, 34);
     }
 }
