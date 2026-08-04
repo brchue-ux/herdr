@@ -3951,23 +3951,23 @@ mod tests {
         }
     }
 
-    /// Resting is grey, live is the signal's own colour. Nothing else about the
-    /// slot changes, so the bar never reflows as alerts come and go.
+    /// Going live changes a slot's colour and its motion, never its text. That
+    /// is what lets a reader learn where a signal sits: the bar cannot reflow
+    /// as alerts come and go.
     #[test]
-    fn a_signal_going_live_changes_its_colour_and_nothing_else() {
-        let width = notifications::Tier::Named.width() + 4;
-        let resting = signal_bar_rows(width, false, false);
-        let alerting = signal_bar_rows(width, true, true);
-
-        assert_eq!(
-            resting[0], alerting[0],
-            "the bar's text moved when two signals went live"
-        );
-        assert_eq!(
-            resting[1..],
-            alerting[1..],
-            "the tree moved when two signals went live"
-        );
+    fn a_signal_going_live_never_moves_the_bar() {
+        for width in [
+            notifications::Tier::Named.width() + 4,
+            notifications::Tier::Marks.width() + 2,
+            notifications::Tier::Tight.width() + 1,
+        ] {
+            let resting = signal_bar_rows(width, false, false);
+            let alerting = signal_bar_rows(width, true, true);
+            assert_eq!(
+                resting[0], alerting[0],
+                "the bar's text moved at {width} columns when two signals went live"
+            );
+        }
     }
 
     /// The narrow ladder: names go first, then the gaps, and all eight marks
