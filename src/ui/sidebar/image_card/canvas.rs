@@ -139,7 +139,26 @@ impl Canvas {
         let Some(i) = self.index(x, y) else {
             return;
         };
+        // Opaque source over anything, and any source over an opaque
+        // destination, are both a plain lerp with no divide — and between the
+        // backdrop and the card fill that is most of the pixels this draws.
+        if alpha >= 1.0 {
+            self.px[i] = color.0;
+            self.px[i + 1] = color.1;
+            self.px[i + 2] = color.2;
+            self.px[i + 3] = 255;
+            return;
+        }
         let dst_a = f32::from(self.px[i + 3]) / 255.0;
+        if dst_a >= 1.0 {
+            for (channel, src) in [color.0, color.1, color.2].into_iter().enumerate() {
+                let dst = f32::from(self.px[i + channel]);
+                self.px[i + channel] = (f32::from(src) * alpha + dst * (1.0 - alpha))
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            return;
+        }
         let out_a = alpha + dst_a * (1.0 - alpha);
         if out_a <= 0.0 {
             return;

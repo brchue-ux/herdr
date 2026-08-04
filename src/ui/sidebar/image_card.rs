@@ -408,22 +408,43 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
     let y0 = (rect.y - reach).floor().max(0.0) as u32;
     let x1 = ((rect.x + rect.w + reach).ceil() as u32).min(bloom.width);
     let y1 = ((rect.y + rect.h + reach).ceil() as u32).min(bloom.height);
+
+    // The profile is a function of distance alone, so it is a curve rather than
+    // a calculation: sampled once per half pixel out to the reach and read back
+    // by index. Two exponentials per pixel over a card and the ground around it
+    // is most of what drawing a card costs otherwise.
+    const PROFILE_STEPS_PER_PX: f32 = 8.0;
+    let profile: Vec<f32> = (0..=((reach * PROFILE_STEPS_PER_PX).ceil() as usize))
+        .map(|step| {
+            let d = step as f32 / PROFILE_STEPS_PER_PX;
+            let near = (-(d * d) / (2.0 * near_sigma * near_sigma)).exp();
+            let far = (-(d * d) / (2.0 * far_sigma * far_sigma)).exp();
+            measured::BLOOM_PEAK
+                * (measured::BLOOM_NEAR_WEIGHT * near + measured::BLOOM_FAR_WEIGHT * far)
+                * bloom_mul
+        })
+        .collect();
+    // The bloom's colour runs the stroke's own gradient, so like the stroke it
+    // depends on the column and nothing else.
+    let columns: Vec<Rgb> = (x0..x1)
+        .map(|x| {
+            let t = (((x as f32 + 0.5) - rect.x) / rect.w).clamp(0.0, 1.0);
+            bloom_a.mix(bloom_b, t)
+        })
+        .collect();
+
     for y in y0..y1 {
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
-            let px = x as f32 + 0.5;
-            let d = rect.distance(px, py);
+        for (column, x) in (x0..x1).enumerate() {
+            let d = rect.distance(x as f32 + 0.5, py);
             if d <= 0.0 {
                 continue;
             }
-            let near = (-(d * d) / (2.0 * near_sigma * near_sigma)).exp();
-            let far = (-(d * d) / (2.0 * far_sigma * far_sigma)).exp();
-            let amount = measured::BLOOM_PEAK
-                * (measured::BLOOM_NEAR_WEIGHT * near + measured::BLOOM_FAR_WEIGHT * far)
-                * bloom_mul;
-            if amount > 0.002 {
-                let t = ((px - rect.x) / rect.w).clamp(0.0, 1.0);
-                bloom.lighten(x, y, bloom_a.mix(bloom_b, t), amount);
+            let Some(amount) = profile.get((d * PROFILE_STEPS_PER_PX) as usize) else {
+                continue;
+            };
+            if *amount > 0.002 {
+                bloom.lighten(x, y, columns[column], *amount);
             }
         }
     }
@@ -486,33 +507,51 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let x1 = ((ox + width).ceil() as u32).min(sheet.width());
     let y1 = ((oy + height).ceil() as u32).min(sheet.height());
     let inner_sigma = (measured::FILL_INNER_SIGMA * height).max(1.0);
+    // Past this far inside the edge the inner glow is below the alpha the
+    // canvas can represent, so the exponential is not worth evaluating — which
+    // matters because that is every pixel in the middle of the card.
+    let inner_reach = inner_sigma * 3.0;
+
+    // The fill's hue travel and the stroke's gradient are both normalised to
+    // the card's own width, so both depend on the column and nothing else.
+    // Resolved once per column rather than once per pixel: a card is tens of
+    // rows tall, and this is the difference between four hundred mixes and
+    // twenty-four thousand.
+    let columns: Vec<(Rgb, Rgb)> = (x0..x1)
+        .map(|x| {
+            let t = (((x as f32 + 0.5) - ox) / width).clamp(0.0, 1.0);
+            (
+                measured::FILL_MID
+                    .mix(measured::FILL_TRAVEL_A.mix(measured::FILL_TRAVEL_B, t), 0.5),
+                stroke_a.mix(stroke_b, t),
+            )
+        })
+        .collect();
 
     for y in y0..y1 {
         let py = y as f32 + 0.5;
-        for x in x0..x1 {
+        for (column, x) in (x0..x1).enumerate() {
             let px = x as f32 + 0.5;
             let d = rect.distance(px, py);
-            // Where along the card's own width this pixel sits, which is what
-            // the stroke gradient and the fill's hue travel are normalised to.
-            let t = ((px - ox) / width).clamp(0.0, 1.0);
+            let (fill, gradient) = columns[column];
 
             let body = coverage(d);
             if body > 0.0 {
-                let fill = measured::FILL_MID
-                    .mix(measured::FILL_TRAVEL_A.mix(measured::FILL_TRAVEL_B, t), 0.5);
                 sheet.blend(x, y, fill, body);
                 // The fill is not a vertical ramp: it is a symmetric inner glow
                 // from both strokes in the local stroke hue.
-                let inner = (-(d * d) / (2.0 * inner_sigma * inner_sigma)).exp()
-                    * measured::FILL_EDGE_ALPHA;
-                if inner > 0.001 {
-                    sheet.blend(x, y, stroke_a.mix(stroke_b, t), inner * body);
+                if d > -inner_reach {
+                    let inner = (-(d * d) / (2.0 * inner_sigma * inner_sigma)).exp()
+                        * measured::FILL_EDGE_ALPHA;
+                    if inner > 0.001 {
+                        sheet.blend(x, y, gradient, inner * body);
+                    }
                 }
             }
 
             let stroke = coverage(d.abs() - half_stroke);
             if stroke > 0.0 {
-                sheet.blend(x, y, stroke_a.mix(stroke_b, t), stroke);
+                sheet.blend(x, y, gradient, stroke);
             }
         }
     }
