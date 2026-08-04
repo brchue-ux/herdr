@@ -1613,6 +1613,7 @@ pub struct AppState {
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub sidebar_animation: crate::config::SidebarAnimationConfig,
+    pub sidebar_notifications: crate::config::SidebarNotificationsConfig,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1865,6 +1866,19 @@ impl AppState {
             lifecycle = lifecycle.with_idle(behaviour);
         }
         lifecycle
+    }
+
+    /// True when the fleet signal bar is drawn.
+    ///
+    /// The bar lives on the reserved header row of the expanded panel, so a
+    /// collapsed sidebar has nowhere to draw it and asks nothing of it.
+    pub(crate) fn fleet_signal_bar_active(&self) -> bool {
+        !self.sidebar_collapsed && self.sidebar_notifications.enabled
+    }
+
+    /// True when a drawn signal bar has something moving in it.
+    pub(crate) fn fleet_signal_animation_active(&self) -> bool {
+        self.fleet_signal_bar_active() && self.sidebar_notifications.animates()
     }
 
     /// How hard the busiest terminal in this workspace is working, in
@@ -2252,6 +2266,7 @@ impl AppState {
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             sidebar_animation: crate::config::SidebarAnimationConfig::default(),
+            sidebar_notifications: crate::config::SidebarNotificationsConfig::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,

@@ -408,76 +408,60 @@ impl App {
     /// costs nothing but the arrivals a client that was not attached could not
     /// have seen anyway.
     pub(crate) fn advance_animations(&mut self, now: Instant, has_viewers: bool) -> bool {
-        if !has_viewers || !self.state.sidebar_animation_active() {
+        let tree = has_viewers && self.state.sidebar_animation_active();
+        let signals = has_viewers && self.state.fleet_signal_animation_active();
+        if !tree && !signals {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
             return forgotten || remembered;
         }
+
+        // Every family is published on every pass, with an empty set when its
+        // own feature is switched off, so turning one off retires exactly its
+        // elements and leaves the others alone. Reconciling is per-family, so
+        // the three can never evict each other.
+        type Members = Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)>;
+
         let lifecycle = self.state.sidebar_row_lifecycle();
-        let spaces: Vec<_> = self
-            .state
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    crate::anim::ElementId::workspace_row(&workspace.id),
-                    crate::anim::behaviour::DriveInputs {
-                        activity: self.state.workspace_activity_level(workspace),
-                    },
-                )
-            })
-            .collect();
-        let changed =
+        let spaces: Members = if tree {
+            self.state
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        crate::anim::ElementId::workspace_row(&workspace.id),
+                        crate::anim::behaviour::DriveInputs {
+                            activity: self.state.workspace_activity_level(workspace),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            Members::new()
+        };
+        let spaces_changed =
             self.state
                 .anim
                 .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
-        self.observe_agent_rows(now, &lifecycle) || changed
-    }
+        let agents_changed = self.observe_agent_rows(now, &lifecycle, tree);
 
-    /// Publish the owned agent rows that exist right now, so each second mate's
-    /// group grows and shrinks on its own.
-    ///
-    /// Every worker and sub agent row is its own element, keyed by pane id, so
-    /// a pane opening under one second mate mounts exactly one row and a pane
-    /// closing dismounts exactly one — the other second mates' groups are not
-    /// even looked at. That is the whole of "independently": there is no group
-    /// object to rebuild, only rows that arrive and leave under the owner they
-    /// already name.
-    ///
-    /// The rows are then remembered, because a departing row's pane is gone
-    /// from the session and the tree could not otherwise draw it for the length
-    /// of its exit. Only worth remembering when an exit is configured; without
-    /// one the engine retires a departed row on the spot and memory would be a
-    /// copy nobody reads.
-    fn observe_agent_rows(&mut self, now: Instant, lifecycle: &crate::anim::Lifecycle) -> bool {
-        let live = crate::ui::sidebar_agent_live_entries(&self.state);
-        let rows: Vec<_> = live
-            .iter()
-            .map(|entry| {
-                (
-                    crate::anim::ElementId::agent_row(entry.pane_id),
-                    crate::anim::behaviour::DriveInputs {
-                        activity: self.state.pane_activity_level(entry.ws_idx, entry.pane_id),
-                    },
-                )
-            })
-            .collect();
-        let changed = self
-            .state
-            .anim
-            .observe(now, crate::anim::Family::AgentRow, lifecycle, rows);
-        if lifecycle.dismount.is_none() {
-            let remembered = !self.state.sidebar_tree_row_memory.is_empty();
-            self.state.sidebar_tree_row_memory.clear();
-            return changed || remembered;
-        }
-        // Observed first, so a row that has just left is already dismounting and
-        // survives this refresh; one whose exit finished is not, and is dropped.
-        let drawn = crate::ui::rows_with_departing(&self.state, live);
-        let moved = drawn.len() != self.state.sidebar_tree_row_memory.len();
-        self.state.sidebar_tree_row_memory = drawn;
-        changed || moved
+        let signal_lifecycle = self.state.sidebar_notifications.lifecycle();
+        let signal_members: Members = if signals {
+            crate::app::fleet_signals::FleetSignals::resolve(&self.state)
+                .animation_membership()
+                .collect()
+        } else {
+            Members::new()
+        };
+        let signals_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::Named,
+            &signal_lifecycle,
+            signal_members,
+        );
+
+        spaces_changed || agents_changed || signals_changed
     }
 
     /// Move the clock the sidebar renders elapsed times against.

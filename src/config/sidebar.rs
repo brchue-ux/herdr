@@ -836,6 +836,81 @@ pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
     pub animation: SidebarAnimationConfig,
+    pub notifications: SidebarNotificationsConfig,
+}
+
+/// How long a signal's arrival runs. Short: an alert lighting up is news, and
+/// news that takes half a second to become readable is late news.
+const DEFAULT_SIGNAL_ENTER_MS: u64 = 220;
+
+/// The always-present bar of fleet signals above the tree.
+///
+/// Off by default, and deliberately so. Three of the eight slots read counts
+/// that cost a `git status` scan or a network round trip to the forge, and both
+/// of those are demand-gated on something rendering them — turning the bar on
+/// by default would start paying for both in every session, for a readout
+/// nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarNotificationsConfig {
+    /// Whether the bar is drawn at all. When it is, it is drawn always: every
+    /// slot is present in every frame, named and grey until its own signal goes
+    /// live. A bar that came and went would make its positions unlearnable.
+    pub enabled: bool,
+    /// What a slot does while its signal is live. `none` leaves a live slot
+    /// coloured but still.
+    pub emphasis: SidebarTokenEmphasis,
+    /// Behaviour a slot plays as it goes live.
+    pub enter: SidebarTokenEmphasis,
+    /// How long that arrival takes, in milliseconds.
+    pub enter_ms: u64,
+}
+
+impl Default for SidebarNotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Colour alone is a weak signal on a one-cell mark, so the live
+            // state breathes by default. It is still overridable to `none` for
+            // anyone who wants colour and nothing else.
+            emphasis: SidebarTokenEmphasis::Pulse,
+            enter: SidebarTokenEmphasis::Fade,
+            enter_ms: DEFAULT_SIGNAL_ENTER_MS,
+        }
+    }
+}
+
+impl SidebarNotificationsConfig {
+    /// The arrival stage a slot plays as it goes live, or `None` when a live
+    /// slot is configured to simply appear.
+    pub(crate) fn enter_stage(&self) -> Option<crate::anim::Stage> {
+        let behaviour = self.enter.behaviour()?;
+        Some(crate::anim::Stage::new(
+            behaviour,
+            std::time::Duration::from_millis(
+                self.enter_ms.clamp(MIN_ROW_ENTER_MS, MAX_ROW_ENTER_MS),
+            ),
+        ))
+    }
+
+    /// The life a slot is given when its signal goes live.
+    ///
+    /// One idle behaviour, because a slot is one mark saying one thing — unlike
+    /// a tree row, which carries several tokens that may each animate their own
+    /// way.
+    pub(crate) fn lifecycle(&self) -> crate::anim::Lifecycle {
+        let mut lifecycle = crate::anim::Lifecycle::still();
+        lifecycle.mount = self.enter_stage();
+        if let Some(behaviour) = self.emphasis.behaviour() {
+            lifecycle = lifecycle.with_idle(behaviour);
+        }
+        lifecycle
+    }
+
+    /// True when a drawn bar has something moving in it.
+    pub(crate) fn animates(&self) -> bool {
+        self.enabled && (self.emphasis.animates() || self.enter_stage().is_some())
+    }
 }
 
 /// How long a row's arrival runs when one is configured.

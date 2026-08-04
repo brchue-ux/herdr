@@ -66,9 +66,16 @@ pub(crate) fn summary_lines(tokens: &std::collections::HashMap<String, String>) 
 
 /// Whether this pane has published anything for the summary view to show.
 pub(crate) fn has_summary(tokens: &std::collections::HashMap<String, String>) -> bool {
-    tokens
-        .get(SUMMARY_TOKEN)
-        .is_some_and(|line| !line.trim().is_empty())
+    is_summary_line(tokens.get(SUMMARY_TOKEN).map(String::as_str))
+}
+
+/// The one rule for "this is a report and not an empty token".
+///
+/// Split out so a caller holding the token store rather than a materialised map
+/// — [`crate::app::fleet_signals`] asks about every pane on every frame — reads
+/// the same rule instead of re-typing it and drifting from it.
+pub(crate) fn is_summary_line(value: Option<&str>) -> bool {
+    value.is_some_and(|line| !line.trim().is_empty())
 }
 
 /// One worker as the summary view shows it.
