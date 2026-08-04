@@ -20,6 +20,52 @@ use crate::ui::AgentPanelEntry;
 /// The metadata token a pane uses to name its owner.
 pub(crate) const OWNER_TOKEN: &str = "owner";
 
+/// Who owns a pane: the one rule, so every reader of it gets the same answer.
+///
+/// Two sources, in order:
+///
+/// 1. A published `owner` token wins. A fleet that states ownership explicitly
+///    means it — a synthetic group like `background` is not something any
+///    structural rule would produce — and keeping the token on top is what lets
+///    a fleet migrate onto the structural edge with no frame in between where
+///    the tree is wrong.
+/// 2. Otherwise the structural edge: the Space of the pane that asked Herdr for
+///    this one, **and only when that pane was in this same Space**.
+///
+/// The same-Space clause carries the whole design. A pane created by a pane
+/// standing here is a worker somebody delegated, and belongs under this Space.
+/// A pane created from a *different* Space is a new Space being spun up — a
+/// second mate's own pane, say — and must get no pane-level owner at all, or it
+/// would draw twice: once as its Space row, and again as a child row inside it.
+///
+/// `workspace_tree_name` is the Space's own handle, resolved by the caller from
+/// live state on the current frame. It is passed in rather than snapshotted at
+/// creation because the record holds a workspace *id* while the tree matches on
+/// a *label*: re-resolving each pass is what makes a renamed Space carry its
+/// group with it instead of orphaning every worker under it.
+pub(crate) fn resolve_owner(
+    owner_token: Option<&str>,
+    created_by: Option<&crate::api::schema::PaneOrigin>,
+    workspace_id: &str,
+    workspace_tree_name: Option<&str>,
+) -> Option<String> {
+    let published = owner_token
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_string);
+    if published.is_some() {
+        return published;
+    }
+    let origin = created_by?;
+    if origin.workspace_id != workspace_id {
+        return None;
+    }
+    workspace_tree_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// The `relation` value for a sub agent.
 ///
 /// It has no [`AgentRelation`] variant on purpose: a sub agent runs *inside*
@@ -358,6 +404,149 @@ mod tests {
         let mut entry = AgentPanelEntry::test_new(name);
         entry.owner = owner.map(str::to_string);
         entry
+    }
+
+    fn origin(pane_id: &str, workspace_id: &str) -> crate::api::schema::PaneOrigin {
+        crate::api::schema::PaneOrigin {
+            pane_id: pane_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+        }
+    }
+
+    /// The case the whole feature exists for: a pane created by a pane standing
+    /// in this same Space is owned by it, with nobody having published a thing.
+    #[test]
+    fn a_pane_created_from_this_space_is_owned_by_this_space() {
+        assert_eq!(
+            resolve_owner(
+                None,
+                Some(&origin("w6M:p2", "w6M")),
+                "w6M",
+                Some("2ndmate-herdr")
+            ),
+            Some("2ndmate-herdr".to_string())
+        );
+    }
+
+    /// The clause that stops a second mate being drawn twice: its own pane was
+    /// opened from the first mate's Space, so it gets no pane-level owner and
+    /// stays a Space row only.
+    #[test]
+    fn a_pane_created_from_another_space_gets_no_owner() {
+        assert_eq!(
+            resolve_owner(
+                None,
+                Some(&origin("wFM:p1", "wFM")),
+                "w6M",
+                Some("2ndmate-herdr")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pane_nobody_asked_for_gets_no_owner() {
+        assert_eq!(
+            resolve_owner(None, None, "w6M", Some("2ndmate-herdr")),
+            None
+        );
+    }
+
+    /// The migration property: a fleet's published token keeps winning, so
+    /// turning the structural rule on cannot move a row that was already right.
+    #[test]
+    fn a_published_token_beats_the_structural_edge() {
+        assert_eq!(
+            resolve_owner(
+                Some("background"),
+                Some(&origin("w6M:p2", "w6M")),
+                "w6M",
+                Some("2ndmate-herdr")
+            ),
+            Some("background".to_string())
+        );
+    }
+
+    /// A token published as whitespace is a token that says nothing, and must
+    /// not shadow an edge Herdr knows for certain.
+    #[test]
+    fn a_blank_token_falls_through_to_the_structural_edge() {
+        assert_eq!(
+            resolve_owner(
+                Some("   "),
+                Some(&origin("w6M:p2", "w6M")),
+                "w6M",
+                Some("2ndmate-herdr")
+            ),
+            Some("2ndmate-herdr".to_string())
+        );
+    }
+
+    /// A Space with no usable handle owns nothing, because an empty owner would
+    /// match no node and the pane would claim a parent that cannot exist.
+    #[test]
+    fn a_space_with_no_name_owns_nothing() {
+        assert_eq!(
+            resolve_owner(None, Some(&origin("w6M:p2", "w6M")), "w6M", None),
+            None
+        );
+        assert_eq!(
+            resolve_owner(None, Some(&origin("w6M:p2", "w6M")), "w6M", Some("  ")),
+            None
+        );
+    }
+
+    /// A structurally-owned pane must nest exactly like a token-owned one:
+    /// [`resolve_owner`] hands the arranger a plain label either way, so the
+    /// tree cannot tell the two apart.
+    #[test]
+    fn a_structural_owner_nests_like_a_published_one() {
+        let structural = resolve_owner(
+            None,
+            Some(&origin("w6M:p2", "w6M")),
+            "w6M",
+            Some("2ndmate-herdr"),
+        );
+        let mut entries = vec![
+            entry("2ndmate-herdr", None),
+            entry("worker-token", Some("2ndmate-herdr")),
+            entry("worker-structural", structural.as_deref()),
+        ];
+
+        classify_agent_relations(&mut entries);
+        arrange_agent_tree(&mut entries);
+
+        assert_eq!(
+            shape(&entries),
+            vec![
+                ("2ndmate-herdr".to_string(), 0, true),
+                ("worker-token".to_string(), 1, false),
+                ("worker-structural".to_string(), 1, true),
+            ]
+        );
+        assert_eq!(entries[1].relation, entries[2].relation);
+    }
+
+    /// An owner nobody answers to is a root, not a deletion. The panel relies
+    /// on this: it keeps a pane Herdr was asked to create even when the owner
+    /// does not resolve, and this is where such a row lands.
+    #[test]
+    fn an_unmatched_owner_stays_present_as_a_root() {
+        let mut entries = vec![
+            entry("2ndmate-herdr", None),
+            entry("orphan", Some("a-space-that-closed")),
+        ];
+
+        classify_agent_relations(&mut entries);
+        arrange_agent_tree(&mut entries);
+
+        assert_eq!(
+            shape(&entries),
+            vec![
+                ("2ndmate-herdr".to_string(), 0, false),
+                ("orphan".to_string(), 0, true),
+            ]
+        );
     }
 
     fn shape(entries: &[AgentPanelEntry]) -> Vec<(String, u8, bool)> {

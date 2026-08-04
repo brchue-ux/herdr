@@ -934,6 +934,7 @@ impl HeadlessServer {
                 focus: true,
                 label,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         )
     }
@@ -951,6 +952,7 @@ impl HeadlessServer {
                 focus: true,
                 label,
                 env: Default::default(),
+                caller_pane_id: None,
             }),
         )
     }

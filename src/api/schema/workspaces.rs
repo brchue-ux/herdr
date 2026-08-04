@@ -14,6 +14,15 @@ pub struct WorkspaceCreateParams {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// The pane making this request. See
+    /// [`crate::api::schema::PaneSplitParams::caller_pane_id`].
+    ///
+    /// A workspace's first pane is always created from somewhere else, so its
+    /// origin never resolves to an owner. It is recorded anyway, because "this
+    /// Space was spun up by that pane" is the fact that makes the cross-Space
+    /// case observable rather than merely absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

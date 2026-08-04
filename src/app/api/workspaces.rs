@@ -54,8 +54,12 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        // Resolved before the new workspace exists, so the caller is looked up
+        // in the topology it was actually standing in.
+        let origin = self.resolve_pane_origin(params.caller_pane_id.as_deref());
         match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
             Ok(index) => {
+                self.record_workspace_root_pane_origin(index, origin);
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
                         workspace.set_custom_name(label);
@@ -70,6 +74,36 @@ impl App {
                 )
             }
             Err(err) => encode_error(id, "workspace_create_failed", err.to_string()),
+        }
+    }
+
+    /// Stamp a freshly created workspace's first pane with who asked for it.
+    ///
+    /// The origin never yields an owner here — the caller is by construction in
+    /// some other Space — but recording it is what makes "this Space was spun
+    /// up by that pane" readable instead of merely absent, which is the only
+    /// way to tell a cross-Space creation apart from a call that forgot to say
+    /// who it was.
+    fn record_workspace_root_pane_origin(
+        &mut self,
+        ws_idx: usize,
+        origin: Option<crate::api::schema::PaneOrigin>,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.tabs.first())
+            .and_then(|tab| tab.panes.get(&tab.root_pane))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.created_by = Some(origin);
         }
     }
 
@@ -491,6 +525,7 @@ mod tests {
                 focus: true,
                 label: None,
                 env: Default::default(),
+                caller_pane_id: None,
             },
         );
         let _: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -520,6 +555,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                caller_pane_id: None,
             },
         );
 

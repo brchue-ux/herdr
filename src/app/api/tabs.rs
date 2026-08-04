@@ -51,7 +51,10 @@ impl App {
             focus,
             label,
             env,
+            caller_pane_id,
         } = params;
+        // Resolved before the tab exists, while the caller is certainly live.
+        let origin = self.resolve_pane_origin(caller_pane_id.as_deref());
         let ws_idx = if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
@@ -90,7 +93,8 @@ impl App {
                 )
             });
         match result {
-            Ok((tab_idx, terminal, runtime)) => {
+            Ok((tab_idx, mut terminal, runtime)) => {
+                terminal.created_by = origin;
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
                 self.state.terminals.insert(terminal.id.clone(), terminal);
                 self.state.remove_alias_shadowed_by_new_pane(
@@ -481,6 +485,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                caller_pane_id: None,
             },
         );
 

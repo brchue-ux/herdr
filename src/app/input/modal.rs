@@ -1023,6 +1023,7 @@ impl App {
                             focus: true,
                             label,
                             env: Default::default(),
+                            caller_pane_id: None,
                         },
                     );
                 } else if !self.state.workspaces.is_empty() && !new_name.is_empty() {
@@ -1051,6 +1052,7 @@ impl App {
                         focus: true,
                         label,
                         env: Default::default(),
+                        caller_pane_id: None,
                     },
                 );
             }

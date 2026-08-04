@@ -533,6 +533,10 @@ fn restore_tab(
         let saved_declared_agent = saved_pane
             .and_then(|pane| pane.declared_agent.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
+        // Restored verbatim rather than re-resolved: the creating pane may well
+        // be gone by now, and the record is a statement about what happened at
+        // creation, not a claim that the creator is still there.
+        let saved_created_by = saved_pane.and_then(|pane| pane.created_by.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -575,6 +579,7 @@ fn restore_tab(
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
             terminal.metadata_tokens = saved_metadata_tokens;
+            terminal.created_by = saved_created_by;
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -666,6 +671,7 @@ fn restore_tab(
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 terminal.metadata_tokens = saved_metadata_tokens;
+                terminal.created_by = saved_created_by;
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1206,6 +1212,81 @@ mod tests {
         assert!(restored_terminal_agent_session(Some(&session), true).is_none());
     }
 
+    /// The durability half of native ownership: a restart must not cost a pane
+    /// its group. Env, cwd and process ancestry all fail this — the record is
+    /// in the session snapshot precisely so it does not.
+    #[tokio::test]
+    async fn restore_carries_the_creating_pane_record() {
+        let cwd = std::env::current_dir().unwrap();
+        let origin = crate::api::schema::PaneOrigin {
+            pane_id: "w6M:p2".into(),
+            workspace_id: "w6M".into(),
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            metadata_tokens: Vec::new(),
+                            declared_agent: None,
+                            created_by: Some(origin.clone()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+                metadata_tokens: Vec::new(),
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            agent_view: None,
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert_eq!(terminal.created_by.as_ref(), Some(&origin));
+    }
+
     #[tokio::test]
     async fn restore_carries_persisted_agent_session_metadata() {
         let cwd = std::env::current_dir().unwrap();
@@ -1239,6 +1320,7 @@ mod tests {
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
                             declared_agent: None,
+                            created_by: None,
                         },
                     )]),
                     zoomed: false,
@@ -1324,6 +1406,7 @@ mod tests {
                                 launch_argv: None,
                                 metadata_tokens: Vec::new(),
                                 declared_agent: None,
+                                created_by: None,
                             },
                         ),
                         (
@@ -1337,6 +1420,7 @@ mod tests {
                                 launch_argv: None,
                                 metadata_tokens: Vec::new(),
                                 declared_agent: None,
+                                created_by: None,
                             },
                         ),
                     ]),
@@ -1407,6 +1491,7 @@ mod tests {
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
                             declared_agent: Some("claude".into()),
+                            created_by: None,
                         },
                     )]),
                     zoomed: false,
@@ -1476,6 +1561,7 @@ mod tests {
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
                             declared_agent: Some("an-agent-this-build-never-heard-of".into()),
+                            created_by: None,
                         },
                     )]),
                     zoomed: false,
@@ -1529,6 +1615,7 @@ mod tests {
                     launch_argv: None,
                     metadata_tokens: Vec::new(),
                     declared_agent: None,
+                    created_by: None,
                 },
             )
         };
@@ -1546,6 +1633,7 @@ mod tests {
             launch_argv: None,
             metadata_tokens: Vec::new(),
             declared_agent: None,
+            created_by: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1702,6 +1790,7 @@ mod tests {
                             launch_argv: None,
                             metadata_tokens: Vec::new(),
                             declared_agent: None,
+                            created_by: None,
                         },
                     )]),
                     zoomed: false,
@@ -1867,6 +1956,7 @@ mod tests {
                 launch_argv: None,
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
+                created_by: None,
             },
         );
         let history = SessionHistorySnapshot {

@@ -114,6 +114,7 @@ impl App {
                 focus: true,
                 label: None,
                 env: Default::default(),
+                caller_pane_id: None,
             },
         );
         self.state.mode = if self.state.active.is_some() {
@@ -474,6 +475,21 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             scroll,
             activity,
+            created_by: terminal.created_by.clone(),
+            // Resolved through the same rule and the same Space handle the
+            // panel draws with, so a script asserting "every worker has an
+            // owner" is asking about the rows the captain is actually looking
+            // at rather than a second opinion.
+            owner: crate::app::agent_tree::resolve_owner(
+                terminal
+                    .metadata_tokens
+                    .values()
+                    .get(crate::app::agent_tree::OWNER_TOKEN)
+                    .map(String::as_str),
+                terminal.created_by.as_ref(),
+                &ws.id,
+                crate::ui::sidebar::space_tree_name(&self.state, ws_idx).as_deref(),
+            ),
             revision: terminal.revision,
         })
     }

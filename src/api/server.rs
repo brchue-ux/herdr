@@ -884,6 +884,8 @@ mod tests {
             scroll: None,
             activity: None,
             revision: 0,
+            created_by: None,
+            owner: None,
         }
     }
 

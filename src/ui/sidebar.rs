@@ -69,8 +69,16 @@ pub(crate) struct AgentPanelEntry {
     pub tokens: std::collections::HashMap<String, String>,
     /// This pane's own handle, the thing another pane's `owner` token names.
     pub agent_name: Option<String>,
-    /// The `owner` metadata token, naming the pane that owns this one.
+    /// Who owns this pane: the published `owner` token if there is one, else
+    /// the Space of the pane that created this one. See
+    /// [`resolve_entry_owner`].
     pub owner: Option<String>,
+    /// Which pane asked Herdr to create this one, if a pane did.
+    ///
+    /// Carried on the entry rather than looked up again because it is what
+    /// separates a pane somebody delegated from a pane a person made by hand,
+    /// which is the line [`sidebar_agent_live_entries`] draws.
+    pub created_by: Option<crate::api::schema::PaneOrigin>,
     /// Depth in the ownership tree, stamped by
     /// [`crate::app::agent_tree::arrange_agent_tree`]. 0 is a root.
     pub depth: u8,
@@ -110,6 +118,7 @@ impl AgentPanelEntry {
             tokens: std::collections::HashMap::new(),
             agent_name: Some(agent_name.to_string()),
             owner: None,
+            created_by: None,
             depth: 0,
             relation: crate::app::agent_tree::AgentRelation::FirstMate,
             is_last_child: true,
@@ -190,6 +199,9 @@ fn collect_agent_panel_entries_with_runtimes(
                             .tabs
                             .get(detail.tab_idx)
                             .is_some_and(|tab| !tab.is_auto_named());
+                    // Resolved before the detail is taken apart, because the
+                    // rule reads two of its fields at once.
+                    let owner = resolve_entry_owner(app, ws_idx, &detail);
                     AgentPanelEntry {
                         ws_idx,
                         tab_idx: detail.tab_idx,
@@ -206,12 +218,9 @@ fn collect_agent_panel_entries_with_runtimes(
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
                         last_agent_state_change_at: detail.last_agent_state_change_at,
+                        owner,
                         state_labels: detail.state_labels,
-                        owner: detail
-                            .tokens
-                            .get(crate::app::agent_tree::OWNER_TOKEN)
-                            .map(|owner| owner.trim().to_string())
-                            .filter(|owner| !owner.is_empty()),
+                        created_by: detail.created_by,
                         tokens: detail.tokens,
                         agent_name: detail.agent_name,
                         depth: 0,
@@ -600,10 +609,32 @@ struct SpaceBlock {
 /// into `owner` — `firstmate`, `2ndmate-explore` — so there is no second naming
 /// scheme to keep in sync. Resolved without terminal runtimes so the tree's
 /// shape cannot change with a terminal title.
-fn space_tree_name(app: &AppState, ws_idx: usize) -> Option<String> {
+pub(crate) fn space_tree_name(app: &AppState, ws_idx: usize) -> Option<String> {
     let ws = app.workspaces.get(ws_idx)?;
     let name = ws.display_name_from(&app.terminals, &TerminalRuntimeRegistry::new());
     (!name.trim().is_empty()).then_some(name)
+}
+
+/// Apply [`crate::app::agent_tree::resolve_owner`] to one pane of one Space.
+///
+/// The Space handle comes from [`space_tree_name`], the same function the Space
+/// nodes are named with, so a derived owner always matches a real node rather
+/// than a label that merely looks like one.
+fn resolve_entry_owner(
+    app: &AppState,
+    ws_idx: usize,
+    detail: &crate::workspace::aggregate::PaneDetail,
+) -> Option<String> {
+    let workspace_id = app.workspaces.get(ws_idx).map(|ws| ws.id.as_str())?;
+    crate::app::agent_tree::resolve_owner(
+        detail
+            .tokens
+            .get(crate::app::agent_tree::OWNER_TOKEN)
+            .map(String::as_str),
+        detail.created_by.as_ref(),
+        workspace_id,
+        space_tree_name(app, ws_idx).as_deref(),
+    )
 }
 
 /// Who this Space says owns it, from its own `owner` metadata token.
@@ -620,13 +651,24 @@ fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
         .filter(|owner| !owner.is_empty())
 }
 
-/// The agent panes that belong in the sidebar tree: the ones that named an
-/// owner.
+/// The agent panes that belong in the sidebar tree: the ones somebody owns, and
+/// the ones somebody asked for.
 ///
-/// A pane with no owner is deliberately absent. In a fleet where the mates are
-/// Spaces, a mate's own pane declares no owner, so drawing every agent pane
-/// would draw each mate twice — once as its Space row and again as a child of
-/// itself. Owning is what makes a pane part of somebody's tree.
+/// A pane a *person* made is deliberately absent. In a fleet where the mates
+/// are Spaces, a mate's own pane is opened from elsewhere and names no owner,
+/// so drawing every agent pane would draw each mate twice — once as its Space
+/// row and again as a child of itself. Belonging to somebody's tree is what
+/// earns a row here.
+///
+/// But being *unplaceable* must not cost a pane its row. A pane Herdr was asked
+/// to create has a `created_by` record even when that record yields no owner —
+/// the creator was in another Space, the Space has no label yet, an explicit
+/// token expired out from under it — and those are exactly the panes worth
+/// seeing. They draw at the root instead, which
+/// [`crate::app::agent_tree::arrange_owner_tree`] already does for any owner it
+/// cannot match. The alternative is the failure this rule exists to end: a gap
+/// in ownership silently deleting worker rows, which is how a run of merged
+/// pull requests went unseen. A flat row is a bad tree; a missing row is a lie.
 ///
 /// No Agents view is applied. This is the only place a worker is drawn now, and
 /// a filter here could hide the whole fleet from the only panel that shows it.
@@ -659,7 +701,7 @@ pub(crate) fn sidebar_agent_live_entries(app: &AppState) -> Vec<AgentPanelEntry>
             )
         });
     }
-    entries.retain(|entry| entry.owner.is_some());
+    entries.retain(|entry| entry.owner.is_some() || entry.created_by.is_some());
     entries
 }
 
@@ -3693,6 +3735,171 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    /// The same miniature fleet with **nothing hand-stamped on the worker**.
+    ///
+    /// Instead of a published `owner` token the worker's terminal carries the
+    /// `created_by` record Herdr writes at creation, naming the mate's own pane
+    /// in the mate's own Space — which is exactly what a `herdr tab create`
+    /// issued from inside that pane leaves behind.
+    ///
+    /// `owner_workspace` selects which Space the creating pane stood in, so one
+    /// helper covers both halves of the rule.
+    fn natively_owned_fleet(
+        width: u16,
+        owner_workspace: usize,
+    ) -> (crate::app::state::AppState, Vec<String>) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        // The Space edge is unchanged by this feature: mates are still grouped
+        // by their own published token.
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+
+        let creator_workspace_id = app.workspaces[owner_workspace].id.clone();
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.created_by = Some(crate::api::schema::PaneOrigin {
+            pane_id: "creator".to_string(),
+            workspace_id: creator_workspace_id,
+        });
+
+        let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let rows = {
+            let buffer = terminal.backend().buffer();
+            (0..20).map(|row| row_text(buffer, row, width)).collect()
+        };
+        (app, rows)
+    }
+
+    /// The headline: a worker created from inside its mate's Space draws under
+    /// that mate with no `owner` token published by anybody.
+    #[test]
+    fn a_natively_owned_worker_nests_under_its_space_with_no_token_published() {
+        let (app, rows) = natively_owned_fleet(26, 1);
+        let screen = rows.join("\n");
+
+        assert!(
+            all_agent_panel_entries(&app)
+                .iter()
+                .all(|entry| !entry.tokens.contains_key("owner")),
+            "the worker was supposed to carry no owner token"
+        );
+
+        let row_of = |name: &str| {
+            rows.iter()
+                .position(|row| row.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
+        };
+        let mate_row = row_of("2ndmate-explore");
+        let worker_row = row_of("worker");
+        assert!(
+            mate_row < worker_row,
+            "the worker did not land under its mate:\n{screen}"
+        );
+        assert!(
+            rows[worker_row].contains('└') || rows[worker_row].contains('├'),
+            "the worker drew with no connector, so it is not nested:\n{screen}"
+        );
+    }
+
+    /// The load-bearing clause. A pane created from a *different* Space is a
+    /// new Space being spun up, not a worker, so it takes no pane-level owner
+    /// and must not draw as a child row inside the Space it happens to sit in.
+    #[test]
+    fn a_worker_created_from_another_space_takes_no_pane_level_owner() {
+        let (app, _) = natively_owned_fleet(26, 0);
+        let worker = all_agent_panel_entries(&app)
+            .into_iter()
+            .find(|entry| entry.agent_name.as_deref() == Some("worker"))
+            .expect("the worker pane is an agent pane");
+
+        assert_eq!(worker.owner, None);
+        assert!(worker.created_by.is_some());
+    }
+
+    /// The record holds a workspace *id* and the tree matches on a *label*, so
+    /// the edge has to be re-resolved every pass. This is the test that fails
+    /// the moment anyone snapshots the label at creation instead.
+    #[test]
+    fn renaming_a_space_moves_its_group_instead_of_orphaning_it() {
+        let (mut app, _) = natively_owned_fleet(26, 1);
+        let owner_of_worker = |app: &crate::app::state::AppState| {
+            all_agent_panel_entries(app)
+                .into_iter()
+                .find(|entry| entry.agent_name.as_deref() == Some("worker"))
+                .and_then(|entry| entry.owner)
+        };
+
+        assert_eq!(owner_of_worker(&app), Some("2ndmate-explore".to_string()));
+
+        app.workspaces[1].set_custom_name("2ndmate-renamed".to_string());
+
+        assert_eq!(owner_of_worker(&app), Some("2ndmate-renamed".to_string()));
+    }
+
+    /// A pane Herdr was asked to create keeps its row even when the owner does
+    /// not resolve. Losing the row is the failure this whole area exists to
+    /// end; drawing it flat at the root is merely a worse tree.
+    #[test]
+    fn an_unresolved_owner_leaves_the_pane_drawn_rather_than_deleted() {
+        let (app, _) = natively_owned_fleet(26, 0);
+        let drawn = sidebar_agent_live_entries(&app);
+
+        let worker = drawn
+            .iter()
+            .find(|entry| entry.agent_name.as_deref() == Some("worker"))
+            .expect("an unowned but delegated pane must still be drawn");
+        assert_eq!(worker.owner, None);
+        assert_eq!(worker.depth, 0, "it should be a root, not nested");
+    }
+
+    /// The other half of that rule: a pane nobody asked for still stays out.
+    /// A mate's own pane is opened by a person, so drawing it here would put
+    /// each mate on screen twice — once as its Space row, once as a child.
+    #[test]
+    fn a_pane_nobody_asked_for_is_still_left_out_of_the_tree() {
+        let (mut app, _) = natively_owned_fleet(26, 1);
+        let worker_terminal = all_agent_panel_entries(&app)
+            .into_iter()
+            .find(|entry| entry.agent_name.as_deref() == Some("worker"))
+            .and_then(|entry| {
+                app.workspaces[1].tabs[0]
+                    .panes
+                    .get(&entry.pane_id)
+                    .map(|pane| pane.attached_terminal_id.clone())
+            })
+            .expect("the worker pane has a terminal");
+        // Take away the record, leaving a pane that looks hand-made.
+        app.terminals.get_mut(&worker_terminal).unwrap().created_by = None;
+
+        assert!(
+            sidebar_agent_live_entries(&app)
+                .iter()
+                .all(|entry| entry.agent_name.as_deref() != Some("worker")),
+            "a pane with neither an owner nor an origin should stay out"
+        );
     }
 
     /// The same miniature fleet, but the worker has finished and published a

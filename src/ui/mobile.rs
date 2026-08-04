@@ -1187,6 +1187,7 @@ mod tests {
             relation: crate::app::agent_tree::AgentRelation::FirstMate,
             is_last_child: true,
             ancestors_continue: Vec::new(),
+            created_by: None,
         }
     }
 

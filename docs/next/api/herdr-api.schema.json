@@ -834,6 +834,17 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "created_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Which pane asked Herdr to create this one. Absent for a pane a human\nmade — a keyboard split, or the first pane of a workspace Herdr opened\nfor itself — and for every pane that predates this record."
+            },
             "cwd": {
               "type": [
                 "string",
@@ -863,6 +874,13 @@
               ]
             },
             "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner": {
+              "description": "Who owns this pane in the sidebar tree, resolved the same way the panel\nresolves it: a published `owner` token wins, otherwise the Space of the\npane that created this one, and only when that pane was in this Space.\n\nRead-only and derived. It exists so a fleet can assert \"every live\nworker has an owner\" from a script instead of noticing by eye that rows\nwent missing.",
               "type": [
                 "string",
                 "null"
@@ -1057,6 +1075,24 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneOrigin": {
+          "description": "Which pane asked Herdr to create another pane, and where it was standing.\n\nHerdr forks every pane itself, so it is the new pane's parent process and\nthe requesting agent is never an ancestor of it. This record is the only\nplace that edge survives: it is written once, in the same mutation that\ncreates the pane, and never recomputed, so it cannot drift and there is no\ninterval in which the pane exists and its origin is unknown.\n\nThe workspace is captured alongside the pane because the pane may move or\nclose later, and the structural question — was the creator standing in this\nsame Space? — has to stay answerable either way.",
+          "properties": {
+            "pane_id": {
+              "description": "Public id of the pane that requested this one.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Public id of the workspace that pane was in at the time.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id"
           ],
           "type": "object"
         },
@@ -3168,6 +3204,13 @@
         },
         "PaneSplitParams": {
           "properties": {
+            "caller_pane_id": {
+              "description": "The pane making this request, so Herdr can record who the new pane\nbelongs to. The CLI fills it from its own ambient `HERDR_PANE_ID`; a\ncaller that omits it or names a pane that no longer exists simply gets\nno origin recorded, never a dangling one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -4162,6 +4205,13 @@
         },
         "TabCreateParams": {
           "properties": {
+            "caller_pane_id": {
+              "description": "The pane making this request. See\n[`crate::api::schema::PaneSplitParams::caller_pane_id`].",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -4258,6 +4308,13 @@
         },
         "WorkspaceCreateParams": {
           "properties": {
+            "caller_pane_id": {
+              "description": "The pane making this request. See\n[`crate::api::schema::PaneSplitParams::caller_pane_id`].\n\nA workspace's first pane is always created from somewhere else, so its\norigin never resolves to an owner. It is recorded anyway, because \"this\nSpace was spun up by that pane\" is the fact that makes the cross-Space\ncase observable rather than merely absent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -7782,6 +7839,17 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "created_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Which pane asked Herdr to create this one. Absent for a pane a human\nmade — a keyboard split, or the first pane of a workspace Herdr opened\nfor itself — and for every pane that predates this record."
+            },
             "cwd": {
               "type": [
                 "string",
@@ -7811,6 +7879,13 @@
               ]
             },
             "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner": {
+              "description": "Who owns this pane in the sidebar tree, resolved the same way the panel\nresolves it: a published `owner` token wins, otherwise the Space of the\npane that created this one, and only when that pane was in this Space.\n\nRead-only and derived. It exists so a fleet can assert \"every live\nworker has an owner\" from a script instead of noticing by eye that rows\nwent missing.",
               "type": [
                 "string",
                 "null"
@@ -8124,6 +8199,24 @@
             "pane_id",
             "direction",
             "layout"
+          ],
+          "type": "object"
+        },
+        "PaneOrigin": {
+          "description": "Which pane asked Herdr to create another pane, and where it was standing.\n\nHerdr forks every pane itself, so it is the new pane's parent process and\nthe requesting agent is never an ancestor of it. This record is the only\nplace that edge survives: it is written once, in the same mutation that\ncreates the pane, and never recomputed, so it cannot drift and there is no\ninterval in which the pane exists and its origin is unknown.\n\nThe workspace is captured alongside the pane because the pane may move or\nclose later, and the structural question — was the creator standing in this\nsame Space? — has to stay answerable either way.",
+          "properties": {
+            "pane_id": {
+              "description": "Public id of the pane that requested this one.",
+              "type": "string"
+            },
+            "workspace_id": {
+              "description": "Public id of the workspace that pane was in at the time.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id"
           ],
           "type": "object"
         },
