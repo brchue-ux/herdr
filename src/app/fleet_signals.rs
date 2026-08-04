@@ -39,7 +39,7 @@ pub(crate) enum FleetSignal {
     /// An agent finished while the captain was looking somewhere else.
     ///
     /// Herdr's own `done` state: a pane that is idle and whose
-    /// [`crate::pane::state::PaneState::seen`] flag is still false.
+    /// [`crate::pane::PaneState::seen`] flag is still false.
     Review,
     /// An agent is blocked on a human answer — [`AgentState::Blocked`].
     Ask,
