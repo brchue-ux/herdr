@@ -688,6 +688,7 @@ impl App {
                 split_borders: Vec::new(),
             },
             drag: None,
+            sidebar_divider_hover: false,
             workspace_press: None,
             tab_press: None,
             selection: None,

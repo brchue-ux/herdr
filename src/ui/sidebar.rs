@@ -1397,6 +1397,68 @@ pub(crate) fn workspace_drop_indicator_row(
         .find_map(|(candidate, row)| (candidate == target).then_some(row))
 }
 
+/// Rows of grip marking on the divider, and the shortest divider that gets one.
+///
+/// The grip is the divider's only at-rest affordance, so it has to read as a
+/// deliberate marking rather than as a rendering artefact: three rows is the
+/// smallest run that does, and below eight rows those three would be most of
+/// the bar and stop reading as a grip at all.
+const DIVIDER_GRIP_ROWS: u16 = 3;
+const DIVIDER_GRIP_MIN_HEIGHT: u16 = 8;
+
+/// The rows the divider's grip marking covers, centred on the bar.
+///
+/// Empty when the sidebar is too short to spare the rows.
+fn sidebar_divider_grip_rows(area: Rect) -> std::ops::Range<u16> {
+    if area.height < DIVIDER_GRIP_MIN_HEIGHT {
+        return 0..0;
+    }
+    let start = area.y + (area.height - DIVIDER_GRIP_ROWS) / 2;
+    start..start + DIVIDER_GRIP_ROWS
+}
+
+/// The sidebar's vertical bar, drawn so it says it can be dragged.
+///
+/// Three states, quietest first. At rest the bar is the separator colour it has
+/// always been and only the grip rows lift to `overlay0` — a colour step, no
+/// glyph change, so nothing that reads the sidebar as text sees anything new.
+/// Hovering the grab band lifts the whole bar and turns the grip heavy, which
+/// is the moment the divider has to look grabbable. A live drag holds that same
+/// hovered look wherever the pointer has been dragged to.
+///
+/// The hover state mirrors [`crate::app::AppState::sidebar_divider_grab_at`]
+/// exactly (see `track_sidebar_divider_hover`), so the bar can never light up
+/// on a cell where a press would be swallowed by a scrollbar track, a worktree
+/// chevron, or the collapse toggle.
+fn render_sidebar_divider(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
+    let p = &app.palette;
+    let active = app.sidebar_divider_hover;
+    let bar_style = if active {
+        Style::default().fg(p.overlay1)
+    } else if is_navigating {
+        Style::default().fg(p.accent)
+    } else {
+        Style::default().fg(p.surface_dim)
+    };
+    let grip_style = if active {
+        Style::default().fg(p.accent)
+    } else if is_navigating {
+        Style::default().fg(p.text)
+    } else {
+        Style::default().fg(p.overlay0)
+    };
+    let grip_symbol = if active { "┃" } else { "│" };
+
+    let grip = sidebar_divider_grip_rows(area);
+    let sep_x = area.x + area.width.saturating_sub(1);
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        let is_grip = grip.contains(&y);
+        buf[(sep_x, y)].set_symbol(if is_grip { grip_symbol } else { "│" });
+        buf[(sep_x, y)].set_style(if is_grip { grip_style } else { bar_style });
+    }
+}
+
 pub(super) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1405,18 +1467,7 @@ pub(super) fn render_sidebar(
 ) {
     let p = &app.palette;
     let is_navigating = matches!(app.mode, Mode::Navigate);
-    let sep_style = if is_navigating {
-        Style::default().fg(p.accent)
-    } else {
-        Style::default().fg(p.surface_dim)
-    };
-
-    let sep_x = area.x + area.width.saturating_sub(1);
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        buf[(sep_x, y)].set_symbol("│");
-        buf[(sep_x, y)].set_style(sep_style);
-    }
+    render_sidebar_divider(app, frame, area, is_navigating);
 
     render_workspace_list(
         app,
@@ -2772,6 +2823,104 @@ mod tests {
             agent: None,
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
+    }
+
+    /// Draws the sidebar and reads the bar column back out of the buffer as
+    /// `(symbol, foreground)` per row, which is the only place the divider's
+    /// affordance actually exists.
+    fn drawn_divider_column(hovered: bool) -> Vec<(String, ratatui::style::Color)> {
+        let area = Rect::new(0, 0, 26, 20);
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("alpha"), Workspace::test_new("beta")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        app.sidebar_divider_hover = hovered;
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar_x = area.x + area.width - 1;
+        (area.y..area.y + area.height)
+            .map(|y| {
+                let cell = &buffer[(bar_x, y)];
+                (cell.symbol().to_string(), cell.fg)
+            })
+            .collect()
+    }
+
+    /// At rest the divider still reads as a plain separator to anything that
+    /// scrapes the sidebar as text: the grip is a colour step only. It is a
+    /// real step, though, and it is a short centred run rather than the whole
+    /// bar.
+    #[test]
+    fn the_resting_divider_marks_a_centred_grip_with_colour_alone() {
+        let column = drawn_divider_column(false);
+        let grip = sidebar_divider_grip_rows(Rect::new(0, 0, 26, 20));
+
+        assert!(
+            column.iter().all(|(symbol, _)| symbol == "│"),
+            "the resting divider changed glyph somewhere: {column:?}"
+        );
+
+        let grip_colours: Vec<_> = column[grip.start as usize..grip.end as usize]
+            .iter()
+            .map(|(_, fg)| *fg)
+            .collect();
+        let bar_colour = column[0].1;
+        assert!(
+            grip_colours.iter().all(|fg| *fg != bar_colour),
+            "the grip is the same colour as the bar, so nothing marks it: {column:?}"
+        );
+        assert_eq!(
+            grip_colours.len(),
+            usize::from(DIVIDER_GRIP_ROWS),
+            "the grip should be a short run, not the whole bar"
+        );
+        assert!(
+            grip.start > 0 && grip.end < 20,
+            "the grip should be centred, not flush against an end: {grip:?}"
+        );
+    }
+
+    /// Hovering is the moment the divider has to look grabbable, so both the
+    /// bar and the grip change and the grip picks up a heavier glyph.
+    #[test]
+    fn hovering_lifts_the_whole_divider_and_thickens_the_grip() {
+        let resting = drawn_divider_column(false);
+        let hovered = drawn_divider_column(true);
+        let grip = sidebar_divider_grip_rows(Rect::new(0, 0, 26, 20));
+
+        assert_ne!(
+            resting[0].1, hovered[0].1,
+            "the bar did not change colour on hover"
+        );
+        for y in grip.clone() {
+            assert_eq!(
+                hovered[y as usize].0, "┃",
+                "the grip did not thicken on hover at row {y}"
+            );
+        }
+        for (y, (symbol, _)) in hovered.iter().enumerate() {
+            if !grip.contains(&(y as u16)) {
+                assert_eq!(symbol, "│", "row {y} thickened outside the grip");
+            }
+        }
+    }
+
+    /// Three grip rows out of a five-row sidebar is not a grip, it is a
+    /// differently coloured divider, so short sidebars get none.
+    #[test]
+    fn a_short_sidebar_draws_no_grip_at_all() {
+        assert!(
+            sidebar_divider_grip_rows(Rect::new(0, 0, 26, DIVIDER_GRIP_MIN_HEIGHT - 1)).is_empty()
+        );
+        assert!(
+            !sidebar_divider_grip_rows(Rect::new(0, 0, 26, DIVIDER_GRIP_MIN_HEIGHT)).is_empty()
+        );
     }
 
     /// The branch every fixture Space reports, so the second configured Space

@@ -1560,6 +1560,10 @@ pub struct AppState {
     // View geometry (computed before render, consumed by render + mouse)
     pub view: ViewState,
     pub(crate) drag: Option<DragState>,
+    /// Whether the pointer currently sits inside the sidebar divider's grab
+    /// band. Pure client presentation state: it only decides how the divider is
+    /// drawn, is never persisted, and never leaves the TUI.
+    pub(crate) sidebar_divider_hover: bool,
     pub(crate) workspace_press: Option<WorkspacePressState>,
     pub(crate) tab_press: Option<TabPressState>,
     pub selection: Option<Selection>,
@@ -2202,6 +2206,7 @@ impl AppState {
                 split_borders: Vec::new(),
             },
             drag: None,
+            sidebar_divider_hover: false,
             workspace_press: None,
             tab_press: None,
             selection: None,
