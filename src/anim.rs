@@ -69,6 +69,13 @@ const POSITION_STEPS: f32 = 512.0;
 pub(crate) enum ElementId {
     /// One workspace's row in the sidebar tree, by canonical workspace id.
     WorkspaceRow(String),
+    /// One owned agent pane's row in the sidebar tree, by pane id.
+    ///
+    /// A separate family from [`Self::WorkspaceRow`] because the two membership
+    /// sets move at completely different rates: Spaces are long-lived, while a
+    /// worker's row arrives and leaves within one piece of work. Reconciling
+    /// one must never retire the other.
+    AgentRow(crate::layout::PaneId),
     /// One terminal's own surface, by the id the work-volume sampler keys on.
     Terminal(crate::terminal::TerminalId),
     /// A singleton surface a subsystem names for itself — a notification bar, a
@@ -80,6 +87,7 @@ pub(crate) enum ElementId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Family {
     WorkspaceRow,
+    AgentRow,
     Terminal,
     Named,
 }
@@ -88,6 +96,7 @@ impl ElementId {
     pub(crate) fn family(&self) -> Family {
         match self {
             Self::WorkspaceRow(_) => Family::WorkspaceRow,
+            Self::AgentRow(_) => Family::AgentRow,
             Self::Terminal(_) => Family::Terminal,
             Self::Named(_) => Family::Named,
         }
@@ -95,6 +104,10 @@ impl ElementId {
 
     pub(crate) fn workspace_row(workspace_id: &str) -> Self {
         Self::WorkspaceRow(workspace_id.to_string())
+    }
+
+    pub(crate) fn agent_row(pane_id: crate::layout::PaneId) -> Self {
+        Self::AgentRow(pane_id)
     }
 }
 
@@ -221,6 +234,10 @@ pub(crate) struct ElementFrame<'a> {
     pub(crate) behaviour: Option<&'a Behaviour>,
     /// `0.0..=1.0` through a bounded phase; accumulated whole turns through the
     /// unbounded idle phase, which [`Behaviour::cell`] wraps.
+    ///
+    /// A dismount counts *down*: it is its mount played backwards, so it starts
+    /// at `1.0` and reaches `0.0` as the element goes. A caller reads the same
+    /// number either way and never has to know which direction it is in.
     pub(crate) progress: f32,
     /// The live signals this element last published.
     pub(crate) inputs: DriveInputs,
@@ -524,7 +541,19 @@ impl Animator {
     ) -> Option<ElementFrame<'_>> {
         let element = self.elements.get(id)?;
         let (behaviour, progress) = match element.lifecycle.stage(element.phase) {
-            Some(stage) => (self.catalogue.get(&stage.behaviour), element.progress),
+            // Leaving is arriving played backwards. Reversing here rather than
+            // at a call site is what lets *any* behaviour serve as an exit
+            // without a second, mirror-image entry in the catalogue, and it
+            // means every consumer of a dismount agrees about which way the
+            // effect runs. The curve reverses with it, which is what a rewind
+            // should do: an ease-out arrival leaves on an ease-in.
+            Some(stage) => (
+                self.catalogue.get(&stage.behaviour),
+                match element.phase {
+                    Phase::Dismount => 1.0 - element.progress,
+                    _ => element.progress,
+                },
+            ),
             None if element.phase == Phase::Idle => {
                 match element.lifecycle.idle_slot(idle_override) {
                     Some((index, name)) => (
@@ -749,6 +778,62 @@ mod tests {
         anim.advance(leaving + Duration::from_millis(400));
         assert!(anim.frame(&row("a"), None).is_none());
         assert!(anim.is_empty());
+    }
+
+    #[test]
+    fn an_exit_is_its_arrival_played_backwards() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        let life = Lifecycle::still()
+            .with_mount(Stage::new(names::WIPE, Duration::from_millis(400)))
+            .with_dismount(Stage::new(names::WIPE, Duration::from_millis(400)));
+
+        // A quarter of the way into the arrival.
+        anim.observe(now, Family::WorkspaceRow, &life, quiet(&["a"]));
+        anim.advance(now + Duration::from_millis(100));
+        let arriving = anim.frame(&row("a"), None).expect("arriving").progress;
+
+        let settled = now + Duration::from_millis(500);
+        anim.observe(settled, Family::WorkspaceRow, &life, quiet(&["a"]));
+        anim.observe(settled, Family::WorkspaceRow, &life, quiet(&[]));
+        // Three quarters of the way into the departure is the same picture: a
+        // row leaves through the states it arrived through, in reverse.
+        anim.advance(settled + Duration::from_millis(300));
+        let leaving = anim.frame(&row("a"), None).expect("leaving");
+        assert_eq!(leaving.phase, Phase::Dismount);
+        assert!(
+            (leaving.progress - arriving).abs() < 0.01,
+            "a dismount at 3/4 should read like a mount at 1/4, got {} against {arriving}",
+            leaving.progress
+        );
+
+        // And it ends where the arrival began: fully gone, not fully drawn.
+        anim.advance(settled + Duration::from_millis(399));
+        let almost = anim.frame(&row("a"), None).expect("still leaving");
+        assert!(almost.progress < 0.01, "got {}", almost.progress);
+    }
+
+    #[test]
+    fn agent_rows_and_space_rows_do_not_retire_each_other() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        let life = mounting();
+        let pane = ElementId::agent_row(crate::layout::PaneId::alloc());
+
+        anim.observe(now, Family::WorkspaceRow, &life, quiet(&["space"]));
+        anim.observe(
+            now,
+            Family::AgentRow,
+            &life,
+            vec![(pane.clone(), DriveInputs::default())],
+        );
+
+        // A pass that publishes no agent rows at all must not touch the Space
+        // rows, and vice versa: two second mates' groups shrinking is exactly
+        // this, one family at a time.
+        anim.observe(now, Family::AgentRow, &life, Vec::new());
+        assert!(anim.frame(&pane, None).is_none());
+        assert!(anim.frame(&row("space"), None).is_some());
     }
 
     #[test]

@@ -1691,6 +1691,19 @@ pub struct AppState {
     /// attaches late is right to draw every element settled rather than replay
     /// arrivals it was not there for.
     pub(crate) anim: crate::anim::Animator,
+    /// The sidebar tree's owned agent rows as of the last loop pass.
+    ///
+    /// The tree is derived from panes that exist, so a pane closing takes the
+    /// only copy of its row with it and there is nothing left to animate a
+    /// departure *from*. This is that missing frame, and nothing more: the
+    /// runtime republishes it every pass, and
+    /// [`crate::ui::sidebar::sidebar_agent_entries`] re-inserts a remembered
+    /// row only while the engine still has an exit to play for it.
+    ///
+    /// Presentation state, for the same reason `anim` is, and empty unless a
+    /// row exit is configured — so an unconfigured Herdr pays nothing and a
+    /// restored or handed-off server starts with every group settled.
+    pub(crate) sidebar_tree_row_memory: Vec<crate::ui::AgentPanelEntry>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1827,7 +1840,8 @@ impl AppState {
         !self.sidebar_collapsed
             && (self.sidebar_agents.has_animated_tokens()
                 || self.sidebar_spaces.has_animated_tokens()
-                || self.sidebar_animation.row_enter_stage().is_some())
+                || self.sidebar_animation.row_enter_stage().is_some()
+                || self.sidebar_animation.row_exit_stage().is_some())
     }
 
     /// The life a sidebar row is given when it arrives.
@@ -1841,6 +1855,7 @@ impl AppState {
     pub(crate) fn sidebar_row_lifecycle(&self) -> crate::anim::Lifecycle {
         let mut lifecycle = crate::anim::Lifecycle::still();
         lifecycle.mount = self.sidebar_animation.row_enter_stage();
+        lifecycle.dismount = self.sidebar_animation.row_exit_stage();
         for behaviour in self
             .sidebar_agents
             .animated_behaviours()
@@ -1904,10 +1919,9 @@ impl AppState {
     /// no runtime, no terminal, or no samples yet is `0.0` — quiet, not absent,
     /// so a caller never has to branch on "unknown".
     // Addressed by pane for callers that have a pane id rather than a terminal.
-    // The sidebar animates whole rows, so its own binding rolls up through
-    // `workspace_activity_level` above; this is the per-pane form the queued
-    // pane-level animation work needs, kept beside it rather than re-derived.
-    #[allow(dead_code)]
+    // A Space row rolls up through `workspace_activity_level` above; a worker or
+    // sub agent row is one pane and reads it here, so two rows under one second
+    // mate do not breathe in lockstep because a third pane beside them is busy.
     pub(crate) fn pane_activity_level(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> f32 {
         self.workspaces
             .get(ws_idx)
@@ -2277,6 +2291,7 @@ impl AppState {
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
+            sidebar_tree_row_memory: Vec::new(),
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {

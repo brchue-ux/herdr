@@ -430,17 +430,25 @@ Every behaviour is drawn as a per-cell color ramp, not with terminal blink, so i
 
 `activity` and `activity-shimmer` read the same per-pane work-volume level the socket API publishes as `pane.activity.level_percent`. It is sampled and smoothed inside Herdr on its own clock — nothing external has to publish it, and a pane that goes quiet settles back to rest on its own.
 
-### Row arrivals
+### Row arrivals and departures
 
-A whole sidebar row can animate as it appears:
+A whole sidebar row can animate as it appears and as it leaves:
 
 ```toml
 [ui.sidebar.animation]
 row_enter = "wipe"
 row_enter_ms = 320
+row_exit = "wipe"
+row_exit_ms = 220
 ```
 
 `row_enter` takes any of the behaviour names above and defaults to `none`, which is how rows have always appeared: fully drawn on their first frame. `row_enter_ms` is clamped to 60–1500 ms. A row's arrival always wins over its tokens' own `emphasis`, so a token cannot start shimmering while the row under it is still arriving.
+
+`row_exit` is the same list of names, played backwards — a row leaves the way it arrived, so you write one name twice rather than looking for a mirror-image behaviour. It defaults to `none`, which is how rows have always disappeared: gone on the very next frame. `row_exit_ms` is clamped to the same 60–1500 ms.
+
+This is what makes an ownership tree read as live. Each worker and sub agent row belongs to the second mate it names in its `owner` token, and each row arrives and leaves on its own: spawning work under one second mate grows that group and only that group, and finishing it shrinks the group back once the departing row has played its exit. With `row_exit = "none"` the group still grows and shrinks — it just does it in one frame instead of moving.
+
+A row that is still leaving is drawn but is no longer a target: its pane has already closed, so clicking it does nothing.
 
 Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
 
