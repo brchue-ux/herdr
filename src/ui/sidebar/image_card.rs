@@ -930,9 +930,12 @@ fn build_sheet_inner(
 
     let width_px = u32::from(sheet_rect.width) * cell_size.width_px;
     let height_px = u32::from(sheet_rect.height) * cell_size.height_px;
-    // A sheet larger than this is a sidebar nobody has; the guard is here so a
-    // bad cell-size report cannot ask for a gigabyte of canvas.
-    const MAX_SHEET_PIXELS: u32 = 16_000_000;
+    // A sheet larger than this is a sidebar nobody has — 8 megapixels is a
+    // panel over a thousand pixels wide and seven thousand tall. The guard is
+    // here so a nonsense cell-size report cannot turn into a huge allocation:
+    // at four bytes a pixel for the sheet and eight more for the bloom field,
+    // this ceiling is about 96 MB, held only while the sheet is being built.
+    const MAX_SHEET_PIXELS: u32 = 8_000_000;
     if width_px == 0 || height_px == 0 || width_px.saturating_mul(height_px) > MAX_SHEET_PIXELS {
         return Err(());
     }
@@ -1054,7 +1057,6 @@ fn lift(sheet: &mut Canvas, card: &PlacedCard<'_>) {
 }
 
 fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
-    let rgba = sheet.to_rgba8();
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, sheet.width(), sheet.height());
     encoder.set_color(png::ColorType::Rgba);
@@ -1064,7 +1066,7 @@ fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
     // the cheap filters already get most of the ratio.
     encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().ok()?;
-    writer.write_image_data(&rgba).ok()?;
+    writer.write_image_data(sheet.rgba8()).ok()?;
     drop(writer);
     Some(out)
 }

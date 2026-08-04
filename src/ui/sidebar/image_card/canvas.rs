@@ -97,9 +97,15 @@ impl Rgb {
 pub(super) struct Canvas {
     width: u32,
     height: u32,
-    /// `RGBA` per pixel, channels 0..=255 as floats so repeated compositing
-    /// does not quantise on every step.
-    px: Vec<f32>,
+    /// `RGBA8`, straight alpha — the PNG encoder's own layout, so finishing the
+    /// sheet is a borrow rather than a conversion pass.
+    ///
+    /// Eight bits per channel rather than a float accumulator: a pixel takes at
+    /// most a handful of blends (the backdrop, the bloom, the fill, the inner
+    /// glow, the stroke, a glyph), so the rounding cannot compound past a level
+    /// or two, and a float buffer would be four times the memory for a sheet
+    /// that is already the tallest image Herdr ever builds.
+    px: Vec<u8>,
 }
 
 impl Canvas {
@@ -107,7 +113,7 @@ impl Canvas {
         Self {
             width,
             height,
-            px: vec![0.0; (width as usize) * (height as usize) * 4],
+            px: vec![0; (width as usize) * (height as usize) * 4],
         }
     }
 
@@ -133,25 +139,24 @@ impl Canvas {
         let Some(i) = self.index(x, y) else {
             return;
         };
-        let dst_a = self.px[i + 3] / 255.0;
+        let dst_a = f32::from(self.px[i + 3]) / 255.0;
         let out_a = alpha + dst_a * (1.0 - alpha);
         if out_a <= 0.0 {
             return;
         }
         for (channel, src) in [color.0, color.1, color.2].into_iter().enumerate() {
             let src = f32::from(src);
-            let dst = self.px[i + channel];
-            self.px[i + channel] = (src * alpha + dst * dst_a * (1.0 - alpha)) / out_a;
+            let dst = f32::from(self.px[i + channel]);
+            self.px[i + channel] = ((src * alpha + dst * dst_a * (1.0 - alpha)) / out_a)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
-        self.px[i + 3] = out_a * 255.0;
+        self.px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
     }
 
     /// Straight RGBA8, ready for a PNG encoder.
-    pub(super) fn to_rgba8(&self) -> Vec<u8> {
-        self.px
-            .iter()
-            .map(|v| v.round().clamp(0.0, 255.0) as u8)
-            .collect()
+    pub(super) fn rgba8(&self) -> &[u8] {
+        &self.px
     }
 }
 
