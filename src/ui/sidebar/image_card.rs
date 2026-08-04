@@ -886,6 +886,23 @@ fn build_sheet_inner(
     let entries = super::workspace_list_entries(app);
     let agents = super::sidebar_agent_entries(app);
     let bounds = super::sidebar_content_rect(sidebar_area);
+    // How far down the panel the sheet may reach. Everything but the tray is
+    // the panel's own floor: blooming over the footer row the `new` button sits
+    // on is harmless, because nothing there is a graphics placement.
+    //
+    // The tray is, and at the same `z` as this sheet. Its badges are their own
+    // layer over its rows, so a sheet reaching into them is two placements on
+    // one plane with no defined order — the last card's bloom would land on the
+    // tray's top row of badges. The tree's rows already stop at the tray's top
+    // edge; the bloom has to stop there too.
+    let bloom_floor = {
+        let tray = super::tray::tray_rect(app, bounds);
+        if tray.height == 0 {
+            bounds.y.saturating_add(bounds.height)
+        } else {
+            tray.y
+        }
+    };
     let backdrop = backdrop_rgb(app);
 
     let mut placed: Vec<(Rect, CardContent)> = Vec::new();
@@ -930,9 +947,7 @@ fn build_sheet_inner(
     let sheet_right = max_x
         .saturating_add(bloom_cells_x)
         .min(bounds.x.saturating_add(bounds.width));
-    let sheet_bottom = max_y
-        .saturating_add(bloom_cells_y)
-        .min(bounds.y.saturating_add(bounds.height));
+    let sheet_bottom = max_y.saturating_add(bloom_cells_y).min(bloom_floor);
     let sheet_rect = Rect::new(
         sheet_x,
         sheet_y,
@@ -1541,6 +1556,87 @@ mod tests {
         app.kitty_graphics_enabled = false;
         crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
         assert!(app.sidebar_card_layer.is_none());
+    }
+
+    /// The sheet and the notification tray are two graphics placements on one
+    /// plane, so the sheet must not reach into the tray.
+    ///
+    /// Both publish at `z: 0`, and the tray's badges are its own layer over its
+    /// rows. The tree's rows already stop at the tray's top edge, but the sheet
+    /// spans the cards *plus their bloom*, and that bloom used to be clamped to
+    /// the whole panel — which put the last card's glow on the tray's top row
+    /// of badges with no defined order between the two. Neither change could
+    /// see this alone: the tray reserves rows the cards never asked about.
+    #[test]
+    fn the_card_sheet_stops_at_the_notification_tray() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 100, 46);
+
+        let sheet_for = |tray_on: bool| {
+            let mut app = pixel_fleet_app();
+            app.sidebar_width = 42;
+            app.sidebar_signal_tray.enabled = tray_on;
+            let cell_size = app.host_cell_size;
+            crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
+            if !is_available(
+                &app,
+                super::super::row_fold_width(&app, app.view.sidebar_rect),
+            ) {
+                return None; // No proportional face on this machine.
+            }
+            let sheet = app
+                .sidebar_card_layer
+                .as_ref()
+                .expect("the tree drew no cards")
+                .rect;
+            let content = super::super::sidebar_content_rect(app.view.sidebar_rect);
+            let last_card = app
+                .view
+                .workspace_card_areas
+                .iter()
+                .filter_map(|card| card.card_frame)
+                .map(|frame| frame.y + frame.height)
+                .max()
+                .expect("the tree drew no card frames");
+            Some((
+                sheet,
+                super::super::tray::tray_rect(&app, content),
+                last_card,
+            ))
+        };
+
+        let Some((sheet, tray, last_card)) = sheet_for(true) else {
+            return;
+        };
+        assert!(tray.height > 0, "the fixture drew no tray");
+        assert!(
+            sheet.y + sheet.height <= tray.y,
+            "the card sheet reached {} rows into the tray",
+            (sheet.y + sheet.height).saturating_sub(tray.y)
+        );
+
+        // The tray is the only thing that moves the floor. With it off the
+        // sheet still blooms past its last card, which is what shipped: the
+        // footer the `new` button sits on is characters, not a placement.
+        let Some((sheet_off, tray_off, last_card_off)) = sheet_for(false) else {
+            return;
+        };
+        assert_eq!(tray_off, Rect::default(), "the tray drew while disabled");
+        assert!(
+            sheet_off.y + sheet_off.height > last_card_off,
+            "turning the tray off clamped the bloom to the last card anyway"
+        );
+        // And the clamp costs the tray-on sheet only the bloom it cannot have:
+        // it still reaches every row up to the tray's edge.
+        assert_eq!(
+            sheet.y + sheet.height,
+            tray.y,
+            "the sheet stopped short of the tray rather than at it"
+        );
+        assert_eq!(
+            last_card, tray.y,
+            "the fixture's tree did not reach the tray"
+        );
     }
 
     fn metrics(line_height: f32) -> FontMetrics {
