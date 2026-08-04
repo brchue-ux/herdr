@@ -464,6 +464,65 @@ impl App {
         spaces_changed || agents_changed || signals_changed
     }
 
+    /// Publish the owned agent rows that exist right now, so each second mate's
+    /// group grows and shrinks on its own.
+    ///
+    /// Every worker and sub agent row is its own element, keyed by pane id, so
+    /// a pane opening under one second mate mounts exactly one row and a pane
+    /// closing dismounts exactly one — the other second mates' groups are not
+    /// even looked at. That is the whole of "independently": there is no group
+    /// object to rebuild, only rows that arrive and leave under the owner they
+    /// already name.
+    ///
+    /// The rows are then remembered, because a departing row's pane is gone
+    /// from the session and the tree could not otherwise draw it for the length
+    /// of its exit. Only worth remembering when an exit is configured; without
+    /// one the engine retires a departed row on the spot and memory would be a
+    /// copy nobody reads.
+    ///
+    /// `tree` is false when the signal bar is the only reason this pass is
+    /// running at all. The rows are then published as an empty set rather than
+    /// skipped, so any that were mid-flight leave properly instead of being
+    /// stranded, and the memory that backs their exits is dropped with them.
+    fn observe_agent_rows(
+        &mut self,
+        now: Instant,
+        lifecycle: &crate::anim::Lifecycle,
+        tree: bool,
+    ) -> bool {
+        let live = if tree {
+            crate::ui::sidebar_agent_live_entries(&self.state)
+        } else {
+            Vec::new()
+        };
+        let rows: Vec<_> = live
+            .iter()
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs {
+                        activity: self.state.pane_activity_level(entry.ws_idx, entry.pane_id),
+                    },
+                )
+            })
+            .collect();
+        let changed = self
+            .state
+            .anim
+            .observe(now, crate::anim::Family::AgentRow, lifecycle, rows);
+        if lifecycle.dismount.is_none() || !tree {
+            let remembered = !self.state.sidebar_tree_row_memory.is_empty();
+            self.state.sidebar_tree_row_memory.clear();
+            return changed || remembered;
+        }
+        // Observed first, so a row that has just left is already dismounting and
+        // survives this refresh; one whose exit finished is not, and is dropped.
+        let drawn = crate::ui::rows_with_departing(&self.state, live);
+        let moved = drawn.len() != self.state.sidebar_tree_row_memory.len();
+        self.state.sidebar_tree_row_memory = drawn;
+        changed || moved
+    }
+
     /// Move the clock the sidebar renders elapsed times against.
     ///
     /// Deliberately separate from arming the repaint deadline. This runs every
@@ -1089,6 +1148,90 @@ mod tests {
         app.advance_headless_animations(now, false);
         assert_eq!(app.state.anim.next_deadline(now), None);
         assert!(app.state.anim.is_empty());
+    }
+
+    /// The whole lifecycle in one pass: an alert going live mounts its element,
+    /// the alert clearing retires it, and nothing has to remember to tear it
+    /// down.
+    #[test]
+    fn a_signal_going_live_mounts_an_element_and_clearing_retires_it() {
+        use crate::app::fleet_signals::FleetSignal;
+
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_notifications.enabled = true;
+        let now = Instant::now();
+
+        // A quiet fleet: the bar is drawn, but nothing in it is animating, so
+        // the engine holds nothing and the loop arms no deadline.
+        app.advance_animations(now, true);
+        assert!(app.state.anim.is_empty());
+        assert_eq!(app.state.anim.next_deadline(now), None);
+
+        app.state.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
+            staged: 0,
+            unstaged: 1,
+            untracked: 0,
+        });
+        app.advance_animations(now, true);
+        assert!(
+            app.state
+                .anim
+                .frame(&FleetSignal::Dirty.element_id(), None)
+                .is_some(),
+            "uncommitted work did not bring its own element into existence"
+        );
+        assert!(
+            app.state
+                .anim
+                .frame(&FleetSignal::Ask.element_id(), None)
+                .is_none(),
+            "a quiet signal was given an element"
+        );
+
+        // Committing the work clears the alert. The element leaves on its own
+        // because it simply stopped being in the published membership set.
+        app.state.workspaces[0].cached_git_dirty =
+            Some(crate::workspace::GitDirtyCounts::default());
+        app.advance_animations(now + std::time::Duration::from_secs(2), true);
+        assert!(app.state.anim.is_empty());
+    }
+
+    /// The two families share one engine and must not evict each other.
+    #[test]
+    fn signal_elements_and_row_elements_do_not_retire_one_another() {
+        use crate::app::fleet_signals::FleetSignal;
+
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        app.state.sidebar_notifications.enabled = true;
+        app.state.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
+            staged: 1,
+            unstaged: 0,
+            untracked: 0,
+        });
+        let now = Instant::now();
+
+        app.advance_animations(now, true);
+        let row = crate::anim::ElementId::workspace_row(&app.state.workspaces[0].id);
+        assert!(app.state.anim.frame(&row, None).is_some());
+        assert!(app
+            .state
+            .anim
+            .frame(&FleetSignal::Dirty.element_id(), None)
+            .is_some());
+
+        // Switching the bar off must retire its slots and leave the row alone.
+        app.state.sidebar_notifications.enabled = false;
+        app.advance_animations(now + std::time::Duration::from_secs(2), true);
+        assert!(
+            app.state.anim.frame(&row, None).is_some(),
+            "the sidebar row was retired by a change to a different family"
+        );
+        assert!(app
+            .state
+            .anim
+            .frame(&FleetSignal::Dirty.element_id(), None)
+            .is_none());
     }
 
     #[test]
