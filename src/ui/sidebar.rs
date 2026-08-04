@@ -3818,9 +3818,15 @@ mod tests {
 
     /// The headline: a worker created from inside its mate's Space draws under
     /// that mate with no `owner` token published by anybody.
+    ///
+    /// Line shell, at a width below [`card::MIN_FOLD_WIDTH`], where the
+    /// connector shares the row with the name. The card shell moves it onto the
+    /// border row, which is why
+    /// [`native_ownership_still_nests_when_the_panel_draws_cards`] checks the
+    /// same ownership by indentation instead.
     #[test]
     fn a_natively_owned_worker_nests_under_its_space_with_no_token_published() {
-        let (app, rows) = natively_owned_fleet(26, 1);
+        let (app, rows) = natively_owned_fleet(WIDEST_LINE_WIDTH, 1);
         let screen = rows.join("\n");
 
         assert!(
@@ -3844,6 +3850,40 @@ mod tests {
         assert!(
             rows[worker_row].contains('└') || rows[worker_row].contains('├'),
             "the worker drew with no connector, so it is not nested:\n{screen}"
+        );
+    }
+
+    /// The same ownership, drawn in the **card** shell.
+    ///
+    /// The card moved the connector off the row carrying the name and onto the
+    /// card's top border, so a test that looks for `└` beside a title passes at
+    /// line width and says nothing at card width. Indentation is the property
+    /// that means "nested" in both shells, so assert that instead: each rank
+    /// starts strictly further right than the one that owns it.
+    #[test]
+    fn native_ownership_still_nests_when_the_panel_draws_cards() {
+        let (_app, rows) = natively_owned_fleet(NARROWEST_CARD_WIDTH + 6, 1);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains('╭')),
+            "expected the card shell at this width:\n{screen}"
+        );
+
+        let indent_of = |name: &str| {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"));
+            row.find(|ch: char| !ch.is_whitespace())
+                .unwrap_or_else(|| panic!("{name} row is blank:\n{screen}"))
+        };
+
+        let first = indent_of("firstmate");
+        let mate = indent_of("2ndmate-explore");
+        let worker = indent_of("worker");
+        assert!(
+            first < mate && mate < worker,
+            "cards did not step in by rank (first={first}, mate={mate}, worker={worker}):\n{screen}"
         );
     }
 
