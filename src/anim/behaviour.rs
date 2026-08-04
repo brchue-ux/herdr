@@ -14,8 +14,10 @@
 //!   allocates nothing, reads no clock, and touches no state, so a render pass
 //!   can call it once per cell without any of them being able to disagree.
 //! - **A behaviour never widens or narrows what it decorates.** It resolves to
-//!   colour, attributes, and coverage only — never to a glyph, a width, or a
-//!   position. Dropping every frame leaves the element identical.
+//!   colour, attributes, coverage, and — for decoration only — a glyph of the
+//!   same display width. Never a width, never a position. Dropping every frame
+//!   leaves the element identical, and no substitution can move a column; see
+//!   [`super::cell::CellPaint::glyph_over`], which is where that is enforced.
 //! - **A live metric scales a behaviour; it never *is* one.** [`Drive`] maps a
 //!   `0.0..=1.0` signal onto a strength or a rate, so the same named behaviour
 //!   works with a metric bound or without one, and the metric's own shape stays
@@ -117,6 +119,27 @@ impl Field {
             }
         }
     }
+
+    /// Cells between this field's first and last position, for turning a length
+    /// expressed in cells into the `0.0..=1.0` the field itself speaks in.
+    ///
+    /// Never zero, so a one-cell element divides cleanly instead of blowing up.
+    /// A field with no single axis to measure along reports one step rather
+    /// than inventing a geometry: a length in cells has no meaning on a scatter.
+    fn span(self, extent: CellExtent) -> f32 {
+        let cells = match self {
+            Self::Linear {
+                axis: Axis::Horizontal,
+                ..
+            } => extent.cols,
+            Self::Linear {
+                axis: Axis::Vertical,
+                ..
+            } => extent.rows,
+            Self::Uniform | Self::Radial { .. } | Self::Scatter { .. } => 2,
+        };
+        f32::from(cells.saturating_sub(1).max(1))
+    }
 }
 
 /// How a cell's place in the field combines with the clock.
@@ -140,6 +163,121 @@ pub(crate) enum Shape {
     ///
     /// `spread` is how many whole cycles separate the first cell from the last.
     Phase { spread: f32 },
+    /// A peak with a short leading edge and a long trailing one. Charges,
+    /// scanners, anything that should read as *moving* rather than as pulsing.
+    ///
+    /// Asymmetric on purpose, and that asymmetry is what carries the sub-cell
+    /// position. A symmetric band gives a cell the same amount whether the
+    /// effect is arriving or leaving, so nothing downstream can tell which; a
+    /// comet's `head_cells` is a linear rise ahead of the peak, so a cell's
+    /// amount *is* how far into that cell the peak has come. At the default
+    /// one-cell rise a glyph ramp resolves that fraction directly — eight
+    /// positions inside a cell the grid could otherwise only light or not.
+    ///
+    /// Both lengths are **in cells**, not in fractions of the field, which is
+    /// the one place this enum departs from the others. A comet drawn over
+    /// three cells and one drawn over thirty should have the same-sized head,
+    /// because the head's size is what the sub-cell reading depends on; a
+    /// fraction would silently stop meaning a cell the moment the element was
+    /// drawn at a different width. The peak travels from one head-length before
+    /// the first cell to one tail-length past the last, so both ends of the
+    /// travel are dark and a looping comet never wraps visibly.
+    Comet { head_cells: f32, tail_cells: f32 },
+}
+
+/// A glyph substitution that resolves a position finer than one cell.
+///
+/// The ramp's steps are positions *inside* a cell: an amount rising from
+/// `floor` to `1.0` walks it end to end, so an effect whose amount is a
+/// continuous function of where it is reads as travelling through a cell rather
+/// than as arriving in it. Three cells and an eight-step ramp is twenty-four
+/// distinguishable positions where the cell grid alone offers three.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GlyphRamp {
+    /// Emptiest first. Every entry must be one column wide;
+    /// `every_glyph_a_behaviour_can_ask_for_is_one_column_wide` is the check.
+    pub(crate) steps: &'static [char],
+    /// Amount below which the cell keeps the glyph it settled to. Above zero so
+    /// a cell the effect has barely reached is left alone rather than flickering
+    /// its lightest step on and off.
+    pub(crate) floor: f32,
+}
+
+impl GlyphRamp {
+    fn glyph(self, amount: f32) -> Option<char> {
+        if self.steps.is_empty() || amount < self.floor {
+            return None;
+        }
+        let span = (1.0 - self.floor).max(1e-3);
+        let position = ((amount - self.floor) / span).clamp(0.0, 1.0);
+        let last = self.steps.len() - 1;
+        let index = (position * last as f32).round() as usize;
+        self.steps.get(index.min(last)).copied()
+    }
+}
+
+/// A discharge: the one thing a *shape* can say that no styling can.
+///
+/// This is the reason [`super::cell::CellPaint`] carries a glyph at all. A
+/// charge crackles — it forks, breaks, and jumps — and there is no colour,
+/// brightness, or attribute on a `─` that reads as an arc, because the
+/// information "something is arcing here" lives in the mark's shape. Above
+/// `above` the cell draws an arc struck through the line instead of the line,
+/// re-rolled every `flicker` of the loop.
+///
+/// The roll also pulls the cell's amount down by up to `jitter`, because a
+/// discharge whose shape flickered while its brightness swept smoothly past
+/// would read as a marching decoration rather than as something electrical.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Crackle {
+    /// Arcs to choose between. One column each, and deliberately drawn from the
+    /// same box-drawing family as the line they strike through, so a discharge
+    /// reads as happening *to* the connector rather than as a foreign glyph
+    /// parked on top of it.
+    pub(crate) arcs: &'static [char],
+    /// Amount at or above which a cell arcs rather than showing its ramp step.
+    pub(crate) above: f32,
+    /// Fraction of one loop between re-rolls. Small enough to read as a
+    /// crackle, large enough that consecutive frames are not pure noise.
+    pub(crate) flicker: f32,
+    /// Deepest a roll may pull a cell's amount, in `0.0..=1.0`.
+    pub(crate) jitter: f32,
+    pub(crate) seed: u32,
+}
+
+impl Crackle {
+    /// One pseudo-random draw, stable for a cell within a flicker bucket.
+    ///
+    /// Bucketed rather than continuous so the discharge holds a shape for a
+    /// few frames and then jumps, which is what crackling looks like; a fresh
+    /// draw every frame is indistinguishable from static.
+    fn roll(self, pos: CellPos, progress: f32) -> u64 {
+        let bucket = (progress / self.flicker.max(1e-3)).floor();
+        let mut hash = u64::from(self.seed)
+            ^ u64::from(pos.col).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(pos.row).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (bucket as i64 as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        hash ^= hash >> 29;
+        hash
+    }
+
+    fn arc(self, roll: u64) -> Option<char> {
+        if self.arcs.is_empty() {
+            return None;
+        }
+        self.arcs
+            .get((roll >> 40) as usize % self.arcs.len())
+            .copied()
+    }
+
+    /// The factor this roll scales the cell's amount by, in
+    /// `1.0 - jitter ..= 1.0`.
+    fn dim(self, roll: u64) -> f32 {
+        let unit = ((roll >> 16) & 0xFFFF) as f32 / 65_535.0;
+        1.0 - self.jitter.clamp(0.0, 1.0) * unit
+    }
 }
 
 /// How progress is paced through its span.
@@ -185,6 +323,12 @@ pub(crate) struct Paint {
     pub(crate) reveal: bool,
     /// Attributes applied once the amount crosses this threshold.
     pub(crate) attrs_above: Option<(f32, AttrPatch)>,
+    /// Sub-cell glyph ramp. Decoration only — a call site drawing information
+    /// ignores it, so setting this can never garble a label.
+    pub(crate) glyphs: Option<GlyphRamp>,
+    /// Discharge shape, for decoration whose whole point is that it is not
+    /// smooth. Overrides [`Paint::glyphs`] on the cells it reaches.
+    pub(crate) crackle: Option<Crackle>,
 }
 
 impl Paint {
@@ -195,6 +339,8 @@ impl Paint {
             depth,
             reveal: false,
             attrs_above: None,
+            glyphs: None,
+            crackle: None,
         }
     }
 
@@ -205,6 +351,26 @@ impl Paint {
             depth: 1.0,
             reveal: true,
             attrs_above: None,
+            glyphs: None,
+            crackle: None,
+        }
+    }
+
+    /// A travelling mark: it inks the foreground toward `ink` and walks the
+    /// horizontal block ramp, so where it has reached is legible to a fraction
+    /// of a cell rather than only to the cell.
+    const fn charge(ink: Ink, depth: f32, floor: f32) -> Self {
+        Self {
+            fg: Some(ink),
+            bg: None,
+            depth,
+            reveal: false,
+            attrs_above: None,
+            glyphs: Some(GlyphRamp {
+                steps: &CHARGE_BLOCKS,
+                floor,
+            }),
+            crackle: None,
         }
     }
 }
@@ -332,6 +498,52 @@ impl Behaviour {
             Shape::Phase { spread } => self
                 .curve
                 .apply((progress + field * spread).rem_euclid(1.0)),
+            Shape::Comet {
+                head_cells,
+                tail_cells,
+            } => {
+                let span = self.field.span(extent);
+                let head = (head_cells / span).clamp(1e-3, 2.0);
+                let tail = (tail_cells / span).clamp(1e-3, 2.0);
+                // One head-length before the first cell to one tail-length past
+                // the last: the offsets are the two lengths that actually reach
+                // back into the field, so both ends of the travel are genuinely
+                // dark and a charge neither pops into existence nor vanishes
+                // still lit.
+                let peak = self.curve.apply(progress) * (1.0 + head + tail) - head;
+                let behind = peak - field;
+                if behind >= 0.0 {
+                    (1.0 - behind / tail).clamp(0.0, 1.0)
+                } else {
+                    (1.0 + behind / head).clamp(0.0, 1.0)
+                }
+            }
+        }
+    }
+
+    /// How strongly this behaviour reaches one cell, before that becomes
+    /// colour, coverage, or a glyph.
+    ///
+    /// For a call site whose own drawing is not a patch over what the settled
+    /// pass produced — a status icon that has to keep meaning what it means and
+    /// therefore blends toward *its own* colour rather than the behaviour's.
+    /// Takes the same progress [`Behaviour::cell`] does, and normalises it the
+    /// same way, so the two can never disagree about where the effect is.
+    ///
+    /// Deliberately not the crackled amount: a discharge's jitter belongs to
+    /// the mark it draws, and a caller asking for the envelope wants the
+    /// envelope.
+    pub(crate) fn strength(&self, pos: CellPos, extent: CellExtent, progress: f32) -> f32 {
+        self.amount(pos, extent, Self::normalized(progress))
+    }
+
+    /// Progress folded into `0.0..=1.0`, whether it arrived as a bounded phase
+    /// or as an unbounded loop's accumulated turns.
+    fn normalized(progress: f32) -> f32 {
+        if (0.0..=1.0).contains(&progress) {
+            progress
+        } else {
+            Self::loop_progress(progress)
         }
     }
 
@@ -349,14 +561,26 @@ impl Behaviour {
         inputs: DriveInputs,
         palette: InkPalette,
     ) -> CellPaint {
-        let progress = if !(0.0..=1.0).contains(&progress) {
-            Self::loop_progress(progress)
-        } else {
-            progress
-        };
-        let amount = self.amount(pos, extent, progress);
+        let progress = Self::normalized(progress);
+        let mut amount = self.amount(pos, extent, progress);
         let depth = (self.paint.depth * self.depth_drive.value(inputs)).clamp(0.0, 1.0);
         let mut paint = CellPaint::default();
+
+        // Shape is resolved before colour so a discharge's own jitter reaches
+        // the brightness too: a crackle that only changed glyphs would read as
+        // a decoration marching over a smooth ramp.
+        if let Some(crackle) = self.paint.crackle {
+            if amount >= crackle.above {
+                let roll = crackle.roll(pos, progress);
+                paint.glyph = crackle.arc(roll);
+                amount *= crackle.dim(roll);
+            }
+        }
+        if paint.glyph.is_none() {
+            if let Some(ramp) = self.paint.glyphs {
+                paint.glyph = ramp.glyph(amount);
+            }
+        }
 
         if self.paint.reveal {
             // Depth scales how far a reveal gets rather than how bright it is:
@@ -415,7 +639,41 @@ pub(crate) mod names {
     pub(crate) const ACTIVITY: &str = "activity";
     /// Looping, live: a band whose speed follows the element's work volume.
     pub(crate) const ACTIVITY_SHIMMER: &str = "activity-shimmer";
+    /// Bounded: a crackling charge running a connector, coloured by whatever
+    /// [`super::Ink::Signal`] is bound to.
+    pub(crate) const RELATION_CHARGE: &str = "relation-charge";
+    /// Bounded: the same travel with no discharge — for a signal that means
+    /// something stopped rather than something happening.
+    pub(crate) const RELATION_DRIFT: &str = "relation-drift";
 }
+
+/// How often a travelling charge needs a frame.
+///
+/// The single source of truth for the connector's resolution: the behaviour
+/// declares it and [`crate::app::relation_signal`] sizes its own sub-cell steps
+/// from it, so the clock that moves a charge and the clock that draws it cannot
+/// disagree. Above the app's 16 ms render floor, and comfortably below the
+/// ~40 ms at which a mark travelling three cells starts to read as stepping.
+pub(crate) const CHARGE_FRAME_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The left-anchored eighth-block ramp: a charge entering a cell from the left.
+///
+/// Emptiest first, and deliberately *not* the vertical ramp
+/// [`super::cell::CellPaint::coverage_block`] uses. Coverage asks "how much of
+/// this cell is filled"; a travelling charge asks "how far into this cell has
+/// it come", and on a horizontal connector only the horizontal ramp answers
+/// that. A cell behind the peak walks the same ramp back down, which is what
+/// makes the charge read as leaving to the right rather than as fading in place.
+const CHARGE_BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+
+/// Marks a discharge can take on a connector cell.
+///
+/// Crossings, a diagonal cross, and two bare forks — all from the box-drawing
+/// family the connector itself is drawn in, so an arc reads as happening to the
+/// line rather than as a foreign glyph parked on it. The forks are the ones
+/// that sell it: a charge that only ever thickened the line would read as a
+/// highlight, and a discharge is exactly the thing that breaks its own path.
+const CHARGE_ARCS: [char; 8] = ['╪', '╫', '╬', '┼', '╳', '╱', '╲', '┿'];
 
 /// Blend fraction toward the surface at the dimmest point of a pulse.
 ///
@@ -476,7 +734,22 @@ impl Catalogue {
     }
 }
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 11] {
+/// How far ahead of its peak a connector charge rises, in cells.
+///
+/// Exactly one, and that is not a taste setting: a one-cell rise is what makes
+/// a single cell's amount equal to how far into that cell the charge has come,
+/// which is the whole mechanism [`CHARGE_BLOCKS`] then resolves into eighths.
+/// Widen it and two cells go fractional at once, and the ramp stops meaning a
+/// position.
+const CHARGE_HEAD_CELLS: f32 = 1.0;
+
+/// Amount at which a charge stops being a smooth mark and starts discharging.
+///
+/// High enough that only the cell the peak is actually on arcs, so the crackle
+/// reads as the charge's core rather than as the whole connector shaking.
+const CHARGE_ARC_ABOVE: f32 = 0.72;
+
+fn built_in_behaviours() -> [(&'static str, Behaviour); 13] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -627,6 +900,52 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 11] {
                 ..BASE
             },
         ),
+        (
+            names::RELATION_CHARGE,
+            Behaviour {
+                field: HORIZONTAL,
+                // A long tail behind a one-cell rise: the charge reads as
+                // having come from the trunk rather than as having appeared.
+                shape: Shape::Comet {
+                    head_cells: CHARGE_HEAD_CELLS,
+                    tail_cells: 2.25,
+                },
+                paint: Paint {
+                    attrs_above: Some((CHARGE_ARC_ABOVE, AttrPatch::bold())),
+                    crackle: Some(Crackle {
+                        arcs: &CHARGE_ARCS,
+                        above: CHARGE_ARC_ABOVE,
+                        // Roughly every other frame of an 800 ms travel: fast
+                        // enough to crackle, slow enough that a shape is held
+                        // long enough to be seen as a shape.
+                        flicker: 0.055,
+                        jitter: 0.45,
+                        seed: 0xA12C,
+                    }),
+                    ..Paint::charge(Ink::Signal, 1.0, 0.12)
+                },
+                frame_interval: CHARGE_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        (
+            names::RELATION_DRIFT,
+            Behaviour {
+                field: HORIZONTAL,
+                // The same route with a longer tail and no discharge. A signal
+                // that means "this branch went quiet" must not be the loudest
+                // thing on the panel, so the vocabulary separates it by motion
+                // as well as by colour.
+                shape: Shape::Comet {
+                    head_cells: CHARGE_HEAD_CELLS,
+                    tail_cells: 3.3,
+                },
+                curve: Curve::EaseInOut,
+                paint: Paint::charge(Ink::Signal, 0.75, 0.2),
+                frame_interval: CHARGE_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
     ]
 }
 
@@ -638,6 +957,7 @@ mod tests {
         surface: (0, 0, 0),
         own: (200, 200, 200),
         accent: (0, 0, 255),
+        signal: (0, 0, 255),
     };
 
     fn get(name: &str) -> Behaviour {
@@ -1060,6 +1380,155 @@ mod tests {
     #[test]
     fn an_unknown_name_resolves_to_nothing_rather_than_to_a_default() {
         assert_eq!(Catalogue::built_in().get("no-such-behaviour"), None);
+    }
+
+    #[test]
+    fn every_glyph_a_behaviour_can_ask_for_is_one_column_wide() {
+        // A wrong-width substitution is refused at draw time rather than
+        // corrupting a row, so getting this wrong would not break a layout — it
+        // would silently never draw. That is worse to debug, not better.
+        let catalogue = Catalogue::built_in();
+        for name in catalogue.names() {
+            let paint = catalogue.get(name).expect("listed").paint;
+            let ramp = paint.glyphs.map(|ramp| ramp.steps).unwrap_or(&[]);
+            let arcs = paint.crackle.map(|crackle| crackle.arcs).unwrap_or(&[]);
+            for glyph in ramp.iter().chain(arcs) {
+                assert_eq!(
+                    unicode_width::UnicodeWidthChar::width(*glyph),
+                    Some(1),
+                    "{name} can ask for {glyph:?}, which is not one column wide"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_comet_resolves_a_position_finer_than_the_cell_it_is_in() {
+        // The whole sub-cell claim, at the resolution the sidebar actually uses:
+        // one cell of a four-cell connector has to show the charge at several
+        // places inside itself, not merely lit or unlit.
+        let behaviour = get(names::RELATION_CHARGE);
+        let extent = CellExtent::row(4);
+        let cell = CellPos::col(2);
+        let mut steps: Vec<char> = (0..=64)
+            .filter_map(|step| {
+                behaviour
+                    .cell(
+                        cell,
+                        extent,
+                        step as f32 / 64.0,
+                        DriveInputs::default(),
+                        PALETTE,
+                    )
+                    .glyph
+            })
+            .filter(|glyph| CHARGE_BLOCKS.contains(glyph))
+            .collect();
+        let drawn = steps.clone();
+        steps.sort_unstable();
+        steps.dedup();
+        assert!(
+            steps.len() >= 4,
+            "one cell showed the charge at only {} positions inside it: {drawn:?}",
+            steps.len()
+        );
+    }
+
+    #[test]
+    fn a_comet_is_dark_at_both_ends_of_its_travel() {
+        // A charge that were still lit when its signal expired would pop out of
+        // existence; one lit at progress zero would pop into it.
+        for name in [names::RELATION_CHARGE, names::RELATION_DRIFT] {
+            let behaviour = get(name);
+            let extent = CellExtent::row(4);
+            for progress in [0.0, 1.0] {
+                for col in 0..extent.cols {
+                    let at = behaviour.strength(CellPos::col(col), extent, progress);
+                    assert_eq!(
+                        at, 0.0,
+                        "{name} still lights cell {col} at progress {progress}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_crackle_holds_a_shape_for_a_few_frames_and_then_jumps() {
+        let crackle = get(names::RELATION_CHARGE)
+            .paint
+            .crackle
+            .expect("the charge discharges");
+        let cell = CellPos::col(1);
+        let at = |progress: f32| crackle.arc(crackle.roll(cell, progress));
+
+        // Inside one flicker bucket the arc is stable. A shape re-rolled every
+        // frame is static, not a discharge.
+        assert_eq!(at(0.5), at(0.5 + crackle.flicker * 0.4));
+
+        // Across buckets it genuinely takes different shapes.
+        let shapes: Vec<Option<char>> = (0..12)
+            .map(|bucket| at(0.5 + crackle.flicker * bucket as f32))
+            .collect();
+        let mut distinct = shapes.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 2,
+            "a discharge has to change shape as it burns: {shapes:?}"
+        );
+    }
+
+    #[test]
+    fn a_crackle_reaches_only_the_core_of_the_charge() {
+        // The fringe of the comet is what carries the sub-cell position, so a
+        // discharge spreading into it would trade the smooth reading away.
+        let behaviour = get(names::RELATION_CHARGE);
+        let extent = CellExtent::row(4);
+        for step in 0..=64 {
+            let progress = step as f32 / 64.0;
+            for col in 0..extent.cols {
+                let cell = CellPos::col(col);
+                let paint = behaviour.cell(cell, extent, progress, DriveInputs::default(), PALETTE);
+                if paint
+                    .glyph
+                    .is_some_and(|glyph| CHARGE_ARCS.contains(&glyph))
+                {
+                    assert!(
+                        behaviour.strength(cell, extent, progress) >= CHARGE_ARC_ABOVE,
+                        "cell {col} arced at progress {progress} without being the charge's core"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_quiet_signal_travels_without_discharging() {
+        // Colour separates the categories; motion separates urgency. Something
+        // going quiet must not crackle like something happening.
+        let drift = get(names::RELATION_DRIFT);
+        assert!(drift.paint.crackle.is_none());
+        assert!(drift.paint.glyphs.is_some(), "but it still moves sub-cell");
+
+        let extent = CellExtent::row(4);
+        for step in 0..=64 {
+            for col in 0..extent.cols {
+                let glyph = drift
+                    .cell(
+                        CellPos::col(col),
+                        extent,
+                        step as f32 / 64.0,
+                        DriveInputs::default(),
+                        PALETTE,
+                    )
+                    .glyph;
+                assert!(
+                    !glyph.is_some_and(|glyph| CHARGE_ARCS.contains(&glyph)),
+                    "the quiet signal drew an arc"
+                );
+            }
+        }
     }
 
     #[test]

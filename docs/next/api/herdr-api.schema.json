@@ -4448,6 +4448,16 @@
               "const": "completed",
               "description": "`from_workspace_id` finished the work it was given.",
               "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "`from_workspace_id` failed the work it was given.",
+              "type": "string"
+            },
+            {
+              "const": "idle",
+              "description": "`from_workspace_id` has nothing left to do and has gone quiet.",
+              "type": "string"
             }
           ]
         },

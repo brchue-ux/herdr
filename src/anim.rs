@@ -669,6 +669,7 @@ mod tests {
         surface: (0, 0, 0),
         own: (200, 200, 200),
         accent: (0, 0, 255),
+        signal: (0, 0, 255),
     };
 
     fn row(id: &str) -> ElementId {

@@ -2,11 +2,12 @@
 //!
 //! The medium is a character-cell grid, so this type is the whole of what an
 //! animation is allowed to say about a cell: its foreground, its background,
-//! its attributes, and how much of its own glyph is present. A glyph never
-//! moves, stretches, or leaves its cell. That is a property of the terminal,
-//! not a gap in this type, and it is why nothing here has a position delta.
+//! its attributes, how much of its own glyph is present, and — for a cell that
+//! is pure decoration — which glyph that is. A glyph never moves, stretches, or
+//! leaves its cell. That is a property of the terminal, not a gap in this type,
+//! and it is why nothing here has a position delta.
 //!
-//! Three properties this module is responsible for holding:
+//! Four properties this module is responsible for holding:
 //!
 //! - **A cell paint is a patch, never a replacement.** Every field is optional
 //!   or a tri-state, so an animation that says nothing about a cell leaves it
@@ -19,7 +20,16 @@
 //! - **Sub-cell resolution comes from the glyph set or not at all.** Text cells
 //!   express coverage as a mix toward the background, because a letter cannot
 //!   be half-drawn; filled cells express it through the eighth-block ramp,
-//!   which genuinely resolves eight steps inside one cell.
+//!   which genuinely resolves eight steps inside one cell. A decoration cell
+//!   gets a third option: [`CellPaint::glyph`] swaps in a glyph of the *same
+//!   display width*, which is how an effect resolves a position finer than a
+//!   cell — or takes a shape no styling of the settled glyph could express.
+//! - **A glyph substitution is an offer, not a command.** [`CellPaint::glyph`]
+//!   is honoured only by a call site drawing pure decoration, through
+//!   [`CellPaint::glyph_over`], which refuses any substitute whose display
+//!   width differs from the glyph it would replace. [`CellPaint::text_style`]
+//!   never applies one at all: an animation must not be able to garble a label
+//!   it was only asked to emphasise.
 
 use ratatui::style::{Modifier, Style};
 
@@ -166,6 +176,13 @@ pub(crate) enum Ink {
     Own,
     /// The palette accent.
     Accent,
+    /// The colour of *what is being signalled* on this element right now.
+    ///
+    /// A role rather than a hue so one behaviour can carry a whole vocabulary:
+    /// the caller resolves it from the category of the thing it is drawing —
+    /// work arriving, work finishing, a failure, a branch going quiet — and the
+    /// same catalogue entry then reads as four different signals.
+    Signal,
     /// A literal colour, for a behaviour that genuinely means one hue.
     Fixed(Rgb),
 }
@@ -176,6 +193,9 @@ pub(crate) struct InkPalette {
     pub(crate) surface: Rgb,
     pub(crate) own: Rgb,
     pub(crate) accent: Rgb,
+    /// What [`Ink::Signal`] resolves to. Defaults to the accent, so a call site
+    /// with no category of its own still draws a signal behaviour correctly.
+    pub(crate) signal: Rgb,
 }
 
 impl InkPalette {
@@ -196,6 +216,7 @@ impl InkPalette {
             .and_then(rgb)
             .or_else(|| rgb(palette.panel_bg))
             .unwrap_or(crate::ui::color::BLACK);
+        let accent = rgb(palette.accent).unwrap_or(surface);
         Self {
             surface,
             own: base
@@ -203,8 +224,21 @@ impl InkPalette {
                 .and_then(rgb)
                 .or_else(|| rgb(palette.text))
                 .unwrap_or(crate::ui::color::WHITE),
-            accent: rgb(palette.accent).unwrap_or(surface),
+            accent,
+            signal: accent,
         }
+    }
+
+    /// Bind [`Ink::Signal`] to the colour of what is actually being signalled.
+    ///
+    /// The colour is lifted away from the surface first, so a vocabulary
+    /// entry that happens to sit close to the host terminal's background — a
+    /// muted grey on a grey theme, a green on a green one — still arrives
+    /// visible rather than invisible.
+    pub(crate) fn with_signal(mut self, signal: Rgb) -> Self {
+        self.signal =
+            crate::ui::color::ensure_contrast(signal, self.surface, SIGNAL_CONTRAST_FLOOR);
+        self
     }
 
     pub(crate) fn ink(self, ink: Ink) -> Rgb {
@@ -212,10 +246,20 @@ impl InkPalette {
             Ink::Surface => self.surface,
             Ink::Own => self.own,
             Ink::Accent => self.accent,
+            Ink::Signal => self.signal,
             Ink::Fixed(rgb) => rgb,
         }
     }
 }
+
+/// Contrast a signal colour must clear against the surface it lights up.
+///
+/// Below WCAG's text floors on purpose: a charge is a mark, not a label, and
+/// forcing 4.5:1 would wash a whole vocabulary toward the same near-white on a
+/// dark theme and the same near-black on a light one — destroying exactly the
+/// hue separation the vocabulary exists to carry. This is the floor at which a
+/// mark is unmistakably present.
+const SIGNAL_CONTRAST_FLOOR: f32 = 2.2;
 
 /// The eighth-block ramp, lightest first.
 ///
@@ -238,6 +282,13 @@ pub(crate) struct CellPaint {
     /// `1.0` for anything that is not a reveal, so a caller that ignores this
     /// field still draws every non-revealing behaviour correctly.
     pub(crate) coverage: f32,
+    /// A glyph offered in place of the cell's settled one.
+    ///
+    /// `None` for every behaviour that does not deal in shape, which is nearly
+    /// all of them. Read it through [`CellPaint::glyph_over`] rather than
+    /// directly: that is where the same-width rule is enforced, and it is the
+    /// only reason a substitution cannot move a column.
+    pub(crate) glyph: Option<char>,
 }
 
 impl Default for CellPaint {
@@ -247,6 +298,7 @@ impl Default for CellPaint {
             bg: None,
             attrs: AttrPatch::NONE,
             coverage: 1.0,
+            glyph: None,
         }
     }
 }
@@ -257,7 +309,26 @@ impl CellPaint {
     /// The per-frame diff is built on this: an element every one of whose cells
     /// is settled costs no repaint at all.
     pub(crate) fn is_settled(&self) -> bool {
-        self.fg.is_none() && self.bg.is_none() && self.attrs.is_empty() && self.coverage >= 1.0
+        self.fg.is_none()
+            && self.bg.is_none()
+            && self.attrs.is_empty()
+            && self.coverage >= 1.0
+            && self.glyph.is_none()
+    }
+
+    /// The glyph this cell should actually draw, given the one it settles to.
+    ///
+    /// A substitute is taken only when it occupies exactly the columns the
+    /// settled glyph did. That is the whole of what the old style-only rule was
+    /// protecting: no cell count, no column, and no reserved width can move,
+    /// whatever a behaviour asks for. A behaviour that asks for something wider
+    /// or narrower is simply not honoured — a decoration is never allowed to
+    /// break the thing it decorates.
+    pub(crate) fn glyph_over(&self, settled: char) -> char {
+        match self.glyph {
+            Some(glyph) if display_width(glyph) == display_width(settled) => glyph,
+            _ => settled,
+        }
     }
 
     /// Fold this paint into the style a text cell was going to be drawn with.
@@ -329,13 +400,27 @@ impl CellPaint {
             | tri(self.attrs.underline) << 6
             | tri(self.attrs.reverse) << 8;
         let coverage = (self.coverage.clamp(0.0, 1.0) * 8.0).round() as u64;
+        // A glyph swap is the coarsest difference a cell can show and the most
+        // visible, so it is compared exactly rather than quantized.
+        let glyph = self.glyph.map_or(0, |glyph| u64::from(glyph) | 1 << 32);
         channel(self.fg)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .rotate_left(17)
             ^ channel(self.bg).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ attrs.rotate_left(41)
             ^ coverage.rotate_left(53)
+            ^ glyph.wrapping_mul(0xD6E8_FEB8_6659_FD93)
     }
+}
+
+/// Columns a glyph occupies, with anything unmeasurable treated as one.
+///
+/// Control characters and unassigned code points report `None`; a decoration
+/// call site has already reserved one column for the glyph it settled to, so
+/// treating an unmeasurable glyph as one column compares like with like rather
+/// than silently letting a zero-width substitute through.
+fn display_width(glyph: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(glyph).unwrap_or(1)
 }
 
 fn rgb_color(rgb: Rgb) -> ratatui::style::Color {
@@ -359,6 +444,7 @@ mod tests {
             surface: (0, 0, 0),
             own: (1, 2, 3),
             accent: (9, 9, 9),
+            signal: (9, 9, 9),
         };
         assert_eq!(paint.text_style(base, palette), base);
     }
@@ -394,6 +480,7 @@ mod tests {
             surface: (0, 0, 0),
             own: (200, 200, 200),
             accent: (0, 0, 255),
+            signal: (0, 0, 255),
         };
         let base = Style::default().fg(ratatui::style::Color::Rgb(200, 200, 200));
         let half = CellPaint {
@@ -450,6 +537,64 @@ mod tests {
             ..CellPaint::default()
         };
         assert_ne!(a.digest(), c.digest());
+    }
+
+    #[test]
+    fn a_substitution_of_the_wrong_width_is_refused_rather_than_drawn() {
+        let paint = |glyph| CellPaint {
+            glyph: Some(glyph),
+            ..CellPaint::default()
+        };
+        // A wide substitute would push every column right of it one cell over,
+        // which is exactly the failure the old style-only rule existed to stop.
+        assert_eq!(paint('한').glyph_over('─'), '─');
+        // A same-width one is taken, because that is the whole point.
+        assert_eq!(paint('╫').glyph_over('─'), '╫');
+        // Including over a blank, which a foreground colour alone could never
+        // ink — the connector's third cell is a space.
+        assert_eq!(paint('▌').glyph_over(' '), '▌');
+        // And a paint offering nothing leaves the settled glyph alone.
+        assert_eq!(CellPaint::default().glyph_over('├'), '├');
+    }
+
+    #[test]
+    fn a_paint_that_offers_a_glyph_is_never_settled() {
+        // Or the per-frame diff would skip the frame that takes it away again,
+        // and a discharge would be left burned into the line.
+        let arc = CellPaint {
+            glyph: Some('╫'),
+            ..CellPaint::default()
+        };
+        assert!(!arc.is_settled());
+        assert_ne!(arc.digest(), CellPaint::default().digest());
+        // Two different marks are two different frames.
+        let other = CellPaint {
+            glyph: Some('╪'),
+            ..CellPaint::default()
+        };
+        assert_ne!(arc.digest(), other.digest());
+    }
+
+    #[test]
+    fn text_never_takes_a_glyph_substitution() {
+        // The line the amended rule draws: decoration may change shape, a label
+        // may not. `text_style` is the path every label takes.
+        let palette = InkPalette {
+            surface: (0, 0, 0),
+            own: (200, 200, 200),
+            accent: (0, 0, 255),
+            signal: (0, 255, 0),
+        };
+        let base = Style::default().fg(ratatui::style::Color::Rgb(200, 200, 200));
+        let arc = CellPaint {
+            glyph: Some('╫'),
+            ..CellPaint::default()
+        };
+        assert_eq!(
+            arc.text_style(base, palette),
+            base,
+            "a glyph offer must not leak into a label's styling either"
+        );
     }
 
     #[test]
