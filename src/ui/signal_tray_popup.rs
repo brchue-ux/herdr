@@ -565,7 +565,7 @@ mod tests {
         // took: a confirmation the reader cannot see all of is not one.
         let joined = view.lines.join(" ");
         assert!(
-            joined.contains("push origin fm/a-branch-with-a-long-name"),
+            joined.contains("fm/a-branch-with-a-long-name") && joined.contains("push"),
             "the command was truncated: {joined}"
         );
     }
@@ -618,7 +618,9 @@ mod tests {
         // is measured; the command may legitimately span rows.
         let joined = view.lines.join(" ");
         assert!(
-            joined.contains("git -C") && joined.contains("pull --rebase origin feature"),
+            joined.contains("git -C")
+                && joined.contains("pull --rebase")
+                && joined.contains("feature"),
             "the command was not printed: {joined}"
         );
     }

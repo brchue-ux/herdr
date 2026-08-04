@@ -258,14 +258,17 @@ impl App {
                     message: format!("marked {cleared} pane{} seen", plural(cleared)),
                 });
             }
-            TrayCommand::Push { ws_idx, branch } => {
-                self.spawn_tray_git(ws_idx, vec!["push".into(), "origin".into(), branch]);
-            }
-            TrayCommand::Sync { ws_idx, branch } => {
-                self.spawn_tray_git(
-                    ws_idx,
-                    vec!["pull".into(), "--rebase".into(), "origin".into(), branch],
-                );
+            // Both go through `TrayCommand::argv`, which is also what the
+            // popover printed — so what runs and what was confirmed are the
+            // same list, produced once.
+            command @ (TrayCommand::Push { .. } | TrayCommand::Sync { .. }) => {
+                let ws_idx = match &command {
+                    TrayCommand::Push { ws_idx, .. } | TrayCommand::Sync { ws_idx, .. } => *ws_idx,
+                    _ => return,
+                };
+                if let Some(args) = command.argv() {
+                    self.spawn_tray_git(ws_idx, args);
+                }
             }
         }
     }

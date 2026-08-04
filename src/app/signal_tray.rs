@@ -154,13 +154,33 @@ pub(crate) enum TrayCommand {
     },
     /// Clear the unseen flag on every pane that has one.
     MarkAllSeen,
-    /// `git push` on `branch`, in this Space's checkout.
+    /// `git push` in this Space's checkout, to `branch`'s own upstream.
     Push { ws_idx: usize, branch: String },
-    /// `git pull --rebase` in this Space's checkout.
+    /// `git pull --rebase` in this Space's checkout, from the same upstream.
     Sync { ws_idx: usize, branch: String },
 }
 
 impl TrayCommand {
+    /// The exact `git` arguments this runs, for the two commands that run one.
+    ///
+    /// **No remote and no refspec, on purpose.** `ahead` and `behind` are read
+    /// against the branch's *configured upstream*, so that upstream is the only
+    /// remote these counts can honestly be acted on — naming `origin` would
+    /// push work somewhere the count was never measured against. In a fleet
+    /// whose Spaces deliberately keep `origin` pointing at a repository nobody
+    /// may push to, that is not a stylistic preference.
+    ///
+    /// A branch with no upstream simply has no counts, so no button is ever
+    /// drawn for it; if git is asked anyway it refuses and says so, which the
+    /// popover prints.
+    pub(crate) fn argv(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Push { .. } => Some(vec!["push".to_string()]),
+            Self::Sync { .. } => Some(vec!["pull".to_string(), "--rebase".to_string()]),
+            Self::Answer { .. } | Self::MarkAllSeen => None,
+        }
+    }
+
     /// Exactly what this will do, in the words the popup prints above the
     /// button. A confirmation the user cannot read is not a confirmation.
     pub(crate) fn description(&self, app: &AppState) -> String {
@@ -172,15 +192,19 @@ impl TrayCommand {
                 )
             }
             Self::MarkAllSeen => "clears the unseen mark on every finished pane".to_string(),
+            // No remote and no refspec, deliberately — see `TrayCommand::argv`.
+            // The branch is named in the popup's own body line above this, so
+            // the reader still sees which branch without the command claiming a
+            // remote Herdr has not checked.
             Self::Push { ws_idx, branch } => {
                 format!(
-                    "runs: git -C {} push origin {branch}",
+                    "runs: git -C {} push  ({branch} → its upstream)",
                     checkout_label(app, *ws_idx)
                 )
             }
             Self::Sync { ws_idx, branch } => {
                 format!(
-                    "runs: git -C {} pull --rebase origin {branch}",
+                    "runs: git -C {} pull --rebase  ({branch} ← its upstream)",
                     checkout_label(app, *ws_idx)
                 )
             }
@@ -847,6 +871,70 @@ mod tests {
         }
     }
 
+    /// The one thing this tray must never do: push somewhere the counts were
+    /// not measured against.
+    ///
+    /// `ahead`/`behind` are read against the branch's *configured upstream*, so
+    /// that is the only remote acting on them can honestly mean. Naming a
+    /// remote on the command line would send work to whatever `origin` happens
+    /// to be — and in a fleet whose Spaces keep `origin` pointing at a
+    /// repository nobody may push to, that is a real accident waiting to
+    /// happen rather than a style point.
+    #[test]
+    fn the_git_commands_never_name_a_remote_or_a_refspec() {
+        let commands = [
+            TrayCommand::Push {
+                ws_idx: 0,
+                branch: "feature".into(),
+            },
+            TrayCommand::Sync {
+                ws_idx: 0,
+                branch: "feature".into(),
+            },
+        ];
+        for command in commands {
+            let argv = command.argv().expect("a git command has an argv");
+            assert!(
+                !argv.iter().any(|arg| arg == "origin"
+                    || arg == "feature"
+                    || arg.starts_with('-') && arg != "--rebase"),
+                "{command:?} named a remote or a refspec: {argv:?}"
+            );
+        }
+        assert_eq!(
+            TrayCommand::Push {
+                ws_idx: 0,
+                branch: "b".into()
+            }
+            .argv(),
+            Some(vec!["push".to_string()])
+        );
+        assert_eq!(
+            TrayCommand::Sync {
+                ws_idx: 0,
+                branch: "b".into()
+            }
+            .argv(),
+            Some(vec!["pull".to_string(), "--rebase".to_string()])
+        );
+    }
+
+    /// The two that only touch Herdr's own state must not look like shell
+    /// commands, or a caller could hand them to the subprocess runner.
+    #[test]
+    fn the_in_herdr_acts_have_no_argv_at_all() {
+        assert_eq!(TrayCommand::MarkAllSeen.argv(), None);
+        assert_eq!(
+            TrayCommand::Answer {
+                ws_idx: 0,
+                pane_id: crate::layout::PaneId::alloc(),
+                yes: true,
+            }
+            .argv(),
+            None
+        );
+    }
+
     #[test]
     fn a_command_says_exactly_what_it_will_run() {
         let mut app = app_with_workspace();
@@ -856,10 +944,13 @@ mod tests {
             branch: "feat/x".into(),
         }
         .description(&app);
+        // The command exactly, and the branch beside it — but no remote, so
+        // nothing here can promise a destination Herdr did not check.
         assert!(
-            described.contains("git -C /w/repo push origin feat/x"),
+            described.contains("git -C /w/repo push") && described.contains("feat/x"),
             "{described}"
         );
+        assert!(!described.contains("origin"), "{described}");
     }
 
     #[test]
