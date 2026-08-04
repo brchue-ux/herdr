@@ -1705,6 +1705,16 @@ pub struct AppState {
     /// row exit is configured — so an unconfigured Herdr pays nothing and a
     /// restored or handed-off server starts with every group settled.
     pub(crate) sidebar_tree_row_memory: Vec<crate::ui::AgentPanelEntry>,
+    /// Which node the sidebar tree is currently rooted on.
+    ///
+    /// Client presentation state, like [`Self::anim`]: it decides what this
+    /// viewer is looking at, never what is true about the session, so it is
+    /// neither persisted nor published. Two clients on one session are entitled
+    /// to be looking at different mates.
+    pub(crate) tree_root: crate::app::tree_view::TreeRoot,
+    /// A root that has been chosen but is not being shown yet, because the view
+    /// it replaces is still coming apart. See [`crate::app::tree_view`].
+    pub(crate) pending_tree_root: Option<crate::app::tree_view::PendingTreeRoot>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
@@ -1879,6 +1889,129 @@ impl AppState {
     /// True when a drawn signal bar has something moving in it.
     pub(crate) fn fleet_signal_animation_active(&self) -> bool {
         self.fleet_signal_bar_active() && self.sidebar_notifications.animates()
+    }
+
+    /// True while a view switch still has something to play or to commit.
+    ///
+    /// The loop consults this before forgetting every element: a switch that
+    /// is mid-dissolve, or one whose new root is still waiting to be adopted,
+    /// must survive a pass in which nothing else in the panel is animating —
+    /// otherwise it strands with the outgoing view half gone.
+    pub(crate) fn tree_view_switch_active(&self) -> bool {
+        self.pending_tree_root.is_some()
+            || self
+                .anim
+                .frame(&crate::app::tree_view::view_element(), None)
+                .is_some_and(|frame| frame.behaviour.is_some())
+    }
+    /// Root the sidebar tree on `root`, taking the current view apart first.
+    ///
+    /// The new root is not adopted here. It is held until the outgoing view has
+    /// finished dematerializing, because that is the one instant at which the
+    /// layout can change without a single row appearing to move — the whole
+    /// point of carrying the switch by materialize/dematerialize rather than by
+    /// reflow. With no transition configured the swap is immediate, which is
+    /// the honest rendering of "this Herdr does not animate".
+    ///
+    /// Returns whether anything changed, so a caller can ask for a repaint.
+    pub(crate) fn select_tree_root(
+        &mut self,
+        root: crate::app::tree_view::TreeRoot,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.tree_root == root && self.pending_tree_root.is_none() {
+            return false;
+        }
+        let lifecycle = self.tree_view_lifecycle();
+        let Some(leave) = lifecycle.dismount.clone() else {
+            self.pending_tree_root = None;
+            self.tree_root = root;
+            return true;
+        };
+        match self.pending_tree_root.as_mut() {
+            // Already mid-dissolve. Re-aiming it is not the same as restarting
+            // it: the view being left is the same view either way, and
+            // restarting would be the transition cancelling itself.
+            Some(pending) => pending.root = root,
+            None => {
+                self.pending_tree_root = Some(crate::app::tree_view::PendingTreeRoot {
+                    root,
+                    commit_at: now + leave.duration,
+                });
+                // Brought into existence and asked to leave in the same pass, so
+                // it enters its departure without a frame of the arrival it was
+                // created holding. Nothing has advanced between the two calls,
+                // so no renderer can see the phase it passed through.
+                let id = crate::app::tree_view::view_element();
+                self.anim.enter(
+                    id.clone(),
+                    &lifecycle,
+                    crate::anim::behaviour::DriveInputs::default(),
+                    now,
+                );
+                self.anim.leave(&id, now);
+            }
+        }
+        true
+    }
+
+    /// The life a whole view is given: it forms on arrival, comes apart on
+    /// departure, and does nothing at all in between.
+    ///
+    /// The same stage on both ends, because the engine plays a dismount as its
+    /// mount reversed — the view comes apart exactly the way it formed, and the
+    /// duration the loop waits before adopting the incoming root is by
+    /// construction the duration the outgoing one spends leaving.
+    fn tree_view_lifecycle(&self) -> crate::anim::Lifecycle {
+        let stage = self.sidebar_animation.view_switch_stage();
+        crate::app::tree_view::view_lifecycle(stage.clone(), stage)
+    }
+
+    /// When the app loop must wake to finish a view switch.
+    ///
+    /// A panel mid-dissolve with nothing else animating would otherwise park
+    /// with the outgoing view half gone and the incoming one never drawn.
+    pub(crate) fn next_tree_view_commit_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_tree_root
+            .as_ref()
+            .map(|pending| pending.commit_at)
+    }
+
+    /// Adopt a due root and start the incoming view materializing.
+    ///
+    /// Runs on the app loop, before the row membership for this pass is
+    /// published, so the rows that arrive with the new view are published
+    /// against the root they belong to rather than one pass late.
+    ///
+    /// Nothing happens outside a switch. A Herdr nobody is re-rooting holds no
+    /// view element and arms no deadline for one, which is the same bargain
+    /// every other animated element here makes.
+    pub(crate) fn advance_tree_view(&mut self, now: std::time::Instant) -> bool {
+        let Some(pending) = self.pending_tree_root.as_ref() else {
+            return false;
+        };
+        // Mid-dissolve. Touching the element at all would resurrect it.
+        if now < pending.commit_at {
+            return false;
+        }
+        let root = pending.root.clone();
+        self.pending_tree_root = None;
+        self.tree_root = root;
+
+        let lifecycle = self.tree_view_lifecycle();
+        if lifecycle.mount.is_none() {
+            return true;
+        }
+        // `enter` on an element that is still leaving restarts it from the
+        // beginning rather than resuming, which is exactly right here: the view
+        // really did go away, and what arrives now is a different one.
+        self.anim.enter(
+            crate::app::tree_view::view_element(),
+            &lifecycle,
+            crate::anim::behaviour::DriveInputs::default(),
+            now,
+        );
+        true
     }
 
     /// How hard the busiest terminal in this workspace is working, in
@@ -2307,6 +2440,8 @@ impl AppState {
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
             sidebar_tree_row_memory: Vec::new(),
+            tree_root: crate::app::tree_view::TreeRoot::default(),
+            pending_tree_root: None,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {

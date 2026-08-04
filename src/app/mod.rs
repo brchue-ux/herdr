@@ -28,6 +28,7 @@ pub mod state;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod tree_view;
 pub(crate) mod worker_summary;
 mod worktrees;
 
@@ -142,6 +143,11 @@ pub struct App {
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
+    /// The tree row a previous click landed on, and when, for the drill-in
+    /// gesture. Held on `App` beside the divider's own double-click for the
+    /// same reason: a click's *history* is this client's input state, not
+    /// anything the session knows.
+    pub(crate) last_sidebar_row_click: Option<(crate::app::tree_view::TreeRoot, Instant)>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
@@ -763,6 +769,8 @@ impl App {
             pane_activity: pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
             sidebar_tree_row_memory: Vec::new(),
+            tree_root: tree_view::TreeRoot::default(),
+            pending_tree_root: None,
             palette: theme_palette,
             theme_name,
             theme_runtime,
@@ -852,6 +860,7 @@ impl App {
             pending_api_worktree_remove_paths: HashMap::new(),
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
+            last_sidebar_row_click: None,
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,

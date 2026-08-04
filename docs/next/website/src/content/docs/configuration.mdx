@@ -490,6 +490,23 @@ The bar hangs on the left of that row and any `herdr api status set` text right-
 `enabled` defaults to `false`. Three of the slots read counts that cost a `git status` scan or a request to the forge, and Herdr only pays for those while something is drawing them — so switching the bar on is also what arms those refreshes, exactly as configuring a `git_dirty` or `pull_requests` token does. `emphasis` takes any behaviour name above and defaults to `pulse`; set it to `none` for a bar that changes colour without moving. `enter`/`enter_ms` are the arrival a slot plays as it goes live, clamped to 60–1500 ms. A slot has no exit: it never leaves, it just goes back to grey.
 
 Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
+Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one or a view switch is in flight, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before between switches. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
+
+### Re-rooting the tree on one mate
+
+Double-click a row that owns a subtree and the Spaces tree re-roots onto it: that row takes rank 0, its own workers take rank 1, and everything else leaves the view. A `◂ main` control appears on the row above the tree to come back out, and double-clicking the row at rank 0 does the same.
+
+Nothing slides. The view being left dematerializes where it is, the layout changes at the instant the panel is empty, and the view being arrived at materializes in place — so no row is ever animated from one position to another.
+
+```toml
+[ui.sidebar.animation]
+view_switch = "dissolve"
+view_switch_ms = 220
+```
+
+`view_switch` takes the same behaviour names as `row_enter`, and like `row_exit` the way out is that name played backwards — the view comes apart the way it formed. Unlike `row_enter` it is on by default, because re-rooting with no transition is a hard cut from one set of rows to another; `view_switch = "none"` restores that hard cut. `view_switch_ms` is how long *each half* takes, clamped to 60–1500 ms.
+
+The switch and the fleet run on separate clocks on purpose. A worker that spawns while the panel is coming apart still plays its own arrival, and a worker that finishes mid-switch still leaves — neither is queued behind the transition, and neither cancels it.
 
 `row_gap` controls the blank terminal rows between entries, independently for the Agent and Space panels. It defaults to `0`, which packs entries together; set it to `1` to restore the previous spacing. It does not add spacing between the content lines declared in `rows`. Consecutive indented worktree children remain packed as one Space group.
 

@@ -809,6 +809,32 @@
           "description": "How long a configured row departure takes, in milliseconds. Clamped to 60-1500."
         },
         {
+          "key": "ui.sidebar.animation.view_switch",
+          "type": "enum",
+          "default": "\"dissolve\"",
+          "description": "Animation the whole Spaces tree plays when it is re-rooted onto one second mate, and - played reversed - on the way back out. Double-clicking a row that owns a subtree drills into it. Unlike row_enter this is on by default, because re-rooting with no transition is a hard cut from one set of rows to another; none restores that hard cut.",
+          "values": [
+            "none",
+            "pulse",
+            "shimmer",
+            "wave",
+            "activity",
+            "activity-shimmer",
+            "fade",
+            "typewriter",
+            "wipe",
+            "drop-in",
+            "dissolve",
+            "collapse"
+          ]
+        },
+        {
+          "key": "ui.sidebar.animation.view_switch_ms",
+          "type": "integer",
+          "default": "220",
+          "description": "How long each half of a tree view switch takes, in milliseconds. The view being left dematerializes for this long, the new root is adopted at the instant nothing is on screen, and the view being arrived at materializes for the same again. Clamped to 60-1500."
+        },
+        {
           "key": "ui.sidebar.notifications.enabled",
           "type": "boolean",
           "default": "false",

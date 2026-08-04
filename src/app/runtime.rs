@@ -410,17 +410,27 @@ impl App {
     pub(crate) fn advance_animations(&mut self, now: Instant, has_viewers: bool) -> bool {
         let tree = has_viewers && self.state.sidebar_animation_active();
         let signals = has_viewers && self.state.fleet_signal_animation_active();
-        if !tree && !signals {
+        // The view switch is gated on neither: a re-root *is* the behaviour
+        // rather than a decoration on a row, and one already in flight has to
+        // be able to finish even when nothing else in the panel is animating.
+        let switching = has_viewers && self.state.tree_view_switch_active();
+        if !tree && !signals && !switching {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
             return forgotten || remembered;
         }
 
+        // Adopting a due root comes first, because it is what decides which
+        // rows this pass draws.
+        let switch_changed = self.state.advance_tree_view(now);
+
         // Every family is published on every pass, with an empty set when its
         // own feature is switched off, so turning one off retires exactly its
         // elements and leaves the others alone. Reconciling is per-family, so
-        // the three can never evict each other.
+        // the families can never evict each other. The view switch is not one of
+        // them: it is a singleton driven by enter/leave, in its own family for
+        // exactly that reason.
         type Members = Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)>;
 
         let lifecycle = self.state.sidebar_row_lifecycle();
@@ -461,7 +471,7 @@ impl App {
             signal_members,
         );
 
-        spaces_changed || agents_changed || signals_changed
+        switch_changed || spaces_changed || agents_changed || signals_changed
     }
 
     /// Publish the owned agent rows that exist right now, so each second mate's
@@ -784,6 +794,7 @@ impl App {
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
             self.state.anim.next_deadline(now),
+            self.state.next_tree_view_commit_deadline(),
             self.next_state_age_tick,
             self.next_activity_sample,
             self.state.relation_signals.next_deadline(),
@@ -871,6 +882,35 @@ mod tests {
             .frame(&id, None)
             .expect("the row is tracked")
             .progress
+    }
+
+    /// The switch has a deadline of its own, and the loop has to arm it: a
+    /// panel mid-dissolve with nothing else animating would otherwise park with
+    /// the outgoing view half gone and the incoming one never drawn.
+    #[test]
+    fn a_view_switch_arms_the_loop_with_nothing_else_animating() {
+        let (mut app, _) = test_app_with_pane();
+        let now = Instant::now();
+        assert_eq!(app.state.anim.next_deadline(now), None);
+
+        assert!(app.state.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string()),
+            now
+        ));
+        let commit = app
+            .state
+            .next_tree_view_commit_deadline()
+            .expect("a switch is in flight");
+        assert!(app
+            .next_loop_deadline(now, false)
+            .is_some_and(|deadline| deadline <= commit));
+
+        assert!(app.handle_scheduled_tasks(commit, false));
+        assert_eq!(
+            app.state.tree_root,
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string())
+        );
+        assert_eq!(app.state.next_tree_view_commit_deadline(), None);
     }
 
     #[test]

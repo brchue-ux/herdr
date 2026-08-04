@@ -475,14 +475,109 @@ pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested:
 }
 
 pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
-    workspace_list_entries_inner(app, false)
+    workspace_list_entries_inner(app, false, &app.tree_root)
 }
 
 /// Like [`workspace_list_entries`] but always expands worktree groups, ignoring
 /// `collapsed_space_keys`. The mobile switcher has no collapse affordance and
 /// always shows the full worktree tree.
 pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceListEntry> {
-    workspace_list_entries_inner(app, true)
+    workspace_list_entries_inner(app, true, &app.tree_root)
+}
+
+/// The whole fleet's tree, whatever the sidebar is currently rooted on.
+///
+/// Reordering asks where a Space sits among *all* the roots, which is a fact
+/// about the session rather than about this viewer's current view. Answering it
+/// from a re-rooted tree would move a Space to a position derived from the two
+/// or three rows that happen to be on screen.
+pub(crate) fn workspace_list_entries_whole_fleet(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_inner(app, true, &crate::app::tree_view::TreeRoot::Fleet)
+}
+
+/// The tree name a row answers to, which is the handle an `owner` token uses.
+///
+/// `None` for a row that never named itself; such a row can be drawn and can be
+/// owned, but nothing can be rooted on it because there is no name to hold.
+fn entry_tree_handle(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<String> {
+    match entry {
+        // A worktree child is a checkout of its parent Space, not a node of the
+        // ownership tree, so it is not a root anything can be re-rooted on.
+        WorkspaceListEntry::Workspace { indented: true, .. } => None,
+        WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
+        WorkspaceListEntry::Agent { entry_idx, .. } => agents
+            .get(*entry_idx)
+            .and_then(|entry| entry.agent_name.clone()),
+    }
+}
+
+/// The tree name one drawn row answers to, for a caller that has an entry but
+/// not the agent list it was built against.
+pub(crate) fn sidebar_tree_handle(app: &AppState, entry: &WorkspaceListEntry) -> Option<String> {
+    entry_tree_handle(app, &sidebar_agent_entries(app), entry)
+}
+
+/// Cut `entries` down to the subtree `root` names, re-depthed onto rank 0.
+///
+/// The selected node takes the position the fleet's root held and its own
+/// children take the position the second mates held — by being drawn there, not
+/// by travelling there. A root that no longer names a row leaves the tree
+/// untouched, so a mate whose Space is closed under an open view degrades back
+/// to the whole fleet instead of blanking the panel.
+fn re_root_entries(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entries: Vec<WorkspaceListEntry>,
+    root: &crate::app::tree_view::TreeRoot,
+) -> Vec<WorkspaceListEntry> {
+    let handles: Vec<Option<String>> = entries
+        .iter()
+        .map(|entry| entry_tree_handle(app, agents, entry))
+        .collect();
+    let rows = entries
+        .iter()
+        .zip(&handles)
+        .map(|(entry, handle)| (entry.depth(), handle.as_deref()));
+    let Some(kept) = crate::app::tree_view::rooted_rows(rows, root) else {
+        return entries;
+    };
+
+    kept.into_iter()
+        .enumerate()
+        .filter_map(|(position, row)| {
+            let mut entry = entries.get(row.index)?.clone();
+            let trimmed = usize::from(row.trimmed_levels);
+            let (depth, ancestors, is_last_child) = match &mut entry {
+                WorkspaceListEntry::Workspace {
+                    depth,
+                    ancestors_continue,
+                    is_last_child,
+                    ..
+                }
+                | WorkspaceListEntry::Agent {
+                    depth,
+                    ancestors_continue,
+                    is_last_child,
+                    ..
+                } => (depth, ancestors_continue, is_last_child),
+            };
+            *depth = row.depth;
+            // The rail is indexed by absolute level, so dropping the levels
+            // above the new root is what keeps a child's `│` under its own
+            // parent rather than under a column that is no longer drawn.
+            let cut = trimmed.min(ancestors.len());
+            ancestors.drain(..cut);
+            if position == 0 {
+                // The new root is the only row in its column.
+                *is_last_child = true;
+            }
+            Some(entry)
+        })
+        .collect()
 }
 
 /// A Space and the worktree children that always travel with it.
@@ -695,7 +790,11 @@ fn arrange_space_tree(
     entries
 }
 
-fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
+fn workspace_list_entries_inner(
+    app: &AppState,
+    force_expanded: bool,
+    root: &crate::app::tree_view::TreeRoot,
+) -> Vec<WorkspaceListEntry> {
     let mut groups_by_key =
         std::collections::HashMap::<String, crate::app::state::WorktreeSpaceGroup>::new();
     for ws in app.workspaces.iter() {
@@ -755,7 +854,12 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
         });
     }
 
-    arrange_space_tree(app, &blocks, &sidebar_agent_entries(app))
+    let agents = sidebar_agent_entries(app);
+    let entries = arrange_space_tree(app, &blocks, &agents);
+    if root.is_fleet() {
+        return entries;
+    }
+    re_root_entries(app, &agents, entries, root)
 }
 
 pub(crate) fn workspace_list_rect(area: Rect) -> Rect {
@@ -924,7 +1028,25 @@ fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
         );
     }
 
-    let taken = bar_width.saturating_add(if bar_width > 0 { HEADER_ROW_GAP } else { 0 });
+    let mut taken = bar_width.saturating_add(if bar_width > 0 { HEADER_ROW_GAP } else { 0 });
+
+    // The way out of a re-rooted tree sits after the bar, never before it. The
+    // bar is a permanent readout whose positions a reader learns, and a control
+    // that comes and goes with the current view must not shift it.
+    let breadcrumb = sidebar_tree_breadcrumb_rect(app, area);
+    if breadcrumb.width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                TREE_BREADCRUMB_LABEL,
+                Style::default().fg(app.palette.accent),
+            )),
+            breadcrumb,
+        );
+        taken = taken
+            .saturating_add(breadcrumb.width)
+            .saturating_add(HEADER_ROW_GAP);
+    }
+
     let remaining = header.width.saturating_sub(taken);
     render_session_status(
         app,
@@ -936,6 +1058,48 @@ fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
             header.height,
         ),
     );
+}
+
+/// What the way back out of a re-rooted tree is labelled.
+///
+/// The captain's own word for the view a mate's subtree was entered from. It
+/// names the destination rather than the current position because the row
+/// immediately below already says where you are.
+const TREE_BREADCRUMB_LABEL: &str = "◂ main";
+
+/// The label for the control that leaves the current view, when there is one.
+///
+/// `None` in the fleet view: there is nothing above it, so the header row stays
+/// exactly as empty as it was.
+fn sidebar_tree_breadcrumb(app: &AppState) -> Option<&'static str> {
+    (!app.tree_root.is_fleet()).then_some(TREE_BREADCRUMB_LABEL)
+}
+
+/// Where that control is drawn and hit-tested.
+///
+/// On the reserved header row, which is the one row above the tree and
+/// therefore the only place a "go up" control can sit without taking a column
+/// away from a row. It follows the fleet signal bar rather than preceding it,
+/// so a control that comes and goes with the current view never shifts a
+/// permanent readout. `area` is the panel's own list rect.
+pub(crate) fn sidebar_tree_breadcrumb_rect(app: &AppState, area: Rect) -> Rect {
+    let Some(label) = sidebar_tree_breadcrumb(app) else {
+        return Rect::default();
+    };
+    let header = workspace_list_header_rect(area);
+    if header.height == 0 {
+        return Rect::default();
+    }
+    // Measured against the same allocation `render_header_row` walks, so the
+    // control is hit-tested exactly where it was drawn however many columns the
+    // signal bar took first.
+    let bar = notifications::fleet_signal_bar_width(app, header.width);
+    let offset = bar.saturating_add(if bar > 0 { HEADER_ROW_GAP } else { 0 });
+    let width = display_width(label) as u16;
+    if header.width.saturating_sub(offset) < width {
+        return Rect::default();
+    }
+    Rect::new(header.x.saturating_add(offset), header.y, width, 1)
 }
 
 /// Draw the session status in the columns of the header row left over for it.
@@ -2393,6 +2557,76 @@ fn rgb_color(rgb: crate::ui::color::Rgb) -> ratatui::style::Color {
     ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
+/// Draw the whole tree's own arrival or departure over the rows already drawn.
+///
+/// The view is one element of the animation engine and the rows underneath are
+/// others, so this composes with them rather than replacing them: a worker
+/// spawning while the panel is coming apart still plays its own arrival, and a
+/// row that finished arriving mid-switch is not snapped back. Nothing here
+/// moves a row — the transition is carried entirely by how present each cell
+/// is, which is the whole reason a re-root never slides anything.
+///
+/// Every cell the tree occupies is reached, connectors and scrollbar included,
+/// because a view that dissolved its text and left its rails behind would read
+/// as the panel breaking rather than as the view leaving.
+fn render_tree_view_transition(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    body: Rect,
+    list_bottom: u16,
+) {
+    use crate::anim::cell::{CellExtent, CellPos, InkPalette};
+    use crate::ui::color::{mix_rgb, resolve_color_rgb};
+
+    let Some(view) = app
+        .anim
+        .frame(&crate::app::tree_view::view_element(), None)
+        .filter(|view| view.behaviour.is_some())
+    else {
+        return;
+    };
+    if body.height == 0 || area.width == 0 {
+        return;
+    }
+    let body_top = body.y;
+    let height = list_bottom
+        .min(body.y + body.height)
+        .saturating_sub(body_top);
+    if height == 0 {
+        return;
+    }
+
+    let extent = CellExtent::new(area.width, height);
+    let panel_bg = resolve_color_rgb(app.palette.panel_bg, &app.host_terminal_theme);
+    let buf = frame.buffer_mut();
+    for row in 0..height {
+        let y = body_top + row;
+        for col in 0..area.width {
+            let x = area.x + col;
+            let base = buf[(x, y)].style();
+            let ink = InkPalette::resolve(base, &app.palette, &app.host_terminal_theme);
+            let paint = view.cell(CellPos::new(col, row), extent, ink);
+            let mut style = paint.text_style(base, ink);
+            // A highlighted row's own background is part of the view too. It is
+            // taken out on the engine's coverage rather than on a second ramp
+            // of this call site's own, so the block and the text it holds leave
+            // together.
+            if paint.coverage < 1.0 {
+                if let (Some(from), Some(to)) = (
+                    base.bg
+                        .and_then(|bg| resolve_color_rgb(bg, &app.host_terminal_theme)),
+                    panel_bg,
+                ) {
+                    let (r, g, b) = mix_rgb(from, to, 1.0 - paint.coverage.clamp(0.0, 1.0));
+                    style = style.bg(ratatui::style::Color::Rgb(r, g, b));
+                }
+            }
+            buf[(x, y)].set_style(style);
+        }
+    }
+}
+
 /// One row's place in its own lifecycle, carried through the token pass.
 ///
 /// The row owns the life; each token names its own idle behaviour through its
@@ -2885,6 +3119,16 @@ fn render_workspace_list(
     if let Some(track) = scrollbar_rect {
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
     }
+
+    // Last, over everything the tree drew: the view's own life is a property of
+    // the whole panel, not of any one row in it.
+    render_tree_view_transition(
+        app,
+        frame,
+        area,
+        workspace_list_body_rect(area, scrollbar_rect.is_some()),
+        list_bottom,
+    );
 
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
@@ -6037,6 +6281,335 @@ rows = [
         for row in &rendered {
             assert!(display_width(row) <= 14, "{row:?}");
         }
+    }
+
+    /// A two-mate fleet: `firstmate` owns `2nd-a` and `2nd-b`, and each second
+    /// mate owns one worker pane. Enough shape that re-rooting has both a
+    /// subtree to keep and a sibling subtree to leave behind.
+    fn re_root_fleet() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut mate_a = Workspace::test_new("2nd-a");
+        let worker_a = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let mut mate_b = Workspace::test_new("2nd-b");
+        let worker_b = mate_b.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate_a, mate_b];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        for ws_idx in [1, 2] {
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        for (ws_idx, pane, name, owner) in [
+            (1usize, worker_a, "worker-a", "2nd-a"),
+            (2, worker_b, "worker-b", "2nd-b"),
+        ] {
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).expect("test terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+        app
+    }
+
+    /// The shape of the drawn list: one `(depth, label)` per row.
+    fn tree_shape(app: &crate::app::state::AppState) -> Vec<(u8, String)> {
+        let agents = sidebar_agent_entries(app);
+        workspace_list_entries(app)
+            .iter()
+            .map(|entry| {
+                let label = match entry {
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => app.workspaces[*ws_idx]
+                        .display_name_from(&app.terminals, &TerminalRuntimeRegistry::new()),
+                    WorkspaceListEntry::Agent { entry_idx, .. } => {
+                        agents[*entry_idx].agent_name.clone().unwrap_or_default()
+                    }
+                };
+                (entry.depth(), label)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_fleet_view_holds_every_mate_and_worker() {
+        let app = re_root_fleet();
+        assert_eq!(
+            tree_shape(&app),
+            vec![
+                (0, "firstmate".to_string()),
+                (1, "2nd-a".to_string()),
+                (2, "worker-a".to_string()),
+                (1, "2nd-b".to_string()),
+                (2, "worker-b".to_string()),
+            ]
+        );
+    }
+
+    /// The captain's rule: the selected second mate takes the position the
+    /// first mate held, its workers take the position the second mates held,
+    /// and everything else is simply not there.
+    #[test]
+    fn selecting_a_second_mate_re_roots_the_tree_onto_it() {
+        let mut app = re_root_fleet();
+        app.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+
+        assert_eq!(
+            tree_shape(&app),
+            vec![(0, "2nd-a".to_string()), (1, "worker-a".to_string())]
+        );
+    }
+
+    /// A re-rooted row is drawn in the root column, not merely renumbered: a
+    /// mate still carrying a `├─` would be a row that had moved rank without
+    /// moving column.
+    #[test]
+    fn the_new_root_draws_in_the_root_column_with_no_connector() {
+        let mut app = re_root_fleet();
+        app.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+
+        let width = 26;
+        let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..20).map(|row| row_text(buffer, row, width)).collect();
+
+        let root_row = rows
+            .iter()
+            .find(|row| row.contains("2nd-a"))
+            .expect("the new root is drawn");
+        assert!(
+            !root_row.contains('├') && !root_row.contains('└'),
+            "a re-rooted mate kept a child connector: {root_row:?}"
+        );
+        let worker_row = rows
+            .iter()
+            .find(|row| row.contains("worker-a"))
+            .expect("its worker is drawn");
+        assert!(
+            worker_row.contains('└'),
+            "the worker lost its connector: {worker_row:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains("2nd-b")),
+            "the sibling subtree was not left behind: {rows:?}"
+        );
+    }
+
+    /// The way back out is a control on the one row above the tree, so it
+    /// costs no column of a panel that has none to spare.
+    #[test]
+    fn a_re_rooted_tree_offers_a_way_back_on_the_header_row() {
+        let mut app = re_root_fleet();
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.sidebar_rect = area;
+
+        assert_eq!(sidebar_tree_breadcrumb(&app), None);
+        assert_eq!(
+            sidebar_tree_breadcrumb_rect(&app, workspace_list_rect(area)),
+            Rect::default()
+        );
+
+        app.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+        let rect = sidebar_tree_breadcrumb_rect(&app, workspace_list_rect(area));
+        assert!(sidebar_tree_breadcrumb(&app).is_some());
+        assert_eq!(
+            rect.y,
+            workspace_list_rect(area).y,
+            "it sits above the tree"
+        );
+        assert!(rect.width > 0);
+    }
+
+    /// A mate whose Space is closed while its own view is open must not blank
+    /// the panel.
+    #[test]
+    fn a_root_that_left_the_fleet_falls_back_to_the_whole_tree() {
+        let mut app = re_root_fleet();
+        app.tree_root = crate::app::tree_view::TreeRoot::Node("gone".to_string());
+
+        assert_eq!(tree_shape(&app).len(), 5);
+    }
+
+    /// Reordering asks where a Space sits among every root, which is a fact
+    /// about the session rather than about this viewer's current view.
+    #[test]
+    fn reordering_still_sees_the_whole_fleet_from_inside_a_mate_view() {
+        let mut app = re_root_fleet();
+        app.tree_root = crate::app::tree_view::TreeRoot::Node("2nd-a".to_string());
+
+        assert_eq!(workspace_list_entries_whole_fleet(&app).len(), 5);
+    }
+
+    /// The switch does not swap the layout until the outgoing view has come
+    /// apart, which is the one instant at which nothing appears to move.
+    #[test]
+    fn a_view_switch_holds_the_old_layout_until_the_panel_is_empty() {
+        let mut app = re_root_fleet();
+        let now = std::time::Instant::now();
+
+        assert!(app.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string()),
+            now
+        ));
+        assert_eq!(app.tree_root, crate::app::tree_view::TreeRoot::Fleet);
+        assert_eq!(tree_shape(&app).len(), 5, "the old view is still drawn");
+        assert_eq!(
+            app.anim
+                .frame(&crate::app::tree_view::view_element(), None)
+                .expect("the view is animating")
+                .phase,
+            crate::anim::Phase::Dismount,
+            "and it is on its way out"
+        );
+
+        let commit = app
+            .next_tree_view_commit_deadline()
+            .expect("the loop is told when to finish the switch");
+        assert!(!app.advance_tree_view(commit - std::time::Duration::from_millis(1)));
+        assert_eq!(tree_shape(&app).len(), 5);
+
+        assert!(app.advance_tree_view(commit));
+        assert_eq!(
+            app.tree_root,
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string())
+        );
+        assert_eq!(tree_shape(&app).len(), 2);
+        assert_eq!(
+            app.anim
+                .frame(&crate::app::tree_view::view_element(), None)
+                .expect("the new view is animating")
+                .phase,
+            crate::anim::Phase::Mount,
+            "the view being arrived at materializes"
+        );
+        assert_eq!(app.next_tree_view_commit_deadline(), None);
+    }
+
+    /// With the transition configured off the swap is immediate, and nothing
+    /// is left animating.
+    #[test]
+    fn an_instant_switch_adopts_the_root_without_an_element() {
+        let mut app = re_root_fleet();
+        app.sidebar_animation.view_switch = crate::config::SidebarTokenEmphasis::None;
+
+        assert!(app.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string()),
+            std::time::Instant::now()
+        ));
+        assert_eq!(tree_shape(&app).len(), 2);
+        assert_eq!(app.next_tree_view_commit_deadline(), None);
+        assert!(app.anim.is_empty());
+    }
+
+    /// Publish the live agent rows the way `App::observe_agent_rows` does, for
+    /// a test that has no app loop to do it.
+    fn publish_agent_rows(
+        app: &mut crate::app::state::AppState,
+        now: std::time::Instant,
+        lifecycle: &crate::anim::Lifecycle,
+    ) {
+        let rows: Vec<_> = sidebar_agent_live_entries(app)
+            .iter()
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::AgentRow, lifecycle, rows);
+    }
+
+    /// The hard requirement: a worker that spawns while the panel is coming
+    /// apart is still its own arrival. Two independent lives, one engine —
+    /// neither queued behind the other, and neither cancelling it.
+    #[test]
+    fn a_worker_arriving_mid_switch_animates_while_the_view_is_leaving() {
+        let mut app = re_root_fleet();
+        app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Dissolve;
+        let now = std::time::Instant::now();
+
+        // Settle the fleet that already exists, so the new worker is the only
+        // thing that can be arriving. Same membership the runtime publishes.
+        let lifecycle = app.sidebar_row_lifecycle();
+        publish_agent_rows(&mut app, now, &lifecycle);
+        let settled = now + std::time::Duration::from_secs(1);
+        app.anim.advance(settled);
+
+        // The switch starts...
+        assert!(app.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2nd-a".to_string()),
+            settled
+        ));
+
+        // ...and a second worker spawns under the mate that is still on screen.
+        let spawned = app.workspaces[1].test_split(ratatui::layout::Direction::Vertical);
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[1].tabs[0].panes[&spawned]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).expect("test terminal");
+        terminal.set_agent_name("worker-a2".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("2nd-a".to_string()))]),
+            None,
+            settled,
+        );
+
+        let mid = settled + std::time::Duration::from_millis(20);
+        let spawned_id = crate::anim::ElementId::agent_row(spawned);
+        assert!(
+            sidebar_agent_live_entries(&app)
+                .iter()
+                .any(|entry| entry.pane_id == spawned),
+            "a worker spawning mid-switch is still live membership"
+        );
+        publish_agent_rows(&mut app, mid, &lifecycle);
+
+        assert_eq!(
+            app.anim
+                .frame(&spawned_id, None)
+                .expect("the new worker is tracked")
+                .phase,
+            crate::anim::Phase::Mount,
+            "the fleet event was not swallowed by the transition"
+        );
+        assert_eq!(
+            app.anim
+                .frame(&crate::app::tree_view::view_element(), None)
+                .expect("the view is still animating")
+                .phase,
+            crate::anim::Phase::Dismount,
+            "and the transition was not cancelled by the fleet event"
+        );
+        assert_eq!(
+            app.next_tree_view_commit_deadline(),
+            Some(settled + std::time::Duration::from_millis(220)),
+            "nor was it restarted"
+        );
     }
 
     #[test]
