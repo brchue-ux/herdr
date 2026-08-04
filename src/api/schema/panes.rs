@@ -347,7 +347,25 @@ pub struct PaneGraphicsPlacementParams {
     pub grid_cols: u32,
     #[serde(default)]
     pub grid_rows: u32,
+    /// Which band the image is drawn in, in Kitty's z-index terms. `0` and
+    /// above draw over the cell's text; negative values draw under the text but
+    /// over the cell background; values at or below
+    /// [`GRAPHICS_Z_BELOW_BACKGROUND`] draw under the background too, which is
+    /// the only band a backdrop can occupy without erasing what is on top of
+    /// it. Defaults to `0`, the band every placement used before this was
+    /// settable.
+    #[serde(default)]
+    pub z: i32,
 }
+
+/// Highest `z` that Kitty draws beneath the cell background: it puts a
+/// placement under the background when `z < -1073741824`.
+///
+/// Named so the band a backdrop wants is a constant rather than a magic number
+/// copied into each caller. Herdr itself never picks a `z` — clients do — so
+/// outside tests nothing in this binary reads it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const GRAPHICS_Z_BELOW_BACKGROUND: i32 = -1_073_741_825;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsClearParams {

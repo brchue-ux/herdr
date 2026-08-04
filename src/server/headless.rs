@@ -3176,6 +3176,8 @@ impl HeadlessServer {
                 | api::schema::Method::PaneGraphicsClear(_)
                 | api::schema::Method::PaneGraphicsStreamOpen(_)
                 | api::schema::Method::PaneGraphicsStreamClose(_)
+                | api::schema::Method::SurfaceGraphicsSet(_)
+                | api::schema::Method::SurfaceGraphicsClear(_)
         )
         .then_some(self.app.state.pane_graphics_revision);
         let mut changed = metadata_expired

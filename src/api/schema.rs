@@ -9,6 +9,7 @@ pub mod plugins;
 pub mod response;
 pub mod server;
 pub mod session;
+pub mod surfaces;
 pub mod tabs;
 pub mod workspaces;
 pub mod worktrees;
@@ -22,6 +23,7 @@ pub use plugins::*;
 pub use response::*;
 pub use server::*;
 pub use session::*;
+pub use surfaces::*;
 pub use tabs::*;
 pub use workspaces::*;
 pub use worktrees::*;
@@ -211,6 +213,12 @@ pub enum Method {
     PaneDeclareAgent(PaneDeclareAgentParams),
     #[serde(rename = "pane.close")]
     PaneClose(PaneTarget),
+    #[serde(rename = "surface.graphics.set")]
+    SurfaceGraphicsSet(SurfaceGraphicsSetParams),
+    #[serde(rename = "surface.graphics.clear")]
+    SurfaceGraphicsClear(SurfaceGraphicsClearParams),
+    #[serde(rename = "surface.graphics.info")]
+    SurfaceGraphicsInfo(SurfaceTarget),
     #[serde(rename = "popup.close")]
     PopupClose(EmptyParams),
     #[serde(rename = "events.subscribe")]

@@ -3525,7 +3525,7 @@ mod tests {
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
         state.pane_graphics_layers.insert(
             pane_id,
-            crate::app::state::PaneGraphicsLayer::new(
+            crate::app::state::GraphicsLayer::new(
                 crate::api::schema::PaneGraphicsFormat::Rgba,
                 1,
                 1,

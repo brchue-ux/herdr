@@ -104,6 +104,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
+| Surface | `surface.graphics.info`, `surface.graphics.set`, `surface.graphics.clear` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio`, `layout.arrange` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -241,6 +242,27 @@ closes; concurrent set, clear, or stream requests return `stream_conflict`.
 ```json
 {"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
+```
+
+`placement.z` picks which band the image is drawn in, using Kitty's z-index
+rules. `0` — the default, and the only value earlier releases used — draws over
+the cell's text. Negative values draw under the text but over the cell
+background. Values below `-1073741824` draw under the background too, which is
+the band a backdrop needs so it does not erase what sits on top of it.
+
+Regions that are not panes have no pane id, so they are addressed by name
+through `surface.graphics.set`, `surface.graphics.clear`, and
+`surface.graphics.info` instead. `surface` currently accepts `sidebar`. These
+take the same formats, limits, placement object, and `feature_disabled` gate as
+the pane methods, and the image is clipped to the named region: nothing placed
+on the sidebar can spill into a pane, and a layout without a sidebar — the
+mobile layout, or a fully hidden sidebar — draws nothing while keeping the
+layer, so it reappears when the region comes back.
+
+```json
+{"id":"surface_info","method":"surface.graphics.info","params":{"surface":"sidebar"}}
+{"id":"surface_set","method":"surface.graphics.set","params":{"surface":"sidebar","format":"png","image_width":260,"image_height":800,"data_base64":"...","placement":{"viewport_col":0,"viewport_row":0,"grid_cols":26,"grid_rows":40,"z":-1073741825}}}
+{"id":"surface_clear","method":"surface.graphics.clear","params":{"surface":"sidebar"}}
 ```
 
 `pane.layout` returns the tab layout snapshot with `workspace_id`, `tab_id`,

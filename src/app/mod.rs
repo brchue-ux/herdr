@@ -791,6 +791,7 @@ impl App {
             installed_plugins,
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
+            surface_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,
@@ -1697,6 +1698,7 @@ impl App {
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.state.pane_graphics_layers.clear();
+                self.state.surface_graphics_layers.clear();
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
@@ -6628,5 +6630,47 @@ last_pane = "prefix+tab"
                 .values()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn disabling_kitty_graphics_drops_pane_and_surface_layers_alike() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut enabled = Config::default();
+        enabled.experimental.kitty_graphics = true;
+        app.apply_live_config(&enabled, &[], &[], false);
+        assert!(app.state.kitty_graphics_enabled);
+
+        let layer = || {
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                1,
+                1,
+                vec![1, 2, 3, 4],
+                crate::api::schema::PaneGraphicsPlacementParams::default(),
+            )
+        };
+        app.state
+            .pane_graphics_layers
+            .insert(crate::layout::PaneId::from_raw(1), layer());
+        app.state
+            .surface_graphics_layers
+            .insert(crate::api::schema::GraphicsSurface::Sidebar, layer());
+
+        app.apply_live_config(&Config::default(), &[], &[], false);
+
+        assert!(!app.state.kitty_graphics_enabled);
+        assert!(app.state.pane_graphics_layers.is_empty());
+        assert!(
+            app.state.surface_graphics_layers.is_empty(),
+            "a surface layer must not survive the feature being turned off"
+        );
     }
 }

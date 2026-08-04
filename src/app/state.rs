@@ -19,7 +19,7 @@ pub(crate) struct PluginPaneRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PaneGraphicsLayer {
+pub(crate) struct GraphicsLayer {
     pub format: crate::api::schema::PaneGraphicsFormat,
     pub image_width: u32,
     pub image_height: u32,
@@ -28,7 +28,7 @@ pub(crate) struct PaneGraphicsLayer {
     pub render: crate::api::schema::PaneGraphicsPlacementParams,
 }
 
-impl PaneGraphicsLayer {
+impl GraphicsLayer {
     pub(crate) fn new(
         format: crate::api::schema::PaneGraphicsFormat,
         image_width: u32,
@@ -36,7 +36,7 @@ impl PaneGraphicsLayer {
         data: Vec<u8>,
         render: crate::api::schema::PaneGraphicsPlacementParams,
     ) -> Self {
-        let data_fingerprint = pane_graphics_data_fingerprint(&data);
+        let data_fingerprint = graphics_data_fingerprint(&data);
         Self {
             format,
             image_width,
@@ -48,7 +48,7 @@ impl PaneGraphicsLayer {
     }
 }
 
-fn pane_graphics_data_fingerprint(data: &[u8]) -> u64 {
+fn graphics_data_fingerprint(data: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut hasher);
     hasher.finish()
@@ -1775,7 +1775,11 @@ pub struct AppState {
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
     /// Runtime image layers owned by API clients and composited over panes.
-    pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, PaneGraphicsLayer>,
+    pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
+    /// The same layers, anchored to a named non-pane region of the client
+    /// viewport instead of to a pane rect.
+    pub(crate) surface_graphics_layers:
+        std::collections::HashMap<crate::api::schema::GraphicsSurface, GraphicsLayer>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2503,6 +2507,7 @@ impl AppState {
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
+            surface_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,

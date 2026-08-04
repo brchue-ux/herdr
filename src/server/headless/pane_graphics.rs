@@ -26,6 +26,7 @@ pub(super) fn frame_pane_graphics_for_client(bytes: Vec<u8>) -> Vec<u8> {
 impl HeadlessServer {
     pub(super) fn pane_graphics_runtime_active(&self) -> bool {
         !self.app.state.pane_graphics_layers.is_empty()
+            || !self.app.state.surface_graphics_layers.is_empty()
             || !self.app.state.pane_graphics_streams.is_empty()
     }
 
