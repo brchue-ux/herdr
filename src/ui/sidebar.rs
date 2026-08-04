@@ -281,12 +281,12 @@ fn space_state_age(
 fn workspace_row_height(
     app: &AppState,
     ws: &crate::workspace::Workspace,
-    indented: bool,
+    worktree_child: bool,
     content_width: usize,
     shell: RowShell,
 ) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
-    let label = if indented {
+    let label = if worktree_child {
         grouped_child_display_label(
             &ws.display_name_from_terminals(&app.terminals),
             ws.branch().as_deref(),
@@ -310,7 +310,7 @@ fn workspace_row_height(
             terminal_title: terminal_title.raw.as_deref(),
             terminal_title_stripped: terminal_title.stripped.as_deref(),
             tokens: &token_values,
-            suppress_git_details: indented,
+            suppress_git_details: worktree_child,
         },
     );
     shell_row_height(
@@ -322,22 +322,22 @@ fn workspace_row_height(
 fn workspace_row_height_in_body(
     app: &AppState,
     workspace: &crate::workspace::Workspace,
-    indented: bool,
+    worktree_child: bool,
     body_height: u16,
     content_width: usize,
     shell: RowShell,
 ) -> u16 {
-    workspace_row_height(app, workspace, indented, content_width, shell).min(body_height)
+    workspace_row_height(app, workspace, worktree_child, content_width, shell).min(body_height)
 }
 
 fn workspace_entry_gap(
     app: &AppState,
     entries: &[WorkspaceListEntry],
     entry_idx: usize,
-    indented: bool,
+    worktree_child: bool,
 ) -> u16 {
     if entry_idx + 1 < entries.len()
-        && !(indented && next_entry_is_indented_workspace(entries, entry_idx))
+        && !(worktree_child && next_entry_is_worktree_child(entries, entry_idx))
     {
         app.sidebar_spaces.row_gap
     } else {
@@ -429,9 +429,15 @@ pub(crate) fn grouped_child_display_label(
 pub(crate) enum WorkspaceListEntry {
     Workspace {
         ws_idx: usize,
-        /// Worktree-group child. A styling fact, not a depth: it also shortens
-        /// the label and suppresses git detail.
-        indented: bool,
+        /// This Space is a linked worktree of the Space that owns it.
+        ///
+        /// Purely a styling fact — it shortens the label, suppresses git
+        /// detail, and says the row carries no group chevron of its own. It
+        /// used to double as a second, parallel connector geometry, which put
+        /// a worktree child's own connector in one column and its workers'
+        /// rails in another; `depth` and `ancestors_continue` are now the only
+        /// things any prefix is measured from, for every row alike.
+        worktree_child: bool,
         depth: u8,
         ancestors_continue: Vec<bool>,
         is_last_child: bool,
@@ -472,10 +478,13 @@ impl WorkspaceListEntry {
     }
 }
 
-pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+pub(crate) fn next_entry_is_worktree_child(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
-        Some(WorkspaceListEntry::Workspace { indented: true, .. })
+        Some(WorkspaceListEntry::Workspace {
+            worktree_child: true,
+            ..
+        })
     )
 }
 
@@ -524,9 +533,10 @@ fn entry_tree_handle(
     entry: &WorkspaceListEntry,
 ) -> Option<String> {
     match entry {
-        // A worktree child is a checkout of its parent Space, not a node of the
-        // ownership tree, so it is not a root anything can be re-rooted on.
-        WorkspaceListEntry::Workspace { indented: true, .. } => None,
+        // A worktree child names itself like any other Space. It is a node of
+        // the ownership tree - workers hang off it by `owner` token - so it can
+        // be re-rooted on, which for a fleet whose second mates are all linked
+        // worktrees is the only thing there is to re-root on.
         WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents
             .get(*entry_idx)
@@ -602,11 +612,26 @@ fn re_root_entries(
 /// A Space and the worktree children that always travel with it.
 ///
 /// The worktree group is a fact about checkouts, not about ownership, so it is
-/// resolved before the ownership walk and re-emitted inside the block. That
-/// keeps the two kinds of nesting from competing for the same parent.
+/// resolved before the ownership walk. It is carried *into* that walk rather
+/// than emitted around it: a child is a node like any other, holding its parent
+/// by index so the two kinds of nesting share one set of connectors instead of
+/// competing for the same parent.
 struct SpaceBlock {
     parent_idx: usize,
     children: Vec<usize>,
+}
+
+/// One Space's row in the tree, flattened out of its [`SpaceBlock`].
+struct SpaceRow {
+    ws_idx: usize,
+    /// This Space is a linked worktree of the Space that owns it.
+    ///
+    /// A styling fact, not a depth — the depth is on the placement, the same as
+    /// for every other row. It shortens the label, suppresses git detail, and
+    /// says the row carries no worktree-group chevron of its own.
+    worktree_child: bool,
+    /// Index, within the same flat list, of the checkout this row was cut from.
+    structural_parent: Option<usize>,
 }
 
 /// The handle an `owner` token uses to name this Space.
@@ -773,31 +798,69 @@ pub(crate) fn rows_with_departing(
     live
 }
 
+/// Flatten `blocks` into one row per Space, each child pointing at the checkout
+/// it was cut from.
+///
+/// This is what puts a worktree child *into* the ownership namespace. Emitting
+/// it beside the walk instead — which is what this used to do — left it with no
+/// entry in the name table `owner` tokens are matched against, so a fleet whose
+/// second mates are linked worktrees of the first mate's repo could not nest a
+/// single worker under one of them, however correct its tokens were.
+fn space_rows(blocks: &[SpaceBlock]) -> Vec<SpaceRow> {
+    let mut rows = Vec::new();
+    for block in blocks {
+        let parent_row = rows.len();
+        rows.push(SpaceRow {
+            ws_idx: block.parent_idx,
+            worktree_child: false,
+            structural_parent: None,
+        });
+        rows.extend(block.children.iter().map(|child_idx| SpaceRow {
+            ws_idx: *child_idx,
+            worktree_child: true,
+            structural_parent: Some(parent_row),
+        }));
+    }
+    rows
+}
+
 /// Arrange `blocks` and the owned agent panes into one tree, then flatten it.
 ///
-/// Both kinds of node go through [`crate::app::agent_tree::arrange_owner_tree`]
-/// together, so a worker nests under its second mate's Space by exactly the
-/// same rule that nests a second mate under the first mate.
+/// Every Space and every owned pane goes through
+/// [`crate::app::agent_tree::arrange_owner_tree`] as a node, so a worker nests
+/// under its second mate's Space by exactly the same rule that nests a second
+/// mate under the first mate — including when that second mate is a linked
+/// worktree, which is the shape a fleet run out of one repo actually has.
 fn arrange_space_tree(
     app: &AppState,
     blocks: &[SpaceBlock],
     agents: &[AgentPanelEntry],
 ) -> Vec<WorkspaceListEntry> {
-    let space_names: Vec<Option<String>> = blocks
+    let rows = space_rows(blocks);
+    let names: Vec<Option<String>> = rows
         .iter()
-        .map(|block| space_tree_name(app, block.parent_idx))
+        .map(|row| space_tree_name(app, row.ws_idx))
         .collect();
-    let space_owners: Vec<Option<String>> = blocks
+    // A worktree child publishes no owner into the walk: the checkout it hangs
+    // off is already carried by `structural_parent`, and a token that could
+    // move it would let a Space leave the group its repository puts it in.
+    let owners: Vec<Option<String>> = rows
         .iter()
-        .map(|block| space_owner(app, block.parent_idx))
+        .map(|row| {
+            (!row.worktree_child)
+                .then(|| space_owner(app, row.ws_idx))
+                .flatten()
+        })
         .collect();
 
-    let mut nodes: Vec<crate::app::agent_tree::OwnedNode<'_>> = space_names
+    let mut nodes: Vec<crate::app::agent_tree::OwnedNode<'_>> = rows
         .iter()
-        .zip(&space_owners)
-        .map(|(name, owner)| crate::app::agent_tree::OwnedNode {
+        .zip(&names)
+        .zip(&owners)
+        .map(|((row, name), owner)| crate::app::agent_tree::OwnedNode {
             name: name.as_deref(),
             owner: owner.as_deref(),
+            parent: row.structural_parent,
         })
         .collect();
     nodes.extend(
@@ -806,57 +869,28 @@ fn arrange_space_tree(
             .map(|entry| crate::app::agent_tree::OwnedNode {
                 name: entry.agent_name.as_deref(),
                 owner: entry.owner.as_deref(),
+                parent: None,
             }),
     );
 
-    let placements = crate::app::agent_tree::arrange_owner_tree(&nodes);
-    // A block's worktree children draw as siblings of whatever it owns, so the
-    // last worktree child is only `└` when nothing owned follows it. In a
-    // depth-first flattening a node owns children exactly when the next row is
-    // one level deeper.
-    let owns_children: Vec<bool> = placements
-        .iter()
-        .enumerate()
-        .map(|(position, placement)| {
-            placements
-                .get(position + 1)
-                .is_some_and(|next| next.depth == placement.depth.saturating_add(1))
-        })
-        .collect();
-
-    let mut entries = Vec::with_capacity(placements.len());
-    for (position, placement) in placements.into_iter().enumerate() {
-        match blocks.get(placement.index) {
-            Some(block) => {
-                entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: block.parent_idx,
-                    indented: false,
-                    depth: placement.depth,
-                    ancestors_continue: placement.ancestors_continue.clone(),
-                    is_last_child: placement.is_last_child && block.children.is_empty(),
-                });
-                let mut child_ancestors = placement.ancestors_continue.clone();
-                child_ancestors.push(!placement.is_last_child);
-                let last = block.children.len().saturating_sub(1);
-                for (child_position, child_idx) in block.children.iter().enumerate() {
-                    entries.push(WorkspaceListEntry::Workspace {
-                        ws_idx: *child_idx,
-                        indented: true,
-                        depth: placement.depth.saturating_add(1),
-                        ancestors_continue: child_ancestors.clone(),
-                        is_last_child: child_position == last && !owns_children[position],
-                    });
-                }
-            }
-            None => entries.push(WorkspaceListEntry::Agent {
-                entry_idx: placement.index - blocks.len(),
+    crate::app::agent_tree::arrange_owner_tree(&nodes)
+        .into_iter()
+        .map(|placement| match rows.get(placement.index) {
+            Some(row) => WorkspaceListEntry::Workspace {
+                ws_idx: row.ws_idx,
+                worktree_child: row.worktree_child,
                 depth: placement.depth,
                 ancestors_continue: placement.ancestors_continue,
                 is_last_child: placement.is_last_child,
-            }),
-        }
-    }
-    entries
+            },
+            None => WorkspaceListEntry::Agent {
+                entry_idx: placement.index - rows.len(),
+                depth: placement.depth,
+                ancestors_continue: placement.ancestors_continue,
+                is_last_child: placement.is_last_child,
+            },
+        })
+        .collect()
 }
 
 fn workspace_list_entries_inner(
@@ -958,20 +992,18 @@ pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect 
 /// much each line may draw, so the two cannot disagree about how much room the
 /// row had - which is the whole reason a row's height may depend on its width
 /// at all.
-fn tree_prefix_width(depth: u8, indented: bool, row_index: usize) -> usize {
-    use crate::app::agent_tree::display_depth;
-    if indented {
-        // A worktree child brings its own legacy connector, so the ownership
-        // rails above it are laid down first and its connector sits after them.
-        3 * display_depth(depth.saturating_sub(1)) as usize + if row_index == 0 { 6 } else { 8 }
-    } else {
-        let depth = display_depth(depth) as usize;
-        match (depth, row_index) {
-            (0, 0) => 1,
-            (0, _) => 3,
-            (_, 0) => 3 * depth + 1,
-            (_, _) => 3 * depth + 3,
-        }
+///
+/// Depth is the only input, for a Space, a worktree child and an owned pane
+/// alike. A worktree child used to be measured from its own parallel geometry,
+/// which is exactly how a second mate's connector ended up in a different
+/// column from the workers railing off it.
+fn tree_prefix_width(depth: u8, row_index: usize) -> usize {
+    let depth = crate::app::agent_tree::display_depth(depth) as usize;
+    match (depth, row_index) {
+        (0, 0) => 1,
+        (0, _) => 3,
+        (_, 0) => 3 * depth + 1,
+        (_, _) => 3 * depth + 3,
     }
 }
 
@@ -989,9 +1021,9 @@ fn row_fold_width(list_area: Rect) -> u16 {
 
 /// Columns a row has for its tokens once its prefix, its shell and any trailing
 /// control are taken out.
-fn row_content_width(fold_width: u16, depth: u8, indented: bool, trailing_width: usize) -> usize {
+fn row_content_width(fold_width: u16, depth: u8, trailing_width: usize) -> usize {
     (fold_width as usize)
-        .saturating_sub(tree_prefix_width(depth, indented, 0))
+        .saturating_sub(tree_prefix_width(depth, 0))
         .saturating_sub(usize::from(
             RowShell::for_fold_width(fold_width).chrome_cols(),
         ))
@@ -1001,8 +1033,8 @@ fn row_content_width(fold_width: u16, depth: u8, indented: bool, trailing_width:
 /// Columns reserved at the right edge of a Space row's first line for the
 /// worktree group chevron, which is drawn over the row rather than laid out in
 /// it.
-fn space_trailing_width(app: &AppState, ws_idx: usize, indented: bool) -> usize {
-    2 * usize::from(!indented && workspace_parent_group_state(app, ws_idx).is_some())
+fn space_trailing_width(app: &AppState, ws_idx: usize, worktree_child: bool) -> usize {
+    2 * usize::from(!worktree_child && workspace_parent_group_state(app, ws_idx).is_some())
 }
 
 /// Columns row 0 of this entry gives up to a worker-summary badge.
@@ -1039,16 +1071,15 @@ fn list_entry_content_width(
     let badge = entry_badge_width(app, agents, entry, fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
-            ws_idx, indented, ..
+            ws_idx,
+            worktree_child,
+            ..
         } => row_content_width(
             fold_width,
             entry.depth(),
-            *indented,
-            space_trailing_width(app, *ws_idx, *indented) + badge,
+            space_trailing_width(app, *ws_idx, *worktree_child) + badge,
         ),
-        WorkspaceListEntry::Agent { .. } => {
-            row_content_width(fold_width, entry.depth(), false, badge)
-        }
+        WorkspaceListEntry::Agent { .. } => row_content_width(fold_width, entry.depth(), badge),
     }
 }
 
@@ -1219,12 +1250,21 @@ fn list_entry_height(
     let shell = RowShell::for_fold_width(fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
-            ws_idx, indented, ..
+            ws_idx,
+            worktree_child,
+            ..
         } => app
             .workspaces
             .get(*ws_idx)
             .map(|ws| {
-                workspace_row_height_in_body(app, ws, *indented, body_height, content_width, shell)
+                workspace_row_height_in_body(
+                    app,
+                    ws,
+                    *worktree_child,
+                    body_height,
+                    content_width,
+                    shell,
+                )
             })
             .unwrap_or(0),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents
@@ -1238,8 +1278,8 @@ fn list_entry_height(
 /// worktree-group packing is unchanged.
 fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
     match entries.get(entry_idx) {
-        Some(WorkspaceListEntry::Workspace { indented, .. }) => {
-            workspace_entry_gap(app, entries, entry_idx, *indented)
+        Some(WorkspaceListEntry::Workspace { worktree_child, .. }) => {
+            workspace_entry_gap(app, entries, entry_idx, *worktree_child)
         }
         Some(WorkspaceListEntry::Agent { .. }) => agent_entry_gap(app, entry_idx, entries.len()),
         None => 0,
@@ -1384,10 +1424,12 @@ pub(crate) fn compute_workspace_list_areas(
         if row_y.saturating_add(row_height) > body_bottom {
             break;
         }
-        let (ws_idx, indented, agent) = match entry {
+        let (ws_idx, worktree_child, agent) = match entry {
             WorkspaceListEntry::Workspace {
-                ws_idx, indented, ..
-            } => (*ws_idx, *indented, None),
+                ws_idx,
+                worktree_child,
+                ..
+            } => (*ws_idx, *worktree_child, None),
             WorkspaceListEntry::Agent { entry_idx, .. } => {
                 let Some(detail) = agents.get(*entry_idx) else {
                     continue;
@@ -1406,7 +1448,7 @@ pub(crate) fn compute_workspace_list_areas(
         cards.push(crate::app::state::WorkspaceCardArea {
             ws_idx,
             rect,
-            indented,
+            worktree_child,
             entry_idx,
             agent,
             card_frame: card_frame_for(rect, entry, fold_width),
@@ -1431,8 +1473,7 @@ fn card_frame_for(rect: Rect, entry: &WorkspaceListEntry, fold_width: u16) -> Op
     if !RowShell::for_fold_width(fold_width).is_card() {
         return None;
     }
-    let indented = matches!(entry, WorkspaceListEntry::Workspace { indented: true, .. });
-    let prefix = tree_prefix_width(entry.depth(), indented, 0) as u16;
+    let prefix = tree_prefix_width(entry.depth(), 0) as u16;
     let width = fold_width.saturating_sub(prefix);
     (width > card::CHROME_COLS && rect.height > card::CHROME_ROWS)
         .then(|| Rect::new(rect.x.saturating_add(prefix), rect.y, width, rect.height))
@@ -1680,7 +1721,7 @@ pub(crate) fn workspace_drop_slots(
             .find_map(|entry| match entry {
                 WorkspaceListEntry::Workspace {
                     ws_idx,
-                    indented: false,
+                    worktree_child: false,
                     ..
                 } => Some(*ws_idx),
                 _ => None,
@@ -1720,7 +1761,10 @@ pub(crate) fn workspace_drop_slots(
     let next_entry = entries.get(last_entry_idx.saturating_add(1));
     if matches!(
         next_entry,
-        Some(WorkspaceListEntry::Workspace { indented: true, .. })
+        Some(WorkspaceListEntry::Workspace {
+            worktree_child: true,
+            ..
+        })
     ) {
         return slots;
     }
@@ -2273,53 +2317,6 @@ fn resolved_token_spans(
     spans
 }
 
-/// Style for one cell of a child row's branch-line connector.
-///
-/// A relation signal only ever changes a cell's *style*. The symbol, the cell
-/// count, and every width the layout was computed from stay exactly what they
-/// would be with no signal at all, so a row whose signal was skipped, cut
-/// short, or never scheduled draws the same characters in the same columns as
-/// one that never had a signal.
-/// Indent and connector for one Agents-panel row.
-///
-/// Deliberately the same vocabulary as the Spaces panel's child cards —
-/// `├─ `/`└─ ` on the first row, a `│` continuation while a level still has
-/// siblings below — because the user sees both panels at once and a second
-/// branch glyph would read as a second meaning. Returns the spans and the
-/// columns they consume, which the caller subtracts from the token budget.
-///
-/// The Spaces panel indents a child by three columns before its connector; the
-/// Agents panel starts one column in rather than three, so the same shape costs
-/// `3 * depth` columns here instead of `3 + 3 * depth`. Continuation rows sit
-/// two columns further right than their first row in both panels, which is what
-/// keeps wrapped text aligned under the name rather than under the state dot.
-/// Vertical rails for `levels` ancestor levels, drawn before a row's own
-/// prefix. A level shows `│` while that ancestor still has a sibling below it.
-///
-/// Zero levels draws nothing, which is what keeps a fleet that declares no
-/// ownership rendering byte-identically to before the tree existed.
-fn ancestor_rail(
-    levels: u8,
-    ancestors_continue: &[bool],
-    p: &Palette,
-) -> (Vec<Span<'static>>, usize) {
-    let levels = crate::app::agent_tree::display_depth(levels);
-    let mut spans = Vec::new();
-    for level in 1..=levels {
-        if ancestors_continue
-            .get(level as usize)
-            .copied()
-            .unwrap_or(false)
-        {
-            spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
-            spans.push(Span::raw("  "));
-        } else {
-            spans.push(Span::raw("   "));
-        }
-    }
-    (spans, 3 * levels as usize)
-}
-
 /// Draw one owned agent pane as a row of the Spaces tree.
 ///
 /// It uses the same connector maths as every other row and its own
@@ -2425,7 +2422,6 @@ fn render_agent_row(
         );
         let (mut rail, _) = card_rail_prefix(
             entry.depth(),
-            false,
             entry.is_last_child(),
             entry.ancestors_continue(),
             p,
@@ -2460,7 +2456,6 @@ fn render_agent_row(
             Some(shell) => {
                 let (mut spans, _) = card_rail_prefix(
                     entry.depth(),
-                    false,
                     entry.is_last_child(),
                     entry.ancestors_continue(),
                     p,
@@ -2619,6 +2614,17 @@ fn render_worker_summary_badge(
     );
 }
 
+/// Indent and connector for one row's first column run, in either panel.
+///
+/// Deliberately the same vocabulary as the Spaces panel's child cards —
+/// `├─ `/`└─ ` on the first row, a `│` continuation while a level still has
+/// siblings below — because the user sees both panels at once and a second
+/// branch glyph would read as a second meaning. Returns the spans and the
+/// columns they consume, which the caller subtracts from the token budget.
+///
+/// Continuation rows sit two columns further right than their first row, which
+/// is what keeps wrapped text aligned under the name rather than under the
+/// state dot.
 fn agent_row_prefix(
     depth: u8,
     is_last_child: bool,
@@ -2679,11 +2685,10 @@ fn agent_row_prefix(
 /// mark. A card does not indent: its left border stands in the connector's own
 /// column on every row, and the frame — not whitespace — is what holds the
 /// content in. So every row of a card, border row and content row alike, is
-/// preceded by exactly `tree_prefix_width(depth, indented, 0)` columns, which
-/// is what lets the layout keep measuring one prefix per row.
+/// preceded by exactly `tree_prefix_width(depth, 0)` columns, which is what
+/// lets the layout keep measuring one prefix per row.
 fn card_rail_prefix(
     depth: u8,
-    indented: bool,
     is_last_child: bool,
     ancestors_continue: &[bool],
     p: &Palette,
@@ -2697,15 +2702,6 @@ fn card_rail_prefix(
             spans.push(Span::raw("  "));
         }
     };
-
-    if indented {
-        // A worktree child brings its own legacy connector, so the ownership
-        // rails above it are laid down first, exactly as its first row does.
-        let (mut spans, rail_width) = ancestor_rail(depth.saturating_sub(1), ancestors_continue, p);
-        spans.push(Span::raw("   "));
-        branch(&mut spans);
-        return (spans, rail_width + 6);
-    }
 
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
@@ -3284,24 +3280,14 @@ fn render_workspace_list(
         };
 
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
-        let display_label = if card.indented {
+        let display_label = if card.worktree_child {
             grouped_child_display_label(&label, ws.branch().as_deref(), ws.custom_name.is_some())
         } else {
             label
         };
-        let parent_group = (!card.indented)
+        let parent_group = (!card.worktree_child)
             .then(|| workspace_parent_group_state(app, i))
             .flatten();
-        let is_last_child = card.indented
-            && entries
-                .iter()
-                .position(|entry| {
-                    matches!(
-                        entry,
-                        WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == i
-                    )
-                })
-                .is_none_or(|entry_idx| !next_entry_is_indented_workspace(&entries, entry_idx));
         let (display_state, display_seen, display_state_age) = parent_group
             .as_ref()
             .filter(|(_, collapsed)| *collapsed)
@@ -3349,7 +3335,7 @@ fn render_workspace_list(
                 terminal_title: terminal_title.raw.as_deref(),
                 terminal_title_stripped: terminal_title.stripped.as_deref(),
                 tokens: &token_values,
-                suppress_git_details: card.indented,
+                suppress_git_details: card.worktree_child,
             },
         );
         // The same call the layout made when it decided this row's height, so
@@ -3358,7 +3344,7 @@ fn render_workspace_list(
         let content_width = entries
             .get(card.entry_idx)
             .map(|entry| list_entry_content_width(app, &agents, entry, fold_width))
-            .unwrap_or_else(|| row_content_width(fold_width, own_depth, card.indented, 0));
+            .unwrap_or_else(|| row_content_width(fold_width, own_depth, 0));
         let shell = RowShell::for_fold_width(fold_width);
         let content_rows = row_height
             .saturating_sub(if card_shell.is_some() {
@@ -3385,27 +3371,9 @@ fn render_workspace_list(
 
         if let Some(shell) = &card_shell {
             let mut top = Vec::new();
-            let (mut top_rail, _) = ancestor_rail(
-                if card.indented {
-                    own_depth.saturating_sub(1)
-                } else {
-                    0
-                },
-                own_ancestors,
-                p,
-            );
-            top.append(&mut top_rail);
             let connector_style = Style::default().fg(p.overlay0);
             let top_charge = ConnectorCharge::new(app, connector_style, signal_phase);
-            if card.indented {
-                top.push(Span::raw("   "));
-                push_connector_spans(
-                    &mut top,
-                    is_last_child,
-                    top_charge.as_ref(),
-                    connector_style,
-                );
-            } else if own_depth > 0 {
+            if own_depth > 0 {
                 let (mut owned, _) = agent_row_prefix(
                     own_depth,
                     own_is_last,
@@ -3418,17 +3386,7 @@ fn render_workspace_list(
             } else {
                 top.push(Span::raw(" "));
             }
-            let (rail, _) = card_rail_prefix(
-                own_depth,
-                card.indented,
-                if card.indented {
-                    is_last_child
-                } else {
-                    own_is_last
-                },
-                own_ancestors,
-                p,
-            );
+            let (rail, _) = card_rail_prefix(own_depth, own_is_last, own_ancestors, p);
             render_card_border_rails(frame, card, top, rail, list_bottom);
             shell.render_glow(frame, list_bottom);
         }
@@ -3453,17 +3411,8 @@ fn render_workspace_list(
                 // meets the card's corner, and the frame holds the content in
                 // from there down.
                 Some(shell) => {
-                    let (mut prefix, _) = card_rail_prefix(
-                        own_depth,
-                        card.indented,
-                        if card.indented {
-                            is_last_child
-                        } else {
-                            own_is_last
-                        },
-                        own_ancestors,
-                        p,
-                    );
+                    let (mut prefix, _) =
+                        card_rail_prefix(own_depth, own_is_last, own_ancestors, p);
                     spans.append(&mut prefix);
                     // The frame's own column and the pad inside it, drawn blank
                     // so the border can be laid over the first of them once the
@@ -3472,67 +3421,39 @@ fn render_workspace_list(
                     usize::from(shell.content_width())
                 }
                 None => {
-                    // Only a worktree child needs a rail drawn for it: it brings
-                    // its own legacy connector, so the ownership levels above it
-                    // have to be laid down first. A Space row that is not a
-                    // worktree child gets its whole prefix, rails included, from
-                    // `agent_row_prefix` below. At depth 0 - a fleet that
-                    // declares no `owner` anywhere - this is empty and the row
-                    // draws exactly as it always has.
-                    let (mut spans_prefix, rail_width) = ancestor_rail(
-                        if card.indented {
-                            own_depth.saturating_sub(1)
-                        } else {
-                            0
-                        },
-                        own_ancestors,
-                        p,
-                    );
-                    spans.append(&mut spans_prefix);
-                    let prefix_width = rail_width
-                        + if card.indented {
-                            spans.push(Span::raw("   "));
-                            if row_index == 0 {
-                                push_connector_spans(
-                                    &mut spans,
-                                    is_last_child,
-                                    row_charge.as_ref(),
-                                    connector_style,
-                                );
-                                6
-                            } else if is_last_child {
-                                spans.push(Span::raw("     "));
-                                8
-                            } else {
-                                spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
-                                spans.push(Span::raw("    "));
-                                8
-                            }
-                        } else if own_depth > 0 {
-                            // An owned Space takes the same connector a worker
-                            // does: the tree runs through the Space/pane
-                            // boundary, so it must not change shape at it — and,
-                            // for the same reason, a charge has to run it too. A
-                            // fleet that declares ownership with `owner` tokens
-                            // is the shape the sidebar sketch actually
-                            // describes, so this is the path most signals take.
-                            let (mut owned, width) = agent_row_prefix(
-                                own_depth,
-                                own_is_last,
-                                own_ancestors,
-                                row_index,
-                                p,
-                                row_charge.as_ref(),
-                            );
-                            spans.append(&mut owned);
-                            width
-                        } else if row_index == 0 {
-                            spans.push(Span::raw(" "));
-                            1
-                        } else {
-                            spans.push(Span::raw("   "));
-                            3
-                        };
+                    // Every Space row gets its whole prefix, rails included,
+                    // from `agent_row_prefix` — a worktree child no differently
+                    // from a Space somebody's `owner` token points at, because
+                    // both are nodes of one tree and a connector that changed
+                    // shape between them would put the two in different
+                    // columns. At depth 0 - a fleet that declares no `owner`
+                    // anywhere and runs no worktrees - this is one space and
+                    // the row draws exactly as it always has.
+                    let prefix_width = if own_depth > 0 {
+                        // An owned Space takes the same connector a worker
+                        // does: the tree runs through the Space/pane boundary,
+                        // so it must not change shape at it — and, for the same
+                        // reason, a charge has to run it too. A fleet that
+                        // declares ownership with `owner` tokens is the shape
+                        // the sidebar sketch actually describes, so this is the
+                        // path most signals take.
+                        let (mut owned, width) = agent_row_prefix(
+                            own_depth,
+                            own_is_last,
+                            own_ancestors,
+                            row_index,
+                            p,
+                            row_charge.as_ref(),
+                        );
+                        spans.append(&mut owned);
+                        width
+                    } else if row_index == 0 {
+                        spans.push(Span::raw(" "));
+                        1
+                    } else {
+                        spans.push(Span::raw("   "));
+                        3
+                    };
                     (card.rect.width as usize).saturating_sub(prefix_width)
                 }
             };
@@ -4156,7 +4077,7 @@ mod tests {
         let card = crate::app::state::WorkspaceCardArea {
             ws_idx: 0,
             rect: Rect::new(0, 0, 4, 1),
-            indented: false,
+            worktree_child: false,
             entry_idx: 0,
             agent: None,
             card_frame: None,
@@ -4438,7 +4359,7 @@ mod tests {
                         agent_row_prefix(depth, is_last_child, &ancestors, row_index, &p, None);
                     assert_eq!(
                         drawn,
-                        tree_prefix_width(depth, false, row_index),
+                        tree_prefix_width(depth, row_index),
                         "depth {depth} row {row_index} last={is_last_child}"
                     );
                 }
@@ -4453,17 +4374,14 @@ mod tests {
     fn a_cards_rails_stop_where_its_border_starts() {
         let p = Palette::catppuccin();
         for depth in 0u8..5 {
-            for indented in [false, true] {
-                for is_last_child in [true, false] {
-                    let ancestors = vec![true; depth as usize + 1];
-                    let (_, drawn) =
-                        card_rail_prefix(depth, indented, is_last_child, &ancestors, &p);
-                    assert_eq!(
-                        drawn,
-                        tree_prefix_width(depth, indented, 0),
-                        "depth {depth} indented={indented} last={is_last_child}"
-                    );
-                }
+            for is_last_child in [true, false] {
+                let ancestors = vec![true; depth as usize + 1];
+                let (_, drawn) = card_rail_prefix(depth, is_last_child, &ancestors, &p);
+                assert_eq!(
+                    drawn,
+                    tree_prefix_width(depth, 0),
+                    "depth {depth} last={is_last_child}"
+                );
             }
         }
     }
@@ -4482,28 +4400,31 @@ mod tests {
     }
 
     /// Every row of the tree earns a frame at the threshold width, at every
-    /// depth the tree can reach — including a worktree child, whose legacy
-    /// connector makes its prefix the widest of the lot. A depth that fell back
-    /// to a bare line while its siblings drew cards would be two layouts
-    /// stacked on each other, and its reserved height would already have been
-    /// spent on chrome it never drew.
+    /// depth the tree can reach, and a worktree child earns one on the same
+    /// terms as any other Space — its prefix is now measured from depth alone,
+    /// so being a worktree child can no longer cost it columns its siblings
+    /// keep. A depth that fell back to a bare line while its siblings drew
+    /// cards would be two layouts stacked on each other, and its reserved
+    /// height would already have been spent on chrome it never drew.
     #[test]
     fn every_depth_still_has_room_for_a_frame_at_the_threshold() {
         for depth in 0u8..5 {
-            for indented in [false, true] {
+            for worktree_child in [false, true] {
                 let entry = WorkspaceListEntry::Workspace {
                     ws_idx: 0,
-                    indented,
+                    worktree_child,
                     depth,
                     is_last_child: true,
                     ancestors_continue: vec![true; depth as usize + 1],
                 };
                 let rect = Rect::new(0, 0, card::MIN_FOLD_WIDTH + 1, 4);
-                let frame = card_frame_for(rect, &entry, card::MIN_FOLD_WIDTH)
-                    .unwrap_or_else(|| panic!("depth {depth} indented={indented} drew no frame"));
+                let frame =
+                    card_frame_for(rect, &entry, card::MIN_FOLD_WIDTH).unwrap_or_else(|| {
+                        panic!("depth {depth} worktree_child={worktree_child} drew no frame")
+                    });
                 assert!(
                     frame.width > card::CHROME_COLS,
-                    "depth {depth} indented={indented} left no room inside its frame"
+                    "depth {depth} worktree_child={worktree_child} left no room inside its frame"
                 );
             }
         }
@@ -4519,7 +4440,7 @@ mod tests {
         let card = crate::app::state::WorkspaceCardArea {
             ws_idx: 0,
             rect,
-            indented: false,
+            worktree_child: false,
             entry_idx: 0,
             agent: None,
             card_frame: Some(frame),
@@ -6012,7 +5933,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             agent: None,
             ws_idx: 0,
             rect: Rect::new(0, 1, 15, 2),
-            indented: false,
+            worktree_child: false,
             card_frame: None,
         }];
 
@@ -6092,8 +6013,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let parent_name_x = find_symbol_x(buffer, cards[0].rect.y, cards[0].rect.width, "m");
         let plain_name_x = find_symbol_x(buffer, cards[3].rect.y, cards[3].rect.width, "n");
         assert_eq!(parent_name_x, plain_name_x);
-        assert_eq!(buffer[(cards[1].rect.x + 3, cards[1].rect.y)].symbol(), "├");
-        assert_eq!(buffer[(cards[2].rect.x + 3, cards[2].rect.y)].symbol(), "└");
+        assert_eq!(buffer[(cards[1].rect.x + 1, cards[1].rect.y)].symbol(), "├");
+        assert_eq!(buffer[(cards[2].rect.x + 1, cards[2].rect.y)].symbol(), "└");
         assert_eq!(
             buffer[(cards[0].rect.x + cards[0].rect.width - 1, cards[0].rect.y)].symbol(),
             "▾"
@@ -6227,9 +6148,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let (_, app) = render_signalled_tree(None, 0);
         let child = app.view.workspace_card_areas[1].rect;
-        // Three connector cells sit after a three-column indent, and the state
-        // icon is the first token drawn after them.
-        let first = child.x + 3;
+        // Three connector cells sit after the depth-1 rail's single column,
+        // and the state icon is the first token drawn after them.
+        let first = child.x + 1;
         let last = first + u16::from(CONNECTOR_CELLS);
 
         let mut moved = 0;
@@ -6271,7 +6192,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let (calm, app) = render_signalled_tree(None, 0);
         let child = app.view.workspace_card_areas[1].rect;
-        let connector = child.x + 3;
+        let connector = child.x + 1;
         let icon = connector + u16::from(CONNECTOR_CELLS);
 
         let mut reshaped = 0usize;
@@ -6326,7 +6247,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             (0..SIGNAL_POSITIONS)
                 .filter_map(|position| {
                     let (buffer, _) = render_signalled_tree(Some(kind), position);
-                    peak_cell(&buffer, (child.x + 3, child.y), settled)
+                    peak_cell(&buffer, (child.x + 1, child.y), settled)
                 })
                 .collect()
         };
@@ -6361,7 +6282,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             // Half-way along, where every kind has its charge on the connector.
             let (buffer, _) = render_signalled_tree(Some(kind), 14);
             let brightest = (0..u16::from(CONNECTOR_CELLS))
-                .map(|cell| buffer[(child.x + 3 + cell, child.y)].style().fg)
+                .map(|cell| buffer[(child.x + 1 + cell, child.y)].style().fg)
                 .max_by_key(|fg| {
                     fg.and_then(crate::ui::color::color_to_rgb)
                         .map(|(r, g, b)| u32::from(r) + u32::from(g) + u32::from(b))
@@ -6419,7 +6340,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             for position in 0..SIGNAL_POSITIONS {
                 let (buffer, app) = render_signalled_tree(Some(kind), position);
                 let child = app.view.workspace_card_areas[1].rect;
-                let icon = &buffer[(child.x + 3 + u16::from(CONNECTOR_CELLS), child.y)];
+                let icon = &buffer[(child.x + 1 + u16::from(CONNECTOR_CELLS), child.y)];
 
                 let workspace = &app.workspaces[1];
                 let (state, seen) = workspace.aggregate_state(&app.terminals);
@@ -6502,9 +6423,10 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let parent_name_x = find_symbol_x(buffer, cards[0].rect.y, cards[0].rect.width, "d");
         let plain_name_x = find_symbol_x(buffer, cards[3].rect.y, cards[3].rect.width, "h");
         assert_eq!(parent_name_x, plain_name_x);
-        // Both linked worktrees render as indented children of that checkout.
-        assert_eq!(buffer[(cards[1].rect.x + 3, cards[1].rect.y)].symbol(), "├");
-        assert_eq!(buffer[(cards[2].rect.x + 3, cards[2].rect.y)].symbol(), "└");
+        // Both linked worktrees render as children of that checkout, on the
+        // ownership tree's own depth-1 column.
+        assert_eq!(buffer[(cards[1].rect.x + 1, cards[1].rect.y)].symbol(), "├");
+        assert_eq!(buffer[(cards[2].rect.x + 1, cards[2].rect.y)].symbol(), "└");
         assert_eq!(
             buffer[(cards[0].rect.x + cards[0].rect.width - 1, cards[0].rect.y)].symbol(),
             "▾"
@@ -6544,7 +6466,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         let child = app.view.workspace_card_areas[1];
         assert_eq!(
-            terminal.backend().buffer()[(child.rect.x + 3, child.rect.y)].symbol(),
+            terminal.backend().buffer()[(child.rect.x + 1, child.rect.y)].symbol(),
             "├"
         );
     }
@@ -6562,9 +6484,9 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
         assert!(headers.is_empty());
         assert_eq!(cards[0].ws_idx, 0);
-        assert!(!cards[0].indented);
+        assert!(!cards[0].worktree_child);
         assert_eq!(cards[1].ws_idx, 1);
-        assert!(cards[1].indented);
+        assert!(cards[1].worktree_child);
         assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
     }
 
@@ -6866,8 +6788,10 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .iter()
             .filter_map(|entry| match entry {
                 WorkspaceListEntry::Workspace {
-                    ws_idx, indented, ..
-                } => Some((*ws_idx, *indented)),
+                    ws_idx,
+                    worktree_child,
+                    ..
+                } => Some((*ws_idx, *worktree_child)),
                 WorkspaceListEntry::Agent { .. } => None,
             })
             .collect()
@@ -7092,8 +7016,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let buffer = terminal.backend().buffer();
         let cards = &app.view.workspace_card_areas;
         assert_eq!(cards[2].ws_idx, 2);
-        assert!(!cards[2].indented);
-        assert_eq!(buffer[(cards[1].rect.x + 3, cards[1].rect.y)].symbol(), "└");
+        assert!(!cards[2].worktree_child);
+        assert_eq!(buffer[(cards[1].rect.x + 1, cards[1].rect.y)].symbol(), "└");
         let parent_name_x = find_symbol_x(buffer, cards[0].rect.y, cards[0].rect.width, "m");
         let peer_name_x = find_symbol_x(buffer, cards[2].rect.y, cards[2].rect.width, "m");
         assert_eq!(peer_name_x, parent_name_x);

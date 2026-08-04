@@ -498,7 +498,9 @@ fn render_mobile_switcher_content(
     for entry in &entries {
         match entry {
             WorkspaceListEntry::Workspace {
-                ws_idx, indented, ..
+                ws_idx,
+                worktree_child,
+                ..
             } => {
                 if let Some(ws) = app.workspaces.get(*ws_idx) {
                     let active = Some(*ws_idx) == app.active;
@@ -513,7 +515,7 @@ fn render_mobile_switcher_content(
                     title_spans.push(Span::styled(dot, dot_style.bg(bg)));
                     title_spans.push(Span::styled(" ", Style::default().bg(bg)));
                     let raw_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-                    let name = if *indented {
+                    let name = if *worktree_child {
                         grouped_child_display_label(
                             &raw_label,
                             ws.branch().as_deref(),

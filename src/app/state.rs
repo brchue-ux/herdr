@@ -672,7 +672,7 @@ impl Palette {
 pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
-    pub indented: bool,
+    pub worktree_child: bool,
     /// Position of this row in the sidebar tree, so the renderer and the hit
     /// tests read the same connector depth the layout used.
     pub entry_idx: usize,
