@@ -1859,7 +1859,13 @@ mod tests {
             row,
         ));
         recompute(&mut app);
-        app.handle_mouse(mouse(MouseEventKind::Moved, bar_col + 12, row));
+        // Away from where the divider *ended up*, not from where it started.
+        // The drag widens the sidebar by twelve columns, which the bounds now
+        // allow outright, so the release point is the bar's new home and a
+        // pointer left sitting on it is still legitimately hovering it.
+        let released_bar_col =
+            app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width.saturating_sub(1);
+        app.handle_mouse(mouse(MouseEventKind::Moved, released_bar_col - 4, row));
         assert!(
             !app.state.sidebar_divider_hover,
             "the divider stayed marked after the drag was released"

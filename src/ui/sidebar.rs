@@ -1,3 +1,4 @@
+mod card;
 mod notifications;
 mod tokens;
 
@@ -9,6 +10,7 @@ use ratatui::{
     Frame,
 };
 
+use self::card::{Card, Pill, RowShell};
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
@@ -266,6 +268,7 @@ fn workspace_row_height(
     ws: &crate::workspace::Workspace,
     indented: bool,
     content_width: usize,
+    shell: RowShell,
 ) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if indented {
@@ -295,10 +298,10 @@ fn workspace_row_height(
             suppress_git_details: indented,
         },
     );
-    fold_token_lines(rows, content_width, None)
-        .len()
-        .max(1)
-        .min(u16::MAX as usize) as u16
+    shell_row_height(
+        shell_row_lines(rows, content_width, None, shell).len(),
+        shell,
+    )
 }
 
 fn workspace_row_height_in_body(
@@ -307,8 +310,9 @@ fn workspace_row_height_in_body(
     indented: bool,
     body_height: u16,
     content_width: usize,
+    shell: RowShell,
 ) -> u16 {
-    workspace_row_height(app, workspace, indented, content_width).min(body_height)
+    workspace_row_height(app, workspace, indented, content_width, shell).min(body_height)
 }
 
 fn workspace_entry_gap(
@@ -918,11 +922,14 @@ fn row_fold_width(list_area: Rect) -> u16 {
     workspace_list_body_rect(list_area, true).width
 }
 
-/// Columns a row has for its tokens once its prefix and any trailing control
-/// are taken out.
+/// Columns a row has for its tokens once its prefix, its shell and any trailing
+/// control are taken out.
 fn row_content_width(fold_width: u16, depth: u8, indented: bool, trailing_width: usize) -> usize {
     (fold_width as usize)
         .saturating_sub(tree_prefix_width(depth, indented, 0))
+        .saturating_sub(usize::from(
+            RowShell::for_fold_width(fold_width).chrome_cols(),
+        ))
         .saturating_sub(trailing_width)
 }
 
@@ -1144,17 +1151,20 @@ fn list_entry_height(
     fold_width: u16,
 ) -> u16 {
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
+    let shell = RowShell::for_fold_width(fold_width);
     match entry {
         WorkspaceListEntry::Workspace {
             ws_idx, indented, ..
         } => app
             .workspaces
             .get(*ws_idx)
-            .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height, content_width))
+            .map(|ws| {
+                workspace_row_height_in_body(app, ws, *indented, body_height, content_width, shell)
+            })
             .unwrap_or(0),
         WorkspaceListEntry::Agent { entry_idx, .. } => agents
             .get(*entry_idx)
-            .map(|entry| agent_entry_height_in_body(app, entry, body_height, content_width))
+            .map(|entry| agent_entry_height_in_body(app, entry, body_height, content_width, shell))
             .unwrap_or(0),
     }
 }
@@ -1248,11 +1258,7 @@ pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Optio
 }
 
 fn resolved_agent_rows(app: &AppState, entry: &AgentPanelEntry) -> Vec<Vec<ResolvedToken>> {
-    let label = entry
-        .state_labels
-        .get(agent_panel_status_key(entry.state, entry.seen))
-        .map(String::as_str)
-        .unwrap_or_else(|| state_label(entry.state, entry.seen));
+    let label = agent_status_label(entry);
     let state_age = entry
         .last_agent_state_change_at
         .map(|at| app.state_age_now.saturating_duration_since(at));
@@ -1264,12 +1270,13 @@ pub(crate) fn agent_entry_height_in_body(
     entry: &AgentPanelEntry,
     body_height: u16,
     content_width: usize,
+    shell: RowShell,
 ) -> u16 {
-    (fold_token_lines(resolved_agent_rows(app, entry), content_width, None)
-        .len()
-        .max(1)
-        .min(u16::MAX as usize) as u16)
-        .min(body_height)
+    shell_row_height(
+        shell_row_lines(resolved_agent_rows(app, entry), content_width, None, shell).len(),
+        shell,
+    )
+    .min(body_height)
 }
 
 pub(crate) fn agent_entry_gap(app: &AppState, entry_idx: usize, entry_count: usize) -> u16 {
@@ -1330,12 +1337,14 @@ pub(crate) fn compute_workspace_list_areas(
                 )
             }
         };
+        let rect = Rect::new(body.x, row_y, body.width, row_height);
         cards.push(crate::app::state::WorkspaceCardArea {
             ws_idx,
-            rect: Rect::new(body.x, row_y, body.width, row_height),
+            rect,
             indented,
             entry_idx,
             agent,
+            card_frame: card_frame_for(rect, entry, fold_width),
         });
         row_y = row_y
             .saturating_add(row_height)
@@ -1344,6 +1353,24 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     (cards, headers)
+}
+
+/// Where this row's card shell stands, if the panel is wide enough to draw one.
+///
+/// The box begins in the column the row's connector points at — which is why
+/// the `├─` lands on the card's top-left corner rather than beside the name —
+/// and ends at the fold width, never at the drawn width. Both edges are
+/// measured with the same functions the fold is, so the layout and the renderer
+/// cannot disagree about which columns are frame.
+fn card_frame_for(rect: Rect, entry: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
+    if !RowShell::for_fold_width(fold_width).is_card() {
+        return None;
+    }
+    let indented = matches!(entry, WorkspaceListEntry::Workspace { indented: true, .. });
+    let prefix = tree_prefix_width(entry.depth(), indented, 0) as u16;
+    let width = fold_width.saturating_sub(prefix);
+    (width > card::CHROME_COLS && rect.height > card::CHROME_ROWS)
+        .then(|| Rect::new(rect.x.saturating_add(prefix), rect.y, width, rect.height))
 }
 
 pub(crate) fn compute_workspace_card_areas(
@@ -1392,8 +1419,8 @@ pub(crate) fn worker_summary_badge_rect(
         return Rect::default();
     }
     Rect::new(
-        card.rect.x + card.rect.width.saturating_sub(1 + width),
-        card.rect.y,
+        card.control_right().saturating_sub(1 + width),
+        card.content_y(),
         width,
         1,
     )
@@ -1473,8 +1500,8 @@ pub(crate) fn workspace_group_chevron_rect(card: &crate::app::state::WorkspaceCa
     }
 
     Rect::new(
-        card.rect.x + card.rect.width.saturating_sub(1),
-        card.rect.y,
+        card.control_right().saturating_sub(1),
+        card.content_y(),
         1,
         1,
     )
@@ -1850,18 +1877,66 @@ fn fold_token_lines(
         }
     }
 
+    collapse_to_max_lines(folded, max_lines)
+}
+
+/// Merge a row's tail into the line above it until the row fits the height the
+/// layout reserved for it.
+///
+/// Independent of whether the row folds by width, because the reason is
+/// different: a row that overflowed its reservation used to lose its tail
+/// outright, and an elided tail says more than a missing one.
+fn collapse_to_max_lines(
+    mut lines: Vec<Vec<ResolvedToken>>,
+    max_lines: Option<u16>,
+) -> Vec<Vec<ResolvedToken>> {
     if let Some(max) = max_lines.map(usize::from).filter(|max| *max > 0) {
-        while folded.len() > max {
-            let Some(tail) = folded.pop() else { break };
-            let Some(previous) = folded.last_mut() else {
-                folded.push(tail);
+        while lines.len() > max {
+            let Some(tail) = lines.pop() else { break };
+            let Some(previous) = lines.last_mut() else {
+                lines.push(tail);
                 break;
             };
             previous.extend(tail);
         }
     }
 
-    folded
+    lines
+}
+
+/// Lay a row's configured token lines out for the shell it is drawn in.
+///
+/// The bare line folds. The card does not, and must not: its content rows *are*
+/// the card — the chip and the title on one, the subtitle and the status pill
+/// on the next — so merging them would spend six columns of frame to produce a
+/// bordered line, which is the one thing a card must not be. A bordered single
+/// line of text is still a line of text.
+///
+/// `max_lines` applies either way: it is the height the layout reserved, and
+/// the renderer is not free to draw past it.
+fn shell_row_lines(
+    lines: Vec<Vec<ResolvedToken>>,
+    content_width: usize,
+    max_lines: Option<u16>,
+    shell: RowShell,
+) -> Vec<Vec<ResolvedToken>> {
+    match shell {
+        RowShell::Line => fold_token_lines(lines, content_width, max_lines),
+        RowShell::Card => collapse_to_max_lines(lines, max_lines),
+    }
+}
+
+/// The rows a tree entry reserves: its content lines plus its shell's chrome.
+///
+/// The layout and the renderer both go through here, because a row whose
+/// reserved height and drawn lines disagree puts every card below it on the
+/// wrong row — the vertical twin of the failure [`tree_prefix_width`] guards
+/// against.
+fn shell_row_height(content_lines: usize, shell: RowShell) -> u16 {
+    content_lines
+        .max(1)
+        .saturating_add(usize::from(shell.chrome_rows()))
+        .min(u16::MAX as usize) as u16
 }
 
 fn resolved_token_spans(
@@ -2205,19 +2280,40 @@ fn render_agent_row(
     };
 
     let p = &app.palette;
-    let rows = fold_token_lines(
-        resolved_agent_rows(app, detail),
-        list_entry_content_width(app, agents, entry, fold_width),
-        Some(card.rect.height),
-    );
+    let shell = RowShell::for_fold_width(fold_width);
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
     let label_color = state_label_color(detail.state, detail.seen, p);
-    let row_style = if is_active {
+    let card_shell = card
+        .card_frame
+        .and_then(|rect| Card::new(rect, label_color, is_active, p, &app.host_terminal_theme));
+    let content_rows = card
+        .rect
+        .height
+        .saturating_sub(if card_shell.is_some() {
+            shell.chrome_rows()
+        } else {
+            0
+        })
+        .max(1);
+    let rows = shell_row_lines(
+        resolved_agent_rows(app, detail),
+        list_entry_content_width(app, agents, entry, fold_width),
+        Some(content_rows),
+        shell,
+    );
+    // The card carries the row's background itself, as a glow: a flat highlight
+    // painted over it would put out the light the card is lit by.
+    let row_style = if is_active && card_shell.is_none() {
         Style::default().bg(p.surface_dim)
     } else {
         Style::default()
     };
-    let name_style = if is_active {
+    // A card's first content row is its title, and a title is the one thing on
+    // the card that is not competing for attention with anything: the frame,
+    // the chip and the glow already carry state, so the name gets full weight
+    // whether or not this is the row the cursor is on. On the bare line it
+    // still earns that weight by being the active pane.
+    let name_style = if is_active || card_shell.is_some() {
         Style::default().fg(p.text).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
@@ -2228,19 +2324,61 @@ fn render_agent_row(
         Style::default().fg(label_color).add_modifier(Modifier::DIM)
     };
     let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
-    let state_icon = state_dot(detail.state, detail.seen, p);
+    let mark = state_dot(detail.state, detail.seen, p);
+    // On a card the mark is set in a chip. It is the same mark, padded and
+    // plated — the alphabet is untouched, and a row with no `state_icon` token
+    // configured gets no chip, exactly as it gets no mark today.
+    let chip = card_shell.as_ref().map(|shell| shell.chip(mark.0));
+    let state_icon = match &chip {
+        Some((text, style)) => (text.as_str(), *style),
+        None => mark,
+    };
+    let pill = card_shell
+        .as_ref()
+        .and_then(|shell| card_pill(shell, agent_status_label(detail), rows.len(), content_rows));
+    let pill_reservation = pill
+        .as_ref()
+        .zip(card_shell.as_ref())
+        .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
+        .unwrap_or(0);
     let summary_badge = worker_summary_badge(app, entries, agents, card);
     // This row's own life, not its Space's: a worker arrives when it starts and
     // leaves when it finishes, which is what makes its second mate's group grow
     // and shrink around it.
     let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
 
+    if let Some(shell) = &card_shell {
+        let (mut top, _) = agent_row_prefix(
+            entry.depth(),
+            entry.is_last_child(),
+            entry.ancestors_continue(),
+            0,
+            p,
+            // The Agents panel lists panes, and a relation signal is keyed on a
+            // workspace, so there is nothing here for a charge to belong to.
+            None,
+        );
+        let (mut rail, _) = card_rail_prefix(
+            entry.depth(),
+            false,
+            entry.is_last_child(),
+            entry.ancestors_continue(),
+            p,
+        );
+        animate_row_spans(&mut top, &row_anim);
+        animate_row_spans(&mut rail, &row_anim);
+        render_card_border_rails(frame, card, top, rail, list_bottom);
+        shell.render_glow(frame, list_bottom);
+    }
+
+    let last_content_row = rows.len().saturating_sub(1);
     for (row_index, resolved) in rows.iter().enumerate() {
-        let row_y = card.rect.y + row_index as u16;
-        if row_index as u16 >= card.rect.height || row_y >= list_bottom {
+        let row_y = card.content_y() + row_index as u16;
+        if row_index as u16 >= content_rows || row_y >= list_bottom {
             break;
         }
-        // Only row 0 carries the badge, so only row 0 gives up the width.
+        // Only the first content row carries the badge, so only it gives up the
+        // width; only the last carries the pill.
         let trailing_width = if row_index == 0 {
             summary_badge
                 .as_ref()
@@ -2248,28 +2386,62 @@ fn render_agent_row(
                 .unwrap_or(0)
         } else {
             0
+        } + if row_index == last_content_row {
+            pill_reservation
+        } else {
+            0
         };
-        let (mut spans, prefix_width) = agent_row_prefix(
-            entry.depth(),
-            entry.is_last_child(),
-            entry.ancestors_continue(),
-            row_index,
-            p,
-            // The Agents panel lists panes, and a relation signal is keyed on a
-            // workspace, so there is nothing here for a charge to belong to.
-            None,
-        );
+        let (mut spans, token_budget) = match &card_shell {
+            Some(shell) => {
+                let (mut spans, _) = card_rail_prefix(
+                    entry.depth(),
+                    false,
+                    entry.is_last_child(),
+                    entry.ancestors_continue(),
+                    p,
+                );
+                // The frame's own column and the pad inside it, drawn blank so
+                // the border can be laid over the first of them once the row
+                // has had its say.
+                spans.push(Span::raw("  "));
+                (spans, usize::from(shell.content_width()))
+            }
+            None => {
+                let (spans, prefix_width) = agent_row_prefix(
+                    entry.depth(),
+                    entry.is_last_child(),
+                    entry.ancestors_continue(),
+                    row_index,
+                    p,
+                    None,
+                );
+                (
+                    spans,
+                    (card.rect.width as usize).saturating_sub(prefix_width),
+                )
+            }
+        };
+        // On a card the whole first content row is the title, however the row's
+        // tokens are configured: a worker's identity lands in the secondary
+        // slot (`Agent`) as often as in the primary one, and a title that
+        // changed weight depending on which token spelled it would read as two
+        // different rows.
+        let secondary_style = if card_shell.is_some() && row_index == 0 {
+            name_style
+        } else {
+            agent_style
+        };
         animate_row_spans(&mut spans, &row_anim);
         spans.extend(resolved_token_spans(
             resolved,
             state_icon,
             status_style,
             name_style,
-            agent_style,
-            agent_style,
+            secondary_style,
+            secondary_style,
             p,
             &row_anim,
-            (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
+            token_budget.saturating_sub(trailing_width),
         ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(row_style),
@@ -2277,8 +2449,70 @@ fn render_agent_row(
         );
     }
 
+    if let Some(shell) = &card_shell {
+        shell.render_frame(frame, list_bottom, pill.as_ref());
+    }
+
     if let Some((owner, count)) = &summary_badge {
         render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
+    }
+}
+
+/// The status readout a card repeats at its foot, or `None` when the card has
+/// no room to say it twice.
+///
+/// A one-content-row card already spends that row on the name and whatever
+/// controls are drawn over it; a pill there would be competing with the row's
+/// own title for the same columns, and the chip on that row is already saying
+/// the same thing in one cell.
+fn card_pill(shell: &Card<'_>, label: &str, lines: usize, content_rows: u16) -> Option<Pill> {
+    if lines < 2 || content_rows < 2 {
+        return None;
+    }
+    let pill = Pill {
+        label: label.to_string(),
+    };
+    (shell.pill_reservation(&pill.label) > 0).then_some(pill)
+}
+
+/// The state label this pane reports, publisher override included.
+fn agent_status_label(entry: &AgentPanelEntry) -> &str {
+    entry
+        .state_labels
+        .get(agent_panel_status_key(entry.state, entry.seen))
+        .map(String::as_str)
+        .unwrap_or_else(|| state_label(entry.state, entry.seen))
+}
+
+/// Draw the tree rails beside a card's border rows.
+///
+/// A card's content rows carry their own rails in the line they render; its two
+/// border rows have no line of their own, so the rails beside them are drawn
+/// here. Without this the tree's vertical rules would break every time they
+/// passed a card — which, at four rows an entity, is most of the panel.
+fn render_card_border_rails(
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    top: Vec<Span<'static>>,
+    rail: Vec<Span<'static>>,
+    list_bottom: u16,
+) {
+    let Some(shell_frame) = card.card_frame else {
+        return;
+    };
+    let width = shell_frame.x.saturating_sub(card.rect.x);
+    if width == 0 || shell_frame.height == 0 {
+        return;
+    }
+    let bottom_y = shell_frame.y + shell_frame.height - 1;
+    for (y, spans) in [(shell_frame.y, top), (bottom_y, rail)] {
+        if y >= list_bottom {
+            continue;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(card.rect.x, y, width, 1),
+        );
     }
 }
 
@@ -2370,6 +2604,64 @@ fn agent_row_prefix(
         spans.push(Span::raw("  "));
         (spans, 3 * depth as usize + 3)
     }
+}
+
+/// The rails a card's content row carries, cut back to the column the card's
+/// own left border stands in.
+///
+/// A bare row's continuation lines sit two columns further right than its first
+/// line, so wrapped text aligns under the name rather than under the state
+/// mark. A card does not indent: its left border stands in the connector's own
+/// column on every row, and the frame — not whitespace — is what holds the
+/// content in. So every row of a card, border row and content row alike, is
+/// preceded by exactly `tree_prefix_width(depth, indented, 0)` columns, which
+/// is what lets the layout keep measuring one prefix per row.
+fn card_rail_prefix(
+    depth: u8,
+    indented: bool,
+    is_last_child: bool,
+    ancestors_continue: &[bool],
+    p: &Palette,
+) -> (Vec<Span<'static>>, usize) {
+    let line_style = Style::default().fg(p.overlay0);
+    let branch = |spans: &mut Vec<Span<'static>>| {
+        if is_last_child {
+            spans.push(Span::raw("   "));
+        } else {
+            spans.push(Span::styled("│", line_style));
+            spans.push(Span::raw("  "));
+        }
+    };
+
+    if indented {
+        // A worktree child brings its own legacy connector, so the ownership
+        // rails above it are laid down first, exactly as its first row does.
+        let (mut spans, rail_width) = ancestor_rail(depth.saturating_sub(1), ancestors_continue, p);
+        spans.push(Span::raw("   "));
+        branch(&mut spans);
+        return (spans, rail_width + 6);
+    }
+
+    let depth = crate::app::agent_tree::display_depth(depth);
+    if depth == 0 {
+        return (vec![Span::raw(" ")], 1);
+    }
+
+    let mut spans = vec![Span::raw(" ")];
+    for level in 1..depth {
+        if ancestors_continue
+            .get(level as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            spans.push(Span::styled("│", line_style));
+            spans.push(Span::raw("  "));
+        } else {
+            spans.push(Span::raw("   "));
+        }
+    }
+    branch(&mut spans);
+    (spans, 3 * depth as usize + 1)
 }
 
 /// The `├─ ` / `└─ ` connector of a child row's first line, charge and all.
@@ -2916,7 +3208,11 @@ fn render_workspace_list(
             }
         }
 
-        let name_style = if selected || is_active || is_dragged {
+        // A card's first content row is its title, and it gets full weight
+        // whether or not the cursor is on it: the frame, the chip and the glow
+        // already say which row this is and what state it is in, so the name is
+        // not competing with them for the same channel.
+        let name_style = if selected || is_active || is_dragged || card.card_frame.is_some() {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.subtext0)
@@ -2946,7 +3242,23 @@ fn render_workspace_list(
             .filter(|(_, collapsed)| *collapsed)
             .map(|(key, _)| space_aggregate_state_and_age(app, key))
             .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
-        let state_icon = state_dot(display_state, display_seen, p);
+        let mark = state_dot(display_state, display_seen, p);
+        let card_shell = card.card_frame.and_then(|rect| {
+            Card::new(
+                rect,
+                state_label_color(display_state, display_seen, p),
+                highlighted,
+                p,
+                &app.host_terminal_theme,
+            )
+        });
+        // The same mark, padded and plated. The alphabet is untouched: a chip
+        // is where a mark is set, not a mark of its own.
+        let chip = card_shell.as_ref().map(|shell| shell.chip(mark.0));
+        let state_icon = match &chip {
+            Some((text, style)) => (text.as_str(), *style),
+            None => mark,
+        };
         let signal_phase = app.workspace_relation_signal_phase(i);
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
@@ -2982,23 +3294,33 @@ fn render_workspace_list(
             .get(card.entry_idx)
             .map(|entry| list_entry_content_width(app, &agents, entry, fold_width))
             .unwrap_or_else(|| row_content_width(fold_width, own_depth, card.indented, 0));
-        let rows = fold_token_lines(rows, content_width, Some(row_height));
+        let shell = RowShell::for_fold_width(fold_width);
+        let content_rows = row_height
+            .saturating_sub(if card_shell.is_some() {
+                shell.chrome_rows()
+            } else {
+                0
+            })
+            .max(1);
+        let rows = shell_row_lines(rows, content_width, Some(content_rows), shell);
+        let pill = card_shell.as_ref().and_then(|shell| {
+            card_pill(
+                shell,
+                state_label(display_state, display_seen),
+                rows.len(),
+                content_rows,
+            )
+        });
+        let pill_reservation = pill
+            .as_ref()
+            .zip(card_shell.as_ref())
+            .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
+            .unwrap_or(0);
+        let content_y = card.content_y();
 
-        for (row_index, resolved) in rows.iter().enumerate() {
-            if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
-                break;
-            }
-            // The branch line only exists on a child card's first row, so that
-            // is the only row a signal can travel and the only row it damages.
-            let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
-            let mut spans = Vec::new();
-            // Only a worktree child needs a rail drawn for it: it brings its
-            // own legacy connector, so the ownership levels above it have to be
-            // laid down first. A Space row that is not a worktree child gets
-            // its whole prefix, rails included, from `agent_row_prefix` below.
-            // At depth 0 - a fleet that declares no `owner` anywhere - this is
-            // empty and the row draws exactly as it always has.
-            let (mut spans_prefix, rail_width) = ancestor_rail(
+        if let Some(shell) = &card_shell {
+            let mut top = Vec::new();
+            let (mut top_rail, _) = ancestor_rail(
                 if card.indented {
                     own_depth.saturating_sub(1)
                 } else {
@@ -3007,58 +3329,152 @@ fn render_workspace_list(
                 own_ancestors,
                 p,
             );
-            spans.append(&mut spans_prefix);
+            top.append(&mut top_rail);
+            let connector_style = Style::default().fg(p.overlay0);
+            let top_charge = ConnectorCharge::new(app, connector_style, signal_phase);
+            if card.indented {
+                top.push(Span::raw("   "));
+                push_connector_spans(
+                    &mut top,
+                    is_last_child,
+                    top_charge.as_ref(),
+                    connector_style,
+                );
+            } else if own_depth > 0 {
+                let (mut owned, _) = agent_row_prefix(
+                    own_depth,
+                    own_is_last,
+                    own_ancestors,
+                    0,
+                    p,
+                    top_charge.as_ref(),
+                );
+                top.append(&mut owned);
+            } else {
+                top.push(Span::raw(" "));
+            }
+            let (rail, _) = card_rail_prefix(
+                own_depth,
+                card.indented,
+                if card.indented {
+                    is_last_child
+                } else {
+                    own_is_last
+                },
+                own_ancestors,
+                p,
+            );
+            render_card_border_rails(frame, card, top, rail, list_bottom);
+            shell.render_glow(frame, list_bottom);
+        }
+
+        let last_content_row = rows.len().saturating_sub(1);
+        for (row_index, resolved) in rows.iter().enumerate() {
+            if row_index as u16 >= content_rows || content_y + row_index as u16 >= list_bottom {
+                break;
+            }
+            // The branch line only exists on a child card's first row, so that
+            // is the only row a signal can travel and the only row it damages.
+            let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
+            let mut spans = Vec::new();
             // Resolved once per row rather than per cell: the charge's colour
             // and its behaviour are the same for every cell of the route, and
             // only its position along that route differs.
             let connector_style = Style::default().fg(p.overlay0);
             let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase);
-            let prefix_width = rail_width
-                + if card.indented {
-                    spans.push(Span::raw("   "));
-                    if row_index == 0 {
-                        push_connector_spans(
-                            &mut spans,
-                            is_last_child,
-                            row_charge.as_ref(),
-                            connector_style,
-                        );
-                        6
-                    } else if is_last_child {
-                        spans.push(Span::raw("     "));
-                        8
-                    } else {
-                        spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
-                        spans.push(Span::raw("    "));
-                        8
-                    }
-                } else if own_depth > 0 {
-                    // An owned Space takes the same connector a worker does:
-                    // the tree runs through the Space/pane boundary, so it must
-                    // not change shape at it — and, for the same reason, a
-                    // charge has to run it too. A fleet that declares ownership
-                    // with `owner` tokens is the shape the sidebar sketch
-                    // actually describes, so this is the path most signals take.
-                    let (mut owned, width) = agent_row_prefix(
+            let token_budget = match &card_shell {
+                // Every row of a card is preceded by the same rails: the
+                // connector is up on the top border row, where the tree now
+                // meets the card's corner, and the frame holds the content in
+                // from there down.
+                Some(shell) => {
+                    let (mut prefix, _) = card_rail_prefix(
                         own_depth,
-                        own_is_last,
+                        card.indented,
+                        if card.indented {
+                            is_last_child
+                        } else {
+                            own_is_last
+                        },
                         own_ancestors,
-                        row_index,
                         p,
-                        row_charge.as_ref(),
                     );
-                    spans.append(&mut owned);
-                    width
-                } else if row_index == 0 {
-                    spans.push(Span::raw(" "));
-                    1
-                } else {
-                    spans.push(Span::raw("   "));
-                    3
-                };
-            // Row 0 keeps the chevron cell clear, and the badge's own width on
-            // top of it, so a mate's name is truncated instead of being drawn
-            // under either control.
+                    spans.append(&mut prefix);
+                    // The frame's own column and the pad inside it, drawn blank
+                    // so the border can be laid over the first of them once the
+                    // row has had its say.
+                    spans.push(Span::raw("  "));
+                    usize::from(shell.content_width())
+                }
+                None => {
+                    // Only a worktree child needs a rail drawn for it: it brings
+                    // its own legacy connector, so the ownership levels above it
+                    // have to be laid down first. A Space row that is not a
+                    // worktree child gets its whole prefix, rails included, from
+                    // `agent_row_prefix` below. At depth 0 - a fleet that
+                    // declares no `owner` anywhere - this is empty and the row
+                    // draws exactly as it always has.
+                    let (mut spans_prefix, rail_width) = ancestor_rail(
+                        if card.indented {
+                            own_depth.saturating_sub(1)
+                        } else {
+                            0
+                        },
+                        own_ancestors,
+                        p,
+                    );
+                    spans.append(&mut spans_prefix);
+                    let prefix_width = rail_width
+                        + if card.indented {
+                            spans.push(Span::raw("   "));
+                            if row_index == 0 {
+                                push_connector_spans(
+                                    &mut spans,
+                                    is_last_child,
+                                    row_charge.as_ref(),
+                                    connector_style,
+                                );
+                                6
+                            } else if is_last_child {
+                                spans.push(Span::raw("     "));
+                                8
+                            } else {
+                                spans.push(Span::styled("│", Style::default().fg(p.overlay0)));
+                                spans.push(Span::raw("    "));
+                                8
+                            }
+                        } else if own_depth > 0 {
+                            // An owned Space takes the same connector a worker
+                            // does: the tree runs through the Space/pane
+                            // boundary, so it must not change shape at it — and,
+                            // for the same reason, a charge has to run it too. A
+                            // fleet that declares ownership with `owner` tokens
+                            // is the shape the sidebar sketch actually
+                            // describes, so this is the path most signals take.
+                            let (mut owned, width) = agent_row_prefix(
+                                own_depth,
+                                own_is_last,
+                                own_ancestors,
+                                row_index,
+                                p,
+                                row_charge.as_ref(),
+                            );
+                            spans.append(&mut owned);
+                            width
+                        } else if row_index == 0 {
+                            spans.push(Span::raw(" "));
+                            1
+                        } else {
+                            spans.push(Span::raw("   "));
+                            3
+                        };
+                    (card.rect.width as usize).saturating_sub(prefix_width)
+                }
+            };
+            // The first content row keeps the chevron cell clear, and the
+            // badge's own width on top of it, so a mate's name is truncated
+            // instead of being drawn under either control. The last one keeps
+            // the status pill's columns for the same reason.
             let trailing_width = if row_index == 0 {
                 usize::from(parent_group.is_some()) * 2
                     + summary_badge
@@ -3069,6 +3485,17 @@ fn render_workspace_list(
                         .unwrap_or(0)
             } else {
                 0
+            } + if row_index == last_content_row {
+                pill_reservation
+            } else {
+                0
+            };
+            // The whole first content row of a card is its title, however the
+            // row's tokens are configured.
+            let secondary_style = if card_shell.is_some() && row_index == 0 {
+                name_style
+            } else {
+                branch_style
             };
             spans.extend(resolved_token_spans(
                 resolved,
@@ -3078,16 +3505,25 @@ fn render_workspace_list(
                 ),
                 state_text_style,
                 name_style,
-                branch_style,
-                branch_style,
+                secondary_style,
+                secondary_style,
                 p,
                 &RowAnimation::for_workspace(app, Some(ws.id.as_str())),
-                (card.rect.width as usize).saturating_sub(prefix_width + trailing_width),
+                token_budget.saturating_sub(trailing_width),
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
-                Rect::new(card.rect.x, row_y + row_index as u16, card.rect.width, 1),
+                Rect::new(
+                    card.rect.x,
+                    content_y + row_index as u16,
+                    card.rect.width,
+                    1,
+                ),
             );
+        }
+
+        if let Some(shell) = &card_shell {
+            shell.render_frame(frame, list_bottom, pill.as_ref());
         }
 
         if let Some((owner, count)) = &summary_badge {
@@ -3424,6 +3860,7 @@ mod tests {
             indented: false,
             entry_idx: 0,
             agent: None,
+            card_frame: None,
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
@@ -3530,11 +3967,33 @@ mod tests {
     /// line has content at a fixed width on any checkout.
     const FIXTURE_BRANCH: &str = "fm/herdr-dynamic-sidebar-width";
 
+    /// A branch short enough that a row's two configured lines still merge
+    /// inside [`card::MIN_FOLD_WIDTH`].
+    ///
+    /// Folding is the bare line's layout, and the bare line is now what the
+    /// panel draws *below* the card threshold, so a fixture that only folds at
+    /// 47 columns cannot exercise the fold at all. This one can.
+    const FOLDABLE_BRANCH: &str = "main";
+
+    /// The two panel widths either side of the shell threshold.
+    ///
+    /// The threshold is stated in fold widths, and a panel folds against
+    /// `width - 2` (one column for the divider bar, one for the scrollbar the
+    /// fold always assumes), so the narrowest panel that draws cards is
+    /// `MIN_FOLD_WIDTH + 2` and the widest that draws lines is one below it.
+    const NARROWEST_CARD_WIDTH: u16 = card::MIN_FOLD_WIDTH + 2;
+    const WIDEST_LINE_WIDTH: u16 = NARROWEST_CARD_WIDTH - 1;
+
     /// A realistic captain fleet rendered with the *default* sidebar layout
     /// (two token rows per Space and per agent), so the dump shows what a user
     /// who never edited `[ui.sidebar]` actually sees.
     fn default_layout_fleet_rows(width: u16, height: u16) -> Vec<String> {
         default_layout_fleet(width, height, None).1
+    }
+
+    /// The same fleet on a branch short enough to fold inside a narrow panel.
+    fn foldable_fleet_rows(width: u16, height: u16) -> Vec<String> {
+        default_layout_fleet_on(width, height, None, FOLDABLE_BRANCH).1
     }
 
     /// The same fleet, optionally with one worker having published a summary so
@@ -3543,6 +4002,15 @@ mod tests {
         width: u16,
         height: u16,
         summary: Option<&str>,
+    ) -> (crate::app::state::AppState, Vec<String>) {
+        default_layout_fleet_on(width, height, summary, FIXTURE_BRANCH)
+    }
+
+    fn default_layout_fleet_on(
+        width: u16,
+        height: u16,
+        summary: Option<&str>,
+        branch: &str,
     ) -> (crate::app::state::AppState, Vec<String>) {
         let mut app = crate::app::state::AppState::test_new();
         let mut explore = Workspace::test_new("2ndmate-explore");
@@ -3568,7 +4036,7 @@ mod tests {
         // pull request from a detached `refs/pull/N/merge`, and a rebase detaches
         // too. Pin it so the fold is measured against a fixed layout.
         for workspace in app.workspaces.iter_mut() {
-            workspace.cached_git_branch = Some(FIXTURE_BRANCH.to_string());
+            workspace.cached_git_branch = Some(branch.to_string());
         }
 
         let now = std::time::Instant::now();
@@ -3679,12 +4147,127 @@ mod tests {
         }
     }
 
-    /// The narrow end is the regression bar: at the widths the captain runs a
-    /// sidebar at today, every row still spends the lines its layout asked for
-    /// and the tree keeps its connectors.
+    /// The card's rails are measured by the same function, at the same row
+    /// index, as the connector row above them — every row of a card starts in
+    /// the same column, or the frame would step in and out as it descended.
+    #[test]
+    fn a_cards_rails_stop_where_its_border_starts() {
+        let p = Palette::catppuccin();
+        for depth in 0u8..5 {
+            for indented in [false, true] {
+                for is_last_child in [true, false] {
+                    let ancestors = vec![true; depth as usize + 1];
+                    let (_, drawn) =
+                        card_rail_prefix(depth, indented, is_last_child, &ancestors, &p);
+                    assert_eq!(
+                        drawn,
+                        tree_prefix_width(depth, indented, 0),
+                        "depth {depth} indented={indented} last={is_last_child}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The layout reserves `content + chrome` rows and the renderer draws the
+    /// chrome at exactly those offsets, so a frame always closes inside the
+    /// rows its own row reserved.
+    #[test]
+    fn a_cards_reserved_height_is_its_content_plus_its_chrome() {
+        for lines in 1usize..6 {
+            assert_eq!(
+                shell_row_height(lines, RowShell::Card),
+                shell_row_height(lines, RowShell::Line) + card::CHROME_ROWS
+            );
+        }
+    }
+
+    /// Every row of the tree earns a frame at the threshold width, at every
+    /// depth the tree can reach — including a worktree child, whose legacy
+    /// connector makes its prefix the widest of the lot. A depth that fell back
+    /// to a bare line while its siblings drew cards would be two layouts
+    /// stacked on each other, and its reserved height would already have been
+    /// spent on chrome it never drew.
+    #[test]
+    fn every_depth_still_has_room_for_a_frame_at_the_threshold() {
+        for depth in 0u8..5 {
+            for indented in [false, true] {
+                let entry = WorkspaceListEntry::Workspace {
+                    ws_idx: 0,
+                    indented,
+                    depth,
+                    is_last_child: true,
+                    ancestors_continue: vec![true; depth as usize + 1],
+                };
+                let rect = Rect::new(0, 0, card::MIN_FOLD_WIDTH + 1, 4);
+                let frame = card_frame_for(rect, &entry, card::MIN_FOLD_WIDTH)
+                    .unwrap_or_else(|| panic!("depth {depth} indented={indented} drew no frame"));
+                assert!(
+                    frame.width > card::CHROME_COLS,
+                    "depth {depth} indented={indented} left no room inside its frame"
+                );
+            }
+        }
+    }
+
+    /// The badge and the chevron used to anchor on `card.rect.y`, which on a
+    /// card is the top border. They move down onto the first content row and in
+    /// past the right border, so neither is ever drawn on the frame itself.
+    #[test]
+    fn a_cards_controls_sit_on_its_first_content_row_inside_the_frame() {
+        let rect = Rect::new(0, 5, 40, 4);
+        let frame = Rect::new(1, 5, 38, 4);
+        let card = crate::app::state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect,
+            indented: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: Some(frame),
+        };
+        let chevron = workspace_group_chevron_rect(&card);
+        assert_eq!(
+            chevron.y,
+            rect.y + 1,
+            "the chevron stayed on the top border"
+        );
+        assert_eq!(
+            chevron.x,
+            frame.x + frame.width - 2,
+            "the chevron landed on the frame's right border"
+        );
+
+        let badge = worker_summary_badge_rect(&card, 3);
+        assert_eq!(badge.y, chevron.y, "the badge and the chevron parted rows");
+        assert_eq!(
+            badge.x + badge.width,
+            chevron.x,
+            "the badge did not stop one cell left of the chevron"
+        );
+
+        // The bare line is untouched: its content starts on its own first row
+        // and reaches its own right edge.
+        let line = crate::app::state::WorkspaceCardArea {
+            card_frame: None,
+            ..card
+        };
+        assert_eq!(workspace_group_chevron_rect(&line).y, rect.y);
+        assert_eq!(
+            workspace_group_chevron_rect(&line).x,
+            rect.x + rect.width - 1
+        );
+    }
+
+    /// The narrow end is the regression bar: at the widths that still draw the
+    /// bare line, every row spends the lines its layout asked for and the tree
+    /// keeps its connectors.
+    ///
+    /// The sweep stops at [`WIDEST_LINE_WIDTH`] because past it the panel draws
+    /// cards, whose rows are counted by
+    /// `a_card_never_folds_the_lines_it_is_made_of` instead.
     #[test]
     fn a_narrow_sidebar_still_stacks_every_configured_line() {
-        for width in [18u16, 22, 26, 30, 36, 44] {
+        for width in [18u16, 22, 26, 30, WIDEST_LINE_WIDTH] {
             let rows = default_layout_fleet_rows(width, 24);
             let screen = rows.join("\n");
             let tree = tree_rows(&rows);
@@ -3711,30 +4294,43 @@ mod tests {
         }
     }
 
-    /// The whole point: widen the sidebar and a row gives a line back rather
-    /// than sitting in a stack sized for a panel half as wide.
+    /// The whole point of the fold: give a row room and it gives a line back
+    /// rather than sitting in a stack sized for a panel half as wide.
+    ///
+    /// Measured at [`WIDEST_LINE_WIDTH`] now rather than at 70 columns. The
+    /// fold is the *bare line's* layout, and a panel wide enough to hold a
+    /// 30-character branch on one line is a panel wide enough to draw cards, in
+    /// which the title and the subtitle are the two rows the card is made of.
+    /// So the room the fold needs is bought with a short branch instead of a
+    /// wide panel; what is being tested — merge two configured lines when they
+    /// fit — is unchanged.
     #[test]
     fn a_wide_sidebar_folds_a_rows_configured_lines_onto_one() {
-        let rows = default_layout_fleet_rows(70, 24);
+        let cramped = tree_rows(&foldable_fleet_rows(18, 24)).len();
+        let rows = foldable_fleet_rows(WIDEST_LINE_WIDTH, 24);
         let screen = rows.join("\n");
         let tree = tree_rows(&rows);
 
-        // Six entities, one line each, where twelve lines were spent before.
-        assert_eq!(
-            tree.len(),
-            6,
-            "the tree did not fold at 70 columns:\n{screen}"
+        assert!(
+            tree.len() < cramped,
+            "the tree spent {} lines at {WIDEST_LINE_WIDTH} columns, no fewer than the \
+             {cramped} it spent at 18:\n{screen}",
+            tree.len()
         );
         assert!(
-            tree[0].contains("firstmate") && tree[0].contains("fm/herdr-dynamic-sidebar-width"),
+            tree[0].contains("firstmate") && tree[0].contains(FOLDABLE_BRANCH),
             "the first mate's branch did not join its name:\n{screen}"
         );
+        // A folded row is still a row of the tree: the merge buys a line back
+        // and touches nothing else.
         assert!(
-            tree[3].contains("├─ ") && tree[3].contains("herdr-divider-grab"),
-            "a folded worker lost its connector:\n{screen}"
+            tree[1].contains("├─ ")
+                && tree[1].contains("2ndmate-explore")
+                && tree[1].contains(FOLDABLE_BRANCH),
+            "a folded mate lost its connector or its branch:\n{screen}"
         );
         assert!(
-            tree[4].contains("│  └─ ") && tree[4].contains("wall-panel-narrowing"),
+            tree.iter().any(|row| row.contains("│  └─ ")),
             "the last worker lost its rail or its closing connector:\n{screen}"
         );
     }
@@ -3743,8 +4339,8 @@ mod tests {
     /// character: a line the layout judged foldable is a line that draws whole.
     #[test]
     fn folding_never_elides_what_it_folded() {
-        for width in [46u16, 54, 62, 70, 90] {
-            let rows = default_layout_fleet_rows(width, 24);
+        for width in 24u16..=WIDEST_LINE_WIDTH {
+            let rows = foldable_fleet_rows(width, 24);
             let screen = rows.join("\n");
             for row in tree_rows(&rows) {
                 // A line carrying both configured tokens is a folded one.
@@ -3770,10 +4366,14 @@ mod tests {
         // Swept densely on purpose. The window where an unreserved badge does
         // damage is only as wide as the badge itself - the merged line has to
         // fit the row but not the row minus the badge - so a handful of sampled
-        // widths steps straight over it.
+        // widths steps straight over it. The sweep stops at the widest bare
+        // line and rides a short branch, because folding is the bare line's
+        // layout: a card keeps its title and its subtitle on separate rows, and
+        // its badge is reserved out of the first of them.
         let mut ever_folded = false;
-        for width in 40u16..=90 {
-            let (_, rows) = default_layout_fleet(width, 24, Some("rebased and green"));
+        for width in 28u16..=WIDEST_LINE_WIDTH {
+            let (_, rows) =
+                default_layout_fleet_on(width, 24, Some("rebased and green"), FOLDABLE_BRANCH);
             let screen = rows.join("\n");
             let badged = tree_rows(&rows)
                 .into_iter()
@@ -3792,7 +4392,7 @@ mod tests {
             );
 
             // The branch reaching row 0 is the tell that this row folded.
-            if !badged.contains(FIXTURE_BRANCH) {
+            if !badged.contains(FOLDABLE_BRANCH) {
                 continue;
             }
             ever_folded = true;
@@ -3816,37 +4416,129 @@ mod tests {
         );
     }
 
-    /// Resizing has to be monotonic to feel like resizing: no width may cost
-    /// the tree rows that a narrower one could show.
+    /// Resizing has to be monotonic to feel like resizing: inside one shell, no
+    /// width may cost the tree rows that a narrower one could show.
+    ///
+    /// Swept per shell rather than across the whole range, because the panel
+    /// changes shell exactly once — at [`card::MIN_FOLD_WIDTH`], where the bare
+    /// line becomes a card — and that step *does* cost rows. It is the trade
+    /// the card is: two rows of chrome an entity, bought deliberately. What
+    /// must not happen is a second such step hiding anywhere else in the range,
+    /// which is what these two sweeps rule out.
     #[test]
     fn widening_the_sidebar_never_costs_the_tree_a_row() {
-        let mut previous = usize::MAX;
-        for width in 18u16..=90 {
-            let lines = tree_rows(&default_layout_fleet_rows(width, 24)).len();
-            assert!(
-                lines <= previous,
-                "widening to {width} columns grew the tree from {previous} lines to {lines}"
-            );
-            previous = lines;
+        for shell in [18u16..=WIDEST_LINE_WIDTH, NARROWEST_CARD_WIDTH..=90] {
+            let mut previous = usize::MAX;
+            for width in shell {
+                let lines = tree_rows(&default_layout_fleet_rows(width, 24)).len();
+                assert!(
+                    lines <= previous,
+                    "widening to {width} columns grew the tree from {previous} lines to {lines}"
+                );
+                previous = lines;
+            }
         }
+    }
+
+    /// The one step that does cost rows, pinned so it stays deliberate: the
+    /// column at which the panel stops drawing lines and starts drawing cards.
+    #[test]
+    fn the_card_shell_starts_at_one_named_width_and_costs_two_rows_an_entity() {
+        let line = default_layout_fleet_rows(WIDEST_LINE_WIDTH, 40);
+        let card = default_layout_fleet_rows(NARROWEST_CARD_WIDTH, 40);
+        assert!(
+            !line.iter().any(|row| row.contains('╭')),
+            "a card was drawn at {WIDEST_LINE_WIDTH} columns, below the threshold:\n{}",
+            line.join("\n")
+        );
+        assert_eq!(
+            tree_rows(&card).iter().filter(|r| r.contains('╭')).count(),
+            6,
+            "the card shell did not start at {NARROWEST_CARD_WIDTH} columns:\n{}",
+            card.join("\n")
+        );
+        assert_eq!(
+            tree_rows(&card).len(),
+            tree_rows(&line).len() + 2 * 6,
+            "the shell cost something other than two rows an entity"
+        );
     }
 
     /// A row that cannot have every line it asked for used to lose the tail
     /// outright. It is folded onto what it does have instead, so the token
     /// budget elides it rather than the layout dropping it.
+    ///
+    /// One body row, at a width narrow enough that the row's two configured
+    /// lines do not merge on their own: the squeeze is the only thing that can
+    /// bring the branch up onto the name's line.
     #[test]
     fn a_row_squeezed_below_its_line_count_keeps_its_tail() {
-        // Four body rows for three Spaces and three workers: nothing has room
-        // for a second line.
-        let rows = default_layout_fleet_rows(54, 6);
+        let rows = default_layout_fleet_rows(30, 3);
         let screen = rows.join("\n");
         let tree = tree_rows(&rows);
 
         assert!(!tree.is_empty(), "nothing rendered:\n{screen}");
         assert!(
-            tree[0].contains("firstmate") && tree[0].contains("fm/herdr-"),
+            tree[0].contains("firstmate") && tree[0].contains("fm/herd"),
             "the first mate's second line was dropped instead of folded:\n{screen}"
         );
+        assert!(
+            tree[0].contains('…'),
+            "the squeezed tail fitted whole, so nothing was actually elided:\n{screen}"
+        );
+    }
+
+    /// A card is drawn whole or not at all.
+    ///
+    /// The layout already refused to place a row that does not fit the body
+    /// (`compute_workspace_list_areas`), and a card makes that refusal visible:
+    /// half a card is a top border and a title with no closing rule, which
+    /// reads as a rendering fault rather than as a list that ran out of room.
+    #[test]
+    fn a_card_is_drawn_whole_or_not_at_all() {
+        for height in 3u16..=12 {
+            let rows = default_layout_fleet_rows(44, height);
+            let screen = rows.join("\n");
+            let tree = tree_rows(&rows);
+            let opened = tree.iter().filter(|row| row.contains('╭')).count();
+            let closed = tree.iter().filter(|row| row.contains('╰')).count();
+            assert_eq!(
+                opened, closed,
+                "a card was opened and not closed at height {height}:\n{screen}"
+            );
+        }
+    }
+
+    /// The card's content rows *are* the card, so they never merge however much
+    /// room the panel has. A folded card would be a bordered line, which is the
+    /// one thing the shell exists not to be.
+    #[test]
+    fn a_card_never_folds_the_lines_it_is_made_of() {
+        for width in [NARROWEST_CARD_WIDTH, 44, 70, 90] {
+            let rows = foldable_fleet_rows(width, 40);
+            let screen = rows.join("\n");
+            let tree = tree_rows(&rows);
+            // Six entities: a top border, two content rows and a closing rule
+            // each, whatever the width.
+            assert_eq!(
+                tree.iter().filter(|row| row.contains('╭')).count(),
+                6,
+                "not every entity drew a card at {width} columns:\n{screen}"
+            );
+            assert_eq!(
+                tree.len(),
+                24,
+                "a card folded its content rows at {width} columns:\n{screen}"
+            );
+            let title = tree
+                .iter()
+                .find(|row| row.contains("firstmate"))
+                .expect("the first mate has a card");
+            assert!(
+                !title.contains(FOLDABLE_BRANCH),
+                "the subtitle merged onto the title row at {width} columns:\n{screen}"
+            );
+        }
     }
 
     /// A first mate owning three second mates, drawn with whatever session
@@ -5022,6 +5714,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             ws_idx: 0,
             rect: Rect::new(0, 1, 15, 2),
             indented: false,
+            card_frame: None,
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(15, 6)).expect("test terminal");

@@ -682,6 +682,41 @@ pub struct WorkspaceCardArea {
     /// are not Spaces: clicking one focuses its pane, and a workspace reorder
     /// drag must not treat it as a drop anchor.
     pub agent: Option<AgentCardTarget>,
+    /// The card shell drawn around this row, when the panel is wide enough for
+    /// one.
+    ///
+    /// `None` is the bare styled line, whose content starts on `rect`'s own
+    /// first row and reaches `rect`'s own right edge. `Some(frame)` is the
+    /// bordered box: it starts after the row's tree rails and its columns are
+    /// measured against the panel's *fold* width rather than its drawn width,
+    /// so the frame's right edge cannot shift by a column when the scrollbar
+    /// comes and goes.
+    ///
+    /// Controls drawn over a row rather than laid out in it — the worktree
+    /// chevron, the worker-summary badge — anchor on
+    /// [`WorkspaceCardArea::content_y`] and
+    /// [`WorkspaceCardArea::control_right`], never on `rect` directly, because
+    /// a card's first row is a border.
+    pub card_frame: Option<Rect>,
+}
+
+impl WorkspaceCardArea {
+    /// The first row of this card that carries content rather than chrome.
+    pub fn content_y(&self) -> u16 {
+        self.card_frame
+            .map(|frame| frame.y.saturating_add(1))
+            .unwrap_or(self.rect.y)
+    }
+
+    /// One past the rightmost column a control drawn over this row may occupy.
+    ///
+    /// The bare row ends at its own right edge; a card ends one column inside
+    /// its right border, so a chevron never lands *on* the frame.
+    pub fn control_right(&self) -> u16 {
+        self.card_frame
+            .map(|frame| frame.x.saturating_add(frame.width).saturating_sub(1))
+            .unwrap_or_else(|| self.rect.x.saturating_add(self.rect.width))
+    }
 }
 
 /// The pane an agent row in the sidebar tree points at.
@@ -2386,8 +2421,8 @@ impl AppState {
             prefix_mods: KeyModifiers::CONTROL,
             default_sidebar_width: 26,
             sidebar_width: 26,
-            sidebar_min_width: 18,
-            sidebar_max_width: 36,
+            sidebar_min_width: crate::config::DEFAULT_SIDEBAR_BOUNDS.0,
+            sidebar_max_width: crate::config::DEFAULT_SIDEBAR_BOUNDS.1,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,

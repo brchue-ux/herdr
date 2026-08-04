@@ -573,9 +573,11 @@ impl App {
             tracing::warn!(
                 min = config.ui.sidebar_min_width,
                 max = config.ui.sidebar_max_width,
-                "ui.sidebar_min_width is greater than sidebar_max_width; falling back to default bounds (18, 36)"
+                default_min = crate::config::DEFAULT_SIDEBAR_BOUNDS.0,
+                default_max = crate::config::DEFAULT_SIDEBAR_BOUNDS.1,
+                "ui.sidebar_min_width is greater than sidebar_max_width; falling back to the default bounds"
             );
-            (18, 36)
+            crate::config::DEFAULT_SIDEBAR_BOUNDS
         });
 
         let worktree_directory =
@@ -3204,8 +3206,10 @@ mod tests {
 
         let mut app = test_app();
         // Default bounds.
-        assert_eq!(app.state.sidebar_min_width, 18);
-        assert_eq!(app.state.sidebar_max_width, 36);
+        assert_eq!(
+            (app.state.sidebar_min_width, app.state.sidebar_max_width),
+            crate::config::DEFAULT_SIDEBAR_BOUNDS
+        );
         assert_eq!(
             app.state.mobile_width_threshold,
             crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD
@@ -3282,12 +3286,9 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert_eq!(
-            app.state.sidebar_min_width, 18,
-            "App::new must fall back to default min when bounds are inverted"
-        );
-        assert_eq!(
-            app.state.sidebar_max_width, 36,
-            "App::new must fall back to default max when bounds are inverted"
+            (app.state.sidebar_min_width, app.state.sidebar_max_width),
+            crate::config::DEFAULT_SIDEBAR_BOUNDS,
+            "App::new must fall back to the default bounds when config inverts them"
         );
     }
 
