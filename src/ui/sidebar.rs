@@ -73,12 +73,14 @@ pub(crate) struct AgentPanelEntry {
     /// the Space of the pane that created this one. See
     /// [`resolve_entry_owner`].
     pub owner: Option<String>,
-    /// Which pane asked Herdr to create this one, if a pane did.
+    /// Whether a pane *in this same Space* asked Herdr to create this one.
     ///
-    /// Carried on the entry rather than looked up again because it is what
-    /// separates a pane somebody delegated from a pane a person made by hand,
-    /// which is the line [`sidebar_agent_live_entries`] draws.
-    pub created_by: Option<crate::api::schema::PaneOrigin>,
+    /// This is the membership test, not `owner`: it is true for every pane
+    /// somebody in this Space delegated, including the ones whose owner did not
+    /// resolve, and false for a pane that spun up a Space of its own. Stamped
+    /// when the entry is built, so a row replayed from memory by
+    /// [`rows_with_departing`] keeps the answer its Space gave it.
+    pub delegated_in_space: bool,
     /// Depth in the ownership tree, stamped by
     /// [`crate::app::agent_tree::arrange_agent_tree`]. 0 is a root.
     pub depth: u8,
@@ -118,7 +120,7 @@ impl AgentPanelEntry {
             tokens: std::collections::HashMap::new(),
             agent_name: Some(agent_name.to_string()),
             owner: None,
-            created_by: None,
+            delegated_in_space: false,
             depth: 0,
             relation: crate::app::agent_tree::AgentRelation::FirstMate,
             is_last_child: true,
@@ -202,6 +204,10 @@ fn collect_agent_panel_entries_with_runtimes(
                     // Resolved before the detail is taken apart, because the
                     // rule reads two of its fields at once.
                     let owner = resolve_entry_owner(app, ws_idx, &detail);
+                    let delegated_in_space = detail
+                        .created_by
+                        .as_ref()
+                        .is_some_and(|origin| ws.id == origin.workspace_id);
                     AgentPanelEntry {
                         ws_idx,
                         tab_idx: detail.tab_idx,
@@ -220,7 +226,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         last_agent_state_change_at: detail.last_agent_state_change_at,
                         owner,
                         state_labels: detail.state_labels,
-                        created_by: detail.created_by,
+                        delegated_in_space,
                         tokens: detail.tokens,
                         agent_name: detail.agent_name,
                         depth: 0,
@@ -660,15 +666,8 @@ fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
 /// row and again as a child of itself. Belonging to somebody's tree is what
 /// earns a row here.
 ///
-/// But being *unplaceable* must not cost a pane its row. A pane Herdr was asked
-/// to create has a `created_by` record even when that record yields no owner —
-/// the creator was in another Space, the Space has no label yet, an explicit
-/// token expired out from under it — and those are exactly the panes worth
-/// seeing. They draw at the root instead, which
-/// [`crate::app::agent_tree::arrange_owner_tree`] already does for any owner it
-/// cannot match. The alternative is the failure this rule exists to end: a gap
-/// in ownership silently deleting worker rows, which is how a run of merged
-/// pull requests went unseen. A flat row is a bad tree; a missing row is a lie.
+/// But being *unplaceable* must not cost a pane its row — see
+/// [`keeps_a_tree_row`], which is where that line is actually drawn.
 ///
 /// No Agents view is applied. This is the only place a worker is drawn now, and
 /// a filter here could hide the whole fleet from the only panel that shows it.
@@ -678,6 +677,30 @@ fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
 /// the instant its pane closes.
 pub(crate) fn sidebar_agent_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     rows_with_departing(app, sidebar_agent_live_entries(app))
+}
+
+/// Whether a pane has earned a row in the tree.
+///
+/// Membership is *delegation within this Space*, not a resolved owner. Those
+/// two come apart in both directions, and each direction is a bug the other
+/// predicate would cause:
+///
+/// - A pane delegated here whose owner did not resolve — the Space has no
+///   usable label yet — still belongs, and draws at the root the way
+///   [`crate::app::agent_tree::arrange_owner_tree`] already draws any owner it
+///   cannot match. Requiring an owner here is what used to *delete* such a row,
+///   which is how a run of merged pull requests went unseen. A flat row is a
+///   bad tree; a missing row is a lie.
+/// - A pane created from a *different* Space is a Space being spun up, not a
+///   worker. It is already on screen as its own Space row, so admitting it here
+///   too draws it twice — once as the Space, once as a root pane inside it.
+///   That was observed live, not reasoned about: every second mate is created
+///   from the first mate's Space, so this doubles the whole fleet.
+///
+/// An explicit `owner` token still admits a pane on its own, so a fleet that
+/// publishes ownership by hand keeps exactly the rows it always had.
+fn keeps_a_tree_row(entry: &AgentPanelEntry) -> bool {
+    entry.owner.is_some() || entry.delegated_in_space
 }
 
 /// The rows a pane that exists right now would draw.
@@ -701,7 +724,7 @@ pub(crate) fn sidebar_agent_live_entries(app: &AppState) -> Vec<AgentPanelEntry>
             )
         });
     }
-    entries.retain(|entry| entry.owner.is_some() || entry.created_by.is_some());
+    entries.retain(keeps_a_tree_row);
     entries
 }
 
@@ -3836,7 +3859,7 @@ mod tests {
             .expect("the worker pane is an agent pane");
 
         assert_eq!(worker.owner, None);
-        assert!(worker.created_by.is_some());
+        assert!(!worker.delegated_in_space);
     }
 
     /// The record holds a workspace *id* and the tree matches on a *label*, so
@@ -3859,20 +3882,49 @@ mod tests {
         assert_eq!(owner_of_worker(&app), Some("2ndmate-renamed".to_string()));
     }
 
-    /// A pane Herdr was asked to create keeps its row even when the owner does
-    /// not resolve. Losing the row is the failure this whole area exists to
-    /// end; drawing it flat at the root is merely a worse tree.
+    /// A pane delegated *here* keeps its row even when the owner does not
+    /// resolve. Losing the row is the failure this whole area exists to end;
+    /// drawing it flat at the root is merely a worse tree.
     #[test]
-    fn an_unresolved_owner_leaves_the_pane_drawn_rather_than_deleted() {
-        let (app, _) = natively_owned_fleet(26, 0);
-        let drawn = sidebar_agent_live_entries(&app);
+    fn a_delegated_pane_with_no_resolved_owner_is_drawn_rather_than_deleted() {
+        let mut entry = AgentPanelEntry::test_new("worker");
+        entry.owner = None;
+        entry.delegated_in_space = true;
+        assert!(keeps_a_tree_row(&entry));
+    }
 
-        let worker = drawn
-            .iter()
-            .find(|entry| entry.agent_name.as_deref() == Some("worker"))
-            .expect("an unowned but delegated pane must still be drawn");
-        assert_eq!(worker.owner, None);
-        assert_eq!(worker.depth, 0, "it should be a root, not nested");
+    /// A pane that spun up a Space of its own is already on screen as that
+    /// Space's row. Admitting it here as well draws the whole fleet twice —
+    /// this was seen live in a lab before it was written down.
+    #[test]
+    fn a_pane_that_spun_up_its_own_space_is_not_drawn_a_second_time() {
+        let mut entry = AgentPanelEntry::test_new("spun-up");
+        entry.owner = None;
+        entry.delegated_in_space = false;
+        assert!(!keeps_a_tree_row(&entry));
+    }
+
+    /// An explicitly published token still admits a pane by itself, so a fleet
+    /// that stamps ownership by hand keeps exactly the rows it always had.
+    #[test]
+    fn a_published_owner_still_earns_a_row_on_its_own() {
+        let mut entry = AgentPanelEntry::test_new("background-helper");
+        entry.owner = Some("background".into());
+        entry.delegated_in_space = false;
+        assert!(keeps_a_tree_row(&entry));
+    }
+
+    /// The cross-Space pane must be absent from the drawn rows entirely, not
+    /// merely unowned - the whole-topology form of the case above.
+    #[test]
+    fn a_cross_space_creation_draws_no_pane_row_at_all() {
+        let (app, _) = natively_owned_fleet(26, 0);
+        assert!(
+            sidebar_agent_live_entries(&app)
+                .iter()
+                .all(|entry| entry.agent_name.as_deref() != Some("worker")),
+            "a pane that spun up its own Space must not also draw as a pane row"
+        );
     }
 
     /// The other half of that rule: a pane nobody asked for still stays out.
