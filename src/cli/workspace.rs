@@ -232,7 +232,7 @@ fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     ))
 }
 
-const REPORT_SIGNAL_USAGE: &str = "usage: herdr workspace report-signal --source ID --kind transfer|completed [--from WORKSPACE_ID] [--to WORKSPACE_ID] [--seq N] [--ttl-ms N]";
+const REPORT_SIGNAL_USAGE: &str = "usage: herdr workspace report-signal --source ID --kind transfer|completed|failed|idle [--from WORKSPACE_ID] [--to WORKSPACE_ID] [--seq N] [--ttl-ms N]";
 
 fn workspace_report_signal(args: &[String]) -> std::io::Result<i32> {
     let mut source = None;
@@ -270,6 +270,8 @@ fn workspace_report_signal(args: &[String]) -> std::io::Result<i32> {
     let kind = match kind.as_deref() {
         Some("transfer") => WorkspaceSignalKind::Transfer,
         Some("completed") => WorkspaceSignalKind::Completed,
+        Some("failed") => WorkspaceSignalKind::Failed,
+        Some("idle") => WorkspaceSignalKind::Idle,
         Some(other) => {
             eprintln!("unknown --kind: {other}");
             eprintln!("{REPORT_SIGNAL_USAGE}");
@@ -283,7 +285,11 @@ fn workspace_report_signal(args: &[String]) -> std::io::Result<i32> {
     };
     let required = match kind {
         WorkspaceSignalKind::Transfer => ("--to", to_workspace_id.is_some()),
-        WorkspaceSignalKind::Completed => ("--from", from_workspace_id.is_some()),
+        // Everything else is a workspace reporting its own outcome, so it is
+        // the origin that has to be named.
+        WorkspaceSignalKind::Completed
+        | WorkspaceSignalKind::Failed
+        | WorkspaceSignalKind::Idle => ("--from", from_workspace_id.is_some()),
     };
     if !required.1 {
         eprintln!("--kind {} requires {}", kind_name(kind), required.0);
@@ -305,6 +311,8 @@ fn kind_name(kind: WorkspaceSignalKind) -> &'static str {
     match kind {
         WorkspaceSignalKind::Transfer => "transfer",
         WorkspaceSignalKind::Completed => "completed",
+        WorkspaceSignalKind::Failed => "failed",
+        WorkspaceSignalKind::Idle => "idle",
     }
 }
 

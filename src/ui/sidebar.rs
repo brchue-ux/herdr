@@ -13,7 +13,7 @@ use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_dot, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
-use crate::app::relation_signal::RelationSignalPhase;
+use crate::app::relation_signal::{RelationSignalKind, RelationSignalPhase};
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -1984,6 +1984,9 @@ fn render_agent_row(
             entry.ancestors_continue(),
             row_index,
             p,
+            // The Agents panel lists panes, and a relation signal is keyed on a
+            // workspace, so there is nothing here for a charge to belong to.
+            None,
         );
         spans.extend(resolved_token_spans(
             resolved,
@@ -2054,6 +2057,7 @@ fn agent_row_prefix(
     ancestors_continue: &[bool],
     row_index: usize,
     p: &Palette,
+    charge: Option<&ConnectorCharge<'_>>,
 ) -> (Vec<Span<'static>>, usize) {
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
@@ -2085,10 +2089,7 @@ fn agent_row_prefix(
     }
 
     if row_index == 0 {
-        let connector = if is_last_child { "└─ " } else { "├─ " };
-        for glyph in connector.chars() {
-            spans.push(Span::styled(glyph.to_string(), line_style));
-        }
+        push_connector_spans(&mut spans, is_last_child, charge, line_style);
         (spans, 3 * depth as usize + 1)
     } else {
         if is_last_child {
@@ -2102,31 +2103,189 @@ fn agent_row_prefix(
     }
 }
 
-fn connector_cell_style(
+/// The `├─ ` / `└─ ` connector of a child row's first line, charge and all.
+///
+/// One function for both panels' connectors so a charge cannot run one shape in
+/// the Spaces tree and another in the owned-Space tree; the sidebar already
+/// insists those be the same three glyphs, and this is what keeps them the same
+/// three glyphs while something is travelling them.
+fn push_connector_spans(
+    spans: &mut Vec<Span<'static>>,
+    is_last_child: bool,
+    charge: Option<&ConnectorCharge<'_>>,
     base: Style,
-    phase: Option<RelationSignalPhase>,
-    cell: u8,
-    p: &Palette,
-) -> Style {
-    match phase.and_then(|phase| phase.connector_cell()) {
-        // A block, not a coloured glyph: one of the three connector cells is a
-        // blank, and a foreground colour on a blank has nothing to ink.
-        Some(lit) if lit == cell => Style::default().fg(p.panel_bg).bg(p.accent),
-        _ => base,
+) {
+    let connector = if is_last_child { "└─ " } else { "├─ " };
+    for (cell, settled) in connector.chars().enumerate() {
+        let (glyph, style) = connector_cell(charge, cell as u16, settled, base);
+        spans.push(Span::styled(glyph.to_string(), style));
     }
 }
 
-/// Emphasis on a row's state icon while a signal is sitting on it.
+/// The colour vocabulary: what each kind of relation signal reads as.
 ///
-/// The icon's own colour becomes the block, rather than being replaced by the
-/// accent, because that colour *is* the agent state. A decoration is never
-/// allowed to overwrite the information underneath it.
-fn arrived_state_icon_style(base: Style, phase: Option<RelationSignalPhase>, p: &Palette) -> Style {
-    if !phase.is_some_and(|phase| phase.is_at_state_icon()) {
+/// Palette roles rather than literal hues, so the vocabulary follows whatever
+/// theme is in force — including onto a light background — instead of being
+/// written down twice and drifting. The four are chosen to be separable by hue
+/// alone, because motion is a poor channel for category: telling a completion
+/// from a failure should not require watching which way an 800 ms animation
+/// went.
+///
+/// `Transfer` deliberately keeps the accent the connector charge has always
+/// used, so the one signal that already existed does not change meaning when
+/// the vocabulary arrives around it.
+fn relation_signal_color(kind: RelationSignalKind, p: &Palette) -> ratatui::style::Color {
+    match kind {
+        RelationSignalKind::Transfer => p.accent,
+        RelationSignalKind::Completed => p.green,
+        RelationSignalKind::Failed => p.red,
+        // The quiet one, and the only one that must not compete for attention:
+        // "this branch stopped" is the least urgent thing a fleet can say.
+        RelationSignalKind::Idle => p.overlay1,
+    }
+}
+
+/// Which named behaviour a kind travels with.
+///
+/// Only two, because motion here separates *urgency*, not category — colour
+/// does category. Something happening crackles; something stopping drifts.
+fn relation_signal_behaviour(kind: RelationSignalKind) -> &'static str {
+    use crate::anim::behaviour::names;
+    match kind {
+        RelationSignalKind::Idle => names::RELATION_DRIFT,
+        RelationSignalKind::Transfer
+        | RelationSignalKind::Completed
+        | RelationSignalKind::Failed => names::RELATION_CHARGE,
+    }
+}
+
+/// One row's relation charge, resolved once and then asked about each cell.
+///
+/// Built only when a signal is actually travelling this row, so the ordinary
+/// case is a `None` costing exactly what the sidebar cost before charges
+/// existed. The route is the three connector cells plus the state icon, in draw
+/// order, which is why nothing here has to know which way the charge is going.
+struct ConnectorCharge<'a> {
+    behaviour: &'a crate::anim::behaviour::Behaviour,
+    progress: f32,
+    ink: crate::anim::cell::InkPalette,
+    /// Kept so the state icon can resolve *its own* colour the same way every
+    /// other colour in Herdr is resolved — against the palette the host
+    /// terminal actually reported, never a static table.
+    host: &'a crate::terminal_theme::TerminalTheme,
+}
+
+impl<'a> ConnectorCharge<'a> {
+    fn new(app: &'a AppState, base: Style, phase: Option<RelationSignalPhase>) -> Option<Self> {
+        let phase = phase?;
+        let behaviour = app
+            .anim
+            .catalogue()
+            .get(relation_signal_behaviour(phase.kind))?;
+        let signal = crate::ui::color::resolve_color_rgb(
+            relation_signal_color(phase.kind, &app.palette),
+            &app.host_terminal_theme,
+        )?;
+        Some(Self {
+            behaviour,
+            progress: phase.progress,
+            ink: crate::anim::cell::InkPalette::resolve(
+                base,
+                &app.palette,
+                &app.host_terminal_theme,
+            )
+            .with_signal(signal),
+            host: &app.host_terminal_theme,
+        })
+    }
+
+    fn route() -> crate::anim::cell::CellExtent {
+        crate::anim::cell::CellExtent::row(u16::from(crate::app::relation_signal::SIGNAL_STOPS))
+    }
+
+    fn paint(&self, cell: u16) -> crate::anim::cell::CellPaint {
+        self.behaviour.cell(
+            crate::anim::cell::CellPos::col(cell),
+            Self::route(),
+            self.progress,
+            crate::anim::behaviour::DriveInputs::default(),
+            self.ink,
+        )
+    }
+
+    /// How strongly the charge reaches one cell, for a call site that draws its
+    /// own thing rather than taking the paint whole.
+    fn strength(&self, cell: u16) -> f32 {
+        self.behaviour.strength(
+            crate::anim::cell::CellPos::col(cell),
+            Self::route(),
+            self.progress,
+        )
+    }
+}
+
+/// One cell of a child row's branch-line connector, charge and all.
+///
+/// The connector is pure decoration — three glyphs that spell out ownership the
+/// indent already showed — so this is the one place in the sidebar that honours
+/// a behaviour's glyph offer. `glyph_over` still refuses anything that is not
+/// the same width, so the cell count and every column stay exactly what they
+/// would be with no signal at all.
+fn connector_cell(
+    charge: Option<&ConnectorCharge<'_>>,
+    cell: u16,
+    settled: char,
+    base: Style,
+) -> (char, Style) {
+    let Some(charge) = charge else {
+        return (settled, base);
+    };
+    let paint = charge.paint(cell);
+    (
+        paint.glyph_over(settled),
+        paint.text_style(base, charge.ink),
+    )
+}
+
+/// Emphasis on a row's state icon as a charge reaches it.
+///
+/// The icon's own colour becomes the block, rather than the signal's, because
+/// that colour *is* the agent state — and its glyph is never substituted for
+/// the same reason. This is where the amended rule earns its keep: a connector
+/// cell may now change shape because it carries no information, and this cell
+/// may not because it carries all of the row's.
+///
+/// The crossfade is continuous rather than a switch, so an arriving charge
+/// flows onto the icon instead of the icon blinking on at the last stop.
+fn arrived_state_icon_style(
+    base: Style,
+    charge: Option<&ConnectorCharge<'_>>,
+    p: &Palette,
+) -> Style {
+    let Some(charge) = charge else {
+        return base;
+    };
+    let amount = charge.strength(u16::from(crate::app::relation_signal::CONNECTOR_CELLS));
+    if amount <= 0.0 {
         return base;
     }
-    let ink = base.fg.unwrap_or(p.text);
-    base.fg(p.panel_bg).bg(ink).add_modifier(Modifier::BOLD)
+    let Some(ink) = crate::ui::color::resolve_color_rgb(base.fg.unwrap_or(p.text), charge.host)
+    else {
+        return base;
+    };
+    let surface = charge.ink.surface;
+    let style = base
+        .fg(rgb_color(crate::ui::color::mix_rgb(ink, surface, amount)))
+        .bg(rgb_color(crate::ui::color::mix_rgb(surface, ink, amount)));
+    if amount >= 0.5 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn rgb_color(rgb: crate::ui::color::Rgb) -> ratatui::style::Color {
+    ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
 /// One row's place in its own lifecycle, carried through the token pass.
@@ -2422,23 +2581,21 @@ fn render_workspace_list(
                 p,
             );
             spans.append(&mut spans_prefix);
+            // Resolved once per row rather than per cell: the charge's colour
+            // and its behaviour are the same for every cell of the route, and
+            // only its position along that route differs.
+            let connector_style = Style::default().fg(p.overlay0);
+            let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase);
             let prefix_width = rail_width
                 + if card.indented {
                     spans.push(Span::raw("   "));
                     if row_index == 0 {
-                        let connector = if is_last_child { "└─ " } else { "├─ " };
-                        let connector_style = Style::default().fg(p.overlay0);
-                        for (cell, glyph) in connector.chars().enumerate() {
-                            spans.push(Span::styled(
-                                glyph.to_string(),
-                                connector_cell_style(
-                                    connector_style,
-                                    row_signal_phase,
-                                    cell as u8,
-                                    p,
-                                ),
-                            ));
-                        }
+                        push_connector_spans(
+                            &mut spans,
+                            is_last_child,
+                            row_charge.as_ref(),
+                            connector_style,
+                        );
                         6
                     } else if is_last_child {
                         spans.push(Span::raw("     "));
@@ -2451,9 +2608,18 @@ fn render_workspace_list(
                 } else if own_depth > 0 {
                     // An owned Space takes the same connector a worker does:
                     // the tree runs through the Space/pane boundary, so it must
-                    // not change shape at it.
-                    let (mut owned, width) =
-                        agent_row_prefix(own_depth, own_is_last, own_ancestors, row_index, p);
+                    // not change shape at it — and, for the same reason, a
+                    // charge has to run it too. A fleet that declares ownership
+                    // with `owner` tokens is the shape the sidebar sketch
+                    // actually describes, so this is the path most signals take.
+                    let (mut owned, width) = agent_row_prefix(
+                        own_depth,
+                        own_is_last,
+                        own_ancestors,
+                        row_index,
+                        p,
+                        row_charge.as_ref(),
+                    );
                     spans.append(&mut owned);
                     width
                 } else if row_index == 0 {
@@ -2481,7 +2647,7 @@ fn render_workspace_list(
                 resolved,
                 (
                     state_icon.0,
-                    arrived_state_icon_style(state_icon.1, row_signal_phase, p),
+                    arrived_state_icon_style(state_icon.1, row_charge.as_ref(), p),
                 ),
                 state_text_style,
                 name_style,
@@ -3065,7 +3231,7 @@ mod tests {
                 for is_last_child in [true, false] {
                     let ancestors = vec![true; depth as usize + 1];
                     let (_, drawn) =
-                        agent_row_prefix(depth, is_last_child, &ancestors, row_index, &p);
+                        agent_row_prefix(depth, is_last_child, &ancestors, row_index, &p, None);
                     assert_eq!(
                         drawn,
                         tree_prefix_width(depth, false, row_index),
@@ -4214,14 +4380,19 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
     }
 
     /// A three-space worktree tree — one parent, two indented children — with a
-    /// relation signal of `kind` advanced to `stop` on the first child.
+    /// relation signal of `kind` advanced to `position` on the first child.
+    ///
+    /// `position` counts the charge's own sub-cell steps, in
+    /// `0..=SIGNAL_POSITIONS`; the last of them is past the signal's expiry, so
+    /// asking for it renders the row exactly as it settles once nothing is
+    /// travelling it.
     ///
     /// Returns the rendered buffer alongside the app, so a caller can compare
-    /// two stops, or a signalled render against an unsignalled one, cell by
+    /// two positions, or a signalled render against an unsignalled one, cell by
     /// cell.
     fn render_signalled_tree(
         kind: Option<crate::app::relation_signal::RelationSignalKind>,
-        stop: u8,
+        position: u16,
     ) -> (ratatui::buffer::Buffer, AppState) {
         let mut app = AppState::test_new();
         app.workspaces = vec![
@@ -4243,12 +4414,12 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             app.relation_signals
                 .accept("firstmate", None, kind, carrier, None, now)
                 .expect("a fresh row always accepts its first signal");
-            // Walk the clock to the requested stop the same way the runtime
+            // Walk the clock to the requested position the same way the runtime
             // tick does, rather than reaching into the signal's internals.
             let step = crate::app::relation_signal::DEFAULT_SIGNAL_TTL
-                / u32::from(crate::app::relation_signal::SIGNAL_STOPS);
+                / u32::from(crate::app::relation_signal::SIGNAL_POSITIONS);
             app.relation_signals
-                .advance(now + step * u32::from(stop) + std::time::Duration::from_millis(1));
+                .advance(now + step * u32::from(position) + std::time::Duration::from_millis(1));
         }
 
         let list_area = workspace_list_rect(area);
@@ -4283,14 +4454,53 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .collect()
     }
 
+    /// How far a cell's foreground has been pulled away from its settled ink.
+    ///
+    /// Stands in for "how lit is this cell": the charge tints the connector's
+    /// own overlay colour toward the signal's, so the distance rises and falls
+    /// exactly as the charge passes. Reading it off the rendered buffer rather
+    /// than off the behaviour is the point — this is what the terminal got.
+    fn lit(cell: &ratatui::buffer::Cell, settled: ratatui::style::Color) -> f32 {
+        let rgb = crate::ui::color::color_to_rgb;
+        match (cell.style().fg.and_then(rgb), rgb(settled)) {
+            (Some(now), Some(base)) => {
+                let apart = |a: u8, b: u8| (f32::from(a) - f32::from(b)).abs();
+                apart(now.0, base.0) + apart(now.1, base.1) + apart(now.2, base.2)
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// The connector cell the charge is brightest on, ties going to the left.
+    ///
+    /// `None` when the charge is not on the connector at all — it has not
+    /// arrived yet, or it has already run past the state icon. The route is
+    /// four cells and only three of them are connector, so both directions
+    /// spend part of their travel entirely off it; a caller comparing frames
+    /// has to skip those rather than read a tie as a position.
+    fn peak_cell(
+        buffer: &ratatui::buffer::Buffer,
+        at: (u16, u16),
+        settled: ratatui::style::Color,
+    ) -> Option<u16> {
+        let mut peak = (0u16, 0.0f32);
+        for cell in 0..u16::from(crate::app::relation_signal::CONNECTOR_CELLS) {
+            let amount = lit(&buffer[(at.0 + cell, at.1)], settled);
+            if amount > peak.1 {
+                peak = (cell, amount);
+            }
+        }
+        (peak.1 > 0.0).then_some(peak.0)
+    }
+
     #[test]
     fn a_signal_frame_damages_only_the_branch_line_of_the_row_it_travels() {
-        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS, SIGNAL_STOPS};
+        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS, SIGNAL_POSITIONS};
 
-        // The whole route: from no signal, through every stop, back to none.
+        // The whole route: from no signal, through every position, back to none.
         let mut frames = vec![render_signalled_tree(None, 0).0];
-        for stop in 0..SIGNAL_STOPS {
-            frames.push(render_signalled_tree(Some(RelationSignalKind::Transfer), stop).0);
+        for position in 0..SIGNAL_POSITIONS {
+            frames.push(render_signalled_tree(Some(RelationSignalKind::Transfer), position).0);
         }
         frames.push(render_signalled_tree(None, 0).0);
 
@@ -4320,79 +4530,216 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert!(moved > 0, "the signal has to actually draw something");
     }
 
-    #[test]
-    fn a_row_draws_the_same_characters_whether_or_not_its_signal_ever_runs() {
-        use crate::app::relation_signal::{RelationSignalKind, SIGNAL_STOPS};
+    /// Every kind, so the vocabulary is exercised rather than just the two that
+    /// existed before it.
+    const EVERY_SIGNAL_KIND: [crate::app::relation_signal::RelationSignalKind; 4] = {
+        use crate::app::relation_signal::RelationSignalKind as K;
+        [K::Transfer, K::Completed, K::Failed, K::Idle]
+    };
 
-        let (calm, _) = render_signalled_tree(None, 0);
-        for kind in [RelationSignalKind::Transfer, RelationSignalKind::Completed] {
-            for stop in 0..SIGNAL_STOPS {
-                let (signalled, _) = render_signalled_tree(Some(kind), stop);
+    #[test]
+    fn a_charge_may_reshape_a_connector_cell_but_never_move_a_column() {
+        // This replaces a rule that said a signal may change a cell's *style*
+        // only. Everything that rule was protecting is asserted here in full:
+        // nothing outside the connector's own three decorative glyphs is ever
+        // reshaped, no substitute is a different width, and an expired signal
+        // leaves the row byte-identical. What it also forbade — and no longer
+        // does — is those three glyphs taking the shape of the charge running
+        // through them, which is the only way a discharge can be drawn at all.
+        use crate::app::relation_signal::{CONNECTOR_CELLS, SIGNAL_POSITIONS};
+
+        let (calm, app) = render_signalled_tree(None, 0);
+        let child = app.view.workspace_card_areas[1].rect;
+        let connector = child.x + 3;
+        let icon = connector + u16::from(CONNECTOR_CELLS);
+
+        let mut reshaped = 0usize;
+        for kind in EVERY_SIGNAL_KIND {
+            // The last position is past expiry, so the loop ends by checking
+            // that the row really does come all the way back.
+            for position in 0..=SIGNAL_POSITIONS {
+                let (signalled, _) = render_signalled_tree(Some(kind), position);
                 for y in calm.area.y..calm.area.y + calm.area.height {
                     for x in calm.area.x..calm.area.x + calm.area.width {
-                        assert_eq!(
-                            calm[(x, y)].symbol(),
-                            signalled[(x, y)].symbol(),
-                            "a signal changed a character at ({x}, {y}); it may only change style, \
-                             so that a skipped or interrupted signal cannot leave a row wrong"
+                        let before = calm[(x, y)].symbol();
+                        let after = signalled[(x, y)].symbol();
+                        if before == after {
+                            continue;
+                        }
+                        assert!(
+                            position < SIGNAL_POSITIONS,
+                            "{kind:?} left ({x}, {y}) as {after:?} after expiring; a signal that \
+                             was skipped, cut short, or never drawn has to leave no trace"
                         );
+                        assert!(
+                            y == child.y && (connector..icon).contains(&x),
+                            "{kind:?} reshaped ({x}, {y}), which is not one of the connector's \
+                             own decorative cells: {before:?} -> {after:?}"
+                        );
+                        assert_eq!(
+                            display_width(before),
+                            display_width(after),
+                            "{kind:?} changed the width of ({x}, {y}): {before:?} -> {after:?}"
+                        );
+                        reshaped += 1;
                     }
                 }
             }
         }
+        assert!(reshaped > 0, "the crackle has to actually take a shape");
     }
 
     #[test]
     fn a_transfer_and_a_completion_run_the_branch_line_in_opposite_directions() {
-        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS};
+        use crate::app::relation_signal::RelationSignalKind;
+
+        use crate::app::relation_signal::SIGNAL_POSITIONS;
 
         let (_, app) = render_signalled_tree(None, 0);
         let child = app.view.workspace_card_areas[1].rect;
-        let accent = app.palette.accent;
-        let lit_cell = |kind, stop| {
-            let (buffer, _) = render_signalled_tree(Some(kind), stop);
-            (0..=CONNECTOR_CELLS).find(|cell| {
-                buffer[(child.x + 3 + u16::from(*cell), child.y)].style().bg == Some(accent)
-            })
+        let settled = app.palette.overlay0;
+        // Every frame the charge is genuinely on the connector, in order. The
+        // two directions light it over different stretches of their travel, so
+        // filtering on "is it lit" is what compares like with like.
+        let track = |kind| -> Vec<u16> {
+            (0..SIGNAL_POSITIONS)
+                .filter_map(|position| {
+                    let (buffer, _) = render_signalled_tree(Some(kind), position);
+                    peak_cell(&buffer, (child.x + 3, child.y), settled)
+                })
+                .collect()
         };
+        let inbound = track(RelationSignalKind::Transfer);
+        let outbound = track(RelationSignalKind::Completed);
 
-        let inbound: Vec<Option<u8>> = (0..CONNECTOR_CELLS)
-            .map(|stop| lit_cell(RelationSignalKind::Transfer, stop))
-            .collect();
-        let outbound: Vec<Option<u8>> = (1..=CONNECTOR_CELLS)
-            .map(|stop| lit_cell(RelationSignalKind::Completed, stop))
-            .collect();
+        assert!(
+            inbound.windows(2).all(|pair| pair[1] >= pair[0]),
+            "a transfer runs toward the icon and never doubles back: {inbound:?}"
+        );
+        assert!(
+            outbound.windows(2).all(|pair| pair[1] <= pair[0]),
+            "a completion runs toward the trunk and never doubles back: {outbound:?}"
+        );
+        assert!(
+            inbound.first() < inbound.last() && outbound.first() > outbound.last(),
+            "and both actually travel: {inbound:?} / {outbound:?}"
+        );
+    }
 
-        assert_eq!(inbound, vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(outbound, vec![Some(2), Some(1), Some(0)]);
+    #[test]
+    fn each_kind_of_signal_draws_in_its_own_colour() {
+        // The point of the vocabulary: a reader should be able to tell a
+        // completion from a failure without timing an 800ms animation.
+        use crate::app::relation_signal::CONNECTOR_CELLS;
+
+        let (_, app) = render_signalled_tree(None, 0);
+        let child = app.view.workspace_card_areas[1].rect;
+
+        let mut inks = Vec::new();
+        for kind in EVERY_SIGNAL_KIND {
+            // Half-way along, where every kind has its charge on the connector.
+            let (buffer, _) = render_signalled_tree(Some(kind), 14);
+            let brightest = (0..u16::from(CONNECTOR_CELLS))
+                .map(|cell| buffer[(child.x + 3 + cell, child.y)].style().fg)
+                .max_by_key(|fg| {
+                    fg.and_then(crate::ui::color::color_to_rgb)
+                        .map(|(r, g, b)| u32::from(r) + u32::from(g) + u32::from(b))
+                        .unwrap_or(0)
+                })
+                .flatten()
+                .unwrap_or_else(|| panic!("{kind:?} lit no connector cell"));
+            inks.push((kind, brightest));
+        }
+
+        for (index, (kind, ink)) in inks.iter().enumerate() {
+            for (other_kind, other) in &inks[index + 1..] {
+                assert_ne!(
+                    ink, other,
+                    "{kind:?} and {other_kind:?} are indistinguishable; the vocabulary only \
+                     works if the categories do not collide"
+                );
+            }
+        }
+    }
+
+    /// The blend fraction from `from` to `to` that produced `observed`, if all
+    /// three channels agree on one.
+    ///
+    /// `None` when `observed` is not on that line at all, which is how a test
+    /// catches a decoration having *replaced* a colour rather than having faded
+    /// toward it.
+    fn mix_fraction(
+        from: crate::ui::color::Rgb,
+        to: crate::ui::color::Rgb,
+        observed: crate::ui::color::Rgb,
+    ) -> Option<f32> {
+        let channel = |a: u8, b: u8, seen: u8| {
+            (a != b).then(|| (f32::from(seen) - f32::from(a)) / (f32::from(b) - f32::from(a)))
+        };
+        let found = [
+            channel(from.0, to.0, observed.0),
+            channel(from.1, to.1, observed.1),
+            channel(from.2, to.2, observed.2),
+        ];
+        let found: Vec<f32> = found.into_iter().flatten().collect();
+        let first = *found.first()?;
+        found
+            .iter()
+            .all(|at| (at - first).abs() < 0.05 && (-0.02..=1.02).contains(at))
+            .then_some(first)
     }
 
     #[test]
     fn an_arriving_signal_emphasises_the_state_icon_without_recolouring_it() {
-        use crate::app::relation_signal::{RelationSignalKind, CONNECTOR_CELLS, SIGNAL_STOPS};
+        use crate::app::relation_signal::{CONNECTOR_CELLS, SIGNAL_POSITIONS};
 
-        // A transfer lands on the icon at its last stop; a completion starts
-        // there, so both directions are covered by the same assertion.
-        for (kind, arrival) in [
-            (RelationSignalKind::Transfer, SIGNAL_STOPS - 1),
-            (RelationSignalKind::Completed, 0),
-        ] {
-            let (buffer, app) = render_signalled_tree(Some(kind), arrival);
-            let child = app.view.workspace_card_areas[1].rect;
-            let icon = &buffer[(child.x + 3 + u16::from(CONNECTOR_CELLS), child.y)];
+        for kind in EVERY_SIGNAL_KIND {
+            let mut reached = 0.0f32;
+            for position in 0..SIGNAL_POSITIONS {
+                let (buffer, app) = render_signalled_tree(Some(kind), position);
+                let child = app.view.workspace_card_areas[1].rect;
+                let icon = &buffer[(child.x + 3 + u16::from(CONNECTOR_CELLS), child.y)];
 
-            let workspace = &app.workspaces[1];
-            let (state, seen) = workspace.aggregate_state(&app.terminals);
-            let (expected_symbol, expected_style) = state_dot(state, seen, &app.palette);
+                let workspace = &app.workspaces[1];
+                let (state, seen) = workspace.aggregate_state(&app.terminals);
+                let (expected_symbol, expected_style) = state_dot(state, seen, &app.palette);
+                let rgb = crate::ui::color::color_to_rgb;
+                let ink = expected_style
+                    .fg
+                    .and_then(rgb)
+                    .expect("a state dot always has a colour");
+                let surface = rgb(app.palette.panel_bg).expect("the panel has a background");
 
-            assert_eq!(icon.symbol(), expected_symbol);
-            assert_eq!(
-                icon.style().bg,
-                expected_style.fg,
-                "the arrival block has to be the state's own colour, because that colour is the \
-                 state and a decoration may not overwrite it"
+                // The icon's glyph carries the agent's state, so unlike the
+                // connector's own decorative cells it is never reshaped.
+                assert_eq!(
+                    icon.symbol(),
+                    expected_symbol,
+                    "{kind:?} at {position} reshaped the state icon"
+                );
+
+                // And the block it fades into is the state's *own* colour,
+                // never the signal's. That colour is the state; a decoration
+                // may emphasise what it decorates but not overwrite it.
+                let mix = match icon.style().bg.and_then(rgb) {
+                    None => 0.0,
+                    Some(bg) => mix_fraction(surface, ink, bg).unwrap_or_else(|| {
+                        panic!(
+                            "{kind:?} at {position} painted the icon {bg:?}, which is not \
+                             anywhere between the panel and the state's own colour"
+                        )
+                    }),
+                };
+                reached = reached.max(mix);
+            }
+            // Not 1.0: the charge is sampled at its own discrete positions, so
+            // its peak lands near the icon rather than exactly on it. What is
+            // being checked is that it genuinely arrives rather than fading out
+            // somewhere along the connector.
+            assert!(
+                reached > 0.85,
+                "{kind:?} never reached the state icon; it only got to {reached}"
             );
-            assert!(icon.style().add_modifier.contains(Modifier::BOLD));
         }
     }
 

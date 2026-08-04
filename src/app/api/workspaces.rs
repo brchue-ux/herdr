@@ -352,6 +352,14 @@ impl App {
                 RelationSignalKind::Completed,
                 params.from_workspace_id.as_deref(),
             ),
+            WorkspaceSignalKind::Failed => (
+                RelationSignalKind::Failed,
+                params.from_workspace_id.as_deref(),
+            ),
+            WorkspaceSignalKind::Idle => (
+                RelationSignalKind::Idle,
+                params.from_workspace_id.as_deref(),
+            ),
         };
         let Some(carrier_id) = carrier_id else {
             return encode_error(
@@ -363,6 +371,12 @@ impl App {
                     }
                     WorkspaceSignalKind::Completed => {
                         "workspace signal kind completed requires from_workspace_id"
+                    }
+                    WorkspaceSignalKind::Failed => {
+                        "workspace signal kind failed requires from_workspace_id"
+                    }
+                    WorkspaceSignalKind::Idle => {
+                        "workspace signal kind idle requires from_workspace_id"
                     }
                 },
             );

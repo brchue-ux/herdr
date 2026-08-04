@@ -67,6 +67,10 @@ pub enum WorkspaceSignalKind {
     Transfer,
     /// `from_workspace_id` finished the work it was given.
     Completed,
+    /// `from_workspace_id` failed the work it was given.
+    Failed,
+    /// `from_workspace_id` has nothing left to do and has gone quiet.
+    Idle,
 }
 
 /// A transient relation between two runtime entities.
