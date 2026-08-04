@@ -1035,6 +1035,89 @@ row_exit_ms = 5
         );
     }
 
+    /// Off by default, and off means the engine is asked for nothing. Turning
+    /// it on is what pays for the Git scan and the forge request behind three
+    /// of its slots, so it must never arrive switched on.
+    #[test]
+    fn the_signal_bar_is_off_until_it_is_asked_for() {
+        let config = SidebarConfig::default();
+        assert!(!config.notifications.enabled);
+        assert!(!config.notifications.animates());
+    }
+
+    #[test]
+    fn a_configured_signal_bar_declares_its_own_life() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.notifications]
+enabled = true
+emphasis = "shimmer"
+enter = "wipe"
+enter_ms = 900
+"#,
+        )
+        .expect("signal bar config");
+        let notifications = config.ui.sidebar.notifications;
+
+        assert!(notifications.enabled);
+        assert!(notifications.animates());
+        let lifecycle = notifications.lifecycle();
+        assert_eq!(
+            lifecycle.mount,
+            Some(crate::anim::Stage::new(
+                crate::anim::behaviour::names::WIPE,
+                std::time::Duration::from_millis(900),
+            ))
+        );
+        assert_eq!(
+            lifecycle.idle,
+            vec![crate::anim::behaviour::names::SHIMMER.to_string()]
+        );
+    }
+
+    /// A live slot can be colour-only. It is still a change the eye catches,
+    /// and it costs the loop nothing.
+    #[test]
+    fn a_still_signal_bar_asks_the_animation_clock_for_nothing() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.notifications]
+enabled = true
+emphasis = "none"
+enter = "none"
+"#,
+        )
+        .expect("still signal bar config");
+        let notifications = config.ui.sidebar.notifications;
+
+        assert!(notifications.enabled);
+        assert!(!notifications.animates());
+        assert_eq!(notifications.lifecycle(), crate::anim::Lifecycle::still());
+    }
+
+    #[test]
+    fn a_signal_arrival_is_clamped_the_same_way_a_row_arrival_is() {
+        let long = SidebarNotificationsConfig {
+            enabled: true,
+            enter_ms: 60_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            long.enter_stage().map(|stage| stage.duration),
+            Some(std::time::Duration::from_millis(MAX_ROW_ENTER_MS))
+        );
+
+        let short = SidebarNotificationsConfig {
+            enabled: true,
+            enter_ms: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            short.enter_stage().map(|stage| stage.duration),
+            Some(std::time::Duration::from_millis(MIN_ROW_ENTER_MS))
+        );
+    }
+
     #[test]
     fn defaults_match_the_compact_agent_and_existing_space_layouts() {
         let config = SidebarConfig::default();

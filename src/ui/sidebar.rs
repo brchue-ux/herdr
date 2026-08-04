@@ -1,3 +1,4 @@
+mod notifications;
 mod tokens;
 
 use ratatui::{
@@ -897,7 +898,47 @@ pub(crate) fn workspace_list_header_rect(area: Rect) -> Rect {
 /// better blank than wrong.
 const MIN_SESSION_STATUS_WIDTH: u16 = 6;
 
-/// Draw the session status on the panel's reserved header row.
+/// Columns between the signal bar and whatever shares its row.
+const HEADER_ROW_GAP: u16 = 2;
+
+/// Draw the panel's reserved header row: the fleet signal bar, then the session
+/// status in whatever is left.
+///
+/// The bar takes its columns from the left and the status right-aligns in the
+/// remainder, so the two never overlap and neither has to know the other's
+/// content. The bar is measured first on purpose: it is a fixed readout whose
+/// positions a reader learns, while the status is arbitrary publisher text that
+/// already knows how to elide and how to drop when it cannot be read.
+fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
+    let header = workspace_list_header_rect(area);
+    if header.height == 0 {
+        return;
+    }
+
+    let bar_width = notifications::fleet_signal_bar_width(app, header.width);
+    if bar_width > 0 {
+        notifications::render_fleet_signal_bar(
+            app,
+            frame,
+            Rect::new(header.x, header.y, bar_width, header.height),
+        );
+    }
+
+    let taken = bar_width.saturating_add(if bar_width > 0 { HEADER_ROW_GAP } else { 0 });
+    let remaining = header.width.saturating_sub(taken);
+    render_session_status(
+        app,
+        frame,
+        Rect::new(
+            header.x.saturating_add(taken),
+            header.y,
+            remaining,
+            header.height,
+        ),
+    );
+}
+
+/// Draw the session status in the columns of the header row left over for it.
 ///
 /// Right-aligned on purpose. Every row below it is left-aligned and carries
 /// the indent guides and connectors that spell out ownership, so a left-hung
@@ -911,18 +952,17 @@ fn render_session_status(app: &AppState, frame: &mut Frame, area: Rect) {
     let Some(status) = app.session_status.as_deref() else {
         return;
     };
-    let header = workspace_list_header_rect(area);
-    if header.width < MIN_SESSION_STATUS_WIDTH || header.height == 0 {
+    if area.width < MIN_SESSION_STATUS_WIDTH || area.height == 0 {
         return;
     }
-    let text = truncate_end(status, usize::from(header.width));
+    let text = truncate_end(status, usize::from(area.width));
     frame.render_widget(
         Paragraph::new(Span::styled(
             text,
             Style::default().fg(app.palette.overlay0),
         ))
         .alignment(Alignment::Right),
-        header,
+        area,
     );
 }
 
@@ -2467,17 +2507,36 @@ fn push_token_span(
     patch: crate::config::SidebarTokenStyle,
     anim: &RowAnimation<'_>,
 ) {
+    let style = apply_token_style(base, patch);
+    push_animated_span(spans, text, style, anim.frame(patch), anim.palette, anim.host);
+}
+
+/// Draw one span of text with an animation frame reaching each of its cells.
+///
+/// The one place a sidebar surface turns an [`crate::anim::ElementFrame`] into
+/// spans. Emits exactly one span when the frame is uniform across the text — the
+/// common case, and the only shape this pass produced before the engine existed
+/// — and one span per cell only when a behaviour genuinely differs cell to cell.
+/// Text nothing is animating takes the first branch and is byte-for-byte what it
+/// always was.
+pub(super) fn push_animated_span(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    style: Style,
+    frame: Option<crate::anim::ElementFrame<'_>>,
+    palette: &Palette,
+    host: &crate::terminal_theme::TerminalTheme,
+) {
     use crate::anim::cell::{CellExtent, CellPos, InkPalette};
 
-    let style = apply_token_style(base, patch);
     let width = crate::ui::text::display_width_u16(&text);
-    let Some(frame) = anim.frame(patch).filter(|_| width > 0) else {
+    let Some(frame) = frame.filter(|_| width > 0) else {
         spans.push(Span::styled(text, style));
         return;
     };
 
     let extent = CellExtent::row(width);
-    let ink = InkPalette::resolve(style, anim.palette, anim.host);
+    let ink = InkPalette::resolve(style, palette, host);
     if frame.is_uniform() {
         let paint = frame.cell(CellPos::col(0), extent, ink);
         spans.push(Span::styled(text, paint.text_style(style, ink)));
@@ -2565,7 +2624,7 @@ fn render_workspace_list(
     let list_bottom = area.y + area.height.saturating_sub(1);
     let fold_width = row_fold_width(area);
 
-    render_session_status(app, frame, area);
+    render_header_row(app, frame, area);
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
@@ -3714,6 +3773,295 @@ mod tests {
             rows[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
             "a stub status drew at 5 columns:\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// Renders a sidebar with the fleet signal bar switched on, optionally with
+    /// two of its signals driven live, and returns the drawn rows.
+    ///
+    /// `dirty` is driven through the workspace's own cached Git counts and
+    /// `blocked` through a pane's detected agent state, which are the same two
+    /// facts the tree below the bar already reads — so the test drives real
+    /// state rather than reaching into the bar.
+    fn signal_bar_rows(width: u16, dirty: bool, blocked: bool) -> Vec<String> {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_notifications.enabled = true;
+
+        if dirty {
+            app.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
+                staged: 0,
+                unstaged: 1,
+                untracked: 0,
+            });
+        }
+        if blocked {
+            let terminal_id = app
+                .terminals
+                .keys()
+                .next()
+                .expect("a terminal exists")
+                .clone();
+            app.terminals
+                .get_mut(&terminal_id)
+                .expect("terminal exists")
+                .state = crate::detect::AgentState::Blocked;
+        }
+
+        // The app loop is what publishes the live set; a render-only test has
+        // to stand in for it or nothing would ever be mounted.
+        let now = std::time::Instant::now();
+        let lifecycle = app.sidebar_notifications.lifecycle();
+        let live: Vec<_> = crate::app::fleet_signals::FleetSignals::resolve(&app)
+            .animation_membership()
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::Named, &lifecycle, live);
+        // Past the arrival, so a live slot is drawn in its steady state rather
+        // than mid-fade.
+        app.anim
+            .advance(now + std::time::Duration::from_millis(600));
+
+        let area = Rect::new(0, 0, width, 12);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| row_text(buffer, area.y + row, area.width))
+            .collect()
+    }
+
+    /// Foreground each signal's mark is drawn in on the header row.
+    ///
+    /// Keyed by the mark rather than by column so the assertion does not have
+    /// to know which tier the width picked.
+    fn signal_bar_mark_colors(
+        width: u16,
+        dirty: bool,
+        blocked: bool,
+    ) -> std::collections::HashMap<String, Option<ratatui::style::Color>> {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_notifications.enabled = true;
+        // Colour, not motion, is what this reads; a still live slot keeps its
+        // own colour and makes the assertion independent of the frame clock.
+        app.sidebar_notifications.emphasis = crate::config::SidebarTokenEmphasis::None;
+        app.sidebar_notifications.enter = crate::config::SidebarTokenEmphasis::None;
+
+        if dirty {
+            app.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
+                staged: 0,
+                unstaged: 1,
+                untracked: 0,
+            });
+        }
+        if blocked {
+            let terminal_id = app
+                .terminals
+                .keys()
+                .next()
+                .expect("a terminal exists")
+                .clone();
+            app.terminals
+                .get_mut(&terminal_id)
+                .expect("terminal exists")
+                .state = crate::detect::AgentState::Blocked;
+        }
+
+        let area = Rect::new(0, 0, width, 12);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut colors = std::collections::HashMap::new();
+        for column in 0..area.width {
+            let cell = &buffer[(column, 0)];
+            colors
+                .entry(cell.symbol().to_string())
+                .or_insert(cell.style().fg);
+        }
+        colors
+    }
+
+    /// Resting slots are the panel's muted grey; a live one is its own colour.
+    /// The change from one to the other is what the bar is for.
+    #[test]
+    fn a_live_signal_leaves_the_resting_grey_for_its_own_colour() {
+        let palette = crate::app::state::AppState::test_new().palette;
+        let width = notifications::Tier::Marks.width() + 2;
+
+        let resting = signal_bar_mark_colors(width, false, false);
+        for signal in crate::app::fleet_signals::FleetSignal::ALL {
+            assert_eq!(
+                resting.get(signal.mark()).copied().flatten(),
+                Some(palette.overlay0),
+                "{signal:?} is not grey on a resting bar"
+            );
+        }
+
+        let alerting = signal_bar_mark_colors(width, true, true);
+        assert_eq!(
+            alerting.get("~").copied().flatten(),
+            Some(palette.green),
+            "uncommitted work did not colour its own slot"
+        );
+        assert_eq!(
+            alerting.get("◉").copied().flatten(),
+            Some(palette.red),
+            "a blocked agent did not colour its own slot"
+        );
+        // And the six that are still quiet have not moved.
+        assert_eq!(
+            alerting.get("⋔").copied().flatten(),
+            Some(palette.overlay0),
+            "a quiet slot changed colour because a different signal went live"
+        );
+    }
+
+    /// The bar's whole promise: at rest it is still there, and it says what the
+    /// eight things are.
+    #[test]
+    fn a_quiet_fleet_still_draws_all_eight_signals_named() {
+        let width = notifications::Tier::Named.width() + 4;
+        let rows = signal_bar_rows(width, false, false);
+        let screen = rows.join("\n");
+
+        for signal in crate::app::fleet_signals::FleetSignal::ALL {
+            assert!(
+                rows[0].contains(signal.name()),
+                "{signal:?} is not named on a resting bar:\n{screen}"
+            );
+            assert!(
+                rows[0].contains(signal.mark()),
+                "{signal:?} has no mark on a resting bar:\n{screen}"
+            );
+        }
+    }
+
+    /// Resting is grey, live is the signal's own colour. Nothing else about the
+    /// slot changes, so the bar never reflows as alerts come and go.
+    #[test]
+    fn a_signal_going_live_changes_its_colour_and_nothing_else() {
+        let width = notifications::Tier::Named.width() + 4;
+        let resting = signal_bar_rows(width, false, false);
+        let alerting = signal_bar_rows(width, true, true);
+
+        assert_eq!(
+            resting[0], alerting[0],
+            "the bar's text moved when two signals went live"
+        );
+        assert_eq!(
+            resting[1..],
+            alerting[1..],
+            "the tree moved when two signals went live"
+        );
+    }
+
+    /// The narrow ladder: names go first, then the gaps, and all eight marks
+    /// survive to the floor.
+    #[test]
+    fn a_narrow_sidebar_keeps_every_signal_and_drops_the_names() {
+        for (width, tier) in [
+            (notifications::Tier::Marks.width(), "marks"),
+            (notifications::Tier::Tight.width(), "tight"),
+        ] {
+            let rows = signal_bar_rows(width + 1, false, false);
+            let screen = rows.join("\n");
+            for signal in crate::app::fleet_signals::FleetSignal::ALL {
+                assert!(
+                    rows[0].contains(signal.mark()),
+                    "{signal:?} vanished from the {tier} tier at {width} columns:\n{screen}"
+                );
+                assert!(
+                    !rows[0].contains(signal.name()),
+                    "{signal:?} still drew its name in the {tier} tier:\n{screen}"
+                );
+            }
+        }
+    }
+
+    /// A real 26-column sidebar - the default width - still shows all eight.
+    #[test]
+    fn the_default_sidebar_width_holds_the_whole_bar() {
+        let rows = signal_bar_rows(26, false, false);
+        let screen = rows.join("\n");
+        assert!(
+            notifications::Tier::widest_fitting(25).is_some(),
+            "the default sidebar cannot hold the bar at all"
+        );
+        for signal in crate::app::fleet_signals::FleetSignal::ALL {
+            assert!(
+                rows[0].contains(signal.mark()),
+                "{signal:?} is missing at the default 26 columns:\n{screen}"
+            );
+        }
+    }
+
+    /// Off by default: an unconfigured Herdr draws the header row exactly as it
+    /// did before the bar existed.
+    #[test]
+    fn the_bar_is_not_drawn_until_it_is_configured_on() {
+        let without = mate_fleet_sidebar_rows(26, None);
+        assert!(
+            without[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
+            "something drew on the header row of an unconfigured Herdr:\n{}",
+            without.join("\n")
+        );
+    }
+
+    /// The bar takes the left of the row and the status keeps the right, so
+    /// turning the bar on never writes over a published status.
+    #[test]
+    fn the_bar_and_the_session_status_share_the_header_row_without_overlapping() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_notifications.enabled = true;
+        app.session_status = Some("62%".to_string());
+
+        let area = Rect::new(0, 0, 40, 12);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let row = row_text(terminal.backend().buffer(), 0, area.width);
+
+        assert!(row.starts_with('●'), "the bar is not hung on the left: {row}");
+        assert!(
+            row.trim_end_matches('│').ends_with("62%"),
+            "the status is not right-aligned beside the bar: {row}"
+        );
+
+        // Both measured in columns: the bar's last slot has to end before the
+        // status begins, or one has been drawn over the other.
+        let columns: Vec<char> = row.chars().collect();
+        let last_slot = columns
+            .iter()
+            .position(|ch| *ch == '⋔')
+            .expect("the bar's last slot is missing");
+        let status_start = columns
+            .windows(3)
+            .position(|window| window == ['6', '2', '%'])
+            .expect("the status is missing");
+        assert!(
+            status_start > last_slot,
+            "the status overlapped the bar: {row}"
         );
     }
 

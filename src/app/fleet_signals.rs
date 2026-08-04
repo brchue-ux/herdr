@@ -70,8 +70,13 @@ pub(crate) enum FleetSignal {
 }
 
 impl FleetSignal {
+    /// How many signals there are. The bar's whole readability rests on this
+    /// being a small fixed number, so it is spelled once here and every width
+    /// and every array length is derived from it.
+    pub(crate) const COUNT: usize = 8;
+
     /// Every signal, in the fixed order they are always read in.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::Review,
         Self::Ask,
         Self::Report,
@@ -166,7 +171,7 @@ impl FleetSignal {
 /// renderer, the animation membership set — reads the same answer.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct FleetSignals {
-    live: [bool; FleetSignal::ALL.len()],
+    live: [bool; FleetSignal::COUNT],
     /// Busiest pane's smoothed work volume, in `0.0..=1.0`.
     fleet_activity: f32,
 }
@@ -174,8 +179,10 @@ pub(crate) struct FleetSignals {
 impl FleetSignals {
     /// Read all eight out of the app's current state.
     pub(crate) fn resolve(app: &AppState) -> Self {
-        let mut signals = Self::default();
-        signals.fleet_activity = fleet_activity(app);
+        let mut signals = Self {
+            fleet_activity: fleet_activity(app),
+            ..Self::default()
+        };
 
         for workspace in &app.workspaces {
             if workspace.git_dirty().is_some_and(|dirty| !dirty.is_clean()) {
@@ -238,6 +245,11 @@ impl FleetSignals {
         self.live[index(signal)]
     }
 
+    /// True when anything at all is asserting.
+    ///
+    /// Test-facing only: the bar draws all eight slots whether or not any of
+    /// them is live, so nothing in the draw path has a reason to ask.
+    #[cfg(test)]
     pub(crate) fn any_live(&self) -> bool {
         self.live.iter().any(|live| *live)
     }
@@ -342,7 +354,7 @@ mod tests {
             );
             seen.push(signal);
         }
-        assert_eq!(seen.len(), 8);
+        assert_eq!(seen.len(), FleetSignal::COUNT);
 
         // The order is the contract: a reader learns the positions once, so a
         // signal must never move under them.
@@ -461,7 +473,9 @@ mod tests {
             .copied()
             .next()
             .expect("test workspace has a pane");
-        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id].attached_terminal_id;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
         app.workspaces[0]
             .tabs
             .get_mut(0)
@@ -518,7 +532,12 @@ mod tests {
         let mut app = AppState::test_new();
         app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
         app.ensure_test_terminals();
-        let terminal_id = *app.terminals.keys().next().expect("a terminal exists");
+        let terminal_id = app
+            .terminals
+            .keys()
+            .next()
+            .expect("a terminal exists")
+            .clone();
         app.terminals
             .get_mut(&terminal_id)
             .expect("terminal exists")
