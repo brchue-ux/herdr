@@ -837,6 +837,7 @@ pub struct SidebarConfig {
     pub spaces: SpacesSidebarConfig,
     pub animation: SidebarAnimationConfig,
     pub notifications: SidebarNotificationsConfig,
+    pub signal_tray: SidebarSignalTrayConfig,
 }
 
 /// How long a signal's arrival runs. Short: an alert lighting up is news, and
@@ -910,6 +911,42 @@ impl SidebarNotificationsConfig {
     /// True when a drawn bar has something moving in it.
     pub(crate) fn animates(&self) -> bool {
         self.enabled && (self.emphasis.animates() || self.enter_stage().is_some())
+    }
+}
+
+/// The notification tray at the foot of the Spaces panel.
+///
+/// Off by default for the same reason the signal bar is, and then some: four of
+/// its eight slots read counts that cost a network round trip to the forge or a
+/// `git status` scan, and both are demand-gated on something rendering them.
+/// The tray also arms the scan the bar deliberately does not, because its `sync`
+/// slot refuses on a dirty tree — see
+/// [`crate::app::fleet_signals::FleetSignalDemand::for_tray`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarSignalTrayConfig {
+    /// Whether the tray is drawn at all. When it is, all eight slots are drawn,
+    /// every frame, for the same reason the bar draws all eight: position is
+    /// half of what makes a badge readable at a glance.
+    pub enabled: bool,
+    /// Whether a badge click may run the in-place acts at all.
+    ///
+    /// `false` turns every badge into a jump. Nothing else changes: the same
+    /// eight slots light on the same eight conditions, and the popup still says
+    /// what each one covers. This exists because "may Herdr run `git push` on my
+    /// behalf from a click" is a policy question with a legitimate no.
+    pub actions: bool,
+}
+
+impl Default for SidebarSignalTrayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // On, but only ever reached from a popup that has already printed
+            // the exact command. Turning the whole tray on is the opt-in; being
+            // asked to confirm a push after that is not a second one.
+            actions: true,
+        }
     }
 }
 

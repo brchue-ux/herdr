@@ -444,6 +444,7 @@ mod tests {
                     open: 4,
                     draft: 1,
                     review_requested: 2,
+                    ..Default::default()
                 }),
                 false,
             ),
@@ -504,6 +505,7 @@ mod tests {
                     open: 2,
                     draft: 0,
                     review_requested: 0,
+                    ..Default::default()
                 }),
                 true,
             ),

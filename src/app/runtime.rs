@@ -311,6 +311,7 @@ impl App {
         }
         changed |= self.advance_relation_signals(now, true);
         changed |= self.sample_pane_activity(now);
+        changed |= self.observe_signal_tray(now);
 
         if self
             .selection_autoscroll_deadline
@@ -546,6 +547,141 @@ impl App {
         let moved = drawn.len() != self.state.sidebar_tree_row_memory.len();
         self.state.sidebar_tree_row_memory = drawn;
         changed || moved
+    }
+
+    /// Fold the fleet's current state into the notification tray.
+    ///
+    /// Three things happen here, and all three are mutations, which is exactly
+    /// why they are here and not in the renderer:
+    ///
+    /// 1. **Escalation.** Whether a badge is merely lit or is demanding
+    ///    attention is a *transition*, so it needs the previous reading to
+    ///    compare against. [`crate::app::signal_tray::SignalTrayState::observe`]
+    ///    is the only place that comparison is made.
+    /// 2. **The question.** A blocked agent's screen lives behind a terminal
+    ///    lock the pure renderer cannot take, so the text is snapshotted into
+    ///    state on a clock — and only while the tray is on and something is
+    ///    blocked, so a Herdr with a quiet fleet pays nothing.
+    /// 3. **The artwork.** Eight badges rasterised from scratch is not a
+    ///    per-frame cost, so it is redone only when the states, the grid or the
+    ///    cell size move.
+    ///
+    /// Returns whether anything a frame would show has changed.
+    pub(crate) fn observe_signal_tray(&mut self, now: Instant) -> bool {
+        if !crate::ui::signal_tray_active(&self.state) {
+            let had = self.state.signal_tray_graphics.take().is_some();
+            self.state.signal_tray_graphics_key = 0;
+            return had;
+        }
+
+        let mut changed = self.refresh_blocked_questions(now);
+        changed |= self
+            .state
+            .signal_tray
+            .observe(crate::app::signal_tray::magnitudes(&self.state));
+        changed |= self.refresh_signal_tray_graphics();
+        changed
+    }
+
+    /// Snapshot what every blocked pane is showing.
+    ///
+    /// Wholesale, so a pane that stopped being blocked stops having a
+    /// remembered question: a stale question under a live badge would be worse
+    /// than none at all.
+    fn refresh_blocked_questions(&mut self, now: Instant) -> bool {
+        if !self.state.signal_tray.questions_are_due(now) {
+            return false;
+        }
+        let blocked: Vec<(crate::layout::PaneId, crate::terminal::TerminalId)> = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .filter_map(|(pane_id, pane)| {
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                matches!(terminal.state, crate::detect::AgentState::Blocked)
+                    .then(|| (*pane_id, pane.attached_terminal_id.clone()))
+            })
+            .collect();
+
+        let questions = blocked
+            .into_iter()
+            .filter_map(|(pane_id, terminal_id)| {
+                let runtime = self.terminal_runtimes.get(&terminal_id)?;
+                let lines = crate::app::signal_tray::SignalTrayState::question_lines(
+                    &runtime.detection_text(),
+                );
+                (!lines.is_empty()).then_some((pane_id, lines))
+            })
+            .collect();
+
+        self.state.signal_tray.set_questions(now, questions);
+        // The snapshot only reaches a frame through an open `ask` popup, so a
+        // refresh nobody is looking at is not a reason to repaint.
+        self.state
+            .signal_tray
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.signal == crate::app::fleet_signals::FleetSignal::Ask)
+    }
+
+    /// Redraw the tray's badge artwork when what it was drawn for has moved.
+    fn refresh_signal_tray_graphics(&mut self) -> bool {
+        if !self.state.kitty_graphics_enabled || !self.state.host_cell_size.is_known() {
+            let had = self.state.signal_tray_graphics.take().is_some();
+            self.state.signal_tray_graphics_key = 0;
+            return had;
+        }
+
+        let cell = self.state.host_cell_size;
+        let key = self.signal_tray_graphics_key(cell);
+        if key == self.state.signal_tray_graphics_key && self.state.signal_tray_graphics.is_some() {
+            return false;
+        }
+
+        let Some((_, image)) =
+            crate::ui::signal_tray_image(&self.state, cell.width_px, cell.height_px)
+        else {
+            let had = self.state.signal_tray_graphics.take().is_some();
+            self.state.signal_tray_graphics_key = 0;
+            return had;
+        };
+
+        self.state.signal_tray_graphics_key = key;
+        self.state.signal_tray_graphics = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Rgba,
+            image.width,
+            image.height,
+            image.pixels,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                // Over the text. The badges *are* the tray; the fallback marks
+                // underneath them are what a host with no graphics gets, and on
+                // a host with graphics they are meant to be covered.
+                z: 0,
+            },
+        ));
+        true
+    }
+
+    /// Everything the artwork depends on, folded into one number.
+    fn signal_tray_graphics_key(&self, cell: crate::kitty_graphics::HostCellSize) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let grid = crate::ui::signal_tray_graphics_rect(&self.state);
+        (grid.x, grid.y, grid.width, grid.height).hash(&mut hasher);
+        (cell.width_px, cell.height_px).hash(&mut hasher);
+        for badge in crate::app::signal_tray::resolve(&self.state).badges() {
+            badge.state.hash(&mut hasher);
+        }
+        format!("{:?}", self.state.palette.peach).hash(&mut hasher);
+        format!("{:?}", self.state.host_terminal_theme.background).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Move the clock the sidebar renders elapsed times against.
@@ -1223,18 +1359,14 @@ mod tests {
         assert!(app.state.anim.is_empty());
         assert_eq!(app.state.anim.next_deadline(now), None);
 
-        app.state.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
-            staged: 0,
-            unstaged: 1,
-            untracked: 0,
-        });
+        app.state.workspaces[0].cached_git_ahead_behind = Some((1, 0));
         app.advance_animations(now, true);
         assert!(
             app.state
                 .anim
-                .frame(&FleetSignal::Dirty.element_id(), None)
+                .frame(&FleetSignal::Push.element_id(), None)
                 .is_some(),
-            "uncommitted work did not bring its own element into existence"
+            "unpushed work did not bring its own element into existence"
         );
         assert!(
             app.state
@@ -1244,10 +1376,9 @@ mod tests {
             "a quiet signal was given an element"
         );
 
-        // Committing the work clears the alert. The element leaves on its own
+        // Pushing the work clears the alert. The element leaves on its own
         // because it simply stopped being in the published membership set.
-        app.state.workspaces[0].cached_git_dirty =
-            Some(crate::workspace::GitDirtyCounts::default());
+        app.state.workspaces[0].cached_git_ahead_behind = Some((0, 0));
         app.advance_animations(now + std::time::Duration::from_secs(2), true);
         assert!(app.state.anim.is_empty());
     }
@@ -1260,11 +1391,7 @@ mod tests {
         let (mut app, _) = test_app_with_pane();
         app.state.sidebar_spaces.rows = pulse_space_rows();
         app.state.sidebar_notifications.enabled = true;
-        app.state.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
-            staged: 1,
-            unstaged: 0,
-            untracked: 0,
-        });
+        app.state.workspaces[0].cached_git_ahead_behind = Some((1, 0));
         let now = Instant::now();
 
         app.advance_animations(now, true);
@@ -1273,7 +1400,7 @@ mod tests {
         assert!(app
             .state
             .anim
-            .frame(&FleetSignal::Dirty.element_id(), None)
+            .frame(&FleetSignal::Push.element_id(), None)
             .is_some());
 
         // Switching the bar off must retire its slots and leave the row alone.
@@ -1286,7 +1413,7 @@ mod tests {
         assert!(app
             .state
             .anim
-            .frame(&FleetSignal::Dirty.element_id(), None)
+            .frame(&FleetSignal::Push.element_id(), None)
             .is_none());
     }
 
@@ -1753,11 +1880,7 @@ mod tests {
         app.state.sidebar_notifications.enabled = true;
         // Something for the bar to actually light up, so its family is
         // populated rather than trivially empty.
-        app.state.workspaces[1].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
-            staged: 0,
-            unstaged: 1,
-            untracked: 0,
-        });
+        app.state.workspaces[1].cached_git_ahead_behind = Some((1, 0));
         let now = Instant::now();
 
         app.advance_animations(now, true);
@@ -1769,7 +1892,7 @@ mod tests {
         assert!(
             app.state
                 .anim
-                .frame(&FleetSignal::Dirty.element_id(), None)
+                .frame(&FleetSignal::Push.element_id(), None)
                 .is_some(),
             "the bar is not actually running, so this proves nothing"
         );
@@ -1793,7 +1916,7 @@ mod tests {
         assert!(app
             .state
             .anim
-            .frame(&FleetSignal::Dirty.element_id(), None)
+            .frame(&FleetSignal::Push.element_id(), None)
             .is_some());
     }
 

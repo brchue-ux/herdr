@@ -89,6 +89,10 @@ struct HostPlacement {
 enum HostSurfaceId {
     Pane(PaneId),
     Sidebar,
+    /// The notification tray's badge artwork, which Herdr draws itself. Its own
+    /// identity rather than a share of `Sidebar`, so a client publishing to the
+    /// sidebar and the tray redrawing cannot evict one another.
+    SignalTray,
 }
 
 impl HostSurfaceId {
@@ -99,6 +103,7 @@ impl HostSurfaceId {
         match self {
             Self::Pane(pane_id) => pane_id.raw().hash(hasher),
             Self::Sidebar => "surface.sidebar".hash(hasher),
+            Self::SignalTray => "surface.signal-tray".hash(hasher),
         }
     }
 }
@@ -662,11 +667,18 @@ fn collect_visible_placements(
     placements
 }
 
-/// Every non-pane rect that currently carries an API-owned image layer.
+/// Every non-pane rect that currently carries an image layer.
 ///
 /// This is the second placement source the graphics surface has: it resolves a
 /// named surface to the rect the layout put it at, so the layer travels the same
 /// clipping, caching, signature and delete-by-id path a pane layer does.
+///
+/// Two owners feed it. API clients publish onto
+/// [`crate::api::schema::GraphicsSurface`]; the notification tray publishes its
+/// own badge artwork, which is Herdr's own drawing rather than a client's. They
+/// are separate [`HostSurfaceId`]s on purpose — sharing one would mean a client
+/// setting a sidebar image erased the tray, and the tray redrawing erased the
+/// client's image.
 fn surface_layer_placement_targets(
     app: &AppState,
 ) -> impl Iterator<Item = (HostSurfaceId, Rect, &crate::app::state::GraphicsLayer)> {
@@ -677,6 +689,13 @@ fn surface_layer_placement_targets(
                 (HostSurfaceId::Sidebar, app.view.sidebar_rect, layer)
             }
         })
+        .chain(app.signal_tray_graphics.as_ref().map(|layer| {
+            (
+                HostSurfaceId::SignalTray,
+                crate::ui::signal_tray_graphics_rect(app),
+                layer,
+            )
+        }))
 }
 
 /// Builds the host placement for one API-owned image layer over `area`.

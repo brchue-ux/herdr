@@ -466,31 +466,103 @@ The eight, in the order they always draw:
 
 | Slot | Live when |
 | --- | --- |
-| `●review` | an agent finished while you were looking somewhere else |
 | `◉ask` | an agent is blocked waiting on your answer |
+| `●review` | an agent finished while you were looking somewhere else |
 | `≡report` | a worker has published a `summary` token that is still standing |
-| `◐busy` | something in the fleet is producing output right now |
 | `⊘stopped` | a pane a mate owns is no longer running an agent |
-| `~dirty` | some checkout has uncommitted work |
-| `↑push` | some branch and its upstream have diverged, either way |
-| `⋔pr` | some checkout's remote has open pull requests |
+| `↑push` | some branch has commits its upstream does not have |
+| `↓sync` | some upstream has commits the checkout does not have |
+| `⋔pr` | a pull request wants you: a review requested of you, or one of yours sent back for changes |
+| `✓checks` | a check run on a pull request you authored is failing or has not finished |
+
+The first four are the fleet waiting on you; the last four are the repository
+waiting on you. Every one of the eight has an owner, a definite act that clears
+it, and somewhere to go — which is why "something is producing output right
+now" is not among them. It has no owner, it clears itself, and it points at
+every pane at once; it is carried instead as the notification tray's own tint.
+Neither is "some checkout has uncommitted work", which is lit in every session
+anyone is actually working in and is only the precondition for `push`.
 
 Every slot is drawn in every frame. A quiet slot is its own name in the panel's muted grey; a live one takes its own colour, turns bold, and animates until the signal clears. The resting bar is the legend for the alerting bar, which is why it never hides a slot for being quiet. Two live slots may share a colour on themes that give two palette roles the same value, so a slot is identified by its mark and its fixed position — colour only tells you live from resting.
 
 The bar gives up detail rather than slots as the panel narrows. The header row is one column narrower than the sidebar, so the three forms need a sidebar of:
 
 - **53 columns** for the named form above — 45 columns of marks and names, plus a space between slots.
-- **16 columns** for the marks alone, one space apart: `● ◉ ≡ ◐ ⊘ ~ ↑ ⋔`.
-- **9 columns** for the marks with no gaps: `●◉≡◐⊘~↑⋔`.
+- **16 columns** for the marks alone, one space apart: `◉ ● ≡ ⊘ ↑ ↓ ⋔ ✓`.
+- **9 columns** for the marks with no gaps: `◉●≡⊘↑↓⋔✓`.
 
 Narrower than one column per signal it draws nothing rather than a prefix of itself: a bar showing five of eight marks gives you no way to know which five, which is worse than no bar. Note that `ui.sidebar_max_width` defaults to `36`, so the named form is out of reach until you raise it.
 
 The bar hangs on the left of that row and any `herdr api status set` text right-aligns in whatever is left.
 
-`enabled` defaults to `false`. Three of the slots read counts that cost a `git status` scan or a request to the forge, and Herdr only pays for those while something is drawing them — so switching the bar on is also what arms those refreshes, exactly as configuring a `git_dirty` or `pull_requests` token does. `emphasis` takes any behaviour name above and defaults to `pulse`; set it to `none` for a bar that changes colour without moving. `enter`/`enter_ms` are the arrival a slot plays as it goes live, clamped to 60–1500 ms. A slot has no exit: it never leaves, it just goes back to grey.
+`enabled` defaults to `false`. Four of the slots read counts that cost a request to the forge or a read of a branch's upstream, and Herdr only pays for those while something is drawing them — so switching the bar on is also what arms those refreshes, exactly as configuring a `git_dirty` or `pull_requests` token does. `emphasis` takes any behaviour name above and defaults to `pulse`; set it to `none` for a bar that changes colour without moving. `enter`/`enter_ms` are the arrival a slot plays as it goes live, clamped to 60–1500 ms. A slot has no exit: it never leaves, it just goes back to grey.
 
 Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
 Animation costs frames. Herdr keeps its animation clock stopped unless an expanded sidebar row actually asks for one or a view switch is in flight, so a configuration without `emphasis` or `row_enter` repaints exactly as often as before between switches. Each behaviour declares its own frame spacing: `pulse` repaints about 10 times a second, the behaviours with visible motion about 20, and a Herdr server never faster than 5 regardless. Collapsing the sidebar stops the clock, and a server with no client attached does not animate a sidebar nobody is looking at. Prefer one animated token over several.
+
+### The notification tray
+
+The same eight signals as a tray of badges at the foot of the Spaces panel — two
+rows of four — where each one is something you can click and act on:
+
+```toml
+[ui.sidebar.signal_tray]
+enabled = true
+actions = true
+```
+
+A badge has three states. **Idle** is engraved into the panel: the slot is
+empty right now, not broken. **Active** means the condition is true and
+standing. **Attention** means it crossed from happening to finished and waiting
+on you, and wears Herdr's alert hue plus a filled pip in its corner. `ask`,
+`review` and `stopped` demand attention the moment they go live; `report`,
+`sync`, `pr` and `checks` do so when the count behind them grows; `push` never
+does, because commits do not get more urgent by sitting on the machine.
+
+On a terminal with Kitty graphics the badges are drawn as images, each mark a
+composition of a silhouette, an interior detail and a highlight. Everywhere
+else the tray falls back to the one-cell marks from the table above, and works
+the same way.
+
+Clicking a badge opens a popover anchored above it, listing what that badge
+covers by name; `···` at the right of the tray's header opens the same popover
+holding the legend. What the popover offers depends on the badge:
+
+| Badge | What a click can do |
+| --- | --- |
+| `ask` | **yes / no**, sent straight to the blocked pane, with the agent's actual question shown above the buttons |
+| `review` | jump to the pane, or **mark all seen** |
+| `report` | open the worker-summaries view |
+| `stopped` | jump only |
+| `push` | **push**, with the exact command, branch and count printed above the button |
+| `sync` | **sync** (`git pull --rebase`), on the same terms — and **refused** on a tree that is not provably clean |
+| `pr` | jump only |
+| `checks` | jump only |
+
+The four jumps are deliberate, not unfinished. Restarting a worker that died
+needs a launch command Herdr does not record per pane, and "re-run the failed
+jobs" is a decision rather than a yes.
+
+Nothing in the tray forces, discards or overwrites work. `sync` is the only act
+that could, so it refuses whenever the checkout has uncommitted changes — or
+whenever Herdr has not read the tree at all, because "we do not know" has to
+fail the same way "it is dirty" does. It then offers the jump instead, so you
+can go and look.
+
+`actions` defaults to `true`, and is the switch for whether a badge click may
+run anything at all. With `actions = false` every badge becomes a jump: the same
+eight slots light on the same eight conditions and the popover still names what
+each covers, but no button will send keys to a pane or run git.
+
+`enabled` defaults to `false`, for the same reason the signal bar does — and
+then some. Switching the tray on arms the forge fetch and the branch-upstream
+read that four of its slots need, *and* the `git status` scan that `sync`'s
+refusal reads. That last one costs more the larger your checkout is, and the
+signal bar deliberately does not arm it.
+
+The tray takes ten rows off the bottom of the panel, or eight on a panel that
+cannot spare ten. A panel too short to hold both the tray and a readable tree
+keeps the tree and draws no tray.
 
 ### Re-rooting the tree on one mate
 

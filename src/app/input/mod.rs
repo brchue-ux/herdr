@@ -45,6 +45,7 @@ mod overlays;
 mod selection;
 mod settings;
 mod sidebar;
+mod signal_tray;
 mod terminal;
 mod worker_summary;
 
@@ -117,6 +118,7 @@ impl App {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
                 Mode::WorkerSummaries => self.handle_worker_summaries_key(key_event),
+                Mode::SignalTray => self.handle_signal_tray_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -297,6 +299,9 @@ impl App {
             return;
         }
         if self.handle_worker_summaries_mouse(mouse) {
+            return;
+        }
+        if self.handle_signal_tray_mouse(mouse) {
             return;
         }
         if self.handle_overlay_mouse(mouse) {

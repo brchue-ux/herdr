@@ -120,14 +120,14 @@ fn slot_text(signal: FleetSignal, tier: Tier) -> String {
 /// `report` — see [`live_style`].
 fn live_color(signal: FleetSignal, p: &Palette) -> Color {
     match signal {
-        FleetSignal::Review => p.teal,
         FleetSignal::Ask => p.red,
+        FleetSignal::Review => p.teal,
         FleetSignal::Report => p.mauve,
-        FleetSignal::Busy => p.yellow,
         FleetSignal::Stopped => p.peach,
-        FleetSignal::Dirty => p.green,
         FleetSignal::Push => p.blue,
+        FleetSignal::Sync => p.green,
         FleetSignal::Pr => p.text,
+        FleetSignal::Checks => p.yellow,
     }
 }
 

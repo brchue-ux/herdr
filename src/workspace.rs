@@ -1567,6 +1567,14 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    /// Ids are a `w` and a base32 counter, and they stay short.
+    ///
+    /// Deliberately not asserted against the length of a *generated* id: the
+    /// counter behind [`generate_workspace_id`] is process-global, so every
+    /// `Workspace::test_new` anywhere in the binary advances it and the length
+    /// of the next id depends on how many other tests ran first. That made this
+    /// a test of the suite's size rather than of the encoding. The encoding is
+    /// what is checked here, over the whole range a real session could reach.
     #[test]
     fn generated_workspace_ids_are_short_base32_handles() {
         let first = generate_workspace_id();
@@ -1575,11 +1583,17 @@ mod tests {
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+
+        // Three base32 digits carry 32³ = 32768 Spaces, which is far past any
+        // session anyone will open.
+        for count in [1usize, 31, 32, 1_000, 32_768] {
+            let encoded = encode_public_number(count);
+            assert!(
+                encoded.len() <= 3,
+                "unexpectedly long handle for {count}: {encoded}"
+            );
+            assert_eq!(decode_public_number(&encoded), Some(count));
+        }
     }
 
     #[test]

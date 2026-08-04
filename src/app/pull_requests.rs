@@ -64,7 +64,12 @@ impl App {
         // network, so it stays gated on something actually drawing the answer.
         let bar_reads_them = self.state.sidebar_notifications.enabled
             && crate::app::fleet_signals::FleetSignalDemand::for_all_signals().pull_requests;
+        // The tray's `pr` and `checks` slots are a third renderer of the same
+        // fetch, so they arm it the same way.
+        let tray_reads_them = crate::ui::signal_tray_active(&self.state)
+            && crate::app::fleet_signals::FleetSignalDemand::for_tray().pull_requests;
         bar_reads_them
+            || tray_reads_them
             || self
                 .state
                 .sidebar_spaces
@@ -227,6 +232,7 @@ mod tests {
                     open: 3,
                     draft: 1,
                     review_requested: 2,
+                    ..Default::default()
                 }),
             }],
         });
@@ -250,6 +256,7 @@ mod tests {
             open: 2,
             draft: 0,
             review_requested: 1,
+            ..Default::default()
         });
 
         app.handle_internal_event_with_prefix_sync(AppEvent::PullRequestsRefreshed {
@@ -277,6 +284,7 @@ mod tests {
             open: 2,
             draft: 0,
             review_requested: 1,
+            ..Default::default()
         });
 
         app.handle_internal_event_with_prefix_sync(AppEvent::PullRequestsRefreshed {

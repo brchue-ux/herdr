@@ -1,6 +1,8 @@
 mod card;
 mod notifications;
 mod tokens;
+pub(crate) mod tray;
+pub(crate) mod tray_art;
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -490,7 +492,7 @@ pub(crate) fn next_entry_is_worktree_child(entries: &[WorkspaceListEntry], idx: 
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
     let ws_area = workspace_list_rect(area);
-    let body = workspace_list_body_rect(ws_area, false);
+    let body = workspace_list_body_rect(app, ws_area, false);
     if body.height == 0 {
         return requested;
     }
@@ -970,19 +972,47 @@ pub(crate) fn workspace_list_rect(area: Rect) -> Rect {
 }
 
 /// The tree owns every row of the panel between the empty header row and the
-/// footer the `new` button and the collapse toggle sit on.
-pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
+/// footer the `new` button and the collapse toggle sit on — less whatever the
+/// notification tray has reserved at the foot.
+///
+/// The tray's rows come out here, in the one function every part of the tree's
+/// geometry already goes through, rather than by shrinking the panel rect
+/// upstream. Doing it upstream would move the footer the `new` button is
+/// measured against and put a blank row above the tray; doing it here leaves
+/// every other coordinate exactly where it was.
+pub(crate) fn workspace_list_body_rect(app: &AppState, area: Rect, has_scrollbar: bool) -> Rect {
+    let tray_rows = tray::reserved_rows(app, area);
     if area.width == 0
-        || area.height <= WORKSPACE_SECTION_HEADER_ROWS + WORKSPACE_SECTION_FOOTER_ROWS
+        || area.height <= WORKSPACE_SECTION_HEADER_ROWS + WORKSPACE_SECTION_FOOTER_ROWS + tray_rows
     {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
-    let footer_y = area.y + area.height.saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS);
+    let footer_y = area.y
+        + area
+            .height
+            .saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS)
+            .saturating_sub(tray_rows);
     let body_height = footer_y.saturating_sub(body_y);
-    let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
-    Rect::new(area.x, body_y, body_width, body_height)
+    Rect::new(
+        area.x,
+        body_y,
+        workspace_list_body_width(area, has_scrollbar),
+        body_height,
+    )
+}
+
+/// The columns a tree row is drawn into, on a panel of this width.
+///
+/// Split out from [`workspace_list_body_rect`] because it is a pure function of
+/// the panel's *width*, and some callers only have one. The notification tray
+/// takes rows off the bottom of the panel and never a column off its side, so a
+/// question about width has no business needing the app's state to answer it —
+/// and `card_shell_min_sidebar_width` is exactly that question, asked of a
+/// hypothetical panel that does not exist yet.
+fn workspace_list_body_width(area: Rect, has_scrollbar: bool) -> u16 {
+    area.width.saturating_sub(u16::from(has_scrollbar))
 }
 
 /// Columns one tree row spends on rails and connector before its first token.
@@ -1015,8 +1045,40 @@ fn tree_prefix_width(depth: u8, row_index: usize) -> usize {
 /// a line, which can retire the scrollbar, which widens the panel, which folds
 /// another row. Measuring against the narrow width costs at most one column of
 /// slack and makes the layout a fixed point.
-fn row_fold_width(list_area: Rect) -> u16 {
-    workspace_list_body_rect(list_area, true).width
+fn row_fold_width(app: &AppState, list_area: Rect) -> u16 {
+    workspace_list_body_rect(app, list_area, true).width
+}
+
+#[cfg(test)]
+mod fold_width_is_a_width {
+    use super::*;
+
+    /// The detent the sidebar drag sticks at is a property of the panel's
+    /// width, and must not move when the tray is switched on: the tray takes
+    /// rows off the bottom, never a column off the side. A regression here
+    /// would make the drag stick at a different column depending on a setting
+    /// that has nothing to do with width.
+    #[test]
+    fn the_card_shell_detent_does_not_move_when_the_tray_is_on() {
+        let detent = card_shell_min_sidebar_width();
+        for width in [detent - 1, detent, detent + 1, 60] {
+            let area = Rect::new(0, 0, width, 40);
+            let list = workspace_list_rect(area);
+
+            let mut app = AppState::test_new();
+            app.sidebar_signal_tray.enabled = false;
+            let without = row_fold_width(&app, list);
+            app.sidebar_signal_tray.enabled = true;
+            let with = row_fold_width(&app, list);
+
+            assert_eq!(with, without, "the tray changed the fold width at {width}");
+            assert_eq!(
+                with,
+                workspace_list_body_width(list, true),
+                "the fold width stopped agreeing with the width-only path at {width}"
+            );
+        }
+    }
 }
 
 /// The narrowest sidebar that draws cards rather than bare lines.
@@ -1031,7 +1093,10 @@ pub(crate) fn card_shell_min_sidebar_width() -> u16 {
     // A tall probe rect, so the body is never the thing that limits the width.
     (1..=MAX_PROBE_SIDEBAR_WIDTH)
         .find(|width| {
-            row_fold_width(workspace_list_rect(Rect::new(0, 0, *width, 24))) >= card::MIN_FOLD_WIDTH
+            // The width-only path: the shell a panel draws depends on how many
+            // columns a row gets, and the tray changes rows rather than columns.
+            workspace_list_body_width(workspace_list_rect(Rect::new(0, 0, *width, 24)), true)
+                >= card::MIN_FOLD_WIDTH
         })
         .unwrap_or(card::MIN_FOLD_WIDTH)
 }
@@ -1309,12 +1374,12 @@ fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usi
 }
 
 fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
-    let body = workspace_list_body_rect(area, false);
+    let body = workspace_list_body_rect(app, area, false);
     if body.width == 0 || body.height == 0 {
         return 0;
     }
 
-    let fold_width = row_fold_width(area);
+    let fold_width = row_fold_width(app, area);
     let mut used_rows = 0u16;
     let mut visible = 0usize;
     let entries = workspace_list_entries(app);
@@ -1337,8 +1402,8 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
 }
 
 fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
-    let body = workspace_list_body_rect(area, false);
-    let fold_width = row_fold_width(area);
+    let body = workspace_list_body_rect(app, area, false);
+    let fold_width = row_fold_width(app, area);
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
     let mut used_rows = 0u16;
@@ -1375,7 +1440,7 @@ pub(crate) fn workspace_list_scroll_metrics(
 
 pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Option<Rect> {
     let metrics = workspace_list_scroll_metrics(app, area);
-    let body = workspace_list_body_rect(area, true);
+    let body = workspace_list_body_rect(app, area, true);
     (should_show_scrollbar(metrics) && body.width > 0 && body.height > 0).then_some(Rect::new(
         area.x + area.width.saturating_sub(1),
         body.y,
@@ -1424,13 +1489,13 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     let metrics = workspace_list_scroll_metrics(app, ws_area);
-    let body = workspace_list_body_rect(ws_area, should_show_scrollbar(metrics));
+    let body = workspace_list_body_rect(app, ws_area, should_show_scrollbar(metrics));
     if body.width == 0 || body.height == 0 {
         return (Vec::new(), Vec::new());
     }
 
     let scroll = app.workspace_scroll;
-    let fold_width = row_fold_width(ws_area);
+    let fold_width = row_fold_width(app, ws_area);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
@@ -3249,7 +3314,7 @@ fn render_workspace_list(
     };
 
     let list_bottom = area.y + area.height.saturating_sub(1);
-    let fold_width = row_fold_width(area);
+    let fold_width = row_fold_width(app, area);
 
     render_header_row(app, frame, area);
 
@@ -3581,9 +3646,14 @@ fn render_workspace_list(
         app,
         frame,
         area,
-        workspace_list_body_rect(area, scrollbar_rect.is_some()),
+        workspace_list_body_rect(app, area, scrollbar_rect.is_some()),
         list_bottom,
     );
+
+    // The tray owns rows the tree was never given, so it draws outside the
+    // transition rather than under it: a re-root is a change of what the tree
+    // is showing, and the fleet's signals do not change with it.
+    tray::render(app, frame, area);
 
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
@@ -4979,7 +5049,7 @@ mod tests {
     /// `blocked` through a pane's detected agent state, which are the same two
     /// facts the tree below the bar already reads — so the test drives real
     /// state rather than reaching into the bar.
-    fn signal_bar_rows(width: u16, dirty: bool, blocked: bool) -> Vec<String> {
+    fn signal_bar_rows(width: u16, ahead: bool, blocked: bool) -> Vec<String> {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.ensure_test_terminals();
@@ -4987,12 +5057,8 @@ mod tests {
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
         app.sidebar_notifications.enabled = true;
 
-        if dirty {
-            app.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
-                staged: 0,
-                unstaged: 1,
-                untracked: 0,
-            });
+        if ahead {
+            app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
         }
         if blocked {
             let terminal_id = app
@@ -5040,7 +5106,7 @@ mod tests {
     /// to know which tier the width picked.
     fn signal_bar_mark_colors(
         width: u16,
-        dirty: bool,
+        ahead: bool,
         blocked: bool,
     ) -> std::collections::HashMap<String, Option<ratatui::style::Color>> {
         let mut app = crate::app::state::AppState::test_new();
@@ -5053,12 +5119,8 @@ mod tests {
         app.sidebar_notifications.emphasis = crate::config::SidebarTokenEmphasis::None;
         app.sidebar_notifications.enter = crate::config::SidebarTokenEmphasis::None;
 
-        if dirty {
-            app.workspaces[0].cached_git_dirty = Some(crate::workspace::GitDirtyCounts {
-                staged: 0,
-                unstaged: 1,
-                untracked: 0,
-            });
+        if ahead {
+            app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
         }
         if blocked {
             let terminal_id = app
@@ -5110,9 +5172,9 @@ mod tests {
 
         let alerting = signal_bar_mark_colors(width, true, true);
         assert_eq!(
-            alerting.get("~").copied().flatten(),
-            Some(palette.green),
-            "uncommitted work did not colour its own slot"
+            alerting.get("↑").copied().flatten(),
+            Some(palette.blue),
+            "unpushed work did not colour its own slot"
         );
         assert_eq!(
             alerting.get("◉").copied().flatten(),
@@ -5239,7 +5301,7 @@ mod tests {
         let row = row_text(terminal.backend().buffer(), 0, area.width);
 
         assert!(
-            row.starts_with('●'),
+            row.starts_with('◉'),
             "the bar is not hung on the left: {row}"
         );
         assert!(
@@ -5803,7 +5865,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         // test rather than the row count.
         let area = Rect::new(0, 0, 20, 7);
         let workspace_area = workspace_list_rect(area);
-        let body = workspace_list_body_rect(workspace_area, false);
+        let body = workspace_list_body_rect(&app, workspace_area, false);
 
         let metrics = workspace_list_scroll_metrics(&app, workspace_area);
         let (cards, _) = compute_workspace_list_areas(&app, area);

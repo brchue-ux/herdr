@@ -183,6 +183,16 @@ pub enum AppEvent {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
+    /// An in-place act started from the notification tray finished.
+    ///
+    /// Carried back as an event rather than awaited, so a remote that has gone
+    /// slow cannot pin the app loop and the popover reports what actually
+    /// happened rather than assuming it worked.
+    SignalTrayCommandFinished {
+        signal_name: &'static str,
+        ok: bool,
+        message: String,
+    },
     /// Background pull request refresh completed for workspaces.
     PullRequestsRefreshed {
         results: Vec<crate::app::WorkspacePullRequests>,
