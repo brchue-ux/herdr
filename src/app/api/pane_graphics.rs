@@ -1,10 +1,11 @@
 use base64::Engine;
 
 use crate::api::schema::{
-    PaneGraphicsClearParams, PaneGraphicsSetParams, PaneGraphicsStreamParams, ResponseResult,
-    PANE_GRAPHICS_SET_MAX_BYTES, PANE_GRAPHICS_STREAM_MAX_BYTES,
+    PaneGraphicsClearParams, PaneGraphicsPlacementParams, PaneGraphicsSetParams,
+    PaneGraphicsStreamParams, ResponseResult, SurfaceGraphicsClearParams, SurfaceGraphicsSetParams,
+    SurfaceTarget, PANE_GRAPHICS_SET_MAX_BYTES, PANE_GRAPHICS_STREAM_MAX_BYTES,
 };
-use crate::app::state::PaneGraphicsLayer;
+use crate::app::state::GraphicsLayer;
 use crate::app::App;
 use crate::layout::PaneId;
 
@@ -61,60 +62,86 @@ impl App {
         pane_id: PaneId,
         params: PaneGraphicsSetParams,
     ) -> String {
-        if params.image_width == 0 || params.image_height == 0 {
-            return encode_error(
-                id,
-                "invalid_image",
-                "image_width and image_height must be greater than zero",
-            );
-        }
-        let max_bytes = if params.data.is_some() {
-            PANE_GRAPHICS_STREAM_MAX_BYTES
-        } else {
-            PANE_GRAPHICS_SET_MAX_BYTES
-        };
-        let data = match params.data {
-            Some(data) => data,
-            None => match base64::engine::general_purpose::STANDARD.decode(params.data_base64) {
-                Ok(data) => data,
-                Err(_) => {
-                    return encode_error(id, "invalid_image", "data_base64 is not valid base64");
-                }
-            },
-        };
-        if data.is_empty() {
-            return encode_error(id, "invalid_image", "image data must not be empty");
-        }
-        if data.len() > max_bytes {
-            return encode_error(id, "image_too_large", "image data is too large");
-        }
-        match pane_graphics_expected_data_len(
+        let layer = match build_graphics_layer(
             params.format,
             params.image_width,
             params.image_height,
-        ) {
-            Ok(Some(expected_len)) if data.len() != expected_len => {
-                return encode_error(
-                    id,
-                    "invalid_image",
-                    "image data length does not match format and dimensions",
-                );
-            }
-            Ok(_) => {}
-            Err(()) => {
-                return encode_error(id, "invalid_image", "image dimensions are too large");
-            }
-        }
-
-        let layer = PaneGraphicsLayer::new(
-            params.format,
-            params.image_width,
-            params.image_height,
-            data,
+            params.data,
+            params.data_base64,
             params.placement,
-        );
+        ) {
+            Ok(layer) => layer,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
         self.state.pane_graphics_layers.insert(pane_id, layer);
         self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_surface_graphics_info(
+        &mut self,
+        id: String,
+        _target: SurfaceTarget,
+    ) -> String {
+        if let Err(response) = require_pane_graphics_enabled(self, &id) {
+            return response;
+        }
+        if !self.state.host_cell_size.is_known() {
+            return encode_error(id, "cell_size_unavailable", "host cell size is unavailable");
+        }
+        encode_success(
+            id,
+            ResponseResult::PaneGraphicsInfo {
+                cell_width_px: self.state.host_cell_size.width_px,
+                cell_height_px: self.state.host_cell_size.height_px,
+            },
+        )
+    }
+
+    pub(super) fn handle_surface_graphics_set(
+        &mut self,
+        id: String,
+        params: SurfaceGraphicsSetParams,
+    ) -> String {
+        if let Err(response) = require_pane_graphics_enabled(self, &id) {
+            return response;
+        }
+        let layer = match build_graphics_layer(
+            params.format,
+            params.image_width,
+            params.image_height,
+            None,
+            params.data_base64,
+            params.placement,
+        ) {
+            Ok(layer) => layer,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        self.state
+            .surface_graphics_layers
+            .insert(params.surface, layer);
+        self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_surface_graphics_clear(
+        &mut self,
+        id: String,
+        params: SurfaceGraphicsClearParams,
+    ) -> String {
+        if let Err(response) = require_pane_graphics_enabled(self, &id) {
+            return response;
+        }
+        if self
+            .state
+            .surface_graphics_layers
+            .remove(&params.surface)
+            .is_some()
+        {
+            self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -234,6 +261,63 @@ fn require_pane_graphics_enabled(app: &App, id: &str) -> Result<(), String> {
         id.to_owned(),
         "feature_disabled",
         "pane graphics require experimental.kitty_graphics",
+    ))
+}
+
+/// Validates and decodes one image payload into a layer.
+///
+/// Every graphics writer — pane set, pane stream frame, surface set — comes
+/// through here so a sidebar image is held to exactly the limits and error codes
+/// a pane image is. `data` is the already-decoded stream payload; callers
+/// without one pass `None` and the base64 field is decoded instead.
+fn build_graphics_layer(
+    format: crate::api::schema::PaneGraphicsFormat,
+    image_width: u32,
+    image_height: u32,
+    data: Option<Vec<u8>>,
+    data_base64: String,
+    placement: PaneGraphicsPlacementParams,
+) -> Result<GraphicsLayer, (&'static str, &'static str)> {
+    if image_width == 0 || image_height == 0 {
+        return Err((
+            "invalid_image",
+            "image_width and image_height must be greater than zero",
+        ));
+    }
+    let max_bytes = if data.is_some() {
+        PANE_GRAPHICS_STREAM_MAX_BYTES
+    } else {
+        PANE_GRAPHICS_SET_MAX_BYTES
+    };
+    let data = match data {
+        Some(data) => data,
+        None => base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|_| ("invalid_image", "data_base64 is not valid base64"))?,
+    };
+    if data.is_empty() {
+        return Err(("invalid_image", "image data must not be empty"));
+    }
+    if data.len() > max_bytes {
+        return Err(("image_too_large", "image data is too large"));
+    }
+    match pane_graphics_expected_data_len(format, image_width, image_height) {
+        Ok(Some(expected_len)) if data.len() != expected_len => {
+            return Err((
+                "invalid_image",
+                "image data length does not match format and dimensions",
+            ));
+        }
+        Ok(_) => {}
+        Err(()) => return Err(("invalid_image", "image dimensions are too large")),
+    }
+
+    Ok(GraphicsLayer::new(
+        format,
+        image_width,
+        image_height,
+        data,
+        placement,
     ))
 }
 
@@ -698,5 +782,114 @@ mod tests {
         assert_eq!(error.error.code, "feature_disabled");
         assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
+    }
+
+    fn surface_set_request(id: &str, data_base64: String, z: i32) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method: crate::api::schema::Method::SurfaceGraphicsSet(SurfaceGraphicsSetParams {
+                surface: crate::api::schema::GraphicsSurface::Sidebar,
+                format: crate::api::schema::PaneGraphicsFormat::Rgba,
+                image_width: 2,
+                image_height: 2,
+                data_base64,
+                placement: PaneGraphicsPlacementParams {
+                    z,
+                    ..Default::default()
+                },
+            }),
+        }
+    }
+
+    fn rgba_2x2_base64() -> String {
+        base64::engine::general_purpose::STANDARD.encode(vec![9_u8; 2 * 2 * 4])
+    }
+
+    #[test]
+    fn api_surface_graphics_honours_the_same_feature_gate_as_panes() {
+        let (mut app, _) = app_with_test_workspace();
+
+        let response = app.handle_api_request(surface_set_request("set", rgba_2x2_base64(), 0));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "feature_disabled");
+        assert!(app.state.surface_graphics_layers.is_empty());
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "info".into(),
+            method: crate::api::schema::Method::SurfaceGraphicsInfo(SurfaceTarget {
+                surface: crate::api::schema::GraphicsSurface::Sidebar,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "feature_disabled");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::SurfaceGraphicsClear(SurfaceGraphicsClearParams {
+                surface: crate::api::schema::GraphicsSurface::Sidebar,
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "feature_disabled");
+    }
+
+    #[test]
+    fn api_surface_graphics_set_stores_a_layer_and_clear_removes_it() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let revision_before = app.state.pane_graphics_revision;
+
+        let response = app.handle_api_request(surface_set_request(
+            "set",
+            rgba_2x2_base64(),
+            crate::api::schema::GRAPHICS_Z_BELOW_BACKGROUND,
+        ));
+        serde_json::from_str::<SuccessResponse>(&response).unwrap();
+
+        let layer = app
+            .state
+            .surface_graphics_layers
+            .get(&crate::api::schema::GraphicsSurface::Sidebar)
+            .expect("sidebar layer");
+        assert_eq!(layer.image_width, 2);
+        assert_eq!(layer.data.len(), 2 * 2 * 4);
+        assert_eq!(
+            layer.render.z,
+            crate::api::schema::GRAPHICS_Z_BELOW_BACKGROUND
+        );
+        assert_ne!(app.state.pane_graphics_revision, revision_before);
+        assert!(
+            app.state.pane_graphics_layers.is_empty(),
+            "a surface layer must not touch pane layers"
+        );
+
+        let revision_after_set = app.state.pane_graphics_revision;
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear".into(),
+            method: crate::api::schema::Method::SurfaceGraphicsClear(SurfaceGraphicsClearParams {
+                surface: crate::api::schema::GraphicsSurface::Sidebar,
+            }),
+        });
+        serde_json::from_str::<SuccessResponse>(&response).unwrap();
+        assert!(app.state.surface_graphics_layers.is_empty());
+        assert_ne!(app.state.pane_graphics_revision, revision_after_set);
+    }
+
+    #[test]
+    fn api_surface_graphics_set_rejects_the_same_payloads_a_pane_does() {
+        let (mut app, _) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+
+        let response = app.handle_api_request(surface_set_request("bad-base64", "!!!".into(), 0));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_image");
+
+        // Right encoding, wrong length for rgba 2x2.
+        let short = base64::engine::general_purpose::STANDARD.encode(vec![1_u8; 4]);
+        let response = app.handle_api_request(surface_set_request("short", short, 0));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_image");
+
+        assert!(app.state.surface_graphics_layers.is_empty());
     }
 }

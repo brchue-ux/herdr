@@ -2200,6 +2200,16 @@
           ],
           "type": "object"
         },
+        "GraphicsSurface": {
+          "description": "A drawable region of the client viewport that is not a pane.\n\nPanes carry an id, so `pane.graphics.*` addresses them directly. Every other\nregion a client can put an image on is named here instead, so one method\nfamily covers all of them and adding a region is an enum variant rather than\na new method.",
+          "oneOf": [
+            {
+              "const": "sidebar",
+              "description": "The desktop layout's left column, up to and including its divider.\nAbsent from the mobile layout, where it has zero width and any placement\non it is clipped away.",
+              "type": "string"
+            }
+          ]
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2666,6 +2676,12 @@
               "default": 0,
               "format": "int32",
               "type": "integer"
+            },
+            "z": {
+              "default": 0,
+              "description": "Which band the image is drawn in, in Kitty's z-index terms. `0` and\nabove draw over the cell's text; negative values draw under the text but\nover the cell background; values at or below\n[`GRAPHICS_Z_BELOW_BACKGROUND`] draw under the background too, which is\nthe only band a backdrop can occupy without erasing what is on top of\nit. Defaults to `0`, the band every placement used before this was\nsettable.",
+              "format": "int32",
+              "type": "integer"
             }
           },
           "type": "object"
@@ -2698,7 +2714,8 @@
                 "grid_cols": 0,
                 "grid_rows": 0,
                 "viewport_col": 0,
-                "viewport_row": 0
+                "viewport_row": 0,
+                "z": 0
               }
             }
           },
@@ -4202,6 +4219,69 @@
               "type": "object"
             }
           ]
+        },
+        "SurfaceGraphicsClearParams": {
+          "properties": {
+            "surface": {
+              "$ref": "#/schemas/request/$defs/GraphicsSurface"
+            }
+          },
+          "required": [
+            "surface"
+          ],
+          "type": "object"
+        },
+        "SurfaceGraphicsSetParams": {
+          "properties": {
+            "data_base64": {
+              "default": "",
+              "type": "string"
+            },
+            "format": {
+              "$ref": "#/schemas/request/$defs/PaneGraphicsFormat"
+            },
+            "image_height": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "image_width": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "placement": {
+              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacementParams",
+              "default": {
+                "grid_cols": 0,
+                "grid_rows": 0,
+                "viewport_col": 0,
+                "viewport_row": 0,
+                "z": 0
+              }
+            },
+            "surface": {
+              "$ref": "#/schemas/request/$defs/GraphicsSurface"
+            }
+          },
+          "required": [
+            "surface",
+            "format",
+            "image_width",
+            "image_height"
+          ],
+          "type": "object"
+        },
+        "SurfaceTarget": {
+          "properties": {
+            "surface": {
+              "$ref": "#/schemas/request/$defs/GraphicsSurface"
+            }
+          },
+          "required": [
+            "surface"
+          ],
+          "type": "object"
         },
         "TabCreateParams": {
           "properties": {
@@ -5915,6 +5995,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "surface.graphics.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SurfaceGraphicsSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "surface.graphics.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SurfaceGraphicsClearParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "surface.graphics.info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/SurfaceTarget"
             }
           },
           "required": [

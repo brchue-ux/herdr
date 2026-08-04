@@ -1124,6 +1124,15 @@ impl App {
             Method::PaneGraphicsStreamClose(params) => {
                 return self.handle_pane_graphics_stream_close(request.id, params);
             }
+            Method::SurfaceGraphicsSet(params) => {
+                return self.handle_surface_graphics_set(request.id, params);
+            }
+            Method::SurfaceGraphicsClear(params) => {
+                return self.handle_surface_graphics_clear(request.id, params);
+            }
+            Method::SurfaceGraphicsInfo(target) => {
+                return self.handle_surface_graphics_info(request.id, target);
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

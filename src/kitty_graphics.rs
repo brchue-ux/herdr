@@ -14,7 +14,7 @@ use crate::app::Mode;
 use crate::ghostty::{
     KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
 };
-use crate::layout::{PaneId, PaneInfo};
+use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const KITTY_CHUNK_BYTES: usize = 3072;
@@ -72,7 +72,7 @@ struct HostViewKey {
 
 #[derive(Debug)]
 struct HostPlacement {
-    pane_id: PaneId,
+    surface: HostSurfaceId,
     area: Rect,
     cell_size: HostCellSize,
     source_key: HostSourceKey,
@@ -80,10 +80,39 @@ struct HostPlacement {
     scrollback_offset: u32,
 }
 
+/// Which rect of the host viewport a placement is anchored to.
+///
+/// Panes are the original and only anchor; the sidebar is a sibling rect of the
+/// tab surface rather than a pane, so it needs its own identity in every id and
+/// cache key a pane placement already gets.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum HostSurfaceId {
+    Pane(PaneId),
+    Sidebar,
+}
+
+impl HostSurfaceId {
+    /// Feeds the surface's identity into a host id hash. A pane contributes
+    /// exactly its raw id, so every host image and placement id a shipped pane
+    /// placement resolves to is unchanged by the sidebar existing.
+    fn hash_identity(self, hasher: &mut DefaultHasher) {
+        match self {
+            Self::Pane(pane_id) => pane_id.raw().hash(hasher),
+            Self::Sidebar => "surface.sidebar".hash(hasher),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum HostSourceKey {
-    Terminal { pane_id: PaneId, image_id: u32 },
-    PaneLayer { pane_id: PaneId },
+    Terminal {
+        pane_id: PaneId,
+        image_id: u32,
+    },
+    /// An API-owned image layer composited over `surface`.
+    Layer {
+        surface: HostSurfaceId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -243,6 +272,18 @@ pub(crate) fn has_visible_pane_graphics(
         return false;
     }
 
+    // Surface layers anchor to viewport chrome rather than to a pane, so they
+    // are checked before — and independently of — the active workspace, exactly
+    // as `collect_visible_placements` collects them.
+    let empty_uploaded = HashMap::new();
+    for (surface_id, area, layer) in surface_layer_placement_targets(app) {
+        let host_placement =
+            layer_host_placement(surface_id, area, cell_size, layer, &empty_uploaded, false);
+        if clipped_placement(&host_placement).is_some() {
+            return true;
+        }
+    }
+
     let Some(ws_idx) = app.active else {
         return false;
     };
@@ -256,10 +297,15 @@ pub(crate) fn has_visible_pane_graphics(
     }
 
     for info in surface.pane_infos {
-        let empty_uploaded = HashMap::new();
         if app.pane_graphics_layers.get(&info.id).is_some_and(|layer| {
-            let host_placement =
-                pane_graphics_host_placement(info, cell_size, layer, &empty_uploaded, false);
+            let host_placement = layer_host_placement(
+                HostSurfaceId::Pane(info.id),
+                info.inner_rect,
+                cell_size,
+                layer,
+                &empty_uploaded,
+                false,
+            );
             clipped_placement(&host_placement).is_some()
         }) {
             return true;
@@ -273,7 +319,7 @@ pub(crate) fn has_visible_pane_graphics(
                 .unwrap_or(0);
             for placement in runtime.kitty_image_placements_with_data_filter(|_| false) {
                 let host_placement = HostPlacement {
-                    pane_id: info.id,
+                    surface: HostSurfaceId::Pane(info.id),
                     area: info.inner_rect,
                     cell_size,
                     source_key: HostSourceKey::Terminal {
@@ -310,15 +356,15 @@ fn encode_graphics_update(
         })
         .map(|placement| placement.source_key)
         .collect();
-    let mut removed_pane_layer_images = HashSet::new();
+    let mut removed_layer_images = HashSet::new();
     sources.retain(|source, host_id| {
         let retain = current_sources.contains(source);
-        if !retain && matches!(source, HostSourceKey::PaneLayer { .. }) {
-            removed_pane_layer_images.insert(*host_id);
+        if !retain && matches!(source, HostSourceKey::Layer { .. }) {
+            removed_layer_images.insert(*host_id);
         }
         retain
     });
-    for host_id in removed_pane_layer_images {
+    for host_id in removed_layer_images {
         if sources.values().any(|id| *id == host_id) {
             continue;
         }
@@ -331,7 +377,7 @@ fn encode_graphics_update(
     for placement in placements {
         let clipped = clipped_placement(placement);
         tracing::debug!(
-            pane_id = ?placement.pane_id,
+            surface = ?placement.surface,
             has_clipped = clipped.is_some(),
             grid_cols = placement.placement.render.grid_cols,
             grid_rows = placement.placement.render.grid_rows,
@@ -344,7 +390,7 @@ fn encode_graphics_update(
         let Some((clipped, format_code)) = clipped else {
             continue;
         };
-        let host_id = host_image_id(placement.pane_id, &placement.placement);
+        let host_id = host_image_id(placement.surface, &placement.placement);
         let host_placement_id = host_placement_id(placement.source_key, &placement.placement);
         let image_signature = image_signature(placement, format_code);
         let placement_signature =
@@ -528,11 +574,27 @@ fn collect_visible_placements(
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
 ) -> Vec<HostPlacement> {
+    let mut placements = Vec::new();
+
+    // Chrome surfaces are laid out beside the tab surface, not inside it, so
+    // they are collected before the active-workspace gate rather than through
+    // the pane walk.
+    for (surface_id, area, layer) in surface_layer_placement_targets(app) {
+        placements.push(layer_host_placement(
+            surface_id,
+            area,
+            cell_size,
+            layer,
+            uploaded_images,
+            true,
+        ));
+    }
+
     let ws_idx = match app.active {
         Some(idx) => idx,
         None => {
             tracing::debug!("collect_visible_placements: no active workspace");
-            return Vec::new();
+            return placements;
         }
     };
     if app
@@ -542,7 +604,7 @@ fn collect_visible_placements(
         .is_none()
     {
         tracing::debug!(ws_idx, "collect_visible_placements: no active tab");
-        return Vec::new();
+        return placements;
     }
 
     tracing::debug!(
@@ -551,11 +613,11 @@ fn collect_visible_placements(
         pane_infos_len = surface.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
-    let mut placements = Vec::new();
     for info in surface.pane_infos {
         if let Some(layer) = app.pane_graphics_layers.get(&info.id) {
-            placements.push(pane_graphics_host_placement(
-                info,
+            placements.push(layer_host_placement(
+                HostSurfaceId::Pane(info.id),
+                info.inner_rect,
                 cell_size,
                 layer,
                 uploaded_images,
@@ -573,7 +635,7 @@ fn collect_visible_placements(
         for placement in runtime.kitty_image_placements_with_data_filter(|descriptor| {
             let format_code = kitty_format_code(descriptor.format);
             let signature = image_signature_from_descriptor(descriptor, format_code);
-            let host_id = host_image_id_for_signature(info.id, signature);
+            let host_id = host_image_id_for_signature(HostSurfaceId::Pane(info.id), signature);
             uploaded_images.get(&host_id).copied() != Some(signature)
         }) {
             let scrollback_offset = runtime
@@ -581,7 +643,7 @@ fn collect_visible_placements(
                 .map(|m| m.offset_from_bottom as u32)
                 .unwrap_or(0);
             placements.push(HostPlacement {
-                pane_id: info.id,
+                surface: HostSurfaceId::Pane(info.id),
                 area: info.inner_rect,
                 cell_size,
                 source_key: HostSourceKey::Terminal {
@@ -600,10 +662,33 @@ fn collect_visible_placements(
     placements
 }
 
-fn pane_graphics_host_placement(
-    info: &PaneInfo,
+/// Every non-pane rect that currently carries an API-owned image layer.
+///
+/// This is the second placement source the graphics surface has: it resolves a
+/// named surface to the rect the layout put it at, so the layer travels the same
+/// clipping, caching, signature and delete-by-id path a pane layer does.
+fn surface_layer_placement_targets(
+    app: &AppState,
+) -> impl Iterator<Item = (HostSurfaceId, Rect, &crate::app::state::GraphicsLayer)> {
+    app.surface_graphics_layers
+        .iter()
+        .map(|(surface, layer)| match surface {
+            crate::api::schema::GraphicsSurface::Sidebar => {
+                (HostSurfaceId::Sidebar, app.view.sidebar_rect, layer)
+            }
+        })
+}
+
+/// Builds the host placement for one API-owned image layer over `area`.
+///
+/// Panes pass their interior rect; chrome surfaces pass whatever rect the layout
+/// gave them. Everything downstream — clipping, ids, cache signatures — is
+/// keyed on `surface`, so neither source can collide with the other.
+fn layer_host_placement(
+    surface: HostSurfaceId,
+    area: Rect,
     cell_size: HostCellSize,
-    layer: &crate::app::state::PaneGraphicsLayer,
+    layer: &crate::app::state::GraphicsLayer,
     uploaded_images: &HashMap<u32, ImageSignature>,
     include_data: bool,
 ) -> HostPlacement {
@@ -616,7 +701,7 @@ fn pane_graphics_host_placement(
         data_len: layer.data.len(),
         data_fingerprint: layer.data_fingerprint,
     };
-    let host_id = pane_graphics_host_image_id(info.id, signature);
+    let host_id = layer_host_image_id(surface, signature);
     let data = if !include_data || uploaded_images.get(&host_id).copied() == Some(signature) {
         Vec::new()
     } else {
@@ -624,26 +709,26 @@ fn pane_graphics_host_placement(
     };
     let render = layer.render;
     let grid_cols = if render.grid_cols == 0 {
-        u32::from(info.inner_rect.width)
+        u32::from(area.width)
     } else {
         render.grid_cols
     };
     let grid_rows = if render.grid_rows == 0 {
-        u32::from(info.inner_rect.height)
+        u32::from(area.height)
     } else {
         render.grid_rows
     };
 
     HostPlacement {
-        pane_id: info.id,
-        area: info.inner_rect,
+        surface,
+        area,
         cell_size,
-        source_key: HostSourceKey::PaneLayer { pane_id: info.id },
+        source_key: HostSourceKey::Layer { surface },
         scrollback_offset: 0,
         placement: KittyImagePlacement {
             image_id: 1,
             placement_id: 1,
-            z: 0,
+            z: render.z,
             x_offset: 0,
             y_offset: 0,
             image_width: layer.image_width,
@@ -676,10 +761,10 @@ fn pane_graphics_kitty_format(format: crate::api::schema::PaneGraphicsFormat) ->
     }
 }
 
-fn host_image_id(pane_id: PaneId, placement: &KittyImagePlacement) -> u32 {
+fn host_image_id(surface: HostSurfaceId, placement: &KittyImagePlacement) -> u32 {
     let format_code = kitty_format_code(placement.format);
     host_image_id_for_signature(
-        pane_id,
+        surface,
         ImageSignature {
             image_width: placement.image_width,
             image_height: placement.image_height,
@@ -690,16 +775,16 @@ fn host_image_id(pane_id: PaneId, placement: &KittyImagePlacement) -> u32 {
     )
 }
 
-fn host_image_id_for_signature(pane_id: PaneId, signature: ImageSignature) -> u32 {
+fn host_image_id_for_signature(surface: HostSurfaceId, signature: ImageSignature) -> u32 {
     let mut hasher = DefaultHasher::new();
-    pane_id.raw().hash(&mut hasher);
+    surface.hash_identity(&mut hasher);
     signature.hash(&mut hasher);
     HOST_IMAGE_ID_BASE + ((hasher.finish() as u32) % 900_000)
 }
 
-fn pane_graphics_host_image_id(pane_id: PaneId, signature: ImageSignature) -> u32 {
+fn layer_host_image_id(surface: HostSurfaceId, signature: ImageSignature) -> u32 {
     let mut hasher = DefaultHasher::new();
-    pane_id.raw().hash(&mut hasher);
+    surface.hash_identity(&mut hasher);
     signature.hash(&mut hasher);
     PANE_GRAPHICS_IMAGE_ID_BIT | ((hasher.finish() as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
 }
@@ -708,9 +793,9 @@ fn host_placement_id(source_key: HostSourceKey, placement: &KittyImagePlacement)
     let mut hasher = DefaultHasher::new();
     match source_key {
         HostSourceKey::Terminal { pane_id, .. } => pane_id.raw().hash(&mut hasher),
-        HostSourceKey::PaneLayer { pane_id } => {
+        HostSourceKey::Layer { surface } => {
             "pane.graphics".hash(&mut hasher);
-            pane_id.raw().hash(&mut hasher);
+            surface.hash_identity(&mut hasher);
         }
     }
     placement.image_id.hash(&mut hasher);
@@ -1003,7 +1088,7 @@ mod tests {
 
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
         HostPlacement {
-            pane_id: PaneId::from_raw(1),
+            surface: HostSurfaceId::Pane(PaneId::from_raw(1)),
             area: Rect::new(0, 0, 20, 10),
             cell_size: HostCellSize {
                 width_px: 10,
@@ -1044,8 +1129,8 @@ mod tests {
 
     fn pane_layer_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
         let mut placement = test_placement(viewport_col, viewport_row);
-        placement.source_key = HostSourceKey::PaneLayer {
-            pane_id: placement.pane_id,
+        placement.source_key = HostSourceKey::Layer {
+            surface: placement.surface,
         };
         placement
     }
@@ -1054,7 +1139,7 @@ mod tests {
     fn terminal_placement_id_preserves_legacy_identity() {
         let placement = test_placement(0, 0);
         let mut legacy = DefaultHasher::new();
-        placement.pane_id.raw().hash(&mut legacy);
+        PaneId::from_raw(1).raw().hash(&mut legacy);
         placement.placement.image_id.hash(&mut legacy);
         placement.placement.placement_id.hash(&mut legacy);
         let expected = 1 + ((legacy.finish() as u32) % 900_000);
@@ -1065,8 +1150,8 @@ mod tests {
         );
         assert_ne!(
             host_placement_id(
-                HostSourceKey::PaneLayer {
-                    pane_id: placement.pane_id,
+                HostSourceKey::Layer {
+                    surface: placement.surface,
                 },
                 &placement.placement,
             ),
@@ -1078,8 +1163,8 @@ mod tests {
     fn pane_graphics_image_ids_are_disjoint_from_terminal_image_ids() {
         let placement = test_placement(0, 0);
         let signature = image_signature(&placement, kitty_format_code(placement.placement.format));
-        let terminal_id = host_image_id_for_signature(placement.pane_id, signature);
-        let pane_graphics_id = pane_graphics_host_image_id(placement.pane_id, signature);
+        let terminal_id = host_image_id_for_signature(placement.surface, signature);
+        let pane_graphics_id = layer_host_image_id(placement.surface, signature);
 
         assert_eq!(terminal_id & PANE_GRAPHICS_IMAGE_ID_BIT, 0);
         assert_ne!(pane_graphics_id & PANE_GRAPHICS_IMAGE_ID_BIT, 0);
@@ -1113,15 +1198,9 @@ mod tests {
 
     #[test]
     fn pane_graphics_layer_defaults_to_full_pane_grid() {
-        let info = PaneInfo {
-            id: PaneId::from_raw(9),
-            rect: Rect::new(0, 0, 12, 5),
-            inner_rect: Rect::new(2, 1, 8, 3),
-            scrollbar_rect: None,
-            borders: ratatui::widgets::Borders::NONE,
-            is_focused: true,
-        };
-        let layer = crate::app::state::PaneGraphicsLayer::new(
+        let pane_id = PaneId::from_raw(9);
+        let inner_rect = Rect::new(2, 1, 8, 3);
+        let layer = crate::app::state::GraphicsLayer::new(
             crate::api::schema::PaneGraphicsFormat::Rgba,
             80,
             30,
@@ -1129,8 +1208,9 @@ mod tests {
             crate::api::schema::PaneGraphicsPlacementParams::default(),
         );
 
-        let placement = pane_graphics_host_placement(
-            &info,
+        let placement = layer_host_placement(
+            HostSurfaceId::Pane(pane_id),
+            inner_rect,
             HostCellSize {
                 width_px: 10,
                 height_px: 10,
@@ -1147,6 +1227,254 @@ mod tests {
         assert_eq!(clipped.cols, 8);
         assert_eq!(clipped.rows, 3);
         assert_eq!(placement.placement.data.len(), 80 * 30 * 4);
+    }
+
+    fn test_cell_size() -> HostCellSize {
+        HostCellSize {
+            width_px: 10,
+            height_px: 10,
+        }
+    }
+
+    fn sidebar_layer(
+        placement: crate::api::schema::PaneGraphicsPlacementParams,
+    ) -> crate::app::state::GraphicsLayer {
+        crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Rgba,
+            200,
+            200,
+            vec![7; 200 * 200 * 4],
+            placement,
+        )
+    }
+
+    /// An `AppState` with a sidebar rect but deliberately no workspaces: the
+    /// sidebar is chrome, so its placement must not depend on a live tab.
+    fn app_with_sidebar(
+        sidebar_rect: Rect,
+        placement: crate::api::schema::PaneGraphicsPlacementParams,
+    ) -> AppState {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.sidebar_rect = sidebar_rect;
+        app.surface_graphics_layers.insert(
+            crate::api::schema::GraphicsSurface::Sidebar,
+            sidebar_layer(placement),
+        );
+        app
+    }
+
+    fn empty_surface() -> crate::ui::TabSurfaceView<'static> {
+        crate::ui::TabSurfaceView {
+            pane_infos: &[],
+            split_borders: &[],
+        }
+    }
+
+    #[test]
+    fn sidebar_layer_anchors_to_the_sidebar_rect_and_fills_it() {
+        let app = app_with_sidebar(
+            Rect::new(0, 0, 26, 20),
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(placements.len(), 1);
+        let placement = &placements[0];
+        assert_eq!(placement.surface, HostSurfaceId::Sidebar);
+        assert_eq!(
+            placement.source_key,
+            HostSourceKey::Layer {
+                surface: HostSurfaceId::Sidebar,
+            }
+        );
+        let (clipped, _) = clipped_placement(placement).expect("visible sidebar layer");
+        assert_eq!((clipped.x, clipped.y), (0, 0));
+        assert_eq!((clipped.cols, clipped.rows), (26, 20));
+    }
+
+    #[test]
+    fn sidebar_layer_clips_to_the_sidebar_and_never_spills_into_panes() {
+        // A grid far wider and taller than the sidebar, offset inside it.
+        let app = app_with_sidebar(
+            Rect::new(4, 2, 26, 20),
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 6,
+                viewport_row: 5,
+                grid_cols: 200,
+                grid_rows: 200,
+                z: 0,
+            },
+        );
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+        let (clipped, _) = clipped_placement(&placements[0]).expect("visible sidebar layer");
+
+        assert_eq!((clipped.x, clipped.y), (10, 7));
+        // Right edge stops at the sidebar's, not the terminal's.
+        assert_eq!(u32::from(clipped.x) + clipped.cols, 4 + 26);
+        assert_eq!(u32::from(clipped.y) + clipped.rows, 2 + 20);
+    }
+
+    #[test]
+    fn sidebar_layer_disappears_when_the_sidebar_has_no_width() {
+        // The mobile layout leaves `sidebar_rect` empty; a stored layer must
+        // then place nothing rather than land at the origin.
+        let app = app_with_sidebar(
+            Rect::default(),
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(placements.len(), 1, "the layer is still stored");
+        assert!(
+            clipped_placement(&placements[0]).is_none(),
+            "but nothing is drawn"
+        );
+        assert!(!has_visible_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+        ));
+    }
+
+    #[test]
+    fn sidebar_layer_z_reaches_the_emitted_placement() {
+        for z in [
+            0,
+            -1,
+            crate::api::schema::GRAPHICS_Z_BELOW_BACKGROUND,
+            i32::MIN,
+        ] {
+            let app = app_with_sidebar(
+                Rect::new(0, 0, 26, 20),
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    z,
+                    ..Default::default()
+                },
+            );
+            let mut cache = HostGraphicsCache::default();
+            let bytes = encode_local_pane_graphics(
+                &app,
+                &TerminalRuntimeRegistry::new(),
+                empty_surface(),
+                test_cell_size(),
+                &mut cache,
+            );
+            let emitted = String::from_utf8_lossy(&bytes).into_owned();
+
+            assert!(emitted.contains("a=t"), "z={z} uploads the image");
+            assert!(
+                emitted.contains(&format!(",z={z},")),
+                "z={z} reaches the placement control: {emitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_the_sidebar_layer_deletes_its_host_image() {
+        let mut app = app_with_sidebar(
+            Rect::new(0, 0, 26, 20),
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        let mut cache = HostGraphicsCache::default();
+        let runtimes = TerminalRuntimeRegistry::new();
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
+        let host_id = *cache.images.keys().next().expect("uploaded host image");
+
+        app.surface_graphics_layers.clear();
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+
+        assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn sidebar_and_pane_layers_never_share_a_host_id() {
+        let signature = ImageSignature {
+            image_width: 4,
+            image_height: 4,
+            format_code: 32,
+            data_len: 64,
+            data_fingerprint: 11,
+        };
+        let pane = HostSurfaceId::Pane(PaneId::from_raw(1));
+
+        assert_ne!(
+            layer_host_image_id(pane, signature),
+            layer_host_image_id(HostSurfaceId::Sidebar, signature)
+        );
+        assert_ne!(
+            host_placement_id(
+                HostSourceKey::Layer { surface: pane },
+                &test_placement(0, 0).placement,
+            ),
+            host_placement_id(
+                HostSourceKey::Layer {
+                    surface: HostSurfaceId::Sidebar,
+                },
+                &test_placement(0, 0).placement,
+            )
+        );
+    }
+
+    #[test]
+    fn pane_host_ids_are_unchanged_by_the_surface_generalisation() {
+        // The pane path shipped first; its host ids are derived from the raw
+        // pane id alone and must stay that way.
+        let signature = ImageSignature {
+            image_width: 4,
+            image_height: 4,
+            format_code: 32,
+            data_len: 64,
+            data_fingerprint: 11,
+        };
+        let pane_id = PaneId::from_raw(17);
+
+        let mut legacy = DefaultHasher::new();
+        pane_id.raw().hash(&mut legacy);
+        signature.hash(&mut legacy);
+        let legacy = legacy.finish();
+
+        assert_eq!(
+            host_image_id_for_signature(HostSurfaceId::Pane(pane_id), signature),
+            HOST_IMAGE_ID_BASE + ((legacy as u32) % 900_000)
+        );
+        assert_eq!(
+            layer_host_image_id(HostSurfaceId::Pane(pane_id), signature),
+            PANE_GRAPHICS_IMAGE_ID_BIT | ((legacy as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
+        );
     }
 
     #[test]
@@ -1426,7 +1754,7 @@ mod tests {
             twin.placement.image_id = 8;
             twin.placement.placement_id = 4;
             twin.source_key = HostSourceKey::Terminal {
-                pane_id: twin.pane_id,
+                pane_id: PaneId::from_raw(1),
                 image_id: twin.placement.image_id,
             };
             twin
@@ -1473,7 +1801,7 @@ mod tests {
             twin.placement.image_id = 8;
             twin.placement.placement_id = 4;
             twin.source_key = HostSourceKey::Terminal {
-                pane_id: twin.pane_id,
+                pane_id: PaneId::from_raw(1),
                 image_id: twin.placement.image_id,
             };
             twin
@@ -1708,7 +2036,7 @@ mod tests {
         placement.placement.data = vec![1_u8; crate::api::schema::PANE_GRAPHICS_STREAM_MAX_BYTES];
         placement.placement.data_len = placement.placement.data.len();
         let (clipped, format_code) = clipped_placement(&placement).expect("visible placement");
-        let host_id = host_image_id(placement.pane_id, &placement.placement);
+        let host_id = host_image_id(placement.surface, &placement.placement);
         let mut encoded = Vec::new();
 
         assert!(encode_upload_image(
