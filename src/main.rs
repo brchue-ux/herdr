@@ -269,7 +269,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # sidebar_min_width = 18
 
 # Maximum sidebar width when expanded (columns)
-# sidebar_max_width = 36
+# sidebar_max_width = 42
 
 # Start with the sidebar collapsed. Changes take effect on the next launch.
 # sidebar_start_collapsed = false

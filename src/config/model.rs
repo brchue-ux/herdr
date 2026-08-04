@@ -11,6 +11,16 @@ use super::{
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
 
+/// The expanded sidebar's width bounds: `(min, max)`.
+///
+/// One constant because three places need the same pair — [`UiConfig::default`],
+/// the fallback a `min > max` config falls back to rather than panicking in
+/// `u16::clamp`, and the state a test app starts from. A default that lived in
+/// only one of them would drift from the other two silently, and the maximum in
+/// particular is a *contract*: it is the width at which the deepest row in the
+/// tree still draws a real name.
+pub const DEFAULT_SIDEBAR_BOUNDS: (u16, u16) = (18, 42);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannelConfig {
@@ -809,7 +819,15 @@ pub struct UiConfig {
     pub sidebar_width: u16,
     /// Minimum sidebar width (columns) when expanded. Default: 18.
     pub sidebar_min_width: u16,
-    /// Maximum sidebar width (columns) when expanded. Default: 36.
+    /// Maximum sidebar width (columns) when expanded. Default: 42.
+    ///
+    /// Not a round number and never was. The old 36 was exactly the width at
+    /// which a 25-character worker name reaches the display-depth cap without
+    /// an ellipsis: seven columns of tree rails, the state mark and its space,
+    /// and one for the scrollbar the fold always assumes. The card shell spends
+    /// six more columns at every depth — two borders, two pads, and the two the
+    /// chip adds around the mark — so 42 is the same contract restated for a
+    /// tree of cards, not a wider sidebar for its own sake.
     pub sidebar_max_width: u16,
     /// Start with the sidebar collapsed. Default: false.
     pub sidebar_start_collapsed: bool,
@@ -1036,8 +1054,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             sidebar_width: 26,
-            sidebar_min_width: 18,
-            sidebar_max_width: 36,
+            sidebar_min_width: DEFAULT_SIDEBAR_BOUNDS.0,
+            sidebar_max_width: DEFAULT_SIDEBAR_BOUNDS.1,
             sidebar_start_collapsed: false,
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
@@ -1410,7 +1428,7 @@ cjk_ime_agents = ["claude", "codex"]
     fn sidebar_bounds_default_and_parse() {
         let default_config = Config::default();
         assert_eq!(default_config.ui.sidebar_min_width, 18);
-        assert_eq!(default_config.ui.sidebar_max_width, 36);
+        assert_eq!(default_config.ui.sidebar_max_width, 42);
         assert_eq!(
             default_config.ui.mobile_width_threshold,
             DEFAULT_MOBILE_WIDTH_THRESHOLD

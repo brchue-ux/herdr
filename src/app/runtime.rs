@@ -1104,6 +1104,7 @@ mod tests {
             indented: true,
             entry_idx: 0,
             agent: None,
+            card_frame: None,
         }];
     }
 
