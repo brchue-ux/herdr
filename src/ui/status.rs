@@ -198,9 +198,7 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
 ///
 /// Every state gets a distinct glyph so the mark stays readable without colour.
 /// Colour vision deficiency, monochrome/low-contrast terminals, and reading the
-/// sidebar from across a desk all lose the red/yellow/teal channel, and three of
-/// these five states used to share `●`. `◉` and `●` match the vocabulary already
-/// used by the mobile header roll-up (`agent_summary_segments`). These stay
+/// sidebar from across a desk all lose the red/yellow/teal channel. These stay
 /// static marks: spinners were removed deliberately for redraw cost.
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     (
@@ -211,14 +209,34 @@ pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static
 
 /// The glyph half of [`state_dot`], for surfaces that build their own style
 /// (the mobile header roll-up tones its own text). Keeping one match here is
-/// what stops a surface from re-typing a mark and drifting.
+/// what stops a surface from re-typing a mark and drifting — and it is what
+/// makes replacing the alphabet a one-place edit.
+///
+/// This alphabet is deliberately all-ASCII and deliberately interim. The
+/// previous set (`◉ ◐ ● ○ ·`) failed four separate ways that were measured, not
+/// argued: blocked (`◉`) and done (`●`) shared 90% of their ink even though
+/// blocked is the mark you must never miss; `◉` is present in only one of the
+/// five monospace families on a stock Linux box; four of the five marks were
+/// East-Asian *Ambiguous* width and one was not, so the icon column silently
+/// widened by state on a terminal configured to draw ambiguous glyphs
+/// double-width; and `·` was the same character, in the same colour, as the
+/// sidebar's own token separator (`src/ui/sidebar/tokens.rs`). ASCII is one
+/// cell in every terminal, present in every font, and shares no ink between
+/// `!`, `>` and `-`.
+///
+/// `Unknown` draws a blank rather than a mark. It is not a state — the detector
+/// documents it as "plain shell or unrecognized program" — so the state column
+/// says nothing about it, which also dissolves the `·` collision.
+///
+/// Idle draws `-` whether or not it has been seen; the two are still separated
+/// by colour and by [`state_label`] (`done` vs `idle`). Giving unacknowledged
+/// its own channel is a runtime change and is not part of this set.
 pub(super) fn state_mark(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
-        (AgentState::Blocked, _) => "◉",
-        (AgentState::Working, _) => "◐",
-        (AgentState::Idle, false) => "●",
-        (AgentState::Idle, true) => "○",
-        (AgentState::Unknown, _) => "·",
+        (AgentState::Blocked, _) => "!",
+        (AgentState::Working, _) => ">",
+        (AgentState::Idle, _) => "-",
+        (AgentState::Unknown, _) => " ",
     }
 }
 
@@ -228,7 +246,11 @@ pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
         (AgentState::Working, _) => "working",
         (AgentState::Idle, false) => "done",
         (AgentState::Idle, true) => "idle",
-        (AgentState::Unknown, _) => "idle",
+        // `unknown`, not `idle`: this is the only one of six copies of this
+        // mapping that said `idle`, so a configured `state_text` token called a
+        // plain shell idle while `herdr api` and the navigator both called the
+        // same pane unknown.
+        (AgentState::Unknown, _) => "unknown",
     }
 }
 
@@ -267,11 +289,11 @@ mod tests {
     fn state_dots_use_aligned_static_workspace_marks() {
         let palette = Palette::catppuccin();
         for (state, seen, symbol, color) in [
-            (AgentState::Blocked, true, "◉", palette.red),
-            (AgentState::Working, true, "◐", palette.yellow),
-            (AgentState::Idle, false, "●", palette.teal),
-            (AgentState::Idle, true, "○", palette.green),
-            (AgentState::Unknown, true, "·", palette.overlay0),
+            (AgentState::Blocked, true, "!", palette.red),
+            (AgentState::Working, true, ">", palette.yellow),
+            (AgentState::Idle, false, "-", palette.teal),
+            (AgentState::Idle, true, "-", palette.green),
+            (AgentState::Unknown, true, " ", palette.overlay0),
         ] {
             let (actual_symbol, style) = state_dot(state, seen, &palette);
             assert_eq!(actual_symbol, symbol);
@@ -279,20 +301,18 @@ mod tests {
         }
     }
 
+    /// One mark per real agent state, and no two of them the same picture.
+    ///
+    /// `Unknown` is exempt: it is not a state, so it deliberately draws nothing.
+    /// `seen` is not in the key — acknowledgement is not carried by the mark.
     #[test]
     fn state_dots_are_distinct_single_cell_glyphs() {
         let palette = Palette::catppuccin();
-        let states = [
-            (AgentState::Blocked, true),
-            (AgentState::Working, true),
-            (AgentState::Idle, false),
-            (AgentState::Idle, true),
-            (AgentState::Unknown, true),
-        ];
+        let states = [AgentState::Blocked, AgentState::Working, AgentState::Idle];
 
         let mut used: Vec<&'static str> = Vec::new();
-        for (state, seen) in states {
-            let (symbol, _) = state_dot(state, seen, &palette);
+        for state in states {
+            let (symbol, _) = state_dot(state, true, &palette);
             assert_eq!(
                 crate::ui::text::display_width(symbol),
                 1,
@@ -303,6 +323,58 @@ mod tests {
                 "state mark {symbol:?} is reused; rolled-up state must not be encoded in colour alone"
             );
             used.push(symbol);
+        }
+
+        assert_eq!(
+            state_dot(AgentState::Unknown, true, &palette).0,
+            " ",
+            "a pane that is not an agent has no state to report"
+        );
+    }
+
+    /// The sidebar's `state_text` token is the sixth copy of the state-to-word
+    /// mapping, and it was the only one that called a plain shell `idle` — the
+    /// same word a genuinely idle agent gets, while `herdr api`, the navigator
+    /// and the agent panel all called the same pane `unknown`.
+    #[test]
+    fn state_label_agrees_with_the_other_copies_of_the_mapping() {
+        for seen in [true, false] {
+            assert_eq!(state_label(AgentState::Unknown, seen), "unknown");
+            assert_eq!(
+                state_label(AgentState::Unknown, seen),
+                crate::detect::manifest::agent_state_label(AgentState::Unknown),
+                "the sidebar and the JSON API must name the same state the same way"
+            );
+        }
+    }
+
+    /// The width contract cannot be settled by measuring: `unicode-width`
+    /// reports 1 for East-Asian *Ambiguous* characters, which iTerm2, Konsole
+    /// and Windows Terminal will all draw two cells wide when configured for
+    /// CJK. The previous set passed that measurement and still jittered the
+    /// icon column by state on those terminals. ASCII has no ambiguous class,
+    /// so this is the assertion that actually holds in a real terminal.
+    #[test]
+    fn state_marks_are_ascii_so_the_column_cannot_widen_by_state() {
+        for state in [
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Unknown,
+        ] {
+            for seen in [true, false] {
+                let mark = state_mark(state, seen);
+                assert!(
+                    mark.is_ascii(),
+                    "state mark {mark:?} for {state:?} seen={seen} is not ASCII, so its cell \
+                     width depends on the terminal's ambiguous-width setting"
+                );
+                assert_eq!(
+                    mark.chars().count(),
+                    1,
+                    "state mark {mark:?} must be exactly one character"
+                );
+            }
         }
     }
 

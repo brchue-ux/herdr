@@ -312,11 +312,14 @@ mod tests {
         // It moved once more when the sidebar divider grew an at-rest grip:
         // three rows in the middle of the bar now carry a lighter foreground.
         // The glyphs are untouched, so this is purely a style move.
-        // The mobile digest below is unchanged, so the desktop sidebar is the
-        // only thing that moved.
+        // It moved a final time when the state alphabet became ASCII
+        // (`state_mark`): every state glyph on this frame is a different
+        // character, and a pane that is not an agent now draws a blank where
+        // it used to draw `·`. Geometry is untouched — the mark still occupies
+        // exactly one cell.
         assert_eq!(
             frame_digest(&frame),
-            "0de4de07a51fe35d919cd8054b9c1d6952f2069e2cda858cc604fd00601841d1"
+            "d4ec348c0c198695455e0a27c85fdc9823d9fad4941133931af890bb6c47bf60"
         );
     }
 
@@ -333,7 +336,7 @@ mod tests {
         assert_eq!(frame.cursor, None);
         assert_eq!(
             frame_digest(&frame),
-            "921c7ce380e6be0d304a5256f520861a17302ce27fd8b6c8f30bd80601a821cf"
+            "eab35c713421e44d9672e664b4ebbab2340a521ff657cbcaf394f84008fda5a8"
         );
     }
 
@@ -350,7 +353,7 @@ mod tests {
 
         assert_eq!(
             frame_digest(&frame),
-            "295608a66067f1e1f066c0adb3cf427e8a2d68bba8f68949fb72d464dcd8baab"
+            "b71abf761edf09b82d730df08edf2eebb057e529aebd03e7a6a53e4a5ea0a7c8"
         );
     }
 }

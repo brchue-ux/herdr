@@ -1045,7 +1045,7 @@ mod tests {
         let line1 = buffer_row_text(buffer, card, card.y);
         let line2 = buffer_row_text(buffer, card, card.y + 1);
 
-        assert!(line1.starts_with(" · one"));
+        assert!(line1.starts_with("   one"), "line1: {line1:?}");
         assert!(!line1.contains("1 one"));
         // At the default 36-column maximum the name and the branch fit on one
         // line, so the row folds onto it and gives the second line back.

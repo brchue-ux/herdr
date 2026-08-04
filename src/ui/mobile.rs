@@ -1267,7 +1267,7 @@ mod tests {
         let labels: Vec<&str> = segments.iter().map(|(text, _)| text.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["◉ 2 blocked", "● 1 done", "2 working", "1 idle"]
+            vec!["! 2 blocked", "- 1 done", "2 working", "1 idle"]
         );
         assert_eq!(segments[0].1, SummaryTone::Blocked);
     }
@@ -1285,7 +1285,7 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["● 1 done".to_string(), "2 working".to_string()]
+            vec!["- 1 done".to_string(), "2 working".to_string()]
         );
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
         };
         let (shown, truncated) = fit_summary_segments(agent_summary_segments(counts), 24);
         let labels: Vec<&str> = shown.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(labels, vec!["◉ 2 blocked", "● 1 done"]);
+        assert_eq!(labels, vec!["! 2 blocked", "- 1 done"]);
         assert!(truncated);
     }
 
