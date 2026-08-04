@@ -671,7 +671,7 @@ mod tests {
         // Auto-named tab 3 already shows its position as its title, so it is
         // decorated with a dot but not double-numbered.
         let row = render_row(&mut app);
-        assert_eq!(row, " · 1 agents     · 2 review     · 3");
+        assert_eq!(row, "   1 agents       2 review       3");
     }
 
     #[test]
@@ -693,7 +693,7 @@ mod tests {
         assert!(!app.sidebar_collapsed);
 
         let row = render_row(&mut app);
-        assert_eq!(row, " · 1 agents     · 2 review     · 3");
+        assert_eq!(row, "   1 agents       2 review       3");
     }
 
     #[test]
@@ -749,8 +749,8 @@ mod tests {
         let unknown_rect = app.view.tab_hit_areas[0];
         assert_eq!(
             buffer[(unknown_rect.x + 1, unknown_rect.y)].symbol(),
-            "·",
-            "tabs with no agent state keep the neutral mark"
+            " ",
+            "a tab with no agent draws no mark, but still reserves the cell"
         );
     }
 
