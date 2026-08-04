@@ -2508,7 +2508,14 @@ fn push_token_span(
     anim: &RowAnimation<'_>,
 ) {
     let style = apply_token_style(base, patch);
-    push_animated_span(spans, text, style, anim.frame(patch), anim.palette, anim.host);
+    push_animated_span(
+        spans,
+        text,
+        style,
+        anim.frame(patch),
+        anim.palette,
+        anim.host,
+    );
 }
 
 /// Draw one span of text with an animation frame reaching each of its cells.
@@ -4042,7 +4049,10 @@ mod tests {
             .unwrap();
         let row = row_text(terminal.backend().buffer(), 0, area.width);
 
-        assert!(row.starts_with('●'), "the bar is not hung on the left: {row}");
+        assert!(
+            row.starts_with('●'),
+            "the bar is not hung on the left: {row}"
+        );
         assert!(
             row.trim_end_matches('│').ends_with("62%"),
             "the status is not right-aligned beside the bar: {row}"

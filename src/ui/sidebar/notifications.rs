@@ -79,9 +79,7 @@ impl Tier {
     /// The most detailed tier that fits `available` columns, or `None` when not
     /// even one column per signal fits.
     pub(super) fn widest_fitting(available: u16) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|tier| tier.width() <= available)
+        Self::ALL.into_iter().find(|tier| tier.width() <= available)
     }
 }
 
@@ -172,7 +170,10 @@ fn push_slot(
 ) {
     let text = slot_text(signal, tier);
     if !signals.is_live(signal) {
-        spans.push(Span::styled(text, Style::default().fg(app.palette.overlay0)));
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(app.palette.overlay0),
+        ));
         return;
     }
 
@@ -226,9 +227,8 @@ mod tests {
     #[test]
     fn every_tier_draws_exactly_the_width_it_reserves() {
         for tier in Tier::ALL {
-            let gaps = usize::from(SLOT_GAP)
-                * usize::from(tier != Tier::Tight)
-                * (FleetSignal::COUNT - 1);
+            let gaps =
+                usize::from(SLOT_GAP) * usize::from(tier != Tier::Tight) * (FleetSignal::COUNT - 1);
             let drawn = FleetSignal::ALL
                 .into_iter()
                 .map(|signal| crate::ui::text::display_width(&slot_text(signal, tier)))

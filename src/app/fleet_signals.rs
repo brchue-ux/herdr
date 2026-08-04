@@ -360,9 +360,7 @@ mod tests {
         // signal must never move under them.
         assert_eq!(
             FleetSignal::ALL.map(FleetSignal::name),
-            [
-                "review", "ask", "report", "busy", "stopped", "dirty", "push", "pr"
-            ]
+            ["review", "ask", "report", "busy", "stopped", "dirty", "push", "pr"]
         );
     }
 
@@ -482,7 +480,10 @@ mod tests {
             .and_then(|tab| tab.panes.get_mut(&pane_id))
             .expect("pane exists")
             .seen = seen;
-        let terminal = app.terminals.get_mut(&terminal_id).expect("terminal exists");
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal exists");
         terminal.state = state;
         if let Some(owner) = owner {
             terminal.metadata_tokens.patch(
@@ -520,9 +521,8 @@ mod tests {
             "an unowned shell is just a shell"
         );
         assert!(
-            signals_for_pane_state(AgentState::Unknown, true, Some("mate")).is_live(
-                FleetSignal::Stopped
-            ),
+            signals_for_pane_state(AgentState::Unknown, true, Some("mate"))
+                .is_live(FleetSignal::Stopped),
             "a worker the fleet launched and that is no longer running an agent is stopped"
         );
     }
