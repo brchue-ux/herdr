@@ -169,6 +169,7 @@ impl App {
                 let changes_view = !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved)
                     || self.state.mode.mouse_motion_changes_view();
                 let divider_hover_before = self.state.sidebar_divider_hover;
+                let divider_detent_before = self.state.sidebar_divider_detent;
                 if self.state.popup_pane.is_some() || self.state.mouse_capture {
                     self.handle_mouse(mouse);
                 } else {
@@ -177,8 +178,12 @@ impl App {
                 }
                 // The divider's hover state is drawn, so a motion that crosses
                 // into or out of its grab band is not the render-neutral motion
-                // the mode-level check above assumes.
-                changes_view || self.state.sidebar_divider_hover != divider_hover_before
+                // the mode-level check above assumes. The detent is drawn too,
+                // and it is the one case where the width deliberately does not
+                // change, so nothing else would ask for the repaint.
+                changes_view
+                    || self.state.sidebar_divider_hover != divider_hover_before
+                    || self.state.sidebar_divider_detent != divider_detent_before
             }
             crate::raw_input::RawInputEvent::OuterFocusGained => {
                 self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);

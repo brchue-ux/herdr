@@ -698,6 +698,7 @@ impl App {
             },
             drag: None,
             sidebar_divider_hover: false,
+            sidebar_divider_detent: false,
             workspace_press: None,
             tab_press: None,
             selection: None,

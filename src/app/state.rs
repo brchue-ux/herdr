@@ -1599,6 +1599,11 @@ pub struct AppState {
     /// band. Pure client presentation state: it only decides how the divider is
     /// drawn, is never persisted, and never leaves the TUI.
     pub(crate) sidebar_divider_hover: bool,
+    /// Whether a live divider drag is currently being held at the card/line
+    /// shell boundary rather than tracking the pointer. Pure client
+    /// presentation state, like the hover beside it: it only decides how the
+    /// divider is drawn, is never persisted, and never leaves the TUI.
+    pub(crate) sidebar_divider_detent: bool,
     pub(crate) workspace_press: Option<WorkspacePressState>,
     pub(crate) tab_press: Option<TabPressState>,
     pub selection: Option<Selection>,
@@ -2407,6 +2412,7 @@ impl AppState {
             },
             drag: None,
             sidebar_divider_hover: false,
+            sidebar_divider_detent: false,
             workspace_press: None,
             tab_press: None,
             selection: None,

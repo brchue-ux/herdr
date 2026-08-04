@@ -793,6 +793,11 @@ impl AppState {
 
                 let workspace_press = self.workspace_press.take();
                 let tab_press = self.tab_press.take();
+                // The held look describes a live drag. Hover tracking runs at
+                // the top of this function, while the drag is still set, so the
+                // release has to retire it here or a divider let go inside the
+                // detent band stays lit as caught.
+                self.sidebar_divider_detent = false;
                 match self.drag.take() {
                     Some(DragState {
                         target:

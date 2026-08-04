@@ -2696,6 +2696,7 @@ impl HeadlessServer {
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         let divider_hover_before = self.app.state.sidebar_divider_hover;
+        let divider_detent_before = self.app.state.sidebar_divider_detent;
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
         self.app.route_client_events_from(client_id, events, false);
@@ -2726,8 +2727,11 @@ impl HeadlessServer {
             // A motion that crosses into or out of the sidebar divider's grab
             // band changes how the divider is drawn, so it is not the
             // render-neutral motion the mode-level check assumed.
-            let divider_hover_changed =
-                self.app.state.sidebar_divider_hover != divider_hover_before;
+            // The detent is drawn as well, and it is the one case where the
+            // width deliberately stops changing, so nothing else would ask.
+            let divider_hover_changed = self.app.state.sidebar_divider_hover
+                != divider_hover_before
+                || self.app.state.sidebar_divider_detent != divider_detent_before;
             foreground_changed
                 || theme_changed
                 || divider_hover_changed
