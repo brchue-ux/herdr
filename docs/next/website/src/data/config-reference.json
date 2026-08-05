@@ -831,8 +831,14 @@
         {
           "key": "ui.sidebar.animation.view_switch_ms",
           "type": "integer",
-          "default": "220",
-          "description": "How long each half of a tree view switch takes, in milliseconds. The view being left dematerializes for this long, the new root is adopted at the instant nothing is on screen, and the view being arrived at materializes for the same again. Clamped to 60-1500."
+          "default": "640",
+          "description": "How long each half of a tree view switch takes, in milliseconds. The view being left dematerializes for this long, the new root is adopted at the instant nothing is on screen, and the view being arrived at materializes for the same again. The transition redraws every 50 ms, so this is really a frame count: 640 ms is about thirteen frames each way. Clamped to 60-1500."
+        },
+        {
+          "key": "ui.sidebar.animation.view_switch_particles_per_cell",
+          "type": "integer",
+          "default": "0",
+          "description": "How many particles one terminal cell of the pixel card sheet is broken into as the view comes apart. 0 leaves the sheet cutting straight from one view to the next, which is what it has always done, and only the characters around the cards dissolve. Any higher number dissolves the cards themselves in pixel space: 1 matches the finest a character dissolve can be, and the count rises from there. Only has an effect when experimental.kitty_graphics is on. Clamped to 256."
         },
         {
           "key": "ui.sidebar.notifications.enabled",
@@ -1264,6 +1270,12 @@
           "type": "boolean",
           "default": "false",
           "description": "Experimental local Kitty graphics rendering for attached clients."
+        },
+        {
+          "key": "experimental.sidebar_card_font",
+          "type": "string",
+          "default": "\"\"",
+          "description": "Path to a proportional .ttf/.otf the sidebar's pixel cards are set in. Empty means search the usual system font directories; when nothing is found the sidebar keeps its character cards. Only read while kitty_graphics is on, and only at startup."
         },
         {
           "key": "experimental.pane_history",

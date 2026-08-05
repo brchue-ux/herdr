@@ -94,6 +94,7 @@ impl Rgb {
 /// Straight rather than premultiplied because everything drawn here composites
 /// source-over onto what is already there, and the result is handed to a PNG
 /// encoder that wants straight alpha anyway.
+#[derive(Clone)]
 pub(super) struct Canvas {
     width: u32,
     height: u32,
@@ -176,6 +177,37 @@ impl Canvas {
     /// Straight RGBA8, ready for a PNG encoder.
     pub(super) fn rgba8(&self) -> &[u8] {
         &self.px
+    }
+
+    /// Scale the alpha of every pixel in a rectangle, leaving colour alone.
+    ///
+    /// The one operation that takes an already-drawn surface *apart*. It is
+    /// alpha rather than a mix toward the backdrop for the reason the sheet is
+    /// transparent in the first place: the tree's own connectors and Space rows
+    /// are drawn as characters underneath, so a card coming apart has to let
+    /// them back through rather than paint over them in the panel's colour.
+    ///
+    /// Colour is deliberately untouched. Straight alpha means a pixel at
+    /// `a = 0.3` is the same ink at three tenths of its presence, so a particle
+    /// dissolving keeps the card's hue all the way out instead of desaturating
+    /// toward grey on its way.
+    pub(super) fn scale_alpha(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, factor: f32) {
+        let factor = factor.clamp(0.0, 1.0);
+        if factor >= 1.0 {
+            return;
+        }
+        let x1 = x1.min(self.width);
+        let y1 = y1.min(self.height);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let Some(i) = self.index(x, y) else {
+                    continue;
+                };
+                self.px[i + 3] = (f32::from(self.px[i + 3]) * factor)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
     }
 }
 

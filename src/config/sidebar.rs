@@ -972,12 +972,37 @@ const DEFAULT_ROW_EXIT_MS: u64 = 220;
 /// Unlike a row arrival this is on out of the box, because the switch itself is
 /// the behaviour: re-rooting the tree with no transition is a hard cut from one
 /// set of rows to another, which is precisely the jumbling the transition
-/// exists to avoid. Fast enough that drilling into a mate feels like a
-/// navigation rather than a wait, and the same on the way out so the motion
-/// reads the same in both directions.
-const DEFAULT_VIEW_SWITCH_MS: u64 = 220;
+/// exists to avoid.
+///
+/// # Why it is not the 220 ms it was
+///
+/// The transition redraws on `SMOOTH_FRAME_INTERVAL`, which is 50 ms, so the
+/// duration is not a continuous dial — it is a frame count. 220 ms is *four
+/// frames per half*, and four frames is not an animation anyone can read: it
+/// is one intermediate state on the way in, one on the way out, and a lot of
+/// hard edge. At 640 ms a half is twelve or thirteen frames, which is where a
+/// dissolve stops reading as a flicker and starts reading as a thing coming
+/// apart — and it is still under two thirds of a second each way, so drilling
+/// into a mate is still a navigation rather than a wait.
+const DEFAULT_VIEW_SWITCH_MS: u64 = 640;
 const MIN_VIEW_SWITCH_MS: u64 = 60;
 const MAX_VIEW_SWITCH_MS: u64 = 1_500;
+
+/// Particles per terminal cell in the card sheet's own dissolve, by default.
+///
+/// Off. The characters keep dissolving exactly as they did; the pixel cards
+/// keep hard-cutting at the commit instant. See
+/// [`SidebarAnimationConfig::view_switch_particles_per_cell`] for what turning
+/// it on costs and why the number is per *cell* rather than in pixels.
+const DEFAULT_VIEW_SWITCH_PARTICLES_PER_CELL: u16 = 0;
+
+/// Most particles one cell may be broken into.
+///
+/// A 10x21 px cell holds 210 pixels, so anything past that is asking for a
+/// particle finer than a pixel — the same dissolve, costing more to compute.
+/// The ceiling is stated rather than derived because the cell size is the
+/// host's to report and a config value must mean something before one is known.
+const MAX_VIEW_SWITCH_PARTICLES_PER_CELL: u16 = 256;
 
 /// Lifecycle animation for sidebar rows themselves, as opposed to the tokens
 /// drawn inside them.
@@ -1018,6 +1043,30 @@ pub struct SidebarAnimationConfig {
     /// adopted at the instant nothing is on screen, and the view being arrived
     /// at materializes for the same again.
     pub view_switch_ms: u64,
+    /// How many particles one terminal cell of the *pixel* card sheet is broken
+    /// into as the view comes apart. `0` — the default — leaves the sheet
+    /// hard-cutting at the commit instant, which is what it has always done.
+    ///
+    /// # What this is for
+    ///
+    /// On a terminal without Kitty graphics the tree is characters and
+    /// `view_switch` is the whole effect. On one with it, the sidebar's cards
+    /// are a picture drawn *over* those characters and opaque across every cell
+    /// a card occupies — so the character dissolve is running underneath a
+    /// picture that is standing still, and what is actually visible is a thin
+    /// border of connectors coming apart around a block of cards that jump. The
+    /// sheet is an image, so it can dissolve at whatever resolution it is asked
+    /// to, and this is that resolution.
+    ///
+    /// # Why per cell and not in pixels
+    ///
+    /// So a setting means the same thing on every host. The particle edge is
+    /// derived from the cell the terminal actually reports, so `1` is one
+    /// particle per cell — the finest a character dissolve can be, matched
+    /// exactly — and the count goes up from there. `20` is twenty times the
+    /// particles a character dissolve has available to it, on a cell of any
+    /// size. Clamped to 256, which is finer than a pixel on most cells.
+    pub view_switch_particles_per_cell: u16,
 }
 
 impl Default for SidebarAnimationConfig {
@@ -1029,6 +1078,7 @@ impl Default for SidebarAnimationConfig {
             row_exit_ms: DEFAULT_ROW_EXIT_MS,
             view_switch: SidebarTokenEmphasis::Dissolve,
             view_switch_ms: DEFAULT_VIEW_SWITCH_MS,
+            view_switch_particles_per_cell: DEFAULT_VIEW_SWITCH_PARTICLES_PER_CELL,
         }
     }
 }
@@ -1063,6 +1113,15 @@ impl SidebarAnimationConfig {
     /// adopting the incoming root is by construction the same duration the
     /// outgoing view spends leaving. They cannot disagree about when the panel
     /// is empty.
+    /// Particles per cell the sheet's own dissolve runs at, clamped.
+    ///
+    /// Zero is off and stays zero: the clamp is a ceiling on a live effect, not
+    /// a floor that turns one on.
+    pub(crate) fn view_switch_particles(&self) -> u16 {
+        self.view_switch_particles_per_cell
+            .min(MAX_VIEW_SWITCH_PARTICLES_PER_CELL)
+    }
+
     pub(crate) fn view_switch_stage(&self) -> Option<crate::anim::Stage> {
         let behaviour = self.view_switch.behaviour()?;
         Some(crate::anim::Stage::new(

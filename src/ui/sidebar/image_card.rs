@@ -131,8 +131,31 @@ pub(crate) struct SidebarCardLayer {
     /// What the sheet was built from. A frame whose signature is unchanged
     /// keeps the sheet it already has and re-encodes nothing.
     pub signature: u64,
+    /// The same, with the transition the sheet is *in* left out.
+    ///
+    /// Two signatures because a switch changes one of them every frame and the
+    /// other not at all: the rows do not move until the commit instant, which
+    /// is the whole point of the switch. Splitting them is what lets a
+    /// transition frame reuse [`Self::undissolved`] instead of drawing ten
+    /// cards, their bloom and their type again to produce the same pixels it
+    /// produced 50 ms ago.
+    pub content_signature: u64,
+    /// The sheet before the transition was applied to it, held only while one
+    /// is running.
+    ///
+    /// `None` whenever the panel is settled or the effect is off, so a Herdr
+    /// nobody has configured this on carries no extra megabyte around.
+    pub undissolved: Option<UndissolvedSheet>,
     pub layer: crate::app::state::GraphicsLayer,
 }
+
+/// The rasterised sheet, held across the frames of one transition.
+///
+/// Opaque outside this module and shared rather than copied: every frame of a
+/// switch reads the same pixels, and the only thing that changes between them
+/// is the alpha mask laid over a scratch copy.
+#[derive(Clone)]
+pub(crate) struct UndissolvedSheet(std::sync::Arc<Canvas>);
 
 /// Whether the panel should be drawing pixel cards at all.
 ///
@@ -975,11 +998,52 @@ fn build_sheet_inner(
     backdrop.0.hash(&mut hasher);
     backdrop.1.hash(&mut hasher);
     backdrop.2.hash(&mut hasher);
+    let content_signature = hasher.finish();
+    // The transition the sheet is *in*, on top of the cards it is a picture of.
+    // Without this the content signature is unchanged for the whole of a switch
+    // — the rows have not moved yet, that is the point of the switch — so the
+    // cards would stand perfectly still while the characters around them came
+    // apart, which is exactly the hard cut this is here to remove. Quantized to
+    // [`DISSOLVE_STEPS`], so a settled panel still hashes to `None` and
+    // rasterises nothing.
+    let dissolve = sheet_dissolve(app, cell_size);
+    dissolve.map(DissolveFrame::step).hash(&mut hasher);
     let signature = hasher.finish();
     if let Some(previous) = previous {
         if previous.signature == signature && previous.rect == sheet_rect {
             return Ok(None);
         }
+    }
+
+    // A transition frame whose *cards* are the ones already drawn re-uses those
+    // pixels. This is the difference between a switch costing one rasterisation
+    // and costing one per frame, and the rasterisation is nine tenths of the
+    // cost: drawing ten cards, their bloom and their type measures about 16 ms
+    // against about 1.4 ms to encode the result and under 1 ms to take it apart.
+    let held = previous.filter(|previous| {
+        previous.content_signature == content_signature && previous.rect == sheet_rect
+    });
+    if let Some(base) = held.and_then(|previous| previous.undissolved.clone()) {
+        // Including the frame that *ends* a transition, which has no dissolve
+        // left to apply and would otherwise pay a full rasterisation to arrive
+        // back at pixels it is already holding.
+        let (width_px, height_px) = (base.0.width(), base.0.height());
+        let data = match dissolve {
+            Some(dissolve) => {
+                let mut sheet = Canvas::clone(&base.0);
+                dissolve.apply(&mut sheet);
+                encode_png(&sheet)
+            }
+            None => encode_png(&base.0),
+        }
+        .ok_or(())?;
+        return Ok(Some(SidebarCardLayer {
+            rect: sheet_rect,
+            signature,
+            content_signature,
+            undissolved: dissolve.map(|_| base),
+            layer: sheet_layer(width_px, height_px, data, sheet_rect),
+        }));
     }
 
     let width_px = u32::from(sheet_rect.width) * cell_size.width_px;
@@ -1048,28 +1112,48 @@ fn build_sheet_inner(
         }
     }
 
+    // Only while a transition is running: a settled panel keeps no second copy
+    // of a sheet it is not about to take apart.
+    let undissolved =
+        dissolve.map(|_| UndissolvedSheet(std::sync::Arc::new(Canvas::clone(&sheet))));
+    if let Some(dissolve) = dissolve {
+        dissolve.apply(&mut sheet);
+    }
+
     let data = encode_png(&sheet).ok_or(())?;
     Ok(Some(SidebarCardLayer {
         rect: sheet_rect,
         signature,
-        layer: crate::app::state::GraphicsLayer::new(
-            crate::api::schema::PaneGraphicsFormat::Png,
-            width_px,
-            height_px,
-            data,
-            crate::api::schema::PaneGraphicsPlacementParams {
-                viewport_col: 0,
-                viewport_row: 0,
-                grid_cols: u32::from(sheet_rect.width),
-                grid_rows: u32::from(sheet_rect.height),
-                // Over the text: the sheet is opaque exactly where a card is
-                // and transparent everywhere else, so the tree's connectors and
-                // its Space rows keep showing through while the character card
-                // under each pixel card is covered.
-                z: 0,
-            },
-        ),
+        content_signature,
+        undissolved,
+        layer: sheet_layer(width_px, height_px, data, sheet_rect),
     }))
+}
+
+/// The placement a finished sheet is published as.
+fn sheet_layer(
+    width_px: u32,
+    height_px: u32,
+    data: Vec<u8>,
+    sheet_rect: Rect,
+) -> crate::app::state::GraphicsLayer {
+    crate::app::state::GraphicsLayer::new(
+        crate::api::schema::PaneGraphicsFormat::Png,
+        width_px,
+        height_px,
+        data,
+        crate::api::schema::PaneGraphicsPlacementParams {
+            viewport_col: 0,
+            viewport_row: 0,
+            grid_cols: u32::from(sheet_rect.width),
+            grid_rows: u32::from(sheet_rect.height),
+            // Over the text: the sheet is opaque exactly where a card is and
+            // transparent everywhere else, so the tree's connectors and its
+            // Space rows keep showing through while the character card under
+            // each pixel card is covered.
+            z: 0,
+        },
+    )
 }
 
 /// Fill the cells one row owns with the ground its card floats on.
@@ -1108,6 +1192,143 @@ fn lift(sheet: &mut Canvas, card: &PlacedCard<'_>) {
             }
         }
     }
+}
+
+/// The view transition, resolved onto the sheet's own pixels.
+///
+/// # Why the sheet has to carry the transition at all
+///
+/// `super::render_tree_view_transition` takes the view apart cell by cell, and
+/// on a terminal with no Kitty graphics that is the whole effect. The card sheet
+/// is *opaque over every cell a card occupies*, so on a terminal that does draw
+/// it the character dissolve is happening entirely underneath a picture that is
+/// standing still: what is left visible is the connectors and the Space rows
+/// around the cards, which is a thin border of the panel dissolving around a
+/// block of cards that hard-cut at the commit instant.
+///
+/// # Why a particle is a square of pixels and not a cell
+///
+/// A cell dissolve on the character path has exactly one resolution available
+/// to it — the cell — because a letter cannot be half drawn. The sheet has no
+/// such limit: it is an image, and the only thing deciding how fine its
+/// dissolve is is how large a block of pixels shares one draw. `particle_px` is
+/// the edge of that block, so the particle *count* goes as its inverse square:
+/// at a 10x21 px host cell, a 21 px particle is one particle per cell, and
+/// halving the edge is four times the particles.
+///
+/// # Why it reads the engine rather than rolling its own scatter
+///
+/// The particle grid is handed to [`crate::anim::ElementFrame::cell`] as if it
+/// were a grid of cells, so the configured behaviour — `dissolve` out of the
+/// box, but `collapse`, `wipe` and the rest all work — decides the order and the
+/// front exactly as it does for the characters. The pixels and the characters
+/// are then the same effect at two resolutions rather than two effects that
+/// have to be kept looking alike by hand.
+#[derive(Debug, Clone, Copy)]
+struct DissolveFrame<'a> {
+    /// How present the view is, in `0.0..=1.0`.
+    ///
+    /// Taken straight off [`crate::anim::ElementFrame::progress`], which already
+    /// counts *down* through a dismount — leaving is arriving played backwards,
+    /// and the engine reverses it once so every consumer agrees which way the
+    /// effect runs. Nothing here reverses it a second time.
+    progress: f32,
+    /// Particle edge, in sheet pixels. Never zero.
+    particle_px: u32,
+    /// The behaviour resolving the front, borrowed from the engine's catalogue
+    /// so the pixels play exactly the behaviour the characters do.
+    behaviour: &'a crate::anim::behaviour::Behaviour,
+}
+
+/// Steps of progress the sheet is rebuilt at.
+///
+/// A re-encode is the expensive half of this effect, so the sheet is quantized
+/// to a fixed ladder rather than to whatever the render loop happened to tick
+/// at: 24 steps across a half-transition is finer than the 50 ms animation
+/// interval can deliver at any duration under about 1.2 s, so in practice the
+/// loop's own frame rate is the binding constraint and this only stops a
+/// faster loop from paying more.
+const DISSOLVE_STEPS: f32 = 24.0;
+
+impl DissolveFrame<'_> {
+    /// The quantized step this frame sits on, for the sheet's signature.
+    fn step(self) -> (u16, u32) {
+        (
+            (self.progress.clamp(0.0, 1.0) * DISSOLVE_STEPS).round() as u16,
+            self.particle_px,
+        )
+    }
+
+    /// Particle columns and rows over a sheet of this size.
+    fn grid(self, width_px: u32, height_px: u32) -> (u16, u16) {
+        let edge = self.particle_px.max(1);
+        let cols = width_px.div_ceil(edge).clamp(1, u32::from(u16::MAX));
+        let rows = height_px.div_ceil(edge).clamp(1, u32::from(u16::MAX));
+        (cols as u16, rows as u16)
+    }
+
+    /// Take the sheet apart at this frame of the transition.
+    fn apply(self, sheet: &mut Canvas) {
+        use crate::anim::cell::{CellExtent, CellPos};
+
+        let (cols, rows) = self.grid(sheet.width(), sheet.height());
+        let extent = CellExtent::new(cols, rows);
+        let progress = self.progress.clamp(0.0, 1.0);
+        let edge = self.particle_px.max(1);
+        for row in 0..rows {
+            for col in 0..cols {
+                let present = self
+                    .behaviour
+                    .strength(CellPos::new(col, row), extent, progress);
+                if present >= 1.0 {
+                    continue;
+                }
+                let x0 = u32::from(col) * edge;
+                let y0 = u32::from(row) * edge;
+                sheet.scale_alpha(x0, y0, x0 + edge, y0 + edge, present);
+            }
+        }
+    }
+}
+
+/// The transition frame the sheet should be drawn at, or `None` when the panel
+/// is settled or the effect is configured off.
+///
+/// `particle_px` is read off the config in *cells* of the host's own cell so a
+/// setting means the same thing on a 10x21 px cell and a 7x15 px one: the
+/// captain's knob is "how many particles per cell", and the pixel edge is
+/// derived from the cell he is actually looking at.
+fn sheet_dissolve(app: &AppState, cell_size: HostCellSize) -> Option<DissolveFrame<'_>> {
+    let per_cell = app.sidebar_animation.view_switch_particles();
+    if per_cell == 0 {
+        return None;
+    }
+    let frame = app
+        .anim
+        .frame(&crate::app::tree_view::view_element(), None)?;
+    // A settled view is not a transition, and the view's lifecycle is
+    // deliberately still, so there is no idle behaviour here to mistake for one.
+    if !matches!(
+        frame.phase,
+        crate::anim::Phase::Mount | crate::anim::Phase::Dismount
+    ) {
+        return None;
+    }
+    let behaviour = frame.behaviour?;
+    // Particles are square, so the edge that puts `per_cell` of them in one
+    // cell is the cell's own area divided by the count, rooted. Rounded to the
+    // nearest whole pixel rather than up, because the count goes as the edge
+    // *squared*: on a 10x21 px cell an edge rounded up from 3.2 to 4 delivers
+    // 13 particles per cell against the 20 asked for, and rounding to 3
+    // delivers 23. Floored at one pixel, because a particle finer than a pixel
+    // is not a finer dissolve — it is the same dissolve costing more to draw.
+    let cell_area = (cell_size.width_px * cell_size.height_px).max(1) as f32;
+    let particle_px = (cell_area / f32::from(per_cell)).sqrt().round().max(1.0) as u32;
+    Some(DissolveFrame {
+        progress: frame.progress,
+        particle_px,
+        behaviour,
+    })
 }
 
 fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
@@ -1287,7 +1508,7 @@ mod tests {
     /// The same fleet with the pixel path live: kitty graphics on and a host
     /// cell size reported. Whether it is actually live also depends on this
     /// machine having a proportional face, which [`is_available`] decides.
-    fn pixel_fleet_app() -> AppState {
+    pub(super) fn pixel_fleet_app() -> AppState {
         let mut app = fleet_app();
         app.kitty_graphics_enabled = true;
         app.host_cell_size = HostCellSize {
@@ -1297,7 +1518,7 @@ mod tests {
         app
     }
 
-    fn sidebar_rect() -> Rect {
+    pub(super) fn sidebar_rect() -> Rect {
         Rect::new(0, 0, 42, 46)
     }
 
@@ -1855,5 +2076,350 @@ mod tests {
         let doing = "Investigateing killed Okta corpus and Herdr work sessions";
         entry.tokens.insert("doing".to_string(), doing.to_string());
         assert_eq!(title_text(&entry), doing);
+    }
+}
+
+#[cfg(test)]
+mod the_sheet_carries_the_view_transition {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+
+    /// Start a re-root and return the app mid-dismount, or `None` when this
+    /// machine has no proportional face and there is no pixel path to test.
+    fn switching(per_cell: u16) -> Option<(AppState, std::time::Instant)> {
+        let mut app = pixel_fleet_app();
+        app.sidebar_animation.view_switch_particles_per_cell = per_cell;
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let SheetUpdate::Rebuilt(_) = build_sheet(&app, &cards, rect, app.host_cell_size, None)
+        else {
+            return None;
+        };
+        let now = std::time::Instant::now();
+        assert!(app.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2ndmate-herdr".to_string()),
+            now
+        ));
+        Some((app, now))
+    }
+
+    fn sheet_at(app: &AppState, previous: Option<&SidebarCardLayer>) -> Option<SidebarCardLayer> {
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(app, rect);
+        match build_sheet(app, &cards, rect, app.host_cell_size, previous) {
+            SheetUpdate::Rebuilt(layer) => Some(layer),
+            _ => None,
+        }
+    }
+
+    /// The default. A Herdr nobody has configured this on rasterises the sheet
+    /// exactly once across a whole switch, holds no second copy of it, and the
+    /// cards cut straight from one view to the next the way they always have.
+    #[test]
+    fn off_by_default_costs_one_sheet_and_holds_no_canvas() {
+        let Some((mut app, now)) = switching(0) else {
+            return;
+        };
+        let mut held = sheet_at(&app, None);
+        assert!(
+            held.as_ref()
+                .is_some_and(|layer| layer.undissolved.is_none()),
+            "a settled sheet keeps no undissolved copy"
+        );
+        let mut rebuilds = 0;
+        for step in 1..=12 {
+            app.anim
+                .advance(now + std::time::Duration::from_millis(step * 50));
+            if let Some(layer) = sheet_at(&app, held.as_ref()) {
+                rebuilds += 1;
+                held = Some(layer);
+            }
+        }
+        assert_eq!(rebuilds, 0, "the sheet does not move while the view leaves");
+    }
+
+    /// Turned on, every frame of the half produces a new sheet — that is the
+    /// effect — and each one is a fresh picture rather than the same bytes.
+    #[test]
+    fn a_switch_redraws_the_sheet_on_every_frame() {
+        let Some((mut app, now)) = switching(20) else {
+            return;
+        };
+        let mut held = sheet_at(&app, None);
+        let mut seen = std::collections::HashSet::new();
+        for step in 1..=8 {
+            app.anim
+                .advance(now + std::time::Duration::from_millis(step * 50));
+            let Some(layer) = sheet_at(&app, held.as_ref()) else {
+                panic!("frame {step} of a running transition produced no sheet");
+            };
+            assert!(
+                seen.insert(layer.layer.data_fingerprint),
+                "frame {step} re-sent the pixels of an earlier frame"
+            );
+            held = Some(layer);
+        }
+    }
+
+    /// The expensive half of a transition frame is rasterising ten cards, their
+    /// bloom and their type — about nine tenths of it. A frame whose cards have
+    /// not moved reuses those pixels instead of drawing them again, and this is
+    /// the check that it actually does.
+    #[test]
+    fn a_transition_frame_reuses_the_cards_it_already_rasterised() {
+        let Some((mut app, now)) = switching(20) else {
+            return;
+        };
+        let first = sheet_at(&app, None).expect("a running transition has a sheet");
+        assert!(
+            first.undissolved.is_some(),
+            "a transition frame holds the sheet it drew"
+        );
+        app.anim
+            .advance(now + std::time::Duration::from_millis(100));
+        let second = sheet_at(&app, Some(&first)).expect("the next frame draws");
+        assert_eq!(
+            first.content_signature, second.content_signature,
+            "the cards have not moved: the switch has not committed yet"
+        );
+        assert_ne!(
+            first.signature, second.signature,
+            "but the frame of the transition has"
+        );
+        assert!(
+            first
+                .undissolved
+                .as_ref()
+                .zip(second.undissolved.as_ref())
+                .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a.0, &b.0)),
+            "the second frame rasterised the cards again instead of reusing them"
+        );
+    }
+
+    /// The knob is particles per *cell*, so it has to mean the same thing on a
+    /// tall cell and a square one — and it has to actually deliver roughly the
+    /// count it is asked for, which is the whole of what the captain's "20x" is.
+    #[test]
+    fn the_particle_count_tracks_the_setting_on_any_cell() {
+        for cell in [
+            HostCellSize {
+                width_px: 10,
+                height_px: 21,
+            },
+            HostCellSize {
+                width_px: 7,
+                height_px: 15,
+            },
+            HostCellSize {
+                width_px: 12,
+                height_px: 12,
+            },
+        ] {
+            let cell_px = f64::from(cell.width_px * cell.height_px);
+            for asked in [1u16, 4, 20] {
+                let mut app = pixel_fleet_app();
+                app.host_cell_size = cell;
+                app.sidebar_animation.view_switch_particles_per_cell = asked;
+                assert!(app.select_tree_root(
+                    crate::app::tree_view::TreeRoot::Node("2ndmate-herdr".to_string()),
+                    std::time::Instant::now()
+                ));
+                let frame = sheet_dissolve(&app, cell).expect("a leaving view dissolves");
+                let edge = f64::from(frame.particle_px * frame.particle_px);
+                let delivered = cell_px / edge;
+                let ratio = delivered / f64::from(asked);
+                assert!(
+                    (0.5..=2.0).contains(&ratio),
+                    "{cell:?} asked {asked}/cell and got {delivered:.1}/cell"
+                );
+            }
+        }
+    }
+
+    /// A particle finer than a pixel is the same dissolve costing more to draw,
+    /// so the edge never goes below one.
+    #[test]
+    fn a_particle_is_never_finer_than_a_pixel() {
+        let mut app = pixel_fleet_app();
+        app.sidebar_animation.view_switch_particles_per_cell = u16::MAX;
+        assert!(app.select_tree_root(
+            crate::app::tree_view::TreeRoot::Node("2ndmate-herdr".to_string()),
+            std::time::Instant::now()
+        ));
+        let frame = sheet_dissolve(&app, app.host_cell_size).expect("a leaving view dissolves");
+        assert_eq!(frame.particle_px, 1);
+    }
+
+    /// What a denser dissolve actually costs, measured rather than reasoned
+    /// about.
+    ///
+    /// Ignored by default because it prints a table and times things; run it
+    /// with `cargo test --release --bin herdr dissolve_cost -- --ignored
+    /// --nocapture`. It exists so the number in the pull request that
+    /// introduced this can be re-derived rather than believed — a debug build
+    /// reports about six times the per-frame cost of a release one, which is
+    /// exactly the kind of gap a quoted figure hides.
+    #[test]
+    #[ignore = "measurement, not an assertion: run with --ignored --nocapture"]
+    fn dissolve_cost() {
+        let app = pixel_fleet_app();
+        let rect = sidebar_rect();
+        let cell = app.host_cell_size;
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let SheetUpdate::Rebuilt(base) = build_sheet(&app, &cards, rect, cell, None) else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        let cell_px = cell.width_px * cell.height_px;
+        println!(
+            "sheet {}x{} cells = {}x{} px, settled PNG {} B, host cell {}x{} px",
+            base.rect.width,
+            base.rect.height,
+            base.layer.image_width,
+            base.layer.image_height,
+            base.layer.data.len(),
+            cell.width_px,
+            cell.height_px,
+        );
+        let half = std::time::Duration::from_millis(app.sidebar_animation.view_switch_ms);
+        let tick = std::time::Duration::from_millis(50);
+        println!(
+            "view_switch_ms {} per half, engine tick 50 ms\n",
+            half.as_millis()
+        );
+        println!("per_cell | delivered | edge px | sheets | PNG B/sheet | ms/sheet | half KB");
+        println!("---------+-----------+---------+--------+-------------+----------+--------");
+        for per_cell in [0u16, 1, 4, 20, 64, 210] {
+            let mut app = pixel_fleet_app();
+            app.sidebar_animation.view_switch_particles_per_cell = per_cell;
+            let now = std::time::Instant::now();
+            assert!(app.select_tree_root(
+                crate::app::tree_view::TreeRoot::Node("2ndmate-herdr".to_string()),
+                now
+            ));
+            let (mut held, mut sheets, mut bytes, mut millis, mut edge) =
+                (None, 0u32, 0usize, 0f64, 0u32);
+            let mut elapsed = std::time::Duration::ZERO;
+            while elapsed <= half {
+                app.anim.advance(now + elapsed);
+                let cards = super::super::compute_workspace_card_areas(&app, rect);
+                let started = std::time::Instant::now();
+                let update = build_sheet(&app, &cards, rect, cell, held.as_ref());
+                let took = started.elapsed().as_secs_f64() * 1000.0;
+                if let SheetUpdate::Rebuilt(layer) = update {
+                    sheets += 1;
+                    bytes += layer.layer.data.len();
+                    millis += took;
+                    held = Some(layer);
+                }
+                if let Some(frame) = sheet_dissolve(&app, cell) {
+                    edge = frame.particle_px;
+                }
+                elapsed += tick;
+            }
+            let n = f64::from(sheets.max(1));
+            let delivered = if edge == 0 {
+                0.0
+            } else {
+                f64::from(cell_px) / f64::from(edge * edge)
+            };
+            println!(
+                "{per_cell:>8} | {delivered:>9.1} | {edge:>7} | {sheets:>6} | {:>11.0} | {:>8.2} | {:>7.0}",
+                bytes as f64 / n,
+                millis / n,
+                bytes as f64 / 1024.0,
+            );
+        }
+    }
+
+    /// Writes the real frames of a switch to PNG files so they can be looked at.
+    #[test]
+    #[ignore = "capture, not an assertion"]
+    fn dissolve_capture() {
+        let out = std::env::var("HERDR_DISSOLVE_CAPTURE_DIR").unwrap_or_default();
+        if out.is_empty() {
+            println!("SKIP: set HERDR_DISSOLVE_CAPTURE_DIR");
+            return;
+        }
+        let rect = sidebar_rect();
+        for per_cell in [0u16, 1, 21] {
+            let mut app = pixel_fleet_app();
+            app.sidebar_animation.view_switch_particles_per_cell = per_cell;
+            let cell = app.host_cell_size;
+            let now = std::time::Instant::now();
+            assert!(app.select_tree_root(
+                crate::app::tree_view::TreeRoot::Node("2ndmate-herdr".to_string()),
+                now
+            ));
+            let mut held: Option<SidebarCardLayer> = None;
+            for step in 0..=12u64 {
+                app.anim
+                    .advance(now + std::time::Duration::from_millis(step * 50));
+                let cards = super::super::compute_workspace_card_areas(&app, rect);
+                if let SheetUpdate::Rebuilt(layer) =
+                    build_sheet(&app, &cards, rect, cell, held.as_ref())
+                {
+                    let path = format!("{out}/p{per_cell:03}-f{step:02}.png");
+                    std::fs::write(&path, &layer.layer.data).expect("writes");
+                    held = Some(layer);
+                }
+            }
+        }
+    }
+
+    /// The transition ends, and the sheet stops holding a second copy of itself.
+    ///
+    /// The cache is scoped to the switch it is for. A panel that has settled
+    /// keeps only the pixels it is showing.
+    #[test]
+    fn the_canvas_is_released_when_the_switch_finishes() {
+        let Some((mut app, now)) = switching(20) else {
+            return;
+        };
+        let mut held = sheet_at(&app, None);
+        assert!(held.as_ref().is_some_and(|l| l.undissolved.is_some()));
+        // Past both halves and the commit between them, then far enough past
+        // the arrival that the view element has retired.
+        let over = std::time::Duration::from_millis(app.sidebar_animation.view_switch_ms * 4);
+        let mut elapsed = std::time::Duration::from_millis(50);
+        while elapsed <= over {
+            app.anim.advance(now + elapsed);
+            app.advance_tree_view(now + elapsed);
+            if let Some(layer) = sheet_at(&app, held.as_ref()) {
+                held = Some(layer);
+            }
+            elapsed += std::time::Duration::from_millis(50);
+        }
+        assert!(
+            held.as_ref().is_some_and(|l| l.undissolved.is_none()),
+            "a settled panel is still holding the sheet it dissolved"
+        );
+    }
+
+    /// A dissolve takes presence away and never puts colour back: a particle
+    /// that has gone is transparent, and one that has not is untouched.
+    #[test]
+    fn a_dissolved_particle_gives_up_alpha_and_keeps_its_colour() {
+        let mut sheet = Canvas::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                sheet.blend(x, y, Rgb(200, 100, 50), 1.0);
+            }
+        }
+        let before = sheet.rgba8().to_vec();
+        sheet.scale_alpha(0, 0, 4, 4, 0.25);
+        let after = sheet.rgba8();
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let i = ((y * 8 + x) * 4) as usize;
+                assert_eq!(
+                    &after[i..i + 3],
+                    &before[i..i + 3],
+                    "the dissolve recoloured ({x},{y})"
+                );
+                let expected = if x < 4 && y < 4 { 64 } else { 255 };
+                assert_eq!(after[i + 3], expected, "alpha at ({x},{y})");
+            }
+        }
     }
 }
