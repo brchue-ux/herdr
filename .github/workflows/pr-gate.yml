@@ -6,6 +6,7 @@ on:
 
 jobs:
   check-contributor:
+    if: github.repository == 'herdrdev/herdr' || github.repository == 'ogulcancelik/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -17,7 +18,6 @@ jobs:
         with:
           github-token: ${{ secrets.KANGAL_GITHUB_TOKEN }}
           script: |
-            const CANONICAL_REPOSITORY = 'ogulcancelik/herdr';
             const KANGAL_USER_ID = 285672167;
             const CI_ONLY_PR_AUTHOR_IDS = new Set([
               49699333, // dependabot[bot]
@@ -25,7 +25,7 @@ jobs:
             ]);
             const MAX_EXTERNAL_CHANGED_FILES = 20;
             const MAX_EXTERNAL_CHANGED_LINES = 1000;
-            const REVIEW_LABELS = ['greptile-review', 'coderabbit-review'];
+            const REVIEW_LABELS = ['ai-review'];
             const MAINTAINER_APPROVED_LABEL = 'maintainer-approved';
             const COMMENT_MARKER = '<!-- herdr:pr-gate -->';
 
@@ -33,12 +33,6 @@ jobs:
             const reopener = context.payload.sender?.login ?? null;
             const action = context.payload.action;
             const defaultBranch = context.payload.repository.default_branch;
-            const repositoryName = context.payload.repository.full_name.toLowerCase();
-
-            if (repositoryName !== CANONICAL_REPOSITORY) {
-              core.setFailed(`PR Gate only runs for ${CANONICAL_REPOSITORY}`);
-              return;
-            }
 
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,

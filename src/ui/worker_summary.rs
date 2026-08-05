@@ -19,7 +19,7 @@ use ratatui::{
     Frame,
 };
 
-use super::status::{state_dot, state_label, state_label_color};
+use super::status::{state_icon, state_label, state_label_color};
 use super::text::truncate_end;
 use super::widgets::{
     action_button_row_rects, centered_popup_rect, modal_stack_areas, render_action_button,
@@ -78,7 +78,8 @@ fn body_lines(summaries: &[WorkerSummary], app: &AppState, width: u16) -> Vec<Li
         if idx > 0 {
             lines.push(Line::from(""));
         }
-        let (glyph, glyph_style) = state_dot(summary.state, summary.seen, p);
+        let (glyph, glyph_style) =
+            state_icon(summary.state, summary.seen, app.status_indicators, p);
         let mut header = vec![
             Span::raw(" "),
             Span::styled(glyph, glyph_style),

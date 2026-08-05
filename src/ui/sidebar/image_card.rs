@@ -352,22 +352,22 @@ impl CardContent {
 
 /// The ground the cards float on.
 ///
-/// The reference's own canvas is `#09111C`, but Herdr paints no global
-/// background: every colour it draws composites against whatever the host
-/// terminal is using, which is the RGB it measures with OSC 11. So the ground
-/// under a card is the host's background when the host told us one, and the
-/// panel's own background after that; the measured canvas is only the last
-/// resort, for a host that answered neither.
+/// The reference's own canvas is `#09111C`, but the ground under a card is
+/// whatever `render_sidebar` actually fills the panel with, and that is
+/// `palette.sidebar_bg`. Its default is `Color::Reset` — "inherit the host" —
+/// so with no theme override the ground is the RGB Herdr measured with OSC 11,
+/// then the panel's own background, and the measured canvas only as a last
+/// resort for a host that answered neither. A theme that *does* set a sidebar
+/// background takes precedence over the host's, because that fill is the pixel
+/// the card's antialiased edge lands on; measuring against the host instead
+/// puts a seam around every card.
 ///
 /// It matters because the bloom is *lift*: the reference has no drop shadow
 /// anywhere, and its cards float by being brighter than the ground rather than
 /// by casting onto it. A bloom with nothing under it to lift is invisible.
 fn backdrop_rgb(app: &AppState) -> Rgb {
-    if let Some(background) = app.host_terminal_theme.background {
-        return Rgb(background.r, background.g, background.b);
-    }
-    crate::ui::color::resolve_color_rgb(app.palette.panel_bg, &app.host_terminal_theme)
-        .map(|rgb| Rgb(rgb.0, rgb.1, rgb.2))
+    crate::ui::sidebar::backdrop_rgb(app)
+        .map(|(r, g, b)| Rgb(r, g, b))
         .unwrap_or(measured::CANVAS)
 }
 

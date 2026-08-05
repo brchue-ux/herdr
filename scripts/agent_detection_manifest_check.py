@@ -90,9 +90,9 @@ STAGED_WEBSITE_MANIFESTS = {
         3,
     ),
     "claude": (
-        "2026.07.31.2",
-        "2026.07.13.1",
-        "d7b3e653a6d84024d1cca5b35bfa8a1d59afd9ce6bbfe06275d38315f18c2dc8",
+        "2026.08.05.1",
+        "2026.08.04.1",
+        "4ed3d5c9bab316bc7664f145c9c2e67f5204862e440e5179258410750206ffba",
         5,
     ),
     "codex": (

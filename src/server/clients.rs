@@ -38,8 +38,13 @@ pub(crate) struct ClientConnection {
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
     pub(crate) terminal_size: (u16, u16),
-    /// Pixel size of one client terminal cell.
-    pub(crate) cell_size: crate::kitty_graphics::HostCellSize,
+    /// Pixel size of one client terminal cell, after the plausibility gate.
+    ///
+    /// Private on purpose: this is the one field on the connection that arrives
+    /// as arithmetic rather than a measurement, so every way in goes through
+    /// [`ClientConnection::set_cell_size`] and nothing downstream has to
+    /// re-check it.
+    cell_size: crate::kitty_graphics::HostCellSize,
     /// Last known host terminal default colors for this client.
     pub(crate) host_terminal_theme: crate::terminal_theme::TerminalTheme,
     /// Last known host terminal appearance for this client.
@@ -114,7 +119,7 @@ impl ClientConnection {
             pending_terminal_attach,
             keybindings,
             terminal_size,
-            cell_size,
+            cell_size: cell_size.plausible_or_unknown(),
             host_terminal_appearance: host_terminal_theme
                 .background
                 .map(crate::terminal_theme::RgbColor::inferred_appearance),
@@ -138,6 +143,26 @@ impl ClientConnection {
     pub(crate) fn request_repaint(&mut self) {
         self.render_state.request_repaint();
         self.pane_graphics_render_pending = false;
+    }
+
+    /// Pixel size of one of this client's terminal cells.
+    ///
+    /// Either unknown or believable; never an arithmetic artefact of a stale
+    /// pty pixel width.
+    pub(crate) fn cell_size(&self) -> crate::kitty_graphics::HostCellSize {
+        self.cell_size
+    }
+
+    /// Records the cell size a client reported, gated on being a cell a
+    /// terminal could actually be drawing in.
+    ///
+    /// A wrong-but-nonzero cell is worse than no cell: `is_known` says yes to
+    /// it and every pixel surface downstream then rasterises into a space that
+    /// does not exist, which the terminal rescales away where no test can see
+    /// it. The gate lives here rather than at the readers so a new reader
+    /// cannot forget it.
+    pub(crate) fn set_cell_size(&mut self, cell_size: crate::kitty_graphics::HostCellSize) {
+        self.cell_size = cell_size.plausible_or_unknown();
     }
 
     pub(crate) fn deferred_render(&self) -> DeferredRender {
@@ -257,6 +282,7 @@ pub(crate) fn events_include_interaction(events: &[crate::raw_input::RawInputEve
         matches!(
             event,
             crate::raw_input::RawInputEvent::Key(_)
+                | crate::raw_input::RawInputEvent::Text(_)
                 | crate::raw_input::RawInputEvent::Mouse(_)
                 | crate::raw_input::RawInputEvent::Paste(_)
                 | crate::raw_input::RawInputEvent::OuterFocusGained
@@ -309,7 +335,7 @@ pub(crate) fn render_targets(
             (
                 client_id,
                 client.terminal_size,
-                client.cell_size,
+                client.cell_size(),
                 foreground_client_id == Some(client_id),
                 client.mode.clone(),
             )

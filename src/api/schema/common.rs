@@ -73,6 +73,13 @@ pub enum ReadSource {
     Transcript,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ReadIntent {
+    #[default]
+    Interactive,
+    Passive,
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
 )]

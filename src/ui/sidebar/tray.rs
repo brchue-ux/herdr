@@ -262,7 +262,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
     if tray.width == 0 || tray.height == 0 {
         return;
     }
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
     let reading = signal_tray::resolve(app);
 
     // The header: the tray's name, and the legend at the right end. The name is
@@ -346,15 +346,7 @@ pub(crate) fn image(app: &AppState, cell_width: u32, cell_height: u32) -> Option
 
     let paint = BadgePaint {
         attention: rgb_of(app.palette.peach, app),
-        // Herdr paints no global background fill, so what an engraved badge is
-        // actually cut into is whatever the host terminal reported. A host that
-        // never answered falls back to the canvas the marks were designed
-        // against rather than to black, which would over-darken every carve.
-        surface: app
-            .host_terminal_theme
-            .background
-            .map(crate::ui::color::terminal_theme_to_rgb)
-            .map_or(DEFAULT_CANVAS, normalise),
+        surface: badge_surface(app),
     };
     let reading = signal_tray::resolve(app);
 
@@ -403,6 +395,22 @@ const DEFAULT_CANVAS: [f32; 3] = [
     0x1C as f32 / 255.0,
 ];
 
+/// What an engraved badge is cut into.
+///
+/// The panel's own fill when a theme paints one, and otherwise — Herdr paints no
+/// global background fill — whatever the host terminal reported. A host that
+/// never answered falls back to the canvas the marks were designed against
+/// rather than to black, which would over-darken every carve.
+fn badge_surface(app: &AppState) -> [f32; 3] {
+    super::panel_fill_rgb(&app.palette, &app.host_terminal_theme)
+        .or_else(|| {
+            app.host_terminal_theme
+                .background
+                .map(crate::ui::color::terminal_theme_to_rgb)
+        })
+        .map_or(DEFAULT_CANVAS, normalise)
+}
+
 fn normalise((r, g, b): crate::ui::color::Rgb) -> [f32; 3] {
     [
         f32::from(r) / 255.0,
@@ -432,6 +440,34 @@ mod tests {
 
     fn content(app: &AppState) -> Rect {
         crate::ui::sidebar::sidebar_content_rect(app.view.sidebar_rect)
+    }
+
+    /// A badge is carved into the panel it sits in, not into the host's own
+    /// colour: with a theme fill, the two are different colours and the carve
+    /// belongs to the one on screen around it.
+    #[test]
+    fn a_badge_is_engraved_into_whatever_the_panel_is_filled_with() {
+        let mut app = app_with_tray(42, 30);
+
+        // No fill, no measured host background: the canvas the marks were
+        // designed against, exactly as before.
+        assert_eq!(badge_surface(&app), DEFAULT_CANVAS);
+
+        // A host that answered is what an unfilled panel is showing.
+        app.host_terminal_theme = app.host_terminal_theme.with_color(
+            crate::terminal_theme::DefaultColorKind::Background,
+            crate::terminal_theme::RgbColor {
+                r: 0,
+                g: 51,
+                b: 102,
+            },
+        );
+        assert_eq!(badge_surface(&app), normalise((0, 51, 102)));
+
+        // And a theme that paints the panel wins over both.
+        app.palette.sidebar_bg = ratatui::style::Color::Rgb(12, 34, 56);
+        app.refresh_sidebar_palette();
+        assert_eq!(badge_surface(&app), normalise((12, 34, 56)));
     }
 
     /// The tray never takes the tree's last rows. A panel that cannot hold both

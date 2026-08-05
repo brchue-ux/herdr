@@ -14,10 +14,14 @@ fn enable_graphics_and_render(
     client_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> FrameData {
     server.app.state.kitty_graphics_enabled = true;
-    server.clients.get_mut(&1).unwrap().cell_size = crate::kitty_graphics::HostCellSize {
-        width_px: 10,
-        height_px: 20,
-    };
+    server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .set_cell_size(crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        });
     server.render_and_stream();
     read_server_frame(
         client_rx

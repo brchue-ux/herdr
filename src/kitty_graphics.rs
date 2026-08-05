@@ -21,20 +21,6 @@ const KITTY_CHUNK_BYTES: usize = 3072;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
 const PANE_GRAPHICS_IMAGE_ID_BIT: u32 = 1 << 31;
 
-/// The query that asks the host terminal how big one cell is, in pixels.
-///
-/// `CSI 16 t` is answered with `CSI 6 ; height ; width t`. It exists because the
-/// other way of getting this number — dividing the pty's `ws_xpixel`/`ws_ypixel`
-/// by its column and row count — is only as good as those two fields, and they
-/// are routinely wrong: Windows has no pixel size to report at all, and an SSH
-/// session carries whatever the client sent at pty-request time, which for
-/// several common Windows clients is a constant that never tracks the window.
-/// A constant `ws_xpixel` divided by a growing column count yields a cell that
-/// *shrinks as the window grows*, which is exactly the failure this query
-/// exists to end. Every terminal that implements Kitty graphics — the only
-/// terminal this number is asked for on — answers this.
-pub(crate) const HOST_CELL_SIZE_QUERY_SEQUENCE: &str = "\x1b[16t";
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostCellSize {
     pub width_px: u32,
@@ -93,6 +79,21 @@ impl HostCellSize {
         }
     }
 
+    /// The gate every externally reported cell passes on the way in.
+    ///
+    /// Distinct from [`Self::or_fallback`] in what it does with *nothing*: an
+    /// unknown cell stays unknown, because a client whose own config has Kitty
+    /// graphics off reports `0x0` and the server reads that absence as "send no
+    /// graphics". Only a cell that claims to be a measurement and is not one is
+    /// replaced.
+    pub(crate) fn plausible_or_unknown(self) -> Self {
+        if self.is_known() {
+            self.or_fallback()
+        } else {
+            self
+        }
+    }
+
     pub(crate) fn try_from_terminal(area: Rect) -> Option<Self> {
         let Ok(size) = crossterm::terminal::window_size() else {
             return None;
@@ -137,40 +138,6 @@ impl HostCellSize {
         }
         self
     }
-
-    /// [`Self::for_area`] for a cell that arrived from outside this module.
-    ///
-    /// A zero-sized area means there is nothing to place an image on, and every
-    /// cell size handed to the graphics path has to answer that the same way or
-    /// `is_known` starts disagreeing with itself depending on where the number
-    /// came from.
-    pub(crate) fn for_area_public(self, area: Rect) -> Self {
-        self.for_area(area)
-    }
-}
-
-/// Reads `CSI 6 ; height ; width t` — the terminal's answer to
-/// [`HOST_CELL_SIZE_QUERY_SEQUENCE`].
-///
-/// Height comes first in the reply, which is the opposite of every other pair
-/// in this file and the reason this parse is a named function rather than a
-/// couple of `split` calls at the call site.
-pub(crate) fn parse_host_cell_size_report(sequence: &str) -> Option<HostCellSize> {
-    let body = sequence.strip_prefix("\x1b[")?.strip_suffix('t')?;
-    let mut parts = body.split(';');
-    if parts.next()? != "6" {
-        return None;
-    }
-    let height_px: u32 = parts.next()?.parse().ok()?;
-    let width_px: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let reported = HostCellSize {
-        width_px,
-        height_px,
-    };
-    reported.is_plausible().then_some(reported)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1337,31 +1304,69 @@ mod host_cell_size_is_a_measurement {
         assert_eq!(good.or_fallback(), good);
     }
 
-    /// `CSI 16 t` is answered height-first, which is the opposite of every
-    /// other pair in this file.
+    /// The original defect, pinned: a pty whose pixel fields are a stale
+    /// constant yields a cell that *shrinks as the window grows*.
+    ///
+    /// Upstream's cell-size fix (#2160) prefers the ioctl whenever it reports
+    /// any nonzero pixels and only queries the host when it reports none, so
+    /// on an SSH pty carrying a constant `ws_xpixel` the division below is
+    /// still what the client computes. This gate is what stops it reaching the
+    /// card path.
+    ///
+    /// The sweep is the regime the defect was measured in — a 3440px-wide
+    /// display, which is 200-390 columns at a real 9px cell, where the stale
+    /// constant divides down to the 2-4px that was reported. Note the bound
+    /// this does *not* claim: the gate refuses a cell for being implausible,
+    /// so a stale pty at a low column count still divides to something inside
+    /// the bounds and is believed. Narrow windows are not covered by this.
     #[test]
-    fn the_cell_size_report_is_read_height_first() {
-        assert_eq!(
-            parse_host_cell_size_report("\x1b[6;24;12t"),
-            Some(HostCellSize {
-                width_px: 12,
-                height_px: 24,
-            })
+    fn a_stale_pty_width_never_yields_a_shrinking_cell_at_the_widths_it_was_seen_at() {
+        // Back-computed from the measurement in #50: ~4px at 1910 wide and
+        // ~2px at 3428 wide puts the constant the SSH client sent near 800px.
+        const STALE_PTY_WIDTH_PX: u32 = 800;
+        const STALE_PTY_HEIGHT_PX: u32 = 1080;
+
+        let mut derived_widths = Vec::new();
+        let mut handed_to_the_card = Vec::new();
+        for columns in [200u32, 250, 300, 350, 390] {
+            let rows = 40;
+            let derived = HostCellSize {
+                width_px: (STALE_PTY_WIDTH_PX / columns).max(1),
+                height_px: (STALE_PTY_HEIGHT_PX / rows).max(1),
+            };
+            assert!(
+                !derived.is_plausible(),
+                "a {}px cell derived at {columns} columns must be refused",
+                derived.width_px
+            );
+            derived_widths.push(derived.width_px);
+            handed_to_the_card.push(derived.or_fallback());
+        }
+
+        // The raw division still descends — that is upstream's path, unchanged.
+        assert!(
+            derived_widths.first() > derived_widths.last(),
+            "the sweep must actually reproduce the shrink: {derived_widths:?}"
         );
-        // Not a cell size report.
-        assert_eq!(parse_host_cell_size_report("\x1b[4;24;12t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12;9t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12"), None);
-        // A reply that parses but describes no real cell is still refused, so a
-        // terminal answering nonsense is the same as one not answering.
-        assert_eq!(parse_host_cell_size_report("\x1b[6;8;2t"), None);
+        // What the card is laid out against does not.
+        assert!(
+            handed_to_the_card.windows(2).all(|pair| pair[0] == pair[1]),
+            "the cell handed to the card path must not track window width: {handed_to_the_card:?}"
+        );
+        assert_eq!(handed_to_the_card[0], HostCellSize::FALLBACK);
     }
 
-    /// The query has to be the sequence terminals answer, byte for byte.
+    /// And a host that answers `CSI 16 t` is believed as-is. 9x18 is the
+    /// captain's terminal; upstream's client reaches this only when the ioctl
+    /// reports no pixels at all.
     #[test]
-    fn the_query_is_csi_16_t() {
-        assert_eq!(HOST_CELL_SIZE_QUERY_SEQUENCE, "\u{1b}[16t");
+    fn a_reported_host_cell_is_taken_whole() {
+        let reported = HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        assert!(reported.is_plausible());
+        assert_eq!(reported.or_fallback(), reported);
     }
 }
 

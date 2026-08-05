@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::status::state_dot;
+use super::status::state_icon;
 use super::text::display_width_u16;
 use super::widgets::panel_contrast_fg;
 use crate::app::AppState;
@@ -408,7 +408,7 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         let mut used = 1usize;
         if decor.state_dot {
             let (agg_state, agg_seen) = tab.aggregate_state(&app.terminals);
-            let (dot, dot_style) = state_dot(agg_state, agg_seen, p);
+            let (dot, dot_style) = state_icon(agg_state, agg_seen, app.status_indicators, p);
             // `dot_style` carries only a foreground, so the tab's own background
             // (accent when active) is preserved underneath it.
             spans.push(Span::styled(dot, dot_style));
@@ -739,8 +739,12 @@ mod tests {
         // Assert against `state_dot` itself, not a copy of the glyph it happens
         // to return today, so changing a state mark can't silently invalidate
         // this test.
-        let (blocked_dot, blocked_style) =
-            state_dot(crate::detect::AgentState::Blocked, false, &app.palette);
+        let (blocked_dot, blocked_style) = state_icon(
+            crate::detect::AgentState::Blocked,
+            false,
+            app.status_indicators,
+            &app.palette,
+        );
         assert_eq!(dot_cell.symbol(), blocked_dot);
         assert_eq!(dot_cell.style().fg, blocked_style.fg);
         // The dot never repaints the tab chip's own background.

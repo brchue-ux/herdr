@@ -205,8 +205,17 @@ impl InkPalette {
     /// `Color::Reset` and unresolvable indexed colours fall back to the palette
     /// surface, so an element drawn against the host's own background still
     /// animates instead of silently doing nothing.
+    ///
+    /// `surface` is what the call site's own panel is filled with, for the
+    /// surfaces that have a fill of their own — the sidebar's ground is
+    /// `palette.sidebar_bg` rather than `panel_bg`, and an element with no
+    /// explicit background must composite against the colour on screen under it
+    /// rather than against the app-wide panel colour. `None` says the call site
+    /// draws on the app's panel background, which is the answer everywhere
+    /// outside a panel with its own fill.
     pub(crate) fn resolve(
         base: Style,
+        surface: Option<Rgb>,
         palette: &crate::app::state::Palette,
         host: &crate::terminal_theme::TerminalTheme,
     ) -> Self {
@@ -214,6 +223,7 @@ impl InkPalette {
         let surface = base
             .bg
             .and_then(rgb)
+            .or(surface)
             .or_else(|| rgb(palette.panel_bg))
             .unwrap_or(crate::ui::color::BLACK);
         let accent = rgb(palette.accent).unwrap_or(surface);

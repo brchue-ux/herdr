@@ -18,7 +18,7 @@ use ratatui::{
 use self::card::{Card, Pill, RowShell};
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
-use super::status::{state_dot, state_label, state_label_color};
+use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
 use crate::app::relation_signal::{RelationSignalKind, RelationSignalPhase};
@@ -335,15 +335,10 @@ fn workspace_row_height_in_body(
     workspace_row_height(app, workspace, worktree_child, content_width, shell).min(body_height)
 }
 
-fn workspace_entry_gap(
-    app: &AppState,
-    entries: &[WorkspaceListEntry],
-    entry_idx: usize,
-    worktree_child: bool,
-) -> u16 {
-    if entry_idx + 1 < entries.len()
-        && !(worktree_child && next_entry_is_worktree_child(entries, entry_idx))
-    {
+fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
+    // No gap anywhere inside a worktree group: not between two children, and
+    // not between the parent and its first child either.
+    if entry_idx + 1 < entries.len() && !next_entry_is_worktree_child(entries, entry_idx) {
         app.sidebar_spaces.row_gap
     } else {
         0
@@ -1316,7 +1311,7 @@ fn render_session_status(app: &AppState, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             text,
-            Style::default().fg(app.palette.overlay0),
+            Style::default().fg(app.sidebar_palette.overlay0),
         ))
         .alignment(Alignment::Right),
         area,
@@ -1378,9 +1373,7 @@ fn list_entry_height(
 /// worktree-group packing is unchanged.
 fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
     match entries.get(entry_idx) {
-        Some(WorkspaceListEntry::Workspace { worktree_child, .. }) => {
-            workspace_entry_gap(app, entries, entry_idx, *worktree_child)
-        }
+        Some(WorkspaceListEntry::Workspace { .. }) => workspace_entry_gap(app, entries, entry_idx),
         Some(WorkspaceListEntry::Agent { .. }) => agent_entry_gap(app, entry_idx, entries.len()),
         None => 0,
     }
@@ -1713,6 +1706,41 @@ pub(crate) fn workspace_group_chevron_rect(card: &crate::app::state::WorkspaceCa
     )
 }
 
+/// The fill the panel is painted with, when the theme gives it one.
+///
+/// The single answer to "what colour is under the sidebar", asked by every pass
+/// that composites inside the panel: the animated ink and the view-switch
+/// dissolve here, the card shell's gradient and plates in
+/// [`card`], the tray's engraved badges in [`tray`], and the pixel cards' bloom
+/// in [`image_card`]. `render_sidebar` fills the panel with
+/// `palette.sidebar_bg`, so that — and nothing else — is what a card's edge, a
+/// badge's carve or a dissolving cell actually lands on.
+///
+/// `None` is the default: `Color::Reset` means "inherit the host", and the
+/// panel then has no fill of its own. Each caller keeps its own answer for that
+/// case, because what a pass should fall back to is a property of what it
+/// draws, not of the panel — the ink wants a colour it can mix toward, the card
+/// declines to tint what it cannot measure, and the tray falls back to the
+/// canvas its marks were designed against.
+pub(crate) fn panel_fill_rgb(
+    p: &Palette,
+    host: &crate::terminal_theme::TerminalTheme,
+) -> Option<crate::ui::color::Rgb> {
+    crate::ui::color::resolve_color_rgb(p.sidebar_bg, host)
+}
+
+/// The colour animated ink composites against inside the panel.
+///
+/// The panel's own fill first, then the RGB Herdr measured with OSC 11 — which
+/// is what an unfilled panel is showing — and the panel background only for a
+/// host that answered neither.
+pub(crate) fn backdrop_rgb(app: &AppState) -> Option<crate::ui::color::Rgb> {
+    let host = &app.host_terminal_theme;
+    panel_fill_rgb(&app.palette, host)
+        .or_else(|| host.background.map(crate::ui::color::terminal_theme_to_rgb))
+        .or_else(|| crate::ui::color::resolve_color_rgb(app.palette.panel_bg, host))
+}
+
 /// The collapsed sidebar's one content column.
 ///
 /// Collapsed is the same single panel as expanded, just narrower: the whole
@@ -1729,7 +1757,10 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
     let is_navigating = matches!(app.mode, Mode::Navigate);
 
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(p.sidebar_bg));
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
@@ -1754,7 +1785,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             break;
         }
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-        let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
+        let (icon, icon_style) = state_icon(agg_state, agg_seen, app.status_indicators, p);
         let is_selected = visible_idx == app.selected && is_navigating;
         let is_active = Some(visible_idx) == app.active;
         let row_style = if is_selected {
@@ -1781,8 +1812,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}", visible_idx + 1), num_style),
-                Span::styled(" ", row_style),
+                Span::styled(format!("{:<2}", visible_idx + 1), num_style),
                 Span::styled(icon, icon_style),
             ])),
             Rect::new(ws_area.x, y, ws_area.width, 1),
@@ -1941,7 +1971,7 @@ fn sidebar_divider_grip_rows(area: Rect) -> std::ops::Range<u16> {
 /// drag. Lighting the full height says the resistance is the boundary rather
 /// than a fault, and it resolves the instant the detent commits.
 fn render_sidebar_divider(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
     let active = app.sidebar_divider_hover;
     let detent = app.sidebar_divider_detent;
     let bar_style = if detent {
@@ -1979,7 +2009,10 @@ pub(super) fn render_sidebar(
     frame: &mut Frame,
     area: Rect,
 ) {
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(p.sidebar_bg));
     let is_navigating = matches!(app.mode, Mode::Navigate);
     render_sidebar_divider(app, frame, area, is_navigating);
 
@@ -2452,7 +2485,7 @@ fn render_agent_row(
         return;
     };
 
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
     let shell = RowShell::for_fold_width(fold_width);
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
     let label_color = state_label_color(detail.state, detail.seen, p);
@@ -2502,7 +2535,7 @@ fn render_agent_row(
         Style::default().fg(label_color).add_modifier(Modifier::DIM)
     };
     let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
-    let mark = state_dot(detail.state, detail.seen, p);
+    let mark = state_icon(detail.state, detail.seen, app.status_indicators, p);
     // On a card the mark is set in a chip. It is the same mark, padded and
     // plated — the alphabet is untouched, and a row with no `state_icon` token
     // configured gets no chip, exactly as it gets no mark today.
@@ -2784,7 +2817,7 @@ fn render_worker_summary_badge(
             .fg(app.palette.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.palette.overlay0)
+        Style::default().fg(app.sidebar_palette.overlay0)
     };
     frame.render_widget(
         Paragraph::new(Span::styled(worker_summary_badge_label(count), style))
@@ -3010,7 +3043,7 @@ impl<'a> ConnectorCharge<'a> {
             .catalogue()
             .get(relation_signal_behaviour(phase.kind))?;
         let signal = crate::ui::color::resolve_color_rgb(
-            relation_signal_color(phase.kind, &app.palette),
+            relation_signal_color(phase.kind, &app.sidebar_palette),
             &app.host_terminal_theme,
         )?;
         Some(Self {
@@ -3018,6 +3051,7 @@ impl<'a> ConnectorCharge<'a> {
             progress: phase.progress,
             ink: crate::anim::cell::InkPalette::resolve(
                 base,
+                backdrop_rgb(app),
                 &app.palette,
                 &app.host_terminal_theme,
             )
@@ -3156,14 +3190,14 @@ fn render_tree_view_transition(
     }
 
     let extent = CellExtent::new(area.width, height);
-    let panel_bg = resolve_color_rgb(app.palette.panel_bg, &app.host_terminal_theme);
+    let backdrop = backdrop_rgb(app);
     let buf = frame.buffer_mut();
     for row in 0..height {
         let y = body_top + row;
         for col in 0..area.width {
             let x = area.x + col;
             let base = buf[(x, y)].style();
-            let ink = InkPalette::resolve(base, &app.palette, &app.host_terminal_theme);
+            let ink = InkPalette::resolve(base, backdrop, &app.palette, &app.host_terminal_theme);
             let paint = view.cell(CellPos::new(col, row), extent, ink);
             let mut style = paint.text_style(base, ink);
             // A highlighted row's own background is part of the view too. It is
@@ -3174,7 +3208,7 @@ fn render_tree_view_transition(
                 if let (Some(from), Some(to)) = (
                     base.bg
                         .and_then(|bg| resolve_color_rgb(bg, &app.host_terminal_theme)),
-                    panel_bg,
+                    backdrop,
                 ) {
                     let (r, g, b) = mix_rgb(from, to, 1.0 - paint.coverage.clamp(0.0, 1.0));
                     style = style.bg(ratatui::style::Color::Rgb(r, g, b));
@@ -3196,6 +3230,9 @@ struct RowAnimation<'a> {
     anim: &'a crate::anim::Animator,
     id: Option<crate::anim::ElementId>,
     palette: &'a Palette,
+    /// The colour under the panel, for a token whose own style names no
+    /// background of its own.
+    surface: Option<crate::ui::color::Rgb>,
     host: &'a crate::terminal_theme::TerminalTheme,
 }
 
@@ -3205,6 +3242,7 @@ impl<'a> RowAnimation<'a> {
             anim: &app.anim,
             id: workspace_id.map(crate::anim::ElementId::workspace_row),
             palette: &app.palette,
+            surface: backdrop_rgb(app),
             host: &app.host_terminal_theme,
         }
     }
@@ -3221,6 +3259,7 @@ impl<'a> RowAnimation<'a> {
             anim: &app.anim,
             id: Some(crate::anim::ElementId::agent_row(pane_id)),
             palette: &app.palette,
+            surface: backdrop_rgb(app),
             host: &app.host_terminal_theme,
         }
     }
@@ -3277,7 +3316,7 @@ fn animate_row_spans(spans: &mut [Span<'static>], anim: &RowAnimation<'_>) {
     let mut col = 0u16;
     for span in spans {
         let width = crate::ui::text::display_width_u16(&span.content);
-        let ink = InkPalette::resolve(span.style, anim.palette, anim.host);
+        let ink = InkPalette::resolve(span.style, anim.surface, anim.palette, anim.host);
         span.style = frame
             .cell(CellPos::col(col), extent, ink)
             .text_style(span.style, ink);
@@ -3305,6 +3344,7 @@ fn push_token_span(
         text,
         style,
         anim.frame(patch),
+        anim.surface,
         anim.palette,
         anim.host,
     );
@@ -3323,6 +3363,7 @@ pub(super) fn push_animated_span(
     text: String,
     style: Style,
     frame: Option<crate::anim::ElementFrame<'_>>,
+    surface: Option<crate::ui::color::Rgb>,
     palette: &Palette,
     host: &crate::terminal_theme::TerminalTheme,
 ) {
@@ -3335,7 +3376,7 @@ pub(super) fn push_animated_span(
     };
 
     let extent = CellExtent::row(width);
-    let ink = InkPalette::resolve(style, palette, host);
+    let ink = InkPalette::resolve(style, surface, palette, host);
     if frame.is_uniform() {
         let paint = frame.cell(CellPos::col(0), extent, ink);
         spans.push(Span::styled(text, paint.text_style(style, ink)));
@@ -3405,7 +3446,7 @@ fn render_workspace_list(
     area: Rect,
     is_navigating: bool,
 ) {
-    let p = &app.palette;
+    let p = &app.sidebar_palette;
     let dragged_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
         Some(crate::app::state::DragTarget::WorkspaceReorder { source_ws_idx, .. }) => {
             Some(*source_ws_idx)
@@ -3498,7 +3539,7 @@ fn render_workspace_list(
             .filter(|(_, collapsed)| *collapsed)
             .map(|(key, _)| space_aggregate_state_and_age(app, key))
             .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
-        let mark = state_dot(display_state, display_seen, p);
+        let mark = state_icon(display_state, display_seen, app.status_indicators, p);
         let card_shell = card.card_frame.and_then(|rect| {
             Card::new(
                 rect,
@@ -5809,6 +5850,96 @@ mod tests {
     }
 
     #[test]
+    fn expanded_and_collapsed_sidebars_use_custom_background() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        app.palette.sidebar_bg = ratatui::style::Color::Rgb(12, 34, 56);
+        app.refresh_sidebar_palette();
+        let area = Rect::new(0, 0, 26, 20);
+
+        let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        expanded
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        assert!(expanded
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|cell| cell.bg == app.palette.sidebar_bg));
+
+        let mut collapsed = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        collapsed
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .unwrap();
+        assert!(collapsed
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|cell| cell.bg == app.palette.sidebar_bg));
+    }
+
+    /// What an animation composites against is the colour the panel is filled
+    /// with, which is `sidebar_bg` and not `panel_bg`.
+    ///
+    /// A dissolving cell and an animated notification slot both fade toward the
+    /// ground, so a ground nowhere on screen inside the panel is a visible
+    /// wrong blend. With no theme override the fill is `Color::Reset` — inherit
+    /// the host — and the order behind it is exactly the one the pixel cards
+    /// already float on.
+    #[test]
+    fn animated_sidebar_ink_composites_against_the_panels_own_fill() {
+        use crate::anim::cell::InkPalette;
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.palette.panel_bg = ratatui::style::Color::Rgb(30, 30, 46);
+
+        // No fill and no measured host background: the panel background is all
+        // there is, which is what this path resolved to before.
+        assert_eq!(backdrop_rgb(&app), Some((30, 30, 46)));
+
+        // A host that answered OSC 11 is the ground, because `Color::Reset`
+        // means the panel is showing the host's own background.
+        app.host_terminal_theme = app.host_terminal_theme.with_color(
+            crate::terminal_theme::DefaultColorKind::Background,
+            crate::terminal_theme::RgbColor {
+                r: 239,
+                g: 241,
+                b: 245,
+            },
+        );
+        assert_eq!(backdrop_rgb(&app), Some((239, 241, 245)));
+
+        // A theme that paints the panel wins over both: that fill is the pixel
+        // every cell in the panel is drawn on.
+        app.palette.sidebar_bg = ratatui::style::Color::Rgb(12, 34, 56);
+        app.refresh_sidebar_palette();
+        assert_eq!(backdrop_rgb(&app), Some((12, 34, 56)));
+
+        // And that is the surface the engine resolves, for a span with no
+        // background of its own.
+        let ink = InkPalette::resolve(
+            Style::default().fg(app.sidebar_palette.text),
+            backdrop_rgb(&app),
+            &app.palette,
+            &app.host_terminal_theme,
+        );
+        assert_eq!(ink.surface, (12, 34, 56));
+
+        // A span that names its own background still keeps it — a selected
+        // row's highlight is what its own text sits on.
+        let highlighted = InkPalette::resolve(
+            Style::default().bg(ratatui::style::Color::Rgb(7, 7, 7)),
+            backdrop_rgb(&app),
+            &app.palette,
+            &app.host_terminal_theme,
+        );
+        assert_eq!(highlighted.surface, (7, 7, 7));
+    }
+
+    #[test]
     fn default_space_workspace_style_tracks_active_state() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
@@ -6248,6 +6379,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             live_cwd.clone(),
             0,
             crate::terminal_theme::TerminalTheme::default(),
+            None,
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
             &crate::pane::PaneLaunchEnv::default(),
             events,
@@ -6742,7 +6874,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
                 let workspace = &app.workspaces[1];
                 let (state, seen) = workspace.aggregate_state(&app.terminals);
-                let (expected_symbol, expected_style) = state_dot(state, seen, &app.palette);
+                let (expected_symbol, expected_style) =
+                    state_icon(state, seen, app.status_indicators, &app.palette);
                 let rgb = crate::ui::color::color_to_rgb;
                 let ink = expected_style
                     .fg
@@ -6885,7 +7018,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert!(!cards[0].worktree_child);
         assert_eq!(cards[1].ws_idx, 1);
         assert!(cards[1].worktree_child);
-        assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
+        assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height);
     }
 
     #[test]
@@ -6903,7 +7036,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let (spacious, _) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 30));
         assert_eq!(
             spacious[1].rect.y,
-            spacious[0].rect.y + spacious[0].rect.height + 2
+            spacious[0].rect.y + spacious[0].rect.height
         );
         assert_eq!(
             spacious[2].rect.y,
@@ -6914,7 +7047,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             spacious[2].rect.y + spacious[2].rect.height + 2
         );
         let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 6));
-        assert_eq!(spacious_metrics.viewport_rows, 2);
+        assert_eq!(spacious_metrics.viewport_rows, 3);
         assert_eq!(spacious_metrics.max_offset_from_bottom, 2);
 
         app.sidebar_spaces.row_gap = 0;

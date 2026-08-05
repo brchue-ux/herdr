@@ -254,7 +254,10 @@ fn strip_ansi_sequences(line: &str) -> String {
     out
 }
 
-fn limit_snapshot_lines(text: String, limit: Option<usize>) -> crate::pane::TerminalReadSnapshot {
+pub(crate) fn limit_snapshot_lines(
+    text: String,
+    limit: Option<usize>,
+) -> crate::pane::TerminalReadSnapshot {
     let Some(limit) = limit else {
         return crate::pane::TerminalReadSnapshot {
             text,

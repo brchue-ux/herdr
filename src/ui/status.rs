@@ -10,7 +10,7 @@ use super::text::display_width_u16;
 use super::widgets::panel_contrast_fg;
 use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
-    config::{ToastClipboardPosition, ToastHerdrPosition},
+    config::{StatusIndicatorStyle, ToastClipboardPosition, ToastHerdrPosition},
     detect::AgentState,
 };
 
@@ -194,20 +194,7 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
-/// Single-cell status mark for a rolled-up agent state.
-///
-/// Every state gets a distinct glyph so the mark stays readable without colour.
-/// Colour vision deficiency, monochrome/low-contrast terminals, and reading the
-/// sidebar from across a desk all lose the red/yellow/teal channel. These stay
-/// static marks: spinners were removed deliberately for redraw cost.
-pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
-    (
-        state_mark(state, seen),
-        Style::default().fg(state_label_color(state, seen, p)),
-    )
-}
-
-/// The glyph half of [`state_dot`], for surfaces that build their own style
+/// The glyph half of [`state_icon`], for surfaces that build their own style
 /// (the mobile header roll-up tones its own text). Keeping one match here is
 /// what stops a surface from re-typing a mark and drifting — and it is what
 /// makes replacing the alphabet a one-place edit.
@@ -238,6 +225,43 @@ pub(super) fn state_mark(state: AgentState, seen: bool) -> &'static str {
         (AgentState::Idle, _) => "-",
         (AgentState::Unknown, _) => " ",
     }
+}
+
+/// The configured alphabet, of which [`state_mark`] is one.
+///
+/// `Ascii` is this fork's default and delegates to `state_mark`; upstream's
+/// `Dots` and `Symbols` stay selectable through `ui.status_indicators`. Only one
+/// is ever drawn at a time, so the two sets never appear side by side.
+pub(super) fn state_icon_symbol(
+    state: AgentState,
+    seen: bool,
+    indicator_style: StatusIndicatorStyle,
+) -> &'static str {
+    match (indicator_style, state, seen) {
+        (StatusIndicatorStyle::Ascii, _, _) => state_mark(state, seen),
+        (StatusIndicatorStyle::Dots, AgentState::Blocked, _) => "●",
+        (StatusIndicatorStyle::Dots, AgentState::Working, _) => "●",
+        (StatusIndicatorStyle::Dots, AgentState::Idle, false) => "●",
+        (StatusIndicatorStyle::Dots, AgentState::Idle, true) => "○",
+        (StatusIndicatorStyle::Dots, AgentState::Unknown, _) => "·",
+        (StatusIndicatorStyle::Symbols, AgentState::Blocked, _) => "×",
+        (StatusIndicatorStyle::Symbols, AgentState::Working, _) => "◐",
+        (StatusIndicatorStyle::Symbols, AgentState::Idle, false) => "✓",
+        (StatusIndicatorStyle::Symbols, AgentState::Idle, true) => "○",
+        (StatusIndicatorStyle::Symbols, AgentState::Unknown, _) => "·",
+    }
+}
+
+pub(super) fn state_icon(
+    state: AgentState,
+    seen: bool,
+    indicator_style: StatusIndicatorStyle,
+    p: &Palette,
+) -> (&'static str, Style) {
+    (
+        state_icon_symbol(state, seen, indicator_style),
+        Style::default().fg(state_label_color(state, seen, p)),
+    )
 }
 
 pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
@@ -286,18 +310,29 @@ mod tests {
     }
 
     #[test]
-    fn state_dots_use_aligned_static_workspace_marks() {
+    fn state_icons_support_dot_and_distinct_symbol_styles() {
         let palette = Palette::catppuccin();
-        for (state, seen, symbol, color) in [
-            (AgentState::Blocked, true, "!", palette.red),
-            (AgentState::Working, true, ">", palette.yellow),
-            (AgentState::Idle, false, "-", palette.teal),
-            (AgentState::Idle, true, "-", palette.green),
-            (AgentState::Unknown, true, " ", palette.overlay0),
+        for (indicator_style, expected_symbols) in [
+            // This fork's default alphabet, and the two upstream ships.
+            (StatusIndicatorStyle::Ascii, ["!", ">", "-", "-", " "]),
+            (StatusIndicatorStyle::Dots, ["●", "●", "●", "○", "·"]),
+            (StatusIndicatorStyle::Symbols, ["×", "◐", "✓", "○", "·"]),
         ] {
-            let (actual_symbol, style) = state_dot(state, seen, &palette);
-            assert_eq!(actual_symbol, symbol);
-            assert_eq!(style.fg, Some(color));
+            for ((state, seen, color), expected_symbol) in [
+                (AgentState::Blocked, true, palette.red),
+                (AgentState::Working, true, palette.yellow),
+                (AgentState::Idle, false, palette.teal),
+                (AgentState::Idle, true, palette.green),
+                (AgentState::Unknown, true, palette.overlay0),
+            ]
+            .into_iter()
+            .zip(expected_symbols)
+            {
+                let (actual_symbol, style) = state_icon(state, seen, indicator_style, &palette);
+                assert_eq!(actual_symbol, expected_symbol);
+                assert_eq!(display_width_u16(actual_symbol), 1);
+                assert_eq!(style.fg, Some(color));
+            }
         }
     }
 
@@ -307,12 +342,11 @@ mod tests {
     /// `seen` is not in the key — acknowledgement is not carried by the mark.
     #[test]
     fn state_dots_are_distinct_single_cell_glyphs() {
-        let palette = Palette::catppuccin();
         let states = [AgentState::Blocked, AgentState::Working, AgentState::Idle];
 
         let mut used: Vec<&'static str> = Vec::new();
         for state in states {
-            let (symbol, _) = state_dot(state, true, &palette);
+            let symbol = state_mark(state, true);
             assert_eq!(
                 crate::ui::text::display_width(symbol),
                 1,
@@ -326,7 +360,7 @@ mod tests {
         }
 
         assert_eq!(
-            state_dot(AgentState::Unknown, true, &palette).0,
+            state_mark(AgentState::Unknown, true),
             " ",
             "a pane that is not an agent has no state to report"
         );
