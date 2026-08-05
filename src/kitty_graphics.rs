@@ -1288,6 +1288,71 @@ mod host_cell_size_is_a_measurement {
         };
         assert_eq!(good.or_fallback(), good);
     }
+
+    /// The original defect, pinned: a pty whose pixel fields are a stale
+    /// constant yields a cell that *shrinks as the window grows*.
+    ///
+    /// Upstream's cell-size fix (#2160) prefers the ioctl whenever it reports
+    /// any nonzero pixels and only queries the host when it reports none, so
+    /// on an SSH pty carrying a constant `ws_xpixel` the division below is
+    /// still what the client computes. This gate is what stops it reaching the
+    /// card path.
+    ///
+    /// The sweep is the regime the defect was measured in — a 3440px-wide
+    /// display, which is 200-390 columns at a real 9px cell, where the stale
+    /// constant divides down to the 2-4px that was reported. Note the bound
+    /// this does *not* claim: the gate refuses a cell for being implausible,
+    /// so a stale pty at a low column count still divides to something inside
+    /// the bounds and is believed. Narrow windows are not covered by this.
+    #[test]
+    fn a_stale_pty_width_never_yields_a_shrinking_cell_at_the_widths_it_was_seen_at() {
+        // Back-computed from the measurement in #50: ~4px at 1910 wide and
+        // ~2px at 3428 wide puts the constant the SSH client sent near 800px.
+        const STALE_PTY_WIDTH_PX: u32 = 800;
+        const STALE_PTY_HEIGHT_PX: u32 = 1080;
+
+        let mut derived_widths = Vec::new();
+        let mut handed_to_the_card = Vec::new();
+        for columns in [200u32, 250, 300, 350, 390] {
+            let rows = 40;
+            let derived = HostCellSize {
+                width_px: (STALE_PTY_WIDTH_PX / columns).max(1),
+                height_px: (STALE_PTY_HEIGHT_PX / rows).max(1),
+            };
+            assert!(
+                !derived.is_plausible(),
+                "a {}px cell derived at {columns} columns must be refused",
+                derived.width_px
+            );
+            derived_widths.push(derived.width_px);
+            handed_to_the_card.push(derived.or_fallback());
+        }
+
+        // The raw division still descends — that is upstream's path, unchanged.
+        assert!(
+            derived_widths.first() > derived_widths.last(),
+            "the sweep must actually reproduce the shrink: {derived_widths:?}"
+        );
+        // What the card is laid out against does not.
+        assert!(
+            handed_to_the_card.windows(2).all(|pair| pair[0] == pair[1]),
+            "the cell handed to the card path must not track window width: {handed_to_the_card:?}"
+        );
+        assert_eq!(handed_to_the_card[0], HostCellSize::FALLBACK);
+    }
+
+    /// And a host that answers `CSI 16 t` is believed as-is. 9x18 is the
+    /// captain's terminal; upstream's client reaches this only when the ioctl
+    /// reports no pixels at all.
+    #[test]
+    fn a_reported_host_cell_is_taken_whole() {
+        let reported = HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        assert!(reported.is_plausible());
+        assert_eq!(reported.or_fallback(), reported);
+    }
 }
 
 #[cfg(test)]
