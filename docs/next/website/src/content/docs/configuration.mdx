@@ -573,10 +573,23 @@ Nothing slides. The view being left dematerializes where it is, the layout chang
 ```toml
 [ui.sidebar.animation]
 view_switch = "dissolve"
-view_switch_ms = 220
+view_switch_ms = 640
+view_switch_particles_per_cell = 0
 ```
 
 `view_switch` takes the same behaviour names as `row_enter`, and like `row_exit` the way out is that name played backwards — the view comes apart the way it formed. Unlike `row_enter` it is on by default, because re-rooting with no transition is a hard cut from one set of rows to another; `view_switch = "none"` restores that hard cut. `view_switch_ms` is how long *each half* takes, clamped to 60–1500 ms.
+
+The transition redraws every 50 ms, so `view_switch_ms` is really a frame count rather than a continuous dial: 640 ms is about thirteen frames each way, and anything under about 250 ms is four frames or fewer — one intermediate state on the way in, one on the way out, and a lot of hard edge.
+
+### Dissolving the pixel cards
+
+`view_switch_particles_per_cell` is off (`0`) by default, and only does anything when [`experimental.kitty_graphics`](#experimental) is on.
+
+With Kitty graphics on, the sidebar's cards are a picture drawn *over* the tree's characters and opaque across every cell a card occupies. The character dissolve is still running underneath it, but what you can actually see is a border of connectors coming apart around a block of cards standing perfectly still — and then jumping, all at once, at the commit instant. Setting this dissolves the cards themselves, in pixels.
+
+The number is particles per terminal *cell*, so it means the same thing whatever size cell your terminal draws: `1` is the finest a character dissolve can be, matched exactly, and the count rises from there. It is clamped to 256, which is finer than a pixel on most cells.
+
+Density is the cheap part. On a 41×37-cell panel holding ten cards, going from one particle per cell to twenty-one costs about a third more bytes per frame and about half a millisecond of CPU. What costs is switching it on at all: the card sheet goes from being re-encoded once per switch to once per frame — twenty-six times across a 640 ms switch, a few megabytes of PNG where today it is a couple of hundred kilobytes. That is fine on a local terminal and is worth thinking about over a slow link. `cargo test --release --bin herdr dissolve_cost -- --ignored --nocapture` re-measures all of it on your own machine.
 
 The switch and the fleet run on separate clocks on purpose. A worker that spawns while the panel is coming apart still plays its own arrival, and a worker that finishes mid-switch still leaves — neither is queued behind the transition, and neither cancels it.
 

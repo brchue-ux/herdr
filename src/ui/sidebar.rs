@@ -7880,9 +7880,17 @@ rows = [
             crate::anim::Phase::Dismount,
             "and the transition was not cancelled by the fleet event"
         );
+        // The configured half rather than a literal: this test is about the
+        // deadline not *moving*, and pinning the number here would make every
+        // change to how long a switch takes read as a broken transition.
+        let half = app
+            .sidebar_animation
+            .view_switch_stage()
+            .expect("the switch is on out of the box")
+            .duration;
         assert_eq!(
             app.next_tree_view_commit_deadline(),
-            Some(settled + std::time::Duration::from_millis(220)),
+            Some(settled + half),
             "nor was it restarted"
         );
     }
