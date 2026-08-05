@@ -1695,6 +1695,10 @@ pub struct AppState {
     /// `[experimental] switch_ascii_input_source_in_prefix`.
     pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
+    /// `[experimental] sidebar_card_font`: an explicit face for the sidebar's
+    /// pixel cards, for a machine whose fonts are not where the search looks.
+    /// `None` means search.
+    pub sidebar_card_font: Option<String>,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1801,6 +1805,15 @@ pub struct AppState {
     /// viewport instead of to a pane rect.
     pub(crate) surface_graphics_layers:
         std::collections::HashMap<crate::api::schema::GraphicsSurface, GraphicsLayer>,
+    /// The sidebar tree's cards, rasterised.
+    ///
+    /// Client presentation state, not a runtime fact: it is a picture of rows
+    /// this client is drawing, at this client's cell size, and it never leaves
+    /// the TUI. It rides the same placement pipeline as an API-owned layer but
+    /// deliberately does not live in `surface_graphics_layers`, so a client
+    /// putting a backdrop on the sidebar and the sidebar drawing its own cards
+    /// are two placements rather than one overwriting the other.
+    pub(crate) sidebar_card_layer: Option<crate::ui::sidebar::SidebarCardLayer>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2485,6 +2498,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
+            sidebar_card_font: None,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
@@ -2534,6 +2548,7 @@ impl AppState {
             signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
+            sidebar_card_layer: None,
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,

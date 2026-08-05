@@ -940,6 +940,11 @@ pub struct ExperimentalConfig {
     pub allow_nested: bool,
     /// Experimental local Kitty graphics rendering for attached clients. Default: false.
     pub kitty_graphics: bool,
+    /// Path to a proportional `.ttf`/`.otf` the sidebar's pixel cards are set
+    /// in. Empty means search the usual system font directories; when nothing
+    /// is found the sidebar keeps its character cards. Only read while
+    /// `kitty_graphics` is on, and only at startup.
+    pub sidebar_card_font: String,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
@@ -1811,6 +1816,25 @@ switch_ascii_input_source_in_prefix = true
         assert!(config.experimental.kitty_graphics);
         assert!(config.experimental.pane_history);
         assert!(config.experimental.switch_ascii_input_source_in_prefix);
+    }
+
+    /// Unset means "search the usual font directories", which is why the
+    /// default is an empty string rather than a path: a default path would be
+    /// wrong on every machine that does not have that exact file.
+    #[test]
+    fn sidebar_card_font_defaults_to_searching_and_parses_a_path() {
+        let default_config: Config = toml::from_str("").unwrap();
+        assert!(default_config.experimental.sidebar_card_font.is_empty());
+
+        let toml = r#"
+[experimental]
+sidebar_card_font = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.experimental.sidebar_card_font,
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        );
     }
 
     #[test]

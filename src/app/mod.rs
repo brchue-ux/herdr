@@ -344,6 +344,16 @@ fn agent_panel_sort_from_config(
     }
 }
 
+/// The configured sidebar card face, or `None` to search for one.
+///
+/// An unset key and a key set to whitespace mean the same thing — search — so a
+/// half-edited config file falls back to the default rather than to a font path
+/// that is one space long.
+fn sidebar_card_font(configured: &str) -> Option<String> {
+    let trimmed = configured.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Parse the configured agent name list into a deduplicated set of `Agent`
 /// values. Unknown agent names are silently dropped so a typo cannot disable
 /// other valid entries.
@@ -760,6 +770,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -798,6 +809,7 @@ impl App {
             signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
+            sidebar_card_layer: None,
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,
@@ -1706,9 +1718,12 @@ impl App {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.state.pane_graphics_layers.clear();
                 self.state.surface_graphics_layers.clear();
+                self.state.sidebar_card_layer = None;
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
+            self.state.sidebar_card_font =
+                sidebar_card_font(&config.experimental.sidebar_card_font);
             self.state.reveal_hidden_cursor_for_cjk_ime =
                 config.experimental.reveal_hidden_cursor_for_cjk_ime;
             self.state.cjk_ime_agent_filter_configured =

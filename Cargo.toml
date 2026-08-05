@@ -19,6 +19,10 @@ include = [
 ]
 
 [dependencies]
+# Glyph rasterisation for the sidebar's pixel cards. Pure Rust, no system
+# library, and no font of its own: the face comes off the machine at runtime
+# (src/ui/sidebar/image_card/font.rs) so Herdr ships no font data.
+ab_glyph = "0.2"
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
