@@ -819,6 +819,7 @@ impl App {
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
+            host_reported_cell_size: None,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         };
@@ -1142,6 +1143,9 @@ impl App {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        if self.state.kitty_graphics_enabled {
+            self.query_host_cell_size();
+        }
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;
@@ -1292,8 +1296,18 @@ impl App {
                 terminal.draw(|frame| {
                     let area = frame.area();
                     if kitty_graphics_enabled {
-                        let observed_cell_size =
-                            crate::kitty_graphics::HostCellSize::try_from_terminal(area);
+                        // What the host said it is, then what the pty's pixel
+                        // fields imply, then the fallback. The host's own answer
+                        // wins because it is the only one of the three that was
+                        // measured rather than divided.
+                        let observed_cell_size = self
+                            .state
+                            .host_reported_cell_size
+                            .map(|reported| reported.for_area_public(area))
+                            .filter(|reported| reported.is_known())
+                            .or_else(|| {
+                                crate::kitty_graphics::HostCellSize::try_from_terminal(area)
+                            });
                         if let Some(observed_cell_size) = observed_cell_size {
                             self.state.host_cell_size = observed_cell_size;
                         }
@@ -1967,6 +1981,11 @@ impl App {
                         self.set_host_terminal_appearance(appearance, true);
                     }
                 }
+                // A cell size that arrived on a headless input source describes
+                // whatever terminal wrote it, which is not the surface this app
+                // is drawn on. The foreground client's own report is the only
+                // one that speaks for the screen.
+                crate::raw_input::RawInputEvent::HostCellSize(_) => {}
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);

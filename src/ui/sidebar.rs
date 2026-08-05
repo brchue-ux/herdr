@@ -2521,7 +2521,7 @@ fn render_agent_row(
     let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
 
     if let Some(shell) = &card_shell {
-        let (mut top, _) = agent_row_prefix(
+        let (mut connector, _) = agent_row_prefix(
             entry.depth(),
             entry.is_last_child(),
             entry.ancestors_continue(),
@@ -2531,15 +2531,32 @@ fn render_agent_row(
             // workspace, so there is nothing here for a charge to belong to.
             None,
         );
-        let (mut rail, _) = card_rail_prefix(
+        let (mut above, _) = card_rail_prefix(
             entry.depth(),
             entry.is_last_child(),
             entry.ancestors_continue(),
+            CardRailSegment::AboveConnector,
             p,
         );
-        animate_row_spans(&mut top, &row_anim);
-        animate_row_spans(&mut rail, &row_anim);
-        render_card_border_rails(frame, card, top, rail, list_bottom);
+        let (mut below, _) = card_rail_prefix(
+            entry.depth(),
+            entry.is_last_child(),
+            entry.ancestors_continue(),
+            CardRailSegment::BelowConnector,
+            p,
+        );
+        animate_row_spans(&mut connector, &row_anim);
+        animate_row_spans(&mut above, &row_anim);
+        animate_row_spans(&mut below, &row_anim);
+        render_card_border_rails(
+            frame,
+            card,
+            connector,
+            above,
+            below,
+            list_entry_gap(app, entries, card.entry_idx),
+            list_bottom,
+        );
         shell.render_glow(frame, list_bottom);
     }
 
@@ -2565,12 +2582,27 @@ fn render_agent_row(
         };
         let (mut spans, token_budget) = match &card_shell {
             Some(shell) => {
-                let (mut spans, _) = card_rail_prefix(
-                    entry.depth(),
-                    entry.is_last_child(),
-                    entry.ancestors_continue(),
-                    p,
-                );
+                // A content row draws its own prefix over the rail laid down
+                // before it, so this is where the connector actually lands. Row
+                // zero is the card's name, and the connector points at the name.
+                let (mut spans, _) = if row_index == 0 {
+                    agent_row_prefix(
+                        entry.depth(),
+                        entry.is_last_child(),
+                        entry.ancestors_continue(),
+                        0,
+                        p,
+                        None,
+                    )
+                } else {
+                    card_rail_prefix(
+                        entry.depth(),
+                        entry.is_last_child(),
+                        entry.ancestors_continue(),
+                        CardRailSegment::BelowConnector,
+                        p,
+                    )
+                };
                 // The frame's own column and the pad inside it, drawn blank so
                 // the border can be laid over the first of them once the row
                 // has had its say.
@@ -2664,8 +2696,10 @@ fn agent_status_label(entry: &AgentPanelEntry) -> &str {
 fn render_card_border_rails(
     frame: &mut Frame,
     card: &crate::app::state::WorkspaceCardArea,
-    top: Vec<Span<'static>>,
-    rail: Vec<Span<'static>>,
+    connector: Vec<Span<'static>>,
+    above: Vec<Span<'static>>,
+    below: Vec<Span<'static>>,
+    trailing_gap: u16,
     list_bottom: u16,
 ) {
     let Some(shell_frame) = card.card_frame else {
@@ -2675,11 +2709,29 @@ fn render_card_border_rails(
     if width == 0 || shell_frame.height == 0 {
         return;
     }
-    let bottom_y = shell_frame.y + shell_frame.height - 1;
-    for (y, spans) in [(shell_frame.y, top), (bottom_y, rail)] {
+    // The connector points at the card's *name*, which is its first content
+    // row, not at the corner of its box. A rail calibrated for one-line rows put
+    // it on the top border, where it reads as an arrow at a rectangle rather
+    // than as a line to a thing with a name.
+    let connector_y = card.content_y();
+    // Every row from the card's top edge to the foot of the gap under it, so
+    // the line is a line. Drawing only the first and last rows of a card left a
+    // dash per card with the tree's own spacing showing through the breaks.
+    let last_y = shell_frame
+        .y
+        .saturating_add(shell_frame.height)
+        .saturating_add(trailing_gap);
+    for y in shell_frame.y..last_y {
         if y >= list_bottom {
-            continue;
+            break;
         }
+        let spans = if y == connector_y {
+            connector.clone()
+        } else if y < connector_y {
+            above.clone()
+        } else {
+            below.clone()
+        };
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect::new(card.rect.x, y, width, 1),
@@ -2788,8 +2840,26 @@ fn agent_row_prefix(
     }
 }
 
-/// The rails a card's content row carries, cut back to the column the card's
-/// own left border stands in.
+/// Where one row of a card sits relative to the row its connector points at.
+///
+/// A one-line row has one rail to draw and no choice to make. A card is four or
+/// more rows tall, and its own level's rail means different things above and
+/// below the connector: above, the line is still travelling down from the
+/// parent and always continues; below, it continues only if this card has a
+/// sibling under it. Drawing the same rail on every row of a card is what made
+/// a last child's line stop at the top of the card and a middle child's line
+/// run past the bottom of the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardRailSegment {
+    /// Rows between the previous row's rail and this card's connector.
+    AboveConnector,
+    /// Rows after the connector: the card's remaining rows, and the gap under
+    /// it up to the next sibling's first row.
+    BelowConnector,
+}
+
+/// The rails a card's row carries, cut back to the column the card's own left
+/// border stands in.
 ///
 /// A bare row's continuation lines sit two columns further right than its first
 /// line, so wrapped text aligns under the name rather than under the state
@@ -2802,15 +2872,23 @@ fn card_rail_prefix(
     depth: u8,
     is_last_child: bool,
     ancestors_continue: &[bool],
+    segment: CardRailSegment,
     p: &Palette,
 ) -> (Vec<Span<'static>>, usize) {
     let line_style = Style::default().fg(p.overlay0);
+    // Above the connector the rail is the parent's, and a parent's line reaches
+    // its last child exactly as it reaches the others — `is_last_child` only
+    // decides whether anything continues *past* the connector.
+    let own_level_continues = match segment {
+        CardRailSegment::AboveConnector => true,
+        CardRailSegment::BelowConnector => !is_last_child,
+    };
     let branch = |spans: &mut Vec<Span<'static>>| {
-        if is_last_child {
-            spans.push(Span::raw("   "));
-        } else {
+        if own_level_continues {
             spans.push(Span::styled("│", line_style));
             spans.push(Span::raw("  "));
+        } else {
+            spans.push(Span::raw("   "));
         }
     };
 
@@ -3481,7 +3559,7 @@ fn render_workspace_list(
         let content_y = card.content_y();
 
         if let Some(shell) = &card_shell {
-            let mut top = Vec::new();
+            let mut connector = Vec::new();
             let connector_style = Style::default().fg(p.overlay0);
             let top_charge = ConnectorCharge::new(app, connector_style, signal_phase);
             if own_depth > 0 {
@@ -3493,12 +3571,33 @@ fn render_workspace_list(
                     p,
                     top_charge.as_ref(),
                 );
-                top.append(&mut owned);
+                connector.append(&mut owned);
             } else {
-                top.push(Span::raw(" "));
+                connector.push(Span::raw(" "));
             }
-            let (rail, _) = card_rail_prefix(own_depth, own_is_last, own_ancestors, p);
-            render_card_border_rails(frame, card, top, rail, list_bottom);
+            let (above, _) = card_rail_prefix(
+                own_depth,
+                own_is_last,
+                own_ancestors,
+                CardRailSegment::AboveConnector,
+                p,
+            );
+            let (below, _) = card_rail_prefix(
+                own_depth,
+                own_is_last,
+                own_ancestors,
+                CardRailSegment::BelowConnector,
+                p,
+            );
+            render_card_border_rails(
+                frame,
+                card,
+                connector,
+                above,
+                below,
+                list_entry_gap(app, &entries, card.entry_idx),
+                list_bottom,
+            );
             shell.render_glow(frame, list_bottom);
         }
 
@@ -3517,13 +3616,29 @@ fn render_workspace_list(
             let connector_style = Style::default().fg(p.overlay0);
             let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase);
             let token_budget = match &card_shell {
-                // Every row of a card is preceded by the same rails: the
-                // connector is up on the top border row, where the tree now
-                // meets the card's corner, and the frame holds the content in
-                // from there down.
+                // The connector is on the card's *name* row — its first content
+                // row — because that is the thing the tree is pointing at. Every
+                // other row of the card carries the plain rail, and the frame
+                // holds the content in from the column beside it.
                 Some(shell) => {
-                    let (mut prefix, _) =
-                        card_rail_prefix(own_depth, own_is_last, own_ancestors, p);
+                    let (mut prefix, _) = if row_index == 0 {
+                        agent_row_prefix(
+                            own_depth,
+                            own_is_last,
+                            own_ancestors,
+                            0,
+                            p,
+                            row_charge.as_ref(),
+                        )
+                    } else {
+                        card_rail_prefix(
+                            own_depth,
+                            own_is_last,
+                            own_ancestors,
+                            CardRailSegment::BelowConnector,
+                            p,
+                        )
+                    };
                     spans.append(&mut prefix);
                     // The frame's own column and the pad inside it, drawn blank
                     // so the border can be laid over the first of them once the
@@ -3890,13 +4005,101 @@ mod tests {
         );
     }
 
+    /// The tree's line is a line, not a dash per card.
+    ///
+    /// A card is four or more rows tall and the panel puts a gap under it, and
+    /// the rail used to be drawn on exactly two of those rows — the top border
+    /// and the bottom. Every row between them, and every gap row, came out
+    /// blank, so the "line" joining a mate to its workers was a column of
+    /// disconnected ticks. This walks the rows between two siblings' connectors
+    /// and insists every one of them carries the rail.
+    #[test]
+    fn a_cards_rail_is_unbroken_from_one_sibling_to_the_next() {
+        let width = NARROWEST_CARD_WIDTH + 6;
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let first = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let second = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+        let owner_id = app.workspaces[1].id.clone();
+        for (pane, name) in [(first, "worker-one"), (second, "worker-two")] {
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.created_by = Some(crate::api::schema::PaneOrigin {
+                pane_id: name.to_string(),
+                workspace_id: owner_id.clone(),
+            });
+        }
+
+        let area = Rect::new(0, 0, width, 30);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("test backend");
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .expect("draw");
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let screen = rows.join("\n");
+
+        let row_of = |name: &str| {
+            rows.iter()
+                .position(|row| row.contains(name))
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
+        };
+        let one = row_of("worker-one");
+        let two = row_of("worker-two");
+        assert!(one < two, "workers drew out of order:\n{screen}");
+        // Only the columns left of the workers' own frame count. The card's
+        // left border is itself a `│`, so a test that looked at the whole row
+        // would pass on a rail that was never drawn at all.
+        let rail_columns = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .filter(|card| {
+                let row = u16::try_from(one).unwrap_or(u16::MAX);
+                card.rect.y <= row && row < card.rect.y.saturating_add(card.rect.height)
+            })
+            .find_map(|card| card.card_frame.map(|frame| frame.x))
+            .unwrap_or_else(|| panic!("no card frame to measure the rail against:\n{screen}"));
+        for (index, row) in rows.iter().enumerate().take(two).skip(one) {
+            let rail: String = row.chars().take(usize::from(rail_columns)).collect();
+            assert!(
+                rail.contains('│') || rail.contains('├') || rail.contains('└'),
+                "row {index} rail {rail:?} broke between the two workers:\n{screen}"
+            );
+        }
+    }
+
     /// The same ownership, drawn in the **card** shell.
     ///
-    /// The card moved the connector off the row carrying the name and onto the
-    /// card's top border, so a test that looks for `└` beside a title passes at
-    /// line width and says nothing at card width. Indentation is the property
-    /// that means "nested" in both shells, so assert that instead: each rank
-    /// starts strictly further right than the one that owns it.
+    /// Two properties, because a card can satisfy either one alone and still be
+    /// wrong. The names step in by rank, which is what "nested" looks like at a
+    /// glance; and each child's row carries its own `├`/`└`, which is what says
+    /// *who* it is nested under. The card used to put that connector on its top
+    /// border row instead — pointing at a corner rather than at a name — and
+    /// this asserted only the indent, so the misplacement had nothing to fail.
     #[test]
     fn native_ownership_still_nests_when_the_panel_draws_cards() {
         let (_app, rows) = natively_owned_fleet(NARROWEST_CARD_WIDTH + 6, 1);
@@ -3906,12 +4109,14 @@ mod tests {
             "expected the card shell at this width:\n{screen}"
         );
 
-        let indent_of = |name: &str| {
-            let row = rows
-                .iter()
+        let row_with = |name: &str| {
+            rows.iter()
                 .find(|row| row.contains(name))
-                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"));
-            row.find(|ch: char| !ch.is_whitespace())
+                .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
+        };
+        let indent_of = |name: &str| {
+            row_with(name)
+                .find(name)
                 .unwrap_or_else(|| panic!("{name} row is blank:\n{screen}"))
         };
 
@@ -3922,6 +4127,14 @@ mod tests {
             first < mate && mate < worker,
             "cards did not step in by rank (first={first}, mate={mate}, worker={worker}):\n{screen}"
         );
+
+        for child in ["2ndmate-explore", "worker"] {
+            let row = row_with(child);
+            assert!(
+                row.contains('└') || row.contains('├'),
+                "{child}'s connector is not on the row carrying its name:\n{screen}"
+            );
+        }
     }
 
     /// The load-bearing clause. A pane created from a *different* Space is a
@@ -4491,15 +4704,53 @@ mod tests {
         let p = Palette::catppuccin();
         for depth in 0u8..5 {
             for is_last_child in [true, false] {
-                let ancestors = vec![true; depth as usize + 1];
-                let (_, drawn) = card_rail_prefix(depth, is_last_child, &ancestors, &p);
-                assert_eq!(
-                    drawn,
-                    tree_prefix_width(depth, 0),
-                    "depth {depth} last={is_last_child}"
-                );
+                for segment in [
+                    CardRailSegment::AboveConnector,
+                    CardRailSegment::BelowConnector,
+                ] {
+                    let ancestors = vec![true; depth as usize + 1];
+                    let (_, drawn) =
+                        card_rail_prefix(depth, is_last_child, &ancestors, segment, &p);
+                    assert_eq!(
+                        drawn,
+                        tree_prefix_width(depth, 0),
+                        "depth {depth} last={is_last_child} {segment:?}"
+                    );
+                }
             }
         }
+    }
+
+    /// A last child's line has to reach it and then stop. Before the reality
+    /// pass the same rail was drawn above and below the connector, so a last
+    /// child got no line at all coming down to it and a middle child's line ran
+    /// on past the bottom of the tree.
+    #[test]
+    fn a_last_childs_rail_arrives_and_then_stops() {
+        let p = Palette::catppuccin();
+        let ancestors = vec![true, true];
+        let ink = |segment| {
+            let (spans, _) = card_rail_prefix(1, true, &ancestors, segment, &p);
+            spans.iter().any(|span| span.content.contains('│'))
+        };
+        assert!(
+            ink(CardRailSegment::AboveConnector),
+            "the parent's line has to reach its last child"
+        );
+        assert!(
+            !ink(CardRailSegment::BelowConnector),
+            "and has to stop there, or it points at a sibling that does not exist"
+        );
+
+        let ink_middle = |segment| {
+            let (spans, _) = card_rail_prefix(1, false, &ancestors, segment, &p);
+            spans.iter().any(|span| span.content.contains('│'))
+        };
+        assert!(ink_middle(CardRailSegment::AboveConnector));
+        assert!(
+            ink_middle(CardRailSegment::BelowConnector),
+            "a child with siblings under it keeps the line running"
+        );
     }
 
     /// The layout reserves `content + chrome` rows and the renderer draws the

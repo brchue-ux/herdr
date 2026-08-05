@@ -138,6 +138,8 @@ pub enum RawInputEvent {
         colors: Vec<(u8, RgbColor)>,
     },
     HostColorSchemeChanged(HostAppearance),
+    /// The host's answer to `CSI 16 t`: how big one cell is, in pixels.
+    HostCellSize(crate::kitty_graphics::HostCellSize),
     Unsupported,
 }
 
@@ -524,6 +526,20 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
 }
 
+/// The last cell size the host reported in this batch, if it reported one.
+///
+/// Last rather than first: a batch that somehow carries two answers is a
+/// terminal that resized between the query and the reply, and the later one is
+/// the one describing the window that is on screen now.
+pub(crate) fn events_report_host_cell_size(
+    events: &[RawInputEvent],
+) -> Option<crate::kitty_graphics::HostCellSize> {
+    events.iter().rev().find_map(|event| match event {
+        RawInputEvent::HostCellSize(cell_size) => Some(*cell_size),
+        _ => None,
+    })
+}
+
 fn input_flush_timeout_ms(framer: &RawInputFramer) -> i32 {
     if framer.has_pending_incomplete_sgr_mouse_sequence() {
         MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS
@@ -745,6 +761,13 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
 
         if let Some(appearance) = parse_host_color_scheme_report(&buffer[..seq_len]) {
             return Some((RawInputEvent::HostColorSchemeChanged(appearance), seq_len));
+        }
+
+        // Before the key parse, not after: `CSI 6 ; h ; w t` is a well-formed
+        // CSI and would otherwise be offered to `parse_terminal_key_sequence`
+        // like any other.
+        if let Some(cell_size) = crate::kitty_graphics::parse_host_cell_size_report(seq) {
+            return Some((RawInputEvent::HostCellSize(cell_size), seq_len));
         }
 
         if let Some(mouse) = parse_sgr_mouse(seq) {

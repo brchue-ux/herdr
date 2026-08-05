@@ -108,7 +108,12 @@ const TITLE_LEADING: f32 = 1.25;
 
 /// Gap between the title block and the tidbit line, as a multiple of the
 /// tidbit's line height.
-const TIDBIT_GAP: f32 = 0.55;
+///
+/// Cut from 0.55 in the reality pass. It is air, and air is the only thing a
+/// card below the top tier has left to give: with the title's size fixed, this
+/// gap and [`MIN_VERTICAL_PAD_PX`] are the whole difference between a tier that
+/// reads smaller and one that does not. See [`tier_height_px`].
+const TIDBIT_GAP: f32 = 0.35;
 
 /// The narrowest panel the image card draws on, in columns.
 ///
@@ -159,9 +164,28 @@ fn tier(depth: u8) -> f32 {
 /// not fit in it, and that is the case at every tier below the first. The tier
 /// still reads — the padding, the plate, the chip, the stroke and the radius
 /// all scale with it — it just cannot squeeze the words.
+///
+/// # Why the ladder is not 1.00 / 0.65 / 0.42 on screen
+///
+/// It cannot be, and the arithmetic says so rather than the implementation.
+/// Two 14 px lines at 1.25 leading is about 2.25 line heights, the tidbit under
+/// them adds its own line and the gap above it, and the whole block will not go
+/// below roughly 0.85 of the 68 px base without shrinking type the captain
+/// fixed at 14 px. Tier 1's nominal is 0.65 of base and tier 2's is 0.42, so
+/// *both* land on that floor and both come out the same height. The step that
+/// survives is the one between the top tier and everything under it, which is
+/// the one that carries the meaning — a worker is visibly shorter than the
+/// first mate. Anything more needs either a smaller title or a card that drops
+/// the tidbit below the top tier, and both are the captain's call, not this
+/// function's.
 fn tier_height_px(depth: u8, metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
     let nominal = BASE_HEIGHT_PX * tier(depth);
-    nominal.max(content_block_px(metrics, tidbit_metrics) + MIN_VERTICAL_PAD_PX * 2.0)
+    nominal.max(content_floor_px(metrics, tidbit_metrics))
+}
+
+/// The shortest a card carrying the full D-MID block can be.
+fn content_floor_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
+    content_block_px(metrics, tidbit_metrics) + MIN_VERTICAL_PAD_PX * 2.0
 }
 
 /// The ink a D-MID card carries: two title lines and the tidbit under them.
@@ -180,7 +204,11 @@ fn content_block_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
 /// height is that number. Below the top tier the same block no longer fits the
 /// nominal at all, so the padding gives way first and the height only grows
 /// once it has nothing left to give.
-const MIN_VERTICAL_PAD_PX: f32 = 5.0;
+///
+/// Cut from 5 px in the reality pass, for the reason spelled out on
+/// [`tier_height_px`]: the floor this sets is what a sub-top-tier card's height
+/// actually is, so every pixel of it is a pixel the tier scale does not get.
+const MIN_VERTICAL_PAD_PX: f32 = 3.0;
 
 /// Rows a card at `depth` occupies, or `None` when the pixel path is not live.
 ///
@@ -209,6 +237,18 @@ pub(crate) fn row_height_cells(app: &AppState, depth: u8, fold_width: u16) -> Op
     Some((rows as u16).max(super::card::CHROME_ROWS + 1))
 }
 
+/// The artwork a card carries in its icon slot, when it carries any.
+///
+/// Nothing constructs one yet: real per-project marks are their own
+/// investigation. The type exists so the slot has a *reason* to be there rather
+/// than a hardcoded gap — the layout asks "is there a mark" and sizes itself
+/// from the answer, so the day a mark arrives it is one constructor away from
+/// being drawn with no relayout. Until then every card answers no and the slot
+/// is not reserved at all, which is what stops an empty box from standing on
+/// screen eating the width the title needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardMark {}
+
 /// What one card says.
 struct CardContent {
     title: String,
@@ -218,6 +258,8 @@ struct CardContent {
     seen: bool,
     depth: u8,
     lifted: bool,
+    /// The project mark, once there are any. See [`CardMark`].
+    mark: Option<CardMark>,
 }
 
 impl CardContent {
@@ -229,6 +271,7 @@ impl CardContent {
         self.seen.hash(hasher);
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
+        self.mark.is_some().hash(hasher);
     }
 }
 
@@ -309,18 +352,41 @@ impl CardGeometry {
     /// on exactly the cards the content pushed taller. The nominal is what the
     /// tier means; the extra height is slack, and slack belongs to the gap
     /// around the content, not to the chrome.
-    fn new(depth: u8, cell_height: f32) -> Self {
+    ///
+    /// `has_mark` collapses the icon slot. An empty plate is not a placeholder,
+    /// it is a box; and at 0.70 h plus its gap it was the single widest thing
+    /// on the card that carried no information, taking that width from the one
+    /// thing that does. The slot keeps its measured size for the day something
+    /// goes in it and is worth nothing until then.
+    fn new(depth: u8, cell_height: f32, has_mark: bool) -> Self {
         let nominal = (BASE_HEIGHT_PX * tier(depth)).max(cell_height);
         Self {
             radius: (measured::RADIUS * nominal).max(2.0),
             stroke: (measured::STROKE_W * nominal).max(1.2),
             pad: measured::PAD * nominal,
             pad_right: measured::PAD_RIGHT * nominal,
-            plate: (measured::PLATE * nominal).min(measured::PLATE_MAX_PX),
+            plate: if has_mark {
+                (measured::PLATE * nominal).min(measured::PLATE_MAX_PX)
+            } else {
+                0.0
+            },
             plate_radius: measured::PLATE_RADIUS * nominal,
-            plate_gap: measured::PLATE_GAP * nominal,
+            plate_gap: if has_mark {
+                measured::PLATE_GAP * nominal
+            } else {
+                0.0
+            },
             bloom_sigma: (measured::BLOOM_SIGMA * nominal).max(1.6),
         }
+    }
+
+    /// Where the card's ink starts, measured in from its left edge.
+    ///
+    /// One expression rather than two, so the collapsed slot and the occupied
+    /// one cannot be spelled differently by the layout and the renderer — which
+    /// is the shape of bug that put a title behind a plate in the first place.
+    fn text_inset(&self) -> f32 {
+        self.pad + self.plate + self.plate_gap
     }
 }
 
@@ -490,6 +556,72 @@ impl BloomField {
     }
 }
 
+/// Where a card's ink may go, in pixels from the card's own left edge.
+///
+/// Split out of [`draw_card`] because it is the number the "titles never
+/// truncate" promise is actually about, and until it was a function nothing
+/// could assert against it: the fit ladder measured `wrap` against invented
+/// widths while the renderer computed a different one from the plate, the chip
+/// and the pad, and the two only met on screen. Every fit test now measures
+/// this, so a change to any of the three has to face the real titles.
+struct TextColumn {
+    left: f32,
+    /// The card's right pad, before the chip has taken its share.
+    right: f32,
+    chip_px: f32,
+    chip_width: f32,
+    chip_height: f32,
+    chip_fits: bool,
+    chip_gap: f32,
+}
+
+impl TextColumn {
+    /// Where the text has to stop once the chip has been placed.
+    fn text_right(&self) -> f32 {
+        self.right - self.chip_width - self.chip_gap
+    }
+
+    /// The width the title and the tidbit are set in.
+    fn available(&self) -> f32 {
+        let right = if self.chip_fits {
+            self.text_right()
+        } else {
+            self.right
+        };
+        (right - self.left).max(0.0)
+    }
+}
+
+fn text_column(
+    font: &CardFont,
+    geometry: &CardGeometry,
+    width: f32,
+    height: f32,
+    state_label: &str,
+) -> TextColumn {
+    let chip_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
+    let chip_metrics = font.metrics(chip_px);
+    let label = state_label.to_uppercase();
+    let chip_width = font.width(&label, chip_px) + chip_px * 1.5;
+    let chip_height = (chip_metrics.line_height * 1.25).max(chip_px * 1.55);
+    let left = geometry.text_inset();
+    let right = width - geometry.pad_right;
+    let chip_gap = geometry.pad * 0.7;
+    TextColumn {
+        left,
+        right,
+        chip_px,
+        chip_width,
+        chip_height,
+        // The chip is dropped rather than overlapped when the card cannot hold
+        // it and a readable title at once. On a correctly measured cell this is
+        // never reached; it was reached on every card of a 3440-wide window,
+        // because the card was being laid out in a two-pixel cell.
+        chip_fits: chip_height < height - 2.0 && right - chip_width - chip_gap > left,
+        chip_gap,
+    }
+}
+
 /// Draw one card's body, plate, chip and text over whatever is already there.
 fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let (stroke_a, stroke_b, _, _, _, lum) = card.inks();
@@ -557,10 +689,9 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     }
 
     // ---- the icon slot ---------------------------------------------------
-    // A plate and nothing in it, on purpose. The marks that go here are real
-    // per-project artwork and are a separate investigation; what this owes them
-    // is the slot at the right size in the right place, so they land without a
-    // relayout.
+    // Drawn only when there is a mark to put in it — `CardGeometry::new` has
+    // already collapsed the slot to nothing when there is not, so this is the
+    // same code path either way and the plate simply has no size.
     let plate = geometry.plate.min(height - geometry.pad * 2.0).max(0.0);
     let plate_x = ox + geometry.pad;
     let plate_y = oy + (height - plate) / 2.0;
@@ -595,14 +726,15 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     }
 
     // ---- the chip --------------------------------------------------------
-    let mut text_right = ox + width - geometry.pad_right;
-    let chip_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
+    let column = text_column(font, geometry, width, height, &content.state_label);
+    let mut text_right = ox + column.right;
+    let chip_px = column.chip_px;
     let chip_metrics = font.metrics(chip_px);
     let label = content.state_label.to_uppercase();
-    let chip_w = font.width(&label, chip_px) + chip_px * 1.5;
-    let chip_h = (chip_metrics.line_height * 1.25).max(chip_px * 1.55);
-    let text_left = plate_x + plate + geometry.plate_gap;
-    if chip_h < height - 2.0 && text_right - chip_w > text_left {
+    let chip_w = column.chip_width;
+    let chip_h = column.chip_height;
+    let text_left = ox + column.left;
+    if column.chip_fits {
         let ink = chip_ink(content.state, content.seen);
         let fill = measured::FILL_MID.mix(ink, 0.16);
         let edge = fill.mix(ink, 0.50);
@@ -644,11 +776,12 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             chip_x,
             chip_x + chip_w,
         );
-        text_right = chip_x - geometry.pad * 0.7;
+        text_right = ox + column.text_right();
     }
 
     // ---- title and tidbit ------------------------------------------------
-    let avail = text_right - text_left;
+    // The same number the fit tests measure, not a second one derived here.
+    let avail = column.available();
     if avail <= 1.0 {
         return;
     }
@@ -808,6 +941,7 @@ fn content_for(
                 seen,
                 depth: entry.depth(),
                 lifted: app.active == Some(*ws_idx),
+                mark: None,
             })
         }
         super::WorkspaceListEntry::Agent { entry_idx, .. } => {
@@ -823,6 +957,7 @@ fn content_for(
                 seen: detail.seen,
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
+                mark: None,
             })
         }
     }
@@ -1000,7 +1135,7 @@ fn build_sheet_inner(
     let cards: Vec<PlacedCard<'_>> = placed
         .iter()
         .map(|(frame, content)| {
-            let geometry = CardGeometry::new(content.depth, cell_h);
+            let geometry = CardGeometry::new(content.depth, cell_h, content.mark.is_some());
             // The card is drawn at the height its tier asked for, centred in
             // the cells the row was given. The leftover is the gutter — this is
             // where the measured 0.19 h sibling gap comes back, and it is also
@@ -1731,6 +1866,235 @@ mod tests {
         }
     }
 
+    /// The captain's own fleet, verbatim, in the column the renderer actually
+    /// gives a title — at every tier and at the panel widths he runs.
+    ///
+    /// This is the test the shipped card did not have. The old fit ladder
+    /// measured `wrap` against invented widths and passed; the renderer derived
+    /// its own width from the plate, the chip and the pad, and on a real panel
+    /// that width was a third of what had been measured. Nothing compared the
+    /// two, so `Investigateing killed Okta corpus and Herdr work sessions` came
+    /// out as `Investi`.
+    ///
+    /// The strings are read off `herdr api snapshot` rather than invented,
+    /// because the previous verification used short made-up names and the
+    /// truncation simply never appeared.
+    const REAL_FLEET_TITLES: &[&str] = &[
+        "Investigateing killed Okta corpus and Herdr work sessions",
+        "Fixing card rendering and truncation issues in herdr",
+        "Establish home_budget_app secondmate operations",
+        "Herdr workspace manager second mate bootstrap",
+        "Adding main branch guard to sync commit hooks",
+        "Validating FM_HOME anchor fix and ship PR",
+    ];
+
+    /// The widest state label a chip ever carries, which is the one that leaves
+    /// the title the least room.
+    const WIDEST_STATE_LABEL: &str = "BLOCKED";
+
+    /// The column a card at `depth` gives its title, on a `sidebar_width`
+    /// panel whose cells are `cell_w` wide. The same arithmetic `card_frame_for`
+    /// and `build_sheet_inner` do, so a test measuring this is measuring the
+    /// card that gets drawn.
+    fn real_text_column(font: &CardFont, sidebar_width: u16, cell_w: f32, depth: u8) -> TextColumn {
+        // The card starts after the tree's own prefix, exactly as
+        // `card_frame_for` places it, on the scrollbar-narrow width
+        // `row_fold_width` measures against.
+        let prefix = if depth == 0 {
+            1
+        } else {
+            3 * u16::from(depth) + 1
+        };
+        let frame_cells = sidebar_width.saturating_sub(1).saturating_sub(prefix);
+        let geometry = CardGeometry::new(depth, 16.0, false);
+        let height = tier_height_px(
+            depth,
+            font.metrics(TITLE_PX),
+            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+        );
+        text_column(
+            font,
+            &geometry,
+            f32::from(frame_cells) * cell_w,
+            height,
+            WIDEST_STATE_LABEL,
+        )
+    }
+
+    /// Every panel width a card is drawn on, against every cell width
+    /// `HostCellSize::is_plausible` lets through.
+    fn card_widths() -> impl Iterator<Item = (u16, f32, u8)> {
+        [34u16, 36, 38, 40, 42, 50, 60]
+            .into_iter()
+            .flat_map(|sidebar_width| {
+                [5.0f32, 6.0, 7.0, 8.0, 10.0, 12.0, 16.0, 24.0]
+                    .into_iter()
+                    .flat_map(move |cell_w| {
+                        (0..3u8).map(move |depth| (sidebar_width, cell_w, depth))
+                    })
+            })
+    }
+
+    /// A line is never wider than its column while a break was available.
+    ///
+    /// This is the invariant that actually broke. `wrap` never shortens a word,
+    /// but a line wider than its column is *drawn and clipped* by `draw_text`,
+    /// and that clip is what turned `Investigateing killed …` into `Investi`.
+    /// The one line allowed to overrun is a single word wider than the whole
+    /// column — there is nothing to break on, and shortening it is the elision
+    /// the captain ruled out. Everything else has to fit.
+    #[test]
+    fn a_real_title_never_overruns_a_column_it_could_have_broken_in() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for (sidebar_width, cell_w, depth) in card_widths() {
+            let column = real_text_column(font, sidebar_width, cell_w, depth);
+            for title in REAL_FLEET_TITLES {
+                for line in wrap(font, title, TITLE_PX, column.available(), TITLE_LINES) {
+                    if font.width(&line, TITLE_PX) <= column.available() + 0.5 {
+                        continue;
+                    }
+                    assert!(
+                        !line.contains(' '),
+                        "{line:?} overruns its {:.1}px column with a break available, at \
+                         sidebar {sidebar_width}, cell {cell_w}, depth {depth}",
+                        column.available()
+                    );
+                }
+            }
+        }
+    }
+
+    /// And on the widths the fleet runs, not even a single unbreakable word
+    /// overruns — so nothing is clipped at all.
+    #[test]
+    fn no_real_title_word_overruns_its_column_at_the_widths_the_fleet_runs() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for (sidebar_width, cell_w, depth) in card_widths() {
+            if sidebar_width < 38 || cell_w < 8.0 {
+                continue;
+            }
+            let column = real_text_column(font, sidebar_width, cell_w, depth);
+            for title in REAL_FLEET_TITLES {
+                for line in wrap(font, title, TITLE_PX, column.available(), TITLE_LINES) {
+                    assert!(
+                        font.width(&line, TITLE_PX) <= column.available() + 0.5,
+                        "{line:?} would be clipped at sidebar {sidebar_width}, cell {cell_w}, \
+                         depth {depth}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And on any panel and cell the captain actually runs, no word is even
+    /// dropped: the whole title is set, on two lines, at 14 px.
+    ///
+    /// 38 columns and an 8 px cell is the floor this is claimed at, and 8 px is
+    /// `HostCellSize::FALLBACK` — the narrowest cell Herdr will ever *assume*.
+    /// Below that pair the longest real `doing` string does not physically fit
+    /// two 14 px lines, and the card's answer is to set the words it can rather
+    /// than to shrink the type. His panel is 42 columns on a 12 px cell, which
+    /// clears this floor with room to spare.
+    #[test]
+    fn every_real_fleet_title_is_set_whole_at_the_widths_the_fleet_runs() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for (sidebar_width, cell_w, depth) in card_widths() {
+            if sidebar_width < 38 || cell_w < 8.0 {
+                continue;
+            }
+            let column = real_text_column(font, sidebar_width, cell_w, depth);
+            for title in REAL_FLEET_TITLES {
+                let lines = wrap(font, title, TITLE_PX, column.available(), TITLE_LINES);
+                let set = lines.join(" ");
+                assert_eq!(
+                    set.split_whitespace().collect::<Vec<_>>(),
+                    title.split_whitespace().collect::<Vec<_>>(),
+                    "dropped words at sidebar {sidebar_width}, cell {cell_w}, depth {depth}: \
+                     {set:?} from {title:?}"
+                );
+            }
+        }
+    }
+
+    /// The empty icon plate was taking this much of the title's column.
+    ///
+    /// Kept as a number rather than a description because "far larger than it
+    /// should be" is what the captain could see and this is what it cost: at
+    /// the top tier the collapsed slot hands the title back more than the width
+    /// of the state chip.
+    #[test]
+    fn collapsing_the_empty_plate_gives_real_width_back_to_the_title() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for depth in 0..3u8 {
+            let height = tier_height_px(
+                depth,
+                font.metrics(TITLE_PX),
+                font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+            );
+            let width = 42.0 * 12.0;
+            let with_plate = text_column(
+                font,
+                &CardGeometry::new(depth, 16.0, true),
+                width,
+                height,
+                WIDEST_STATE_LABEL,
+            );
+            let without = text_column(
+                font,
+                &CardGeometry::new(depth, 16.0, false),
+                width,
+                height,
+                WIDEST_STATE_LABEL,
+            );
+            assert!(
+                without.available() > with_plate.available(),
+                "depth {depth} gained nothing by collapsing the slot"
+            );
+        }
+        // At the top tier specifically, where the plate was capped at its
+        // widest, the gain is worth more than the chip.
+        let top = text_column(
+            font,
+            &CardGeometry::new(0, 16.0, false),
+            42.0 * 12.0,
+            68.0,
+            WIDEST_STATE_LABEL,
+        );
+        let top_with = text_column(
+            font,
+            &CardGeometry::new(0, 16.0, true),
+            42.0 * 12.0,
+            68.0,
+            WIDEST_STATE_LABEL,
+        );
+        assert!(top.available() - top_with.available() >= measured::PLATE_MAX_PX);
+    }
+
+    /// The chip is at the card's right edge, so it is the first thing a card
+    /// too narrow for its content stops drawing. On his 3440-wide window every
+    /// chip vanished; on a card measured in a real cell none may.
+    #[test]
+    fn the_state_chip_is_drawn_at_every_tier_and_width_a_card_is_drawn_at() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for (sidebar_width, cell_w, depth) in card_widths() {
+            let column = real_text_column(font, sidebar_width, cell_w, depth);
+            assert!(
+                column.chip_fits,
+                "no chip at sidebar {sidebar_width}, cell {cell_w}, depth {depth}"
+            );
+        }
+    }
+
     /// A title short enough for one line stays on one line rather than being
     /// broken to fill the reserved two.
     #[test]
@@ -1777,8 +2141,8 @@ mod tests {
     /// for rather than inflating them.
     #[test]
     fn chrome_scales_with_the_tier_not_with_the_drawn_height() {
-        let base = CardGeometry::new(0, 16.0);
-        let deep = CardGeometry::new(2, 16.0);
+        let base = CardGeometry::new(0, 16.0, true);
+        let deep = CardGeometry::new(2, 16.0, true);
         assert!(deep.pad < base.pad);
         assert!(deep.plate < base.plate);
         assert!(deep.radius < base.radius);
@@ -1792,7 +2156,28 @@ mod tests {
         const {
             assert!(measured::PLATE * BASE_HEIGHT_PX > measured::PLATE_MAX_PX);
         }
-        assert_eq!(CardGeometry::new(0, 16.0).plate, measured::PLATE_MAX_PX);
+        assert_eq!(
+            CardGeometry::new(0, 16.0, true).plate,
+            measured::PLATE_MAX_PX
+        );
+    }
+
+    /// No mark, no slot — and every pixel the slot was taking goes to the text
+    /// column rather than to a wider gap.
+    #[test]
+    fn a_card_with_no_mark_reserves_no_icon_slot() {
+        let marked = CardGeometry::new(0, 16.0, true);
+        let bare = CardGeometry::new(0, 16.0, false);
+        assert_eq!(bare.plate, 0.0);
+        assert_eq!(bare.plate_gap, 0.0);
+        assert_eq!(bare.text_inset(), bare.pad);
+        assert!(
+            bare.text_inset() < marked.text_inset(),
+            "collapsing the slot has to move the ink left, not just stop drawing a box"
+        );
+        // The slot is collapsed, not deleted: the measured size is still there
+        // for the day a mark arrives.
+        assert!(marked.plate > 0.0);
     }
 
     /// The distance field is what the fill, the stroke and the bloom all read,

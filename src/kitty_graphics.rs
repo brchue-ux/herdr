@@ -21,6 +21,20 @@ const KITTY_CHUNK_BYTES: usize = 3072;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
 const PANE_GRAPHICS_IMAGE_ID_BIT: u32 = 1 << 31;
 
+/// The query that asks the host terminal how big one cell is, in pixels.
+///
+/// `CSI 16 t` is answered with `CSI 6 ; height ; width t`. It exists because the
+/// other way of getting this number — dividing the pty's `ws_xpixel`/`ws_ypixel`
+/// by its column and row count — is only as good as those two fields, and they
+/// are routinely wrong: Windows has no pixel size to report at all, and an SSH
+/// session carries whatever the client sent at pty-request time, which for
+/// several common Windows clients is a constant that never tracks the window.
+/// A constant `ws_xpixel` divided by a growing column count yields a cell that
+/// *shrinks as the window grows*, which is exactly the failure this query
+/// exists to end. Every terminal that implements Kitty graphics — the only
+/// terminal this number is asked for on — answers this.
+pub(crate) const HOST_CELL_SIZE_QUERY_SEQUENCE: &str = "\x1b[16t";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostCellSize {
     pub width_px: u32,
@@ -28,6 +42,57 @@ pub(crate) struct HostCellSize {
 }
 
 impl HostCellSize {
+    /// The cell Herdr assumes when nothing on the machine will tell it one.
+    ///
+    /// Deliberately a whole cell rather than a pair of independent numbers: the
+    /// card is laid out in this space, so the *ratio* between the two is what
+    /// decides whether it comes out square or squashed, and a mismatched pair
+    /// distorts every card drawn against it.
+    pub(crate) const FALLBACK: Self = Self {
+        width_px: 8,
+        height_px: 16,
+    };
+
+    /// The narrowest and widest a real terminal cell gets.
+    ///
+    /// Not taste: a cell narrower than this is a font no one can read, and one
+    /// wider is a display no one has. The bounds are here to catch a *reported*
+    /// cell that is arithmetic rather than a measurement — the constant
+    /// `ws_xpixel` case above lands at two or three pixels wide on a wide
+    /// window, which is inside no font's range and outside these bounds.
+    const MIN_WIDTH_PX: u32 = 5;
+    const MAX_WIDTH_PX: u32 = 128;
+    const MIN_HEIGHT_PX: u32 = 10;
+    const MAX_HEIGHT_PX: u32 = 256;
+    /// A cell is taller than it is wide, always, and by a bounded amount.
+    const MIN_ASPECT: f32 = 1.05;
+    const MAX_ASPECT: f32 = 4.0;
+
+    /// Whether this looks like a cell a terminal actually draws in.
+    ///
+    /// Checked wherever a cell size arrives from outside Herdr, because a
+    /// wrong-but-nonzero cell is worse than no cell at all: `is_known` says yes
+    /// to it, and everything downstream then rasterises into a pixel space that
+    /// does not exist.
+    pub(crate) fn is_plausible(self) -> bool {
+        if !(Self::MIN_WIDTH_PX..=Self::MAX_WIDTH_PX).contains(&self.width_px)
+            || !(Self::MIN_HEIGHT_PX..=Self::MAX_HEIGHT_PX).contains(&self.height_px)
+        {
+            return false;
+        }
+        let aspect = self.height_px as f32 / self.width_px as f32;
+        (Self::MIN_ASPECT..=Self::MAX_ASPECT).contains(&aspect)
+    }
+
+    /// This cell if it is believable, and the fallback if it is not.
+    pub(crate) fn or_fallback(self) -> Self {
+        if self.is_plausible() {
+            self
+        } else {
+            Self::FALLBACK
+        }
+    }
+
     pub(crate) fn try_from_terminal(area: Rect) -> Option<Self> {
         let Ok(size) = crossterm::terminal::window_size() else {
             return None;
@@ -35,13 +100,27 @@ impl HostCellSize {
         if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
             return None;
         }
-        Some(
-            Self {
-                width_px: (size.width as u32 / size.columns as u32).max(1),
-                height_px: (size.height as u32 / size.rows as u32).max(1),
-            }
-            .for_area(area),
-        )
+        let derived = Self {
+            width_px: (size.width as u32 / size.columns as u32).max(1),
+            height_px: (size.height as u32 / size.rows as u32).max(1),
+        };
+        // A derived cell that is not a believable cell is discarded rather than
+        // clamped. Clamping would keep the half of the pair that happened to
+        // land in range and silently change the aspect; the caller's fallback
+        // is at least a coherent cell.
+        if !derived.is_plausible() {
+            tracing::debug!(
+                width_px = derived.width_px,
+                height_px = derived.height_px,
+                pixel_width = size.width,
+                pixel_height = size.height,
+                columns = size.columns,
+                rows = size.rows,
+                "terminal pixel size gives an implausible cell; ignoring it"
+            );
+            return None;
+        }
+        Some(derived.for_area(area))
     }
 
     pub(crate) fn is_known(self) -> bool {
@@ -49,11 +128,7 @@ impl HostCellSize {
     }
 
     pub(crate) fn fallback_for_area(area: Rect) -> Self {
-        Self {
-            width_px: 8,
-            height_px: 16,
-        }
-        .for_area(area)
+        Self::FALLBACK.for_area(area)
     }
 
     fn for_area(self, area: Rect) -> Self {
@@ -62,6 +137,40 @@ impl HostCellSize {
         }
         self
     }
+
+    /// [`Self::for_area`] for a cell that arrived from outside this module.
+    ///
+    /// A zero-sized area means there is nothing to place an image on, and every
+    /// cell size handed to the graphics path has to answer that the same way or
+    /// `is_known` starts disagreeing with itself depending on where the number
+    /// came from.
+    pub(crate) fn for_area_public(self, area: Rect) -> Self {
+        self.for_area(area)
+    }
+}
+
+/// Reads `CSI 6 ; height ; width t` — the terminal's answer to
+/// [`HOST_CELL_SIZE_QUERY_SEQUENCE`].
+///
+/// Height comes first in the reply, which is the opposite of every other pair
+/// in this file and the reason this parse is a named function rather than a
+/// couple of `split` calls at the call site.
+pub(crate) fn parse_host_cell_size_report(sequence: &str) -> Option<HostCellSize> {
+    let body = sequence.strip_prefix("\x1b[")?.strip_suffix('t')?;
+    let mut parts = body.split(';');
+    if parts.next()? != "6" {
+        return None;
+    }
+    let height_px: u32 = parts.next()?.parse().ok()?;
+    let width_px: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let reported = HostCellSize {
+        width_px,
+        height_px,
+    };
+    reported.is_plausible().then_some(reported)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1119,6 +1228,103 @@ fn encode_kitty_data(out: &mut Vec<u8>, control: &str, data: &[u8]) {
         let more = if chunks.peek().is_some() { 1 } else { 0 };
         let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
         let _ = write!(out, "\x1b_Gm={more};{encoded}\x1b\\");
+    }
+}
+
+#[cfg(test)]
+mod host_cell_size_is_a_measurement {
+    use super::*;
+
+    /// The shape that reached the captain's screen.
+    ///
+    /// His terminal reported a pty pixel width that did not track the window,
+    /// so `ws_xpixel / columns` shrank as the window grew: about 4 px per cell
+    /// on a 1910-wide window and about 2 px on a 3428-wide one, against a real
+    /// cell of about 12. Every one of those has to be refused, because a cell
+    /// that small is not a small font — it is arithmetic on a field the
+    /// terminal never filled in, and the sidebar's cards get rasterised into it
+    /// and then stretched back out by the terminal.
+    #[test]
+    fn a_cell_no_font_could_draw_in_is_refused() {
+        for (width_px, height_px) in [(2, 8), (3, 9), (4, 12), (1, 1), (2, 12)] {
+            assert!(
+                !HostCellSize {
+                    width_px,
+                    height_px
+                }
+                .is_plausible(),
+                "{width_px}x{height_px} was accepted as a terminal cell"
+            );
+        }
+    }
+
+    /// And the cells real terminals actually have are not refused, including
+    /// the fallback Herdr assumes when nothing will tell it one.
+    #[test]
+    fn the_cells_real_terminals_have_are_accepted() {
+        for (width_px, height_px) in [
+            (8, 16),  // the fallback, and a common 1x cell
+            (12, 24), // the captain's
+            (6, 13),
+            (7, 15),
+            (10, 21),
+            (20, 42), // a HiDPI terminal reporting physical pixels
+            (24, 48),
+        ] {
+            assert!(
+                HostCellSize {
+                    width_px,
+                    height_px
+                }
+                .is_plausible(),
+                "{width_px}x{height_px} was refused"
+            );
+        }
+        assert!(HostCellSize::FALLBACK.is_plausible());
+    }
+
+    /// A refused cell becomes a coherent one rather than a clamped half of
+    /// itself: the card is laid out against the *ratio*, so keeping whichever
+    /// of the pair happened to be in range would distort every card.
+    #[test]
+    fn a_refused_cell_falls_back_whole() {
+        let bogus = HostCellSize {
+            width_px: 2,
+            height_px: 16,
+        };
+        assert_eq!(bogus.or_fallback(), HostCellSize::FALLBACK);
+        let good = HostCellSize {
+            width_px: 12,
+            height_px: 24,
+        };
+        assert_eq!(good.or_fallback(), good);
+    }
+
+    /// `CSI 16 t` is answered height-first, which is the opposite of every
+    /// other pair in this file.
+    #[test]
+    fn the_cell_size_report_is_read_height_first() {
+        assert_eq!(
+            parse_host_cell_size_report("\x1b[6;24;12t"),
+            Some(HostCellSize {
+                width_px: 12,
+                height_px: 24,
+            })
+        );
+        // Not a cell size report.
+        assert_eq!(parse_host_cell_size_report("\x1b[4;24;12t"), None);
+        assert_eq!(parse_host_cell_size_report("\x1b[6;24t"), None);
+        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12;9t"), None);
+        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12"), None);
+        // A reply that parses but describes no real cell is still refused, so a
+        // terminal answering nonsense is the same as one not answering.
+        assert_eq!(parse_host_cell_size_report("\x1b[6;8;2t"), None);
+    }
+
+    /// The query has to be the sequence terminals answer, byte for byte.
+    #[test]
+    fn the_query_is_csi_16_t() {
+        assert_eq!(HOST_CELL_SIZE_QUERY_SEQUENCE, "\u{1b}[16t");
     }
 }
 

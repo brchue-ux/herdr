@@ -404,6 +404,9 @@ fn windows_client_input_event_from_raw(
         crate::raw_input::RawInputEvent::HostDefaultColor { .. }
         | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
         | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
+        // Answered to the client, not to the app: it reaches the server as the
+        // cell size on the next resize rather than as an input event.
+        | crate::raw_input::RawInputEvent::HostCellSize(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }

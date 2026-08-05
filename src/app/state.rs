@@ -1830,6 +1830,14 @@ pub struct AppState {
     pub host_terminal_theme: TerminalTheme,
     /// Last known foreground host terminal cell size in pixels.
     pub(crate) host_cell_size: crate::kitty_graphics::HostCellSize,
+    /// The cell size the host itself reported, when it answered `CSI 16 t`.
+    ///
+    /// Kept apart from `host_cell_size` because it outranks it: `host_cell_size`
+    /// is re-derived from the pty's pixel fields every frame, and those fields
+    /// are a guess where this is a measurement. Only the local (non-client) TUI
+    /// fills this in — an attached client resolves the same precedence on its
+    /// own side and sends the winner as its resize cell size.
+    pub(crate) host_reported_cell_size: Option<crate::kitty_graphics::HostCellSize>,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
     /// Terminal runtimes that should be shut down by the app/runtime layer
@@ -2558,6 +2566,7 @@ impl AppState {
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
+            host_reported_cell_size: None,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         }
