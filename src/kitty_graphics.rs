@@ -848,18 +848,20 @@ fn surface_layer_placement_targets(
         // cards are ever withheld; every other surface this client is entitled
         // to keeps flowing either way.
         .chain(
-            (!app.sidebar_card_shapes || app.view.sidebar_card_layers_published)
-                .then_some(app.sidebar_card_layers.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .map(|(slot, cards)| {
-                    (
-                        HostSurfaceId::SidebarCards(slot.try_into().unwrap_or(u16::MAX)),
-                        cards.rect,
-                        &cards.layer,
-                    )
-                }),
+            if !app.sidebar_card_shapes || app.view.sidebar_card_layers_published {
+                app.sidebar_card_layers.as_slice()
+            } else {
+                &[]
+            }
+            .iter()
+            .enumerate()
+            .map(|(slot, cards)| {
+                (
+                    HostSurfaceId::SidebarCards(slot.try_into().unwrap_or(u16::MAX)),
+                    cards.rect,
+                    &cards.layer,
+                )
+            }),
         )
 }
 

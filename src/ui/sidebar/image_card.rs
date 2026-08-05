@@ -127,7 +127,8 @@ pub(crate) const MIN_FOLD_WIDTH: u16 = super::card::MIN_FOLD_WIDTH;
 /// card's height — measured dead by 26–28 px on a 61 px card.
 const BLOOM_REACH: f32 = 0.45;
 
-/// One card's finished pixels, and the cells it covers.
+/// One finished image and the cells it covers — one card's shape, or the whole
+/// tree's sheet.
 ///
 /// `Clone` so a card whose content did not change can be carried into the next
 /// frame's list when a *sibling* did. That copies the encoded bytes — a few
@@ -135,14 +136,14 @@ const BLOOM_REACH: f32 = 0.45;
 /// expensive half by roughly an order of magnitude.
 #[derive(Clone)]
 pub(crate) struct SidebarCardLayer {
-    /// The cell rect the sheet is placed at. Chosen by the tree's own geometry,
-    /// so the sheet is exactly as large as the cards plus the reach of their
-    /// bloom.
+    /// The cell rect this image is placed at. Chosen by the tree's own geometry:
+    /// for a shape, exactly its own card plus the reach of that card's bloom;
+    /// for the sheet, every card plus the reach of theirs.
     pub rect: Rect,
-    /// What the sheet was built from. A frame whose signature is unchanged
-    /// keeps the sheet it already has and re-encodes nothing.
+    /// What this image was built from. An entry whose signature is unchanged
+    /// keeps the pixels it already has and re-encodes nothing.
     pub signature: u64,
-    /// The same, with the transition the sheet is *in* left out.
+    /// The same, with the transition the image is *in* left out.
     ///
     /// Two signatures because a switch changes one of them every frame and the
     /// other not at all: the rows do not move until the commit instant, which
@@ -151,7 +152,7 @@ pub(crate) struct SidebarCardLayer {
     /// cards, their bloom and their type again to produce the same pixels it
     /// produced 50 ms ago.
     pub content_signature: u64,
-    /// The sheet before the transition was applied to it, held only while one
+    /// This image before the transition was applied to it, held only while one
     /// is running.
     ///
     /// `None` whenever the panel is settled or the effect is off, so a Herdr
@@ -160,7 +161,8 @@ pub(crate) struct SidebarCardLayer {
     pub layer: crate::app::state::GraphicsLayer,
 }
 
-/// The rasterised sheet, held across the frames of one transition.
+/// One rasterised image — the whole sheet, or one card's shape — held across the
+/// frames of one transition.
 ///
 /// Opaque outside this module and shared rather than copied: every frame of a
 /// switch reads the same pixels, and the only thing that changes between them
