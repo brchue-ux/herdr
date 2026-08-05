@@ -3013,28 +3013,25 @@ impl HeadlessServer {
                     width_px: cell_width_px,
                     height_px: cell_height_px,
                 };
-                let direct_terminal_id = match self.clients.get_mut(&client_id) {
+                let direct_attach = match self.clients.get_mut(&client_id) {
                     Some(client) => match &client.mode {
                         ClientConnectionMode::TerminalAttach { terminal_id } => {
                             let terminal_id = terminal_id.clone();
                             client.terminal_size = (cols, rows);
                             client.set_cell_size(reported_cell_size);
                             client.render_state.request_repaint();
-                            Some(terminal_id)
+                            // The gated cell is carried out of this lookup
+                            // rather than read back afterwards: the pty's pixel
+                            // fields are what the client's own cell was divided
+                            // out of, and there is no second reader here that
+                            // could be handed the raw division instead.
+                            Some((terminal_id, client.cell_size()))
                         }
                         _ => None,
                     },
                     None => None,
                 };
-                if let Some(terminal_id) = direct_terminal_id {
-                    // The pty's pixel fields are what the client's own cell was
-                    // divided out of, so a cell the gate refused must not be
-                    // multiplied back up and handed to the runtime.
-                    let pty_cell_size = self
-                        .clients
-                        .get(&client_id)
-                        .map(ClientConnection::cell_size)
-                        .unwrap_or(reported_cell_size);
+                if let Some((terminal_id, pty_cell_size)) = direct_attach {
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                         runtime.resize(rows, cols, pty_cell_size.width_px, pty_cell_size.height_px);
                     }

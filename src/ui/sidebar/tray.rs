@@ -262,7 +262,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
     if tray.width == 0 || tray.height == 0 {
         return;
     }
-    let p = &app.palette;
+    let p = &app.sidebar_palette();
     let reading = signal_tray::resolve(app);
 
     // The header: the tray's name, and the legend at the right end. The name is

@@ -639,76 +639,99 @@ impl Palette {
         self
     }
 
-    /// Raise the four muted tokens until they clear a minimum WCAG contrast
-    /// against every background Herdr actually composites them over.
-    ///
-    /// That is normally just the host terminal background measured over
-    /// OSC 10/11, because Herdr paints no global fill. A theme that sets
-    /// `sidebar_bg` adds a second one: the sidebar fills its whole panel with
-    /// that colour, so the quiet tokens drawn in the tree land on it rather
-    /// than on the host's background, and flooring against the host alone
-    /// leaves them below their intended floor exactly where they are read.
-    ///
-    /// Only `surface0`, `surface_dim`, `overlay0` and `overlay1` are floored.
-    /// Accents carry meaning and are hand-tuned per theme, so a computed floor
-    /// on them would look worse than the palette it "fixed"; these four are
-    /// the tokens whose whole job is to be quiet, and therefore the ones that
-    /// disappear when the palette and the background disagree.
-    ///
-    /// Two deliberate no-ops:
-    /// - No background to measure against at all (the host never answered the
-    ///   OSC query, which multiplexers commonly cause, and no theme fill is
-    ///   set) leaves the palette exactly as authored.
-    /// - `Color::Reset` means "inherit the host" and is never rewritten, so a
-    ///   theme that opts out of painting a surface keeps opting out.
-    pub fn with_contrast_floor(mut self, host: &crate::terminal_theme::TerminalTheme) -> Self {
-        use crate::ui::color::{ensure_contrast, resolve_color_rgb, terminal_theme_to_rgb};
+    /// WCAG AA for body text — `overlay1` is read as text.
+    const OVERLAY1_FLOOR: f32 = 4.5;
+    /// WCAG AA for large text and non-text UI — `overlay0` is secondary text
+    /// and scrollbar thumbs.
+    const OVERLAY0_FLOOR: f32 = 3.0;
+    /// Deliberately *not* a WCAG number. Separators, scrollbar tracks and
+    /// selection fills are meant to be nearly invisible, so this only has to
+    /// catch "literally indistinguishable from the background" and lift just
+    /// far enough to be seen. Calibrated so a hand-tuned theme on its own
+    /// background is barely touched — Catppuccin Mocha's `surface_dim` (which
+    /// equals its base colour, so it vanishes on a matching host) moves
+    /// #1e1e2e → #262635 and nothing else in the theme changes.
+    const SURFACE_FLOOR: f32 = 1.1;
 
-        /// WCAG AA for body text — `overlay1` is read as text.
-        const OVERLAY1_FLOOR: f32 = 4.5;
-        /// WCAG AA for large text and non-text UI — `overlay0` is secondary
-        /// text and scrollbar thumbs.
-        const OVERLAY0_FLOOR: f32 = 3.0;
-        /// Deliberately *not* a WCAG number. Separators, scrollbar tracks and
-        /// selection fills are meant to be nearly invisible, so this only has
-        /// to catch "literally indistinguishable from the background" and lift
-        /// just far enough to be seen. Calibrated so a hand-tuned theme on its
-        /// own background is barely touched — Catppuccin Mocha's `surface_dim`
-        /// (which equals its base colour, so it vanishes on a matching host)
-        /// moves #1e1e2e → #262635 and nothing else in the theme changes.
-        const SURFACE_FLOOR: f32 = 1.1;
-
-        // The host's background first, so a token that only has to clear the
-        // panel ends up tuned for the panel: the last floor applied is the one
-        // guaranteed to hold.
-        let backgrounds: Vec<_> = host
-            .background
-            .map(terminal_theme_to_rgb)
-            .into_iter()
-            .chain(resolve_color_rgb(self.sidebar_bg, host))
-            .collect();
-        if backgrounds.is_empty() {
-            return self;
-        }
+    /// Raise the four muted tokens until they clear a minimum contrast against
+    /// one background.
+    ///
+    /// Only `surface0`, `surface_dim`, `overlay0` and `overlay1`. Accents carry
+    /// meaning and are hand-tuned per theme, so a computed floor on them would
+    /// look worse than the palette it "fixed"; these four are the tokens whose
+    /// whole job is to be quiet, and therefore the ones that disappear when the
+    /// palette and the background disagree.
+    ///
+    /// One background, never a sequence of them: `ensure_contrast` promises
+    /// only that it will not lower contrast against *the background it was
+    /// given*, so lifting a token away from a second background can push it
+    /// back under its floor on the first. A token drawn on two surfaces
+    /// therefore needs two floored copies, not one colour floored twice.
+    fn floor_quiet_tokens(
+        &mut self,
+        host: &crate::terminal_theme::TerminalTheme,
+        background: crate::ui::color::Rgb,
+    ) {
+        use crate::ui::color::{ensure_contrast, resolve_color_rgb};
 
         for (token, floor) in [
-            (&mut self.surface0, SURFACE_FLOOR),
-            (&mut self.surface_dim, SURFACE_FLOOR),
-            (&mut self.overlay0, OVERLAY0_FLOOR),
-            (&mut self.overlay1, OVERLAY1_FLOOR),
+            (&mut self.surface0, Self::SURFACE_FLOOR),
+            (&mut self.surface_dim, Self::SURFACE_FLOOR),
+            (&mut self.overlay0, Self::OVERLAY0_FLOOR),
+            (&mut self.overlay1, Self::OVERLAY1_FLOOR),
         ] {
             let Some(rgb) = resolve_color_rgb(*token, host) else {
                 continue;
             };
-            let floored = backgrounds.iter().fold(rgb, |color, background| {
-                ensure_contrast(color, *background, floor)
-            });
+            let floored = ensure_contrast(rgb, background, floor);
             if floored != rgb {
                 *token = Color::Rgb(floored.0, floored.1, floored.2);
             }
         }
+    }
 
+    /// The palette as everything outside the sidebar draws it: floored against
+    /// the host terminal background Herdr measured over OSC 10/11.
+    ///
+    /// That is the right surface for these tokens almost everywhere, because
+    /// Herdr paints no global fill — a pane, the tab bar and an unstyled panel
+    /// all composite straight onto the host's background.
+    ///
+    /// Two deliberate no-ops:
+    /// - No measured background (the host never answered the OSC query, which
+    ///   multiplexers commonly cause) leaves the palette exactly as authored.
+    /// - `Color::Reset` means "inherit the host" and is never rewritten, so a
+    ///   theme that opts out of painting a surface keeps opting out.
+    pub fn with_contrast_floor(mut self, host: &crate::terminal_theme::TerminalTheme) -> Self {
+        use crate::ui::color::terminal_theme_to_rgb;
+
+        let Some(background) = host.background.map(terminal_theme_to_rgb) else {
+            return self;
+        };
+        self.floor_quiet_tokens(host, background);
         self
+    }
+
+    /// The same palette as the desktop sidebar draws it.
+    ///
+    /// A theme that sets `sidebar_bg` gives the panel a fill of its own, so the
+    /// quiet tokens in the tree land on that colour rather than on the host's
+    /// background and need their own floor against it. It has to be a second
+    /// copy: `overlay1` is also the settings and modal description ink, and a
+    /// single token floored for a dark panel on a light host is unreadable in
+    /// the modal — the two surfaces can straddle mid-grey, and then no one
+    /// colour clears both.
+    ///
+    /// Returns the palette unchanged when the panel has no fill of its own,
+    /// which is the default: `Color::Reset` resolves to no colour, so the
+    /// sidebar keeps drawing with the host-floored tokens.
+    pub fn for_sidebar(&self, host: &crate::terminal_theme::TerminalTheme) -> Self {
+        let mut sidebar = self.clone();
+        let Some(background) = crate::ui::color::resolve_color_rgb(self.sidebar_bg, host) else {
+            return sidebar;
+        };
+        sidebar.floor_quiet_tokens(host, background);
+        sidebar
     }
 }
 
@@ -2388,6 +2411,16 @@ impl AppState {
         }
         ws.active_tab().map(|tab| tab.layout.focused()) == Some(pane_id)
     }
+
+    /// The palette every surface inside the desktop sidebar panel draws with.
+    ///
+    /// Derived rather than stored so it cannot fall out of step with
+    /// [`Self::palette`] or with the measured host theme it resolves against;
+    /// it is the palette itself whenever the panel has no fill of its own,
+    /// which is the default.
+    pub fn sidebar_palette(&self) -> Palette {
+        self.palette.for_sidebar(&self.host_terminal_theme)
+    }
 }
 
 #[cfg(test)]
@@ -3044,6 +3077,78 @@ mod tests {
             assert_eq!(after.text, before.text);
             assert_eq!(after.subtext0, before.subtext0);
             assert_eq!(after.surface1, before.surface1);
+        }
+
+        /// A theme with a sidebar fill on a host whose background is nowhere
+        /// near it — the case where the two surfaces straddle mid-grey and no
+        /// one colour clears both floors.
+        fn straddling_surfaces() -> (TerminalTheme, Palette) {
+            let host = host_background(239, 241, 245);
+            let custom = crate::config::CustomThemeColors {
+                sidebar_bg: Some("#181825".to_string()),
+                ..Default::default()
+            };
+            let palette = Palette::catppuccin_latte()
+                .with_overrides(&custom)
+                .with_contrast_floor(&host);
+            (host, palette)
+        }
+
+        #[test]
+        fn a_sidebar_fill_never_detunes_the_tokens_drawn_outside_the_sidebar() {
+            let (host, palette) = straddling_surfaces();
+            let without_fill = Palette::catppuccin_latte().with_contrast_floor(&host);
+
+            // `overlay1` is the settings and modal description ink and
+            // `overlay0` the navigator's secondary text, so a sidebar fill
+            // reaching them is unreadable modal text, not a quieter sidebar.
+            assert_eq!(palette.overlay1, without_fill.overlay1);
+            assert_eq!(palette.overlay0, without_fill.overlay0);
+            assert_eq!(palette.surface0, without_fill.surface0);
+            assert_eq!(palette.surface_dim, without_fill.surface_dim);
+        }
+
+        #[test]
+        fn every_floored_token_clears_its_floor_on_the_surface_it_is_drawn_on() {
+            let (host, palette) = straddling_surfaces();
+            let sidebar = palette.for_sidebar(&host);
+
+            // Outside the sidebar the tokens land on the host background, and
+            // a modal on this theme fills with `panel_bg`, which is the same
+            // light colour — so the ink a modal is read in has to clear its
+            // floor there and not merely against the dark panel.
+            let host_bg = (239, 241, 245);
+            let modal_bg = resolve_color_rgb(palette.panel_bg, &host).expect("modal fill");
+            for background in [host_bg, modal_bg] {
+                assert!(
+                    ratio_against(palette.overlay1, &host, background) >= 4.5,
+                    "overlay1 is unreadable on {background:?}"
+                );
+                assert!(ratio_against(palette.overlay0, &host, background) >= 3.0);
+                assert!(ratio_against(palette.surface_dim, &host, background) >= 1.1);
+                assert!(ratio_against(palette.surface0, &host, background) >= 1.1);
+            }
+
+            // Inside the panel they land on its own fill instead.
+            let sidebar_bg = resolve_color_rgb(palette.sidebar_bg, &host).expect("panel fill");
+            assert!(ratio_against(sidebar.overlay1, &host, sidebar_bg) >= 4.5);
+            assert!(ratio_against(sidebar.overlay0, &host, sidebar_bg) >= 3.0);
+            assert!(ratio_against(sidebar.surface_dim, &host, sidebar_bg) >= 1.1);
+            assert!(ratio_against(sidebar.surface0, &host, sidebar_bg) >= 1.1);
+
+            // The panel's floor is a second copy, never a second pass over the
+            // shared one: this is the assertion that fails if the two are ever
+            // folded back into one token.
+            assert_ne!(sidebar.overlay1, palette.overlay1);
+            assert_eq!(sidebar.accent, palette.accent);
+        }
+
+        #[test]
+        fn a_panel_with_no_fill_of_its_own_draws_with_the_host_floored_palette() {
+            let host = host_background(239, 241, 245);
+            let palette = Palette::catppuccin_latte().with_contrast_floor(&host);
+            assert_eq!(palette.sidebar_bg, Color::Reset);
+            assert_eq!(palette.for_sidebar(&host), palette);
         }
 
         #[test]
