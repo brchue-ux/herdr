@@ -3776,13 +3776,19 @@ fn render_workspace_list(
         }
 
         if let Some((_, collapsed)) = parent_group {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    if collapsed { "▸" } else { "▾" },
-                    Style::default().fg(p.accent),
-                )),
-                workspace_group_chevron_rect(card),
-            );
+            // Suppressed with the badge beside it, and for the same reason: both
+            // anchor inside the card's frame, so under a shape they would show
+            // through artwork that carries no room for them. The opaque sheet
+            // covered neither, and this keeps the two in step.
+            if !covered {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        if collapsed { "▸" } else { "▾" },
+                        Style::default().fg(p.accent),
+                    )),
+                    workspace_group_chevron_rect(card),
+                );
+            }
         }
     }
 

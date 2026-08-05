@@ -202,9 +202,21 @@ pub(crate) fn is_available(app: &AppState, fold_width: u16) -> bool {
 /// shape that was never drawn leaves the tree blank. Suppression has to be
 /// conditioned on the artwork existing, not on it being intended.
 ///
+/// # Why it asks the *pass* and not the state
+///
+/// Whether the shapes reach a screen is a per-client fact, and
+/// `AppState::sidebar_card_layers` is the foreground client's. A second attached
+/// client whose own cell size is unknown — graphics off in its config, or a
+/// direct attach — is rendered without one, so its pass deliberately leaves the
+/// foreground's artwork alone and is then sent no images at all. Reading the
+/// shared layers here would suppress that client's character cards in favour of
+/// pixels it never receives, drawing the tree as bare connectors. So the answer
+/// comes off `ViewState::sidebar_card_shapes_published`, which the pass that
+/// built the cards recorded for itself.
+///
 /// [`MAX_IMAGE_PIXELS`]: Rasteriser::rasterise
 pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
-    app.sidebar_card_shapes && is_available(app, fold_width) && !app.sidebar_card_layers.is_empty()
+    app.view.sidebar_card_shapes_published && is_available(app, fold_width)
 }
 
 /// The tier a row at `depth` is drawn at.
@@ -1177,9 +1189,12 @@ fn build_cards_inner(
         return Err(());
     }
 
-    // The tree's whole extent: the cards plus the reach of their bloom, clamped
-    // into the panel. A placement whose rect leaves the panel would be clipped by
-    // the pipeline anyway; keeping it inside means the clip never has to run.
+    let title_metrics = font.metrics(TITLE_PX);
+    let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
+
+    // The tree's whole extent: every card's own image, unioned, clamped into the
+    // panel. A placement whose rect leaves the panel would be clipped by the
+    // pipeline anyway; keeping it inside means the clip never has to run.
     //
     // The sheet is exactly this rect. A shape is not — it is only as large as its
     // own card — but it still needs this, because it is the field the view-switch
@@ -1187,31 +1202,19 @@ fn build_cards_inner(
     // instead would give every card the same local dissolve at a different scale,
     // and the wave that is supposed to cross the tree would break at every card's
     // edge.
-    let bloom_cells_x = ((BASE_HEIGHT_PX * BLOOM_REACH) / cell_w).ceil() as u16;
-    let bloom_cells_y = ((BASE_HEIGHT_PX * BLOOM_REACH) / cell_h).ceil() as u16;
-    let min_x = placed.iter().map(|(r, _)| r.x).min().unwrap_or(bounds.x);
-    let min_y = placed.iter().map(|(r, _)| r.y).min().unwrap_or(bounds.y);
-    let max_x = placed
+    let extents: Vec<(u8, Rect)> = placed
         .iter()
-        .map(|(r, _)| r.x.saturating_add(r.width))
-        .max()
-        .unwrap_or(bounds.x);
-    let max_y = placed
-        .iter()
-        .map(|(r, _)| r.y.saturating_add(r.height))
-        .max()
-        .unwrap_or(bounds.y);
-    let field_rect = clamp_bloomed(
-        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y),
-        bloom_cells_x,
-        bloom_cells_y,
+        .map(|(frame, content)| (content.depth, *frame))
+        .collect();
+    let field_rect = dissolve_field_rect(
+        &extents,
+        (cell_w, cell_h),
+        (title_metrics, tidbit_metrics),
         bounds,
         bloom_floor,
     )
     .ok_or(())?;
 
-    let title_metrics = font.metrics(TITLE_PX);
-    let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
     let rasteriser = Rasteriser {
         font,
         title_metrics,
@@ -1230,6 +1233,63 @@ fn build_cards_inner(
         return rasteriser.shapes(&placed, previous);
     }
     rasteriser.sheet(&placed, previous)
+}
+
+/// The cells one card's own image covers: its frame plus the reach of its own
+/// bloom, clamped into the panel.
+///
+/// Its *own* bloom and not the tree's largest, because the reach is a fraction
+/// of the card's drawn height (see [`lay_bloom`]) and a worker's card is two
+/// thirds of a mate's. Giving every card the top tier's margin would make every
+/// smaller card's image bigger than it needs to be, and the margin is
+/// transparent padding that still has to be encoded and uploaded.
+fn card_image_rect(
+    depth: u8,
+    frame: Rect,
+    cell: (f32, f32),
+    metrics: (FontMetrics, FontMetrics),
+    bounds: Rect,
+    bloom_floor: u16,
+) -> Option<Rect> {
+    let (cell_w, cell_h) = cell;
+    let (title_metrics, tidbit_metrics) = metrics;
+    let drawn =
+        tier_height_px(depth, title_metrics, tidbit_metrics).min(f32::from(frame.height) * cell_h);
+    let reach = drawn * BLOOM_REACH;
+    clamp_bloomed(
+        frame,
+        (reach / cell_w).ceil() as u16,
+        (reach / cell_h).ceil() as u16,
+        bounds,
+        bloom_floor,
+    )
+}
+
+/// The field every card is dissolved against: the union of their images.
+///
+/// Built out of the same [`card_image_rect`] each shape is drawn into, and not
+/// out of a margin of its own, because a field that does not contain a card it
+/// resolves fails silently: `Rasteriser::dissolve_origin` saturates and
+/// [`DissolveFrame::apply`] clamps to the field's grid, so the part of that card
+/// outside the field simply keeps full alpha for the whole transition while its
+/// neighbours fade. A constant margin is exactly how the two drift apart —
+/// [`tier_height_px`] floors a card at what its content needs, so a proportional
+/// face with a tall line height draws the top tier past [`BASE_HEIGHT_PX`] and
+/// gives it a larger margin than a constant read off that base.
+fn dissolve_field_rect(
+    cards: &[(u8, Rect)],
+    cell: (f32, f32),
+    metrics: (FontMetrics, FontMetrics),
+    bounds: Rect,
+    bloom_floor: u16,
+) -> Option<Rect> {
+    cards
+        .iter()
+        .filter_map(|(depth, frame)| {
+            card_image_rect(*depth, *frame, cell, metrics, bounds, bloom_floor)
+        })
+        .reduce(|field, rect| field.union(rect))
+        .filter(|field| field.width > 0 && field.height > 0)
 }
 
 /// Grow `rect` by a bloom margin and clamp it into the panel.
@@ -1547,22 +1607,14 @@ impl Rasteriser<'_> {
         }
     }
 
-    /// The cells one card's own image covers: its frame plus the reach of its
-    /// own bloom, clamped into the panel.
-    ///
-    /// Its *own* bloom and not the tree's largest, because the reach is a
-    /// fraction of the card's drawn height (see [`lay_bloom`]) and a worker's
-    /// card is two thirds of a mate's. Giving every card the top tier's margin
-    /// would make every smaller card's image bigger than it needs to be, and the
-    /// margin is transparent padding that still has to be encoded and uploaded.
+    /// The cells one card's own image covers, from the same [`card_image_rect`]
+    /// the dissolve field is built out of.
     fn card_rect(&self, frame: Rect, content: &CardContent) -> Option<Rect> {
-        let drawn = tier_height_px(content.depth, self.title_metrics, self.tidbit_metrics)
-            .min(f32::from(frame.height) * self.cell_h);
-        let reach = drawn * BLOOM_REACH;
-        clamp_bloomed(
+        card_image_rect(
+            content.depth,
             frame,
-            (reach / self.cell_w).ceil() as u16,
-            (reach / self.cell_h).ceil() as u16,
+            (self.cell_w, self.cell_h),
+            (self.title_metrics, self.tidbit_metrics),
             self.bounds,
             self.bloom_floor,
         )
@@ -2419,6 +2471,46 @@ mod tests {
         FontMetrics {
             ascent: line_height * 0.8,
             line_height,
+        }
+    }
+
+    /// The dissolve field contains every card it dissolves.
+    ///
+    /// Both come out of [`card_image_rect`], so containment is by construction —
+    /// and it is asserted because losing it fails silently:
+    /// `Rasteriser::dissolve_origin` saturates and `DissolveFrame::apply` clamps
+    /// to the field's grid, so the part of a card outside the field keeps full
+    /// alpha for the whole transition while its neighbours fade. The fixture is a
+    /// face tall enough to push the top tier past [`BASE_HEIGHT_PX`], which is
+    /// the case a margin read off that constant got wrong.
+    #[test]
+    fn the_dissolve_field_contains_every_card_it_dissolves() {
+        let title = metrics(40.0);
+        let tidbit = metrics(30.0);
+        assert!(
+            tier_height_px(0, title, tidbit) > BASE_HEIGHT_PX,
+            "the fixture's face is not tall enough to test anything"
+        );
+        let cell = (10.0f32, 21.0f32);
+        let bounds = Rect::new(0, 0, 40, 60);
+        let bloom_floor = bounds.y + bounds.height;
+        let cards = [
+            (0u8, Rect::new(1, 2, 38, 8)),
+            (1u8, Rect::new(3, 10, 36, 6)),
+            (2u8, Rect::new(5, 16, 34, 5)),
+        ];
+
+        let field = dissolve_field_rect(&cards, cell, (title, tidbit), bounds, bloom_floor)
+            .expect("a tree of three cards has a field");
+        for (depth, frame) in cards {
+            let rect = card_image_rect(depth, frame, cell, (title, tidbit), bounds, bloom_floor)
+                .expect("a card with a frame has an image");
+            assert_eq!(
+                field.union(rect),
+                field,
+                "the card at depth {depth} reaches outside the field it is \
+                 dissolved against"
+            );
         }
     }
 
@@ -3337,6 +3429,28 @@ mod a_card_is_its_own_shape {
         app
     }
 
+    /// A whole terminal wide enough to hold [`sidebar_rect`]'s panel.
+    fn pass_area() -> Rect {
+        Rect::new(0, 0, 100, sidebar_rect().height)
+    }
+
+    /// Run one real foreground pass over `app`, as a client with a known cell
+    /// size gets. `None` when this machine has no proportional face.
+    ///
+    /// Through `compute_view` rather than `build_cards` directly, because the
+    /// fact under test — whether *this* pass published shapes — is recorded
+    /// there and nowhere else.
+    fn shape_pass(
+        app: &mut AppState,
+        runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) -> Option<u16> {
+        app.sidebar_width = sidebar_rect().width;
+        let cell_size = app.host_cell_size;
+        crate::ui::compute_view_with_cell_size(app, runtimes, pass_area(), cell_size);
+        (!app.sidebar_card_layers.is_empty())
+            .then(|| super::super::row_fold_width(app, app.view.sidebar_rect))
+    }
+
     /// The cards a build published, or `None` when this machine has no
     /// proportional face and there is no pixel path to test.
     fn built(app: &AppState) -> Option<Vec<SidebarCardLayer>> {
@@ -3659,6 +3773,9 @@ mod a_card_is_its_own_shape {
     fn a_panel_too_narrow_for_a_card_gets_no_shapes() {
         let mut app = shape_fleet_app();
         app.sidebar_width = MIN_FOLD_WIDTH;
+        // Claimed by the pass, so the veto under test is the width and not the
+        // absence of artwork.
+        app.view.sidebar_card_shapes_published = true;
         let narrow = Rect::new(0, 0, MIN_FOLD_WIDTH, 46);
         assert!(
             !is_available(&app, super::super::row_fold_width(&app, narrow)),
@@ -3681,6 +3798,7 @@ mod a_card_is_its_own_shape {
     fn graphics_off_draws_no_shapes_and_hides_no_characters() {
         let mut app = shape_fleet_app();
         app.kitty_graphics_enabled = false;
+        app.view.sidebar_card_shapes_published = true;
         let fold = super::super::row_fold_width(&app, sidebar_rect());
         assert!(!is_available(&app, fold));
         assert!(
@@ -3715,22 +3833,76 @@ mod a_card_is_its_own_shape {
             "the character cards were suppressed before any shape existed"
         );
 
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let mut drawn = shape_fleet_app();
-        let cards = super::super::compute_workspace_card_areas(&drawn, sidebar_rect());
-        let CardsUpdate::Rebuilt(layers) =
-            build_cards(&drawn, &cards, sidebar_rect(), drawn.host_cell_size, &[])
-        else {
+        let Some(fold) = shape_pass(&mut drawn, &runtimes) else {
             return; // No face on this machine.
         };
-        drawn.sidebar_card_layers = layers;
         assert!(
             shape_covers_row(&drawn, fold),
             "shapes were drawn and the character cards were drawn under them too"
         );
 
-        // And losing the artwork puts the characters straight back.
-        drawn.sidebar_card_layers.clear();
-        assert!(!shape_covers_row(&drawn, fold));
+        // A build that fails publishes nothing, and the characters come straight
+        // back. The cell here is the failure the pixel path actually has: a
+        // cell-size report large enough to put every card's image past
+        // `MAX_IMAGE_PIXELS`.
+        let mut failed = shape_fleet_app();
+        failed.host_cell_size = HostCellSize {
+            width_px: 4000,
+            height_px: 4000,
+        };
+        assert!(
+            shape_pass(&mut failed, &runtimes).is_none(),
+            "an image well past the pixel ceiling was published anyway"
+        );
+        let failed_fold = super::super::row_fold_width(&failed, failed.view.sidebar_rect);
+        assert!(
+            is_available(&failed, failed_fold),
+            "the pixel path bowed out before the build could fail, so this \
+             tests nothing"
+        );
+        assert!(
+            !shape_covers_row(&failed, failed_fold),
+            "a build that published nothing suppressed the character cards anyway"
+        );
+    }
+
+    /// A pass that will not be sent the shapes keeps drawing its characters.
+    ///
+    /// The suppression is a property of the *pass* about to be encoded, never of
+    /// the shared state: `AppState::sidebar_card_layers` and `host_cell_size` are
+    /// the foreground client's, and a second attached client whose own cell size
+    /// is unknown is rendered without one and then sent no images at all. Reading
+    /// the shared layers there would leave that client's Spaces tree as bare
+    /// connectors — every card's glow, tokens, frame and badge suppressed with
+    /// nothing drawn over them.
+    #[test]
+    fn a_client_that_is_sent_no_images_keeps_its_character_cards() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut app = shape_fleet_app();
+        let Some(fold) = shape_pass(&mut app, &runtimes) else {
+            return; // No face on this machine.
+        };
+        assert!(shape_covers_row(&app, fold));
+
+        // The same server, sizing a frame for a second client: no pane resize
+        // and no cell size, which is what the headless server does for every
+        // client that is not the foreground one.
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, pass_area());
+        assert!(
+            !app.sidebar_card_layers.is_empty(),
+            "a pass that cannot see pixels threw away the foreground client's \
+             artwork, which costs it a re-encode and a re-upload every frame"
+        );
+        assert!(
+            !shape_covers_row(
+                &app,
+                super::super::row_fold_width(&app, app.view.sidebar_rect)
+            ),
+            "a client that is sent no images had its character cards suppressed \
+             anyway, which draws the tree as bare connectors"
+        );
     }
 
     /// Turning the flag on moves no row and changes no tier.

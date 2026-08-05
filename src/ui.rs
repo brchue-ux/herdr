@@ -244,15 +244,21 @@ fn desktop_tab_bar_and_terminal_area(
 /// returns `Unchanged` when that hash matches what is already held, so a fleet
 /// whose cards change about once every ninety seconds rasterises about that
 /// often rather than on every frame.
+///
+/// Returns whether *this* pass published transparent shapes over the tree, which
+/// is what `ViewState::sidebar_card_shapes_published` carries to the renderer. A
+/// pass that leaves the foreground client's cards alone answers `false`: the
+/// artwork exists, but not for this pass, and the renderer must keep drawing the
+/// character cards it is going to be sent instead.
 fn update_sidebar_card_layers(
     app: &mut AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
-) {
+) -> bool {
     if !app.kitty_graphics_enabled {
         app.sidebar_card_layers.clear();
-        return;
+        return false;
     }
     if !cell_size.is_known() {
         // A pass that does not know the host's cell size cannot speak for its
@@ -261,7 +267,7 @@ fn update_sidebar_card_layers(
         // exactly as they are rather than clearing artwork this pass has no way
         // to redraw, which would make every background frame cost the
         // foreground one a re-encode and a re-upload.
-        return;
+        return false;
     }
     match sidebar::image_card::build_cards(
         app,
@@ -274,6 +280,9 @@ fn update_sidebar_card_layers(
         sidebar::image_card::CardsUpdate::Rebuilt(layers) => app.sidebar_card_layers = layers,
         sidebar::image_card::CardsUpdate::Empty => app.sidebar_card_layers.clear(),
     }
+    // Published, not merely intended: a build that produced nothing falls back
+    // to the character cards rather than blanking the tree.
+    app.sidebar_card_shapes && !app.sidebar_card_layers.is_empty()
 }
 
 fn compute_view_internal(
@@ -324,7 +333,8 @@ fn compute_view_internal(
     // Here rather than in `render` because it is a mutation, and after the card
     // areas because it draws into exactly those rects: the pixel card never
     // decides its own geometry.
-    update_sidebar_card_layers(app, &workspace_card_areas, sidebar_area, cell_size);
+    let sidebar_card_shapes_published =
+        update_sidebar_card_layers(app, &workspace_card_areas, sidebar_area, cell_size);
 
     let tab_label_decor = TabLabelDecor::from_state(app);
     let tab_bar_view = app
@@ -375,6 +385,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
+        sidebar_card_shapes_published,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -438,6 +449,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        sidebar_card_shapes_published: false,
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
         tab_scroll_left_hit_area: Rect::default(),

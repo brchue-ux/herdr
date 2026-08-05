@@ -881,6 +881,16 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    /// Whether *this* pass published transparent card shapes over the tree.
+    ///
+    /// A property of the pass about to be encoded, never of shared state.
+    /// `AppState::host_cell_size` and `AppState::sidebar_card_layers` belong to
+    /// the foreground client, and a pass that cannot see the host's cell size
+    /// deliberately leaves both alone — so a second attached client would
+    /// otherwise suppress its character cards on the strength of artwork it is
+    /// never sent, and draw a tree of bare connectors. Read through
+    /// `ui::sidebar::image_card::shape_covers_row`.
+    pub sidebar_card_shapes_published: bool,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
@@ -2445,6 +2455,7 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                sidebar_card_shapes_published: false,
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
