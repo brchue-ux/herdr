@@ -202,11 +202,11 @@ fn push_slot(
 ) {
     let text = slot_text(signal, tier);
     if !signals.is_live(signal) {
-        spans.push(Span::styled(text, resting_style(&app.sidebar_palette())));
+        spans.push(Span::styled(text, resting_style(&app.sidebar_palette)));
         return;
     }
 
-    let style = live_style(signal, &app.sidebar_palette());
+    let style = live_style(signal, &app.sidebar_palette);
     let frame = app
         .anim
         .frame(&signal.element_id(), None)

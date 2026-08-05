@@ -301,6 +301,8 @@ fn compute_view_internal(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
+    app.refresh_sidebar_palette();
+
     if is_mobile_width(area, app.mobile_width_threshold) {
         compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
         return;
@@ -1233,6 +1235,42 @@ mod tests {
         assert!(auto_style.add_modifier.contains(Modifier::DIM));
         assert_eq!(custom_style.fg, Some(app.palette.panel_bg));
         assert!(custom_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// The sidebar's ink is a function of the palette and the measured host
+    /// theme, and it is read once per tree row — so it is derived once, here,
+    /// rather than re-floored at every read. This is the assertion that fails
+    /// if a later change moves the palette without moving the panel's copy.
+    #[test]
+    fn compute_view_rederives_the_sidebar_palette_from_the_current_theme() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+
+        // Unset is the default, and then the panel draws with the shared ink.
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        assert_eq!(app.sidebar_palette, app.palette);
+
+        app.host_terminal_theme = crate::terminal_theme::TerminalTheme::default().with_color(
+            crate::terminal_theme::DefaultColorKind::Background,
+            crate::terminal_theme::RgbColor {
+                r: 239,
+                g: 241,
+                b: 245,
+            },
+        );
+        app.palette.sidebar_bg = Color::Rgb(24, 24, 37);
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+
+        assert_eq!(
+            app.sidebar_palette,
+            app.palette.for_sidebar(&app.host_terminal_theme)
+        );
+        assert_ne!(
+            app.sidebar_palette, app.palette,
+            "a panel with its own fill has its own floor, so the two must differ"
+        );
     }
 
     #[test]

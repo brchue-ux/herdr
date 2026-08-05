@@ -1825,6 +1825,16 @@ pub struct AppState {
     pub(crate) pending_tree_root: Option<crate::app::tree_view::PendingTreeRoot>,
     /// UI color palette — all sidebar/UI colors centralized for theming.
     pub palette: Palette,
+    /// [`Self::palette`] as the desktop sidebar panel draws it.
+    ///
+    /// Derived from `palette` and the measured host theme by
+    /// [`Self::refresh_sidebar_palette`], which `compute_view` runs once a
+    /// frame, so a theme change, a config reload or a host appearance report
+    /// all reach the panel through the same repaint that already follows them.
+    /// Stored rather than computed per read because the sidebar asks for it
+    /// once per row and once per fleet-signal slot, and a panel with a fill of
+    /// its own re-floors four tokens on every one of those.
+    pub sidebar_palette: Palette,
     /// Currently applied theme name (for settings UI).
     pub theme_name: String,
     /// Runtime theme configuration used to resolve manual and auto-switch palettes.
@@ -2412,14 +2422,15 @@ impl AppState {
         ws.active_tab().map(|tab| tab.layout.focused()) == Some(pane_id)
     }
 
-    /// The palette every surface inside the desktop sidebar panel draws with.
+    /// Re-derive [`Self::sidebar_palette`] from the palette and host theme it
+    /// is a function of.
     ///
-    /// Derived rather than stored so it cannot fall out of step with
-    /// [`Self::palette`] or with the measured host theme it resolves against;
-    /// it is the palette itself whenever the panel has no fill of its own,
-    /// which is the default.
-    pub fn sidebar_palette(&self) -> Palette {
-        self.palette.for_sidebar(&self.host_terminal_theme)
+    /// Called from `compute_view`, which every render path runs first, so the
+    /// two can only be out of step for a state that was never laid out. It is
+    /// the palette itself whenever the panel has no fill of its own, which is
+    /// the default.
+    pub fn refresh_sidebar_palette(&mut self) {
+        self.sidebar_palette = self.palette.for_sidebar(&self.host_terminal_theme);
     }
 }
 
@@ -2591,6 +2602,7 @@ impl AppState {
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,
             palette: Palette::catppuccin(),
+            sidebar_palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
             theme_runtime: ThemeRuntimeConfig {
                 manual_name: "catppuccin".to_string(),

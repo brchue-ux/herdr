@@ -1311,7 +1311,7 @@ fn render_session_status(app: &AppState, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             text,
-            Style::default().fg(app.sidebar_palette().overlay0),
+            Style::default().fg(app.sidebar_palette.overlay0),
         ))
         .alignment(Alignment::Right),
         area,
@@ -1722,7 +1722,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
     let is_navigating = matches!(app.mode, Mode::Navigate);
 
-    let p = &app.sidebar_palette();
+    let p = &app.sidebar_palette;
     frame
         .buffer_mut()
         .set_style(area, Style::default().bg(p.sidebar_bg));
@@ -1936,7 +1936,7 @@ fn sidebar_divider_grip_rows(area: Rect) -> std::ops::Range<u16> {
 /// drag. Lighting the full height says the resistance is the boundary rather
 /// than a fault, and it resolves the instant the detent commits.
 fn render_sidebar_divider(app: &AppState, frame: &mut Frame, area: Rect, is_navigating: bool) {
-    let p = &app.sidebar_palette();
+    let p = &app.sidebar_palette;
     let active = app.sidebar_divider_hover;
     let detent = app.sidebar_divider_detent;
     let bar_style = if detent {
@@ -1974,7 +1974,7 @@ pub(super) fn render_sidebar(
     frame: &mut Frame,
     area: Rect,
 ) {
-    let p = &app.sidebar_palette();
+    let p = &app.sidebar_palette;
     frame
         .buffer_mut()
         .set_style(area, Style::default().bg(p.sidebar_bg));
@@ -2450,7 +2450,7 @@ fn render_agent_row(
         return;
     };
 
-    let p = &app.sidebar_palette();
+    let p = &app.sidebar_palette;
     let shell = RowShell::for_fold_width(fold_width);
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
     let label_color = state_label_color(detail.state, detail.seen, p);
@@ -2782,7 +2782,7 @@ fn render_worker_summary_badge(
             .fg(app.palette.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.sidebar_palette().overlay0)
+        Style::default().fg(app.sidebar_palette.overlay0)
     };
     frame.render_widget(
         Paragraph::new(Span::styled(worker_summary_badge_label(count), style))
@@ -3008,7 +3008,7 @@ impl<'a> ConnectorCharge<'a> {
             .catalogue()
             .get(relation_signal_behaviour(phase.kind))?;
         let signal = crate::ui::color::resolve_color_rgb(
-            relation_signal_color(phase.kind, &app.sidebar_palette()),
+            relation_signal_color(phase.kind, &app.sidebar_palette),
             &app.host_terminal_theme,
         )?;
         Some(Self {
@@ -3403,7 +3403,7 @@ fn render_workspace_list(
     area: Rect,
     is_navigating: bool,
 ) {
-    let p = &app.sidebar_palette();
+    let p = &app.sidebar_palette;
     let dragged_ws_idx = match app.drag.as_ref().map(|drag| &drag.target) {
         Some(crate::app::state::DragTarget::WorkspaceReorder { source_ws_idx, .. }) => {
             Some(*source_ws_idx)
@@ -5812,6 +5812,7 @@ mod tests {
         app.workspaces.clear();
         app.active = None;
         app.palette.sidebar_bg = ratatui::style::Color::Rgb(12, 34, 56);
+        app.refresh_sidebar_palette();
         let area = Rect::new(0, 0, 26, 20);
 
         let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
