@@ -128,6 +128,12 @@ pub(crate) const MIN_FOLD_WIDTH: u16 = super::card::MIN_FOLD_WIDTH;
 const BLOOM_REACH: f32 = 0.45;
 
 /// One card's finished pixels, and the cells it covers.
+///
+/// `Clone` so a card whose content did not change can be carried into the next
+/// frame's list when a *sibling* did. That copies the encoded bytes — a few
+/// kilobytes of flat-fill PNG — and skips the rasterisation, which is the
+/// expensive half by roughly an order of magnitude.
+#[derive(Clone)]
 pub(crate) struct SidebarCardLayer {
     /// The cell rect the sheet is placed at. Chosen by the tree's own geometry,
     /// so the sheet is exactly as large as the cards plus the reach of their
@@ -172,6 +178,33 @@ pub(crate) fn is_available(app: &AppState, fold_width: u16) -> bool {
         && app.host_cell_size.is_known()
         && fold_width >= MIN_FOLD_WIDTH
         && font::card_font(app.sidebar_card_font.as_deref()).is_some()
+}
+
+/// Whether a transparent shape will be drawn over this row's frame, so the
+/// character card standing under it must not be drawn at all.
+///
+/// The sheet answers `false` and keeps drawing the character card underneath,
+/// because the sheet is opaque over every cell a row owns and covers it. A shape
+/// is transparent everywhere outside its own glow, so anything drawn beneath it
+/// would show *through* it — the character card's border, its chip and its
+/// title, doubled a few pixels off the pixel card's own. Not drawing them is
+/// what makes the transparency mean "the panel is behind this card".
+///
+/// The row's connectors and rails are outside the card's frame and are left
+/// alone: they are the tree, not the card, and the card was never covering them.
+///
+/// # Why this asks whether shapes were actually published
+///
+/// [`is_available`] says the pixel path *should* be live; it does not say a card
+/// came out of it. A build that fails — a cell-size report that makes an image
+/// larger than [`MAX_IMAGE_PIXELS`], an encoder that returns nothing — publishes
+/// no layers at all, and suppressing the character cards on the strength of a
+/// shape that was never drawn leaves the tree blank. Suppression has to be
+/// conditioned on the artwork existing, not on it being intended.
+///
+/// [`MAX_IMAGE_PIXELS`]: Rasteriser::rasterise
+pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
+    app.sidebar_card_shapes && is_available(app, fold_width) && !app.sidebar_card_layers.is_empty()
 }
 
 /// The tier a row at `depth` is drawn at.
@@ -1032,50 +1065,65 @@ fn content_for(
     }
 }
 
-/// What one pass over the tree's cards concluded about the sheet.
+/// What one pass over the tree's cards concluded.
 ///
 /// Three outcomes rather than an `Option`, because "keep what you have" and
 /// "there is nothing to draw" are opposites and an `Option<Layer>` spells them
-/// the same way — which is how a stale sheet outlives the rows it was a picture
+/// the same way — which is how a stale card outlives the row it was a picture
 /// of.
-pub(crate) enum SheetUpdate {
-    /// Nothing the sheet is a picture of moved. Keep it, encode nothing.
+pub(crate) enum CardsUpdate {
+    /// Nothing the cards are a picture of moved. Keep them, encode nothing.
     Unchanged,
-    Rebuilt(SidebarCardLayer),
+    Rebuilt(Vec<SidebarCardLayer>),
     /// The pixel path is not live, or the tree has no agent cards in it.
     Empty,
 }
 
-/// Build the sheet for the tree's current cards.
+/// Build the images for the tree's current cards.
 ///
-/// `previous` is the sheet the last frame produced. A frame whose content
-/// signature matches it reports [`SheetUpdate::Unchanged`]: nothing is
-/// rasterised and nothing is re-encoded, which is what makes a fleet whose
-/// cards change about once every ninety seconds cost about that often rather
-/// than sixty times a second.
-pub(crate) fn build_sheet(
+/// `previous` is what the last frame produced. A frame whose content signature
+/// matches it reports [`CardsUpdate::Unchanged`]: nothing is rasterised and
+/// nothing is re-encoded, which is what makes a fleet whose cards change about
+/// once every ninety seconds cost about that often rather than sixty times a
+/// second.
+///
+/// # Two drawing models
+///
+/// Under `[experimental] sidebar_card_shapes` this returns **one layer per
+/// card**: each is its own RGBA image, transparent outside its own glow, at its
+/// own placement and its own position. Otherwise it returns a single layer — one
+/// opaque sheet spanning the whole tree, with each row's background painted into
+/// it.
+///
+/// The difference is not cosmetic. The sheet's glow terminates at the sheet's
+/// rectangle instead of falling off into whatever is behind it, so a card cannot
+/// be moved relative to its neighbours without that rectangle's edge shearing
+/// across them. A shape has no rectangle to clip: two shapes that overlap are two
+/// placements, and the terminal composites their glows. That is what makes
+/// sliding, fading and reflowing one card independently expressible at all.
+pub(crate) fn build_cards(
     app: &AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: HostCellSize,
-    previous: Option<&SidebarCardLayer>,
-) -> SheetUpdate {
-    match build_sheet_inner(app, cards, sidebar_area, cell_size, previous) {
-        Ok(Some(layer)) => SheetUpdate::Rebuilt(layer),
-        Ok(None) => SheetUpdate::Unchanged,
-        Err(()) => SheetUpdate::Empty,
+    previous: &[SidebarCardLayer],
+) -> CardsUpdate {
+    match build_cards_inner(app, cards, sidebar_area, cell_size, previous) {
+        Ok(Some(layers)) => CardsUpdate::Rebuilt(layers),
+        Ok(None) => CardsUpdate::Unchanged,
+        Err(()) => CardsUpdate::Empty,
     }
 }
 
-/// `Ok(Some)` is a new sheet, `Ok(None)` is the one already held, `Err` is none
+/// `Ok(Some)` is new artwork, `Ok(None)` is what is already held, `Err` is none
 /// at all.
-fn build_sheet_inner(
+fn build_cards_inner(
     app: &AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: HostCellSize,
-    previous: Option<&SidebarCardLayer>,
-) -> Result<Option<SidebarCardLayer>, ()> {
+    previous: &[SidebarCardLayer],
+) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
     let fold_width = super::row_fold_width(app, super::workspace_list_rect(sidebar_area));
     if !is_available(app, fold_width) {
         return Err(());
@@ -1129,9 +1177,16 @@ fn build_sheet_inner(
         return Err(());
     }
 
-    // The sheet spans the cards plus the reach of their bloom, clamped into the
-    // panel. A placement whose rect leaves the panel would be clipped by the
-    // pipeline anyway; keeping it inside means the clip never has to run.
+    // The tree's whole extent: the cards plus the reach of their bloom, clamped
+    // into the panel. A placement whose rect leaves the panel would be clipped by
+    // the pipeline anyway; keeping it inside means the clip never has to run.
+    //
+    // The sheet is exactly this rect. A shape is not — it is only as large as its
+    // own card — but it still needs this, because it is the field the view-switch
+    // dissolve is resolved over. Sizing the particle grid to each card's own image
+    // instead would give every card the same local dissolve at a different scale,
+    // and the wave that is supposed to cross the tree would break at every card's
+    // edge.
     let bloom_cells_x = ((BASE_HEIGHT_PX * BLOOM_REACH) / cell_w).ceil() as u16;
     let bloom_cells_y = ((BASE_HEIGHT_PX * BLOOM_REACH) / cell_h).ceil() as u16;
     let min_x = placed.iter().map(|(r, _)| r.x).min().unwrap_or(bounds.x);
@@ -1146,173 +1201,421 @@ fn build_sheet_inner(
         .map(|(r, _)| r.y.saturating_add(r.height))
         .max()
         .unwrap_or(bounds.y);
-    let sheet_x = min_x.saturating_sub(bloom_cells_x).max(bounds.x);
-    let sheet_y = min_y.saturating_sub(bloom_cells_y).max(bounds.y);
-    let sheet_right = max_x
-        .saturating_add(bloom_cells_x)
-        .min(bounds.x.saturating_add(bounds.width));
-    let sheet_bottom = max_y.saturating_add(bloom_cells_y).min(bloom_floor);
-    let sheet_rect = Rect::new(
-        sheet_x,
-        sheet_y,
-        sheet_right.saturating_sub(sheet_x),
-        sheet_bottom.saturating_sub(sheet_y),
-    );
-    if sheet_rect.width == 0 || sheet_rect.height == 0 {
-        return Err(());
-    }
+    let field_rect = clamp_bloomed(
+        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y),
+        bloom_cells_x,
+        bloom_cells_y,
+        bounds,
+        bloom_floor,
+    )
+    .ok_or(())?;
 
-    let mut hasher = DefaultHasher::new();
-    cell_size.width_px.hash(&mut hasher);
-    cell_size.height_px.hash(&mut hasher);
-    sheet_rect.x.hash(&mut hasher);
-    sheet_rect.y.hash(&mut hasher);
-    sheet_rect.width.hash(&mut hasher);
-    sheet_rect.height.hash(&mut hasher);
-    for (frame, content) in &placed {
-        frame.x.hash(&mut hasher);
-        frame.y.hash(&mut hasher);
-        frame.width.hash(&mut hasher);
-        frame.height.hash(&mut hasher);
-        content.hash_into(&mut hasher);
+    let title_metrics = font.metrics(TITLE_PX);
+    let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
+    let rasteriser = Rasteriser {
+        font,
+        title_metrics,
+        tidbit_metrics,
+        cell_size,
+        cell_w,
+        cell_h,
+        field: field_rect,
+        bounds,
+        bloom_floor,
+        backdrop,
+        dissolve: sheet_dissolve(app, cell_size),
+    };
+
+    if app.sidebar_card_shapes {
+        return rasteriser.shapes(&placed, previous);
     }
-    backdrop.0.hash(&mut hasher);
-    backdrop.1.hash(&mut hasher);
-    backdrop.2.hash(&mut hasher);
-    let content_signature = hasher.finish();
-    // The transition the sheet is *in*, on top of the cards it is a picture of.
-    // Without this the content signature is unchanged for the whole of a switch
-    // — the rows have not moved yet, that is the point of the switch — so the
-    // cards would stand perfectly still while the characters around them came
-    // apart, which is exactly the hard cut this is here to remove. Quantized to
-    // [`DISSOLVE_STEPS`], so a settled panel still hashes to `None` and
-    // rasterises nothing.
-    let dissolve = sheet_dissolve(app, cell_size);
-    dissolve.map(DissolveFrame::step).hash(&mut hasher);
-    let signature = hasher.finish();
-    if let Some(previous) = previous {
-        if previous.signature == signature && previous.rect == sheet_rect {
+    rasteriser.sheet(&placed, previous)
+}
+
+/// Grow `rect` by a bloom margin and clamp it into the panel.
+///
+/// `None` when nothing survives the clamp, which is the one case a caller must
+/// not turn into a zero-sized placement.
+fn clamp_bloomed(
+    rect: Rect,
+    margin_x: u16,
+    margin_y: u16,
+    bounds: Rect,
+    bloom_floor: u16,
+) -> Option<Rect> {
+    let x = rect.x.saturating_sub(margin_x).max(bounds.x);
+    let y = rect.y.saturating_sub(margin_y).max(bounds.y);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(margin_x)
+        .min(bounds.x.saturating_add(bounds.width));
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(margin_y)
+        .min(bloom_floor);
+    let out = Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y));
+    (out.width > 0 && out.height > 0).then_some(out)
+}
+
+/// Everything both drawing models need to turn placed cards into images.
+///
+/// The two differ in *how many images they cut the tree into* and in whether
+/// each one paints a background — not in how a card is drawn. Sharing this is
+/// what keeps the geometry, the type, the bloom and the state inks identical
+/// across the flag, so turning it on changes the card's edges and nothing else
+/// about the card.
+struct Rasteriser<'a> {
+    font: &'static CardFont,
+    title_metrics: FontMetrics,
+    tidbit_metrics: FontMetrics,
+    cell_size: HostCellSize,
+    cell_w: f32,
+    cell_h: f32,
+    /// The tree's whole extent, and the field the dissolve is resolved over.
+    field: Rect,
+    bounds: Rect,
+    bloom_floor: u16,
+    backdrop: Rgb,
+    dissolve: Option<DissolveFrame<'a>>,
+}
+
+impl Rasteriser<'_> {
+    /// One opaque image for the whole tree.
+    fn sheet(
+        &self,
+        placed: &[(Rect, CardContent)],
+        previous: &[SidebarCardLayer],
+    ) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
+        let sheet_rect = self.field;
+        let mut hasher = DefaultHasher::new();
+        self.hash_common(&mut hasher, sheet_rect);
+        for (frame, content) in placed {
+            hash_placed(&mut hasher, frame, content);
+        }
+        let content_signature = hasher.finish();
+        // The transition the sheet is *in*, on top of the cards it is a picture
+        // of. Without this the content signature is unchanged for the whole of a
+        // switch — the rows have not moved yet, that is the point of the switch —
+        // so the cards would stand perfectly still while the characters around
+        // them came apart, which is exactly the hard cut this is here to remove.
+        // Quantized to [`DISSOLVE_STEPS`], so a settled panel still hashes to
+        // `None` and rasterises nothing.
+        self.dissolve.map(DissolveFrame::step).hash(&mut hasher);
+        let signature = hasher.finish();
+
+        let previous = previous.first();
+        if previous
+            .is_some_and(|previous| previous.signature == signature && previous.rect == sheet_rect)
+        {
             return Ok(None);
         }
+
+        // A transition frame whose *cards* are the ones already drawn re-uses
+        // those pixels. This is the difference between a switch costing one
+        // rasterisation and costing one per frame, and the rasterisation is nine
+        // tenths of the cost: drawing ten cards, their bloom and their type
+        // measures about 16 ms against about 1.4 ms to encode the result and
+        // under 1 ms to take it apart.
+        let held = previous
+            .filter(|previous| {
+                previous.content_signature == content_signature && previous.rect == sheet_rect
+            })
+            .and_then(|previous| previous.undissolved.clone());
+        let layer = self.finish(sheet_rect, held, signature, content_signature, || {
+            self.rasterise(placed, sheet_rect, true)
+        })?;
+        Ok(Some(vec![layer]))
     }
 
-    // A transition frame whose *cards* are the ones already drawn re-uses those
-    // pixels. This is the difference between a switch costing one rasterisation
-    // and costing one per frame, and the rasterisation is nine tenths of the
-    // cost: drawing ten cards, their bloom and their type measures about 16 ms
-    // against about 1.4 ms to encode the result and under 1 ms to take it apart.
-    let held = previous.filter(|previous| {
-        previous.content_signature == content_signature && previous.rect == sheet_rect
-    });
-    if let Some(base) = held.and_then(|previous| previous.undissolved.clone()) {
-        // Including the frame that *ends* a transition, which has no dissolve
-        // left to apply and would otherwise pay a full rasterisation to arrive
-        // back at pixels it is already holding.
+    /// One transparent image per card.
+    ///
+    /// The card is the unit of everything here: its own rect, its own signature,
+    /// its own placement. A card whose content did not change is carried forward
+    /// without being rasterised or re-encoded even when a sibling changed, which
+    /// is the property the queued motion work needs — moving one card must cost
+    /// one card, not the tree.
+    fn shapes(
+        &self,
+        placed: &[(Rect, CardContent)],
+        previous: &[SidebarCardLayer],
+    ) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
+        // Measured first, drawn second. Deciding whether anything moved before
+        // rasterising anything is what makes a settled panel free: the common
+        // frame walks this list, matches every entry, and returns having encoded
+        // nothing.
+        let planned: Vec<PlannedShape> = placed
+            .iter()
+            .map(|(frame, content)| self.plan(*frame, content))
+            .collect::<Option<_>>()
+            .ok_or(())?;
+
+        if planned.len() == previous.len()
+            && planned.iter().zip(previous).all(|(planned, previous)| {
+                planned.signature == previous.signature && planned.rect == previous.rect
+            })
+        {
+            return Ok(None);
+        }
+
+        let mut layers = Vec::with_capacity(planned.len());
+        for (index, planned) in planned.iter().enumerate() {
+            // Positional rather than by identity: a card only keeps its slot
+            // while the tree's shape is unchanged, and a tree that reordered has
+            // moved every rect it reordered — which the signature already caught.
+            let previous = previous.get(index);
+            if let Some(held) = previous.filter(|previous| {
+                previous.signature == planned.signature && previous.rect == planned.rect
+            }) {
+                // Untouched. The bytes are copied but the drawing is not redone,
+                // and the drawing is the expensive half by an order of magnitude.
+                layers.push(SidebarCardLayer::clone(held));
+                continue;
+            }
+            let held = previous
+                .filter(|previous| {
+                    previous.content_signature == planned.content_signature
+                        && previous.rect == planned.rect
+                })
+                .and_then(|previous| previous.undissolved.clone());
+            // One card, drawn into an image that is only as large as that card
+            // and the reach of its own bloom, with no background painted
+            // anywhere. Everything outside the glow stays at alpha zero.
+            let one = &placed[index..index + 1];
+            layers.push(self.finish(
+                planned.rect,
+                held,
+                planned.signature,
+                planned.content_signature,
+                || self.rasterise(one, planned.rect, false),
+            )?);
+        }
+        Ok(Some(layers))
+    }
+
+    /// What one card's image will be, before anything is drawn.
+    fn plan(&self, frame: Rect, content: &CardContent) -> Option<PlannedShape> {
+        let rect = self.card_rect(frame, content)?;
+        let mut hasher = DefaultHasher::new();
+        self.hash_common(&mut hasher, rect);
+        hash_placed(&mut hasher, &frame, content);
+        let content_signature = hasher.finish();
+        self.dissolve.map(DissolveFrame::step).hash(&mut hasher);
+        if self.dissolve.is_some() {
+            // Where the card sits in the field decides which particles it loses
+            // and when, so two cards on the same step still come apart at
+            // different moments. Only while a transition is running: with none,
+            // the field has no bearing on the card's pixels and hashing it would
+            // rebuild every card whenever the tree's extent changed.
+            self.dissolve_origin(rect).hash(&mut hasher);
+            self.field_px().hash(&mut hasher);
+        }
+        Some(PlannedShape {
+            rect,
+            signature: hasher.finish(),
+            content_signature,
+        })
+    }
+
+    /// Encode one finished image, reusing held pixels when a transition frame
+    /// already has them.
+    fn finish(
+        &self,
+        rect: Rect,
+        held: Option<UndissolvedSheet>,
+        signature: u64,
+        content_signature: u64,
+        draw: impl FnOnce() -> Result<Canvas, ()>,
+    ) -> Result<SidebarCardLayer, ()> {
+        // A held canvas covers the frame that *ends* a transition too, which has
+        // no dissolve left to apply and would otherwise pay a full rasterisation
+        // to arrive back at pixels it is already holding.
+        let base = match held {
+            Some(base) => base,
+            None => UndissolvedSheet(std::sync::Arc::new(draw()?)),
+        };
         let (width_px, height_px) = (base.0.width(), base.0.height());
-        let data = match dissolve {
+        let data = match self.dissolve {
             Some(dissolve) => {
-                let mut sheet = Canvas::clone(&base.0);
-                dissolve.apply(&mut sheet);
-                encode_png(&sheet)
+                let mut canvas = Canvas::clone(&base.0);
+                dissolve.apply(&mut canvas, self.dissolve_origin(rect), self.field_px());
+                encode_png(&canvas)
             }
             None => encode_png(&base.0),
         }
         .ok_or(())?;
-        return Ok(Some(SidebarCardLayer {
-            rect: sheet_rect,
+        Ok(SidebarCardLayer {
+            rect,
             signature,
             content_signature,
-            undissolved: dissolve.map(|_| base),
-            layer: sheet_layer(width_px, height_px, data, sheet_rect),
-        }));
-    }
-
-    let width_px = u32::from(sheet_rect.width) * cell_size.width_px;
-    let height_px = u32::from(sheet_rect.height) * cell_size.height_px;
-    // A sheet larger than this is a sidebar nobody has — 8 megapixels is a
-    // panel over a thousand pixels wide and seven thousand tall. The guard is
-    // here so a nonsense cell-size report cannot turn into a huge allocation:
-    // at four bytes a pixel for the sheet and eight more for the bloom field,
-    // this ceiling is about 96 MB, held only while the sheet is being built.
-    const MAX_SHEET_PIXELS: u32 = 8_000_000;
-    if width_px == 0 || height_px == 0 || width_px.saturating_mul(height_px) > MAX_SHEET_PIXELS {
-        return Err(());
-    }
-
-    let mut sheet = Canvas::new(width_px, height_px);
-    let title_metrics = font.metrics(TITLE_PX);
-    let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
-    let cards: Vec<PlacedCard<'_>> = placed
-        .iter()
-        .map(|(frame, content)| {
-            let geometry = CardGeometry::new(content.depth, cell_h, content.mark.is_some());
-            // The card is drawn at the height its tier asked for, centred in
-            // the cells the row was given. The leftover is the gutter — this is
-            // where the measured 0.19 h sibling gap comes back, and it is also
-            // what makes the tier scale visible again after the row height was
-            // rounded up to a whole number of cells.
-            let cell_top = f32::from(frame.y.saturating_sub(sheet_rect.y)) * cell_h;
-            let cell_height = f32::from(frame.height) * cell_h;
-            let wanted =
-                tier_height_px(content.depth, title_metrics, tidbit_metrics).min(cell_height);
-            PlacedCard {
-                rect: RoundRect {
-                    x: f32::from(frame.x.saturating_sub(sheet_rect.x)) * cell_w,
-                    y: cell_top + (cell_height - wanted) / 2.0,
-                    w: f32::from(frame.width) * cell_w,
-                    h: wanted,
-                    r: geometry.radius,
-                },
-                content,
-                geometry,
-            }
+            // Only while a transition is running: a settled panel keeps no
+            // second copy of artwork it is not about to take apart.
+            undissolved: self.dissolve.map(|_| base),
+            layer: card_layer(width_px, height_px, data, rect),
         })
-        .collect();
-
-    // Backdrop first, over exactly the cells each row owns. The sheet is
-    // otherwise transparent, so this is what covers the character card standing
-    // underneath — including in the gutter, where the card itself does not
-    // reach — while leaving the tree's connectors and everything outside a row
-    // showing through.
-    for (frame, _) in &placed {
-        fill_row_backdrop(&mut sheet, frame, sheet_rect, cell_w, cell_h, backdrop);
     }
 
-    let mut bloom = BloomField::new(width_px, height_px);
-    for card in &cards {
-        lay_bloom(&mut bloom, card);
-    }
-    bloom.composite(&mut sheet);
+    /// Draw `placed` into an image covering `rect`.
+    ///
+    /// `paint_backdrop` is true only for the sheet, which has to cover the
+    /// character card standing under it. A shape leaves those pixels transparent
+    /// — that is the whole point of it — which is sound because the character
+    /// content beneath a shape is not drawn at all.
+    fn rasterise(
+        &self,
+        placed: &[(Rect, CardContent)],
+        rect: Rect,
+        paint_backdrop: bool,
+    ) -> Result<Canvas, ()> {
+        let width_px = u32::from(rect.width) * self.cell_size.width_px;
+        let height_px = u32::from(rect.height) * self.cell_size.height_px;
+        // An image larger than this is a sidebar nobody has — 8 megapixels is a
+        // panel over a thousand pixels wide and seven thousand tall. The guard is
+        // here so a nonsense cell-size report cannot turn into a huge allocation:
+        // at four bytes a pixel for the canvas and eight more for the bloom
+        // field, this ceiling is about 96 MB, held only while it is being built.
+        const MAX_IMAGE_PIXELS: u32 = 8_000_000;
+        if width_px == 0 || height_px == 0 || width_px.saturating_mul(height_px) > MAX_IMAGE_PIXELS
+        {
+            return Err(());
+        }
 
-    for card in &cards {
-        draw_card(&mut sheet, card, font);
-        if card.content.lifted {
-            // Selection is a change of intensity, never of hue — the same rule
-            // the character card's lifted glow ramp follows.
-            lift(&mut sheet, card);
+        let mut canvas = Canvas::new(width_px, height_px);
+        let cards: Vec<PlacedCard<'_>> = placed
+            .iter()
+            .map(|(frame, content)| self.place(*frame, content, rect))
+            .collect();
+
+        if paint_backdrop {
+            // Over exactly the cells each row owns. The sheet is otherwise
+            // transparent, so this is what covers the character card standing
+            // underneath — including in the gutter, where the card itself does
+            // not reach — while leaving the tree's connectors and everything
+            // outside a row showing through.
+            for (frame, _) in placed {
+                fill_row_backdrop(
+                    &mut canvas,
+                    frame,
+                    rect,
+                    self.cell_w,
+                    self.cell_h,
+                    self.backdrop,
+                );
+            }
+        }
+
+        let mut bloom = BloomField::new(width_px, height_px);
+        for card in &cards {
+            lay_bloom(&mut bloom, card);
+        }
+        bloom.composite(&mut canvas);
+
+        for card in &cards {
+            draw_card(&mut canvas, card, self.font);
+            if card.content.lifted {
+                // Selection is a change of intensity, never of hue — the same
+                // rule the character card's lifted glow ramp follows.
+                lift(&mut canvas, card);
+            }
+        }
+        Ok(canvas)
+    }
+
+    /// One card's rounded rect, in the coordinates of an image covering `rect`.
+    fn place<'c>(&self, frame: Rect, content: &'c CardContent, rect: Rect) -> PlacedCard<'c> {
+        let geometry = CardGeometry::new(content.depth, self.cell_h, content.mark.is_some());
+        // The card is drawn at the height its tier asked for, centred in the
+        // cells the row was given. The leftover is the gutter — this is where the
+        // measured 0.19 h sibling gap comes back, and it is also what makes the
+        // tier scale visible again after the row height was rounded up to a whole
+        // number of cells.
+        let cell_top = f32::from(frame.y.saturating_sub(rect.y)) * self.cell_h;
+        let cell_height = f32::from(frame.height) * self.cell_h;
+        let wanted =
+            tier_height_px(content.depth, self.title_metrics, self.tidbit_metrics).min(cell_height);
+        PlacedCard {
+            rect: RoundRect {
+                x: f32::from(frame.x.saturating_sub(rect.x)) * self.cell_w,
+                y: cell_top + (cell_height - wanted) / 2.0,
+                w: f32::from(frame.width) * self.cell_w,
+                h: wanted,
+                r: geometry.radius,
+            },
+            content,
+            geometry,
         }
     }
 
-    // Only while a transition is running: a settled panel keeps no second copy
-    // of a sheet it is not about to take apart.
-    let undissolved =
-        dissolve.map(|_| UndissolvedSheet(std::sync::Arc::new(Canvas::clone(&sheet))));
-    if let Some(dissolve) = dissolve {
-        dissolve.apply(&mut sheet);
+    /// The cells one card's own image covers: its frame plus the reach of its
+    /// own bloom, clamped into the panel.
+    ///
+    /// Its *own* bloom and not the tree's largest, because the reach is a
+    /// fraction of the card's drawn height (see [`lay_bloom`]) and a worker's
+    /// card is two thirds of a mate's. Giving every card the top tier's margin
+    /// would make every smaller card's image bigger than it needs to be, and the
+    /// margin is transparent padding that still has to be encoded and uploaded.
+    fn card_rect(&self, frame: Rect, content: &CardContent) -> Option<Rect> {
+        let drawn = tier_height_px(content.depth, self.title_metrics, self.tidbit_metrics)
+            .min(f32::from(frame.height) * self.cell_h);
+        let reach = drawn * BLOOM_REACH;
+        clamp_bloomed(
+            frame,
+            (reach / self.cell_w).ceil() as u16,
+            (reach / self.cell_h).ceil() as u16,
+            self.bounds,
+            self.bloom_floor,
+        )
     }
 
-    let data = encode_png(&sheet).ok_or(())?;
-    Ok(Some(SidebarCardLayer {
-        rect: sheet_rect,
-        signature,
-        content_signature,
-        undissolved,
-        layer: sheet_layer(width_px, height_px, data, sheet_rect),
-    }))
+    /// Where an image at `rect` sits inside the dissolve field, in pixels.
+    fn dissolve_origin(&self, rect: Rect) -> (u32, u32) {
+        (
+            u32::from(rect.x.saturating_sub(self.field.x)) * self.cell_size.width_px,
+            u32::from(rect.y.saturating_sub(self.field.y)) * self.cell_size.height_px,
+        )
+    }
+
+    /// The dissolve field's own size, in pixels.
+    fn field_px(&self) -> (u32, u32) {
+        (
+            u32::from(self.field.width) * self.cell_size.width_px,
+            u32::from(self.field.height) * self.cell_size.height_px,
+        )
+    }
+
+    /// The facts every image's signature starts from.
+    fn hash_common(&self, hasher: &mut DefaultHasher, rect: Rect) {
+        self.cell_size.width_px.hash(hasher);
+        self.cell_size.height_px.hash(hasher);
+        rect.x.hash(hasher);
+        rect.y.hash(hasher);
+        rect.width.hash(hasher);
+        rect.height.hash(hasher);
+        self.backdrop.0.hash(hasher);
+        self.backdrop.1.hash(hasher);
+        self.backdrop.2.hash(hasher);
+    }
 }
 
-/// The placement a finished sheet is published as.
-fn sheet_layer(
+/// What one card's image will be, decided before any pixel is drawn.
+struct PlannedShape {
+    rect: Rect,
+    signature: u64,
+    content_signature: u64,
+}
+
+/// One card's frame and content, fed into a signature.
+fn hash_placed(hasher: &mut DefaultHasher, frame: &Rect, content: &CardContent) {
+    frame.x.hash(hasher);
+    frame.y.hash(hasher);
+    frame.width.hash(hasher);
+    frame.height.hash(hasher);
+    content.hash_into(hasher);
+}
+
+/// The placement a finished image is published as.
+fn card_layer(
     width_px: u32,
     height_px: u32,
     data: Vec<u8>,
@@ -1328,10 +1631,15 @@ fn sheet_layer(
             viewport_row: 0,
             grid_cols: u32::from(sheet_rect.width),
             grid_rows: u32::from(sheet_rect.height),
-            // Over the text: the sheet is opaque exactly where a card is and
-            // transparent everywhere else, so the tree's connectors and its
-            // Space rows keep showing through while the character card under
-            // each pixel card is covered.
+            // Over the text, so the tree's connectors and its Space rows keep
+            // showing through wherever the image is transparent while the
+            // character card under each pixel card is covered.
+            //
+            // One band for every card rather than a stack. Two placements at the
+            // same `z` composite — measured on a real Kitty, and exactly, in
+            // linear light — so overlapping cards blend their glows instead of
+            // one winning, and no card needs to be told where it sits in a
+            // stacking order to look right beside its neighbours.
             z: 0,
         },
     )
@@ -1448,25 +1756,48 @@ impl DissolveFrame<'_> {
         (cols as u16, rows as u16)
     }
 
-    /// Take the sheet apart at this frame of the transition.
-    fn apply(self, sheet: &mut Canvas) {
+    /// Take one image apart at this frame of the transition.
+    ///
+    /// `origin` is where the image sits inside `field`, both in pixels. The
+    /// particle grid is laid over the **field** and not over the image, which is
+    /// what lets a tree cut into one image per card come apart as a single wave
+    /// crossing the panel: every card reads the same grid at its own offset
+    /// rather than running its own dissolve at its own scale. The sheet passes
+    /// `(0, 0)` and its own size, and reduces to the whole-canvas walk this was.
+    fn apply(self, canvas: &mut Canvas, origin: (u32, u32), field: (u32, u32)) {
         use crate::anim::cell::{CellExtent, CellPos};
 
-        let (cols, rows) = self.grid(sheet.width(), sheet.height());
+        let (cols, rows) = self.grid(field.0, field.1);
         let extent = CellExtent::new(cols, rows);
         let progress = self.progress.clamp(0.0, 1.0);
         let edge = self.particle_px.max(1);
-        for row in 0..rows {
-            for col in 0..cols {
-                let present = self
-                    .behaviour
-                    .strength(CellPos::new(col, row), extent, progress);
+        // Only the particles this image actually overlaps. A card's image is a
+        // small window onto the field, so walking the whole grid per card would
+        // make the dissolve cost the tree's area once for every card in it.
+        let first_col = (origin.0 / edge).min(u32::from(cols));
+        let first_row = (origin.1 / edge).min(u32::from(rows));
+        let last_col = (origin.0 + canvas.width())
+            .div_ceil(edge)
+            .min(u32::from(cols));
+        let last_row = (origin.1 + canvas.height())
+            .div_ceil(edge)
+            .min(u32::from(rows));
+        for row in first_row..last_row {
+            for col in first_col..last_col {
+                let present =
+                    self.behaviour
+                        .strength(CellPos::new(col as u16, row as u16), extent, progress);
                 if present >= 1.0 {
                     continue;
                 }
-                let x0 = u32::from(col) * edge;
-                let y0 = u32::from(row) * edge;
-                sheet.scale_alpha(x0, y0, x0 + edge, y0 + edge, present);
+                // Field pixels back to this image's own. A particle straddling
+                // the image's edge is clamped to it rather than dropped, so the
+                // wave does not develop a seam at every card boundary.
+                let x0 = (col * edge).saturating_sub(origin.0);
+                let y0 = (row * edge).saturating_sub(origin.1);
+                let x1 = ((col + 1) * edge).saturating_sub(origin.0);
+                let y1 = ((row + 1) * edge).saturating_sub(origin.1);
+                canvas.scale_alpha(x0, y0, x1, y1, present);
             }
         }
     }
@@ -1531,6 +1862,49 @@ fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::workspace::Workspace;
+
+    /// The single-sheet call shape these tests were written against.
+    ///
+    /// They exercise the sheet, which publishes exactly one layer, and they are
+    /// the characterization of everything the two drawing models share —
+    /// geometry, tiers, wrapping, the fit ladder, the transition. Rewriting each
+    /// one to unwrap a list would put list handling in front of what they are
+    /// actually asserting without testing anything new, so the shim keeps them
+    /// reading the way they did. The shapes path has its own tests, which assert
+    /// the things only it can be wrong about.
+    pub(super) fn build_sheet(
+        app: &AppState,
+        cards: &[crate::app::state::WorkspaceCardArea],
+        sidebar_area: Rect,
+        cell_size: HostCellSize,
+        previous: Option<&SidebarCardLayer>,
+    ) -> SheetUpdate {
+        assert!(
+            !app.sidebar_card_shapes,
+            "the single-sheet shim was handed an app on the shapes path"
+        );
+        match build_cards(
+            app,
+            cards,
+            sidebar_area,
+            cell_size,
+            previous.map(std::slice::from_ref).unwrap_or_default(),
+        ) {
+            CardsUpdate::Unchanged => SheetUpdate::Unchanged,
+            CardsUpdate::Rebuilt(layers) => match layers.into_iter().next() {
+                Some(layer) => SheetUpdate::Rebuilt(layer),
+                None => SheetUpdate::Empty,
+            },
+            CardsUpdate::Empty => SheetUpdate::Empty,
+        }
+    }
+
+    /// [`CardsUpdate`] with the list collapsed to the sheet's one layer.
+    pub(super) enum SheetUpdate {
+        Unchanged,
+        Rebuilt(SidebarCardLayer),
+        Empty,
+    }
 
     /// A fleet of ten agents at three depths, with the real `doing` strings the
     /// fit ladder was measured against — including the one that says
@@ -1937,8 +2311,8 @@ mod tests {
             return; // No proportional face on this machine.
         }
         let sheet = app
-            .sidebar_card_layer
-            .as_ref()
+            .sidebar_card_layers
+            .first()
             .expect("compute_view drew the tree's cards");
         let signature = sheet.signature;
         assert!(sheet.rect.width > 0 && sheet.rect.height > 0);
@@ -1948,7 +2322,7 @@ mod tests {
         // cost the next real frame a re-encode and a re-upload.
         crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, area);
         assert_eq!(
-            app.sidebar_card_layer.as_ref().map(|sheet| sheet.signature),
+            app.sidebar_card_layers.first().map(|sheet| sheet.signature),
             Some(signature),
             "a pass that cannot see pixels threw away the sheet"
         );
@@ -1957,7 +2331,7 @@ mod tests {
         // with it, so nothing is left on the host to delete later.
         app.kitty_graphics_enabled = false;
         crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
-        assert!(app.sidebar_card_layer.is_none());
+        assert!(app.sidebar_card_layers.is_empty());
     }
 
     /// The sheet and the notification tray are two graphics placements on one
@@ -1987,8 +2361,8 @@ mod tests {
                 return None; // No proportional face on this machine.
             }
             let sheet = app
-                .sidebar_card_layer
-                .as_ref()
+                .sidebar_card_layers
+                .first()
                 .expect("the tree drew no cards")
                 .rect;
             let content = super::super::sidebar_content_rect(app.view.sidebar_rect);
@@ -2600,7 +2974,7 @@ mod tests {
 
 #[cfg(test)]
 mod the_sheet_carries_the_view_transition {
-    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::tests::{build_sheet, pixel_fleet_app, sidebar_rect, SheetUpdate};
     use super::*;
 
     /// Start a re-root and return the app mid-dismount, or `None` when this
@@ -2940,5 +3314,532 @@ mod the_sheet_carries_the_view_transition {
                 assert_eq!(after[i + 3], expected, "alpha at ({x},{y})");
             }
         }
+    }
+}
+
+/// The card is an object made of its own glowing outline, not a picture of a
+/// rectangle.
+///
+/// The captain diagnosed the sheet from a screenshot: *"I can tell that it is
+/// still technically the full width, and all you've done is match the background
+/// to make the card look a different shape and size, because I can see the sharp
+/// rectangular edge of the background that has not been blended with the glow."*
+/// Everything here is that sentence turned into an assertion.
+#[cfg(test)]
+mod a_card_is_its_own_shape {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+
+    /// The same fleet, drawing shapes instead of one sheet.
+    fn shape_fleet_app() -> AppState {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        app
+    }
+
+    /// The cards a build published, or `None` when this machine has no
+    /// proportional face and there is no pixel path to test.
+    fn built(app: &AppState) -> Option<Vec<SidebarCardLayer>> {
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        match build_cards(app, &cards, sidebar_rect(), app.host_cell_size, &[]) {
+            CardsUpdate::Rebuilt(layers) => Some(layers),
+            _ => None,
+        }
+    }
+
+    /// The rows that carry a card, which is what a published layer answers to.
+    fn framed(app: &AppState) -> Vec<Rect> {
+        super::super::compute_workspace_card_areas(app, sidebar_rect())
+            .into_iter()
+            .filter_map(|card| card.card_frame)
+            .filter(|frame| frame.width > 0 && frame.height > 0)
+            .collect()
+    }
+
+    /// Straight RGBA8 back out of a published layer.
+    fn decode(layer: &SidebarCardLayer) -> (u32, u32, Vec<u8>) {
+        let decoder = png::Decoder::new(layer.layer.data.as_slice());
+        let mut reader = decoder.read_info().expect("a layer that is not a PNG");
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).expect("a PNG with no frame");
+        buf.truncate(info.buffer_size());
+        (info.width, info.height, buf)
+    }
+
+    /// One card, one image, one placement.
+    ///
+    /// This is the property every queued motion item rests on: a card that can
+    /// be moved, faded or reflowed on its own has to *be* on its own first.
+    #[test]
+    fn each_card_is_its_own_placement() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        assert_eq!(
+            layers.len(),
+            framed(&app).len(),
+            "the tree published a different number of images than it has cards"
+        );
+        assert!(layers.len() > 1, "a fleet of one card cannot test this");
+        for layer in &layers {
+            assert!(!layer.layer.data.is_empty(), "a card published no pixels");
+            assert!(layer.rect.width > 0 && layer.rect.height > 0);
+        }
+
+        // And the sheet, on the same fleet, is still exactly one.
+        let sheet = pixel_fleet_app();
+        assert_eq!(
+            built(&sheet).map(|layers| layers.len()),
+            Some(1),
+            "the sheet stopped being one image for the whole tree"
+        );
+    }
+
+    /// Nothing is lit outside the card's own outline and the reach of its glow.
+    ///
+    /// This is the assertion the sheet cannot pass, and the test asserts that
+    /// too — a check that both models satisfy would be checking nothing. The
+    /// boundary is built from the row's frame, which comes from the character
+    /// layout and not from the rasteriser, so this is not the drawing code
+    /// marking its own homework.
+    #[test]
+    fn a_shape_lights_nothing_outside_its_own_glow() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let frames = framed(&app);
+        let cell_w = f32::from(app.host_cell_size.width_px as u16);
+        let cell_h = f32::from(app.host_cell_size.height_px as u16);
+
+        let mut checked = 0;
+        for (layer, frame) in layers.iter().zip(&frames) {
+            let (width, height, px) = decode(layer);
+            // The card's own box inside this image, from the row's frame.
+            let left = f32::from(frame.x.saturating_sub(layer.rect.x)) * cell_w;
+            let top = f32::from(frame.y.saturating_sub(layer.rect.y)) * cell_h;
+            let box_w = f32::from(frame.width) * cell_w;
+            let box_h = f32::from(frame.height) * cell_h;
+            // Every card's glow reaches at most `BLOOM_REACH` of the tallest a
+            // card is ever drawn, plus a pixel for the antialiasing ramp.
+            let reach = box_h * BLOOM_REACH + 1.0;
+
+            for y in 0..height {
+                for x in 0..width {
+                    if px[((y * width + x) * 4 + 3) as usize] == 0 {
+                        continue;
+                    }
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let dx = (left - fx).max(fx - (left + box_w)).max(0.0);
+                    let dy = (top - fy).max(fy - (top + box_h)).max(0.0);
+                    assert!(
+                        dx.hypot(dy) <= reach,
+                        "a shape lit a pixel {:.1} px outside its own card — that \
+                         is a painted background, not a glow",
+                        dx.hypot(dy),
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no shape drew anything to check");
+    }
+
+    /// Alpha at the four corners of the cells one card owns.
+    ///
+    /// A card is a *rounded* rect, so its own frame's corners are outside it by
+    /// the corner radius whatever else is true — which makes them the one place
+    /// that answers "is this a shape, or a rectangle painted to look like one"
+    /// on every card, at every tier, gutter or no gutter.
+    fn frame_corner_alphas(layer: &SidebarCardLayer, frame: Rect, cell: HostCellSize) -> [u8; 4] {
+        let (width, height, px) = decode(layer);
+        let left = u32::from(frame.x.saturating_sub(layer.rect.x)) * cell.width_px;
+        let top = u32::from(frame.y.saturating_sub(layer.rect.y)) * cell.height_px;
+        let right = (left + u32::from(frame.width) * cell.width_px).min(width) - 1;
+        let bottom = (top + u32::from(frame.height) * cell.height_px).min(height) - 1;
+        let at = |x: u32, y: u32| px[((y * width + x) * 4 + 3) as usize];
+        [
+            at(left, top),
+            at(right, top),
+            at(left, bottom),
+            at(right, bottom),
+        ]
+    }
+
+    /// A shape's own frame corners are not opaque.
+    ///
+    /// The card is rounded, so its corners are where a painted background gives
+    /// itself away — this is the "sharp rectangular edge of the background that
+    /// has not been blended with the glow" the captain read off a screenshot.
+    #[test]
+    fn a_shape_has_no_opaque_rectangle_behind_it() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        for (layer, frame) in layers.iter().zip(framed(&app)) {
+            for alpha in frame_corner_alphas(layer, frame, app.host_cell_size) {
+                assert!(
+                    alpha < 255,
+                    "a card's corner was fully opaque, so it is still a painted \
+                     rectangle rather than a shape"
+                );
+            }
+        }
+    }
+
+    /// The sheet's corners *are* opaque, which is what makes the test above
+    /// worth running.
+    ///
+    /// A check both models satisfied would be checking nothing. The sheet paints
+    /// its backdrop over every cell of every row, so the rectangle reaches the
+    /// corner at full alpha and the glow terminates against it.
+    #[test]
+    fn the_sheet_is_an_opaque_rectangle_and_that_is_the_bug() {
+        let app = pixel_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let opaque_corner = framed(&app)
+            .into_iter()
+            .any(|frame| frame_corner_alphas(&layers[0], frame, app.host_cell_size).contains(&255));
+        assert!(
+            opaque_corner,
+            "the sheet stopped painting a background — if that is deliberate, it \
+             has converged with the shapes path and one of the two should go"
+        );
+    }
+
+    /// Cards may overlap, because there is no box to clip.
+    ///
+    /// Their images do overlap already: each reaches a bloom's width past its own
+    /// row and onto its neighbour's. Under the sheet that overlap had to be
+    /// resolved *inside one raster* — which is exactly why the tree could only
+    /// ever be one picture. As separate placements the terminal composites them,
+    /// measured on a real Kitty and recorded in
+    /// `data/herdr-card-as-alpha-shape/blend-test/`.
+    #[test]
+    fn shapes_overlap_instead_of_tiling() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let overlaps = layers.iter().enumerate().any(|(i, a)| {
+            layers.iter().skip(i + 1).any(|b| {
+                a.rect.x < b.rect.x + b.rect.width
+                    && b.rect.x < a.rect.x + a.rect.width
+                    && a.rect.y < b.rect.y + b.rect.height
+                    && b.rect.y < a.rect.y + a.rect.height
+            })
+        });
+        assert!(
+            overlaps,
+            "no two cards overlapped, so nothing here proves they can"
+        );
+    }
+
+    /// A card whose content did not change is not redrawn when a sibling's did.
+    ///
+    /// The whole point of cutting the tree into objects: moving one card must
+    /// cost one card. Under the sheet any change re-rasterised and re-encoded the
+    /// entire tree, which is what made the queued motion work unaffordable.
+    #[test]
+    fn changing_one_card_leaves_its_siblings_untouched() {
+        let app = shape_fleet_app();
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let CardsUpdate::Rebuilt(first) =
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[])
+        else {
+            return; // No face on this machine.
+        };
+        assert!(matches!(
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &first),
+            CardsUpdate::Unchanged
+        ));
+
+        // Change what exactly one card says, and nothing else about the tree.
+        let mut moved = app;
+        let pane = cards
+            .iter()
+            .find_map(|card| card.agent.as_ref())
+            .expect("the fleet has no agent card to change");
+        let terminal_id = moved.workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .find(|(id, _)| **id == pane.pane_id)
+            .map(|(_, state)| state.attached_terminal_id.clone())
+            .expect("the changed pane has no terminal");
+        let now = moved.state_age_now;
+        moved
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the changed terminal went away")
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([(
+                    "doing".to_string(),
+                    Some("Rewiring the card's own outline".to_string()),
+                )]),
+                None,
+                now,
+            );
+        let CardsUpdate::Rebuilt(second) =
+            build_cards(&moved, &cards, sidebar_rect(), moved.host_cell_size, &first)
+        else {
+            panic!("a tree whose card changed did not rebuild");
+        };
+        assert_eq!(first.len(), second.len());
+
+        let changed = first
+            .iter()
+            .zip(&second)
+            .filter(|(a, b)| a.signature != b.signature)
+            .count();
+        assert!(changed > 0, "nothing rebuilt, so the cache is a freeze");
+        assert!(
+            changed < first.len(),
+            "every card rebuilt because one of them changed — that is the sheet's \
+             cost with more steps"
+        );
+        for (a, b) in first.iter().zip(&second) {
+            if a.signature == b.signature {
+                assert_eq!(
+                    a.layer.data_fingerprint, b.layer.data_fingerprint,
+                    "an unchanged card was re-encoded anyway"
+                );
+            }
+        }
+    }
+
+    /// A card's glow stops at the notification tray, exactly as the sheet's did.
+    ///
+    /// Both publish at `z: 0` and the tray's badges are their own layer, so a
+    /// card reaching into the tray would put its bloom on the badges with no
+    /// defined order between them. Cutting the sheet into cards is where that
+    /// clamp is easiest to lose: it used to be applied once, to the sheet, and is
+    /// now applied to every card.
+    #[test]
+    fn no_shape_reaches_into_the_notification_tray() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 100, 46);
+        let mut app = shape_fleet_app();
+        app.sidebar_width = 42;
+        app.sidebar_signal_tray.enabled = true;
+        let cell_size = app.host_cell_size;
+        crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
+        if !is_available(
+            &app,
+            super::super::row_fold_width(&app, app.view.sidebar_rect),
+        ) {
+            return; // No face on this machine.
+        }
+        let content = super::super::sidebar_content_rect(app.view.sidebar_rect);
+        let tray = super::super::tray::tray_rect(&app, content);
+        assert!(tray.height > 0, "the tray is off, so this tests nothing");
+        assert!(
+            !app.sidebar_card_layers.is_empty(),
+            "the tree drew no cards"
+        );
+        for layer in &app.sidebar_card_layers {
+            assert!(
+                layer.rect.y + layer.rect.height <= tray.y,
+                "a card's image reached into the tray at row {}",
+                tray.y
+            );
+        }
+    }
+
+    /// Below the card shell's own width the panel is characters, shapes or not.
+    ///
+    /// The fallback is not a property of the drawing model: a row too narrow for
+    /// a card is a bare styled line, and a shape drawn over it would be a third
+    /// layout. Both paths read the same [`is_available`].
+    #[test]
+    fn a_panel_too_narrow_for_a_card_gets_no_shapes() {
+        let mut app = shape_fleet_app();
+        app.sidebar_width = MIN_FOLD_WIDTH;
+        let narrow = Rect::new(0, 0, MIN_FOLD_WIDTH, 46);
+        assert!(
+            !is_available(&app, super::super::row_fold_width(&app, narrow)),
+            "a panel narrower than the card shell still tried to draw pixels"
+        );
+        assert!(
+            !shape_covers_row(&app, super::super::row_fold_width(&app, narrow)),
+            "a narrow panel suppressed its character cards and drew no shapes, \
+             which is a blank row"
+        );
+        let cards = super::super::compute_workspace_card_areas(&app, narrow);
+        assert!(matches!(
+            build_cards(&app, &cards, narrow, app.host_cell_size, &[]),
+            CardsUpdate::Empty
+        ));
+    }
+
+    /// Graphics off is the character path, shapes flag or not.
+    #[test]
+    fn graphics_off_draws_no_shapes_and_hides_no_characters() {
+        let mut app = shape_fleet_app();
+        app.kitty_graphics_enabled = false;
+        let fold = super::super::row_fold_width(&app, sidebar_rect());
+        assert!(!is_available(&app, fold));
+        assert!(
+            !shape_covers_row(&app, fold),
+            "the character cards were suppressed with no shape to replace them"
+        );
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        assert!(matches!(
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[]),
+            CardsUpdate::Empty
+        ));
+    }
+
+    /// Characters are suppressed only where a shape actually got drawn.
+    ///
+    /// The suppression and the artwork are decided in two different places — the
+    /// renderer asks [`shape_covers_row`], the artwork comes out of
+    /// [`build_cards`] — and if those two ever disagree in this direction the
+    /// tree renders blank: no character card, and no pixel card over it either.
+    /// It is the one failure this change can produce that is worse than the bug
+    /// it fixes, so it is asserted rather than reasoned about.
+    #[test]
+    fn characters_are_never_suppressed_without_a_shape_to_replace_them() {
+        let app = shape_fleet_app();
+        let fold = super::super::row_fold_width(&app, sidebar_rect());
+
+        // Nothing published yet — the state a frame is in before its first
+        // build, and the state it falls back to when a build fails.
+        assert!(app.sidebar_card_layers.is_empty());
+        assert!(
+            !shape_covers_row(&app, fold),
+            "the character cards were suppressed before any shape existed"
+        );
+
+        let mut drawn = shape_fleet_app();
+        let cards = super::super::compute_workspace_card_areas(&drawn, sidebar_rect());
+        let CardsUpdate::Rebuilt(layers) =
+            build_cards(&drawn, &cards, sidebar_rect(), drawn.host_cell_size, &[])
+        else {
+            return; // No face on this machine.
+        };
+        drawn.sidebar_card_layers = layers;
+        assert!(
+            shape_covers_row(&drawn, fold),
+            "shapes were drawn and the character cards were drawn under them too"
+        );
+
+        // And losing the artwork puts the characters straight back.
+        drawn.sidebar_card_layers.clear();
+        assert!(!shape_covers_row(&drawn, fold));
+    }
+
+    /// Turning the flag on moves no row and changes no tier.
+    ///
+    /// The captain paid for the 68 px base, the 65% tier step, D-MID density and
+    /// two-line titles. This is a change to what a card's *edges* do, and the
+    /// layout has to come out the same on both sides of the flag.
+    #[test]
+    fn the_shapes_path_moves_nothing_the_layout_settled() {
+        let sheet = pixel_fleet_app();
+        let shapes = shape_fleet_app();
+        // Geometry only: two apps built in one test hand out different pane ids,
+        // and a pane id is not something the drawing model has any business
+        // being compared on.
+        let geometry = |app: &AppState| {
+            super::super::compute_workspace_card_areas(app, sidebar_rect())
+                .into_iter()
+                .map(|card| (card.rect, card.card_frame, card.entry_idx))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            geometry(&sheet),
+            geometry(&shapes),
+            "the drawing model moved the rows it was only supposed to redraw"
+        );
+        for depth in 0..3u8 {
+            let fold = super::super::row_fold_width(&sheet, sidebar_rect());
+            assert_eq!(
+                row_height_cells(&sheet, depth, fold),
+                row_height_cells(&shapes, depth, fold),
+                "tier {depth} changed height with the drawing model"
+            );
+        }
+    }
+}
+
+/// Writes the real artwork out so a real terminal can be asked what it does
+/// with it.
+///
+/// Nothing here asserts: the assertions live in [`super::a_card_is_its_own_shape`]
+/// and they are what CI runs. This exists because the claim being made is about
+/// *pixels on a screen* — that a card's glow falls off into what is behind it
+/// instead of stopping at a rectangle, and that two overlapping cards blend
+/// rather than clip — and the only honest way to check that is to put the cards
+/// a real Herdr would send into a real terminal and look.
+///
+/// Off unless `HERDR_SHAPE_CAPTURE_DIR` is set, exactly like [`dissolve_capture`].
+/// Writes `shape-NN.png` per card, `sheet.png` for the same fleet on the other
+/// path, and `manifest.tsv` giving each image the cell rect it is placed at, so
+/// the harness in `data/herdr-card-as-alpha-shape/` can replay them.
+#[cfg(test)]
+mod shape_capture {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+    use std::fmt::Write as _;
+
+    #[test]
+    fn shape_capture() {
+        let out = std::env::var("HERDR_SHAPE_CAPTURE_DIR").unwrap_or_default();
+        if out.is_empty() {
+            println!("SKIP: set HERDR_SHAPE_CAPTURE_DIR");
+            return;
+        }
+        let rect = sidebar_rect();
+        let mut manifest = String::from("file\tx\ty\tw\th\tcell_w\tcell_h\n");
+
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        let cell = app.host_cell_size;
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let CardsUpdate::Rebuilt(layers) = build_cards(&app, &cards, rect, cell, &[]) else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        for (index, layer) in layers.iter().enumerate() {
+            let name = format!("shape-{index:02}.png");
+            std::fs::write(format!("{out}/{name}"), &layer.layer.data).expect("writes");
+            let _ = writeln!(
+                manifest,
+                "{name}\t{}\t{}\t{}\t{}\t{}\t{}",
+                layer.rect.x,
+                layer.rect.y,
+                layer.rect.width,
+                layer.rect.height,
+                cell.width_px,
+                cell.height_px,
+            );
+        }
+
+        // The same fleet on the sheet, so the two can be put side by side and
+        // the difference is the feature rather than a description of it.
+        let sheet_app = pixel_fleet_app();
+        let sheet_cards = super::super::compute_workspace_card_areas(&sheet_app, rect);
+        if let CardsUpdate::Rebuilt(sheet) = build_cards(&sheet_app, &sheet_cards, rect, cell, &[])
+        {
+            std::fs::write(format!("{out}/sheet.png"), &sheet[0].layer.data).expect("writes");
+            let _ = writeln!(
+                manifest,
+                "sheet.png\t{}\t{}\t{}\t{}\t{}\t{}",
+                sheet[0].rect.x,
+                sheet[0].rect.y,
+                sheet[0].rect.width,
+                sheet[0].rect.height,
+                cell.width_px,
+                cell.height_px,
+            );
+        }
+
+        std::fs::write(format!("{out}/manifest.tsv"), manifest).expect("writes");
+        println!("wrote {} shapes to {out}", layers.len());
     }
 }

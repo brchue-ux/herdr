@@ -450,6 +450,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # usual system font directories; when nothing is found the sidebar keeps its
 # character cards. Read once at startup.
 # sidebar_card_font = ""
+# Draw each sidebar card as its own transparent shape instead of as one opaque
+# sheet covering the whole tree, so a card's glow falls off into what is behind
+# it and two overlapping cards blend instead of clipping. Requires
+# kitty_graphics.
+# sidebar_card_shapes = false
 # Save recent pane screen history across full server restarts.
 pane_history = false
 # While prefix mode is active, temporarily switch the host input source to

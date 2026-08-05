@@ -744,6 +744,22 @@ The path is read once at startup. Below 34 columns, with `kitty_graphics = false
 or on a direct attach — where graphics are disabled anyway — the sidebar renders
 its character cards exactly as before.
 
+By default the tree is drawn as one image with each row's background painted into
+it, so a card's glow stops at that image's rectangle rather than falling off into
+what is behind it. Draw each card as its own transparent shape instead with:
+
+```toml
+[experimental]
+kitty_graphics = true
+sidebar_card_shapes = true
+```
+
+Each card then becomes its own image at its own placement — transparent everywhere
+outside its own glow — so nothing has a rectangular edge to show, and two cards
+that overlap have their glows blended by the terminal rather than one clipping the
+other. The layout is unchanged: same rows, same tiers, same titles. The character
+fallback is unchanged too, and applies to both.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:

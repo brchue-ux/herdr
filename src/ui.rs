@@ -236,43 +236,43 @@ fn desktop_tab_bar_and_terminal_area(
     }
 }
 
-/// Rebuild the sidebar's card sheet when its content moved, and drop it when
-/// the pixel path is not live.
+/// Rebuild the sidebar's cards when their content moved, and drop them when the
+/// pixel path is not live.
 ///
-/// The sheet is left exactly as it is when nothing changed:
-/// [`sidebar::image_card::build_sheet`] hashes the cards it would draw and
-/// returns `None` when that hash matches the sheet already held, so a fleet
+/// They are left exactly as they are when nothing changed:
+/// [`sidebar::image_card::build_cards`] hashes the cards it would draw and
+/// returns `Unchanged` when that hash matches what is already held, so a fleet
 /// whose cards change about once every ninety seconds rasterises about that
 /// often rather than on every frame.
-fn update_sidebar_card_layer(
+fn update_sidebar_card_layers(
     app: &mut AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
     if !app.kitty_graphics_enabled {
-        app.sidebar_card_layer = None;
+        app.sidebar_card_layers.clear();
         return;
     }
     if !cell_size.is_known() {
         // A pass that does not know the host's cell size cannot speak for its
         // pixels — a virtual client rendering to a buffer, or the headless
-        // server sizing a background frame. Leave the foreground client's sheet
-        // exactly as it is rather than clearing a picture this pass has no way
+        // server sizing a background frame. Leave the foreground client's cards
+        // exactly as they are rather than clearing artwork this pass has no way
         // to redraw, which would make every background frame cost the
         // foreground one a re-encode and a re-upload.
         return;
     }
-    match sidebar::image_card::build_sheet(
+    match sidebar::image_card::build_cards(
         app,
         cards,
         sidebar_area,
         cell_size,
-        app.sidebar_card_layer.as_ref(),
+        &app.sidebar_card_layers,
     ) {
-        sidebar::image_card::SheetUpdate::Unchanged => {}
-        sidebar::image_card::SheetUpdate::Rebuilt(layer) => app.sidebar_card_layer = Some(layer),
-        sidebar::image_card::SheetUpdate::Empty => app.sidebar_card_layer = None,
+        sidebar::image_card::CardsUpdate::Unchanged => {}
+        sidebar::image_card::CardsUpdate::Rebuilt(layers) => app.sidebar_card_layers = layers,
+        sidebar::image_card::CardsUpdate::Empty => app.sidebar_card_layers.clear(),
     }
 }
 
@@ -324,7 +324,7 @@ fn compute_view_internal(
     // Here rather than in `render` because it is a mutation, and after the card
     // areas because it draws into exactly those rects: the pixel card never
     // decides its own geometry.
-    update_sidebar_card_layer(app, &workspace_card_areas, sidebar_area, cell_size);
+    update_sidebar_card_layers(app, &workspace_card_areas, sidebar_area, cell_size);
 
     let tab_label_decor = TabLabelDecor::from_state(app);
     let tab_bar_view = app
