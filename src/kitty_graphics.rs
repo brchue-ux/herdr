@@ -835,8 +835,20 @@ fn surface_layer_placement_targets(
         // One entry per card under the shapes path and exactly one under the
         // sheet path, each at its own slot, so a card that changed is the only
         // thing re-uploaded and a card that went away is the only thing deleted.
+        //
+        // Gated on the pass that is about to be encoded having built them, and
+        // not on this client having a cell size of its own. The layers are the
+        // foreground client's: a pass that left them alone laid its rows out
+        // without them and drew its character cards, so sending it the images
+        // would stand a transparent shape over a border, a chip and a title a
+        // few pixels off — the doubling `image_card::shape_covers_row` exists
+        // to prevent, arrived at from the other side. Only the cards are
+        // withheld; every other surface this client is entitled to still flows.
         .chain(
-            app.sidebar_card_layers
+            app.view
+                .sidebar_card_layers_published
+                .then_some(app.sidebar_card_layers.as_slice())
+                .unwrap_or_default()
                 .iter()
                 .enumerate()
                 .map(|(slot, cards)| {
@@ -1753,6 +1765,7 @@ mod tests {
             },
         );
         app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(1, 2, 20, 12))];
+        app.view.sidebar_card_layers_published = true;
 
         let placements = collect_visible_placements(
             &app,
@@ -1804,6 +1817,7 @@ mod tests {
         app.active = None;
         app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
         app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(0, 1, 24, 10))];
+        app.view.sidebar_card_layers_published = true;
 
         assert!(has_visible_pane_graphics(
             &app,
@@ -1819,6 +1833,7 @@ mod tests {
         app.mode = Mode::Terminal;
         app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
         app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(0, 1, 24, 10))];
+        app.view.sidebar_card_layers_published = true;
 
         let mut cache = HostGraphicsCache::default();
         let runtimes = TerminalRuntimeRegistry::new();

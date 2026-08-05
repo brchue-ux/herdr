@@ -211,12 +211,17 @@ pub(crate) fn is_available(app: &AppState, fold_width: u16) -> bool {
 /// foreground's artwork alone and is then sent no images at all. Reading the
 /// shared layers here would suppress that client's character cards in favour of
 /// pixels it never receives, drawing the tree as bare connectors. So the answer
-/// comes off `ViewState::sidebar_card_shapes_published`, which the pass that
-/// built the cards recorded for itself.
+/// comes off `ViewState::sidebar_card_layers_published`, which the pass that
+/// built the cards recorded for itself — the same field
+/// `kitty_graphics::surface_layer_placement_targets` reads to decide which
+/// passes are sent the images, so a pass cannot draw characters and be sent
+/// shapes to double them either.
 ///
 /// [`MAX_IMAGE_PIXELS`]: Rasteriser::rasterise
 pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
-    app.view.sidebar_card_shapes_published && is_available(app, fold_width)
+    app.view.sidebar_card_layers_published
+        && app.sidebar_card_shapes
+        && is_available(app, fold_width)
 }
 
 /// The tier a row at `depth` is drawn at.
@@ -3775,7 +3780,7 @@ mod a_card_is_its_own_shape {
         app.sidebar_width = MIN_FOLD_WIDTH;
         // Claimed by the pass, so the veto under test is the width and not the
         // absence of artwork.
-        app.view.sidebar_card_shapes_published = true;
+        app.view.sidebar_card_layers_published = true;
         let narrow = Rect::new(0, 0, MIN_FOLD_WIDTH, 46);
         assert!(
             !is_available(&app, super::super::row_fold_width(&app, narrow)),
@@ -3798,7 +3803,7 @@ mod a_card_is_its_own_shape {
     fn graphics_off_draws_no_shapes_and_hides_no_characters() {
         let mut app = shape_fleet_app();
         app.kitty_graphics_enabled = false;
-        app.view.sidebar_card_shapes_published = true;
+        app.view.sidebar_card_layers_published = true;
         let fold = super::super::row_fold_width(&app, sidebar_rect());
         assert!(!is_available(&app, fold));
         assert!(
@@ -3902,6 +3907,61 @@ mod a_card_is_its_own_shape {
             ),
             "a client that is sent no images had its character cards suppressed \
              anyway, which draws the tree as bare connectors"
+        );
+    }
+
+    /// And a pass that drew its character cards is sent no card images.
+    ///
+    /// The mirror of the case above, and the one a second *Kitty* client hits:
+    /// its own cell size is known and graphics are on, so the encode side used
+    /// to send it the foreground's shapes even though its own pass had drawn the
+    /// character cards — a transparent shape standing over a border, a chip and
+    /// a title a few pixels off. Both halves read the one pass fact, so the two
+    /// cannot disagree in either direction.
+    #[test]
+    fn a_pass_that_drew_characters_is_sent_no_card_graphics() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut app = shape_fleet_app();
+        app.mode = crate::app::Mode::Terminal;
+        let Some(fold) = shape_pass(&mut app, &runtimes) else {
+            return; // No face on this machine.
+        };
+        assert!(shape_covers_row(&app, fold));
+
+        // The foreground client: its pass published, so it is sent the shapes.
+        let cell_size = app.host_cell_size;
+        let mut foreground = crate::kitty_graphics::HostGraphicsCache::default();
+        let bytes = crate::kitty_graphics::encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            app.view.tab_surface(),
+            cell_size,
+            &mut foreground,
+        );
+        assert!(
+            !bytes.is_empty() && !foreground.is_empty(),
+            "the client whose pass drew the shapes was sent none of them"
+        );
+
+        // A second app client with graphics on and a cell size of its own, whose
+        // frame was sized through the non-resizing path.
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, pass_area());
+        assert!(!shape_covers_row(
+            &app,
+            super::super::row_fold_width(&app, app.view.sidebar_rect)
+        ));
+        let mut second = crate::kitty_graphics::HostGraphicsCache::default();
+        let bytes = crate::kitty_graphics::encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            app.view.tab_surface(),
+            cell_size,
+            &mut second,
+        );
+        assert!(
+            bytes.is_empty() && second.is_empty(),
+            "a client that drew its character cards was sent the shapes too, \
+             which doubles every border, chip and title a few pixels off"
         );
     }
 

@@ -245,11 +245,11 @@ fn desktop_tab_bar_and_terminal_area(
 /// whose cards change about once every ninety seconds rasterises about that
 /// often rather than on every frame.
 ///
-/// Returns whether *this* pass published transparent shapes over the tree, which
-/// is what `ViewState::sidebar_card_shapes_published` carries to the renderer. A
-/// pass that leaves the foreground client's cards alone answers `false`: the
-/// artwork exists, but not for this pass, and the renderer must keep drawing the
-/// character cards it is going to be sent instead.
+/// Returns whether *this* pass published card artwork, which is what
+/// `ViewState::sidebar_card_layers_published` carries to both halves of the
+/// pixel path. A pass that leaves the foreground client's cards alone answers
+/// `false`: the artwork exists, but not for this pass, so that pass keeps
+/// drawing its character cards and is sent none of the images.
 fn update_sidebar_card_layers(
     app: &mut AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
@@ -282,7 +282,7 @@ fn update_sidebar_card_layers(
     }
     // Published, not merely intended: a build that produced nothing falls back
     // to the character cards rather than blanking the tree.
-    app.sidebar_card_shapes && !app.sidebar_card_layers.is_empty()
+    !app.sidebar_card_layers.is_empty()
 }
 
 fn compute_view_internal(
@@ -333,7 +333,7 @@ fn compute_view_internal(
     // Here rather than in `render` because it is a mutation, and after the card
     // areas because it draws into exactly those rects: the pixel card never
     // decides its own geometry.
-    let sidebar_card_shapes_published =
+    let sidebar_card_layers_published =
         update_sidebar_card_layers(app, &workspace_card_areas, sidebar_area, cell_size);
 
     let tab_label_decor = TabLabelDecor::from_state(app);
@@ -385,7 +385,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
-        sidebar_card_shapes_published,
+        sidebar_card_layers_published,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -449,7 +449,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
-        sidebar_card_shapes_published: false,
+        sidebar_card_layers_published: false,
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
         tab_scroll_left_hit_area: Rect::default(),
