@@ -210,6 +210,11 @@ impl App {
                 self.query_host_terminal_theme();
                 self.set_host_terminal_appearance(appearance, true)
             }
+            crate::raw_input::RawInputEvent::HostCellSize(cell_size) => {
+                let changed = self.state.host_reported_cell_size != Some(cell_size);
+                self.state.host_reported_cell_size = Some(cell_size);
+                changed
+            }
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
         self.sync_prefix_input_source(previous_mode);

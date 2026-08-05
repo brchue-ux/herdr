@@ -63,6 +63,23 @@ pub(super) struct CardFont {
     source: String,
 }
 
+/// Every candidate face that exists on this machine.
+///
+/// Tests measure against all of them rather than against `card_font(None)`.
+/// The face is whatever the machine happens to have, and the faces differ in
+/// width by about 25% — `DejaVuSans` sets the longest real title 16% wider than
+/// `UbuntuSans` — so a fit test that measured only the first candidate present
+/// passed on a developer box with the Ubuntu fonts installed and failed on CI,
+/// which has DejaVu. Anything asserting that text fits has to face the widest
+/// face the machine could pick, not the one it happened to pick.
+#[cfg(test)]
+pub(super) fn all_available_faces() -> Vec<(&'static str, CardFont)> {
+    CANDIDATES
+        .iter()
+        .filter_map(|path| CardFont::load(path).map(|font| (*path, font)))
+        .collect()
+}
+
 impl CardFont {
     fn load(path: &str) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;

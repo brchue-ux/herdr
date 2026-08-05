@@ -9,6 +9,16 @@ impl App {
         let _ = std::io::stdout().flush();
     }
 
+    /// Asks the host how big one of its cells is. See
+    /// [`crate::kitty_graphics::HOST_CELL_SIZE_QUERY_SEQUENCE`].
+    pub(super) fn query_host_cell_size(&self) {
+        use std::io::Write;
+
+        let query = crate::kitty_graphics::HOST_CELL_SIZE_QUERY_SEQUENCE;
+        let _ = std::io::stdout().write_all(query.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
+
     pub(super) fn update_host_terminal_theme(
         &mut self,
         kind: crate::terminal_theme::DefaultColorKind,

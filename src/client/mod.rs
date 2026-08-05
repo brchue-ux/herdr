@@ -16,7 +16,7 @@ mod input;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1332,6 +1332,14 @@ async fn run_client_loop(
         query_host_terminal_theme();
     }
 
+    // Only when graphics are on, and only when this connection renders the app:
+    // nothing else in Herdr needs a cell size, and a direct pane attach must not
+    // put a query the child did not write into the child's own input stream.
+    let will_query_host_cell_size = state.attach_escape.is_none() && state.kitty_graphics_enabled;
+    if will_query_host_cell_size {
+        query_host_cell_size();
+    }
+
     // Spawn the resize poller thread.
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
@@ -1426,6 +1434,11 @@ async fn run_client_loop(
                     if crate::raw_input::events_require_host_terminal_theme_query(&events) {
                         query_host_terminal_theme();
                     }
+                    // Recorded here rather than forwarded: the server is told
+                    // through the resize path, which is the one message that
+                    // already carries a cell size, so the server has exactly one
+                    // way to learn it instead of two that can disagree.
+                    record_any_host_cell_size(&events);
                     data
                 };
                 if should_bridge_clipboard_image_paste(
@@ -1504,6 +1517,14 @@ async fn run_client_loop(
                 state.reported_size = (new_cols, new_rows);
                 // Resizing invalidates the host-side blit baseline.
                 state.request_repaint();
+                // A window dragged onto a display with a different scale keeps
+                // its column count and changes its cell, so a resize is the one
+                // moment worth asking again. Sent from here rather than from the
+                // poll thread because this loop owns stdout; the query converges
+                // because an unchanged answer reports no further resize.
+                if will_query_host_cell_size {
+                    query_host_cell_size();
+                }
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -2082,23 +2103,79 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Resize polling
 // ---------------------------------------------------------------------------
 
+/// The cell size the host answered `CSI 16 t` with, once it has answered.
+///
+/// A static rather than a field on the client's state because the two things
+/// that need it are on opposite sides of the client: the input loop learns it,
+/// and the resize poll thread — which owns no reference to that loop — is what
+/// tells the server. Packed into one word so a reader can never observe a width
+/// from one report beside a height from another.
+static HOST_REPORTED_CELL_SIZE: AtomicU64 = AtomicU64::new(0);
+
+fn record_host_cell_size(cell_size: crate::kitty_graphics::HostCellSize) {
+    let packed = (u64::from(cell_size.width_px) << 32) | u64::from(cell_size.height_px);
+    HOST_REPORTED_CELL_SIZE.store(packed, Ordering::Release);
+}
+
+fn host_reported_cell_size() -> Option<crate::kitty_graphics::HostCellSize> {
+    let packed = HOST_REPORTED_CELL_SIZE.load(Ordering::Acquire);
+    if packed == 0 {
+        return None;
+    }
+    Some(crate::kitty_graphics::HostCellSize {
+        width_px: (packed >> 32) as u32,
+        height_px: (packed & 0xffff_ffff) as u32,
+    })
+}
+
+/// Take the host's cell-size report off a batch of raw input events, if it
+/// carried one.
+///
+/// Both platforms need this and neither can share the other's plumbing: on Unix
+/// the events are parsed in the main loop, and on Windows they are parsed in the
+/// reader thread and filtered into `ClientInputEvent`s — which a cell size is
+/// not, so it has to be taken before that filter runs or it is simply dropped.
+/// One function so the two cannot diverge, and so neither is dead code.
+fn record_any_host_cell_size(events: &[crate::raw_input::RawInputEvent]) {
+    if let Some(cell_size) = crate::raw_input::events_report_host_cell_size(events) {
+        record_host_cell_size(cell_size);
+    }
+}
+
+fn query_host_cell_size() {
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(crate::kitty_graphics::HOST_CELL_SIZE_QUERY_SEQUENCE.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// The terminal's size in columns and rows, and how big one cell of it is.
+///
+/// The cell comes from the host's own `CSI 16 t` answer when there is one, and
+/// only from the pty's pixel fields when there is not. That order is the whole
+/// point: the pty fields are a division of two numbers the terminal is not
+/// obliged to fill in, and a wrong-but-nonzero answer from them is indetectable
+/// downstream — it is simply a pixel space the card gets rasterised into and
+/// the terminal then rescales, which is what put a 2-pixel cell on a 3440-wide
+/// window. `is_plausible` rejects that shape; the fallback is a coherent cell.
 fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !kitty_graphics_enabled {
         return (cols, rows, 0, 0);
     }
-    let Ok(size) = crossterm::terminal::window_size() else {
-        return (cols, rows, 8, 16);
-    };
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return (cols, rows, 8, 16);
-    }
-    (
-        cols,
-        rows,
-        (size.width as u32 / size.columns as u32).max(1),
-        (size.height as u32 / size.rows as u32).max(1),
-    )
+    let cell = host_reported_cell_size()
+        .or_else(|| {
+            let size = crossterm::terminal::window_size().ok()?;
+            if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
+                return None;
+            }
+            Some(crate::kitty_graphics::HostCellSize {
+                width_px: (size.width as u32 / size.columns as u32).max(1),
+                height_px: (size.height as u32 / size.rows as u32).max(1),
+            })
+        })
+        .unwrap_or(crate::kitty_graphics::HostCellSize::FALLBACK)
+        .or_fallback();
+    (cols, rows, cell.width_px, cell.height_px)
 }
 
 /// Reports polled changes and signalled resizes that return to the same size.
@@ -2177,6 +2254,47 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    /// The host's cell-size report is not an input event, and both platforms
+    /// have a filter that would drop it. Taking it is what turns a terminal
+    /// that answers `CSI 16 t` into a card drawn at the right size — on Windows
+    /// especially, where `crossterm::terminal::window_size()` is unimplemented
+    /// and this is the only source of a real cell there is.
+    #[test]
+    fn a_cell_size_report_is_taken_off_a_batch_of_raw_input() {
+        let reported = crate::kitty_graphics::HostCellSize {
+            width_px: 11,
+            height_px: 23,
+        };
+        record_any_host_cell_size(&[
+            crate::raw_input::RawInputEvent::OuterFocusGained,
+            crate::raw_input::RawInputEvent::HostCellSize(reported),
+        ]);
+        assert_eq!(host_reported_cell_size(), Some(reported));
+
+        // A batch carrying none leaves the last one standing rather than
+        // clearing it: the terminal answers once and resizes many times.
+        record_any_host_cell_size(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert_eq!(host_reported_cell_size(), Some(reported));
+    }
+
+    /// And once taken, it outranks the pty division in the geometry the client
+    /// reports to the server.
+    #[test]
+    fn a_reported_cell_size_outranks_the_pty_division() {
+        let reported = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        record_host_cell_size(reported);
+        let (_, _, width_px, height_px) = current_terminal_geometry(true);
+        assert_eq!((width_px, height_px), (9, 18));
+        // Graphics off means the server is told nothing about pixels at all.
+        assert_eq!(current_terminal_geometry(false), {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            (cols, rows, 0, 0)
+        });
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

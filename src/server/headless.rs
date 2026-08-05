@@ -1074,9 +1074,14 @@ impl HeadlessServer {
 
         let terminal_size = client.terminal_size;
         let outer_terminal_focus = client.outer_terminal_focus;
+        // Plausible, not merely nonzero. A client that could not measure its
+        // cell sends an arithmetic guess, and an implausible one rasterises the
+        // sidebar's cards into a pixel space the terminal then rescales — which
+        // is invisible here and looks like a broken card on the screen. Falling
+        // back to a coherent cell keeps that failure to a soft rescale.
         let host_cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known()
         {
-            client.cell_size
+            client.cell_size.or_fallback()
         } else {
             crate::kitty_graphics::HostCellSize::default()
         };

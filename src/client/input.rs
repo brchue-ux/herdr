@@ -345,6 +345,12 @@ fn send_windows_raw_events(
     event_tx: &mpsc::Sender<ClientLoopEvent>,
 ) -> bool {
     let raw_event_count = events.len();
+    // Taken here, before the filter, because the host's cell size is not an
+    // input event and has nowhere to go once these become `ClientInputEvent`s.
+    // It matters more on Windows than anywhere else: `window_size()` is
+    // unimplemented there, so the terminal's own answer is the *only* way this
+    // client ever learns a real cell rather than the fallback.
+    super::record_any_host_cell_size(&events);
     let events = events
         .into_iter()
         .filter_map(windows_client_input_event_from_raw)
@@ -404,6 +410,9 @@ fn windows_client_input_event_from_raw(
         crate::raw_input::RawInputEvent::HostDefaultColor { .. }
         | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
         | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
+        // Answered to the client, not to the app: it reaches the server as the
+        // cell size on the next resize rather than as an input event.
+        | crate::raw_input::RawInputEvent::HostCellSize(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }
