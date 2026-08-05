@@ -8,6 +8,7 @@ import {
   gitTreesEqual,
   listDocumentationPaths,
   resolveCommit,
+  resolveCommitIfPresent,
 } from './docs-snapshot.mjs';
 
 const websiteDir = dirname(fileURLToPath(import.meta.url));
@@ -157,8 +158,16 @@ export async function checkVersions() {
       if (!/^[0-9a-f]{40}$/.test(entry.commit)) {
         throw new Error(`docs version ${entry.version} has invalid commit ${entry.commit}`);
       }
-      const taggedCommit = resolveCommit(git, entry.tag);
-      if (taggedCommit !== entry.commit) {
+      // A release tag is not in every checkout that carries the release commit: a fork
+      // clone has the history without the upstream tags. Only the tag can prove that it
+      // still points at the recorded commit, so verify it when it resolves and say so
+      // when it does not, rather than failing a checkout that never had the tag.
+      const taggedCommit = resolveCommitIfPresent(git, entry.tag);
+      if (!taggedCommit) {
+        process.stdout.write(
+          `docs version ${entry.version} tag ${entry.tag} is absent from this checkout; provenance unverified\n`,
+        );
+      } else if (taggedCommit !== entry.commit) {
         throw new Error(
           `docs version ${entry.version} tag ${entry.tag} moved from ${entry.commit} to ${taggedCommit}`,
         );

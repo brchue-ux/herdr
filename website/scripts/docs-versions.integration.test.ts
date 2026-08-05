@@ -152,6 +152,13 @@ describe('documentation release publishing', () => {
     await rm(linkedPage);
     runScript(root, ['check']);
 
+    const publishedCommit = JSON.parse(await read(root, 'docs/versions/manifest.json'))
+      .versions[0].commit;
+    git(root, ['tag', '-d', 'v1.0.0']);
+    expect(runScript(root, ['check'])).toContain('v1.0.0 is absent from this checkout');
+    git(root, ['tag', 'v1.0.0', publishedCommit]);
+    runScript(root, ['check']);
+
     delete archivedManifest.versions[0].commit;
     await write(root, 'docs/versions/manifest.json', `${JSON.stringify(archivedManifest)}\n`);
     expect(() => runScript(root, ['check'])).toThrow();
@@ -173,8 +180,9 @@ function git(root: string, args: string[]) {
 }
 
 function runScript(root: string, args: string[]) {
-  execFileSync('node', [script, ...args], {
+  return execFileSync('node', [script, ...args], {
     cwd: root,
+    encoding: 'utf8',
     env: { ...process.env, HERDR_DOCS_REPO_ROOT: root },
     stdio: 'pipe',
   });
