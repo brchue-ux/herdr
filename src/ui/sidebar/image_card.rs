@@ -556,6 +556,17 @@ impl BloomField {
     }
 }
 
+/// Padding inside the state chip, each side, as a multiple of its type size.
+///
+/// Trimmed from 0.75 in the reality pass. The chip is the single widest thing
+/// competing with the title for a narrow card's one horizontal budget — wider
+/// than both pads and the gap put together — so its own air is the first place
+/// to look when a real title will not fit.
+const CHIP_SIDE_PAD: f32 = 0.55;
+
+/// Gap between the chip and the text column, as a multiple of the card's pad.
+const CHIP_GAP_MUL: f32 = 0.5;
+
 /// Where a card's ink may go, in pixels from the card's own left edge.
 ///
 /// Split out of [`draw_card`] because it is the number the "titles never
@@ -592,32 +603,60 @@ impl TextColumn {
     }
 }
 
+/// Whether `title` sets whole — every word, no line overrunning — in `avail`.
+fn title_sets_whole(font: &CardFont, title: &str, avail: f32) -> bool {
+    if avail <= 1.0 {
+        return false;
+    }
+    let lines = wrap(font, title, TITLE_PX, avail, TITLE_LINES);
+    let words = lines
+        .iter()
+        .map(|line| line.split_whitespace().count())
+        .sum::<usize>();
+    words == title.split_whitespace().count()
+        && lines
+            .iter()
+            .all(|line| font.width(line, TITLE_PX) <= avail + 0.5)
+}
+
+/// The chip yields to the title, never the other way round.
+///
+/// The card's one absolute is that a title is never shortened and never shrunk.
+/// The chip is the widest thing competing with it — about a quarter of a narrow
+/// card — so on a card that cannot hold both, the chip is what goes. It is
+/// dropped only when dropping it actually makes the title whole: on a card too
+/// narrow for the title either way there is nothing to buy, and the state is
+/// worth more than one extra word.
 fn text_column(
     font: &CardFont,
     geometry: &CardGeometry,
     width: f32,
     height: f32,
     state_label: &str,
+    title: &str,
 ) -> TextColumn {
     let chip_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
     let chip_metrics = font.metrics(chip_px);
     let label = state_label.to_uppercase();
-    let chip_width = font.width(&label, chip_px) + chip_px * 1.5;
+    let chip_width = font.width(&label, chip_px) + chip_px * CHIP_SIDE_PAD * 2.0;
     let chip_height = (chip_metrics.line_height * 1.25).max(chip_px * 1.55);
     let left = geometry.text_inset();
     let right = width - geometry.pad_right;
-    let chip_gap = geometry.pad * 0.7;
+    let chip_gap = geometry.pad * CHIP_GAP_MUL;
+
+    let with_chip = right - chip_width - chip_gap - left;
+    let without_chip = right - left;
+    let room_for_chip = chip_height < height - 2.0 && with_chip > 0.0;
+    let chip_costs_a_word =
+        !title_sets_whole(font, title, with_chip) && title_sets_whole(font, title, without_chip);
+
     TextColumn {
         left,
         right,
         chip_px,
         chip_width,
         chip_height,
-        // The chip is dropped rather than overlapped when the card cannot hold
-        // it and a readable title at once. On a correctly measured cell this is
-        // never reached; it was reached on every card of a 3440-wide window,
-        // because the card was being laid out in a two-pixel cell.
-        chip_fits: chip_height < height - 2.0 && right - chip_width - chip_gap > left,
+        chip_fits: room_for_chip && !chip_costs_a_word,
         chip_gap,
     }
 }
@@ -726,7 +765,14 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     }
 
     // ---- the chip --------------------------------------------------------
-    let column = text_column(font, geometry, width, height, &content.state_label);
+    let column = text_column(
+        font,
+        geometry,
+        width,
+        height,
+        &content.state_label,
+        &content.title,
+    );
     let mut text_right = ox + column.right;
     let chip_px = column.chip_px;
     let chip_metrics = font.metrics(chip_px);
@@ -1896,7 +1942,13 @@ mod tests {
     /// panel whose cells are `cell_w` wide. The same arithmetic `card_frame_for`
     /// and `build_sheet_inner` do, so a test measuring this is measuring the
     /// card that gets drawn.
-    fn real_text_column(font: &CardFont, sidebar_width: u16, cell_w: f32, depth: u8) -> TextColumn {
+    fn real_text_column(
+        font: &CardFont,
+        sidebar_width: u16,
+        cell_w: f32,
+        depth: u8,
+        title: &str,
+    ) -> TextColumn {
         // The card starts after the tree's own prefix, exactly as
         // `card_frame_for` places it, on the scrollbar-narrow width
         // `row_fold_width` measures against.
@@ -1918,21 +1970,26 @@ mod tests {
             f32::from(frame_cells) * cell_w,
             height,
             WIDEST_STATE_LABEL,
+            title,
         )
     }
 
-    /// Every panel width a card is drawn on, against every cell width
-    /// `HostCellSize::is_plausible` lets through.
+    /// The panel and cell sizes worth sweeping, at every tier.
+    ///
+    /// Boundaries rather than a dense grid, because these run against every face
+    /// on the machine and the cost is real. 34 is the narrowest panel a card is
+    /// drawn on at all, 42 is the captain's, 60 is a wide one. 5 px is the
+    /// narrowest cell `HostCellSize::is_plausible` lets through, 8 px is the
+    /// fallback and the floor the whole-title guarantee is claimed at, 9 px is
+    /// what his terminal answers `CSI 16 t` with, and 24 px is a HiDPI cell.
+    /// 6 px sits below the guarantee on purpose: it is what exercises the
+    /// graceful-degradation path rather than the guarantee.
     fn card_widths() -> impl Iterator<Item = (u16, f32, u8)> {
-        [34u16, 36, 38, 40, 42, 50, 60]
-            .into_iter()
-            .flat_map(|sidebar_width| {
-                [5.0f32, 6.0, 7.0, 8.0, 10.0, 12.0, 16.0, 24.0]
-                    .into_iter()
-                    .flat_map(move |cell_w| {
-                        (0..3u8).map(move |depth| (sidebar_width, cell_w, depth))
-                    })
-            })
+        [34u16, 38, 42, 60].into_iter().flat_map(|sidebar_width| {
+            [5.0f32, 6.0, 8.0, 9.0, 12.0, 24.0]
+                .into_iter()
+                .flat_map(move |cell_w| (0..3u8).map(move |depth| (sidebar_width, cell_w, depth)))
+        })
     }
 
     /// A line is never wider than its column while a break was available.
@@ -1945,81 +2002,132 @@ mod tests {
     /// the captain ruled out. Everything else has to fit.
     #[test]
     fn a_real_title_never_overruns_a_column_it_could_have_broken_in() {
-        let Some(font) = font::card_font(None) else {
-            return;
-        };
-        for (sidebar_width, cell_w, depth) in card_widths() {
-            let column = real_text_column(font, sidebar_width, cell_w, depth);
-            for title in REAL_FLEET_TITLES {
-                for line in wrap(font, title, TITLE_PX, column.available(), TITLE_LINES) {
-                    if font.width(&line, TITLE_PX) <= column.available() + 0.5 {
-                        continue;
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                for title in REAL_FLEET_TITLES {
+                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
+                    for line in wrap(&font, title, TITLE_PX, column.available(), TITLE_LINES) {
+                        if font.width(&line, TITLE_PX) <= column.available() + 0.5 {
+                            continue;
+                        }
+                        assert!(
+                            !line.contains(' '),
+                            "{line:?} overruns its {:.1}px column with a break available, in \
+                             {face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}",
+                            column.available()
+                        );
                     }
-                    assert!(
-                        !line.contains(' '),
-                        "{line:?} overruns its {:.1}px column with a break available, at \
-                         sidebar {sidebar_width}, cell {cell_w}, depth {depth}",
-                        column.available()
-                    );
                 }
             }
         }
     }
 
-    /// And on the widths the fleet runs, not even a single unbreakable word
-    /// overruns — so nothing is clipped at all.
-    #[test]
-    fn no_real_title_word_overruns_its_column_at_the_widths_the_fleet_runs() {
-        let Some(font) = font::card_font(None) else {
-            return;
-        };
-        for (sidebar_width, cell_w, depth) in card_widths() {
-            if sidebar_width < 38 || cell_w < 8.0 {
-                continue;
-            }
-            let column = real_text_column(font, sidebar_width, cell_w, depth);
-            for title in REAL_FLEET_TITLES {
-                for line in wrap(font, title, TITLE_PX, column.available(), TITLE_LINES) {
-                    assert!(
-                        font.width(&line, TITLE_PX) <= column.available() + 0.5,
-                        "{line:?} would be clipped at sidebar {sidebar_width}, cell {cell_w}, \
-                         depth {depth}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// And on any panel and cell the captain actually runs, no word is even
-    /// dropped: the whole title is set, on two lines, at 14 px.
+    /// The cell floor the whole-title guarantee below is claimed at.
     ///
-    /// 38 columns and an 8 px cell is the floor this is claimed at, and 8 px is
-    /// `HostCellSize::FALLBACK` — the narrowest cell Herdr will ever *assume*.
-    /// Below that pair the longest real `doing` string does not physically fit
-    /// two 14 px lines, and the card's answer is to set the words it can rather
-    /// than to shrink the type. His panel is 42 columns on a 12 px cell, which
-    /// clears this floor with room to spare.
+    /// 8 px is [`crate::kitty_graphics::HostCellSize::FALLBACK`]'s width — the
+    /// narrowest cell Herdr will ever *assume*, and therefore the narrowest one
+    /// a card is laid out in unless a terminal genuinely reports something
+    /// smaller. Below it a 57-character title does not physically fit two 14 px
+    /// lines on a 34-column panel in any face, and the card's answer there is to
+    /// set the words it can rather than to shrink the type.
+    const GUARANTEED_CELL_WIDTH_PX: f32 = 8.0;
+
+    /// Every real title, set whole, in every face on this machine, at every
+    /// panel width a card is drawn on and every cell at or above the fallback.
+    ///
+    /// The version of this that shipped red asserted the same thing about
+    /// `card_font(None)` — whichever face the machine happened to pick first.
+    /// A developer box with the Ubuntu fonts installed picks `UbuntuSans` and
+    /// passes; CI has `DejaVuSans`, which sets the longest title 16% wider, and
+    /// fails. Measuring every face is the fix, and it is why the guarantee below
+    /// is stated against a cell width rather than against a panel width: with
+    /// the chip yielding, the panel width stopped being the binding constraint.
     #[test]
-    fn every_real_fleet_title_is_set_whole_at_the_widths_the_fleet_runs() {
-        let Some(font) = font::card_font(None) else {
-            return;
-        };
-        for (sidebar_width, cell_w, depth) in card_widths() {
-            if sidebar_width < 38 || cell_w < 8.0 {
-                continue;
-            }
-            let column = real_text_column(font, sidebar_width, cell_w, depth);
-            for title in REAL_FLEET_TITLES {
-                let lines = wrap(font, title, TITLE_PX, column.available(), TITLE_LINES);
-                let set = lines.join(" ");
-                assert_eq!(
-                    set.split_whitespace().collect::<Vec<_>>(),
-                    title.split_whitespace().collect::<Vec<_>>(),
-                    "dropped words at sidebar {sidebar_width}, cell {cell_w}, depth {depth}: \
-                     {set:?} from {title:?}"
-                );
+    fn every_real_fleet_title_is_set_whole_in_every_face_at_every_width() {
+        let faces = font::all_available_faces();
+        assert!(
+            !faces.is_empty() || font::card_font(None).is_none(),
+            "a machine with a card face must expose it to this test"
+        );
+        for (face, font) in faces {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                if cell_w < GUARANTEED_CELL_WIDTH_PX {
+                    continue;
+                }
+                for title in REAL_FLEET_TITLES {
+                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
+                    let lines = wrap(&font, title, TITLE_PX, column.available(), TITLE_LINES);
+                    let set = lines.join(" ");
+                    assert_eq!(
+                        set.split_whitespace().collect::<Vec<_>>(),
+                        title.split_whitespace().collect::<Vec<_>>(),
+                        "dropped words in {face} at sidebar {sidebar_width}, cell {cell_w}, \
+                         depth {depth}: {set:?} from {title:?}"
+                    );
+                    for line in &lines {
+                        assert!(
+                            font.width(line, TITLE_PX) <= column.available() + 0.5,
+                            "{line:?} would be clipped in {face} at sidebar {sidebar_width}, \
+                             cell {cell_w}, depth {depth}"
+                        );
+                    }
+                }
             }
         }
+    }
+
+    /// And that guarantee is bought by the chip, not by the title.
+    ///
+    /// On a card too narrow for both, the chip is what goes — the title is the
+    /// one thing on the card that is never shortened and never shrunk. This
+    /// pins the direction of that trade so a later change cannot quietly
+    /// reverse it and start clipping words again.
+    #[test]
+    fn the_chip_yields_to_the_title_and_never_the_other_way_round() {
+        let mut ever_yielded = false;
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                for title in REAL_FLEET_TITLES {
+                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
+                    let with_chip = column.text_right() - column.left;
+                    let without_chip = column.right - column.left;
+                    let where_ = format!(
+                        "{face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}, \
+                         {title:?}"
+                    );
+
+                    if column.chip_fits {
+                        // A chip is only kept when keeping it costs no words.
+                        assert!(
+                            title_sets_whole(&font, title, with_chip)
+                                || !title_sets_whole(&font, title, without_chip),
+                            "the chip was kept at the title's expense in {where_}"
+                        );
+                    } else {
+                        ever_yielded = true;
+                        // And is only given up when giving it up buys the title
+                        // — otherwise the card simply had no room for one.
+                        let bought_the_title = title_sets_whole(&font, title, without_chip)
+                            && !title_sets_whole(&font, title, with_chip);
+                        let never_had_room = with_chip <= 0.0
+                            || column.chip_height
+                                >= tier_height_px(
+                                    depth,
+                                    font.metrics(TITLE_PX),
+                                    font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+                                ) - 2.0;
+                        assert!(
+                            bought_the_title || never_had_room,
+                            "the chip vanished for nothing in {where_}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            ever_yielded,
+            "no width in the sweep exercised the chip standing down, so the trade is untested"
+        );
     }
 
     /// The empty icon plate was taking this much of the title's column.
@@ -2046,6 +2154,7 @@ mod tests {
                 width,
                 height,
                 WIDEST_STATE_LABEL,
+                REAL_FLEET_TITLES[0],
             );
             let without = text_column(
                 font,
@@ -2053,6 +2162,7 @@ mod tests {
                 width,
                 height,
                 WIDEST_STATE_LABEL,
+                REAL_FLEET_TITLES[0],
             );
             assert!(
                 without.available() > with_plate.available(),
@@ -2067,6 +2177,7 @@ mod tests {
             42.0 * 12.0,
             68.0,
             WIDEST_STATE_LABEL,
+            REAL_FLEET_TITLES[0],
         );
         let top_with = text_column(
             font,
@@ -2074,24 +2185,47 @@ mod tests {
             42.0 * 12.0,
             68.0,
             WIDEST_STATE_LABEL,
+            REAL_FLEET_TITLES[0],
         );
         assert!(top.available() - top_with.available() >= measured::PLATE_MAX_PX);
     }
 
+    /// The panel and cell the captain's fleet actually runs on.
+    ///
+    /// 42 columns from his config, and a 9x18 cell read straight off his
+    /// terminal's own answer to `CSI 16 t`. Nothing about the card is allowed to
+    /// degrade here, in any face.
+    const FLEET_SIDEBAR_COLUMNS: u16 = 42;
+    const FLEET_CELL_WIDTH_PX: f32 = 9.0;
+
     /// The chip is at the card's right edge, so it is the first thing a card
     /// too narrow for its content stops drawing. On his 3440-wide window every
-    /// chip vanished; on a card measured in a real cell none may.
+    /// chip vanished, because the card was being laid out in a two-pixel cell.
+    /// On the fleet's real geometry none may, in any face and at any tier.
     #[test]
-    fn the_state_chip_is_drawn_at_every_tier_and_width_a_card_is_drawn_at() {
-        let Some(font) = font::card_font(None) else {
-            return;
-        };
-        for (sidebar_width, cell_w, depth) in card_widths() {
-            let column = real_text_column(font, sidebar_width, cell_w, depth);
-            assert!(
-                column.chip_fits,
-                "no chip at sidebar {sidebar_width}, cell {cell_w}, depth {depth}"
-            );
+    fn the_state_chip_is_drawn_on_the_fleets_own_geometry() {
+        for (face, font) in font::all_available_faces() {
+            for depth in 0..3u8 {
+                for title in REAL_FLEET_TITLES {
+                    let column = real_text_column(
+                        &font,
+                        FLEET_SIDEBAR_COLUMNS,
+                        FLEET_CELL_WIDTH_PX,
+                        depth,
+                        title,
+                    );
+                    assert!(
+                        column.chip_fits,
+                        "no chip in {face} at the fleet's own geometry, depth {depth}, {title:?}"
+                    );
+                    // And it is not bought with a word.
+                    assert!(
+                        title_sets_whole(&font, title, column.available()),
+                        "{title:?} is not whole in {face} at the fleet's own geometry, \
+                         depth {depth}"
+                    );
+                }
+            }
         }
     }
 
