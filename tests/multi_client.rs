@@ -273,6 +273,19 @@ fn create_workspace_and_root_pane(socket_path: &Path, label: &str) -> (String, S
     (workspace_id, pane_id)
 }
 
+fn report_idle_agent(socket_path: &Path, pane_id: &str) {
+    let response = send_json_request(
+        socket_path,
+        &format!(
+            r#"{{"id":"report_agent","method":"pane.report_agent","params":{{"pane_id":"{pane_id}","agent":"pi","state":"idle","source":"multi-client-test"}}}}"#
+        ),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "pane.report_agent should succeed: {response}"
+    );
+}
+
 fn pane_send_input(socket_path: &Path, pane_id: &str, text: &str) {
     let request = format!(
         "{{\"id\":\"send_input\",\"method\":\"pane.send_input\",\"params\":{{\"pane_id\":\"{pane_id}\",\"text\":\"{}\",\"keys\":[\"Enter\"]}}}}",
@@ -747,6 +760,17 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     frame_text(frame).contains(needle)
 }
 
+/// The first Space row visible in the sidebar tree, if any.
+///
+/// Anchored on the row itself rather than on a section header: this fork draws
+/// one living tree with no "agents" heading above it.
+fn first_visible_space_label(frame: &FrameWire) -> Option<String> {
+    frame_text(frame).lines().find_map(|line| {
+        let start = line.find("agent-")?;
+        Some(line[start..start + "agent-NN".len()].to_string())
+    })
+}
+
 #[test]
 fn multi_client_allows_multiple_simultaneous_connections() {
     let _lock = test_lock();
@@ -822,6 +846,79 @@ fn multi_client_effective_size_shrinks_when_smaller_client_joins() {
     assert!(
         size_with_small_client.is_some(),
         "effective pane size should shrink when smaller client joins: before={large_only_size:?}, last_seen={last_seen_size:?}"
+    );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+/// A background client's projection must not undo the foreground client's
+/// scroll. Upstream's version of this drove the Agents panel (#2280); this fork
+/// folded that surface into the one living tree, so it drives the tree instead.
+#[test]
+fn non_foreground_client_render_preserves_sidebar_scroll() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    for index in 1..=23 {
+        let (_, pane_id) =
+            create_workspace_and_root_pane(&api_socket, &format!("agent-{index:02}"));
+        report_idle_agent(&api_socket, &pane_id);
+    }
+
+    // Short enough that 23 Spaces cannot all fit, so the tree really scrolls.
+    let mut probe = connect_raw_client(&client_socket, 106, 14);
+    assert!(wait_for_frame(&mut probe, Duration::from_secs(2)));
+    drain_server_messages(&mut probe, Duration::from_millis(250));
+
+    // Scroll the tree away from the top so there is a position to clobber.
+    let wheel_down = b"\x1b[<65;10;5M";
+    send_client_input(&mut probe, &wheel_down.repeat(8));
+    let (scrolled_away, scroll_frames) =
+        wait_for_frame_matching_with_snapshots(&mut probe, Duration::from_secs(3), |frame| {
+            first_visible_space_label(frame).is_some_and(|label| label != "agent-01")
+        })
+        .expect("scrolled frame decoding should succeed");
+    assert!(
+        scrolled_away,
+        "wheel input should scroll the sidebar tree off its first Space; frames:\n{}",
+        scroll_frames.join("\n--- frame ---\n")
+    );
+    // Where the wheel actually left it, read off the frame that satisfied the
+    // wait above rather than assumed from the scroll arithmetic.
+    let scrolled_label = scroll_frames
+        .last()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let start = line.find("agent-")?;
+                Some(line[start..start + "agent-NN".len()].to_string())
+            })
+        })
+        .expect("a Space row should be visible after scrolling");
+
+    // A second, taller client attaches and renders in the background. Its
+    // projection uses a different viewport and must not rewrite shared scroll.
+    let mut tall_background = connect_raw_client(&client_socket, 106, 44);
+    assert!(wait_for_frame(&mut tall_background, Duration::from_secs(2)));
+    drain_server_messages(&mut probe, Duration::from_millis(500));
+
+    send_client_input(&mut probe, wheel_down);
+    let (advanced, probe_frames) =
+        wait_for_frame_matching_with_snapshots(&mut probe, Duration::from_secs(3), |frame| {
+            first_visible_space_label(frame).is_some_and(|label| label != scrolled_label)
+        })
+        .expect("probe frame decoding should succeed");
+    assert!(
+        advanced,
+        "background client projection must not undo the foreground wheel event; frames:\n{}",
+        probe_frames.join("\n--- frame ---\n")
     );
 
     cleanup_spawned_herdr(server, base);

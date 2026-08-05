@@ -18,7 +18,7 @@ use ratatui::{
 use self::card::{Card, Pill, RowShell};
 use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
-use super::status::{state_dot, state_label, state_label_color};
+use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, middle_elide, truncate_end};
 use crate::app::agent_view::AgentViewHidden;
 use crate::app::relation_signal::{RelationSignalKind, RelationSignalPhase};
@@ -339,11 +339,11 @@ fn workspace_entry_gap(
     app: &AppState,
     entries: &[WorkspaceListEntry],
     entry_idx: usize,
-    worktree_child: bool,
+    _worktree_child: bool,
 ) -> u16 {
-    if entry_idx + 1 < entries.len()
-        && !(worktree_child && next_entry_is_worktree_child(entries, entry_idx))
-    {
+    // No gap anywhere inside a worktree group: not between two children, and
+    // not between the parent and its first child either.
+    if entry_idx + 1 < entries.len() && !next_entry_is_worktree_child(entries, entry_idx) {
         app.sidebar_spaces.row_gap
     } else {
         0
@@ -1730,6 +1730,9 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
     let is_navigating = matches!(app.mode, Mode::Navigate);
 
     let p = &app.palette;
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(p.sidebar_bg));
     let sep_style = if is_navigating {
         Style::default().fg(p.accent)
     } else {
@@ -1754,7 +1757,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             break;
         }
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-        let (icon, icon_style) = state_dot(agg_state, agg_seen, p);
+        let (icon, icon_style) = state_icon(agg_state, agg_seen, app.status_indicators, p);
         let is_selected = visible_idx == app.selected && is_navigating;
         let is_active = Some(visible_idx) == app.active;
         let row_style = if is_selected {
@@ -1781,8 +1784,7 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}", visible_idx + 1), num_style),
-                Span::styled(" ", row_style),
+                Span::styled(format!("{:<2}", visible_idx + 1), num_style),
                 Span::styled(icon, icon_style),
             ])),
             Rect::new(ws_area.x, y, ws_area.width, 1),
@@ -1980,6 +1982,9 @@ pub(super) fn render_sidebar(
     area: Rect,
 ) {
     let p = &app.palette;
+    frame
+        .buffer_mut()
+        .set_style(area, Style::default().bg(p.sidebar_bg));
     let is_navigating = matches!(app.mode, Mode::Navigate);
     render_sidebar_divider(app, frame, area, is_navigating);
 
@@ -2502,7 +2507,7 @@ fn render_agent_row(
         Style::default().fg(label_color).add_modifier(Modifier::DIM)
     };
     let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
-    let mark = state_dot(detail.state, detail.seen, p);
+    let mark = state_icon(detail.state, detail.seen, app.status_indicators, p);
     // On a card the mark is set in a chip. It is the same mark, padded and
     // plated — the alphabet is untouched, and a row with no `state_icon` token
     // configured gets no chip, exactly as it gets no mark today.
@@ -3498,7 +3503,7 @@ fn render_workspace_list(
             .filter(|(_, collapsed)| *collapsed)
             .map(|(key, _)| space_aggregate_state_and_age(app, key))
             .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
-        let mark = state_dot(display_state, display_seen, p);
+        let mark = state_icon(display_state, display_seen, app.status_indicators, p);
         let card_shell = card.card_frame.and_then(|rect| {
             Card::new(
                 rect,
@@ -5809,6 +5814,37 @@ mod tests {
     }
 
     #[test]
+    fn expanded_and_collapsed_sidebars_use_custom_background() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        app.palette.sidebar_bg = ratatui::style::Color::Rgb(12, 34, 56);
+        let area = Rect::new(0, 0, 26, 20);
+
+        let mut expanded = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        expanded
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        assert!(expanded
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|cell| cell.bg == app.palette.sidebar_bg));
+
+        let mut collapsed = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        collapsed
+            .draw(|frame| render_sidebar_collapsed(&app, frame, area))
+            .unwrap();
+        assert!(collapsed
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|cell| cell.bg == app.palette.sidebar_bg));
+    }
+
+    #[test]
     fn default_space_workspace_style_tracks_active_state() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
@@ -6248,6 +6284,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             live_cwd.clone(),
             0,
             crate::terminal_theme::TerminalTheme::default(),
+            None,
             crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
             &crate::pane::PaneLaunchEnv::default(),
             events,
@@ -6742,7 +6779,8 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
                 let workspace = &app.workspaces[1];
                 let (state, seen) = workspace.aggregate_state(&app.terminals);
-                let (expected_symbol, expected_style) = state_dot(state, seen, &app.palette);
+                let (expected_symbol, expected_style) =
+                    state_icon(state, seen, app.status_indicators, &app.palette);
                 let rgb = crate::ui::color::color_to_rgb;
                 let ink = expected_style
                     .fg
@@ -6885,7 +6923,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert!(!cards[0].worktree_child);
         assert_eq!(cards[1].ws_idx, 1);
         assert!(cards[1].worktree_child);
-        assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height + 1);
+        assert_eq!(cards[1].rect.y, cards[0].rect.y + cards[0].rect.height);
     }
 
     #[test]
@@ -6903,7 +6941,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let (spacious, _) = compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 30));
         assert_eq!(
             spacious[1].rect.y,
-            spacious[0].rect.y + spacious[0].rect.height + 2
+            spacious[0].rect.y + spacious[0].rect.height
         );
         assert_eq!(
             spacious[2].rect.y,
@@ -6914,7 +6952,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             spacious[2].rect.y + spacious[2].rect.height + 2
         );
         let spacious_metrics = workspace_list_scroll_metrics(&app, Rect::new(0, 0, 30, 6));
-        assert_eq!(spacious_metrics.viewport_rows, 2);
+        assert_eq!(spacious_metrics.viewport_rows, 3);
         assert_eq!(spacious_metrics.max_offset_from_bottom, 2);
 
         app.sidebar_spaces.row_gap = 0;

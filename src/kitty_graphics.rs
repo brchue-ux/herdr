@@ -21,20 +21,6 @@ const KITTY_CHUNK_BYTES: usize = 3072;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
 const PANE_GRAPHICS_IMAGE_ID_BIT: u32 = 1 << 31;
 
-/// The query that asks the host terminal how big one cell is, in pixels.
-///
-/// `CSI 16 t` is answered with `CSI 6 ; height ; width t`. It exists because the
-/// other way of getting this number — dividing the pty's `ws_xpixel`/`ws_ypixel`
-/// by its column and row count — is only as good as those two fields, and they
-/// are routinely wrong: Windows has no pixel size to report at all, and an SSH
-/// session carries whatever the client sent at pty-request time, which for
-/// several common Windows clients is a constant that never tracks the window.
-/// A constant `ws_xpixel` divided by a growing column count yields a cell that
-/// *shrinks as the window grows*, which is exactly the failure this query
-/// exists to end. Every terminal that implements Kitty graphics — the only
-/// terminal this number is asked for on — answers this.
-pub(crate) const HOST_CELL_SIZE_QUERY_SEQUENCE: &str = "\x1b[16t";
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HostCellSize {
     pub width_px: u32,
@@ -137,40 +123,6 @@ impl HostCellSize {
         }
         self
     }
-
-    /// [`Self::for_area`] for a cell that arrived from outside this module.
-    ///
-    /// A zero-sized area means there is nothing to place an image on, and every
-    /// cell size handed to the graphics path has to answer that the same way or
-    /// `is_known` starts disagreeing with itself depending on where the number
-    /// came from.
-    pub(crate) fn for_area_public(self, area: Rect) -> Self {
-        self.for_area(area)
-    }
-}
-
-/// Reads `CSI 6 ; height ; width t` — the terminal's answer to
-/// [`HOST_CELL_SIZE_QUERY_SEQUENCE`].
-///
-/// Height comes first in the reply, which is the opposite of every other pair
-/// in this file and the reason this parse is a named function rather than a
-/// couple of `split` calls at the call site.
-pub(crate) fn parse_host_cell_size_report(sequence: &str) -> Option<HostCellSize> {
-    let body = sequence.strip_prefix("\x1b[")?.strip_suffix('t')?;
-    let mut parts = body.split(';');
-    if parts.next()? != "6" {
-        return None;
-    }
-    let height_px: u32 = parts.next()?.parse().ok()?;
-    let width_px: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let reported = HostCellSize {
-        width_px,
-        height_px,
-    };
-    reported.is_plausible().then_some(reported)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1335,33 +1287,6 @@ mod host_cell_size_is_a_measurement {
             height_px: 24,
         };
         assert_eq!(good.or_fallback(), good);
-    }
-
-    /// `CSI 16 t` is answered height-first, which is the opposite of every
-    /// other pair in this file.
-    #[test]
-    fn the_cell_size_report_is_read_height_first() {
-        assert_eq!(
-            parse_host_cell_size_report("\x1b[6;24;12t"),
-            Some(HostCellSize {
-                width_px: 12,
-                height_px: 24,
-            })
-        );
-        // Not a cell size report.
-        assert_eq!(parse_host_cell_size_report("\x1b[4;24;12t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12;9t"), None);
-        assert_eq!(parse_host_cell_size_report("\x1b[6;24;12"), None);
-        // A reply that parses but describes no real cell is still refused, so a
-        // terminal answering nonsense is the same as one not answering.
-        assert_eq!(parse_host_cell_size_report("\x1b[6;8;2t"), None);
-    }
-
-    /// The query has to be the sequence terminals answer, byte for byte.
-    #[test]
-    fn the_query_is_csi_16_t() {
-        assert_eq!(HOST_CELL_SIZE_QUERY_SEQUENCE, "\u{1b}[16t");
     }
 }
 
