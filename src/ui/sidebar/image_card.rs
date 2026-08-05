@@ -3965,6 +3965,46 @@ mod a_card_is_its_own_shape {
         );
     }
 
+    /// The sheet is still sent to a pass that did not build it.
+    ///
+    /// The withhold above belongs to the shapes path alone, and this is its
+    /// paired contrast — a gate collapsed to one term fails one of these two
+    /// whichever way it collapses. A sheet is opaque over every cell a row owns,
+    /// so it covers the character cards standing under it rather than doubling
+    /// them, and the second client of two the same size sees pixel cards exactly
+    /// as it did before shapes existed. Withholding it there would be this
+    /// branch changing the default path, which it must not do.
+    #[test]
+    fn the_sheet_still_reaches_a_pass_that_did_not_build_it() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut app = pixel_fleet_app();
+        app.mode = crate::app::Mode::Terminal;
+        assert!(!app.sidebar_card_shapes, "this is the flag-off path");
+        if shape_pass(&mut app, &runtimes).is_none() {
+            return; // No face on this machine.
+        }
+        let cell_size = app.host_cell_size;
+
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, pass_area());
+        assert!(
+            !app.view.sidebar_card_layers_published,
+            "the non-resizing pass built the sheet itself, so this tests nothing"
+        );
+        let mut second = crate::kitty_graphics::HostGraphicsCache::default();
+        let bytes = crate::kitty_graphics::encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            app.view.tab_surface(),
+            cell_size,
+            &mut second,
+        );
+        assert!(
+            !bytes.is_empty() && !second.is_empty(),
+            "the default sheet path stopped reaching a second client, which is \
+             this branch changing behaviour with its flag off"
+        );
+    }
+
     /// Turning the flag on moves no row and changes no tier.
     ///
     /// The captain paid for the 68 px base, the 65% tier step, D-MID density and

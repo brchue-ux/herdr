@@ -836,17 +836,19 @@ fn surface_layer_placement_targets(
         // sheet path, each at its own slot, so a card that changed is the only
         // thing re-uploaded and a card that went away is the only thing deleted.
         //
-        // Gated on the pass that is about to be encoded having built them, and
-        // not on this client having a cell size of its own. The layers are the
-        // foreground client's: a pass that left them alone laid its rows out
-        // without them and drew its character cards, so sending it the images
-        // would stand a transparent shape over a border, a chip and a title a
-        // few pixels off — the doubling `image_card::shape_covers_row` exists
-        // to prevent, arrived at from the other side. Only the cards are
-        // withheld; every other surface this client is entitled to still flows.
+        // Withheld from a pass that did not build them, but only under the
+        // shapes path. The layers are the foreground client's, and a pass that
+        // left them alone laid its rows out without them and drew its character
+        // cards — so a *shape* arriving there would stand a transparent outline
+        // over a border, a chip and a title a few pixels off, the doubling
+        // `image_card::shape_covers_row` exists to prevent, arrived at from the
+        // other side. A *sheet* cannot double anything: it is opaque over every
+        // cell a row owns, so it simply covers the characters, which is what the
+        // default path did before shapes existed and still has to do. Only the
+        // cards are ever withheld; every other surface this client is entitled
+        // to keeps flowing either way.
         .chain(
-            app.view
-                .sidebar_card_layers_published
+            (!app.sidebar_card_shapes || app.view.sidebar_card_layers_published)
                 .then_some(app.sidebar_card_layers.as_slice())
                 .unwrap_or_default()
                 .iter()
