@@ -210,7 +210,13 @@ enum HostSurfaceId {
     /// identity would make either of them silently replace the other's image,
     /// and a client painting a backdrop under the tree is exactly the case that
     /// has to work.
-    SidebarCards,
+    ///
+    /// Carries the card's slot in the tree because a card is its own object: the
+    /// shapes path publishes one placement per card, and giving each its own
+    /// identity is what lets one card be re-uploaded, moved or dropped without
+    /// disturbing the others. The sheet path publishes a single layer and uses
+    /// slot `0`.
+    SidebarCards(u16),
 }
 
 impl HostSurfaceId {
@@ -222,7 +228,10 @@ impl HostSurfaceId {
             Self::Pane(pane_id) => pane_id.raw().hash(hasher),
             Self::Sidebar => "surface.sidebar".hash(hasher),
             Self::SignalTray => "surface.signal-tray".hash(hasher),
-            Self::SidebarCards => "surface.sidebar.cards".hash(hasher),
+            Self::SidebarCards(slot) => {
+                "surface.sidebar.cards".hash(hasher);
+                slot.hash(hasher);
+            }
         }
     }
 }
@@ -820,11 +829,39 @@ fn surface_layer_placement_targets(
         // map, so they travel the same clipping, dedup, signature and
         // delete-by-id path as a client's layer without being reachable — or
         // clearable — by `surface.graphics.*`. Their rect is the tree's, not
-        // the sidebar's: the sheet is only as large as the cards it holds.
+        // the sidebar's: a card's image is only as large as that card and the
+        // reach of its bloom.
+        //
+        // One entry per card under the shapes path and exactly one under the
+        // sheet path, each at its own slot, so a card that changed is the only
+        // thing re-uploaded and a card that went away is the only thing deleted.
+        //
+        // Withheld from a pass that did not build them, but only under the
+        // shapes path. The layers are the foreground client's, and a pass that
+        // left them alone laid its rows out without them and drew its character
+        // cards — so a *shape* arriving there would stand a transparent outline
+        // over a border, a chip and a title a few pixels off, the doubling
+        // `image_card::shape_covers_row` exists to prevent, arrived at from the
+        // other side. A *sheet* cannot double anything: it is opaque over every
+        // cell a row owns, so it simply covers the characters, which is what the
+        // default path did before shapes existed and still has to do. Only the
+        // cards are ever withheld; every other surface this client is entitled
+        // to keeps flowing either way.
         .chain(
-            app.sidebar_card_layer
-                .as_ref()
-                .map(|cards| (HostSurfaceId::SidebarCards, cards.rect, &cards.layer)),
+            if !app.sidebar_card_shapes || app.view.sidebar_card_layers_published {
+                app.sidebar_card_layers.as_slice()
+            } else {
+                &[]
+            }
+            .iter()
+            .enumerate()
+            .map(|(slot, cards)| {
+                (
+                    HostSurfaceId::SidebarCards(slot.try_into().unwrap_or(u16::MAX)),
+                    cards.rect,
+                    &cards.layer,
+                )
+            }),
         )
 }
 
@@ -1731,7 +1768,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(1, 2, 20, 12)));
+        app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(1, 2, 20, 12))];
+        app.view.sidebar_card_layers_published = true;
 
         let placements = collect_visible_placements(
             &app,
@@ -1744,12 +1782,12 @@ mod tests {
 
         let cards = placements
             .iter()
-            .find(|placement| placement.surface == HostSurfaceId::SidebarCards)
+            .find(|placement| placement.surface == HostSurfaceId::SidebarCards(0))
             .expect("the sidebar's own cards reach the pipeline");
         assert_eq!(
             cards.source_key,
             HostSourceKey::Layer {
-                surface: HostSurfaceId::SidebarCards,
+                surface: HostSurfaceId::SidebarCards(0),
             }
         );
         // The tree's rect, not the whole panel's: the sheet is only as large as
@@ -1782,7 +1820,8 @@ mod tests {
         app.mode = Mode::Terminal;
         app.active = None;
         app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
-        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(0, 1, 24, 10)));
+        app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(0, 1, 24, 10))];
+        app.view.sidebar_card_layers_published = true;
 
         assert!(has_visible_pane_graphics(
             &app,
@@ -1797,7 +1836,8 @@ mod tests {
         let mut app = AppState::test_new();
         app.mode = Mode::Terminal;
         app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
-        app.sidebar_card_layer = Some(sidebar_card_layer(Rect::new(0, 1, 24, 10)));
+        app.sidebar_card_layers = vec![sidebar_card_layer(Rect::new(0, 1, 24, 10))];
+        app.view.sidebar_card_layers_published = true;
 
         let mut cache = HostGraphicsCache::default();
         let runtimes = TerminalRuntimeRegistry::new();
@@ -1813,7 +1853,7 @@ mod tests {
 
         // A panel that stopped drawing pixel cards — narrowed past the card
         // shell, or graphics turned off — leaves nothing behind on the host.
-        app.sidebar_card_layer = None;
+        app.sidebar_card_layers.clear();
         let bytes = encode_local_pane_graphics(
             &app,
             &runtimes,

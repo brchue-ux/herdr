@@ -695,6 +695,7 @@ impl App {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                sidebar_card_layers_published: false,
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -771,6 +772,7 @@ impl App {
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
+            sidebar_card_shapes: config.experimental.sidebar_card_shapes,
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -809,7 +811,7 @@ impl App {
             signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
-            sidebar_card_layer: None,
+            sidebar_card_layers: Vec::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,
@@ -1732,12 +1734,19 @@ impl App {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.state.pane_graphics_layers.clear();
                 self.state.surface_graphics_layers.clear();
-                self.state.sidebar_card_layer = None;
+                self.state.sidebar_card_layers.clear();
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
             self.state.sidebar_card_font =
                 sidebar_card_font(&config.experimental.sidebar_card_font);
+            // Switching the drawing model invalidates every card already held:
+            // the two paths publish different rects and different placements, so
+            // a stale layer from the other path would leave an orphan on screen.
+            if self.state.sidebar_card_shapes != config.experimental.sidebar_card_shapes {
+                self.state.sidebar_card_shapes = config.experimental.sidebar_card_shapes;
+                self.state.sidebar_card_layers.clear();
+            }
             self.state.reveal_hidden_cursor_for_cjk_ime =
                 config.experimental.reveal_hidden_cursor_for_cjk_ime;
             self.state.cjk_ime_agent_filter_configured =

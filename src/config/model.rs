@@ -945,6 +945,18 @@ pub struct ExperimentalConfig {
     /// is found the sidebar keeps its character cards. Only read while
     /// `kitty_graphics` is on, and only at startup.
     pub sidebar_card_font: String,
+    /// Draw each sidebar card as its own transparent shape rather than as one
+    /// opaque sheet covering the whole tree. Default: false.
+    ///
+    /// With the sheet, a card is a region painted inside one rectangle whose
+    /// background is matched to the theme, so the card's glow terminates at that
+    /// rectangle's edge instead of falling off into whatever is behind it. With
+    /// shapes, each card is its own RGBA image at its own placement: transparent
+    /// outside its own glow, so there is no rectangle to clip and two cards that
+    /// overlap have their glows blended by the terminal.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub sidebar_card_shapes: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when

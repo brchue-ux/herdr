@@ -1278,6 +1278,12 @@
           "description": "Path to a proportional .ttf/.otf the sidebar's pixel cards are set in. Empty means search the usual system font directories; when nothing is found the sidebar keeps its character cards. Only read while kitty_graphics is on, and only at startup."
         },
         {
+          "key": "experimental.sidebar_card_shapes",
+          "type": "boolean",
+          "default": "false",
+          "description": "Draw each sidebar card as its own transparent shape rather than as one opaque sheet covering the whole tree. With the sheet, a card's glow terminates at the sheet's rectangle instead of falling off into what is behind it; with shapes, each card is its own RGBA image at its own placement, so there is no rectangle to clip and two overlapping cards have their glows blended by the terminal. Only read while kitty_graphics is on."
+        },
+        {
           "key": "experimental.pane_history",
           "type": "boolean",
           "default": "false",

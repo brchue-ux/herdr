@@ -881,6 +881,19 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    /// Whether *this* pass built the sidebar's card artwork.
+    ///
+    /// A property of the pass about to be encoded, never of shared state.
+    /// `AppState::host_cell_size` and `AppState::sidebar_card_layers` belong to
+    /// the foreground client, and a pass that cannot see the host's cell size
+    /// deliberately leaves both alone. It is the single truth both halves of the
+    /// pixel path read: `ui::sidebar::image_card::shape_covers_row` will not
+    /// suppress a row's character card unless this pass drew a shape over it,
+    /// and `kitty_graphics::surface_layer_placement_targets` will not send a
+    /// pass card images it did not publish. Splitting those two apart is what
+    /// draws a tree of bare connectors on one client and doubled borders on the
+    /// other.
+    pub sidebar_card_layers_published: bool,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
@@ -1699,6 +1712,10 @@ pub struct AppState {
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
     pub sidebar_card_font: Option<String>,
+    /// `[experimental] sidebar_card_shapes`: draw each card as its own
+    /// transparent shape at its own placement rather than as one opaque sheet
+    /// spanning the tree. See the field's doc on `ExperimentalConfig`.
+    pub sidebar_card_shapes: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1813,7 +1830,13 @@ pub struct AppState {
     /// deliberately does not live in `surface_graphics_layers`, so a client
     /// putting a backdrop on the sidebar and the sidebar drawing its own cards
     /// are two placements rather than one overwriting the other.
-    pub(crate) sidebar_card_layer: Option<crate::ui::sidebar::SidebarCardLayer>,
+    ///
+    /// A list rather than one layer because a card is its own object: under
+    /// `[experimental] sidebar_card_shapes` each card is a separate transparent
+    /// image at its own placement, so moving, fading or reflowing one card
+    /// touches one entry and leaves the rest alone. The sheet path puts exactly
+    /// one entry here, so both paths are the same shape downstream.
+    pub(crate) sidebar_card_layers: Vec<crate::ui::sidebar::SidebarCardLayer>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2435,6 +2458,7 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                sidebar_card_layers_published: false,
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -2507,6 +2531,7 @@ impl AppState {
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             sidebar_card_font: None,
+            sidebar_card_shapes: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
@@ -2556,7 +2581,7 @@ impl AppState {
             signal_tray_graphics_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
-            sidebar_card_layer: None,
+            sidebar_card_layers: Vec::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,

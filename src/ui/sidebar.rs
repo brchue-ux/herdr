@@ -2459,6 +2459,11 @@ fn render_agent_row(
     let card_shell = card
         .card_frame
         .and_then(|rect| Card::new(rect, label_color, is_active, p, &app.host_terminal_theme));
+    // A transparent pixel card carries this row's ink itself, and anything drawn
+    // under it would show through it rather than be covered by it. The shell is
+    // still *constructed* — the row's content width, its rails and its prefix are
+    // measured off it — it is just not drawn.
+    let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
     let content_rows = card
         .rect
         .height
@@ -2557,7 +2562,9 @@ fn render_agent_row(
             list_entry_gap(app, entries, card.entry_idx),
             list_bottom,
         );
-        shell.render_glow(frame, list_bottom);
+        if !covered {
+            shell.render_glow(frame, list_bottom);
+        }
     }
 
     let last_content_row = rows.len().saturating_sub(1);
@@ -2635,17 +2642,22 @@ fn render_agent_row(
             agent_style
         };
         animate_row_spans(&mut spans, &row_anim);
-        spans.extend(resolved_token_spans(
-            resolved,
-            state_icon,
-            status_style,
-            name_style,
-            secondary_style,
-            secondary_style,
-            p,
-            &row_anim,
-            token_budget.saturating_sub(trailing_width),
-        ));
+        // Under a shape the prefix still draws — it is the tree's connector,
+        // outside the card — but the row's own tokens do not: the pixel card has
+        // already set this title, this chip and this tidbit in its own type.
+        if !covered {
+            spans.extend(resolved_token_spans(
+                resolved,
+                state_icon,
+                status_style,
+                name_style,
+                secondary_style,
+                secondary_style,
+                p,
+                &row_anim,
+                token_budget.saturating_sub(trailing_width),
+            ));
+        }
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(row_style),
             Rect::new(card.rect.x, row_y, card.rect.width, 1),
@@ -2653,11 +2665,15 @@ fn render_agent_row(
     }
 
     if let Some(shell) = &card_shell {
-        shell.render_frame(frame, list_bottom, pill.as_ref());
+        if !covered {
+            shell.render_frame(frame, list_bottom, pill.as_ref());
+        }
     }
 
     if let Some((owner, count)) = &summary_badge {
-        render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
+        if !covered {
+            render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
+        }
     }
 }
 
@@ -3492,6 +3508,11 @@ fn render_workspace_list(
                 &app.host_terminal_theme,
             )
         });
+        // A transparent pixel card carries this row's ink itself, and anything
+        // drawn under it would show through it rather than be covered by it. The
+        // shell is still constructed — the row's content width, its rails and its
+        // prefix are measured off it — it is just not drawn.
+        let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
         // The same mark, padded and plated. The alphabet is untouched: a chip
         // is where a mark is set, not a mark of its own.
         let chip = card_shell.as_ref().map(|shell| shell.chip(mark.0));
@@ -3598,7 +3619,9 @@ fn render_workspace_list(
                 list_entry_gap(app, &entries, card.entry_idx),
                 list_bottom,
             );
-            shell.render_glow(frame, list_bottom);
+            if !covered {
+                shell.render_glow(frame, list_bottom);
+            }
         }
 
         let last_content_row = rows.len().saturating_sub(1);
@@ -3709,20 +3732,26 @@ fn render_workspace_list(
             } else {
                 branch_style
             };
-            spans.extend(resolved_token_spans(
-                resolved,
-                (
-                    state_icon.0,
-                    arrived_state_icon_style(state_icon.1, row_charge.as_ref(), p),
-                ),
-                state_text_style,
-                name_style,
-                secondary_style,
-                secondary_style,
-                p,
-                &RowAnimation::for_workspace(app, Some(ws.id.as_str())),
-                token_budget.saturating_sub(trailing_width),
-            ));
+            // Under a shape the prefix still draws — it is the tree's connector,
+            // outside the card — but the row's own tokens do not: the pixel card
+            // has already set this title, this chip and this tidbit in its own
+            // type, and a transparent card would show both.
+            if !covered {
+                spans.extend(resolved_token_spans(
+                    resolved,
+                    (
+                        state_icon.0,
+                        arrived_state_icon_style(state_icon.1, row_charge.as_ref(), p),
+                    ),
+                    state_text_style,
+                    name_style,
+                    secondary_style,
+                    secondary_style,
+                    p,
+                    &RowAnimation::for_workspace(app, Some(ws.id.as_str())),
+                    token_budget.saturating_sub(trailing_width),
+                ));
+            }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
                 Rect::new(
@@ -3735,21 +3764,31 @@ fn render_workspace_list(
         }
 
         if let Some(shell) = &card_shell {
-            shell.render_frame(frame, list_bottom, pill.as_ref());
+            if !covered {
+                shell.render_frame(frame, list_bottom, pill.as_ref());
+            }
         }
 
         if let Some((owner, count)) = &summary_badge {
-            render_worker_summary_badge(app, frame, card, &agents, owner, *count, list_bottom);
+            if !covered {
+                render_worker_summary_badge(app, frame, card, &agents, owner, *count, list_bottom);
+            }
         }
 
         if let Some((_, collapsed)) = parent_group {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    if collapsed { "▸" } else { "▾" },
-                    Style::default().fg(p.accent),
-                )),
-                workspace_group_chevron_rect(card),
-            );
+            // Suppressed with the badge beside it, and for the same reason: both
+            // anchor inside the card's frame, so under a shape they would show
+            // through artwork that carries no room for them. The opaque sheet
+            // covered neither, and this keeps the two in step.
+            if !covered {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        if collapsed { "▸" } else { "▾" },
+                        Style::default().fg(p.accent),
+                    )),
+                    workspace_group_chevron_rect(card),
+                );
+            }
         }
     }
 
