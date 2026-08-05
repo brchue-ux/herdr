@@ -259,9 +259,14 @@ fn desktop_tab_bar_and_terminal_area(
 /// pixel path. A pass that leaves the foreground client's cards alone answers
 /// `false`: the artwork exists, but not for this pass, so that pass keeps
 /// drawing its character cards and is sent none of the images.
+///
+/// It also stamps each row's resolved motion offset back onto `cards`, so the
+/// character renderer draws the tree's connectors at the cells the placement
+/// actually used rather than deriving a second answer — see
+/// `crate::app::state::WorkspaceCardArea::motion_cells`.
 fn update_sidebar_card_layers(
     app: &mut AppState,
-    cards: &[crate::app::state::WorkspaceCardArea],
+    cards: &mut [crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> bool {
@@ -278,13 +283,17 @@ fn update_sidebar_card_layers(
         // foreground one a re-encode and a re-upload.
         return false;
     }
-    match sidebar::image_card::build_cards(
+    let build = sidebar::image_card::build_cards(
         app,
         cards,
         sidebar_area,
         cell_size,
         &app.sidebar_card_layers,
-    ) {
+    );
+    for (card, offset) in cards.iter_mut().zip(build.motion) {
+        card.motion_cells = offset;
+    }
+    match build.update {
         sidebar::image_card::CardsUpdate::Unchanged => {}
         sidebar::image_card::CardsUpdate::Rebuilt(layers) => app.sidebar_card_layers = layers,
         sidebar::image_card::CardsUpdate::Empty => app.sidebar_card_layers.clear(),
@@ -335,7 +344,7 @@ fn compute_view_internal(
             .min(app.workspaces.len().saturating_sub(1));
     }
 
-    let workspace_card_areas = if app.sidebar_collapsed {
+    let mut workspace_card_areas = if app.sidebar_collapsed {
         Vec::new()
     } else {
         compute_workspace_card_areas(app, sidebar_area)
@@ -345,7 +354,7 @@ fn compute_view_internal(
     // areas because it draws into exactly those rects: the pixel card never
     // decides its own geometry.
     let sidebar_card_layers_published =
-        update_sidebar_card_layers(app, &workspace_card_areas, sidebar_area, cell_size);
+        update_sidebar_card_layers(app, &mut workspace_card_areas, sidebar_area, cell_size);
 
     let tab_label_decor = TabLabelDecor::from_state(app);
     let tab_bar_view = app

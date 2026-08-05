@@ -1066,6 +1066,12 @@ pub struct SidebarAnimationConfig {
     /// bounded arrival to slide through, playing
     /// [`crate::anim::behaviour::names::STILL`] so its characters look settled
     /// throughout.
+    ///
+    /// Pixel cards only, so a host without `[experimental] kitty_graphics` and
+    /// `sidebar_card_shapes` is left exactly as it was — including the phase
+    /// motion would have invented, which is why the gate is
+    /// [`crate::app::state::AppState::sidebar_rows_move`] rather than this
+    /// field.
     pub row_motion: SidebarRowMotion,
     /// Behaviour the whole tree plays when it is re-rooted onto one second
     /// mate, and again on the way back out.
@@ -1125,14 +1131,26 @@ impl Default for SidebarAnimationConfig {
 }
 
 impl SidebarAnimationConfig {
-    /// True when rows are configured to move as they arrive and leave.
+    /// True when rows are *configured* to move as they arrive and leave.
+    ///
+    /// Configuration only. Whether rows can actually move is a property of the
+    /// host as much as of the config — motion is an offset applied to a pixel
+    /// card, and a terminal drawing characters has nothing to offset — so every
+    /// caller outside this module asks
+    /// [`crate::app::state::AppState::sidebar_rows_move`], which folds the two
+    /// together. Handing this flag straight to [`Self::stage`] is what once let
+    /// a character-only host synthesize a departure phase it could not play,
+    /// and keep a closed pane's row on screen for the whole of it.
     pub(crate) fn rows_move(&self) -> bool {
         matches!(self.row_motion, SidebarRowMotion::Slide)
     }
 
     /// The arrival stage, or `None` when rows are configured to just appear.
-    pub(crate) fn row_enter_stage(&self) -> Option<crate::anim::Stage> {
-        Self::stage(self.row_enter, self.row_enter_ms, self.rows_move())
+    ///
+    /// `moves` is whether rows move *on this host*, from
+    /// [`crate::app::state::AppState::sidebar_rows_move`].
+    pub(crate) fn row_enter_stage(&self, moves: bool) -> Option<crate::anim::Stage> {
+        Self::stage(self.row_enter, self.row_enter_ms, moves)
     }
 
     /// The departure stage, or `None` when rows are configured to just vanish.
@@ -1140,8 +1158,8 @@ impl SidebarAnimationConfig {
     /// This is the one thing that decides whether a row that has left is still
     /// drawn: with no exit stage a departing row is retired on the spot, so
     /// nothing downstream has to know an exit was configured.
-    pub(crate) fn row_exit_stage(&self) -> Option<crate::anim::Stage> {
-        Self::stage(self.row_exit, self.row_exit_ms, self.rows_move())
+    pub(crate) fn row_exit_stage(&self, moves: bool) -> Option<crate::anim::Stage> {
+        Self::stage(self.row_exit, self.row_exit_ms, moves)
     }
 
     /// `moves` is what lets motion stand on its own. A row with no cell
@@ -1150,6 +1168,10 @@ impl SidebarAnimationConfig {
     /// created anyway and plays a behaviour that draws nothing. That is the
     /// whole of "slide composes with dissolve rather than replacing it": both
     /// read the same clock, and neither needs the other to be configured.
+    ///
+    /// It is deliberately a parameter rather than [`Self::rows_move`] read
+    /// here: a phase created for a movement that cannot happen is a row drawn
+    /// from memory with nothing playing on it.
     fn stage(emphasis: SidebarTokenEmphasis, ms: u64, moves: bool) -> Option<crate::anim::Stage> {
         let behaviour = match emphasis.behaviour() {
             Some(behaviour) => behaviour,
@@ -1208,7 +1230,9 @@ row_exit_ms = 5
 
         let animation = config.ui.sidebar.animation;
         assert_eq!(animation.row_exit, SidebarTokenEmphasis::Wipe);
-        let exit = animation.row_exit_stage().expect("a named exit is a stage");
+        let exit = animation
+            .row_exit_stage(animation.rows_move())
+            .expect("a named exit is a stage");
         assert_eq!(
             exit.duration,
             std::time::Duration::from_millis(MIN_ROW_ENTER_MS),
@@ -1219,7 +1243,7 @@ row_exit_ms = 5
         assert_eq!(
             exit.behaviour,
             animation
-                .row_enter_stage()
+                .row_enter_stage(animation.rows_move())
                 .expect("a named arrival is a stage")
                 .behaviour
         );
@@ -1228,9 +1252,9 @@ row_exit_ms = 5
     #[test]
     fn rows_neither_arrive_nor_leave_unless_asked_to() {
         let animation = SidebarAnimationConfig::default();
-        assert!(animation.row_enter_stage().is_none());
+        assert!(animation.row_enter_stage(animation.rows_move()).is_none());
         assert!(
-            animation.row_exit_stage().is_none(),
+            animation.row_exit_stage(animation.rows_move()).is_none(),
             "an unconfigured Herdr must drop a closed pane's row on the next frame"
         );
         assert!(!animation.rows_move(), "motion must not arrive switched on");
@@ -1257,11 +1281,16 @@ row_motion = "slide"
         assert!(animation.rows_move());
         // The dissolve still owns what the cells do, and it still runs for
         // exactly as long as it was told to.
-        let enter = animation.row_enter_stage().expect("an arrival");
+        let enter = animation
+            .row_enter_stage(animation.rows_move())
+            .expect("an arrival");
         assert_eq!(enter.behaviour, crate::anim::behaviour::names::DISSOLVE);
         assert_eq!(enter.duration, std::time::Duration::from_millis(260));
         assert_eq!(
-            animation.row_exit_stage().expect("a departure").duration,
+            animation
+                .row_exit_stage(animation.rows_move())
+                .expect("a departure")
+                .duration,
             std::time::Duration::from_millis(220)
         );
     }
@@ -1280,14 +1309,19 @@ row_motion = "slide"
 
         let animation = config.ui.sidebar.animation;
         assert_eq!(animation.row_enter, SidebarTokenEmphasis::None);
-        let enter = animation.row_enter_stage().expect("motion needs a phase");
+        let enter = animation
+            .row_enter_stage(animation.rows_move())
+            .expect("motion needs a phase");
         assert_eq!(
             enter.behaviour,
             crate::anim::behaviour::names::STILL,
             "a row asked only to move must not also be given a cell effect"
         );
         assert_eq!(
-            animation.row_exit_stage().expect("a departure").behaviour,
+            animation
+                .row_exit_stage(animation.rows_move())
+                .expect("a departure")
+                .behaviour,
             crate::anim::behaviour::names::STILL
         );
     }

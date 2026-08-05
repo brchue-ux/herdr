@@ -1301,6 +1301,7 @@ mod tests {
             entry_idx: 0,
             agent: None,
             card_frame: None,
+            motion_cells: (0, 0),
         }];
     }
 

@@ -1546,6 +1546,7 @@ pub(crate) fn compute_workspace_list_areas(
             entry_idx,
             agent,
             card_frame: card_frame_for(rect, entry, fold_width),
+            motion_cells: (0, 0),
         });
         row_y = row_y
             .saturating_add(row_height)
@@ -2467,12 +2468,17 @@ fn resolved_token_spans(
 /// It uses the same connector maths as every other row and its own
 /// `[ui.sidebar.agents]` token layout, so a worker reads as a branch of its
 /// mate rather than as a visitor from somewhere else.
+// The panel's two vertical bounds and its fold width are all the row's caller
+// already knows and the row must not re-derive: measuring them twice is how a
+// row's reserved height and its drawn lines come to disagree.
+#[allow(clippy::too_many_arguments)]
 fn render_agent_row(
     app: &AppState,
     frame: &mut Frame,
     card: &crate::app::state::WorkspaceCardArea,
     entries: &[WorkspaceListEntry],
     agents: &[AgentPanelEntry],
+    list_top: u16,
     list_bottom: u16,
     fold_width: u16,
 ) {
@@ -2498,6 +2504,7 @@ fn render_agent_row(
     // still *constructed* — the row's content width, its rails and its prefix are
     // measured off it — it is just not drawn.
     let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
+    let motion = row_motion_cells(card, covered);
     let content_rows = card
         .rect
         .height
@@ -2594,7 +2601,9 @@ fn render_agent_row(
             above,
             below,
             list_entry_gap(app, entries, card.entry_idx),
+            list_top,
             list_bottom,
+            motion,
         );
         if !covered {
             shell.render_glow(frame, list_bottom);
@@ -2607,6 +2616,15 @@ fn render_agent_row(
         if row_index as u16 >= content_rows || row_y >= list_bottom {
             break;
         }
+        // A row still crossing the panel draws nothing in characters: its own
+        // rail would point at a card that has not arrived, and under a shape
+        // this line carries only that rail anyway.
+        if motion.0 != 0 {
+            continue;
+        }
+        let Some(row_y) = moved_row(row_y, motion.1, list_top, list_bottom) else {
+            continue;
+        };
         // Only the first content row carries the badge, so only it gives up the
         // width; only the last carries the pill.
         let trailing_width = if row_index == 0 {
@@ -2737,12 +2755,45 @@ fn agent_status_label(entry: &AgentPanelEntry) -> &str {
         .unwrap_or_else(|| state_label(entry.state, entry.seen))
 }
 
+/// Where a row is drawn relative to where the layout put it, in whole cells.
+///
+/// `(0, 0)` unless a pixel card was actually placed for this row on this pass:
+/// `motion_cells` is the offset the *placement* took, so applying it to the
+/// characters of a row whose card is not on screen would move a line away from
+/// the thing it belongs to rather than with it.
+fn row_motion_cells(card: &crate::app::state::WorkspaceCardArea, covered: bool) -> (i32, i32) {
+    if covered {
+        card.motion_cells
+    } else {
+        (0, 0)
+    }
+}
+
+/// One of a row's rows, moved by the row's own motion offset, or `None` when
+/// that puts it outside the list.
+fn moved_row(y: u16, dy: i32, list_top: u16, list_bottom: u16) -> Option<u16> {
+    let moved = i32::from(y).checked_add(dy)?;
+    let moved = u16::try_from(moved).ok()?;
+    (moved >= list_top && moved < list_bottom).then_some(moved)
+}
+
 /// Draw the tree rails beside a card's border rows.
 ///
 /// A card's content rows carry their own rails in the line they render; its two
 /// border rows have no line of their own, so the rails beside them are drawn
 /// here. Without this the tree's vertical rules would break every time they
 /// passed a card — which, at four rows an entity, is most of the panel.
+///
+/// `motion` is [`row_motion_cells`]. The rail travels with the card because the
+/// two are one thing seen by two renderers: a connector left at the layout's
+/// row while the card it points at is four rows higher is an arrow at empty
+/// space. Both are whole-cell arithmetic over the same published offset, so
+/// they cannot land a row apart. A row still travelling *sideways* draws no
+/// rail at all — its card has not reached the panel yet.
+// Three pre-rendered span runs, the gap under the card and the three bounds the
+// rail is drawn between: every one of them is a separate fact about this one
+// row, and grouping them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 fn render_card_border_rails(
     frame: &mut Frame,
     card: &crate::app::state::WorkspaceCardArea,
@@ -2750,13 +2801,15 @@ fn render_card_border_rails(
     above: Vec<Span<'static>>,
     below: Vec<Span<'static>>,
     trailing_gap: u16,
+    list_top: u16,
     list_bottom: u16,
+    motion: (i32, i32),
 ) {
     let Some(shell_frame) = card.card_frame else {
         return;
     };
     let width = shell_frame.x.saturating_sub(card.rect.x);
-    if width == 0 || shell_frame.height == 0 {
+    if width == 0 || shell_frame.height == 0 || motion.0 != 0 {
         return;
     }
     // The connector points at the card's *name*, which is its first content
@@ -2772,9 +2825,9 @@ fn render_card_border_rails(
         .saturating_add(shell_frame.height)
         .saturating_add(trailing_gap);
     for y in shell_frame.y..last_y {
-        if y >= list_bottom {
-            break;
-        }
+        let Some(drawn_y) = moved_row(y, motion.1, list_top, list_bottom) else {
+            continue;
+        };
         let spans = if y == connector_y {
             connector.clone()
         } else if y < connector_y {
@@ -2784,7 +2837,7 @@ fn render_card_border_rails(
         };
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(card.rect.x, y, width, 1),
+            Rect::new(card.rect.x, drawn_y, width, 1),
         );
     }
 }
@@ -3475,7 +3528,16 @@ fn render_workspace_list(
 
     for card in cards {
         if card.agent.is_some() {
-            render_agent_row(app, frame, card, &entries, &agents, list_bottom, fold_width);
+            render_agent_row(
+                app,
+                frame,
+                card,
+                &entries,
+                &agents,
+                area.y,
+                list_bottom,
+                fold_width,
+            );
             continue;
         }
         let i = card.ws_idx;
@@ -3496,25 +3558,6 @@ fn render_workspace_list(
         let is_dragged = dragged_ws_idx == Some(i);
         let highlighted = selected || is_active || is_dragged;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-
-        if highlighted {
-            let bg = if selected {
-                p.surface0
-            } else if is_dragged {
-                p.surface1
-            } else {
-                p.surface_dim
-            };
-            let buf = frame.buffer_mut();
-            for y in row_y..row_y + row_height {
-                if y >= list_bottom {
-                    break;
-                }
-                for x in card.rect.x..card.rect.x + card.rect.width {
-                    buf[(x, y)].set_style(Style::default().bg(bg));
-                }
-            }
-        }
 
         // A card's first content row is its title, and it gets full weight
         // whether or not the cursor is on it: the frame, the chip and the glow
@@ -3555,6 +3598,33 @@ fn render_workspace_list(
         // shell is still constructed — the row's content width, its rails and its
         // prefix are measured off it — it is just not drawn.
         let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
+        // Where this row is drawn, which is where the layout put it unless its
+        // card is mid-slide. Resolved here rather than earlier because it is
+        // only honoured while a pixel card is actually on this row.
+        let motion = row_motion_cells(card, covered);
+
+        // The selection wash follows the row it belongs to. Drawn after the
+        // shell is known so it can, and before anything else this row paints so
+        // it is still under all of it — it patches the background and leaves
+        // every symbol alone.
+        if highlighted && motion.0 == 0 {
+            let bg = if selected {
+                p.surface0
+            } else if is_dragged {
+                p.surface1
+            } else {
+                p.surface_dim
+            };
+            let buf = frame.buffer_mut();
+            for y in row_y..row_y + row_height {
+                let Some(drawn_y) = moved_row(y, motion.1, area.y, list_bottom) else {
+                    continue;
+                };
+                for x in card.rect.x..card.rect.x + card.rect.width {
+                    buf[(x, drawn_y)].set_style(Style::default().bg(bg));
+                }
+            }
+        }
         // The same mark, padded and plated. The alphabet is untouched: a chip
         // is where a mark is set, not a mark of its own.
         let chip = card_shell.as_ref().map(|shell| shell.chip(mark.0));
@@ -3659,7 +3729,9 @@ fn render_workspace_list(
                 above,
                 below,
                 list_entry_gap(app, &entries, card.entry_idx),
+                area.y,
                 list_bottom,
+                motion,
             );
             if !covered {
                 shell.render_glow(frame, list_bottom);
@@ -3671,6 +3743,17 @@ fn render_workspace_list(
             if row_index as u16 >= content_rows || content_y + row_index as u16 >= list_bottom {
                 break;
             }
+            // A row still crossing the panel draws nothing in characters: its
+            // own rail would point at a card that has not arrived, and under a
+            // shape this line carries only that rail anyway.
+            if motion.0 != 0 {
+                continue;
+            }
+            let Some(drawn_y) =
+                moved_row(content_y + row_index as u16, motion.1, area.y, list_bottom)
+            else {
+                continue;
+            };
             // The branch line only exists on a child card's first row, so that
             // is the only row a signal can travel and the only row it damages.
             let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
@@ -3796,12 +3879,7 @@ fn render_workspace_list(
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
-                Rect::new(
-                    card.rect.x,
-                    content_y + row_index as u16,
-                    card.rect.width,
-                    1,
-                ),
+                Rect::new(card.rect.x, drawn_y, card.rect.width, 1),
             );
         }
 
@@ -4491,6 +4569,7 @@ mod tests {
             entry_idx: 0,
             agent: None,
             card_frame: None,
+            motion_cells: (0, 0),
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
@@ -4892,6 +4971,7 @@ mod tests {
             entry_idx: 0,
             agent: None,
             card_frame: Some(frame),
+            motion_cells: (0, 0),
         };
         let chevron = workspace_group_chevron_rect(&card);
         assert_eq!(
@@ -4917,6 +4997,7 @@ mod tests {
         // and reaches its own right edge.
         let line = crate::app::state::WorkspaceCardArea {
             card_frame: None,
+            motion_cells: (0, 0),
             ..card
         };
         assert_eq!(workspace_group_chevron_rect(&line).y, rect.y);
@@ -6466,6 +6547,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             rect: Rect::new(0, 1, 15, 2),
             worktree_child: false,
             card_frame: None,
+            motion_cells: (0, 0),
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(15, 6)).expect("test terminal");

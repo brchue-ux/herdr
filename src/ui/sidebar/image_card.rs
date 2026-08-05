@@ -1136,6 +1136,26 @@ pub(crate) enum CardsUpdate {
     Empty,
 }
 
+/// What one pass over the tree's cards concluded, and where it decided to put
+/// them.
+///
+/// The two travel together because a pass that changed no artwork still moved
+/// it: every frame of a slide is a [`CardsUpdate::Rebuilt`] of *held* pixels at
+/// a new placement, and the settled frames either side of it are `Unchanged` at
+/// no offset. Returning the offsets beside the update is what lets the
+/// character renderer draw the tree's connectors at exactly the cells the
+/// placement used, instead of deriving a second answer from the same engine.
+pub(crate) struct CardsBuild {
+    pub(crate) update: CardsUpdate,
+    /// One entry per input card, in the same order, in whole cells. `(0, 0)`
+    /// for a card that is settled, that this pass did not draw, or whenever
+    /// rows do not move on this host.
+    ///
+    /// Stamped onto [`crate::app::state::WorkspaceCardArea::motion_cells`] by
+    /// the caller.
+    pub(crate) motion: Vec<(i32, i32)>,
+}
+
 /// Build the images for the tree's current cards.
 ///
 /// `previous` is what the last frame produced. A frame whose content signature
@@ -1164,22 +1184,32 @@ pub(crate) fn build_cards(
     sidebar_area: Rect,
     cell_size: HostCellSize,
     previous: &[SidebarCardLayer],
-) -> CardsUpdate {
-    match build_cards_inner(app, cards, sidebar_area, cell_size, previous) {
+) -> CardsBuild {
+    // Sized and zeroed up front so every early return out of the build answers
+    // "nothing moved" rather than "no answer": a pass that drew nothing must
+    // leave the character renderer drawing the tree where the layout put it.
+    let mut motion = vec![(0, 0); cards.len()];
+    let update = match build_cards_inner(app, cards, sidebar_area, cell_size, previous, &mut motion)
+    {
         Ok(Some(layers)) => CardsUpdate::Rebuilt(layers),
         Ok(None) => CardsUpdate::Unchanged,
         Err(()) => CardsUpdate::Empty,
-    }
+    };
+    CardsBuild { update, motion }
 }
 
 /// `Ok(Some)` is new artwork, `Ok(None)` is what is already held, `Err` is none
 /// at all.
+///
+/// `motion` is filled in with the offset each card was placed at, indexed like
+/// `cards`.
 fn build_cards_inner(
     app: &AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: HostCellSize,
     previous: &[SidebarCardLayer],
+    motion: &mut [(i32, i32)],
 ) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
     let fold_width = super::row_fold_width(app, super::workspace_list_rect(sidebar_area));
     if !is_available(app, fold_width) {
@@ -1219,9 +1249,13 @@ fn build_cards_inner(
     // together. Only when rows are configured to move: with motion off nothing
     // reads the engine here at all and every card is placed exactly where the
     // layout put it, which is what the panel has always done.
-    let moving = app.sidebar_animation.rows_move();
+    let moving = app.sidebar_rows_move();
     let mut placed: Vec<(Rect, CardContent)> = Vec::new();
     let mut lives: Vec<super::motion::RowLife> = Vec::new();
+    // Which input card each entry of `placed` came from, so the resolved
+    // offsets can be handed back on the caller's own indexing. A card without a
+    // frame or without content is skipped here and stays at rest.
+    let mut placed_from: Vec<usize> = Vec::new();
     for (index, card) in cards.iter().enumerate() {
         let Some(frame) = card.card_frame else {
             continue;
@@ -1247,16 +1281,29 @@ fn build_cards_inner(
             });
         }
         placed.push((frame, content));
+        placed_from.push(index);
     }
     if placed.is_empty() {
         return Err(());
     }
     let panel_px = f32::from(bounds.width) * cell_w;
     let offsets = if moving {
-        super::motion::row_offsets(&lives, panel_px)
+        super::motion::cell_offsets(
+            &super::motion::row_offsets(&lives, panel_px),
+            cell_w,
+            cell_h,
+        )
     } else {
-        vec![(0.0, 0.0); placed.len()]
+        vec![(0, 0); placed.len()]
     };
+    // Published before anything is drawn, so the offsets the connectors follow
+    // are the ones the placement was planned from even on the frame the
+    // rasterisation fails.
+    for (slot, offset) in placed_from.iter().zip(&offsets) {
+        if let Some(cell) = motion.get_mut(*slot) {
+            *cell = *offset;
+        }
+    }
 
     let title_metrics = font.metrics(TITLE_PX);
     let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
@@ -1467,7 +1514,7 @@ impl Rasteriser<'_> {
         let signature = hasher.finish();
 
         let previous = previous.first();
-        let viewport = self.aim(sheet_rect, (0.0, 0.0));
+        let viewport = self.aim(sheet_rect, (0, 0));
         if previous.is_some_and(|previous| {
             previous.signature == signature
                 && previous.rect == sheet_rect
@@ -1507,12 +1554,12 @@ impl Rasteriser<'_> {
     /// tree's artwork.
     ///
     /// `offsets` is where each card is drawn relative to where the layout put
-    /// it, from [`super::motion::row_offsets`], and is all zeroes whenever rows
-    /// are not configured to move.
+    /// it, in whole cells, from [`super::motion::cell_offsets`], and is all
+    /// zeroes whenever rows do not move on this host.
     fn shapes(
         &self,
         placed: &[(Rect, CardContent)],
-        offsets: &[(f32, f32)],
+        offsets: &[(i32, i32)],
         previous: &[SidebarCardLayer],
     ) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
         // Measured first, drawn second. Deciding whether anything moved before
@@ -1614,23 +1661,21 @@ impl Rasteriser<'_> {
 
     /// Where an image drawn for `rect` is placed, relative to [`Self::clip`].
     ///
-    /// Rounded to whole cells. A card's placement is a cell position, and the
-    /// engine's own frame step is coarser than a cell is tall over any arrival
-    /// short enough to read as one — so sub-cell placement would buy at most an
-    /// extra position per transition while costing every card a pixel-offset
-    /// path and a transparent pad for the clip to eat. Measured in
-    /// `data/herdr-row-slide-reflow/`.
-    fn aim(&self, rect: Rect, offset: (f32, f32)) -> (i32, i32) {
+    /// `offset` is already in whole cells — a card's placement is a cell
+    /// position, and the quantisation happens once, in
+    /// [`super::motion::cell_offsets`], so the connector rails drawn in
+    /// characters beside this card are following exactly this number.
+    fn aim(&self, rect: Rect, offset: (i32, i32)) -> (i32, i32) {
         let clip = self.clip();
         (
-            i32::from(rect.x) - i32::from(clip.x) + (offset.0 / self.cell_w).round() as i32,
-            i32::from(rect.y) - i32::from(clip.y) + (offset.1 / self.cell_h).round() as i32,
+            i32::from(rect.x) - i32::from(clip.x) + offset.0,
+            i32::from(rect.y) - i32::from(clip.y) + offset.1,
         )
     }
 
     /// What one card's image will be, and where it goes, before anything is
     /// drawn.
-    fn plan(&self, frame: Rect, content: &CardContent, offset: (f32, f32)) -> Option<PlannedShape> {
+    fn plan(&self, frame: Rect, content: &CardContent, offset: (i32, i32)) -> Option<PlannedShape> {
         let rect = self.card_rect(frame, content)?;
         let mut hasher = DefaultHasher::new();
         self.hash_common(&mut hasher, rect);
@@ -2147,7 +2192,9 @@ mod tests {
             sidebar_area,
             cell_size,
             previous.map(std::slice::from_ref).unwrap_or_default(),
-        ) {
+        )
+        .update
+        {
             CardsUpdate::Unchanged => SheetUpdate::Unchanged,
             CardsUpdate::Rebuilt(layers) => match layers.into_iter().next() {
                 Some(layer) => SheetUpdate::Rebuilt(layer),
@@ -3661,7 +3708,7 @@ mod a_card_is_its_own_shape {
     /// proportional face and there is no pixel path to test.
     fn built(app: &AppState) -> Option<Vec<SidebarCardLayer>> {
         let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
-        match build_cards(app, &cards, sidebar_rect(), app.host_cell_size, &[]) {
+        match build_cards(app, &cards, sidebar_rect(), app.host_cell_size, &[]).update {
             CardsUpdate::Rebuilt(layers) => Some(layers),
             _ => None,
         }
@@ -3869,12 +3916,12 @@ mod a_card_is_its_own_shape {
         let app = shape_fleet_app();
         let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
         let CardsUpdate::Rebuilt(first) =
-            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[])
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[]).update
         else {
             return; // No face on this machine.
         };
         assert!(matches!(
-            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &first),
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &first).update,
             CardsUpdate::Unchanged
         ));
 
@@ -3905,7 +3952,7 @@ mod a_card_is_its_own_shape {
                 now,
             );
         let CardsUpdate::Rebuilt(second) =
-            build_cards(&moved, &cards, sidebar_rect(), moved.host_cell_size, &first)
+            build_cards(&moved, &cards, sidebar_rect(), moved.host_cell_size, &first).update
         else {
             panic!("a tree whose card changed did not rebuild");
         };
@@ -3994,7 +4041,7 @@ mod a_card_is_its_own_shape {
         );
         let cards = super::super::compute_workspace_card_areas(&app, narrow);
         assert!(matches!(
-            build_cards(&app, &cards, narrow, app.host_cell_size, &[]),
+            build_cards(&app, &cards, narrow, app.host_cell_size, &[]).update,
             CardsUpdate::Empty
         ));
     }
@@ -4013,7 +4060,7 @@ mod a_card_is_its_own_shape {
         );
         let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
         assert!(matches!(
-            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[]),
+            build_cards(&app, &cards, sidebar_rect(), app.host_cell_size, &[]).update,
             CardsUpdate::Empty
         ));
     }
@@ -4308,7 +4355,7 @@ mod rows_make_room_for_each_other {
         rect: Rect,
         previous: &[SidebarCardLayer],
     ) -> Option<Vec<SidebarCardLayer>> {
-        match build_cards(app, cards, rect, app.host_cell_size, previous) {
+        match build_cards(app, cards, rect, app.host_cell_size, previous).update {
             CardsUpdate::Rebuilt(layers) => Some(layers),
             // No proportional face on this machine, or nothing moved.
             CardsUpdate::Unchanged | CardsUpdate::Empty => None,
@@ -4563,7 +4610,8 @@ mod rows_make_room_for_each_other {
                         narrow,
                         app.host_cell_size,
                         &[]
-                    ),
+                    )
+                    .update,
                     CardsUpdate::Empty
                 ),
                 "a panel this narrow drew a card, so this is not the fallback"
@@ -4596,6 +4644,210 @@ mod rows_make_room_for_each_other {
             rendered(crate::config::SidebarRowMotion::None),
             "motion reached the character fallback, which cannot express it"
         );
+    }
+
+    /// The tree's connectors travel with the cards they point at.
+    ///
+    /// A card is pixels and the `├─ ` beside it is a character, drawn by two
+    /// different renderers — so "the character path is the authority on where a
+    /// row is" once meant the rails stayed at the layout's row while the
+    /// artwork slid four rows away from them, and every card in the panel was
+    /// visibly detached from its own connector for the whole of an arrival.
+    /// They can move together exactly because the offset is quantized to whole
+    /// cells once and both read that one number.
+    ///
+    /// What this pins is the reflow as a whole: with a row's slot still closed,
+    /// the tree below it is drawn precisely where it stood before that slot
+    /// existed.
+    #[test]
+    fn the_tree_below_an_arrival_is_drawn_where_the_cards_below_it_are_placed() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // Wider than the panel so the layout is the desktop one; the rails live
+        // in the panel's first few columns whatever the rest of the screen is.
+        let area = Rect::new(0, 0, 100, sidebar_rect().height);
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let strip = |app: &AppState| -> Vec<String> {
+            let sidebar = app.view.sidebar_rect;
+            let mut terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("backend");
+            terminal
+                .draw(|frame| super::super::render_sidebar(app, &runtimes, frame, sidebar))
+                .expect("draws");
+            let buffer = terminal.backend().buffer();
+            (0..area.height)
+                .map(|row| {
+                    (0..RAIL_COLUMNS)
+                        .map(|col| buffer[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let mut app = moving_fleet();
+        let cell_size = app.host_cell_size;
+        app.mode = crate::app::Mode::Terminal;
+        app.sidebar_width = sidebar_rect().width;
+        app.sidebar_max_width = sidebar_rect().width;
+        let (index, pane) = arriving_row(&super::super::compute_workspace_card_areas(
+            &app,
+            sidebar_rect(),
+        ));
+
+        // Everything but one row exists, and settles.
+        let now = Instant::now();
+        publish(&mut app, now, Some(pane));
+        let settled_at = now + Duration::from_secs(2);
+        app.anim.advance(settled_at);
+
+        // Its first frame: its slot is still entirely closed.
+        publish(&mut app, settled_at, None);
+        crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
+        if !app.view.sidebar_card_layers_published {
+            // No proportional face on this machine, the same skip every other
+            // pixel-card test takes.
+            return;
+        }
+        let mid_cards = app.view.workspace_card_areas.clone();
+        let mid = strip(&app);
+
+        let arriving = mid_cards[index];
+        assert_ne!(
+            arriving.motion_cells.0, 0,
+            "the arriving row is not travelling, so this is not its first frame"
+        );
+        let span = mid_cards
+            .get(index + 1)
+            .map(|card| -card.motion_cells.1)
+            .expect("nothing below the arriving row");
+        assert!(
+            span > 0,
+            "the row below the arrival did not hold its ground"
+        );
+
+        app.anim.advance(settled_at + Duration::from_secs(2));
+        crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell_size);
+        let settled = strip(&app);
+        assert!(
+            app.view.workspace_card_areas[index].motion_cells == (0, 0),
+            "the arrival never finished"
+        );
+
+        // Above the arrival nothing moved at all.
+        for y in 0..usize::from(arriving.rect.y) {
+            assert_eq!(mid[y], settled[y], "the tree above the arrival moved");
+        }
+        // At and below it, the tree is exactly the settled tree read `span`
+        // rows further down — connectors, rails and the gaps between them.
+        // Bounded by the list rather than the panel: the footer and the tray
+        // are not the tree and do not reflow with it.
+        let list = super::super::workspace_list_rect(app.view.sidebar_rect);
+        // The renderer's own floor, which is one row short of the panel it was
+        // given: `list_bottom` in `render_workspace_list`.
+        let list_bottom = usize::from(list.y + list.height.saturating_sub(1));
+        let bottom = list_bottom
+            .saturating_sub(usize::from(u16::try_from(span).expect("a row span")))
+            .min(settled.len());
+        let mut moved = 0usize;
+        for y in usize::from(arriving.rect.y)..bottom {
+            assert_eq!(
+                mid[y],
+                settled[y + span as usize],
+                "row {y} of the tree is not where the cards under the arrival \
+                 were placed"
+            );
+            moved += usize::from(mid[y].trim() != settled[y].trim());
+        }
+        assert!(
+            moved > 0,
+            "no rail moved, so this proves nothing about the reflow"
+        );
+    }
+
+    /// The panel's first columns, which is all the tree's rails ever occupy.
+    const RAIL_COLUMNS: u16 = 6;
+
+    /// A host that cannot move a row must not be given the phase motion would
+    /// have moved it through.
+    ///
+    /// `row_motion` *synthesizes* an arrival and a departure so a row asked
+    /// only to move has a bounded phase to move through. That synthesized
+    /// departure is also the one thing that keeps a closed pane's row on
+    /// screen: the loop republishes the last pass's rows into
+    /// `sidebar_tree_row_memory` whenever a dismount exists, and the tree
+    /// re-inserts them. Read off the config alone it existed everywhere —
+    /// including on a terminal with no graphics, where a closed pane's row then
+    /// sat there for the whole of `row_exit_ms` with nothing playing on it.
+    ///
+    /// Membership has to actually change for this to show, which is why
+    /// `a_panel_too_narrow_for_a_card_renders_identically_with_motion_on`
+    /// cannot catch it: it renders the same fleet twice.
+    #[test]
+    fn a_host_that_cannot_draw_a_pixel_card_retires_a_departed_row_at_once() {
+        // Motion and nothing else, so the only life a row has is the one
+        // motion invents for it.
+        let mut app = moving_fleet();
+        app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::None;
+        app.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::None;
+
+        // Everything settled, then one pane closes. `still_drawn` is what the
+        // tree would put on screen on the frame after.
+        let still_drawn = |app: &mut AppState| -> bool {
+            app.anim = crate::anim::Animator::default();
+            app.sidebar_tree_row_memory.clear();
+            let live = crate::ui::sidebar_agent_live_entries(app);
+            let (_, pane) = arriving_row(&super::super::compute_workspace_card_areas(
+                app,
+                sidebar_rect(),
+            ));
+            let now = Instant::now();
+            publish(app, now, None);
+            app.anim.advance(now + Duration::from_secs(2));
+            app.sidebar_tree_row_memory = live;
+
+            let gone = now + Duration::from_secs(2);
+            publish(app, gone, Some(pane));
+            let live: Vec<_> = crate::ui::sidebar_agent_live_entries(app)
+                .into_iter()
+                .filter(|entry| entry.pane_id != pane)
+                .collect();
+            crate::ui::rows_with_departing(app, live)
+                .iter()
+                .any(|entry| entry.pane_id == pane)
+        };
+
+        assert!(
+            app.sidebar_rows_move(),
+            "the pixel path is live, so motion is too"
+        );
+        assert!(app.sidebar_row_lifecycle().dismount.is_some());
+        assert!(
+            still_drawn(&mut app),
+            "a row that is moving out has to still be drawn while it does"
+        );
+
+        for label in ["kitty_graphics", "sidebar_card_shapes"] {
+            let mut app = moving_fleet();
+            app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::None;
+            app.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::None;
+            match label {
+                "kitty_graphics" => app.kitty_graphics_enabled = false,
+                _ => app.sidebar_card_shapes = false,
+            }
+            assert!(
+                !app.sidebar_rows_move(),
+                "motion reached a host with {label} off"
+            );
+            assert!(
+                app.sidebar_row_lifecycle().dismount.is_none(),
+                "with {label} off a row was given a departure it cannot play"
+            );
+            assert!(
+                !still_drawn(&mut app),
+                "with {label} off a closed pane's row lingered instead of going \
+                 on the next frame"
+            );
+        }
     }
 
     /// With motion off nothing reads the engine and every card sits exactly
@@ -4939,7 +5191,7 @@ mod shape_capture {
         app.sidebar_card_shapes = true;
         let cell = app.host_cell_size;
         let cards = super::super::compute_workspace_card_areas(&app, rect);
-        let CardsUpdate::Rebuilt(layers) = build_cards(&app, &cards, rect, cell, &[]) else {
+        let CardsUpdate::Rebuilt(layers) = build_cards(&app, &cards, rect, cell, &[]).update else {
             println!("SKIP: no proportional face on this machine");
             return;
         };
@@ -4962,7 +5214,8 @@ mod shape_capture {
         // the difference is the feature rather than a description of it.
         let sheet_app = pixel_fleet_app();
         let sheet_cards = super::super::compute_workspace_card_areas(&sheet_app, rect);
-        if let CardsUpdate::Rebuilt(sheet) = build_cards(&sheet_app, &sheet_cards, rect, cell, &[])
+        if let CardsUpdate::Rebuilt(sheet) =
+            build_cards(&sheet_app, &sheet_cards, rect, cell, &[]).update
         {
             std::fs::write(format!("{out}/sheet.png"), &sheet[0].layer.data).expect("writes");
             let _ = writeln!(

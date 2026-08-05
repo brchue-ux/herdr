@@ -35,16 +35,40 @@
 //!   a placement escape rather than of redrawing the tree — see
 //!   [`super::image_card::build_cards`].
 //!
+//! # The tree's connectors travel with the card
+//!
+//! A card is pixels but the `├─ ` pointing at it is a character, and the two
+//! are drawn by different renderers. They stay attached because the offset is
+//! quantized to whole cells once, by [`cell_offsets`], and both read that one
+//! number: the placement adds it to its viewport, and
+//! [`super::render_card_border_rails`] adds it to the rows it draws the rail
+//! on. The offset is published per row on
+//! [`crate::app::state::WorkspaceCardArea::motion_cells`], which is drawing
+//! state only — where a row *is* stays `rect`, so a click during a transition
+//! still lands on the row the layout says it hit.
+//!
+//! A row that is still travelling *sideways* draws no rail of its own at all.
+//! Its card is off the panel's right edge for those frames, so a connector at
+//! its resting position would be an arrow pointing at nothing; it appears with
+//! the card, at the moment the card lands.
+//!
 //! # The character fallback cuts
 //!
-//! Below `MIN_FOLD_WIDTH`, and on any host without graphics, a row is
-//! characters. A character cannot leave its cell — that is a property of
-//! terminals, and it is the same reason [`crate::anim::behaviour`] resolves
-//! colour and coverage but never position. So there is nothing to slide there
-//! and rows appear and disappear on the frame the layout says they do, exactly
-//! as they always have. The arrival and departure *phases* still run, so a
-//! `row_enter` dissolve still plays on those cells; only the movement is
-//! absent.
+//! Below `MIN_FOLD_WIDTH`, and on any host without graphics or without
+//! `[experimental] sidebar_card_shapes`, a row is characters. A character
+//! cannot leave its cell — that is a property of terminals, and it is the same
+//! reason [`crate::anim::behaviour`] resolves colour and coverage but never
+//! position. So there is nothing to slide there and rows appear and disappear
+//! on the frame the layout says they do, exactly as they always have.
+//!
+//! That fallback is held by [`crate::app::state::AppState::sidebar_rows_move`]
+//! rather than here, and it has to be held before the animation engine is
+//! reached and not after: motion's phase is *synthesized* when nothing else
+//! asked for one, and a departure phase on a host that cannot move anything
+//! would keep a closed pane's row on screen for the whole of `row_exit_ms`
+//! with nothing playing on it. A `row_enter` dissolve the fleet configured for
+//! itself still runs there, exactly as it did before motion existed; only the
+//! phase motion would have invented is absent.
 
 use crate::anim::{ElementId, Phase};
 use crate::app::state::AppState;
@@ -100,6 +124,34 @@ pub(crate) fn row_offsets(rows: &[RowLife], panel_width_px: f32) -> Vec<(f32, f3
         opening += absent * row.height_px.max(0.0);
     }
     offsets
+}
+
+/// The same offsets in whole cells, which is the only unit anything on the
+/// panel is actually placed at.
+///
+/// Rounded here and nowhere else. A card's placement and the tree's connector
+/// beside it are two different renderers reading one number, and they are only
+/// attached to each other because it is the *same* number — two roundings of
+/// the same pixel offset would be one rounding each and could differ by a row.
+/// See [`super::image_card::CardsBuild::motion`], which is how the cell offset
+/// reaches the character renderer.
+///
+/// Whole cells rather than Kitty's sub-cell placement offsets on purpose: the
+/// engine's own 50 ms frame step is coarser than a cell is tall over any
+/// arrival short enough to read as one, measured in
+/// `data/herdr-row-slide-reflow/subcell-test/`.
+pub(crate) fn cell_offsets(offsets: &[(f32, f32)], cell_w: f32, cell_h: f32) -> Vec<(i32, i32)> {
+    let quantize = |value: f32, cell: f32| {
+        if cell > 0.0 && value.is_finite() {
+            (value / cell).round() as i32
+        } else {
+            0
+        }
+    };
+    offsets
+        .iter()
+        .map(|(dx, dy)| (quantize(*dx, cell_w), quantize(*dy, cell_h)))
+        .collect()
 }
 
 /// How far through its own life the engine says this element is.
@@ -205,6 +257,24 @@ mod tests {
         assert_eq!(offsets[1].1, -40.0, "half of the first row's 80");
         assert_eq!(offsets[2].1, -40.0, "the second one does not move itself");
         assert_eq!(offsets[3].1, -80.0, "half the first plus all of the second");
+    }
+
+    /// The number the placement uses and the number the connector uses are one
+    /// number, so a card and the rail pointing at it cannot land a row apart.
+    #[test]
+    fn the_cell_offset_is_rounded_once_and_shared() {
+        let rows = [settled(80.0), arriving(60.0, 0.5), settled(60.0)];
+        let cells = cell_offsets(&row_offsets(&rows, PANEL), 10.0, 21.0);
+        assert_eq!(cells[0], (0, 0));
+        assert_eq!(cells[2], (0, -1), "half of 60 px on a 21 px cell");
+    }
+
+    #[test]
+    fn a_cell_size_that_is_not_a_size_offsets_nothing() {
+        let rows = [arriving(60.0, 0.0), settled(60.0)];
+        let offsets = row_offsets(&rows, PANEL);
+        assert_eq!(cell_offsets(&offsets, 0.0, 0.0), vec![(0, 0); 2]);
+        assert_eq!(cell_offsets(&offsets, -10.0, -21.0), vec![(0, 0); 2]);
     }
 
     #[test]

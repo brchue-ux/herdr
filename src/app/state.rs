@@ -765,6 +765,24 @@ pub struct WorkspaceCardArea {
     /// [`WorkspaceCardArea::control_right`], never on `rect` directly, because
     /// a card's first row is a border.
     pub card_frame: Option<Rect>,
+    /// Where this row is *drawn* relative to where the layout put it, in whole
+    /// cells, while it is arriving or leaving. `(0, 0)` at rest and whenever
+    /// rows are not moving on this host.
+    ///
+    /// Deliberately beside [`WorkspaceCardArea::rect`] rather than folded into
+    /// it. The layout stays the sole authority on where a row *is* — hit
+    /// testing, the wheel, the scrollbar and the workspace drop slots all read
+    /// `rect`, and moving it would make a click during a transition land on a
+    /// row the user is not pointing at. This is the drawing side of the same
+    /// row, and only the two renderers that draw it read it: the pixel card's
+    /// placement and the tree's connector rails beside it. Both take the number
+    /// from here rather than deriving it, because being attached to each other
+    /// is the whole point.
+    ///
+    /// Stamped by [`crate::ui::sidebar::image_card::build_cards`], which is the
+    /// one place the offset is resolved — see
+    /// [`crate::ui::sidebar::motion::cell_offsets`].
+    pub motion_cells: (i32, i32),
 }
 
 impl WorkspaceCardArea {
@@ -1996,11 +2014,35 @@ impl AppState {
     /// sidebar renders its own compact layout without configured token rows, so
     /// a collapsed sidebar never animates.
     pub(crate) fn sidebar_animation_active(&self) -> bool {
+        let moves = self.sidebar_rows_move();
         !self.sidebar_collapsed
             && (self.sidebar_agents.has_animated_tokens()
                 || self.sidebar_spaces.has_animated_tokens()
-                || self.sidebar_animation.row_enter_stage().is_some()
-                || self.sidebar_animation.row_exit_stage().is_some())
+                || self.sidebar_animation.row_enter_stage(moves).is_some()
+                || self.sidebar_animation.row_exit_stage(moves).is_some())
+    }
+
+    /// True when a sidebar row's arrival and departure move it *on this host*.
+    ///
+    /// The config setting is only half the answer. A slide is an offset applied
+    /// to where an already-rasterised pixel card is placed, so it exists only
+    /// where those cards do: with `[experimental] kitty_graphics` off, or
+    /// `sidebar_card_shapes` off — where the tree is one opaque sheet with no
+    /// single row in it to move — there is nothing a row could travel through.
+    /// Asking the config alone is what once synthesized an exit phase on a
+    /// character-only host, which left a closed pane's row drawn for the whole
+    /// of `row_exit_ms` with nothing playing on it.
+    ///
+    /// The panel's *width* is deliberately not part of this even though
+    /// `image_card::is_available` gates on it too. A lifecycle is what an
+    /// element's whole life is built from, and the sidebar can be dragged past
+    /// the card threshold while a row is mid-flight — a width-dependent
+    /// lifecycle would change that life underneath it. Width is handled where
+    /// it belongs, on the drawing side.
+    pub(crate) fn sidebar_rows_move(&self) -> bool {
+        self.sidebar_animation.rows_move()
+            && self.sidebar_card_shapes
+            && self.kitty_graphics_enabled
     }
 
     /// The life a sidebar row is given when it arrives.
@@ -2012,9 +2054,10 @@ impl AppState {
     /// each keeps its own period and its own live rate — while still sharing
     /// one arrival.
     pub(crate) fn sidebar_row_lifecycle(&self) -> crate::anim::Lifecycle {
+        let moves = self.sidebar_rows_move();
         let mut lifecycle = crate::anim::Lifecycle::still();
-        lifecycle.mount = self.sidebar_animation.row_enter_stage();
-        lifecycle.dismount = self.sidebar_animation.row_exit_stage();
+        lifecycle.mount = self.sidebar_animation.row_enter_stage(moves);
+        lifecycle.dismount = self.sidebar_animation.row_exit_stage(moves);
         for behaviour in self
             .sidebar_agents
             .animated_behaviours()
