@@ -5902,7 +5902,7 @@ mod tests {
 
         // A host that answered OSC 11 is the ground, because `Color::Reset`
         // means the panel is showing the host's own background.
-        app.host_terminal_theme = app.host_terminal_theme.clone().with_color(
+        app.host_terminal_theme = app.host_terminal_theme.with_color(
             crate::terminal_theme::DefaultColorKind::Background,
             crate::terminal_theme::RgbColor {
                 r: 239,

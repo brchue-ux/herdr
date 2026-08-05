@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(badge_surface(&app), DEFAULT_CANVAS);
 
         // A host that answered is what an unfilled panel is showing.
-        app.host_terminal_theme = app.host_terminal_theme.clone().with_color(
+        app.host_terminal_theme = app.host_terminal_theme.with_color(
             crate::terminal_theme::DefaultColorKind::Background,
             crate::terminal_theme::RgbColor {
                 r: 0,
