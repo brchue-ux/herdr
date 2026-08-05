@@ -2039,10 +2039,39 @@ impl AppState {
     /// the card threshold while a row is mid-flight — a width-dependent
     /// lifecycle would change that life underneath it. Width is handled where
     /// it belongs, on the drawing side.
+    ///
+    /// The host's *cell size* is deliberately not part of it either, and for a
+    /// different reason: it is a per-client report, while this lifecycle is
+    /// shared [`AppState`] read by every attached client. Folding it in would
+    /// let one client's cell size decide another client's row lives, which is
+    /// the class of defect this area has already produced three times — code
+    /// deciding what to draw from a different client's view.
+    ///
+    /// That leaves one reachable residual, recorded here rather than left to be
+    /// rediscovered: a server with both experimental flags on, attached by a
+    /// client whose own config has graphics off, reports no cell size. No card
+    /// is drawn for that client, but this still answers `true`, so a closed
+    /// pane's row lingers for `row_exit_ms` with nothing playing on it. Closing
+    /// it means giving a row a per-client lifecycle, which is a larger change
+    /// than the defect is worth — do not "fix" it by reading per-client state
+    /// from here.
     pub(crate) fn sidebar_rows_move(&self) -> bool {
+        self.rows_move_given_face(crate::ui::sidebar::image_card::card_face_available(
+            self.sidebar_card_font.as_deref(),
+        ))
+    }
+
+    /// [`Self::sidebar_rows_move`] with the face condition passed in.
+    ///
+    /// Split out only so the gate itself is testable: the face is resolved
+    /// through a process-lifetime `OnceLock`, so a test cannot make the machine
+    /// it is running on stop having one. What is worth pinning is that *all
+    /// four* terms are required, and that is what this exposes.
+    fn rows_move_given_face(&self, face_available: bool) -> bool {
         self.sidebar_animation.rows_move()
             && self.sidebar_card_shapes
             && self.kitty_graphics_enabled
+            && face_available
     }
 
     /// The life a sidebar row is given when it arrives.
@@ -3034,6 +3063,76 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    /// Row motion needs all four of its conditions, not the config flag alone.
+    ///
+    /// The three host conditions are what stop a synthesized departure phase
+    /// existing on a host that draws no pixel cards — which is what once left a
+    /// closed pane's row on screen for the whole of `row_exit_ms` with nothing
+    /// playing on it. The face is included here and asserted through
+    /// [`AppState::rows_move_given_face`] rather than by removing the machine's
+    /// fonts, because the face is resolved once per process behind a
+    /// `OnceLock`: a test cannot make the machine it is running on stop having
+    /// one, but it can pin that the answer is required.
+    #[test]
+    fn row_motion_needs_the_config_the_two_flags_and_a_face() {
+        let mut app = AppState::test_new();
+        app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+        app.sidebar_card_shapes = true;
+        app.kitty_graphics_enabled = true;
+        assert!(
+            app.rows_move_given_face(true),
+            "all four present and it still refused"
+        );
+
+        assert!(
+            !app.rows_move_given_face(false),
+            "a host with no proportional face draws no card, so no row may be \
+             given a phase to move through"
+        );
+
+        for drop in ["config", "shapes", "graphics"] {
+            let mut app = AppState::test_new();
+            app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+            app.sidebar_card_shapes = true;
+            app.kitty_graphics_enabled = true;
+            match drop {
+                "config" => {
+                    app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::None
+                }
+                "shapes" => app.sidebar_card_shapes = false,
+                _ => app.kitty_graphics_enabled = false,
+            }
+            assert!(
+                !app.rows_move_given_face(true),
+                "motion survived without {drop}"
+            );
+        }
+    }
+
+    /// And the gate is what the lifecycle reads, so a host that cannot move a
+    /// row is given no phase to move it through.
+    #[test]
+    fn a_host_without_a_face_is_given_no_synthesized_departure() {
+        let mut app = AppState::test_new();
+        app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+        app.sidebar_card_shapes = true;
+        app.kitty_graphics_enabled = true;
+        // Motion and nothing else, so the only life a row could have is the
+        // one motion invents for it.
+        app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::None;
+        app.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::None;
+
+        let moves = app.sidebar_rows_move();
+        let lifecycle = app.sidebar_row_lifecycle();
+        assert_eq!(
+            lifecycle.dismount.is_some(),
+            moves,
+            "the synthesized departure and the motion gate have drifted apart, \
+             which is what leaves a closed pane's row drawn for row_exit_ms"
+        );
+        assert_eq!(lifecycle.mount.is_some(), moves);
+    }
 
     mod contrast_floor {
         use super::super::Palette;

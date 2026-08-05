@@ -217,7 +217,23 @@ pub(crate) fn is_available(app: &AppState, fold_width: u16) -> bool {
     app.kitty_graphics_enabled
         && app.host_cell_size.is_known()
         && fold_width >= MIN_FOLD_WIDTH
-        && font::card_font(app.sidebar_card_font.as_deref()).is_some()
+        && card_face_available(app.sidebar_card_font.as_deref())
+}
+
+/// Whether this machine has a face a card can be set in.
+///
+/// One condition of [`is_available`], exposed on its own because
+/// [`AppState::sidebar_rows_move`] needs exactly this one and must not take the
+/// other two it does not already have. Herdr ships no font, so a minimal
+/// container or server routinely has none — the pixel-card tests in this file
+/// all branch on it — and a row lifecycle that ignored that would synthesize an
+/// exit phase on a host that draws no cards.
+///
+/// Safe to fold into a *lifecycle*, unlike the panel width, because the search
+/// runs once and is cached for the process lifetime: it cannot change under a
+/// row that is already mid-flight.
+pub(crate) fn card_face_available(override_path: Option<&str>) -> bool {
+    font::card_font(override_path).is_some()
 }
 
 /// Whether a transparent shape will be drawn over this row's frame, so the

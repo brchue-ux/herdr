@@ -34,25 +34,44 @@ Two facts fall out:
    whole line of work exists to remove. Buying sub-cell placement therefore also means giving
    every card an extra cell row of transparent padding for the clip to eat.
 
-## Why it is not worth buying
+## Why it was not bought here — and why that is a boundary, not a verdict
 
-The binding constraint on how smooth motion looks is not the cell — it is the frame.
+The binding constraint on how smooth motion looks is not the cell. It is the frame.
 
-`crate::anim::behaviour::SMOOTH_FRAME_INTERVAL` is **50 ms**, the finest step any behaviour in
-the engine declares. A 320 ms arrival is therefore about **six frames**. A reflow moves a row by
-one row's height — around 76 px at the 10×21 px cell the cards are measured against, which is
-four cells.
+`crate::anim::behaviour::SMOOTH_FRAME_INTERVAL` is **50 ms**, the finest step any behaviour in the
+engine declares. A 320 ms arrival is therefore about **six frames**. A reflow moves a row by one
+row's height — about 72 px on a 9x18 px cell, which is four cells.
 
 - At whole cells, six frames resolve to **five distinct positions**.
 - At sub-cell, six frames resolve to **six**.
 
-One extra position, in exchange for a pixel-offset path through the placement pipeline and a
-transparent pad on every card image. The frame step is coarser than the cell is tall, so the
-quantization that is actually visible is the engine's, not the grid's.
+So at the engine's current step, sub-cell placement buys almost nothing, and this change ships at
+whole cells.
 
-This flips if `row_enter_ms` is raised a long way: at 1500 ms an arrival is thirty frames, the
-per-frame travel drops to about 2.5 px, and whole cells would then be the thing you see. If the
-captain wants arrivals that slow, this is the file to come back to.
+**That is not the same as saying sub-cell is not worth having.** The measurement above counts
+*positions per transition* at a fixed 50 ms step, which quietly assumes stepped motion is
+acceptable. It is not: four 18 px jumps read as stepping, not as a glide. Held to a smooth-motion
+requirement the same numbers say the opposite, and this is the correction —
+
+- Smoothness needs a **finer frame tier** as well. Roughly 4 px per step over 72 px is ~18 steps,
+  so ~18 ms frames; `MIN_RENDER_INTERVAL` is 16 ms, so the loop can do it.
+- But extra frames alone buy nothing. Cell-crossing time here is `320 x 18/72` = **80 ms**, so any
+  interval below 80 ms already produces duplicate positions under cell quantization. Twenty frames
+  still land on five positions without sub-cell placement.
+- **Both are needed together**, and then a third thing follows: once a card sits at a fraction of a
+  cell, a character connector cannot follow it — a glyph occupies a whole cell row and there is no
+  half-row position for `|`, `├` or `─`. So smooth motion also requires the tree's trunk and
+  branches to be drawn as pixel artwork.
+
+That chain — sub-cell placement, a finer frame tier, and the line as pixel wires — is the named
+next piece of work. The transparent-pad cost below is real and still applies to whoever does it.
+
+## The pad sub-cell would cost
+
+With `c`/`r` given, a `Y` offset clips the bottom `Y` pixels of the image, and those are the card's
+own bloom. A clip that *moves* is the shearing edge this line of work exists to remove, so sub-cell
+placement also means giving every card image one extra cell row of transparent padding for the clip
+to eat.
 
 ## Reproducing
 
