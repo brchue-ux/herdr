@@ -915,7 +915,8 @@ pub struct UiConfig {
     /// Retired setting that Herdr wrote before the workspace filter was removed.
     #[serde(rename = "agent_panel_scope")]
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
-    /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
+    /// Agent status indicator style. Saved values are "ascii", "dots" or
+    /// "symbols". Default: "ascii".
     pub status_indicators: StatusIndicatorStyle,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,

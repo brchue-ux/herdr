@@ -79,6 +79,21 @@ impl HostCellSize {
         }
     }
 
+    /// The gate every externally reported cell passes on the way in.
+    ///
+    /// Distinct from [`Self::or_fallback`] in what it does with *nothing*: an
+    /// unknown cell stays unknown, because a client whose own config has Kitty
+    /// graphics off reports `0x0` and the server reads that absence as "send no
+    /// graphics". Only a cell that claims to be a measurement and is not one is
+    /// replaced.
+    pub(crate) fn plausible_or_unknown(self) -> Self {
+        if self.is_known() {
+            self.or_fallback()
+        } else {
+            self
+        }
+    }
+
     pub(crate) fn try_from_terminal(area: Rect) -> Option<Self> {
         let Ok(size) = crossterm::terminal::window_size() else {
             return None;

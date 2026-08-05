@@ -335,12 +335,7 @@ fn workspace_row_height_in_body(
     workspace_row_height(app, workspace, worktree_child, content_width, shell).min(body_height)
 }
 
-fn workspace_entry_gap(
-    app: &AppState,
-    entries: &[WorkspaceListEntry],
-    entry_idx: usize,
-    _worktree_child: bool,
-) -> u16 {
+fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
     // No gap anywhere inside a worktree group: not between two children, and
     // not between the parent and its first child either.
     if entry_idx + 1 < entries.len() && !next_entry_is_worktree_child(entries, entry_idx) {
@@ -1378,9 +1373,7 @@ fn list_entry_height(
 /// worktree-group packing is unchanged.
 fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
     match entries.get(entry_idx) {
-        Some(WorkspaceListEntry::Workspace { worktree_child, .. }) => {
-            workspace_entry_gap(app, entries, entry_idx, *worktree_child)
-        }
+        Some(WorkspaceListEntry::Workspace { .. }) => workspace_entry_gap(app, entries, entry_idx),
         Some(WorkspaceListEntry::Agent { .. }) => agent_entry_gap(app, entry_idx, entries.len()),
         None => 0,
     }

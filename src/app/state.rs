@@ -640,17 +640,25 @@ impl Palette {
     }
 
     /// Raise the four muted tokens until they clear a minimum WCAG contrast
-    /// against the host terminal background Herdr measured over OSC 10/11.
+    /// against every background Herdr actually composites them over.
+    ///
+    /// That is normally just the host terminal background measured over
+    /// OSC 10/11, because Herdr paints no global fill. A theme that sets
+    /// `sidebar_bg` adds a second one: the sidebar fills its whole panel with
+    /// that colour, so the quiet tokens drawn in the tree land on it rather
+    /// than on the host's background, and flooring against the host alone
+    /// leaves them below their intended floor exactly where they are read.
     ///
     /// Only `surface0`, `surface_dim`, `overlay0` and `overlay1` are floored.
     /// Accents carry meaning and are hand-tuned per theme, so a computed floor
     /// on them would look worse than the palette it "fixed"; these four are
     /// the tokens whose whole job is to be quiet, and therefore the ones that
-    /// disappear when the palette and the host background disagree.
+    /// disappear when the palette and the background disagree.
     ///
     /// Two deliberate no-ops:
-    /// - No measured background (the host never answered the OSC query, which
-    ///   multiplexers commonly cause) leaves the palette exactly as authored.
+    /// - No background to measure against at all (the host never answered the
+    ///   OSC query, which multiplexers commonly cause, and no theme fill is
+    ///   set) leaves the palette exactly as authored.
     /// - `Color::Reset` means "inherit the host" and is never rewritten, so a
     ///   theme that opts out of painting a surface keeps opting out.
     pub fn with_contrast_floor(mut self, host: &crate::terminal_theme::TerminalTheme) -> Self {
@@ -670,9 +678,18 @@ impl Palette {
         /// moves #1e1e2e → #262635 and nothing else in the theme changes.
         const SURFACE_FLOOR: f32 = 1.1;
 
-        let Some(background) = host.background.map(terminal_theme_to_rgb) else {
+        // The host's background first, so a token that only has to clear the
+        // panel ends up tuned for the panel: the last floor applied is the one
+        // guaranteed to hold.
+        let backgrounds: Vec<_> = host
+            .background
+            .map(terminal_theme_to_rgb)
+            .into_iter()
+            .chain(resolve_color_rgb(self.sidebar_bg, host))
+            .collect();
+        if backgrounds.is_empty() {
             return self;
-        };
+        }
 
         for (token, floor) in [
             (&mut self.surface0, SURFACE_FLOOR),
@@ -683,7 +700,9 @@ impl Palette {
             let Some(rgb) = resolve_color_rgb(*token, host) else {
                 continue;
             };
-            let floored = ensure_contrast(rgb, background, floor);
+            let floored = backgrounds.iter().fold(rgb, |color, background| {
+                ensure_contrast(color, *background, floor)
+            });
             if floored != rgb {
                 *token = Color::Rgb(floored.0, floored.1, floored.2);
             }

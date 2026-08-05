@@ -1047,12 +1047,12 @@ impl HeadlessServer {
         };
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+        if self.app.state.kitty_graphics_enabled && client.cell_size().is_known() {
             crate::ui::compute_view_with_cell_size(
                 &mut self.app.state,
                 &self.app.terminal_runtimes,
                 area,
-                client.cell_size,
+                client.cell_size(),
             );
         } else {
             crate::ui::compute_view_with_runtime_registry(
@@ -1110,14 +1110,15 @@ impl HeadlessServer {
         // Plausible, not merely nonzero. A client that could not measure its
         // cell sends an arithmetic guess, and an implausible one rasterises the
         // sidebar's cards into a pixel space the terminal then rescales — which
-        // is invisible here and looks like a broken card on the screen. Falling
-        // back to a coherent cell keeps that failure to a soft rescale.
-        let host_cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known()
-        {
-            client.cell_size.or_fallback()
-        } else {
-            crate::kitty_graphics::HostCellSize::default()
-        };
+        // is invisible here and looks like a broken card on the screen. The
+        // connection already gated it on the way in; this is the same rule
+        // stated where the state it feeds is set.
+        let host_cell_size =
+            if self.app.state.kitty_graphics_enabled && client.cell_size().is_known() {
+                client.cell_size().or_fallback()
+            } else {
+                crate::kitty_graphics::HostCellSize::default()
+            };
         let host_terminal_theme = client.host_terminal_theme;
         let host_terminal_appearance = client.host_terminal_appearance;
         let host_terminal_appearance_explicit = client.host_terminal_appearance_explicit;
@@ -2668,7 +2669,7 @@ impl HeadlessServer {
             return false;
         };
         let (cols, rows) = client.terminal_size;
-        let cell_size = client.cell_size;
+        let cell_size = client.cell_size();
         client.mode = ClientConnectionMode::TerminalAttach {
             terminal_id: terminal_id.clone(),
         };
@@ -3008,52 +3009,48 @@ impl HeadlessServer {
                     client_id,
                     cols, rows, cell_width_px, cell_height_px, "client resize"
                 );
-                let direct_terminal_id = if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                    terminal_size,
-                    cell_size,
-                    render_state,
-                    ..
-                }) = self.clients.get_mut(&client_id)
-                {
-                    *terminal_size = (cols, rows);
-                    *cell_size = crate::kitty_graphics::HostCellSize {
-                        width_px: cell_width_px,
-                        height_px: cell_height_px,
-                    };
-                    render_state.request_repaint();
-                    Some(terminal_id.clone())
-                } else {
-                    None
+                let reported_cell_size = crate::kitty_graphics::HostCellSize {
+                    width_px: cell_width_px,
+                    height_px: cell_height_px,
+                };
+                let direct_terminal_id = match self.clients.get_mut(&client_id) {
+                    Some(client) => match &client.mode {
+                        ClientConnectionMode::TerminalAttach { terminal_id } => {
+                            let terminal_id = terminal_id.clone();
+                            client.terminal_size = (cols, rows);
+                            client.set_cell_size(reported_cell_size);
+                            client.render_state.request_repaint();
+                            Some(terminal_id)
+                        }
+                        _ => None,
+                    },
+                    None => None,
                 };
                 if let Some(terminal_id) = direct_terminal_id {
+                    // The pty's pixel fields are what the client's own cell was
+                    // divided out of, so a cell the gate refused must not be
+                    // multiplied back up and handed to the runtime.
+                    let pty_cell_size = self
+                        .clients
+                        .get(&client_id)
+                        .map(ClientConnection::cell_size)
+                        .unwrap_or(reported_cell_size);
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        runtime.resize(rows, cols, cell_width_px, cell_height_px);
+                        runtime.resize(rows, cols, pty_cell_size.width_px, pty_cell_size.height_px);
                     }
                     return true;
                 }
-                if let Some(ClientConnection {
-                    mode: ClientConnectionMode::TerminalObserve { .. },
-                    terminal_size,
-                    cell_size,
-                    render_state,
-                    ..
-                }) = self.clients.get_mut(&client_id)
-                {
-                    *terminal_size = (cols, rows);
-                    *cell_size = crate::kitty_graphics::HostCellSize {
-                        width_px: cell_width_px,
-                        height_px: cell_height_px,
-                    };
-                    render_state.request_repaint();
-                    return true;
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    if matches!(client.mode, ClientConnectionMode::TerminalObserve { .. }) {
+                        client.terminal_size = (cols, rows);
+                        client.set_cell_size(reported_cell_size);
+                        client.render_state.request_repaint();
+                        return true;
+                    }
                 }
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.terminal_size = (cols, rows);
-                    client.cell_size = crate::kitty_graphics::HostCellSize {
-                        width_px: cell_width_px,
-                        height_px: cell_height_px,
-                    };
+                    client.set_cell_size(reported_cell_size);
                 }
                 self.promote_client_to_foreground(client_id);
                 self.resize_shared_runtime_to_effective_size();
@@ -9623,14 +9620,102 @@ next_tab = ""
         );
     }
 
+    /// The sidebar's cards are laid out in pixels, so the cell they are laid
+    /// out against has to be a cell a terminal draws in.
+    ///
+    /// The failure this pins is silent everywhere except the screen: a pty
+    /// carrying a stale constant `ws_xpixel` — routinely the case over SSH —
+    /// divides to a *narrower* cell every column the window gains, the client
+    /// forwards that division, and the cards rasterise into a pixel space that
+    /// does not exist. Kitty then rescales the artwork into the cells it was
+    /// placed in, so nothing errors and every buffer assertion still passes.
+    ///
+    /// Driven through the real ingress and the real card path rather than
+    /// through the plausibility check on its own, because it was the check in
+    /// isolation that gave the false all-clear.
+    #[tokio::test]
+    async fn a_stale_pty_cell_never_reaches_the_sidebar_card_layout() {
+        /// The pty's pixel fields, stale from a window that has since grown.
+        const STALE_PTY_WIDTH_PX: u32 = 800;
+        const STALE_PTY_HEIGHT_PX: u32 = 660;
+        const ROWS: u16 = 24;
+
+        let (mut server, _client_rx, _pane_id) = retained_test_server(b"card");
+        server.app.state.kitty_graphics_enabled = true;
+
+        let mut laid_out_against = Vec::new();
+        for cols in [100u16, 160, 220, 300] {
+            server.handle_server_event(ServerEvent::ClientResize {
+                client_id: 1,
+                cols,
+                rows: ROWS,
+                cell_width_px: STALE_PTY_WIDTH_PX / u32::from(cols),
+                cell_height_px: STALE_PTY_HEIGHT_PX / u32::from(ROWS),
+            });
+
+            let client_cell = server.clients.get(&1).expect("client").cell_size();
+            assert!(
+                client_cell.is_plausible(),
+                "at {cols} columns a stale pty divides to {client_cell:?}, which reached the client"
+            );
+            assert_eq!(
+                server.app.state.host_cell_size, client_cell,
+                "the cell the sidebar measures rows against and the cell it \
+                 rasterises them at must be the same cell"
+            );
+
+            // The card path itself, at the cell the server renders this client
+            // at, so the assertions below are about what the sidebar was
+            // actually laid out against.
+            crate::ui::compute_view_with_cell_size(
+                &mut server.app.state,
+                &server.app.terminal_runtimes,
+                Rect::new(0, 0, cols, ROWS),
+                client_cell,
+            );
+            // Empty on a machine with no proportional face, which is the only
+            // reason this is a loop over what was published rather than an
+            // assertion that something was.
+            for layer in &server.app.state.sidebar_card_layers {
+                let rasterised = crate::kitty_graphics::HostCellSize {
+                    width_px: layer.layer.image_width / u32::from(layer.rect.width.max(1)),
+                    height_px: layer.layer.image_height / u32::from(layer.rect.height.max(1)),
+                };
+                assert!(
+                    rasterised.is_plausible(),
+                    "a card at {cols} columns was rasterised at {rasterised:?} per cell"
+                );
+            }
+
+            laid_out_against.push(client_cell);
+        }
+
+        // Not merely in range at each width: the symptom is a cell that shrinks
+        // as the window grows, and a gate that widened its own bounds instead
+        // of refusing the division would still pass the checks above.
+        for pair in laid_out_against.windows(2) {
+            assert!(
+                pair[1].width_px >= pair[0].width_px,
+                "the cell the cards are laid out against narrowed from {:?} to {:?} \
+                 as the window gained columns",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn retained_pty_update_allows_kitty_enabled_empty_graphics_cache() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         server.app.state.kitty_graphics_enabled = true;
-        server.clients.get_mut(&1).unwrap().cell_size = crate::kitty_graphics::HostCellSize {
-            width_px: 10,
-            height_px: 20,
-        };
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .set_cell_size(crate::kitty_graphics::HostCellSize {
+                width_px: 10,
+                height_px: 20,
+            });
 
         server.render_and_stream();
         let _ = client_rx
@@ -9658,10 +9743,10 @@ next_tab = ""
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         server.app.state.kitty_graphics_enabled = true;
         let client = server.clients.get_mut(&1).unwrap();
-        client.cell_size = crate::kitty_graphics::HostCellSize {
+        client.set_cell_size(crate::kitty_graphics::HostCellSize {
             width_px: 10,
             height_px: 20,
-        };
+        });
 
         server.render_and_stream();
         let _ = client_rx

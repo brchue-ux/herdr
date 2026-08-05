@@ -388,7 +388,19 @@ impl AppState {
                 let idx = scroll + (row - area.y) as usize;
                 (idx < THEME_NAMES.len()).then_some(idx)
             }
-            SettingsSection::Indicators | SettingsSection::Sound => {
+            SettingsSection::Indicators => {
+                let list_y = area.y + 3;
+                // Bounded by the alphabet itself, not by a literal: this fork
+                // ships a third style beside upstream's two, and a hardcoded
+                // row count is what makes the last one keyboard-only.
+                let rows = u16::try_from(STATUS_INDICATOR_COUNT).unwrap_or(u16::MAX);
+                if row >= list_y && row < list_y.saturating_add(rows) {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
+            SettingsSection::Sound => {
                 let list_y = area.y + 3;
                 if row >= list_y && row < list_y + 2 {
                     Some((row - list_y) as usize)

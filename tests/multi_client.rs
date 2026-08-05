@@ -760,15 +760,23 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     frame_text(frame).contains(needle)
 }
 
+/// The `agent-NN` Space label on one rendered line, if the whole label is on it.
+///
+/// Bounded rather than sliced: a label against the panel's right edge or an
+/// elided one leaves fewer bytes than the label is long, and an unchecked slice
+/// aborts the test binary instead of failing the assertion that wanted it.
+fn space_label_in_line(line: &str) -> Option<String> {
+    let start = line.find("agent-")?;
+    line.get(start..start + "agent-NN".len())
+        .map(str::to_string)
+}
+
 /// The first Space row visible in the sidebar tree, if any.
 ///
 /// Anchored on the row itself rather than on a section header: this fork draws
 /// one living tree with no "agents" heading above it.
 fn first_visible_space_label(frame: &FrameWire) -> Option<String> {
-    frame_text(frame).lines().find_map(|line| {
-        let start = line.find("agent-")?;
-        Some(line[start..start + "agent-NN".len()].to_string())
-    })
+    frame_text(frame).lines().find_map(space_label_in_line)
 }
 
 #[test]
@@ -895,12 +903,7 @@ fn non_foreground_client_render_preserves_sidebar_scroll() {
     // wait above rather than assumed from the scroll arithmetic.
     let scrolled_label = scroll_frames
         .last()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                let start = line.find("agent-")?;
-                Some(line[start..start + "agent-NN".len()].to_string())
-            })
-        })
+        .and_then(|text| text.lines().find_map(space_label_in_line))
         .expect("a Space row should be visible after scrolling");
 
     // A second, taller client attaches and renders in the background. Its
