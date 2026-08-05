@@ -159,10 +159,16 @@ fn glow_amount(stops: &[f32; 4], row: u16, height: u16) -> f32 {
 
 /// One card's colours, resolved once for the whole box.
 ///
-/// `None` for every mix when the panel background has no colour of its own —
-/// `Color::Reset` under the terminal theme means "whatever the host is using",
-/// and a gradient toward an unknown colour is a guess. The card still draws its
-/// frame in the state hue; it just does not tint what it cannot measure.
+/// The ground is the panel's own fill when the theme paints one — a card's
+/// gradient, glow and plates all land on it, and the plate's legibility floor is
+/// measured against it, so a mix toward a colour that is nowhere on screen is a
+/// visible seam around every card.
+///
+/// `None` for every mix when neither the panel fill nor the panel background has
+/// a colour of its own — `Color::Reset` under the terminal theme means "whatever
+/// the host is using", and a gradient toward an unknown colour is a guess. The
+/// card still draws its frame in the state hue; it just does not tint what it
+/// cannot measure.
 struct CardInk {
     accent: Rgb,
     panel: Option<Rgb>,
@@ -172,7 +178,7 @@ impl CardInk {
     fn new(accent: Color, p: &Palette, host: &TerminalTheme) -> Option<Self> {
         Some(Self {
             accent: resolve_color_rgb(accent, host)?,
-            panel: resolve_color_rgb(p.panel_bg, host),
+            panel: super::panel_fill_rgb(p, host).or_else(|| resolve_color_rgb(p.panel_bg, host)),
         })
     }
 
@@ -449,6 +455,36 @@ pub(super) struct Pill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything a card mixes — its borders, its glow, and the plates whose
+    /// legibility floor is measured against it — lands on the panel's own fill
+    /// when a theme paints one. A card lit against a colour nowhere on screen
+    /// is a seam around every row.
+    #[test]
+    fn a_cards_gradient_and_plates_are_measured_against_the_panels_own_fill() {
+        let host = TerminalTheme::default();
+        let mut p = Palette::catppuccin();
+        p.panel_bg = Color::Rgb(30, 30, 46);
+
+        // No fill: the panel background, exactly as before.
+        let plain = CardInk::new(Color::Rgb(200, 200, 200), &p, &host).expect("an accent resolves");
+        assert_eq!(plain.panel, Some((30, 30, 46)));
+
+        // A theme fill is what the card is actually drawn on.
+        p.sidebar_bg = Color::Rgb(12, 34, 56);
+        let filled =
+            CardInk::new(Color::Rgb(200, 200, 200), &p, &host).expect("an accent resolves");
+        assert_eq!(filled.panel, Some((12, 34, 56)));
+        assert_eq!(filled.plate(CHIP_MIX).1, Color::Rgb(12, 34, 56));
+
+        // And a panel with neither still declines to tint what it cannot
+        // measure.
+        p.sidebar_bg = Color::Reset;
+        p.panel_bg = Color::Reset;
+        let unmeasured =
+            CardInk::new(Color::Rgb(200, 200, 200), &p, &host).expect("an accent resolves");
+        assert_eq!(unmeasured.panel, None);
+    }
 
     #[test]
     fn the_shell_is_a_whole_panel_decision_taken_at_one_threshold() {

@@ -1706,25 +1706,39 @@ pub(crate) fn workspace_group_chevron_rect(card: &crate::app::state::WorkspaceCa
     )
 }
 
-/// The colour the panel is actually filled with, when it resolves to one.
+/// The fill the panel is painted with, when the theme gives it one.
 ///
-/// The single answer to "what is under the sidebar", shared by every pass that
-/// has to composite against it — the character path's animated ink, the
-/// view-switch dissolve, and the pixel cards' bloom. `render_sidebar` fills the
-/// panel with `palette.sidebar_bg`, whose default is `Color::Reset` — "inherit
-/// the host" — so the ground is a theme's own sidebar fill first, then the RGB
-/// Herdr measured with OSC 11, and the panel background only for a host that
-/// answered neither. A caller that needs a colour no matter what supplies its
-/// own last resort.
+/// The single answer to "what colour is under the sidebar", asked by every pass
+/// that composites inside the panel: the animated ink and the view-switch
+/// dissolve here, the card shell's gradient and plates in
+/// [`card`], the tray's engraved badges in [`tray`], and the pixel cards' bloom
+/// in [`image_card`]. `render_sidebar` fills the panel with
+/// `palette.sidebar_bg`, so that — and nothing else — is what a card's edge, a
+/// badge's carve or a dissolving cell actually lands on.
+///
+/// `None` is the default: `Color::Reset` means "inherit the host", and the
+/// panel then has no fill of its own. Each caller keeps its own answer for that
+/// case, because what a pass should fall back to is a property of what it
+/// draws, not of the panel — the ink wants a colour it can mix toward, the card
+/// declines to tint what it cannot measure, and the tray falls back to the
+/// canvas its marks were designed against.
+pub(crate) fn panel_fill_rgb(
+    p: &Palette,
+    host: &crate::terminal_theme::TerminalTheme,
+) -> Option<crate::ui::color::Rgb> {
+    crate::ui::color::resolve_color_rgb(p.sidebar_bg, host)
+}
+
+/// The colour animated ink composites against inside the panel.
+///
+/// The panel's own fill first, then the RGB Herdr measured with OSC 11 — which
+/// is what an unfilled panel is showing — and the panel background only for a
+/// host that answered neither.
 pub(crate) fn backdrop_rgb(app: &AppState) -> Option<crate::ui::color::Rgb> {
-    let resolve = |color| crate::ui::color::resolve_color_rgb(color, &app.host_terminal_theme);
-    resolve(app.palette.sidebar_bg)
-        .or_else(|| {
-            app.host_terminal_theme
-                .background
-                .map(crate::ui::color::terminal_theme_to_rgb)
-        })
-        .or_else(|| resolve(app.palette.panel_bg))
+    let host = &app.host_terminal_theme;
+    panel_fill_rgb(&app.palette, host)
+        .or_else(|| host.background.map(crate::ui::color::terminal_theme_to_rgb))
+        .or_else(|| crate::ui::color::resolve_color_rgb(app.palette.panel_bg, host))
 }
 
 /// The collapsed sidebar's one content column.
@@ -3035,7 +3049,7 @@ impl<'a> ConnectorCharge<'a> {
         Some(Self {
             behaviour,
             progress: phase.progress,
-            ink: crate::anim::cell::InkPalette::resolve_over(
+            ink: crate::anim::cell::InkPalette::resolve(
                 base,
                 backdrop_rgb(app),
                 &app.palette,
@@ -3183,8 +3197,7 @@ fn render_tree_view_transition(
         for col in 0..area.width {
             let x = area.x + col;
             let base = buf[(x, y)].style();
-            let ink =
-                InkPalette::resolve_over(base, backdrop, &app.palette, &app.host_terminal_theme);
+            let ink = InkPalette::resolve(base, backdrop, &app.palette, &app.host_terminal_theme);
             let paint = view.cell(CellPos::new(col, row), extent, ink);
             let mut style = paint.text_style(base, ink);
             // A highlighted row's own background is part of the view too. It is
@@ -3303,7 +3316,7 @@ fn animate_row_spans(spans: &mut [Span<'static>], anim: &RowAnimation<'_>) {
     let mut col = 0u16;
     for span in spans {
         let width = crate::ui::text::display_width_u16(&span.content);
-        let ink = InkPalette::resolve_over(span.style, anim.surface, anim.palette, anim.host);
+        let ink = InkPalette::resolve(span.style, anim.surface, anim.palette, anim.host);
         span.style = frame
             .cell(CellPos::col(col), extent, ink)
             .text_style(span.style, ink);
@@ -3363,7 +3376,7 @@ pub(super) fn push_animated_span(
     };
 
     let extent = CellExtent::row(width);
-    let ink = InkPalette::resolve_over(style, surface, palette, host);
+    let ink = InkPalette::resolve(style, surface, palette, host);
     if frame.is_uniform() {
         let paint = frame.cell(CellPos::col(0), extent, ink);
         spans.push(Span::styled(text, paint.text_style(style, ink)));
@@ -5907,7 +5920,7 @@ mod tests {
 
         // And that is the surface the engine resolves, for a span with no
         // background of its own.
-        let ink = InkPalette::resolve_over(
+        let ink = InkPalette::resolve(
             Style::default().fg(app.sidebar_palette.text),
             backdrop_rgb(&app),
             &app.palette,
@@ -5917,7 +5930,7 @@ mod tests {
 
         // A span that names its own background still keeps it — a selected
         // row's highlight is what its own text sits on.
-        let highlighted = InkPalette::resolve_over(
+        let highlighted = InkPalette::resolve(
             Style::default().bg(ratatui::style::Color::Rgb(7, 7, 7)),
             backdrop_rgb(&app),
             &app.palette,
