@@ -216,6 +216,7 @@ fn push_slot(
         text,
         style,
         frame,
+        super::backdrop_rgb(app),
         &app.palette,
         &app.host_terminal_theme,
     );

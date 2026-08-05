@@ -366,17 +366,9 @@ impl CardContent {
 /// anywhere, and its cards float by being brighter than the ground rather than
 /// by casting onto it. A bloom with nothing under it to lift is invisible.
 fn backdrop_rgb(app: &AppState) -> Rgb {
-    let resolve = |color| {
-        crate::ui::color::resolve_color_rgb(color, &app.host_terminal_theme)
-            .map(|rgb| Rgb(rgb.0, rgb.1, rgb.2))
-    };
-    if let Some(sidebar_bg) = resolve(app.palette.sidebar_bg) {
-        return sidebar_bg;
-    }
-    if let Some(background) = app.host_terminal_theme.background {
-        return Rgb(background.r, background.g, background.b);
-    }
-    resolve(app.palette.panel_bg).unwrap_or(measured::CANVAS)
+    crate::ui::sidebar::backdrop_rgb(app)
+        .map(|(r, g, b)| Rgb(r, g, b))
+        .unwrap_or(measured::CANVAS)
 }
 
 /// The chip's ink per state.

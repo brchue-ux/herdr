@@ -210,10 +210,28 @@ impl InkPalette {
         palette: &crate::app::state::Palette,
         host: &crate::terminal_theme::TerminalTheme,
     ) -> Self {
+        Self::resolve_over(base, None, palette, host)
+    }
+
+    /// The same, for a call site that knows what its surface is actually filled
+    /// with.
+    ///
+    /// A panel with a fill of its own — the sidebar, whose ground is
+    /// `palette.sidebar_bg` rather than `panel_bg` — passes it here, so an
+    /// element with no explicit background of its own composites against the
+    /// colour on screen under it instead of against the app-wide panel colour.
+    /// `None` is exactly [`Self::resolve`]: the palette's panel background.
+    pub(crate) fn resolve_over(
+        base: Style,
+        surface: Option<Rgb>,
+        palette: &crate::app::state::Palette,
+        host: &crate::terminal_theme::TerminalTheme,
+    ) -> Self {
         let rgb = |color| resolve_color_rgb(color, host);
         let surface = base
             .bg
             .and_then(rgb)
+            .or(surface)
             .or_else(|| rgb(palette.panel_bg))
             .unwrap_or(crate::ui::color::BLACK);
         let accent = rgb(palette.accent).unwrap_or(surface);
