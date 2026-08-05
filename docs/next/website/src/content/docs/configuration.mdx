@@ -465,6 +465,23 @@ This is what makes an ownership tree read as live. Each worker and sub agent row
 
 A row that is still leaving is drawn but is no longer a target: its pane has already closed, so clicking it does nothing.
 
+### Rows that move
+
+`row_enter` and `row_exit` say what a row's *cells* do while it arrives and leaves. `row_motion` says whether the row also **moves**:
+
+```toml
+[ui.sidebar.animation]
+row_motion = "slide"
+```
+
+With `slide`, an arriving row comes in from the panel's right edge while every row below it pans down to open its slot, and a departing row slides back out the way it came while they pan up to close it. It defaults to `none`, which is how rows have always behaved: they appear and disappear exactly where the layout puts them.
+
+This is a separate setting rather than another `row_enter` name because position is not something a character cell can express — a glyph cannot leave its cell — so the two are orthogonal choices and either one alone is a whole answer. Turning motion on retires nothing: a row can dissolve *and* slide, dissolve without moving, or move without dissolving. Motion runs on the arrival and departure that `row_enter_ms` and `row_exit_ms` already time, so it needs no duration of its own, and asking for `row_motion` with `row_enter = "none"` still gives the row an arrival to move through.
+
+Motion applies to the **pixel cards** only. It needs `[experimental] kitty_graphics` and `sidebar_card_shapes`, a host that reports its cell size, and a panel at least 34 columns wide — the same conditions the cards themselves need. Everywhere else the sidebar is characters, so there is nothing to move and rows appear and disappear on the frame the layout says they do, exactly as they always have. A `row_enter` effect still plays on those cells.
+
+Motion resolves at the panel's own 50 ms animation step, so `row_enter_ms` is effectively a frame count: 320 ms is about six frames, and a longer arrival reads more smoothly than a shorter one.
+
 ### The fleet signal bar
 
 Eight fixed slots on the row above the Spaces tree, saying what the fleet is waiting on:

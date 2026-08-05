@@ -356,6 +356,23 @@ impl Paint {
         }
     }
 
+    /// Touches nothing: no ink, no coverage, no attributes, no glyph.
+    ///
+    /// Every cell comes back [`CellPaint::is_settled`], so this is how a
+    /// behaviour can exist purely to give an element a *phase* — see
+    /// [`names::STILL`].
+    const fn inert() -> Self {
+        Self {
+            fg: None,
+            bg: None,
+            depth: 0.0,
+            reveal: false,
+            attrs_above: None,
+            glyphs: None,
+            crackle: None,
+        }
+    }
+
     /// A travelling mark: it inks the foreground toward `ink` and walks the
     /// horizontal block ramp, so where it has reached is legible to a fraction
     /// of a cell rather than only to the cell.
@@ -629,6 +646,17 @@ pub(crate) mod names {
     pub(crate) const DISSOLVE: &str = "dissolve";
     /// Bounded: closes inward from the edges toward the centre.
     pub(crate) const COLLAPSE: &str = "collapse";
+    /// Bounded: nothing at all, at a frame spacing fine enough to move on.
+    ///
+    /// Every cell resolves settled, so an element playing this looks exactly as
+    /// it does at rest. It exists because a *phase* is worth having on its own:
+    /// an element's mount and dismount are the only clock that says "this is
+    /// arriving" and "this is leaving", and a caller can carry something other
+    /// than a cell effect on it — the sidebar's row motion moves a card's
+    /// placement on exactly this phase. Without it, asking for motion with no
+    /// cell emphasis would mean no bounded phase at all, and nothing to move
+    /// through.
+    pub(crate) const STILL: &str = "still";
     /// Looping: the whole element breathes toward its surface and back.
     pub(crate) const PULSE: &str = "pulse";
     /// Looping: a bright band travels across the element.
@@ -749,7 +777,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 13] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 14] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -825,6 +853,18 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 13] {
                 field: Field::Radial { inward: true },
                 shape: Shape::Front { softness: 0.2 },
                 curve: Curve::EaseInOut,
+                frame_interval: SMOOTH_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        (
+            names::STILL,
+            Behaviour {
+                paint: Paint::inert(),
+                // It draws nothing, so this is not about what a cell shows: it
+                // is the spacing at which whatever *else* rides this phase gets
+                // a frame. The sidebar's row motion rides it, and motion is the
+                // one thing a coarse step reads as judder rather than as calm.
                 frame_interval: SMOOTH_FRAME_INTERVAL,
                 ..BASE
             },

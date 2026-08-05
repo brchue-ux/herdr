@@ -1,0 +1,9 @@
+case        top_y  top_px  bot_y  bot_px  height
+native_y0      84       4    200       4     120
+native_y16    100       4    216       4     120
+native_y8      92       4    208       4     120
+y0             84       3    176       3      95
+y16           100       3    176       3      79
+y8             92       3    176       3      87
+
+baseline y0: top=84 height=95

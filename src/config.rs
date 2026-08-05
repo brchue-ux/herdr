@@ -36,6 +36,16 @@ pub use self::{
     theme::{parse_color, CustomThemeColors, ThemeConfig},
 };
 
+/// The type of [`SidebarAnimationConfig::row_motion`].
+///
+/// Separate from the block above only so it can carry this attribute: the
+/// setting is read through `SidebarAnimationConfig::rows_move`, so outside
+/// tests nothing in the binary has cause to name the enum itself. It is still
+/// re-exported, because a `pub` field whose type cannot be named is not really
+/// public.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use self::sidebar::SidebarRowMotion;
+
 pub(crate) use self::io::upsert_top_level_bool;
 pub(crate) use self::keybinds::parse_key_combo;
 

@@ -1,5 +1,6 @@
 mod card;
 pub(crate) mod image_card;
+pub(crate) mod motion;
 mod notifications;
 mod tokens;
 pub(crate) mod tray;

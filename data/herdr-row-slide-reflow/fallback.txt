@@ -1,0 +1,82 @@
+=== row_motion = Slide ===
+                               │
+ ! fleet                       │
+   fm/herdr-row-slide-reflow   │
+ - fleet · 2ndmate-herdr       │
+ ├─ > fleet                    │
+ │    herdr-card-image-card    │
+ ├─ > fleet                    │
+ │    herdr-card-iteration-2   │
+ └─ > fleet · herdr-row-slide  │
+ ! fleet · 2ndmate-homeauto    │
+ ├─ ! fleet · homeauto-audit   │
+ └─ - fleet · homeauto-backup  │
+ - fleet · 2ndmate-budget      │
+ ├─ - fleet · budget-guard     │
+ └─ - fleet · budget-anchor    │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+ new                      menu«│
+=== row_motion = None ===
+                               │
+ ! fleet                       │
+   fm/herdr-row-slide-reflow   │
+ - fleet · 2ndmate-herdr       │
+ ├─ > fleet                    │
+ │    herdr-card-image-card    │
+ ├─ > fleet                    │
+ │    herdr-card-iteration-2   │
+ └─ > fleet · herdr-row-slide  │
+ ! fleet · 2ndmate-homeauto    │
+ ├─ ! fleet · homeauto-audit   │
+ └─ - fleet · homeauto-backup  │
+ - fleet · 2ndmate-budget      │
+ ├─ - fleet · budget-guard     │
+ └─ - fleet · budget-anchor    │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+                               │
+ new                      menu«│

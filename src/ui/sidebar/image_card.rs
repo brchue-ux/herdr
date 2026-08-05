@@ -136,10 +136,24 @@ const BLOOM_REACH: f32 = 0.45;
 /// expensive half by roughly an order of magnitude.
 #[derive(Clone)]
 pub(crate) struct SidebarCardLayer {
-    /// The cell rect this image is placed at. Chosen by the tree's own geometry:
-    /// for a shape, exactly its own card plus the reach of that card's bloom;
-    /// for the sheet, every card plus the reach of theirs.
+    /// The cell rect this image was *drawn for*. Chosen by the tree's own
+    /// geometry: for a shape, exactly its own card plus the reach of that card's
+    /// bloom; for the sheet, every card plus the reach of theirs.
+    ///
+    /// Where it is drawn is [`Self::clip`] plus the layer's own viewport offset,
+    /// which is the same thing whenever the panel is settled and is not while a
+    /// row is arriving or leaving. Keeping the two apart is what lets a card
+    /// move without its artwork changing: this rect is what the pixels are a
+    /// picture of, so it is what the signature is taken over.
     pub rect: Rect,
+    /// The box on the panel this image may draw in.
+    ///
+    /// The placement's *area*, so the pipeline's existing clipper crops a card
+    /// that has slid past the panel's edge against the panel rather than letting
+    /// it spill over the terminal panes — and crops it by cropping the source,
+    /// so what remains is still at 1:1 and still unscaled. At rest a card is
+    /// wholly inside this and nothing is cropped at all.
+    pub clip: Rect,
     /// What this image was built from. An entry whose signature is unchanged
     /// keeps the pixels it already has and re-encodes nothing.
     pub signature: u64,
@@ -159,6 +173,30 @@ pub(crate) struct SidebarCardLayer {
     /// nobody has configured this on carries no extra megabyte around.
     pub undissolved: Option<UndissolvedSheet>,
     pub layer: crate::app::state::GraphicsLayer,
+}
+
+impl SidebarCardLayer {
+    /// Point an image that is already drawn at a place on the panel.
+    ///
+    /// The one operation a slide performs. It touches no pixels — which is the
+    /// whole cost argument: rasterising a card measures about an order of
+    /// magnitude more than copying one, so motion that re-places an existing
+    /// image is very nearly free while motion that redraws it would cost the
+    /// tree on every frame of every transition.
+    fn aim_at(&mut self, rect: Rect, clip: Rect, viewport: (i32, i32)) {
+        self.rect = rect;
+        self.clip = clip;
+        self.layer.render.viewport_col = viewport.0;
+        self.layer.render.viewport_row = viewport.1;
+    }
+
+    /// Where this image is actually placed, relative to [`Self::clip`].
+    fn viewport(&self) -> (i32, i32) {
+        (
+            self.layer.render.viewport_col,
+            self.layer.render.viewport_row,
+        )
+    }
 }
 
 /// One rasterised image — the whole sheet, or one card's shape — held across the
@@ -1176,8 +1214,15 @@ fn build_cards_inner(
     };
     let backdrop = backdrop_rgb(app);
 
+    // How far through its own arrival or departure each drawn row is, gathered
+    // in layout order beside the cards themselves so the two lists index
+    // together. Only when rows are configured to move: with motion off nothing
+    // reads the engine here at all and every card is placed exactly where the
+    // layout put it, which is what the panel has always done.
+    let moving = app.sidebar_animation.rows_move();
     let mut placed: Vec<(Rect, CardContent)> = Vec::new();
-    for card in cards {
+    let mut lives: Vec<super::motion::RowLife> = Vec::new();
+    for (index, card) in cards.iter().enumerate() {
         let Some(frame) = card.card_frame else {
             continue;
         };
@@ -1190,11 +1235,28 @@ fn build_cards_inner(
         let Some(content) = content_for(app, entry, &agents) else {
             continue;
         };
+        if moving {
+            lives.push(super::motion::RowLife {
+                // The distance to the next row's own top, so the span a row
+                // opens and closes is its height *and* the gap the layout puts
+                // after it. Taken off the layout rather than recomputed from
+                // `row_gap`, so the two can never disagree about what a row
+                // occupies.
+                height_px: row_span_cells(cards, index) * cell_h,
+                settle: row_settle(app, card),
+            });
+        }
         placed.push((frame, content));
     }
     if placed.is_empty() {
         return Err(());
     }
+    let panel_px = f32::from(bounds.width) * cell_w;
+    let offsets = if moving {
+        super::motion::row_offsets(&lives, panel_px)
+    } else {
+        vec![(0.0, 0.0); placed.len()]
+    };
 
     let title_metrics = font.metrics(TITLE_PX);
     let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
@@ -1237,9 +1299,41 @@ fn build_cards_inner(
     };
 
     if app.sidebar_card_shapes {
-        return rasteriser.shapes(&placed, previous);
+        return rasteriser.shapes(&placed, &offsets, previous);
     }
     rasteriser.sheet(&placed, previous)
+}
+
+/// How many cell rows the row at `index` occupies before the next one starts.
+///
+/// The gap the layout puts after a row belongs to that row for this purpose:
+/// what appears and disappears with a row is its box *and* the air under it, so
+/// a reflow that moved only the box would leave a gap growing on its own.
+fn row_span_cells(cards: &[crate::app::state::WorkspaceCardArea], index: usize) -> f32 {
+    let card = &cards[index];
+    let span = cards
+        .get(index + 1)
+        .map(|next| next.rect.y.saturating_sub(card.rect.y))
+        // The last row has nothing under it to measure against, so it opens and
+        // closes over its own height.
+        .unwrap_or(card.rect.height);
+    f32::from(span)
+}
+
+/// How far through its own life the engine says this row is.
+///
+/// The row's element is the same one [`crate::app::runtime`] publishes the
+/// membership for, keyed the same way, so motion cannot end up watching a
+/// different clock from the one the row's own arrival runs on.
+fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f32 {
+    let id = match card.agent.as_ref() {
+        Some(target) => crate::anim::ElementId::agent_row(target.pane_id),
+        None => match app.workspaces.get(card.ws_idx) {
+            Some(workspace) => crate::anim::ElementId::workspace_row(&workspace.id),
+            None => return 1.0,
+        },
+    };
+    super::motion::settle(app, &id)
 }
 
 /// The cells one card's own image covers: its frame plus the reach of its own
@@ -1359,7 +1453,7 @@ impl Rasteriser<'_> {
         let mut hasher = DefaultHasher::new();
         self.hash_common(&mut hasher, sheet_rect);
         for (frame, content) in placed {
-            hash_placed(&mut hasher, frame, content);
+            hash_placed(&mut hasher, frame, &sheet_rect, content);
         }
         let content_signature = hasher.finish();
         // The transition the sheet is *in*, on top of the cards it is a picture
@@ -1373,9 +1467,12 @@ impl Rasteriser<'_> {
         let signature = hasher.finish();
 
         let previous = previous.first();
-        if previous
-            .is_some_and(|previous| previous.signature == signature && previous.rect == sheet_rect)
-        {
+        let viewport = self.aim(sheet_rect, (0.0, 0.0));
+        if previous.is_some_and(|previous| {
+            previous.signature == signature
+                && previous.rect == sheet_rect
+                && previous.viewport() == viewport
+        }) {
             return Ok(None);
         }
 
@@ -1390,9 +1487,14 @@ impl Rasteriser<'_> {
                 previous.content_signature == content_signature && previous.rect == sheet_rect
             })
             .and_then(|previous| previous.undissolved.clone());
-        let layer = self.finish(sheet_rect, held, signature, content_signature, || {
+        let mut layer = self.finish(sheet_rect, held, signature, content_signature, || {
             self.rasterise(placed, sheet_rect, true)
         })?;
+        // The sheet never moves: it is one image spanning every row, so there is
+        // no "one row" in it to slide. It is aimed anyway, at zero offset, so
+        // both paths hand the pipeline the same shape and the clip box is not a
+        // thing only one of them has.
+        layer.aim_at(sheet_rect, self.clip(), viewport);
         Ok(Some(vec![layer]))
     }
 
@@ -1400,12 +1502,17 @@ impl Rasteriser<'_> {
     ///
     /// The card is the unit of everything here: its own rect, its own signature,
     /// its own placement. A card whose content did not change is carried forward
-    /// without being rasterised or re-encoded even when a sibling changed, which
-    /// is the property the queued motion work needs — moving one card must cost
-    /// one card, not the tree.
+    /// without being rasterised or re-encoded even when a sibling changed, or
+    /// when *it* moved — moving one card costs one card's placement, not the
+    /// tree's artwork.
+    ///
+    /// `offsets` is where each card is drawn relative to where the layout put
+    /// it, from [`super::motion::row_offsets`], and is all zeroes whenever rows
+    /// are not configured to move.
     fn shapes(
         &self,
         placed: &[(Rect, CardContent)],
+        offsets: &[(f32, f32)],
         previous: &[SidebarCardLayer],
     ) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
         // Measured first, drawn second. Deciding whether anything moved before
@@ -1414,59 +1521,120 @@ impl Rasteriser<'_> {
         // nothing.
         let planned: Vec<PlannedShape> = placed
             .iter()
-            .map(|(frame, content)| self.plan(*frame, content))
+            .enumerate()
+            .map(|(index, (frame, content))| {
+                self.plan(
+                    *frame,
+                    content,
+                    offsets.get(index).copied().unwrap_or_default(),
+                )
+            })
             .collect::<Option<_>>()
             .ok_or(())?;
 
         if planned.len() == previous.len()
             && planned.iter().zip(previous).all(|(planned, previous)| {
-                planned.signature == previous.signature && planned.rect == previous.rect
+                planned.signature == previous.signature
+                    && planned.rect == previous.rect
+                    && planned.viewport == previous.viewport()
             })
         {
             return Ok(None);
         }
 
+        let clip = self.clip();
         let mut layers = Vec::with_capacity(planned.len());
+        // Which held cards have already been claimed, so two rows that really
+        // are the same picture cannot both take the same one.
+        let mut taken = vec![false; previous.len()];
         for (index, planned) in planned.iter().enumerate() {
-            // Positional rather than by identity: a card only keeps its slot
-            // while the tree's shape is unchanged, and a tree that reordered has
-            // moved every rect it reordered — which the signature already caught.
-            let previous = previous.get(index);
-            if let Some(held) = previous.filter(|previous| {
-                previous.signature == planned.signature && previous.rect == planned.rect
-            }) {
-                // Untouched. The bytes are copied but the drawing is not redone,
-                // and the drawing is the expensive half by an order of magnitude.
-                layers.push(SidebarCardLayer::clone(held));
-                continue;
-            }
-            let held = previous
-                .filter(|previous| {
-                    previous.content_signature == planned.content_signature
-                        && previous.rect == planned.rect
-                })
-                .and_then(|previous| previous.undissolved.clone());
-            // One card, drawn into an image that is only as large as that card
-            // and the reach of its own bloom, with no background painted
-            // anywhere. Everything outside the glow stays at alpha zero.
-            let one = &placed[index..index + 1];
-            layers.push(self.finish(
-                planned.rect,
-                held,
-                planned.signature,
-                planned.content_signature,
-                || self.rasterise(one, planned.rect, false),
-            )?);
+            // Matched by what a card *is*, not by which slot it stood in. A row
+            // inserted or removed in the middle of the tree shifts every slot
+            // under it while changing not one of their signatures — the
+            // signature is content and size, deliberately not position (see
+            // [`Self::hash_common`]) — so slot matching would declare all of
+            // them different and redraw the lot. That was measured: a departure
+            // finishing re-uploaded better than half the tree.
+            //
+            // Two cards that hash the same are the same pixels, so which of them
+            // claims a held image cannot be observable.
+            let held = (0..previous.len())
+                .find(|slot| !taken[*slot] && previous[*slot].signature == planned.signature);
+            let mut layer = match held {
+                // Untouched, or moved and nothing more. The bytes are copied but
+                // the drawing is not redone, and the drawing is the expensive
+                // half by an order of magnitude. This is the case every frame of
+                // a slide takes.
+                Some(slot) => {
+                    taken[slot] = true;
+                    SidebarCardLayer::clone(&previous[slot])
+                }
+                None => {
+                    let base = (0..previous.len())
+                        .find(|slot| {
+                            !taken[*slot]
+                                && previous[*slot].content_signature == planned.content_signature
+                        })
+                        .and_then(|slot| previous[slot].undissolved.clone());
+                    // One card, drawn into an image that is only as large as
+                    // that card and the reach of its own bloom, with no
+                    // background painted anywhere. Everything outside the glow
+                    // stays at alpha zero.
+                    let one = &placed[index..index + 1];
+                    self.finish(
+                        planned.rect,
+                        base,
+                        planned.signature,
+                        planned.content_signature,
+                        || self.rasterise(one, planned.rect, false),
+                    )?
+                }
+            };
+            layer.aim_at(planned.rect, clip, planned.viewport);
+            layers.push(layer);
         }
         Ok(Some(layers))
     }
 
-    /// What one card's image will be, before anything is drawn.
-    fn plan(&self, frame: Rect, content: &CardContent) -> Option<PlannedShape> {
+    /// The box on the panel a card may draw in: everything the tree's own rects
+    /// are already clamped into.
+    ///
+    /// Exactly the bounds [`clamp_bloomed`] holds a settled card inside, so at
+    /// rest every card is wholly within it and the clipper has nothing to do.
+    /// A card in motion is the only thing that ever reaches it, and reaching it
+    /// is what stops a slide from spilling over the terminal panes.
+    fn clip(&self) -> Rect {
+        Rect::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.width,
+            self.bloom_floor.saturating_sub(self.bounds.y),
+        )
+    }
+
+    /// Where an image drawn for `rect` is placed, relative to [`Self::clip`].
+    ///
+    /// Rounded to whole cells. A card's placement is a cell position, and the
+    /// engine's own frame step is coarser than a cell is tall over any arrival
+    /// short enough to read as one — so sub-cell placement would buy at most an
+    /// extra position per transition while costing every card a pixel-offset
+    /// path and a transparent pad for the clip to eat. Measured in
+    /// `data/herdr-row-slide-reflow/`.
+    fn aim(&self, rect: Rect, offset: (f32, f32)) -> (i32, i32) {
+        let clip = self.clip();
+        (
+            i32::from(rect.x) - i32::from(clip.x) + (offset.0 / self.cell_w).round() as i32,
+            i32::from(rect.y) - i32::from(clip.y) + (offset.1 / self.cell_h).round() as i32,
+        )
+    }
+
+    /// What one card's image will be, and where it goes, before anything is
+    /// drawn.
+    fn plan(&self, frame: Rect, content: &CardContent, offset: (f32, f32)) -> Option<PlannedShape> {
         let rect = self.card_rect(frame, content)?;
         let mut hasher = DefaultHasher::new();
         self.hash_common(&mut hasher, rect);
-        hash_placed(&mut hasher, &frame, content);
+        hash_placed(&mut hasher, &frame, &rect, content);
         let content_signature = hasher.finish();
         self.dissolve.map(DissolveFrame::step).hash(&mut hasher);
         if self.dissolve.is_some() {
@@ -1480,6 +1648,7 @@ impl Rasteriser<'_> {
         }
         Some(PlannedShape {
             rect,
+            viewport: self.aim(rect, offset),
             signature: hasher.finish(),
             content_signature,
         })
@@ -1514,6 +1683,11 @@ impl Rasteriser<'_> {
         .ok_or(())?;
         Ok(SidebarCardLayer {
             rect,
+            // Replaced by `aim_at` before this reaches anything that draws. The
+            // image's own rect is the honest default: it is where a card with no
+            // motion configured goes, so a layer that somehow escaped un-aimed
+            // would be placed exactly where it has always been placed.
+            clip: rect,
             signature,
             content_signature,
             // Only while a transition is running: a settled panel keeps no
@@ -1644,11 +1818,26 @@ impl Rasteriser<'_> {
     }
 
     /// The facts every image's signature starts from.
+    ///
+    /// # Why the rect's position is deliberately not one of them
+    ///
+    /// An image is drawn entirely in its own coordinates: [`Self::place`] puts a
+    /// card at `frame - rect`, and [`Self::rasterise`] sizes the canvas from
+    /// `rect.width`/`rect.height`. So two images whose rects differ only by a
+    /// translation are the same pixels, and hashing where the rect *is* would
+    /// declare them different and redraw one to arrive back at the other.
+    ///
+    /// That is exactly what a reflow does to every card below an arriving row,
+    /// on the one frame the layout changes — so a signature that moved with the
+    /// panel would make a slide cost a full tree rasterisation at the moment it
+    /// begins. Blind to position, it costs a clone.
+    ///
+    /// Position is not lost: a *transition* frame folds it back in through
+    /// [`Self::dissolve_origin`], because there a card's pixels genuinely do
+    /// depend on where in the field it sits.
     fn hash_common(&self, hasher: &mut DefaultHasher, rect: Rect) {
         self.cell_size.width_px.hash(hasher);
         self.cell_size.height_px.hash(hasher);
-        rect.x.hash(hasher);
-        rect.y.hash(hasher);
         rect.width.hash(hasher);
         rect.height.hash(hasher);
         self.backdrop.0.hash(hasher);
@@ -1657,17 +1846,27 @@ impl Rasteriser<'_> {
     }
 }
 
-/// What one card's image will be, decided before any pixel is drawn.
+/// What one card's image will be, and where it goes, decided before any pixel
+/// is drawn.
 struct PlannedShape {
+    /// The cell rect the image is drawn for.
     rect: Rect,
+    /// Where it is placed, relative to the clip box — the image rect's own
+    /// position plus whatever motion offset this frame calls for.
+    viewport: (i32, i32),
     signature: u64,
     content_signature: u64,
 }
 
 /// One card's frame and content, fed into a signature.
-fn hash_placed(hasher: &mut DefaultHasher, frame: &Rect, content: &CardContent) {
-    frame.x.hash(hasher);
-    frame.y.hash(hasher);
+///
+/// The frame is hashed *relative to the image it is drawn into*, for the reason
+/// [`Rasteriser::hash_common`] gives: what the pixels depend on is where the
+/// card sits inside its own image, never where that image sits on the panel.
+/// Signed, because the panel clamp can put an image's origin past its card's.
+fn hash_placed(hasher: &mut DefaultHasher, frame: &Rect, rect: &Rect, content: &CardContent) {
+    (i32::from(frame.x) - i32::from(rect.x)).hash(hasher);
+    (i32::from(frame.y) - i32::from(rect.y)).hash(hasher);
     frame.width.hash(hasher);
     frame.height.hash(hasher);
     content.hash_into(hasher);
@@ -4038,6 +4237,671 @@ mod a_card_is_its_own_shape {
                 "tier {depth} changed height with the drawing model"
             );
         }
+    }
+}
+
+/// A row arriving opens the space it needs, and a row leaving gives it back.
+///
+/// The captain's ask, in his words: *"these worker panes are being materialized
+/// and swiped to the right and then to the left as the existing ones pan up and
+/// pan down… that's what pans up and pans down to make room or absorb the
+/// room."* Everything here is that sentence turned into an assertion, over the
+/// real tree rather than over [`super::motion`]'s arithmetic.
+#[cfg(test)]
+mod rows_make_room_for_each_other {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The composition the flag exists to allow: cards as shapes, rows moving,
+    /// and the captain's dissolve still running on the cells underneath.
+    fn moving_fleet() -> AppState {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+        app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Dissolve;
+        app.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::Dissolve;
+        app
+    }
+
+    /// Publish the row membership the app loop would, optionally holding one
+    /// pane back so it is the only thing arriving on the pass after.
+    fn publish(app: &mut AppState, now: Instant, without: Option<crate::layout::PaneId>) {
+        let lifecycle = app.sidebar_row_lifecycle();
+        let rows: Vec<_> = crate::ui::sidebar_agent_live_entries(app)
+            .iter()
+            .filter(|entry| Some(entry.pane_id) != without)
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::AgentRow, &lifecycle, rows);
+        let spaces: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    crate::anim::ElementId::workspace_row(&workspace.id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
+    }
+
+    fn build(
+        app: &AppState,
+        cards: &[crate::app::state::WorkspaceCardArea],
+        previous: &[SidebarCardLayer],
+    ) -> Option<Vec<SidebarCardLayer>> {
+        build_at(app, cards, sidebar_rect(), previous)
+    }
+
+    fn build_at(
+        app: &AppState,
+        cards: &[crate::app::state::WorkspaceCardArea],
+        rect: Rect,
+        previous: &[SidebarCardLayer],
+    ) -> Option<Vec<SidebarCardLayer>> {
+        match build_cards(app, cards, rect, app.host_cell_size, previous) {
+            CardsUpdate::Rebuilt(layers) => Some(layers),
+            // No proportional face on this machine, or nothing moved.
+            CardsUpdate::Unchanged | CardsUpdate::Empty => None,
+        }
+    }
+
+    /// A panel with room to spare, for the one test that has to *add* a row:
+    /// [`sidebar_rect`] is already showing as many rows as it can hold, so a
+    /// new pane there falls off the bottom instead of pushing anything.
+    fn tall_rect() -> Rect {
+        Rect::new(0, 0, sidebar_rect().width, 90)
+    }
+
+    /// The first agent row that has at least one row under it, so the test has
+    /// both an "above" and a "below" to check.
+    fn arriving_row(
+        cards: &[crate::app::state::WorkspaceCardArea],
+    ) -> (usize, crate::layout::PaneId) {
+        cards
+            .iter()
+            .enumerate()
+            .take(cards.len().saturating_sub(1))
+            .find_map(|(index, card)| card.agent.as_ref().map(|agent| (index, agent.pane_id)))
+            .expect("the fleet has no agent row with a sibling below it")
+    }
+
+    /// A fleet mid-arrival and the same fleet settled, from one setup.
+    ///
+    /// `None` when this machine has no proportional face, which is the same
+    /// skip every other pixel-card test takes.
+    fn mid_and_settled() -> Option<(Vec<SidebarCardLayer>, Vec<SidebarCardLayer>, usize, f32)> {
+        let mut app = moving_fleet();
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let (index, pane) = arriving_row(&cards);
+
+        // Everything but one row exists, and settles.
+        let now = Instant::now();
+        publish(&mut app, now, Some(pane));
+        let settled_at = now + Duration::from_secs(2);
+        app.anim.advance(settled_at);
+
+        // Then it arrives, and this is its first frame.
+        publish(&mut app, settled_at, None);
+        let mid = build(&app, &cards, &[])?;
+
+        // And this is the frame after its last.
+        app.anim.advance(settled_at + Duration::from_secs(2));
+        let settled = build(&app, &cards, &[])?;
+        Some((mid, settled, index, row_span_cells(&cards, index)))
+    }
+
+    #[test]
+    fn a_row_arriving_moves_every_row_below_it_and_none_above() {
+        let Some((mid, settled, index, span)) = mid_and_settled() else {
+            return;
+        };
+        assert_eq!(mid.len(), settled.len());
+        assert!(index + 1 < mid.len(), "nothing below the arriving row");
+
+        for slot in 0..index {
+            assert_eq!(
+                mid[slot].viewport(),
+                settled[slot].viewport(),
+                "row {slot} above the arrival moved"
+            );
+        }
+        assert_eq!(
+            mid[index].viewport().1,
+            settled[index].viewport().1,
+            "the arriving row made room for itself"
+        );
+        for slot in (index + 1)..mid.len() {
+            assert_eq!(
+                settled[slot].viewport().1 - mid[slot].viewport().1,
+                span as i32,
+                "row {slot} did not start where it was standing before the slot \
+                 existed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arriving_row_itself_starts_clear_of_the_panel_and_ends_home() {
+        let Some((mid, settled, index, _)) = mid_and_settled() else {
+            return;
+        };
+        let panel = i32::from(super::super::sidebar_content_rect(sidebar_rect()).width);
+        assert!(
+            mid[index].viewport().0 >= panel,
+            "an arrival that starts on screen reads as a jump: {:?} against a \
+             {panel}-column panel",
+            mid[index].viewport()
+        );
+        assert_eq!(settled[index].viewport().0, mid[index].rect.x as i32);
+    }
+
+    /// The cost claim, and the reason motion is affordable at all.
+    ///
+    /// A pane appearing moves every row below it, which moves those cards'
+    /// image rects — so a signature that knew where a card sat would rebuild the
+    /// whole tree on the frame a slide *begins*, every time. It does not: the
+    /// pixels are the same pixels, and they are carried over.
+    #[test]
+    fn a_row_appearing_re_places_its_siblings_without_redrawing_one_of_them() {
+        let mut app = moving_fleet();
+        let before_cards = super::super::compute_workspace_card_areas(&app, tall_rect());
+        let Some(before) = build_at(&app, &before_cards, tall_rect(), &[]) else {
+            return;
+        };
+
+        // A new worker in the fleet, which pushes everything below it down a row
+        // and leaves what every other row says untouched. Focus is put back
+        // where it was: selection is card *content*, so a split that stole it
+        // would legitimately redraw two cards and this test would be measuring
+        // that instead of the reflow.
+        let focused = app.workspaces[0]
+            .focused_pane_id()
+            .expect("the fleet has a focused pane");
+        let spawned = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        if let Some(tab) = app.workspaces[0].active_tab_mut() {
+            tab.layout.focus_pane(focused);
+        }
+        app.ensure_test_terminals();
+        // A pane with no published identity is not a tree row — it renders
+        // empty and is left out — so the new worker has to say who it is before
+        // it can push anything.
+        let terminal_id = app.workspaces[0].tabs[0].panes[&spawned]
+            .attached_terminal_id
+            .clone();
+        let now = app.state_age_now;
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the new pane has no terminal");
+        terminal.set_agent_name("newcomer".to_string());
+        terminal.state = crate::detect::AgentState::Working;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([
+                ("doing".to_string(), Some("Just arrived".to_string())),
+                ("project".to_string(), Some("herdr".to_string())),
+                // Under the *first* second mate, so the two groups below it are
+                // the ones that have to move.
+                ("owner".to_string(), Some("2ndmate-herdr".to_string())),
+            ]),
+            None,
+            now,
+        );
+        let after_cards = super::super::compute_workspace_card_areas(&app, tall_rect());
+        assert_eq!(
+            after_cards.len(),
+            before_cards.len() + 1,
+            "the split did not add a row"
+        );
+        assert!(
+            after_cards
+                .iter()
+                .any(|card| card.agent.as_ref().is_some_and(|a| a.pane_id == spawned)),
+            "the spawned pane did not reach the tree"
+        );
+        let after = build_at(&app, &after_cards, tall_rect(), &before).expect("a new row rebuilds");
+
+        // Every card that existed before is still the same drawing, wherever it
+        // has been pushed to — matched by signature rather than by slot,
+        // because an insertion in the middle shifts every slot under it.
+        let mut carried = 0usize;
+        let mut moved = 0usize;
+        for old in &before {
+            let Some(new) = after.iter().find(|new| new.signature == old.signature) else {
+                panic!("a card was redrawn to arrive back at the pixels it already had");
+            };
+            assert_eq!(
+                new.layer.data_fingerprint, old.layer.data_fingerprint,
+                "a card kept its signature but was re-encoded anyway"
+            );
+            carried += 1;
+            moved += usize::from(new.viewport() != old.viewport());
+        }
+        assert_eq!(carried, before.len());
+        assert!(moved > 0, "no card was re-placed, so nothing reflowed");
+    }
+
+    /// Motion never lets a card be drawn over the terminal panes.
+    ///
+    /// A slide deliberately puts a card past the panel's right edge. What stops
+    /// that from spilling is the clip box, and that box is the same one every
+    /// settled card is already held inside — so nothing about the panel's
+    /// footprint changes, in motion or out of it.
+    #[test]
+    fn a_card_in_motion_is_clipped_to_the_panel_it_belongs_to() {
+        let Some((mid, settled, _, _)) = mid_and_settled() else {
+            return;
+        };
+        let bounds = super::super::sidebar_content_rect(sidebar_rect());
+        for layer in mid.iter().chain(&settled) {
+            assert!(
+                layer.clip.x >= bounds.x
+                    && layer.clip.x + layer.clip.width <= bounds.x + bounds.width,
+                "a card's clip box reached outside the panel: {:?} against {bounds:?}",
+                layer.clip
+            );
+            assert!(
+                layer.clip.y >= bounds.y
+                    && layer.clip.y + layer.clip.height <= bounds.y + bounds.height,
+                "a card's clip box reached outside the panel vertically: {:?}",
+                layer.clip
+            );
+        }
+    }
+
+    /// Below the card shell's width the panel is characters, and characters do
+    /// not move.
+    ///
+    /// A glyph cannot leave its cell — the same property [`crate::anim`] is
+    /// built around, and the reason the behaviour catalogue resolves colour and
+    /// coverage but never position. So there is nothing to slide there, and the
+    /// honest fallback is the one the panel already has: a row appears and
+    /// disappears on the frame the layout says it does. What this pins is that
+    /// turning motion on changes *nothing* about that path, so the fallback
+    /// cannot drift away from it.
+    #[test]
+    fn a_panel_too_narrow_for_a_card_renders_identically_with_motion_on() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        // Narrow enough that the card shell is off, which is the same threshold
+        // the pixel path uses.
+        let narrow = Rect::new(0, 0, MIN_FOLD_WIDTH, 40);
+        let rendered = |motion: crate::config::SidebarRowMotion| -> Vec<String> {
+            let mut app = moving_fleet();
+            app.sidebar_animation.row_motion = motion;
+            app.sidebar_width = narrow.width;
+            app.sidebar_max_width = narrow.width;
+            let cards = super::super::compute_workspace_card_areas(&app, narrow);
+            let (_, pane) = arriving_row(&cards);
+
+            let now = Instant::now();
+            publish(&mut app, now, Some(pane));
+            let settled = now + Duration::from_secs(2);
+            app.anim.advance(settled);
+            publish(&mut app, settled, None);
+            // Part-way into the arrival, which is the only moment a slide could
+            // have moved anything.
+            app.anim
+                .advance(settled + Duration::from_millis(app.sidebar_animation.row_enter_ms / 2));
+
+            app.view.sidebar_rect = narrow;
+            app.view.workspace_card_areas = cards;
+            assert!(
+                matches!(
+                    build_cards(
+                        &app,
+                        &app.view.workspace_card_areas,
+                        narrow,
+                        app.host_cell_size,
+                        &[]
+                    ),
+                    CardsUpdate::Empty
+                ),
+                "a panel this narrow drew a card, so this is not the fallback"
+            );
+
+            let mut terminal =
+                Terminal::new(TestBackend::new(narrow.width, narrow.height)).expect("backend");
+            terminal
+                .draw(|frame| {
+                    super::super::render_sidebar(
+                        &app,
+                        &crate::terminal::TerminalRuntimeRegistry::new(),
+                        frame,
+                        narrow,
+                    )
+                })
+                .expect("draws");
+            let buffer = terminal.backend().buffer();
+            (0..narrow.height)
+                .map(|row| {
+                    (0..narrow.width)
+                        .map(|col| buffer[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            rendered(crate::config::SidebarRowMotion::Slide),
+            rendered(crate::config::SidebarRowMotion::None),
+            "motion reached the character fallback, which cannot express it"
+        );
+    }
+
+    /// With motion off nothing reads the engine and every card sits exactly
+    /// where the layout put it — the behaviour every Herdr that has not turned
+    /// this on keeps.
+    #[test]
+    fn a_panel_with_motion_off_places_every_card_on_its_own_rect() {
+        let mut app = moving_fleet();
+        app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::None;
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let (_, pane) = arriving_row(&cards);
+        let now = Instant::now();
+        publish(&mut app, now, Some(pane));
+        app.anim.advance(now + Duration::from_secs(2));
+        publish(&mut app, now + Duration::from_secs(2), None);
+
+        let Some(layers) = build(&app, &cards, &[]) else {
+            return;
+        };
+        for layer in &layers {
+            assert_eq!(
+                layer.viewport(),
+                (
+                    i32::from(layer.rect.x) - i32::from(layer.clip.x),
+                    i32::from(layer.rect.y) - i32::from(layer.clip.y)
+                ),
+                "a card moved with motion switched off"
+            );
+        }
+    }
+}
+
+/// Writes out the *exact bytes* a real Herdr sends, frame by frame through a
+/// row arriving and the same row leaving, so a real terminal can be asked what
+/// it does with them.
+///
+/// Nothing here asserts; the assertions are in
+/// [`super::rows_make_room_for_each_other`] and they are what CI runs. This
+/// exists because the claim is about motion on a screen — that a row's
+/// neighbours are *seen* to open a gap for it — and no unit test can show that.
+/// The escapes come out of `kitty_graphics::encode_local_pane_graphics`, the one
+/// the client actually writes to the host, so what a screenshot shows is what
+/// the feature does rather than a reconstruction of it.
+///
+/// Off unless `HERDR_MOTION_CAPTURE_DIR` is set, exactly like
+/// [`super::shape_capture`]. Writes `enter-NN.esc` and `leave-NN.esc` — each
+/// self-contained, uploads included, so one frame can be replayed into a fresh
+/// terminal — plus `cost.tsv`, which is the same sequence encoded against a
+/// cache that *persists* across the frames and is therefore what the running
+/// client actually pays per frame of motion.
+#[cfg(test)]
+mod motion_capture {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+    use std::fmt::Write as _;
+    use std::time::{Duration, Instant};
+
+    /// Frames per transition. One more than the engine can resolve at its 50 ms
+    /// step over a 320 ms arrival, so the strip cannot be accused of having
+    /// smoothed anything the panel would not really draw.
+    const STEPS: usize = 8;
+
+    struct Capture {
+        dir: String,
+        cost: String,
+        persistent: crate::kitty_graphics::HostGraphicsCache,
+        runtimes: crate::terminal::TerminalRuntimeRegistry,
+    }
+
+    impl Capture {
+        /// One frame: the panel laid out at `app`'s current animation position,
+        /// encoded twice — once standalone for the replay, once against the
+        /// running cache for the cost column.
+        fn frame(&mut self, app: &mut AppState, name: &str) {
+            let cell_size = app.host_cell_size;
+            // Wide enough not to trip the mobile layout, and wider than the
+            // panel on purpose: everything right of column 42 is the terminal
+            // panes, and a sliding card reaching any of it would be the bug the
+            // clip box exists to prevent.
+            let area = Rect::new(0, 0, 100, sidebar_rect().height);
+            crate::ui::compute_view_with_cell_size(app, &self.runtimes, area, cell_size);
+
+            assert!(
+                app.view.sidebar_card_layers_published,
+                "{name} drew no cards, so there is nothing to capture"
+            );
+            let mut fresh = crate::kitty_graphics::HostGraphicsCache::default();
+            let standalone = crate::kitty_graphics::encode_local_pane_graphics(
+                app,
+                &self.runtimes,
+                app.view.tab_surface(),
+                cell_size,
+                &mut fresh,
+            );
+            std::fs::write(format!("{}/{name}.esc", self.dir), &standalone).expect("writes");
+
+            let incremental = crate::kitty_graphics::encode_local_pane_graphics(
+                app,
+                &self.runtimes,
+                app.view.tab_surface(),
+                cell_size,
+                &mut self.persistent,
+            );
+            let _ = writeln!(
+                self.cost,
+                "{name}\t{}\t{}",
+                standalone.len(),
+                incremental.len()
+            );
+        }
+    }
+
+    /// Publish the row membership the app loop would, holding `without` back,
+    /// and keep the departing-row memory the same way `App::observe_agent_rows`
+    /// does — otherwise a row whose pane has gone has nothing left to be drawn
+    /// from and the exit is invisible rather than absent.
+    fn publish(app: &mut AppState, now: Instant, without: Option<crate::layout::PaneId>) {
+        let lifecycle = app.sidebar_row_lifecycle();
+        let live: Vec<_> = crate::ui::sidebar_agent_live_entries(app)
+            .into_iter()
+            .filter(|entry| Some(entry.pane_id) != without)
+            .collect();
+        let rows: Vec<_> = live
+            .iter()
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::AgentRow, &lifecycle, rows);
+        let spaces: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    crate::anim::ElementId::workspace_row(&workspace.id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
+        app.sidebar_tree_row_memory = crate::ui::rows_with_departing(app, live);
+    }
+
+    /// The same panel drawn below the card shell's width, with motion on and
+    /// with it off, as text.
+    fn narrow_render(app: &mut AppState) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let narrow = Rect::new(0, 0, MIN_FOLD_WIDTH, 40);
+        let restore = (
+            app.sidebar_width,
+            app.sidebar_max_width,
+            app.sidebar_animation.row_motion,
+        );
+        let mut out = String::new();
+        for motion in [
+            crate::config::SidebarRowMotion::Slide,
+            crate::config::SidebarRowMotion::None,
+        ] {
+            app.sidebar_animation.row_motion = motion;
+            app.sidebar_width = narrow.width;
+            app.sidebar_max_width = narrow.width;
+            app.view.sidebar_rect = narrow;
+            app.view.workspace_card_areas = super::super::compute_workspace_card_areas(app, narrow);
+            let mut terminal =
+                Terminal::new(TestBackend::new(narrow.width, narrow.height)).expect("backend");
+            terminal
+                .draw(|frame| {
+                    super::super::render_sidebar(
+                        app,
+                        &crate::terminal::TerminalRuntimeRegistry::new(),
+                        frame,
+                        narrow,
+                    )
+                })
+                .expect("draws");
+            let buffer = terminal.backend().buffer();
+            let _ = writeln!(out, "=== row_motion = {motion:?} ===");
+            for row in 0..narrow.height {
+                for col in 0..narrow.width {
+                    out.push_str(buffer[(col, row)].symbol());
+                }
+                out.push('\n');
+            }
+        }
+        (
+            app.sidebar_width,
+            app.sidebar_max_width,
+            app.sidebar_animation.row_motion,
+        ) = restore;
+        out
+    }
+
+    #[test]
+    fn motion_capture() {
+        let dir = std::env::var("HERDR_MOTION_CAPTURE_DIR").unwrap_or_default();
+        if dir.is_empty() {
+            println!("SKIP: set HERDR_MOTION_CAPTURE_DIR");
+            return;
+        }
+
+        let mut app = pixel_fleet_app();
+        app.mode = crate::app::Mode::Terminal;
+        app.sidebar_card_shapes = true;
+        // The 42 columns the captain reviews the tree at. The default ceiling is
+        // narrower than that, and it is a clamp rather than a preference, so it
+        // has to be lifted or the panel comes out 36 wide.
+        app.sidebar_max_width = sidebar_rect().width;
+        app.sidebar_width = sidebar_rect().width;
+        app.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+        app.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Dissolve;
+        app.sidebar_animation.row_enter_ms = 320;
+        app.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::Dissolve;
+        app.sidebar_animation.row_exit_ms = 320;
+
+        let mut capture = Capture {
+            dir: dir.clone(),
+            cost: String::from("frame\tstandalone_bytes\tincremental_bytes\n"),
+            persistent: crate::kitty_graphics::HostGraphicsCache::default(),
+            runtimes: crate::terminal::TerminalRuntimeRegistry::new(),
+        };
+
+        // The tree as it stands, before the worker exists at all. This is the
+        // picture the arrival has to be seen departing from, so it is taken
+        // before the pane is created rather than after: a card whose row the
+        // engine is not yet tracking is drawn settled, and a "before" frame that
+        // already showed the newcomer in place would prove nothing.
+        let t0 = Instant::now();
+        publish(&mut app, t0, None);
+        app.anim.advance(t0 + Duration::from_secs(2));
+        let settled = t0 + Duration::from_secs(2);
+        capture.frame(&mut app, "enter-00-before");
+
+        // The worker that arrives, under the first second mate so the two groups
+        // below it are the ones with room to make.
+        let focused = app.workspaces[0]
+            .focused_pane_id()
+            .expect("the fleet has a focused pane");
+        let newcomer = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        if let Some(tab) = app.workspaces[0].active_tab_mut() {
+            tab.layout.focus_pane(focused);
+        }
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&newcomer]
+            .attached_terminal_id
+            .clone();
+        let now = app.state_age_now;
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the new pane has no terminal");
+        terminal.set_agent_name("herdr-row-slide".to_string());
+        terminal.state = crate::detect::AgentState::Working;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([
+                (
+                    "doing".to_string(),
+                    Some("Making the sidebar's rows move".to_string()),
+                ),
+                ("project".to_string(), Some("herdr".to_string())),
+                ("context".to_string(), Some("8%".to_string())),
+                ("owner".to_string(), Some("2ndmate-herdr".to_string())),
+            ]),
+            None,
+            now,
+        );
+
+        // And it arrives: the pane exists, so the layout already has its slot,
+        // and the engine is told about it in the same pass the loop would.
+        publish(&mut app, settled, None);
+        for step in 0..STEPS {
+            let at = settled + Duration::from_millis(320 * step as u64 / (STEPS - 1) as u64);
+            app.anim.advance(at);
+            capture.frame(&mut app, &format!("enter-{:02}", step + 1));
+            if step == STEPS / 2 {
+                // The character fallback, taken at the moment a slide would be
+                // most visible if it reached that path. It does not.
+                let fallback = narrow_render(&mut app);
+                std::fs::write(format!("{dir}/fallback.txt"), fallback).expect("writes");
+            }
+        }
+        let done = settled + Duration::from_secs(2);
+        app.anim.advance(done);
+        capture.frame(&mut app, "enter-99-after");
+
+        // And then it goes: its pane closes, which is the only thing that makes
+        // a row leave.
+        app.workspaces[0].close_pane(newcomer);
+        publish(&mut app, done, None);
+        for step in 0..STEPS {
+            let at = done + Duration::from_millis(320 * step as u64 / (STEPS - 1) as u64);
+            app.anim.advance(at);
+            publish(&mut app, at, None);
+            capture.frame(&mut app, &format!("leave-{:02}", step + 1));
+        }
+        app.anim.advance(done + Duration::from_secs(2));
+        publish(&mut app, done + Duration::from_secs(2), None);
+        capture.frame(&mut app, "leave-99-after");
+
+        std::fs::write(format!("{dir}/cost.tsv"), &capture.cost).expect("writes");
+
+        println!("wrote {} frames to {dir}", STEPS * 2 + 3);
     }
 }
 
