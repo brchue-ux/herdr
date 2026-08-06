@@ -534,9 +534,11 @@ struct CardContent {
     lifted: bool,
     /// The project mark, once there are any. See [`CardMark`].
     mark: Option<CardMark>,
-    /// This frame of the card's breath, in `0.0..=1.0`, quantized to
-    /// [`CARD_BREATH_STEPS`]. `0.0` is the card at its own settled light, which
-    /// is what a host with no card animation draws.
+    /// This frame of the card's breath, quantized to [`CARD_BREATH_STEPS`].
+    /// `0.0` is the card at its own settled light, which is what a host with no
+    /// card animation draws, and `1.0` is a full breath — but a snapping
+    /// behaviour carries *past* `1.0` on its overshoot and this holds that too.
+    /// See [`quantize`] for why the ladder has no ceiling.
     breath: f32,
     /// The state change crossing the card right now, if one is.
     wash: Option<CardWashFrame>,
@@ -783,8 +785,18 @@ impl CardLight {
     /// reference's own inactive card holds its hue, and a breath that
     /// desaturated would read as the card losing its state rather than as the
     /// card resting.
+    ///
+    /// The envelope is taken **whole**, overshoot included. A snap that carries
+    /// ten percent past its target is a card that settles ten percent further
+    /// back than a full breath before it comes forward again, and that extra
+    /// travel at the deepest point is the snap being visible at all. Both dips
+    /// stay comfortably positive there — at `1.1` the ink is at `×0.868` and
+    /// the bloom at `×0.604` — so nothing downstream needs the cap that used to
+    /// be here. Only the floor is kept: a negative envelope would *brighten*
+    /// the card past its own state's light, which is the one thing this
+    /// function's whole reading rules out.
     fn breathed(self, envelope: f32) -> Self {
-        let swing = envelope.clamp(0.0, 1.0);
+        let swing = envelope.max(0.0);
         Self {
             ink: self.ink,
             lum: self.lum * (1.0 - BREATH_LUM_DIP * swing),
@@ -893,10 +905,43 @@ const BREATH_BLOOM_DIP: f32 = 0.36;
 /// the engine is *asked*, and this says how often the answer is different enough
 /// to be worth a rasterisation. A card whose quantised step has not moved is
 /// carried forward by signature with nothing redrawn — which is what keeps a
-/// tree of breathing cards off the frame-time tail. Twelve steps across a swing
-/// that never exceeds a third of the bloom is under two per cent of the card's
-/// light per step, below what a step of the panel's own dithering would show.
-const CARD_BREATH_STEPS: f32 = 12.0;
+/// tree of breathing cards off the frame-time tail.
+///
+/// # Why the ladder is sized by interval and not by amplitude
+///
+/// This was twelve, on the reasoning that a step of the breath was under two
+/// per cent of the card's light and so below what the panel's own dithering
+/// would show. The amplitude argument is sound and it is the wrong axis: an eye
+/// following a slow ramp reads the *interval between changes*, not the size of
+/// one, so a step nobody can see individually still ticks if it arrives every
+/// sixth of a second. Twelve steps across [`crate::anim::behaviour`]'s 5,200 ms
+/// rest breath is a change every 160 ms — 4.8 a second, against the ~62 the
+/// loop offers — which is exactly the tick a resting tree was reported to have.
+///
+/// Forty-eight puts the rest breath's median step at 40 ms and a live card's at
+/// 10 ms, and it is also what renders the snap's overshoot at its stated size:
+/// a ladder of twelve rounds a 10% overshoot down to 8.3%, and this one lands
+/// it at 10.4%.
+///
+/// # What it costs, measured
+///
+/// Through the real builder at the real 16 ms loop, release, a ten-card tree at
+/// a 42-column sidebar, three runs of 20 s each: rebuilds go from **14.8 to
+/// 41.0 a second** and the card path's mean load from **5.6–7.9% of one core to
+/// 16.0–17.0%**.
+///
+/// The **tail does not move**, which is the number that matters for a 60 fps
+/// floor. Worst frame 8.8–10.2 ms before against 9.1–12.7 ms after, p99.9
+/// 8.8–9.3 ms against 9.0–10.7 ms — the same distribution, because the worst
+/// frame is a whole-tree redraw either way and a finer ladder makes those
+/// frames more *frequent*, not more expensive. What actually moves is the
+/// median, 0.04 ms to 3.1 ms, which is the cost being paid and not a tail risk.
+/// Both stay inside a 16.67 ms budget with room over.
+///
+/// Going further buys little: the loop cannot show more than ~62 changes a
+/// second, and 96 steps doubles the cost again for a median step already under
+/// the frame interval.
+const CARD_BREATH_STEPS: f32 = 48.0;
 
 /// Steps of the wash's sweep the artwork is rebuilt at.
 ///
@@ -1686,15 +1731,26 @@ fn wash(app: &AppState, row: crate::anim::CardRow) -> Option<CardWashFrame> {
     })
 }
 
-/// One value snapped to a ladder of `steps` over `0.0..=1.0`.
+/// One value snapped to a ladder whose rungs are `1.0 / steps` apart.
 ///
 /// Quantized where it is *read* rather than where it is hashed, so the number
 /// that reaches the signature and the number that reaches the pixels are the
 /// same number. Rounded to the ladder and not merely hashed against it: a card
 /// carried forward on a matching signature keeps the pixels it was drawn with,
 /// and those pixels have to be the ones the ladder's step means.
+///
+/// **The ladder is not capped at `1.0`, and that is the point.**
+/// [`crate::anim::Curve::SnapPendulum`] deliberately carries about ten percent
+/// past its target and swings back — the snap the visual target asks for by
+/// name — and [`crate::anim::behaviour::Behaviour::strength`] hands that
+/// overshoot over intact precisely so a consumer that wants it can have it.
+/// Capping here spent the whole overshoot on the ladder's top rung, so a card
+/// held one unchanged signature straight through the snap and the pendulum: the
+/// motion happened, and the picture did not move for a third of a second in the
+/// middle of it. Only the floor is kept, because a rung below zero is not a
+/// dimmer card, it is an envelope read backwards.
 fn quantize(value: f32, steps: f32) -> f32 {
-    (value.clamp(0.0, 1.0) * steps).round() / steps
+    (value.max(0.0) * steps).round() / steps
 }
 
 /// The card for one tree row, whichever kind of row it is.
@@ -7032,11 +7088,16 @@ mod cards_breathe_and_wash {
     ///
     /// [`CARD_BREATH_STEPS`] is what stops it: a card whose quantised envelope
     /// has not moved hashes to the same signature and is carried forward with
-    /// nothing redrawn. So over two seconds of frames at the render floor, the
-    /// great majority of card-frames have to be held rather than drawn. The
-    /// numbers are a band and not a fixed count, because what is being pinned
-    /// is that the quantiser is load-bearing, not what a particular period
-    /// divides to.
+    /// nothing redrawn. So over two seconds of frames at the render floor, most
+    /// card-frames have to be held rather than drawn. The numbers are a band and
+    /// not a fixed count, because what is being pinned is that the quantiser is
+    /// load-bearing, not what a particular period divides to.
+    ///
+    /// The band was re-derived when the ladder went from twelve steps to
+    /// forty-eight: a finer ladder deliberately holds fewer frames, so a bound
+    /// fitted to the old dial would fail on the new one for the intended reason
+    /// rather than the guarded one. What has to stay true is that a *majority*
+    /// of card-frames are still carried forward — measured at 38% redrawn.
     #[test]
     fn a_breathing_tree_holds_most_of_its_artwork_between_frames() {
         let (mut app, now) = breathing_fleet();
@@ -7075,9 +7136,136 @@ mod cards_breathe_and_wash {
         );
         let share = redrawn as f32 / card_frames as f32;
         assert!(
-            share < 0.35,
+            share < 0.5,
             "{redrawn} of {card_frames} card-frames were rasterised ({:.0}%). The              breath is being drawn at the loop's rate rather than at its own              quantised step, which is exactly the frame-time tail this ladder              exists to keep off.",
             share * 100.0
+        );
+    }
+
+    /// **The snap the captain asked for reaches the pixels.**
+    ///
+    /// *"a 10% overshoot that kinda pendulums snaps back into place"* —
+    /// [`crate::anim::Curve::SnapPendulum`] carries past its target by design
+    /// and [`crate::anim::behaviour::Behaviour::strength`] hands that over
+    /// intact. The card path used to clamp it away twice, in [`quantize`] and
+    /// in [`CardLight::breathed`], so the overshoot existed in the engine and
+    /// never once in the artwork.
+    ///
+    /// Asserted on the *drawn ink* and not on the envelope, because a number
+    /// that survives quantisation and is then flattened on the way to the
+    /// colour has still not reached the screen: a card at the top of its snap
+    /// has to be measurably further back than the same card at a full breath.
+    #[test]
+    fn the_snaps_overshoot_survives_the_ladder_and_reaches_the_ink() {
+        let (mut app, now) = breathing_fleet();
+        if card_in(&app, AgentState::Working).is_none() {
+            return;
+        }
+        let mut peak_breath = f32::MIN;
+        let mut deepest_bloom = f32::MAX;
+        // Four live cycles at a step far finer than the ladder, so what is
+        // being walked is the curve rather than the sampling.
+        for step in 0..=2_000u64 {
+            app.anim.advance(now + Duration::from_millis(step * 5));
+            let Some(card) = card_in(&app, AgentState::Working) else {
+                return;
+            };
+            peak_breath = peak_breath.max(card.breath);
+            deepest_bloom = deepest_bloom.min(card.arrived_light().bloom);
+        }
+        assert!(
+            peak_breath > 1.0,
+            "the working card's envelope peaked at {peak_breath:.4}, so the snap's \
+             overshoot is still being clamped away before it is drawn"
+        );
+        // The whole of the specified overshoot, not a rounded-down remnant. One
+        // rung of the ladder is the tolerance, because the ladder is the only
+        // thing between the curve and this number.
+        let rung = 1.0 / CARD_BREATH_STEPS;
+        assert!(
+            peak_breath >= 1.10 - rung,
+            "the envelope reached {peak_breath:.4}, short of the stated ten per \
+             cent overshoot by more than the ladder's own rung of {rung:.4}"
+        );
+        // And it is visible: a full breath sets the bloom back by
+        // `BREATH_BLOOM_DIP`, so an overshoot has to set it back further still.
+        let Some(card) = card_in(&app, AgentState::Working) else {
+            return;
+        };
+        let at_full_breath = card.settled_light().bloom * (1.0 - BREATH_BLOOM_DIP);
+        assert!(
+            deepest_bloom < at_full_breath,
+            "the card's bloom bottomed out at {deepest_bloom:.4}, which is no \
+             deeper than the {at_full_breath:.4} a full breath alone reaches — \
+             the overshoot is in the envelope but not in the ink"
+        );
+    }
+
+    /// **A working card never stops moving in the middle of its snap.**
+    ///
+    /// The failure this pins is not slowness, it is a *stall*: with the
+    /// overshoot clamped, every part of the curve above the cap resolved to one
+    /// rung, so a card held a single unchanged picture for 312 ms of every
+    /// 2,400 ms cycle — dead still at exactly the moment it was supposed to
+    /// snap. Both fixes bear on it, the clamp far more than the ladder.
+    ///
+    /// The bound is stated against the cycle rather than in bare milliseconds,
+    /// so it keeps its meaning if the live period is ever retuned: no single
+    /// picture may be held for more than a tenth of one breath. A card at the
+    /// smooth peak of a *resting* breath legitimately dwells — that is a
+    /// stationary point of a sine, not a stall — which is why this asks the
+    /// snapping behaviour and not the drifting one.
+    #[test]
+    fn a_working_card_holds_no_picture_for_a_tenth_of_its_own_cycle() {
+        let (mut app, now) = breathing_fleet();
+        let Some(first) = card_in(&app, AgentState::Working) else {
+            return;
+        };
+        const SAMPLE_MS: u64 = 5;
+        // Asked of the catalogue rather than restated here, so retuning the
+        // live breath's period moves the bound with it.
+        let Some(cycle_ms) = app
+            .anim
+            .catalogue()
+            .get(crate::anim::behaviour::names::CARD_LIVE)
+            .map(|behaviour| behaviour.period.as_millis() as u64)
+        else {
+            return;
+        };
+        let budget_ms = cycle_ms / 10;
+
+        let mut held = first.breath;
+        let mut held_since = 0u64;
+        let mut worst = (0u64, 0u64, held);
+        for step in 1..=2_000u64 {
+            let at = step * SAMPLE_MS;
+            app.anim.advance(now + Duration::from_millis(at));
+            let Some(card) = card_in(&app, AgentState::Working) else {
+                return;
+            };
+            if (card.breath - held).abs() <= f32::EPSILON {
+                continue;
+            }
+            let dwell = at - held_since;
+            if dwell > worst.1 {
+                worst = (held_since, dwell, held);
+            }
+            held = card.breath;
+            held_since = at;
+        }
+        assert!(
+            worst.1 > 0,
+            "the working card never changed its picture at all, so this is \
+             measuring a still panel rather than a breath"
+        );
+        assert!(
+            worst.1 <= budget_ms,
+            "a working card held one unchanged picture for {} ms — more than the \
+             {budget_ms} ms tenth of its own {cycle_ms} ms cycle — starting at \
+             {} ms, frozen at envelope {:.4}",
+            worst.1,
+            worst.0,
+            worst.2
         );
     }
 
