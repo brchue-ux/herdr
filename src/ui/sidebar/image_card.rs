@@ -124,9 +124,84 @@ const TIDBIT_GAP: f32 = 0.35;
 /// is a 34-column sidebar.
 pub(crate) const MIN_FOLD_WIDTH: u16 = super::card::MIN_FOLD_WIDTH;
 
-/// A card's own bloom reaches this far past its stroke, as a fraction of the
-/// card's height — measured dead by 26–28 px on a 61 px card.
-const BLOOM_REACH: f32 = 0.45;
+/// The smallest amount [`lay_bloom`] will paint.
+///
+/// Below this a bloom pixel cannot move an 8-bit channel: the peak amount is
+/// [`measured::BLOOM_PEAK`] = 0.19 and it carries about +33 levels over the
+/// canvas, so 0.002 is roughly a third of one level. It is also the number
+/// [`BLOOM_REACH_SIGMAS`] is derived from — see there.
+const BLOOM_PAINT_FLOOR: f32 = 0.002;
+
+/// A card's bloom is carried this many sigmas past its stroke, and truncated
+/// there.
+///
+/// # Why a count of sigmas, and not a fraction of the card's height
+///
+/// This was `BLOOM_REACH = 0.45`, a fraction of the card's *drawn* height,
+/// while the sigma it truncates is a fraction of the tier's *nominal* height.
+/// Those are not the same number, and their ratio is different on every tier —
+/// a top-tier card is drawn at its nominal 68 px, a mate's content pushes it to
+/// 1.52× its nominal, a worker's to 1.85×. So one constant produced three
+/// different truncations, measured on the real layers:
+///
+/// ```text
+///   tier        drawn/nominal   cut lands at   value there   last painted alpha
+///   top tier         1.00          2.37 σ        15.1% of peak        7/255
+///   mate             1.52          3.60 σ         4.8% of peak        3/255
+///   worker           1.85          2.84 σ         9.3% of peak        5/255
+/// ```
+///
+/// `lay_bloom`'s `profile.get(..)` returns `None` past the reach, so the glow
+/// **stops dead** rather than fading — a cut at 15% of peak is a visible hard
+/// rim, and it was worst on the biggest, most-looked-at card. That is what the
+/// captain's *"still needs to retain quality and crispness"* is about, and it is
+/// a separate defect from the bleed: shrinking this constant does not darken the
+/// gutter at all, it only moves the hard edge closer in.
+///
+/// # How 3.7 was derived
+///
+/// Not fitted to a picture — read off the renderer's own paint floor.
+/// [`lay_bloom`] already declines to paint an amount at or under
+/// [`BLOOM_PAINT_FLOOR`], and the card's bloom multiplier never exceeds 1.0, so
+/// the distance at which the profile falls under that floor is the distance past
+/// which truncating can remove nothing that would have been drawn. Both the
+/// floor and [`measured::BLOOM_PEAK`] are absolute, so that distance is a
+/// property of the profile's *shape* alone: the same number of sigmas on every
+/// tier, at every cell size, on every card. For the two-lobe field this draws it
+/// is **3.64 σ**; 3.7 rounds up so the cut sits under the floor rather than on
+/// it.
+///
+/// The consequence is that the truncation is no longer visible by construction
+/// rather than by measurement — the profile has already stopped painting before
+/// the reach cuts it — and `card_glow_falls_to_nothing_before_it_is_cut` holds
+/// it there if any of the shape constants move.
+const BLOOM_REACH_SIGMAS: f32 = 3.7;
+
+/// The narrowest a bloom's near lobe is ever drawn, in pixels.
+///
+/// A sigma under a pixel or two is not a gradient, it is a stroke with a fringe.
+const BLOOM_SIGMA_MIN_PX: f32 = 1.6;
+
+/// The height a card at `depth` gets *as a tier*, before its content pushes it
+/// taller.
+///
+/// Every ratio in the measured table is a fraction of this and not of the drawn
+/// height — see [`CardGeometry::new`]. Named because the bloom needs it in two
+/// places that must agree exactly: the field [`lay_bloom`] paints, and the image
+/// [`card_image_rect`] sizes to hold it.
+fn nominal_height_px(depth: u8, cell_height: f32) -> f32 {
+    (BASE_HEIGHT_PX * tier(depth)).max(cell_height)
+}
+
+/// The sigma of the near lobe of a card's bloom, in pixels.
+fn bloom_sigma_px(depth: u8, cell_height: f32) -> f32 {
+    (measured::BLOOM_SIGMA * nominal_height_px(depth, cell_height)).max(BLOOM_SIGMA_MIN_PX)
+}
+
+/// How far a card's bloom is carried past its stroke, in pixels.
+fn bloom_reach_px(depth: u8, cell_height: f32) -> f32 {
+    bloom_sigma_px(depth, cell_height) * BLOOM_REACH_SIGMAS
+}
 
 /// Where across a column the tree's rails put their ink.
 ///
@@ -983,7 +1058,7 @@ impl CardGeometry {
     /// thing that does. The slot keeps its measured size for the day something
     /// goes in it and is worth nothing until then.
     fn new(depth: u8, cell_height: f32, has_mark: bool) -> Self {
-        let nominal = (BASE_HEIGHT_PX * tier(depth)).max(cell_height);
+        let nominal = nominal_height_px(depth, cell_height);
         Self {
             radius: (measured::RADIUS * nominal).max(2.0),
             stroke: (measured::STROKE_W * nominal).max(1.2),
@@ -1000,7 +1075,7 @@ impl CardGeometry {
             } else {
                 0.0
             },
-            bloom_sigma: (measured::BLOOM_SIGMA * nominal).max(1.6),
+            bloom_sigma: bloom_sigma_px(depth, cell_height),
         }
     }
 
@@ -1147,8 +1222,11 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
         return;
     }
     let rect = card.rect;
-    let reach = rect.h * BLOOM_REACH;
     let near_sigma = card.geometry.bloom_sigma;
+    // The reach truncates the field, so it is measured in the field's own units.
+    // Against the card's drawn height instead — which is what it used to be — the
+    // cut lands at a different brightness on every tier. See [`BLOOM_REACH_SIGMAS`].
+    let reach = near_sigma * BLOOM_REACH_SIGMAS;
     let far_sigma = near_sigma * measured::BLOOM_FAR_SIGMA_MUL;
 
     let x0 = (rect.x - reach).floor().max(0.0) as u32;
@@ -1197,7 +1275,7 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
             };
             let (color, bloom_mul) = columns[column];
             let amount = *amount * bloom_mul;
-            if amount > 0.002 {
+            if amount > BLOOM_PAINT_FLOOR {
                 bloom.lighten(x, y, color, amount);
             }
         }
@@ -2057,14 +2135,8 @@ fn build_cards_inner(
         .iter()
         .map(|(frame, content)| (content.depth, *frame))
         .collect();
-    let field_rect = dissolve_field_rect(
-        &extents,
-        (cell_w, cell_h),
-        (title_metrics, tidbit_metrics),
-        bounds,
-        bloom_floor,
-    )
-    .ok_or(())?;
+    let field_rect =
+        dissolve_field_rect(&extents, (cell_w, cell_h), bounds, bloom_floor).ok_or(())?;
 
     let rasteriser = Rasteriser {
         font,
@@ -2121,24 +2193,25 @@ fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f3
 /// The cells one card's own image covers: its frame plus the reach of its own
 /// bloom, clamped into the panel.
 ///
-/// Its *own* bloom and not the tree's largest, because the reach is a fraction
-/// of the card's drawn height (see [`lay_bloom`]) and a worker's card is two
-/// thirds of a mate's. Giving every card the top tier's margin would make every
-/// smaller card's image bigger than it needs to be, and the margin is
-/// transparent padding that still has to be encoded and uploaded.
+/// Its *own* bloom and not the tree's largest, because the reach scales with the
+/// card's tier (see [`bloom_reach_px`]) and a worker's card is two thirds of a
+/// mate's. Giving every card the top tier's margin would make every smaller
+/// card's image bigger than it needs to be, and the margin is transparent
+/// padding that still has to be encoded and uploaded.
+///
+/// The margin is the tier's own [`bloom_reach_px`] and not a fraction of the
+/// height the card is *drawn* at, because that is the reach [`lay_bloom`] paints
+/// to. The two used to be spelled differently and a card whose content pushed it
+/// past its tier carried transparent padding it never lit.
 fn card_image_rect(
     depth: u8,
     frame: Rect,
     cell: (f32, f32),
-    metrics: (FontMetrics, FontMetrics),
     bounds: Rect,
     bloom_floor: u16,
 ) -> Option<Rect> {
     let (cell_w, cell_h) = cell;
-    let (title_metrics, tidbit_metrics) = metrics;
-    let drawn =
-        tier_height_px(depth, title_metrics, tidbit_metrics).min(f32::from(frame.height) * cell_h);
-    let reach = drawn * BLOOM_REACH;
+    let reach = bloom_reach_px(depth, cell_h);
     clamp_bloomed(
         frame,
         (reach / cell_w).ceil() as u16,
@@ -2162,15 +2235,12 @@ fn card_image_rect(
 fn dissolve_field_rect(
     cards: &[(u8, Rect)],
     cell: (f32, f32),
-    metrics: (FontMetrics, FontMetrics),
     bounds: Rect,
     bloom_floor: u16,
 ) -> Option<Rect> {
     cards
         .iter()
-        .filter_map(|(depth, frame)| {
-            card_image_rect(*depth, *frame, cell, metrics, bounds, bloom_floor)
-        })
+        .filter_map(|(depth, frame)| card_image_rect(*depth, *frame, cell, bounds, bloom_floor))
         .reduce(|field, rect| field.union(rect))
         .filter(|field| field.width > 0 && field.height > 0)
 }
@@ -2735,7 +2805,6 @@ impl Rasteriser<'_> {
             content.depth,
             frame,
             (self.cell_w, self.cell_h),
-            (self.title_metrics, self.tidbit_metrics),
             self.bounds,
             self.bloom_floor,
         )
@@ -3711,10 +3780,10 @@ mod tests {
             (2u8, Rect::new(5, 16, 34, 5)),
         ];
 
-        let field = dissolve_field_rect(&cards, cell, (title, tidbit), bounds, bloom_floor)
+        let field = dissolve_field_rect(&cards, cell, bounds, bloom_floor)
             .expect("a tree of three cards has a field");
         for (depth, frame) in cards {
-            let rect = card_image_rect(depth, frame, cell, (title, tidbit), bounds, bloom_floor)
+            let rect = card_image_rect(depth, frame, cell, bounds, bloom_floor)
                 .expect("a card with a frame has an image");
             assert_eq!(
                 field.union(rect),
@@ -4837,6 +4906,20 @@ mod a_card_is_its_own_shape {
         }
     }
 
+    /// The depth of every drawn card, in the order [`built`] publishes them.
+    fn depthed(app: &AppState) -> Vec<u8> {
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        let entries = super::super::workspace_list_entries(app);
+        let agents = super::super::sidebar_agent_entries(app);
+        cards
+            .iter()
+            .filter(|card| card.card_frame.is_some_and(|f| f.width > 0 && f.height > 0))
+            .filter_map(|card| entries.get(card.entry_idx))
+            .filter_map(|entry| content_for(app, entry, &agents))
+            .map(|content| content.depth)
+            .collect()
+    }
+
     /// The rows that carry a card, which is what a published layer answers to.
     fn framed(app: &AppState) -> Vec<Rect> {
         super::super::compute_workspace_card_areas(app, sidebar_rect())
@@ -4979,17 +5062,20 @@ mod a_card_is_its_own_shape {
         let cell_w = f32::from(app.host_cell_size.width_px as u16);
         let cell_h = f32::from(app.host_cell_size.height_px as u16);
 
+        let depths = depthed(&app);
         let mut checked = 0;
-        for (layer, frame) in layers.iter().zip(&frames) {
+        for ((layer, frame), depth) in layers.iter().zip(&frames).zip(depths) {
             let (width, height, px) = decode(layer);
             // The card's own box inside this image, from the row's frame.
             let left = f32::from(frame.x.saturating_sub(layer.rect.x)) * cell_w;
             let top = f32::from(frame.y.saturating_sub(layer.rect.y)) * cell_h;
             let box_w = f32::from(frame.width) * cell_w;
             let box_h = f32::from(frame.height) * cell_h;
-            // Every card's glow reaches at most `BLOOM_REACH` of the tallest a
-            // card is ever drawn, plus a pixel for the antialiasing ramp.
-            let reach = box_h * BLOOM_REACH + 1.0;
+            // Every card's glow reaches at most its own tier's bloom reach, plus
+            // a pixel for the antialiasing ramp. Its own tier and not the tree's
+            // largest: a bound taken off the biggest card would pass a worker
+            // that lit twice the ground it should.
+            let reach = bloom_reach_px(depth, cell_h) + 1.0;
 
             for y in 0..height {
                 for x in 0..width {
@@ -5010,6 +5096,207 @@ mod a_card_is_its_own_shape {
             }
         }
         assert!(checked > 0, "no shape drew anything to check");
+    }
+
+    /// The gutter between two cards is genuinely darker than the rim beside them.
+    ///
+    /// The captain, on the cards as they shipped: *"fade radius too wide"* — one
+    /// card's glow landing on the next. The cause was arithmetic rather than a
+    /// bug: [`measured::BLOOM_SIGMA`] at 0.19 h put a top-tier card's sigma at
+    /// 12.9 px while the gap between two cards is 10–16 px, so the glow's own
+    /// half-width *was* the gutter and the gap sat at 85–100% of the brightness
+    /// against a card's own stroke.
+    ///
+    /// Measured on the composited panel and not on the layers, because that is
+    /// where the question lives: two neighbours' halos are two separate graphics
+    /// placements and the terminal composites them source-over in linear light,
+    /// so the gutter carries *both*. A per-layer check would measure half of it
+    /// and pass on a panel that still bleeds.
+    ///
+    /// The threshold is a contract and not the measurement: this reads 51.6% at
+    /// the worst gutter in the fixture and the constants it replaced read 100%.
+    #[test]
+    fn a_card_glow_leaves_the_gutter_darker_than_the_rim() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let cell = app.host_cell_size;
+        let rect = sidebar_rect();
+        let (pw, ph) = (
+            u32::from(rect.width) * cell.width_px,
+            u32::from(rect.height) * cell.height_px,
+        );
+        let canvas = backdrop_rgb(&app);
+        let mut panel = vec![
+            [
+                srgb_to_linear(canvas.0),
+                srgb_to_linear(canvas.1),
+                srgb_to_linear(canvas.2)
+            ];
+            (pw * ph) as usize
+        ];
+        // Where each card's own ink sits on the panel, so the gutters between
+        // them can be found without asking the layout a second time.
+        let mut inks: Vec<(u32, u32)> = Vec::new();
+        for layer in &layers {
+            let (lw, lh, px) = decode(layer);
+            let ox = u32::from(layer.rect.x) * cell.width_px;
+            let oy = u32::from(layer.rect.y) * cell.height_px;
+            let cx = lw / 2;
+            let opaque: Vec<u32> = (0..lh)
+                .filter(|y| px[(((y * lw + cx) * 4) + 3) as usize] > 200)
+                .collect();
+            if let (Some(first), Some(last)) = (opaque.first(), opaque.last()) {
+                inks.push((oy + first, oy + last));
+            }
+            for y in 0..lh {
+                for x in 0..lw {
+                    let (px_, py) = (ox + x, oy + y);
+                    if px_ >= pw || py >= ph {
+                        continue;
+                    }
+                    let s = ((y * lw + x) * 4) as usize;
+                    let a = f32::from(px[s + 3]) / 255.0;
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let dst = &mut panel[(py * pw + px_) as usize];
+                    for (k, d) in dst.iter_mut().enumerate() {
+                        *d = srgb_to_linear(px[s + k]) * a + *d * (1.0 - a);
+                    }
+                }
+            }
+        }
+        assert!(inks.len() > 2, "a gutter needs two cards either side of it");
+
+        // Luminance and not a channel excess: every card carries its own hue
+        // since the stage/severity split, so a cyan-excess reads *negative* on an
+        // amber card. "Does the gutter get dark" is a luminance question on every
+        // hue. Taken as the brightest the row gets anywhere across the panel,
+        // which is the honest floor.
+        let ground = luminance([
+            srgb_to_linear(canvas.0),
+            srgb_to_linear(canvas.1),
+            srgb_to_linear(canvas.2),
+        ]);
+        let row = |y: u32| {
+            (0..pw)
+                .map(|x| luminance(panel[(y * pw + x) as usize]))
+                .fold(f32::MIN, f32::max)
+        };
+        let mut checked = 0;
+        for pair in inks.windows(2) {
+            let (above, below) = (pair[0].1, pair[1].0);
+            if below <= above + 2 {
+                continue; // Cards that touch have no gutter to measure.
+            }
+            let rim = row(above + 1).max(row(below - 1));
+            let floor = (above + 1..below).map(row).fold(f32::MAX, f32::min);
+            let share = (floor - ground) / (rim - ground).max(f32::EPSILON);
+            assert!(
+                share < 0.60,
+                "the gutter in rows {}..{} sits at {:.1}% of the glow against the \
+                 card's own stroke — the glow's half-width is the whole gap and \
+                 one card's halo is landing on the next",
+                above + 1,
+                below - 1,
+                100.0 * share,
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no gutter was measured");
+    }
+
+    /// A card's glow fades out before it is truncated, rather than stopping dead.
+    ///
+    /// The other half of *"still needs to retain quality and crispness"*.
+    /// [`lay_bloom`] carries the field to [`BLOOM_REACH_SIGMAS`] and its
+    /// `profile.get(..)` returns `None` past it, so whatever the field is still
+    /// worth at that distance becomes a hard edge in open panel. It used to be
+    /// worth 15% of peak on a top-tier card — an outermost painted alpha of 7 —
+    /// and, because the reach was a fraction of the card's *drawn* height while
+    /// the sigma is a fraction of its tier's *nominal* height, a different amount
+    /// on every tier.
+    ///
+    /// The reach is now derived from [`BLOOM_PAINT_FLOOR`], so the profile has
+    /// already fallen under what `lay_bloom` will paint before the truncation
+    /// reaches it. This asserts the observable consequence: the outermost pixel a
+    /// card lights is the faintest one representable. It is the assertion that
+    /// goes red if any of the bloom's shape constants move without the reach
+    /// being re-derived with them.
+    #[test]
+    fn a_card_glow_falls_to_nothing_before_it_is_cut() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let mut checked = 0;
+        for layer in &layers {
+            let (w, h, px) = decode(layer);
+            let alpha = |x: u32, y: u32| px[((y * w + x) * 4 + 3) as usize];
+            // Out of the card in each direction, from the middle of the side it
+            // leaves — clear of the corners, where two falloffs overlap.
+            let (cx, cy) = (w / 2, h / 2);
+            let edges = [
+                (0..h).find(|y| alpha(cx, *y) > 0).map(|y| alpha(cx, y)),
+                (0..h)
+                    .rev()
+                    .find(|y| alpha(cx, *y) > 0)
+                    .map(|y| alpha(cx, y)),
+                (0..w).find(|x| alpha(*x, cy) > 0).map(|x| alpha(x, cy)),
+                (0..w)
+                    .rev()
+                    .find(|x| alpha(*x, cy) > 0)
+                    .map(|x| alpha(x, cy)),
+            ];
+            for (side, outermost) in edges.into_iter().enumerate() {
+                let Some(outermost) = outermost else {
+                    continue;
+                };
+                // A card clipped by the panel's own edge is cut by the clamp and
+                // not by the reach, which is a different question.
+                if is_clipped(layer, side) {
+                    continue;
+                }
+                assert!(
+                    outermost <= 2,
+                    "a card's glow was still worth alpha {outermost} where it was \
+                     truncated — that is a step in open panel, not a falloff. The \
+                     reach has to be re-derived whenever the bloom's sigma, its far \
+                     lobe or its weights move",
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no glow edge was checked");
+    }
+
+    /// Whether this layer runs into the panel's own boundary on `side`, in the
+    /// order [`a_card_glow_falls_to_nothing_before_it_is_cut`] scans them.
+    fn is_clipped(layer: &SidebarCardLayer, side: usize) -> bool {
+        let bounds = super::super::sidebar_content_rect(sidebar_rect());
+        let r = layer.rect;
+        match side {
+            0 => r.y <= bounds.y,
+            1 => r.y + r.height >= bounds.y + bounds.height,
+            2 => r.x <= bounds.x,
+            _ => r.x + r.width >= bounds.x + bounds.width,
+        }
+    }
+
+    /// sRGB byte to linear light, which is where the terminal composites.
+    fn srgb_to_linear(c: u8) -> f32 {
+        let s = f32::from(c) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance([r, g, b]: [f32; 3]) -> f32 {
+        0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
     /// Alpha at the four corners of the cells one card owns.
@@ -7442,3 +7729,11 @@ mod cards_breathe_and_wash {
         );
     }
 }
+// Throwaway measurement probes written for herdr-glow-cause-scout.
+// Append verbatim to the END of src/ui/sidebar/image_card.rs on fork/master
+// (measured at aeb46d50) and run with:
+//   cargo test --bin herdr glow_probe -- --nocapture --test-threads=1
+//   cargo test --release --bin herdr probe_i_cost -- --nocapture
+// They reuse the crate's own test fixtures (tests::pixel_fleet_app, 42-column
+// sidebar_rect, 10x21 px cell) and the real build_cards() path, so what they
+// measure is the actual PNG bytes the server puts on the wire.

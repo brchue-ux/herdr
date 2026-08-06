@@ -73,9 +73,40 @@ pub(super) const FILL_INNER_SIGMA: f32 = 0.09;
 /// Peak outward excess as a fraction of the stroke's own excess over canvas:
 /// +33 lum immediately outside the stroke where the stroke's excess is 173.
 pub(super) const BLOOM_PEAK: f32 = 0.19;
-/// Gaussian sigma of the bloom, as a fraction of `h` — 11.5 px on a 61 px card,
-/// reading zero by 26–28 px.
-pub(super) const BLOOM_SIGMA: f32 = 0.19;
+/// Gaussian sigma of the bloom's near lobe, as a fraction of the tier's
+/// **nominal** height — not the height the card is drawn at. See
+/// [`super::CardGeometry::new`] for why every ratio in this table is against the
+/// nominal, and [`super::BLOOM_REACH_SIGMAS`] for what went wrong when one
+/// constant was not.
+///
+/// # Why this is 0.07 and not the sampled 0.19
+///
+/// 0.19 h is what the reference was measured at, and on a card standing alone it
+/// is right. In a tree it is not. At 0.19 h a top-tier card's sigma is **12.9
+/// px** while the gap between two cards is **10–16 px**, so the glow's own
+/// half-width *is* the gutter — and a gaussian has barely begun to decay inside
+/// one sigma. Measured by compositing the real card layers the way the terminal
+/// does, the gutter between two cards sat at a mean **84.9%** of the brightness
+/// right against a card's own stroke, worst case **100%**: across the whole gap
+/// there was no falloff at all. That is what reads as one card's glow bleeding
+/// onto the next.
+///
+/// Nothing but the sigma moves that number. Not [`super::BLOOM_REACH_SIGMAS`],
+/// which truncates a tail that is already dim; not [`BLOOM_FAR_WEIGHT`], which
+/// governs how far past the neighbour the tail carries rather than how bright
+/// the gap is. Both were measured and both leave an 11 px gutter within two
+/// points of where they found it. At 0.07 h the same nine gutters measure a mean
+/// **39.5%**, worst **51.6%**.
+///
+/// The captain chose this over widening `row_gap`, which was the other lever on
+/// the menu and would have cost a card per four rows: *"narrower glow. still
+/// needs to retain quality and crispness."* Card density is untouched.
+///
+/// [`BLOOM_PEAK`] is deliberately **not** touched, so the rim immediately
+/// outside a card's stroke is exactly as bright as it was sampled. What changed
+/// is how far the glow carries, not how strong it starts — which is the half of
+/// his sentence about quality.
+pub(super) const BLOOM_SIGMA: f32 = 0.07;
 /// The bloom is *more saturated* than the stroke: its excess is (8,40,39) where
 /// the stroke's R/G is 0.52.
 ///
@@ -93,7 +124,12 @@ pub(super) const BLOOM_LUM_MUL: f32 = 0.78;
 /// the tail and one fitted to the tail undershoots the peak.
 pub(super) const BLOOM_NEAR_WEIGHT: f32 = 0.82;
 pub(super) const BLOOM_FAR_WEIGHT: f32 = 0.18;
-pub(super) const BLOOM_FAR_SIGMA_MUL: f32 = 2.2;
+/// Narrowed with [`BLOOM_SIGMA`], and for the same reason: the far lobe carries
+/// the tail, and at 2.2× it put 18% of the peak more than five sigmas out —
+/// which at the tree's spacing is another card. It still does the job it was
+/// added for (a single gaussian cannot fit both the peak and the tail), it just
+/// no longer reaches the neighbour to do it.
+pub(super) const BLOOM_FAR_SIGMA_MUL: f32 = 1.5;
 
 /// Padding: 9 px on a 61 px card at left, top and bottom; 13 px at the right.
 pub(super) const PAD: f32 = 0.148;
