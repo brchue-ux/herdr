@@ -127,6 +127,41 @@ pub(crate) const MIN_FOLD_WIDTH: u16 = super::card::MIN_FOLD_WIDTH;
 /// card's height — measured dead by 26–28 px on a 61 px card.
 const BLOOM_REACH: f32 = 0.45;
 
+/// Where across a column the tree's rails put their ink.
+///
+/// # The bug this exists to fix
+///
+/// The captain, on his first look at the transparent cards: *"tree trunk not
+/// aligned with firstmate/workers. branches not aligned with secondmates."*
+///
+/// The tree's geometry is settled in characters — `tree_prefix_width` is the
+/// single place a prefix is measured, and a card's left border deliberately
+/// stands in its connector's own column so the two share it. Under the
+/// character shell that works, because the card's border is a `│` and a rail is
+/// a `│`: two glyphs in one column, and a font draws a box-drawing vertical
+/// down the **middle** of the cell it is in.
+///
+/// A pixel card's border is not a glyph. It is a stroke on a rounded rect whose
+/// left side is `frame.x`, and `frame.x` is a cell **boundary** — so the drawn
+/// border landed half a column left of every rail meant to continue it. Half a
+/// cell is small in columns and plainly visible in pixels, and it applies to
+/// every rail in the tree at once: the trunk under the first mate, and each
+/// branch under a second mate. One offset, both of his findings.
+///
+/// So the pixel card is moved onto the character geometry rather than the other
+/// way round. The characters cannot move — a glyph goes where the font puts it —
+/// and they remain the layout authority regardless, which is what makes this
+/// the side that gives.
+///
+/// # Why one half and not a measurement
+///
+/// Cell-centred is what a box-drawing vertical is *for*: `│`, `├` and `└` have
+/// to meet each other across rows in a grid that only knows whole cells, so the
+/// stem is centred by construction rather than by any one font's taste. Herdr
+/// cannot query the host's glyph outlines in any case, and a half-column error
+/// is exactly the error being removed here.
+const RAIL_INK_COLUMN_FRACTION: f32 = 0.5;
+
 /// One finished image and the cells it covers — one card's shape, or the whole
 /// tree's sheet.
 ///
@@ -1988,11 +2023,19 @@ impl Rasteriser<'_> {
         let cell_height = f32::from(frame.height) * self.cell_h;
         let wanted =
             tier_height_px(content.depth, self.title_metrics, self.tidbit_metrics).min(cell_height);
+        // The left border stands where the tree's rails have their ink, not
+        // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
+        let left =
+            (f32::from(frame.x.saturating_sub(rect.x)) + RAIL_INK_COLUMN_FRACTION) * self.cell_w;
         PlacedCard {
             rect: RoundRect {
-                x: f32::from(frame.x.saturating_sub(rect.x)) * self.cell_w,
+                x: left,
                 y: cell_top + (cell_height - wanted) / 2.0,
-                w: f32::from(frame.width) * self.cell_w,
+                // The right edge does not move: nothing in the tree is drawn
+                // against it, so pulling the left one in is what aligns the card
+                // rather than sliding the whole box off the columns the layout
+                // gave it.
+                w: (f32::from(frame.width) - RAIL_INK_COLUMN_FRACTION) * self.cell_w,
                 h: wanted,
                 r: geometry.radius,
             },
@@ -3992,6 +4035,82 @@ mod a_card_is_its_own_shape {
             Some(1),
             "the sheet stopped being one image for the whole tree"
         );
+    }
+
+    /// **The card's left border stands where the tree's rails have their ink.**
+    ///
+    /// The captain's two structural findings on the shapes path — *"tree trunk
+    /// not aligned with firstmate/workers. branches not aligned with
+    /// secondmates"* — are one offset seen twice. A rail is a box-drawing glyph
+    /// and a font draws those down the middle of a cell; the card's border was a
+    /// stroke on `frame.x`, which is a cell boundary. Half a column apart, at
+    /// every level of the tree at once.
+    ///
+    /// Measured in the published pixels rather than off [`Rasteriser::place`],
+    /// because the thing that was wrong was where the ink landed. The two
+    /// candidate positions are half a cell apart — five pixels on this fixture's
+    /// 10 px cell — so the tolerance here tells them apart and would fail the
+    /// old geometry.
+    #[test]
+    fn a_cards_left_border_stands_in_the_middle_of_its_column_where_the_rails_do() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let frames = framed(&app);
+        assert_eq!(layers.len(), frames.len());
+        let cell_w = f32::from(u16::try_from(app.host_cell_size.width_px).expect("a sane cell"));
+
+        let mut checked = 0;
+        for (layer, frame) in layers.iter().zip(&frames) {
+            let (width_px, height_px, rgba) = decode(layer);
+            // The card's own band, away from the rounded corners and from the
+            // bloom that gathers under it.
+            let y = height_px / 2;
+            let row = |x: u32| rgba[((y * width_px + x) * 4 + 3) as usize];
+            let Some(first_lit) = (0..width_px).find(|x| row(*x) > 200) else {
+                continue;
+            };
+
+            let column_left = f32::from(frame.x.saturating_sub(layer.rect.x)) * cell_w;
+            let rail_ink = column_left + RAIL_INK_COLUMN_FRACTION * cell_w;
+            let measured = first_lit as f32;
+            assert!(
+                (measured - rail_ink).abs() <= 2.0,
+                "a card at column {} put its border at {measured} px, not at the {rail_ink} px \
+                 its column's rails are drawn down",
+                frame.x
+            );
+            assert!(
+                (measured - column_left).abs() > 2.0,
+                "the border is still on the cell boundary at {column_left} px, half a column \
+                 left of every rail meant to continue it"
+            );
+            checked += 1;
+        }
+        assert!(checked > 1, "no card was actually measured");
+    }
+
+    /// The right edge did not move with it. Nothing in the tree is drawn against
+    /// a card's right edge, so pulling the left one in is what aligns the card —
+    /// sliding the whole box would take it off the columns the layout gave it
+    /// and into the scrollbar's.
+    #[test]
+    fn aligning_the_left_border_did_not_push_the_card_past_its_own_columns() {
+        let app = shape_fleet_app();
+        let Some(layers) = built(&app) else {
+            return;
+        };
+        for (layer, frame) in layers.iter().zip(&framed(&app)) {
+            assert!(
+                layer.rect.x + layer.rect.width >= frame.x + frame.width,
+                "a card's image no longer covers the columns its row was given"
+            );
+            assert!(
+                layer.rect.x + layer.rect.width <= sidebar_rect().width,
+                "a card reached past the panel"
+            );
+        }
     }
 
     /// Nothing is lit outside the card's own outline and the reach of its glow.

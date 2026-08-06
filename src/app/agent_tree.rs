@@ -330,7 +330,13 @@ pub(crate) fn arrange_agent_tree(entries: &mut Vec<AgentPanelEntry>) {
 /// carry one, so a structural edge is resolved without ever entering the name
 /// namespace — but it joins the same cycle scan below, so it degrades to a root
 /// on a loop exactly as a published edge does.
-fn resolve_parents(nodes: &[OwnedNode<'_>]) -> Vec<Option<usize>> {
+///
+/// Exposed because a caller composing the node list sometimes has to know the
+/// shape it is about to get *before* the walk runs — the Spaces tree resolves
+/// which of its Spaces are first mates and which are second mates so it can
+/// decide where a first-mate-opened worker hangs, and asking here is what keeps
+/// that answer the same one [`arrange_owner_tree`] will reach.
+pub(crate) fn resolve_parents(nodes: &[OwnedNode<'_>]) -> Vec<Option<usize>> {
     let mut by_name: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (idx, node) in nodes.iter().enumerate() {
         if let Some(name) = node.name {
