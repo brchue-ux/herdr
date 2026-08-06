@@ -472,6 +472,9 @@ impl App {
         let tree = has_viewers && self.state.sidebar_animation_active();
         let signals = has_viewers && self.state.fleet_signal_animation_active();
         let badges = has_viewers && self.state.signal_tray_animation_active();
+        let washes = has_viewers
+            && self.state.sidebar_cards.wash
+            && self.state.sidebar_card_animation_active();
         // The view switch is gated on neither: a re-root *is* the behaviour
         // rather than a decoration on a row, and one already in flight has to
         // be able to finish even when nothing else in the panel is animating.
@@ -480,7 +483,13 @@ impl App {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
-            return forgotten || remembered;
+            // The card states go with the elements. Keeping them across a host
+            // that has stopped drawing would make the first frame back wash
+            // every card whose state moved while nobody was looking, and
+            // animating history is exactly what `Animator::forget_all` exists
+            // to prevent.
+            let washed = self.state.sidebar_card_washes.forget_all();
+            return forgotten || remembered || washed;
         }
 
         // Adopting a due root comes first, because it is what decides which
@@ -516,7 +525,7 @@ impl App {
             self.state
                 .anim
                 .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
-        let agents_changed = self.observe_agent_rows(now, &lifecycle, tree);
+        let agents_changed = self.observe_agent_rows(now, &lifecycle, tree, washes);
 
         let signal_lifecycle = self.state.sidebar_notifications.lifecycle();
         let signal_members: Members = if signals {
@@ -590,12 +599,14 @@ impl App {
         now: Instant,
         lifecycle: &crate::anim::Lifecycle,
         tree: bool,
+        washes: bool,
     ) -> bool {
         let live = if tree {
             crate::ui::sidebar_agent_live_entries(&self.state)
         } else {
             Vec::new()
         };
+        let washes_changed = self.observe_card_washes(now, &live, washes);
         let rows: Vec<_> = live
             .iter()
             .map(|entry| {
@@ -614,14 +625,66 @@ impl App {
         if lifecycle.dismount.is_none() || !tree {
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
-            return changed || remembered;
+            return changed || remembered || washes_changed;
         }
         // Observed first, so a row that has just left is already dismounting and
         // survives this refresh; one whose exit finished is not, and is dropped.
         let drawn = crate::ui::rows_with_departing(&self.state, live);
         let moved = drawn.len() != self.state.sidebar_tree_row_memory.len();
         self.state.sidebar_tree_row_memory = drawn;
-        changed || moved
+        changed || moved || washes_changed
+    }
+
+    /// Publish the state washes crossing the tree's cards right now.
+    ///
+    /// Reads the same live entries the rows were published from rather than
+    /// gathering its own, because the two must agree about which cards exist: a
+    /// wash on a row the tree is not drawing is a sweep nobody sees, and one
+    /// missing from a row it *is* drawing is a state change that arrives with
+    /// no announcement.
+    ///
+    /// Space cards are folded in beside the agent rows because the tree draws
+    /// both as cards — a first mate's card changes state exactly as a worker's
+    /// does, and a Space's state is the aggregate its own row already shows.
+    ///
+    /// `live_washes` is false when the wash is switched off or the pixel path is
+    /// not drawing cards. The family is still published, as an empty set, for
+    /// the reason the comment above `Members` gives: a family that is not being
+    /// animated should say so rather than go unmentioned, so turning the wash
+    /// off retires exactly its elements and touches nothing else.
+    fn observe_card_washes(
+        &mut self,
+        now: Instant,
+        live: &[crate::ui::sidebar::AgentPanelEntry],
+        live_washes: bool,
+    ) -> bool {
+        let members = if live_washes {
+            let cards: Vec<_> = self
+                .state
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        crate::anim::CardRow::Space(workspace.id.clone()),
+                        workspace.aggregate_state(&self.state.terminals).0,
+                    )
+                })
+                .chain(
+                    live.iter()
+                        .map(|entry| (crate::anim::CardRow::Agent(entry.pane_id), entry.state)),
+                )
+                .collect();
+            let window = self.state.sidebar_cards.wash_duration();
+            self.state.sidebar_card_washes.observe(now, window, cards)
+        } else {
+            self.state.sidebar_card_washes.forget_all();
+            Vec::new()
+        };
+        let lifecycle =
+            crate::app::card_wash::CardWashes::lifecycle(self.state.sidebar_cards.wash_duration());
+        self.state
+            .anim
+            .observe(now, crate::anim::Family::CardWash, &lifecycle, members)
     }
 
     /// Fold the fleet's current state into the notification tray.
@@ -1601,6 +1664,133 @@ mod tests {
         };
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 40);
         app
+    }
+
+    /// A fleet whose cards are drawn as pixels, so the card animations have
+    /// something to happen to.
+    fn card_app() -> super::super::App {
+        let (mut app, _) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.sidebar_card_shapes = true;
+        app.state.kitty_graphics_enabled = true;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 40, 40);
+        app
+    }
+
+    fn set_first_pane_state(app: &mut super::super::App, state: crate::detect::AgentState) {
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+            terminal.state = state;
+        }
+    }
+
+    fn live_washes(app: &super::super::App) -> usize {
+        app.state
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                app.state
+                    .sidebar_card_washes
+                    .live(&crate::anim::CardRow::Space(workspace.id.clone()))
+                    .is_some()
+            })
+            .count()
+    }
+
+    /// The whole plumbing, through the loop the app really runs: a card's state
+    /// moves, one wash mounts in its own family, it plays, and it retires when
+    /// its window closes.
+    ///
+    /// The families are checked to coexist for the same reason the tray's are.
+    /// A wash published as `Family::AgentRow` or `Family::WorkspaceRow` would be
+    /// swept by the row reconciliation it shares a pass with; published as
+    /// `Named` the fleet signal bar would retire it mid-sweep.
+    #[test]
+    fn a_state_change_mounts_one_wash_and_it_retires_when_its_window_closes() {
+        let mut app = card_app();
+        if !app.state.sidebar_card_animation_active() {
+            // No proportional face on this machine: nothing draws pixel cards,
+            // so nothing publishes their animation either. The same skip every
+            // other pixel-card test takes.
+            return;
+        }
+        let now = Instant::now();
+        set_first_pane_state(&mut app, crate::detect::AgentState::Idle);
+        app.advance_animations(now, true);
+        assert_eq!(
+            live_washes(&app),
+            0,
+            "a card arriving is not a card changing"
+        );
+
+        set_first_pane_state(&mut app, crate::detect::AgentState::Working);
+        app.advance_animations(now, true);
+        assert_eq!(live_washes(&app), 1);
+
+        let window = app.state.sidebar_cards.wash_duration();
+        let id = crate::anim::ElementId::CardWash(
+            app.state
+                .sidebar_card_washes
+                .live(&crate::anim::CardRow::Space(
+                    app.state.workspaces[0].id.clone(),
+                ))
+                .expect("the wash is live"),
+        );
+        let frame = app
+            .state
+            .anim
+            .frame(&id, None)
+            .expect("the wash is tracked");
+        assert_eq!(frame.phase, crate::anim::Phase::Mount);
+        assert!(frame.behaviour.is_some(), "the sweep is playing nothing");
+
+        // Half way: still mounting, and further through than it was.
+        app.advance_animations(now + window / 2, true);
+        let mid = app
+            .state
+            .anim
+            .frame(&id, None)
+            .expect("the wash is still tracked")
+            .progress;
+        assert!(mid > 0.3 && mid < 0.9, "the sweep is at {mid:.3} half way");
+
+        // And past its window it is gone from both the memory and the engine.
+        app.advance_animations(now + window + Duration::from_millis(50), true);
+        assert_eq!(live_washes(&app), 0);
+        assert!(app.state.anim.frame(&id, None).is_none());
+    }
+
+    /// Turning the wash off retires exactly its elements and leaves the rows
+    /// alone, which is what publishing an empty set for a switched-off family
+    /// buys.
+    #[test]
+    fn switching_the_wash_off_retires_it_without_touching_the_rows() {
+        let mut app = card_app();
+        if !app.state.sidebar_card_animation_active() {
+            return;
+        }
+        let now = Instant::now();
+        set_first_pane_state(&mut app, crate::detect::AgentState::Idle);
+        app.advance_animations(now, true);
+        set_first_pane_state(&mut app, crate::detect::AgentState::Working);
+        app.advance_animations(now, true);
+        assert_eq!(live_washes(&app), 1);
+
+        app.state.sidebar_cards.wash = false;
+        app.advance_animations(now + Duration::from_millis(20), true);
+        assert_eq!(live_washes(&app), 0);
+        let row = crate::anim::ElementId::workspace_row(&app.state.workspaces[0].id);
+        assert!(
+            app.state.anim.frame(&row, None).is_some(),
+            "retiring the wash family took the workspace row with it"
+        );
     }
 
     /// The reason the badges are their own family.

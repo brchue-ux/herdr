@@ -97,9 +97,46 @@ pub(crate) enum ElementId {
     /// publishes all eight always, because rest is one of the three things a
     /// badge has to be able to say.
     TrayBadge(crate::app::fleet_signals::FleetSignal),
+    /// One card's state wash: the sweep that crosses a card when its state
+    /// changes, and leaves the card in the new state.
+    ///
+    /// Its own family, and for the same reason the tray badges have one: the
+    /// row families are reconciled against the rows that *exist*, and a wash is
+    /// not a row — it is one bounded event on a row that outlives it. Published
+    /// as [`Self::AgentRow`] it would fight the row's own life; published as
+    /// [`Self::Named`] the fleet signal bar's pass would retire it mid-sweep.
+    ///
+    /// The change it carries is part of its name rather than a payload, which
+    /// is what makes a second change *restart* the wash instead of being
+    /// absorbed by the one already running: a different change is a different
+    /// element, so the old one falls out of membership and retires while the
+    /// new one mounts. See [`Animator::admit`], which deliberately never
+    /// restarts an element that is still there.
+    CardWash(CardWash),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
+}
+
+/// One state change on one card: which card, and which way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CardWash {
+    pub(crate) row: CardRow,
+    /// The state the card is leaving, which is what it is still drawn in ahead
+    /// of the front.
+    pub(crate) from: crate::detect::AgentState,
+    /// The state it changed into, which is what the front leaves behind it.
+    pub(crate) into: crate::detect::AgentState,
+}
+
+/// Which row in the tree a card stands on.
+///
+/// Both kinds, because a mate is a Space and a worker is a pane and the tree
+/// draws them as the same card — so a state change on either is the same event.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum CardRow {
+    Agent(crate::layout::PaneId),
+    Space(String),
 }
 
 /// Which membership set an element belongs to.
@@ -110,6 +147,7 @@ pub(crate) enum Family {
     Terminal,
     TreeView,
     TrayBadge,
+    CardWash,
     Named,
 }
 
@@ -121,6 +159,7 @@ impl ElementId {
             Self::Terminal(_) => Family::Terminal,
             Self::TreeView => Family::TreeView,
             Self::TrayBadge(_) => Family::TrayBadge,
+            Self::CardWash(_) => Family::CardWash,
             Self::Named(_) => Family::Named,
         }
     }

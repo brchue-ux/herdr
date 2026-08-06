@@ -838,6 +838,83 @@ pub struct SidebarConfig {
     pub animation: SidebarAnimationConfig,
     pub notifications: SidebarNotificationsConfig,
     pub signal_tray: SidebarSignalTrayConfig,
+    pub cards: SidebarCardsConfig,
+}
+
+/// How long a state wash takes to cross a card, in milliseconds.
+const DEFAULT_CARD_WASH_MS: u64 = 520;
+
+/// Bounds on a configured wash. Below the floor a sweep cannot resolve as a
+/// sweep at any frame tier; above the ceiling a card spends longer announcing a
+/// state change than most state changes last.
+const MIN_CARD_WASH_MS: u64 = 120;
+const MAX_CARD_WASH_MS: u64 = 2_000;
+
+/// How the tree's pixel cards move.
+///
+/// Two switches rather than one because the two effects cost differently and
+/// fail differently. The breath is a per-card, per-frame cost that never stops;
+/// the wash is a per-change cost that is zero on a quiet fleet. Anyone who finds
+/// one of them too much should not have to give up the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidebarCardsConfig {
+    /// Whether a card breathes.
+    ///
+    /// On. The visual-target spec asks for a card at rest to read as *"on the
+    /// back burner — dimmed or recessed slightly"*, and a still card cannot say
+    /// that: without motion, "recessed" is indistinguishable from "this theme is
+    /// a bit dark". Off leaves every card drawn at its own settled light, which
+    /// is exactly what a host with no graphics already gets.
+    pub pulse: bool,
+    /// Whether a state change washes across a card.
+    ///
+    /// On. This is the only thing in the tree that says a card *changed* rather
+    /// than that it *is*: the state chip is legible either way, but reading it
+    /// requires already looking at that card. Off is the honest setting for
+    /// anyone who wants a still panel.
+    pub wash: bool,
+    /// How long a wash takes to cross a card, in milliseconds.
+    pub wash_ms: u64,
+}
+
+impl Default for SidebarCardsConfig {
+    fn default() -> Self {
+        Self {
+            pulse: true,
+            wash: true,
+            wash_ms: DEFAULT_CARD_WASH_MS,
+        }
+    }
+}
+
+impl SidebarCardsConfig {
+    /// How long one wash runs, clamped into what a sweep can actually be.
+    pub(crate) fn wash_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.wash_ms.clamp(MIN_CARD_WASH_MS, MAX_CARD_WASH_MS))
+    }
+
+    /// True when anything about a card is configured to move.
+    pub(crate) fn animates(&self) -> bool {
+        self.pulse || self.wash
+    }
+
+    /// Every behaviour a card can be asked to breathe with.
+    ///
+    /// Declared up front and both at once, for the reason
+    /// [`crate::anim::Lifecycle::idle`] gives: the engine accumulates a phase
+    /// per declared behaviour, and a card that named only the one its state
+    /// happens to want today would freeze on it when the state moved.
+    pub(crate) fn pulse_behaviours(&self) -> &'static [&'static str] {
+        if self.pulse {
+            &[
+                crate::anim::behaviour::names::CARD_REST,
+                crate::anim::behaviour::names::CARD_LIVE,
+            ]
+        } else {
+            &[]
+        }
+    }
 }
 
 /// How long a signal's arrival runs. Short: an alert lighting up is news, and

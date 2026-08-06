@@ -7,7 +7,11 @@ pub mod manifest;
 pub mod manifest_update;
 
 /// The detected state of a terminal pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` because a state is part of an animated element's identity: a card's
+/// state wash is keyed on the change it carries, so the states either side of
+/// it are half of what names the element (`crate::anim::ElementId::CardWash`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentState {
     /// Agent finished, prompt visible, nothing happening.
     Idle,

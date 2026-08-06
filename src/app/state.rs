@@ -1738,6 +1738,8 @@ pub struct AppState {
     pub sidebar_notifications: crate::config::SidebarNotificationsConfig,
     /// The notification tray at the foot of the panel.
     pub sidebar_signal_tray: crate::config::SidebarSignalTrayConfig,
+    /// How the tree's pixel cards move.
+    pub sidebar_cards: crate::config::SidebarCardsConfig,
     pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
@@ -1826,6 +1828,9 @@ pub struct AppState {
     /// attaches late is right to draw every element settled rather than replay
     /// arrivals it was not there for.
     pub(crate) anim: crate::anim::Animator,
+    /// What state each drawn card was last seen in, so a change can be told
+    /// from a state. Presentation state for the same reason [`Self::anim`] is.
+    pub(crate) sidebar_card_washes: crate::app::card_wash::CardWashes,
     /// The sidebar tree's owned agent rows as of the last loop pass.
     ///
     /// The tree is derived from panes that exist, so a pane closing takes the
@@ -2027,7 +2032,33 @@ impl AppState {
             && (self.sidebar_agents.has_animated_tokens()
                 || self.sidebar_spaces.has_animated_tokens()
                 || self.sidebar_animation.row_enter_stage(moves).is_some()
-                || self.sidebar_animation.row_exit_stage(moves).is_some())
+                || self.sidebar_animation.row_exit_stage(moves).is_some()
+                || self.sidebar_card_animation_active())
+    }
+
+    /// True when the tree's cards are moving.
+    ///
+    /// Gated on the pixel path and not only on the config, the same way
+    /// [`Self::signal_tray_animation_active`] is and for the same reason: a
+    /// card's breath and its wash *are* its artwork — the card is rasterised at
+    /// a different light — so on a host drawing character rows there is nothing
+    /// for either to happen to. Publishing elements nothing could show would arm
+    /// a deadline for a frame no one sees.
+    ///
+    /// The panel's width is deliberately not part of it, for the reason
+    /// [`Self::sidebar_rows_move`] gives about lifecycles: the sidebar can be
+    /// dragged past the card threshold while a wash is mid-sweep, and a
+    /// width-dependent gate would change that sweep's life underneath it. Width
+    /// is handled on the drawing side, where it belongs.
+    pub(crate) fn sidebar_card_animation_active(&self) -> bool {
+        !self.sidebar_collapsed
+            && self.sidebar_cards.animates()
+            && self.sidebar_card_shapes
+            && self.kitty_graphics_enabled
+            && self.host_cell_size.is_known()
+            && crate::ui::sidebar::image_card::card_face_available(
+                self.sidebar_card_font.as_deref(),
+            )
     }
 
     /// True when a sidebar row's arrival and departure move it *on this host*.
@@ -2100,6 +2131,17 @@ impl AppState {
             .animated_behaviours()
             .into_iter()
             .chain(self.sidebar_spaces.animated_behaviours())
+            // The card's own breath rides the row's element rather than one of
+            // its own: a card *is* the row, so there is no second membership to
+            // reconcile and no way for the two to disagree about when a card
+            // exists. Both breaths are declared whichever one the card's state
+            // wants today, for the reason `Lifecycle::idle` gives.
+            .chain(
+                self.sidebar_card_animation_active()
+                    .then(|| self.sidebar_cards.pulse_behaviours().iter().copied())
+                    .into_iter()
+                    .flatten(),
+            )
         {
             lifecycle = lifecycle.with_idle(behaviour);
         }
@@ -2653,6 +2695,7 @@ impl AppState {
                 .headless_animation_interval(),
             sidebar_notifications: crate::config::SidebarNotificationsConfig::default(),
             sidebar_signal_tray: crate::config::SidebarSignalTrayConfig::default(),
+            sidebar_cards: crate::config::SidebarCardsConfig::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: true,
             copy_on_select: true,
@@ -2696,6 +2739,7 @@ impl AppState {
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
+            sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_tree_row_memory: Vec::new(),
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,

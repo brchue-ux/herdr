@@ -527,3 +527,101 @@ fn frame_floor_lab_animated_tray_badges() {
         without.fps()
     );
 }
+
+/// The tree's cards, still and moving.
+///
+/// The cards need the graphics path *and* `sidebar_card_shapes` to be drawn as
+/// pixels at all, so both are on in every arm — otherwise the "with" arm would
+/// be measuring the difference between pixel cards and character rows rather
+/// than the difference between still cards and breathing ones, which is the
+/// question.
+const CARDS_STILL: &str = r#"
+onboarding = false
+
+[experimental]
+kitty_graphics = true
+sidebar_card_shapes = true
+
+[ui.sidebar.spaces]
+rows = [[{ token = "workspace", emphasis = "pulse" }]]
+
+[ui.sidebar.cards]
+pulse = false
+wash = false
+"#;
+
+const CARDS_BREATHING: &str = r#"
+onboarding = false
+
+[experimental]
+kitty_graphics = true
+sidebar_card_shapes = true
+
+[ui.sidebar.spaces]
+rows = [[{ token = "workspace", emphasis = "pulse" }]]
+
+[ui.sidebar.cards]
+pulse = true
+wash = true
+"#;
+
+/// What a full tree of breathing cards costs, measured rather than estimated.
+///
+/// The standard this answers to is worst case and tail, not the mean: 60 fps is
+/// the floor for stability and the 0.1% lows are what a reader actually
+/// notices. A breath is a *per-card, per-frame* cost — the one shape of change
+/// that shows up in the tail rather than in the average — so the arms isolate
+/// it from the pixel-card path it rides on:
+///
+/// - **J** — pixel cards drawn, nothing about them moving. The baseline.
+/// - **K** — the same tree with every card breathing.
+///
+/// Deliberately not asserting a fixed millisecond figure; the numbers move with
+/// the machine. What the assertions hold is the shape — enough samples for a
+/// tail to mean anything, and the breathing arm not collapsing against the
+/// still one.
+#[test]
+#[ignore = "live lab: spawns a real server and measures wall-clock frame timing"]
+fn frame_floor_lab_breathing_cards() {
+    let still = run_arm(
+        "J  12 spaces, pixel cards, still",
+        "j",
+        CARDS_STILL,
+        12,
+        true,
+    );
+    let breathing = run_arm(
+        "K  12 spaces, pixel cards, breathing",
+        "k",
+        CARDS_BREATHING,
+        12,
+        true,
+    );
+
+    for arm in [&still, &breathing] {
+        arm.report();
+    }
+    println!(
+        "\n  >>> fps   still {:.2} | breathing {:.2}\n  >>> p99   still {:.2} ms | breathing {:.2} ms\n  >>> 0.1%  still {:.2} ms | breathing {:.2} ms\n  >>> worst still {:.2} ms | breathing {:.2} ms\n",
+        still.fps(),
+        breathing.fps(),
+        still.percentile(0.99),
+        breathing.percentile(0.99),
+        still.percentile(0.999),
+        breathing.percentile(0.999),
+        still.gaps_ms.iter().cloned().fold(f64::NAN, f64::max),
+        breathing.gaps_ms.iter().cloned().fold(f64::NAN, f64::max),
+    );
+
+    assert!(
+        breathing.frames > 100,
+        "not enough samples for a tail: {}",
+        breathing.frames
+    );
+    assert!(
+        breathing.fps() > still.fps() * 0.85,
+        "a breathing tree cost more than a seventh of the frame rate: {:.2} against {:.2}",
+        breathing.fps(),
+        still.fps()
+    );
+}
