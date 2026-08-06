@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::protocol::RenderEncoding;
 use crate::server::client_transport::ClientWriter;
-use crate::server::render_stream::ClientRenderState;
+use crate::server::render_stream::{ClientRenderState, VirtualRenderer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
@@ -59,6 +59,11 @@ pub(crate) struct ClientConnection {
     pub(crate) last_activity: u64,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
+    /// This client's own ratatui terminal, kept across frames.
+    ///
+    /// Per client rather than per server: two clients at different sizes
+    /// sharing one would resize it every frame, and a resize is a full clear.
+    pub(crate) renderer: VirtualRenderer,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
     /// Whether the next graphics frame must clear and rebuild host-side Kitty state.
@@ -129,6 +134,7 @@ impl ClientConnection {
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
+            renderer: VirtualRenderer::default(),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,
             render_pending: false,
