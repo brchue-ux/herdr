@@ -428,3 +428,102 @@ fn frame_floor_lab_frame_time_distribution() {
         arm.frames
     );
 }
+
+/// The same realistic tree, with the notification tray's eight badges drawn as
+/// animated artwork.
+///
+/// The tray needs the graphics path to draw badges at all, so `kitty_graphics`
+/// is on in both arms — otherwise the "with" arm would be measuring the
+/// difference between artwork and character marks rather than the difference
+/// between still artwork and moving artwork, which is the question.
+const TRAY_STILL: &str = r#"
+onboarding = false
+
+[experimental]
+kitty_graphics = true
+
+[ui.sidebar.spaces]
+rows = [[{ token = "workspace", emphasis = "pulse" }]]
+
+[ui.sidebar.signal_tray]
+enabled = true
+animate = false
+"#;
+
+const TRAY_ANIMATED: &str = r#"
+onboarding = false
+
+[experimental]
+kitty_graphics = true
+
+[ui.sidebar.spaces]
+rows = [[{ token = "workspace", emphasis = "pulse" }]]
+
+[ui.sidebar.signal_tray]
+enabled = true
+animate = true
+"#;
+
+/// What eight animating badges cost, measured rather than estimated.
+///
+/// The standard this answers to is worst case and tail, not the mean: 60 fps is
+/// the floor for stability and the 0.1% lows are what a reader actually
+/// notices. Three arms, so the badges' cost is isolated from the tray's:
+///
+/// - **G** — the tray off entirely. The baseline the fork already ships.
+/// - **H** — the tray on, badges still. Adds the artwork raster, once per state
+///   change, and the layer's own upload.
+/// - **I** — the tray on, badges animating. Adds a re-raster and re-upload of
+///   the eight-badge layer on the badge frame tier.
+///
+/// Deliberately not asserting a fixed millisecond figure. The numbers move with
+/// the machine; what the assertions hold is the shape — enough samples for a
+/// tail to mean anything, and the animated arm not collapsing against the still
+/// one.
+#[test]
+#[ignore = "live lab: spawns a real server and measures wall-clock frame timing"]
+fn frame_floor_lab_animated_tray_badges() {
+    let without = run_arm("G  12 spaces, no tray", "g", PULSE_ROWS, 12, true);
+    let still = run_arm(
+        "H  12 spaces, tray on, badges still",
+        "h",
+        TRAY_STILL,
+        12,
+        true,
+    );
+    let animated = run_arm(
+        "I  12 spaces, tray on, badges animating",
+        "i",
+        TRAY_ANIMATED,
+        12,
+        true,
+    );
+
+    for arm in [&without, &still, &animated] {
+        arm.report();
+    }
+    println!(
+        "\n  >>> fps  no tray {:.2} | still badges {:.2} | animating badges {:.2}\n  >>> p99  no tray {:.2} ms | still {:.2} ms | animating {:.2} ms\n  >>> worst no tray {:.2} ms | still {:.2} ms | animating {:.2} ms\n",
+        without.fps(),
+        still.fps(),
+        animated.fps(),
+        without.percentile(0.99),
+        still.percentile(0.99),
+        animated.percentile(0.99),
+        without.gaps_ms.iter().cloned().fold(f64::NAN, f64::max),
+        still.gaps_ms.iter().cloned().fold(f64::NAN, f64::max),
+        animated.gaps_ms.iter().cloned().fold(f64::NAN, f64::max),
+    );
+
+    assert!(
+        animated.frames > 100,
+        "not enough samples for a tail: {}",
+        animated.frames
+    );
+    assert!(
+        animated.fps() > without.fps() * 0.85,
+        "eight animating badges cost more than a seventh of the frame rate: {:.2} against {:.2}",
+        animated.fps(),
+        without.fps()
+    );
+}

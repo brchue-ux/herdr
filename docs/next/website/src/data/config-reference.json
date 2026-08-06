@@ -948,6 +948,12 @@
           "description": "Whether a tray badge click may act in place. false turns every badge into a jump: the same eight slots still light, but no button sends keys to a pane or runs git."
         },
         {
+          "key": "ui.sidebar.signal_tray.animate",
+          "type": "boolean",
+          "default": "true",
+          "description": "Whether the tray badges move. Each of the three badge states plays its own rhythm, which is how they are told apart without relying on colour: a resting badge breathes slowly and never travels, a lit one snaps into place and settles, and one demanding attention does the same at better than twice the rate. false leaves every badge drawn at its settled position. Motion needs the graphics path, so it does nothing on a host drawing the fallback character marks."
+        },
+        {
           "key": "ui.accent",
           "type": "color",
           "default": "\"cyan\"",

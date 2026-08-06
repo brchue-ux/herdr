@@ -4496,6 +4496,18 @@ impl HeadlessServer {
         }
         let has_viewers = self.has_app_viewers();
         changed |= self.app.advance_headless_animations(now, has_viewers);
+        // The tray's escalation, its blocked-pane snapshot and its badge
+        // artwork, in that order after the animation has moved — the artwork is
+        // rasterised from where the badges *are*, so a pass that drew it before
+        // advancing would always be one frame behind.
+        //
+        // This is the server's copy of what `App::handle_scheduled_tasks` does
+        // for a Herdr with its own terminal, and it has to be here rather than
+        // shared with it: the two loops own different clocks, and the headless
+        // one is the only path a real Herdr takes. Without it the tray falls
+        // back to its character marks on every server-backed session — which is
+        // every session — because nothing ever rasterises the badges.
+        changed |= self.app.observe_signal_tray(now);
         self.app.sync_state_age_timer(now, has_viewers);
         changed
     }
@@ -6842,6 +6854,68 @@ next_tab = ""
         assert!(server.handle_scheduled_tasks_headless(armed + tier, false));
         assert_eq!(server.app.state.anim.next_deadline(armed + tier), None);
         assert!(server.app.state.anim.is_empty());
+    }
+
+    /// The tray's badges are artwork on a server-backed Herdr, which is every
+    /// Herdr.
+    ///
+    /// Caught by a live pass and not by the suite: `observe_signal_tray` was
+    /// only ever called from `App::handle_scheduled_tasks`, the loop a Herdr
+    /// with its own terminal runs. Nothing rasterised the badges on the
+    /// headless path, so the tray silently drew its no-graphics fallback marks
+    /// on every real session. This is the check that it does not go back.
+    #[test]
+    fn headless_scheduled_tasks_rasterise_the_trays_badge_artwork() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        server.app.state.active = Some(0);
+        server.app.state.sidebar_signal_tray.enabled = true;
+        server.app.state.kitty_graphics_enabled = true;
+        server.app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        server.app.state.view.sidebar_rect = Rect::new(0, 0, 30, 40);
+        // A viewer, because the badges only move for someone who is looking.
+        let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+
+        let now = Instant::now();
+        assert!(
+            server.app.state.signal_tray_graphics.is_none(),
+            "the fixture already had artwork"
+        );
+        server.handle_scheduled_tasks_headless(now, false);
+        let layer = server
+            .app
+            .state
+            .signal_tray_graphics
+            .as_ref()
+            .expect("the headless pass must rasterise the tray's badges");
+        assert!(
+            layer.data.iter().skip(3).step_by(4).any(|alpha| *alpha > 0),
+            "the tray layer was rasterised entirely transparent"
+        );
+
+        // And it keeps following the animation: the badges move, so the layer's
+        // cache key has to move with them.
+        let first = server.app.state.signal_tray_graphics_key;
+        server.handle_scheduled_tasks_headless(now + Duration::from_millis(400), false);
+        assert_ne!(
+            first, server.app.state.signal_tray_graphics_key,
+            "the artwork stopped following the badges once it had been drawn once"
+        );
     }
 
     #[tokio::test]

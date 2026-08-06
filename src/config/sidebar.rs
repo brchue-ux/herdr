@@ -936,6 +936,18 @@ pub struct SidebarSignalTrayConfig {
     /// what each one covers. This exists because "may Herdr run `git push` on my
     /// behalf from a click" is a policy question with a legitimate no.
     pub actions: bool,
+    /// Whether the badges move.
+    ///
+    /// On, because motion is how the three badge states are told apart —
+    /// colour alone measurably fails, so a still tray is a tray whose reader
+    /// has to remember eight hues. Turning it off leaves every badge drawn at
+    /// its settled position, which is exactly what a host with no graphics
+    /// already gets, so nothing becomes unreadable.
+    ///
+    /// A separate switch from [`Self::enabled`] because the cost is separate:
+    /// a still tray rasterises its artwork once per state change, and a moving
+    /// one rasterises on the badge frame tier for as long as anything is lit.
+    pub animate: bool,
 }
 
 impl Default for SidebarSignalTrayConfig {
@@ -946,6 +958,7 @@ impl Default for SidebarSignalTrayConfig {
             // the exact command. Turning the whole tray on is the opt-in; being
             // asked to confirm a push after that is not a second one.
             actions: true,
+            animate: true,
         }
     }
 }

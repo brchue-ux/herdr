@@ -192,6 +192,18 @@ impl FleetSignal {
         crate::anim::ElementId::Named(self.element_key())
     }
 
+    /// The animation element this signal's *tray badge* owns.
+    ///
+    /// A different element from [`Self::element_id`], in a different family,
+    /// and that separation is load-bearing rather than incidental. The bar's
+    /// element exists only while the signal is live, because a slot that is not
+    /// asserting has nothing to play. A badge's exists always, because rest is
+    /// one of the three things a badge says — see
+    /// [`crate::anim::ElementId::TrayBadge`].
+    pub(crate) fn badge_element_id(self) -> crate::anim::ElementId {
+        crate::anim::ElementId::TrayBadge(self)
+    }
+
     /// True when answering this signal costs a `git status` scan.
     ///
     /// None of the eight *light* on a dirty tree — that is exactly why `dirty`

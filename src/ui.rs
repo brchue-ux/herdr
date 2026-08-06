@@ -107,7 +107,7 @@ pub(crate) use self::sidebar::sidebar_content_rect;
 /// says nothing about which surface it belongs to.
 pub(crate) use self::sidebar::tray::{
     active as signal_tray_active, badge_at as signal_tray_badge_at, image as signal_tray_image,
-    menu_at as signal_tray_menu_at,
+    menu_at as signal_tray_menu_at, motion_fingerprint as signal_tray_motion_fingerprint,
 };
 
 /// Where the tray's badge artwork is composited.

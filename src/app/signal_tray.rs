@@ -79,6 +79,37 @@ impl BadgeState {
     pub(crate) fn is_live(self) -> bool {
         !matches!(self, Self::Idle)
     }
+
+    /// The catalogue behaviour this state moves on.
+    ///
+    /// **This mapping is the state language.** The visual target is explicit
+    /// that a badge's state has to survive a reader who cannot separate the
+    /// hues, so the three states are three *rhythms* first and three colours
+    /// second: rest breathes slowly and never travels, active snaps on the
+    /// stated curve, and attention snaps on the same curve at better than twice
+    /// the rate. All three names are declared on the element's lifecycle, so
+    /// each keeps its own accumulated phase and a badge escalating does not
+    /// restart the clock of the state it left.
+    pub(crate) fn behaviour(self) -> &'static str {
+        match self {
+            Self::Idle => crate::anim::behaviour::names::BADGE_REST,
+            Self::Active => crate::anim::behaviour::names::BADGE_CHARGE,
+            Self::Attention => crate::anim::behaviour::names::BADGE_ALERT,
+        }
+    }
+
+    /// The lifecycle every tray badge lives on.
+    ///
+    /// Every state's behaviour is declared up front rather than swapped in when
+    /// the state changes, because [`crate::anim::Lifecycle`] is read only when
+    /// an element is *new* — a lifecycle that carried one name would freeze a
+    /// badge on whatever state it happened to mount in.
+    pub(crate) fn lifecycle() -> crate::anim::Lifecycle {
+        crate::anim::Lifecycle::still()
+            .with_idle(Self::Idle.behaviour())
+            .with_idle(Self::Active.behaviour())
+            .with_idle(Self::Attention.behaviour())
+    }
 }
 
 /// When a live badge escalates from [`BadgeState::Active`] to
@@ -342,6 +373,32 @@ impl TrayReading {
     #[cfg(test)]
     pub(crate) fn any_live(&self) -> bool {
         self.badges.iter().any(|badge| badge.state.is_live())
+    }
+
+    /// All eight badges as animation elements, with the fleet's pulse as their
+    /// live drive.
+    ///
+    /// **All eight, always** — unlike the bar's membership, which is only the
+    /// live ones. A badge at rest is still saying something, and an element
+    /// that dropped out of the set every time its signal cleared would replay
+    /// its arrival every time one came back.
+    ///
+    /// The drive is the fleet's own activity rather than the badge's own
+    /// intensity, because a badge's intensity is already carried by *which*
+    /// behaviour it plays. What is left for a live drive to say is how hard the
+    /// fleet as a whole is working, which is the tray's existing tint concept
+    /// applied to tempo.
+    pub(crate) fn animation_membership(
+        &self,
+    ) -> impl Iterator<Item = (crate::anim::ElementId, crate::anim::behaviour::DriveInputs)> + '_
+    {
+        let activity = self.activity();
+        self.badges.iter().map(move |badge| {
+            (
+                badge.signal.badge_element_id(),
+                crate::anim::behaviour::DriveInputs { activity },
+            )
+        })
     }
 }
 
@@ -778,6 +835,78 @@ mod tests {
         app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
         app.ensure_test_terminals();
         app
+    }
+
+    /// Three states, three behaviours, and every one of them registered.
+    ///
+    /// A state whose behaviour name was not in the catalogue would animate
+    /// nothing at all — the engine treats an unregistered name as "plays
+    /// nothing", deliberately, so a typo here is a badge that silently stops
+    /// moving rather than a failure anyone would notice.
+    #[test]
+    fn each_badge_state_moves_on_its_own_registered_behaviour() {
+        let catalogue = crate::anim::behaviour::Catalogue::built_in();
+        let mut seen = Vec::new();
+        for state in [BadgeState::Idle, BadgeState::Active, BadgeState::Attention] {
+            let name = state.behaviour();
+            assert!(
+                catalogue.get(name).is_some(),
+                "{state:?} names {name}, which nothing registered"
+            );
+            assert!(
+                !seen.contains(&name),
+                "{state:?} shares {name} with another state"
+            );
+            seen.push(name);
+        }
+    }
+
+    /// The lifecycle has to declare all three, not just the one a badge
+    /// happened to mount in.
+    ///
+    /// `Lifecycle` is read only when an element is new, so a badge admitted
+    /// while idle and later escalating would have no phase for the behaviour it
+    /// is now being asked to play, and would freeze.
+    #[test]
+    fn a_badge_can_change_state_without_being_remounted() {
+        use std::time::{Duration, Instant};
+
+        let lifecycle = BadgeState::lifecycle();
+        let mut anim = crate::anim::Animator::default();
+        let id = FleetSignal::Ask.badge_element_id();
+        let now = Instant::now();
+        anim.enter(
+            id.clone(),
+            &lifecycle,
+            crate::anim::behaviour::DriveInputs::default(),
+            now,
+        );
+        anim.advance(now + Duration::from_millis(300));
+
+        for state in [BadgeState::Idle, BadgeState::Active, BadgeState::Attention] {
+            let frame = anim
+                .frame(&id, Some(state.behaviour()))
+                .expect("the badge is mounted");
+            assert!(
+                frame.behaviour.is_some(),
+                "{state:?} resolved to no behaviour on a badge that never changed element"
+            );
+        }
+    }
+
+    /// All eight are published, whatever they are doing.
+    #[test]
+    fn the_membership_carries_every_badge_not_only_the_lit_ones() {
+        let mut app = app_with_workspace();
+        app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
+        let reading = resolve(&app);
+        assert!(reading.any_live(), "the fixture lit nothing");
+
+        let published: Vec<_> = reading.animation_membership().map(|(id, _)| id).collect();
+        assert_eq!(published.len(), FleetSignal::COUNT);
+        for signal in FleetSignal::ALL {
+            assert!(published.contains(&signal.badge_element_id()), "{signal:?}");
+        }
     }
 
     /// The safety property the whole tray is built around. `sync` is the only
