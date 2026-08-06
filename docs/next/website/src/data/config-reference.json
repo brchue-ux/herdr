@@ -954,6 +954,24 @@
           "description": "Whether the tray badges move. Each of the three badge states plays its own rhythm, which is how they are told apart without relying on colour: a resting badge breathes slowly and never travels, a lit one snaps into place and settles, and one demanding attention does the same at better than twice the rate. false leaves every badge drawn at its settled position. Motion needs the graphics path, so it does nothing on a host drawing the fallback character marks."
         },
         {
+          "key": "ui.sidebar.cards.pulse",
+          "type": "boolean",
+          "default": "true",
+          "description": "Whether a card in the tree breathes. A card with work behind it snaps and settles on the fleet's own tempo; one on the back burner drifts slowly and sinks a little further back into the panel as it does, which is what makes an idle card read as recessed rather than merely dark. false leaves every card drawn at its own settled light. Needs the graphics path and experimental.sidebar_card_shapes, so it does nothing on a host drawing character rows."
+        },
+        {
+          "key": "ui.sidebar.cards.wash",
+          "type": "boolean",
+          "default": "true",
+          "description": "Whether a state change washes left to right across the card it happened on. The card ahead of the sweep is still the state it left and behind it is the state it arrived at, so when the sweep has crossed, the whole card is in the new state and stays there. false leaves a card simply changing colour. Needs the graphics path and experimental.sidebar_card_shapes."
+        },
+        {
+          "key": "ui.sidebar.cards.wash_ms",
+          "type": "integer",
+          "default": "520",
+          "description": "How long a state wash takes to cross a card, in milliseconds. Clamped to 120-2000."
+        },
+        {
           "key": "ui.accent",
           "type": "color",
           "default": "\"cyan\"",

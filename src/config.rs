@@ -28,8 +28,8 @@ pub use self::{
         ToastHerdrPosition, UpdateChannelConfig, DEFAULT_SIDEBAR_BOUNDS, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
-        AgentSidebarToken, AgentsSidebarConfig, SidebarAnimationConfig, SidebarConfig,
-        SidebarNotificationsConfig, SidebarSignalTrayConfig, SidebarTokenEmphasis,
+        AgentSidebarToken, AgentsSidebarConfig, SidebarAnimationConfig, SidebarCardsConfig,
+        SidebarConfig, SidebarNotificationsConfig, SidebarSignalTrayConfig, SidebarTokenEmphasis,
         SidebarTokenStyle, SpaceSidebarToken, SpacesSidebarConfig,
     },
     sound::SoundConfig,

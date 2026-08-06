@@ -306,6 +306,19 @@ pub(crate) enum Curve {
     /// the colour path clamps at the one place it mixes. It also returns to
     /// exactly `0.0` at the end of its span, so it loops without a seam.
     SnapPendulum,
+    /// The same snap, ending where it landed instead of releasing back to rest.
+    ///
+    /// Not a second motion character: [`snap`] is the stated one and both
+    /// curves are it, so [`SNAP_OVERSHOOT`] and [`SNAP_REVERSE`] cannot drift
+    /// apart between them. What this one drops is the release, and the release
+    /// exists for exactly one reason — a *loop* must come back to where it
+    /// started or it has a seam in it. A bounded arrival has nothing to loop
+    /// back to, and playing the release on one would undo the arrival: a card's
+    /// state wash would sweep across, taint the card, and then untaint it.
+    ///
+    /// Ends at exactly `1.0`, because the pendulum's second lobe is a whole
+    /// sine hump and closes on zero.
+    SnapArrival,
 }
 
 /// Steepness of the snap's exponential ramp.
@@ -346,6 +359,26 @@ fn pendulum(u: f32) -> f32 {
     }
 }
 
+/// The snap itself, over its own `0.0..=1.0`: the exponential ramp, then the
+/// pendulum that settles it.
+///
+/// The captain's sentence and nothing else — *"exponential acceleration, starts
+/// slow then ramps into a snap, a 10% overshoot that pendulums back, maybe 5%
+/// in reverse"*. Both snap curves are this function; they differ only in what
+/// they do after it, which is why the numbers live here once.
+fn snap(u: f32) -> f32 {
+    // The rise and the ring re-expressed as fractions of the snap alone rather
+    // than of a whole [`Curve::SnapPendulum`] span, so the two curves resolve
+    // the same shape at the same place in it.
+    const RISE: f32 = SNAP_RISE / (SNAP_RISE + SNAP_RING);
+    let u = u.clamp(0.0, 1.0);
+    if u < RISE {
+        exp_in(u / RISE)
+    } else {
+        1.0 + pendulum((u - RISE) / (1.0 - RISE))
+    }
+}
+
 impl Curve {
     fn apply(self, progress: f32) -> f32 {
         let p = progress.clamp(0.0, 1.0);
@@ -357,10 +390,8 @@ impl Curve {
             Self::Sine => (1.0 - (std::f32::consts::TAU * p).cos()) / 2.0,
             Self::SnapPendulum => {
                 let settled = SNAP_RISE + SNAP_RING;
-                if p < SNAP_RISE {
-                    exp_in(p / SNAP_RISE)
-                } else if p < settled {
-                    1.0 + pendulum((p - SNAP_RISE) / SNAP_RING)
+                if p < settled {
+                    snap(p / settled)
                 } else {
                     // The release back to rest is the same acceleration played
                     // forward, so the return reads as deliberate rather than as
@@ -368,6 +399,7 @@ impl Curve {
                     1.0 - exp_in((p - settled) / (1.0 - settled).max(1e-3))
                 }
             }
+            Self::SnapArrival => snap(p),
         }
     }
 }
@@ -754,6 +786,29 @@ pub(crate) mod names {
     /// deeper, so the difference between lit and waiting is a rhythm rather
     /// than a hue.
     pub(crate) const BADGE_ALERT: &str = "badge-alert";
+    /// Looping: a card on the back burner, breathing.
+    ///
+    /// Slow and shallow, and the swing goes *down* from the card's own light
+    /// rather than up — see [`super::super::ui::sidebar::image_card`], where
+    /// the envelope is read. A card with nothing behind it should read as set
+    /// back into the panel, and a breath that brightened would be the card
+    /// asking to be looked at.
+    pub(crate) const CARD_REST: &str = "card-rest";
+    /// Looping: a card with work behind it, breathing on the stated snap.
+    ///
+    /// The same ladder the tray badges use, and for the same reason: rest and
+    /// work are told apart by *rhythm* before they are told apart by hue, so
+    /// this one snaps where [`CARD_REST`] drifts, and takes its tempo from the
+    /// pane's own work volume.
+    pub(crate) const CARD_LIVE: &str = "card-live";
+    /// Bounded: a card's state change washing left to right across it.
+    ///
+    /// A [`super::Field::Linear`] front rather than a band, which is the whole
+    /// difference between this and [`SHIMMER`]. A band peaks as it passes a
+    /// cell and leaves it as it was; a front leaves everything behind it at
+    /// full amount, so when this has crossed, the whole card is in the state it
+    /// changed into. The card is different afterwards, and it looks it.
+    pub(crate) const CARD_WASH: &str = "card-wash";
 }
 
 /// How long one rest breath takes.
@@ -814,6 +869,55 @@ const CHARGE_BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉
 /// that sell it: a charge that only ever thickened the line would read as a
 /// highlight, and a discharge is exactly the thing that breaks its own path.
 const CHARGE_ARCS: [char; 8] = ['╪', '╫', '╬', '┼', '╳', '╱', '╲', '┿'];
+
+/// How long one breath takes on a card with nothing behind it.
+///
+/// Slower than any other loop in the catalogue, deliberately. Rest is read as a
+/// tempo first, and a whole tree of cards breathing at a badge's rate would be
+/// a panel full of movement saying nothing — the visual-target spec's *"back
+/// burner"* is the absence of demand, not a dimmer setting.
+const CARD_REST_PERIOD: Duration = Duration::from_millis(5_200);
+
+/// How long one snap-and-settle takes on a card with work behind it.
+const CARD_LIVE_PERIOD: Duration = Duration::from_millis(2_400);
+
+/// How far a resting card's breath swings.
+///
+/// Shallow, and the consumer subtracts it: at the trough a resting card sits
+/// about a fifth below its own light with its bloom pulled further, which is
+/// the *recessed* half of "dimmed or recessed slightly". A deeper swing at this
+/// period reads as a fade rather than as breathing.
+const CARD_REST_DEPTH: f32 = 0.20;
+
+/// How far a live card's breath swings.
+const CARD_LIVE_DEPTH: f32 = 0.55;
+
+/// Frame spacing for a card that is moving.
+///
+/// Every frame at this tier re-rasterises the cards whose quantised envelope
+/// moved, so it is the card path's real cost dial. The smooth tier rather than
+/// the charge tier: a card's breath and its wash are both changes of *light*
+/// over a whole shape, and neither has an edge fine enough for 25 ms to resolve
+/// something 50 ms does not. See [`CARD_BREATH_STEPS`] in
+/// [`crate::ui::sidebar::image_card`], which is the other half of that dial.
+///
+/// [`CARD_BREATH_STEPS`]: crate::ui::sidebar::image_card
+const CARD_FRAME_INTERVAL: Duration = SMOOTH_FRAME_INTERVAL;
+
+/// How long a state wash takes to cross a card.
+///
+/// Long enough that the snap is a movement across the card rather than a
+/// flash, short enough that the card has arrived in its new state before a
+/// reader's eye has finished travelling to it.
+pub(crate) const CARD_WASH_PERIOD: Duration = Duration::from_millis(520);
+
+/// How much of the card the wash's leading edge takes to go from nothing to
+/// full, as a fraction of its width.
+///
+/// Soft rather than a hard step: the wash is light arriving, and light does not
+/// have a straight edge. At a fifth of the card the front is visibly a front
+/// and still crosses in one read.
+const CARD_WASH_SOFTNESS: f32 = 0.22;
 
 /// Blend fraction toward the surface at the dimmest point of a pulse.
 ///
@@ -889,7 +993,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 17] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 20] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -1139,6 +1243,58 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 17] {
                 paint: Paint::tint(Ink::Accent, 1.0),
                 period: BADGE_ALERT_PERIOD,
                 frame_interval: BADGE_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        // The two card breaths and the wash between them. The breaths are
+        // uniform for the same reason the badges are — a card is one object,
+        // and the pixel path in `image_card` reads them as an envelope through
+        // `Behaviour::strength` rather than as a cell paint. The wash is the one
+        // that is not: it is a field sweep, and it is the only thing here whose
+        // amount has to differ column by column.
+        (
+            names::CARD_REST,
+            Behaviour {
+                curve: Curve::Sine,
+                paint: Paint::tint(Ink::Surface, CARD_REST_DEPTH),
+                period: CARD_REST_PERIOD,
+                // The slow tier. A five-second breath has nothing at 50 ms that
+                // it does not have at 100, and a resting card is the tree's
+                // common case — every card in a quiet fleet is one.
+                ..BASE
+            },
+        ),
+        (
+            names::CARD_LIVE,
+            Behaviour {
+                curve: Curve::SnapPendulum,
+                paint: Paint::tint(Ink::Accent, CARD_LIVE_DEPTH),
+                period: CARD_LIVE_PERIOD,
+                frame_interval: CARD_FRAME_INTERVAL,
+                // A harder-working pane breathes faster, the same way the
+                // `activity` entry and a lit badge do: tempo is where effort is
+                // legible at a glance, and brightness alone reads as a theme.
+                rate_drive: Drive::Activity {
+                    at_rest: 1.0,
+                    at_full: 1.7,
+                },
+                ..BASE
+            },
+        ),
+        (
+            names::CARD_WASH,
+            Behaviour {
+                field: HORIZONTAL,
+                shape: Shape::Front {
+                    softness: CARD_WASH_SOFTNESS,
+                },
+                // The arrival, not the loop: this plays once, on a state
+                // change, and has to end with the card tainted rather than back
+                // where it started.
+                curve: Curve::SnapArrival,
+                paint: Paint::tint(Ink::Accent, 1.0),
+                period: CARD_WASH_PERIOD,
+                frame_interval: CARD_FRAME_INTERVAL,
                 ..BASE
             },
         ),
@@ -1873,5 +2029,169 @@ mod tests {
         // A resting badge is the tray's common case, so it must not ask the
         // loop for the smooth tier that a snapping one needs.
         assert!(rest.frame_interval > charge.frame_interval);
+    }
+
+    /// The two snap curves are one snap.
+    ///
+    /// [`Curve::SnapArrival`] is [`Curve::SnapPendulum`]'s span up to its
+    /// settle, replayed over a whole `0.0..=1.0`. Written as an equality rather
+    /// than as two lists of numbers so that a change to the ramp, the overshoot
+    /// or the reverse cannot land on one curve and not the other — which is the
+    /// only way the *stated* motion character could quietly become two
+    /// characters.
+    #[test]
+    fn both_snap_curves_are_the_same_snap() {
+        let settled = SNAP_RISE + SNAP_RING;
+        for i in 0..=400 {
+            let u = i as f32 / 400.0;
+            let pendulum = Curve::SnapPendulum.apply(u * settled);
+            let arrival = Curve::SnapArrival.apply(u);
+            assert!(
+                (pendulum - arrival).abs() < 1e-4,
+                "the snap diverged at {u:.3}: {pendulum:.5} against {arrival:.5}"
+            );
+        }
+    }
+
+    /// The stated character, read off the curve rather than off the constants:
+    /// slow, then a ramp into a snap, ~10% past, ~5% back, and *arrived* at the
+    /// end rather than back where it started.
+    #[test]
+    fn the_arrival_snap_overshoots_pendulums_back_and_ends_arrived() {
+        let at = |u: f32| Curve::SnapArrival.apply(u);
+
+        assert!(at(0.0).abs() < 1e-6, "the snap did not start at rest");
+        assert!(
+            (at(1.0) - 1.0).abs() < 1e-4,
+            "a bounded arrival has to end arrived, ended at {:.5}",
+            at(1.0)
+        );
+
+        // Exponential acceleration: half way through the ramp it has covered a
+        // small fraction of the distance, which is what "starts slow then ramps
+        // into a snap" means as a number.
+        const RISE: f32 = SNAP_RISE / (SNAP_RISE + SNAP_RING);
+        assert!(
+            at(RISE / 2.0) < 0.25,
+            "the ramp was linear rather than accelerating: {:.3} at its midpoint",
+            at(RISE / 2.0)
+        );
+
+        let samples: Vec<f32> = (0..=1_000).map(|i| at(i as f32 / 1_000.0)).collect();
+        let peak = samples.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            (peak - (1.0 + SNAP_OVERSHOOT)).abs() < 0.01,
+            "the overshoot is {:.1}% rather than the stated ten",
+            (peak - 1.0) * 100.0
+        );
+        // And the reverse swing, which is only meaningful after the peak.
+        let after_peak = samples
+            .iter()
+            .skip_while(|value| **value < peak)
+            .cloned()
+            .fold(f32::MAX, f32::min);
+        assert!(
+            (after_peak - (1.0 - SNAP_REVERSE)).abs() < 0.01,
+            "the reverse swing is {:.1}% rather than the stated five",
+            (1.0 - after_peak) * 100.0
+        );
+    }
+
+    /// The wash's whole claim: when it has crossed, every column of the card is
+    /// at full amount and stays there.
+    ///
+    /// The comparison is against a band, because that is the effect this could
+    /// have been and must not be. A band peaks as it passes a column and leaves
+    /// it exactly as it was, so it ends with the card unchanged — a highlight.
+    #[test]
+    fn a_finished_wash_covers_every_column_and_a_band_would_not() {
+        let extent = CellExtent::row(64);
+        let wash = get(names::CARD_WASH);
+        let band = Behaviour {
+            shape: Shape::Band { width: 0.45 },
+            ..wash
+        };
+        for col in 0..extent.cols {
+            let pos = CellPos::col(col);
+            assert!(
+                wash.strength(pos, extent, 1.0) >= 0.999,
+                "column {col} was left behind by a wash that finished"
+            );
+        }
+        let band_end: f32 = (0..extent.cols)
+            .map(|col| band.strength(CellPos::col(col), extent, 1.0))
+            .fold(f32::MIN, f32::max);
+        assert!(
+            band_end < 0.5,
+            "the band left the card tainted, so this test is no longer telling \
+             a wash from a highlight"
+        );
+    }
+
+    /// And it crosses left to right: every column arrives, and the left one
+    /// arrives first.
+    #[test]
+    fn the_wash_crosses_from_the_left() {
+        let extent = CellExtent::row(64);
+        let wash = get(names::CARD_WASH);
+        // The step at which each column first reaches half.
+        let arrival = |col: u16| {
+            (0..=200)
+                .find(|i| wash.strength(CellPos::col(col), extent, *i as f32 / 200.0) >= 0.5)
+                .expect("every column has to arrive")
+        };
+        let first = arrival(0);
+        let last = arrival(extent.cols - 1);
+        assert!(
+            first < last,
+            "the front did not travel: column 0 arrived at {first} and the last at {last}"
+        );
+
+        // Once a column has arrived it stays arrived, which is the difference
+        // between a front and something passing over.
+        for i in 0..=200 {
+            let progress = i as f32 / 200.0;
+            if progress * 200.0 < first as f32 {
+                continue;
+            }
+            assert!(
+                wash.strength(CellPos::col(0), extent, progress) >= 0.5,
+                "the leftmost column un-arrived at {progress:.3}"
+            );
+        }
+    }
+
+    /// The two card breaths are two rhythms, the same way the three badges are:
+    /// rest is slower, shallower, and on a different curve entirely.
+    #[test]
+    fn a_resting_card_breathes_slower_and_shallower_than_a_working_one() {
+        let rest = get(names::CARD_REST);
+        let live = get(names::CARD_LIVE);
+
+        assert!(
+            rest.period > live.period * 2,
+            "rest at {:?} is not slow enough against a working card at {:?}",
+            rest.period,
+            live.period
+        );
+        assert_eq!(rest.curve, Curve::Sine, "rest drifts, it does not snap");
+        assert_eq!(live.curve, Curve::SnapPendulum);
+        assert!(rest.paint.depth < live.paint.depth);
+
+        // Both are uniform: a card is one object, so its breath is the whole
+        // card's and never a sweep across it. The wash is the only card
+        // behaviour with a field.
+        assert!(rest.is_uniform());
+        assert!(live.is_uniform());
+        assert!(!get(names::CARD_WASH).is_uniform());
+
+        // A resting card is the tree's common case, so it must not ask the loop
+        // for the tier a snapping one needs.
+        assert!(rest.frame_interval > live.frame_interval);
+
+        // A working card takes its tempo from its pane's work volume; a resting
+        // one has none to take.
+        assert!(live.is_metric_reactive());
+        assert!(!rest.is_metric_reactive());
     }
 }

@@ -413,7 +413,72 @@ pub(crate) fn row_height_cells(app: &AppState, depth: u8, fold_width: u16) -> Op
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardMark {}
 
-/// What one card says.
+/// A state change part-way across a card.
+///
+/// # Why this is a front and not a highlight
+///
+/// [`Shape::Band`] peaks as it passes a cell and leaves it exactly as it was;
+/// [`Shape::Front`] leaves everything behind it at full amount. So a band is a
+/// shimmer that crosses the card and changes nothing, and a front is a *wash*:
+/// when it has crossed, the whole card is in the state it changed into and
+/// stays there. That is the acceptance criterion, and it is one enum value.
+///
+/// # Why it carries the state it came from
+///
+/// Because the front has to have two sides. The card ahead of the edge is still
+/// the state it left, the card behind it is the state it arrived at, and the
+/// sweep is the boundary between them travelling — which is what makes the
+/// change legible as a change rather than as a card that is suddenly a
+/// different colour. A pure render pass cannot know the previous state, so
+/// [`crate::app::card_wash`] remembers it.
+///
+/// [`Shape::Band`]: crate::anim::behaviour::Shape::Band
+/// [`Shape::Front`]: crate::anim::behaviour::Shape::Front
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardWashFrame {
+    /// The state the card is leaving.
+    from: AgentState,
+    /// How far through the sweep, in `0.0..=1.0`, quantized to
+    /// [`CARD_WASH_STEPS`].
+    progress: f32,
+    /// The behaviour resolving the front. Copied out of the engine's catalogue
+    /// rather than borrowed, so a card's content owns its whole appearance and
+    /// nothing here grows a lifetime — the sweep is still the engine's, and no
+    /// second one is written anywhere in this file.
+    behaviour: crate::anim::behaviour::Behaviour,
+}
+
+impl CardWashFrame {
+    /// How far the wash has taken this column, in `0.0..=1.0`.
+    ///
+    /// `t` is across the card, left to right. The columns are handed to the
+    /// engine as if they were cells, exactly as [`DissolveFrame::apply`] hands
+    /// it a particle grid: the pixels and the characters are then the same
+    /// effect at two resolutions rather than two effects kept looking alike by
+    /// hand.
+    fn amount(self, t: f32) -> f32 {
+        use crate::anim::cell::{CellExtent, CellPos};
+        // A ladder rather than the card's real pixel width: the front is a
+        // smooth function of `t`, so the resolution it is sampled at changes
+        // nothing anyone could see, and a fixed extent keeps the arithmetic
+        // independent of how wide this particular card happens to be.
+        const COLUMNS: u16 = 256;
+        let col = (t.clamp(0.0, 1.0) * f32::from(COLUMNS - 1)).round() as u16;
+        self.behaviour
+            .strength(CellPos::col(col), CellExtent::row(COLUMNS), self.progress)
+            .clamp(0.0, 1.0)
+    }
+
+    /// The quantized step this frame sits on, for the card's signature.
+    fn step(self) -> (u16, u8) {
+        (
+            (self.progress.clamp(0.0, 1.0) * CARD_WASH_STEPS).round() as u16,
+            self.from as u8,
+        )
+    }
+}
+
+/// What one card says, and how it is lit while it says it.
 struct CardContent {
     title: String,
     tidbit: Option<String>,
@@ -424,6 +489,12 @@ struct CardContent {
     lifted: bool,
     /// The project mark, once there are any. See [`CardMark`].
     mark: Option<CardMark>,
+    /// This frame of the card's breath, in `0.0..=1.0`, quantized to
+    /// [`CARD_BREATH_STEPS`]. `0.0` is the card at its own settled light, which
+    /// is what a host with no card animation draws.
+    breath: f32,
+    /// The state change crossing the card right now, if one is.
+    wash: Option<CardWashFrame>,
 }
 
 impl CardContent {
@@ -436,6 +507,41 @@ impl CardContent {
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
         self.mark.is_some().hash(hasher);
+        // Both quantized before they reach here, so a card whose light has not
+        // moved by a step anyone could see hashes the same and is carried
+        // forward without being redrawn. This is the whole of what keeps a tree
+        // of breathing cards from rasterising on every frame.
+        ((self.breath * CARD_BREATH_STEPS).round() as u16).hash(hasher);
+        self.wash.map(CardWashFrame::step).hash(hasher);
+    }
+
+    /// The light this card has arrived at: the state it is in, breathing.
+    fn arrived_light(&self) -> CardLight {
+        CardLight::of(self.state).breathed(self.breath)
+    }
+
+    /// The light ahead of a wash's front: the state the card left, breathing.
+    ///
+    /// The breath is applied to *both* sides of the front rather than to the
+    /// result, because a card breathes throughout a state change — breathing
+    /// only the destination would make a wash look like the moment the card's
+    /// breath was switched on.
+    fn leaving_light(&self) -> Option<CardLight> {
+        self.wash
+            .map(|wash| CardLight::of(wash.from).breathed(self.breath))
+    }
+
+    /// The light the card's chrome and its type are drawn in.
+    ///
+    /// The destination, never the sweep. Two reasons, and they are different
+    /// reasons. The chip already *says* the new state in words, so drawing it
+    /// in the old state's ink would be a mark contradicting its own label. And
+    /// type is held out of both effects entirely: a title that breathed would
+    /// be a title that is periodically harder to read, and the visual-target
+    /// spec's digestibility condition does not take a break for half of every
+    /// cycle.
+    fn settled_light(&self) -> CardLight {
+        CardLight::of(self.state)
     }
 }
 
@@ -477,22 +583,155 @@ fn chip_ink(state: AgentState, seen: bool) -> Rgb {
     Rgb::from_hsl(h, s, l)
 }
 
-/// How much saturation and light a card keeps.
+/// The light one card is drawn in: how saturated its ink is, how bright, and
+/// how far its bloom lifts it off the panel.
 ///
-/// The reference's answer to "what carries state without a rainbow": an
-/// inactive card is the same hue with S 14.5% where an active one is 59.6%, at
-/// 57% of the luminance, and with no bloom at all.
-fn card_intensity(state: AgentState) -> (f32, f32, f32) {
-    match state {
-        AgentState::Working | AgentState::Blocked => (1.0, 1.0, 1.0),
-        AgentState::Idle => (
-            (1.0 + measured::MUTED_SAT) / 2.0,
-            (1.0 + measured::MUTED_LUM) / 2.0,
-            0.35,
-        ),
-        AgentState::Unknown => (measured::MUTED_SAT, measured::MUTED_LUM, 0.0),
+/// One value rather than three loose floats because the breath and the wash
+/// both act on all three together, and they have to: the visual-target spec
+/// asks a resting card to read as *recessed*, and recession is a depth cue —
+/// *"consider glow radius, saturation and contrast against the background
+/// together, not brightness alone."* A breath that moved only the luminance
+/// would be a dimmer, which is the thing that spec rules out by name.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardLight {
+    sat: f32,
+    lum: f32,
+    /// How much of the card's measured bloom is laid down, in `0.0..=1.0`.
+    bloom: f32,
+}
+
+impl CardLight {
+    /// How much saturation and light a card in this state keeps.
+    ///
+    /// The reference's answer to "what carries state without a rainbow": an
+    /// inactive card is the same hue with S 14.5% where an active one is 59.6%,
+    /// at 57% of the luminance, and with no bloom at all.
+    fn of(state: AgentState) -> Self {
+        let (sat, lum, bloom) = match state {
+            AgentState::Working | AgentState::Blocked => (1.0, 1.0, 1.0),
+            AgentState::Idle => (
+                (1.0 + measured::MUTED_SAT) / 2.0,
+                (1.0 + measured::MUTED_LUM) / 2.0,
+                0.35,
+            ),
+            AgentState::Unknown => (measured::MUTED_SAT, measured::MUTED_LUM, 0.0),
+        };
+        Self { sat, lum, bloom }
+    }
+
+    /// The same light after one frame of this card's breath.
+    ///
+    /// The swing is **subtracted**, always, whichever behaviour supplied it.
+    /// That is the whole reading: a card breathes by settling *back* into the
+    /// panel and returning, never by brightening past its own state's light. A
+    /// breath that went the other way would make an idle card periodically
+    /// brighter than a working one at its trough, which inverts the only thing
+    /// the card's light is for.
+    ///
+    /// The bloom gives further than the ink does, because the bloom is the
+    /// depth cue — it is the lift that makes a card float, and taking the lift
+    /// away is what *recessed* looks like. Saturation is left alone: the
+    /// reference's own inactive card holds its hue, and a breath that
+    /// desaturated would read as the card losing its state rather than as the
+    /// card resting.
+    fn breathed(self, envelope: f32) -> Self {
+        let swing = envelope.clamp(0.0, 1.0);
+        Self {
+            sat: self.sat,
+            lum: self.lum * (1.0 - BREATH_LUM_DIP * swing),
+            bloom: self.bloom * (1.0 - BREATH_BLOOM_DIP * swing),
+        }
+    }
+
+    /// The stroke's two ends and the bloom's, at this light.
+    fn inks(self) -> CardInk {
+        let stroke_a = measured::STROKE_A.restate(self.sat, self.lum);
+        let stroke_b = measured::STROKE_B.restate(self.sat, self.lum);
+        let red = |c: Rgb| Rgb((f32::from(c.0) * measured::BLOOM_RED_MUL) as u8, c.1, c.2);
+        CardInk {
+            stroke_a,
+            stroke_b,
+            bloom_a: red(stroke_a),
+            bloom_b: red(stroke_b),
+            bloom: self.bloom,
+        }
     }
 }
+
+/// The colours one column of a card is drawn from.
+///
+/// The stroke runs a gradient from its own left end to its own right one and
+/// the bloom runs the same gradient in a more saturated form, so a column needs
+/// both ends rather than one colour — the *column's* position in that gradient
+/// is a separate axis from where the state wash has reached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardInk {
+    stroke_a: Rgb,
+    stroke_b: Rgb,
+    bloom_a: Rgb,
+    bloom_b: Rgb,
+    /// How much of the card's measured bloom this column lays down.
+    bloom: f32,
+}
+
+impl CardInk {
+    /// This ink `t` of the way toward `other`.
+    ///
+    /// Mixed as resolved colour rather than as [`CardLight`], and that is the
+    /// cheap half of the wash: the two states either side of the front are
+    /// fixed for a whole frame, so they are converted out of HSL once each and
+    /// a column is three channel lerps. Converting per column would cost more
+    /// arithmetic than drawing the card's pixels does.
+    fn mix(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            stroke_a: self.stroke_a.mix(other.stroke_a, t),
+            stroke_b: self.stroke_b.mix(other.stroke_b, t),
+            bloom_a: self.bloom_a.mix(other.bloom_a, t),
+            bloom_b: self.bloom_b.mix(other.bloom_b, t),
+            bloom: self.bloom + (other.bloom - self.bloom) * t,
+        }
+    }
+}
+
+/// How far a full breath pulls a card's own luminance down.
+///
+/// Small. The card has to stay exactly as readable at the trough of its breath
+/// as at the crest — the spec's *digestibility* condition is not suspended for
+/// half of every cycle — so the ink barely moves and the bloom carries the
+/// swing.
+const BREATH_LUM_DIP: f32 = 0.12;
+
+/// How far a full breath pulls a card's bloom down.
+///
+/// Three times the ink's dip, and this asymmetry is the effect. The bloom is
+/// what lifts a card off the panel (see [`lay_bloom`]), so breathing it is
+/// breathing the card's apparent *depth* — the card sinks back and comes
+/// forward while its own body stays legible throughout.
+const BREATH_BLOOM_DIP: f32 = 0.36;
+
+/// Steps of the breath envelope a card's artwork can actually tell apart.
+///
+/// This is the card path's real cost dial, and it is set here rather than left
+/// to the frame tier because the two do different jobs: the tier says how often
+/// the engine is *asked*, and this says how often the answer is different enough
+/// to be worth a rasterisation. A card whose quantised step has not moved is
+/// carried forward by signature with nothing redrawn — which is what keeps a
+/// tree of breathing cards off the frame-time tail. Twelve steps across a swing
+/// that never exceeds a third of the bloom is under two per cent of the card's
+/// light per step, below what a step of the panel's own dithering would show.
+const CARD_BREATH_STEPS: f32 = 12.0;
+
+/// Steps of the wash's sweep the artwork is rebuilt at.
+///
+/// Finer than the breath, because a *front* crossing a card is the one thing
+/// here whose position is legible: a coarse ladder reads as the edge stepping
+/// rather than travelling. Twenty-four steps over the configured duration is
+/// finer than the 50 ms frame tier can deliver at any wash under about 1.2 s, so
+/// in practice the tier is the binding constraint and this only stops a faster
+/// loop from paying more. The same reasoning, and the same number, as
+/// [`DISSOLVE_STEPS`].
+const CARD_WASH_STEPS: f32 = 24.0;
 
 /// The resolved pixel geometry of one card.
 struct CardGeometry {
@@ -597,21 +836,78 @@ struct PlacedCard<'a> {
 }
 
 impl PlacedCard<'_> {
-    /// The stroke's two ends and the bloom's, after this card's state has had
-    /// its say about saturation and light.
-    fn inks(&self) -> (Rgb, Rgb, Rgb, Rgb, f32, f32) {
-        let (sat, lum, bloom_mul) = card_intensity(self.content.state);
-        let stroke_a = measured::STROKE_A.restate(sat, lum);
-        let stroke_b = measured::STROKE_B.restate(sat, lum);
-        let red = |c: Rgb| Rgb((f32::from(c.0) * measured::BLOOM_RED_MUL) as u8, c.1, c.2);
-        (
-            stroke_a,
-            stroke_b,
-            red(stroke_a),
-            red(stroke_b),
-            bloom_mul,
-            lum,
-        )
+    /// Where a pixel column sits across this card, in `0.0..=1.0`.
+    ///
+    /// Clamped, so the columns either side of the card — the ones its bloom
+    /// reaches into — resolve to the card's own two ends rather than running
+    /// off the field. A halo lit by a state its card never reached would be a
+    /// wash that leaked past the shape it crossed.
+    fn column_t(&self, x: u32) -> f32 {
+        (((x as f32 + 0.5) - self.rect.x) / self.rect.w).clamp(0.0, 1.0)
+    }
+
+    /// This card's inks, resolved once, ready to be read at any column.
+    ///
+    /// Resolving them per column would be the obvious way to write the wash and
+    /// it is the expensive one: [`Rgb::restate`] is an HSL round trip, a card is
+    /// a few hundred pixels wide, and its bloom band is wider still — so a
+    /// per-column resolve costs more arithmetic than drawing the card's pixels
+    /// does. The two states either side of the front are *fixed* for the whole
+    /// of a frame; only the amount between them varies. So both are converted
+    /// once and a column is three channel mixes.
+    fn inks(&self) -> CardInks {
+        CardInks::of(self.content)
+    }
+
+    /// The card's ink and luminance at its settled light, for the chrome and
+    /// the type that stay out of both effects. See
+    /// [`CardContent::settled_light`].
+    fn settled_inks(&self) -> (Rgb, f32) {
+        let light = self.content.settled_light();
+        (light.inks().stroke_a, light.lum)
+    }
+}
+
+/// One card's inks, and the front between its two states.
+///
+/// The whole cost argument of the wash lives here. A card resolves two inks at
+/// most — the state it is leaving and the state it arrived at — and reading a
+/// column is a mix between them at the amount the engine's own field gives that
+/// column. With no wash there is one ink and a column is a copy.
+#[derive(Debug, Clone, Copy)]
+struct CardInks {
+    into: CardInk,
+    from: Option<CardInk>,
+    wash: Option<CardWashFrame>,
+}
+
+impl CardInks {
+    fn of(content: &CardContent) -> Self {
+        Self {
+            into: content.arrived_light().inks(),
+            from: content.leaving_light().map(CardLight::inks),
+            wash: content.wash,
+        }
+    }
+
+    /// The ink at `t` across the card, left to right.
+    fn at(self, t: f32) -> CardInk {
+        let (Some(from), Some(wash)) = (self.from, self.wash) else {
+            return self.into;
+        };
+        from.mix(self.into, wash.amount(t))
+    }
+
+    /// The strongest bloom this card lays down anywhere across itself.
+    ///
+    /// Asked of the whole card rather than of one column because a wash's two
+    /// sides can differ: a card arriving from `Unknown` has no bloom ahead of
+    /// its front and a full one behind it, and skipping the lay on the strength
+    /// of either alone would drop half the halo.
+    fn peak_bloom(self) -> f32 {
+        self.into
+            .bloom
+            .max(self.from.map_or(0.0, |from| from.bloom))
     }
 }
 
@@ -625,8 +921,8 @@ impl PlacedCard<'_> {
 /// anything; maxed, each card's halo is exactly the one it was measured to
 /// have.
 fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
-    let (_, _, bloom_a, bloom_b, bloom_mul, _) = card.inks();
-    if bloom_mul <= 0.0 {
+    let inks = card.inks();
+    if inks.peak_bloom() <= 0.0 {
         return;
     }
     let rect = card.rect;
@@ -643,6 +939,11 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
     // a calculation: sampled once per half pixel out to the reach and read back
     // by index. Two exponentials per pixel over a card and the ground around it
     // is most of what drawing a card costs otherwise.
+    //
+    // The card's own bloom strength is deliberately *not* baked into it any
+    // more: it now varies across the card — the breath swings it and a state
+    // wash carries two different values either side of its front — so it is a
+    // per-column multiplier applied where the profile is read.
     const PROFILE_STEPS_PER_PX: f32 = 8.0;
     let profile: Vec<f32> = (0..=((reach * PROFILE_STEPS_PER_PX).ceil() as usize))
         .map(|step| {
@@ -651,15 +952,15 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
             let far = (-(d * d) / (2.0 * far_sigma * far_sigma)).exp();
             measured::BLOOM_PEAK
                 * (measured::BLOOM_NEAR_WEIGHT * near + measured::BLOOM_FAR_WEIGHT * far)
-                * bloom_mul
         })
         .collect();
     // The bloom's colour runs the stroke's own gradient, so like the stroke it
     // depends on the column and nothing else.
-    let columns: Vec<Rgb> = (x0..x1)
+    let columns: Vec<(Rgb, f32)> = (x0..x1)
         .map(|x| {
-            let t = (((x as f32 + 0.5) - rect.x) / rect.w).clamp(0.0, 1.0);
-            bloom_a.mix(bloom_b, t)
+            let t = card.column_t(x);
+            let ink = inks.at(t);
+            (ink.bloom_a.mix(ink.bloom_b, t), ink.bloom)
         })
         .collect();
 
@@ -673,8 +974,10 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
             let Some(amount) = profile.get((d * PROFILE_STEPS_PER_PX) as usize) else {
                 continue;
             };
-            if *amount > 0.002 {
-                bloom.lighten(x, y, columns[column], *amount);
+            let (color, bloom_mul) = columns[column];
+            let amount = *amount * bloom_mul;
+            if amount > 0.002 {
+                bloom.lighten(x, y, color, amount);
             }
         }
     }
@@ -827,7 +1130,10 @@ fn text_column(
 
 /// Draw one card's body, plate, chip and text over whatever is already there.
 fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
-    let (stroke_a, stroke_b, _, _, _, lum) = card.inks();
+    // The card's chrome and its type are drawn at the settled light; only the
+    // body — stroke, fill and inner glow — sweeps with the wash and swings with
+    // the breath. See [`CardContent::settled_light`].
+    let (stroke_a, lum) = card.settled_inks();
     let content = card.content;
     let geometry = &card.geometry;
     let rect = card.rect;
@@ -852,13 +1158,20 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // Resolved once per column rather than once per pixel: a card is tens of
     // rows tall, and this is the difference between four hundred mixes and
     // twenty-four thousand.
+    //
+    // The stroke's own ends are resolved per column too now rather than once
+    // for the card, which is what carries the wash: with none they are the same
+    // pair every column and this is the gradient it always was, and with one
+    // the column ahead of the front is still lit by the state the card left.
+    let inks = card.inks();
     let columns: Vec<(Rgb, Rgb)> = (x0..x1)
         .map(|x| {
-            let t = (((x as f32 + 0.5) - ox) / width).clamp(0.0, 1.0);
+            let t = card.column_t(x);
+            let ink = inks.at(t);
             (
                 measured::FILL_MID
                     .mix(measured::FILL_TRAVEL_A.mix(measured::FILL_TRAVEL_B, t), 0.5),
-                stroke_a.mix(stroke_b, t),
+                ink.stroke_a.mix(ink.stroke_b, t),
             )
         })
         .collect();
@@ -1111,6 +1424,89 @@ fn title_text(entry: &AgentPanelEntry) -> String {
         .unwrap_or_else(|| entry.primary_label.clone())
 }
 
+/// The catalogue behaviour a card in this state breathes with.
+///
+/// **This mapping is the card's half of the state language**, and it is the same
+/// ladder the tray badges use: a card with work behind it and a card on the back
+/// burner are two *rhythms* before they are two brightnesses, so a reader who
+/// cannot separate the hues still reads the tree. Both names are declared on
+/// every row's lifecycle, so a card changing state does not restart the clock of
+/// the state it left.
+fn breath_behaviour(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working | AgentState::Blocked => crate::anim::behaviour::names::CARD_LIVE,
+        AgentState::Idle | AgentState::Unknown => crate::anim::behaviour::names::CARD_REST,
+    }
+}
+
+/// Where this card is in its breath, as the engine's envelope.
+///
+/// A **pure read** of the engine, exactly as `render` is a pure read of state:
+/// [`crate::anim::Animator::frame`] takes `&self` and consults no clock, so
+/// asking here cannot make one card disagree with another drawn in the same
+/// pass. All the clock work happened in `Animator::advance`, on the app loop.
+///
+/// Nothing about the motion is expressed here: this asks the catalogue where the
+/// card is and [`CardLight::breathed`] says what that means in light. `0.0`
+/// whenever the engine has nothing — animation off, a host with no cards, or a
+/// row that has only just been published — which is the card at its own settled
+/// light.
+fn breath(app: &AppState, row: &crate::anim::ElementId, state: AgentState) -> f32 {
+    use crate::anim::cell::{CellExtent, CellPos};
+    if !app.sidebar_cards.pulse {
+        return 0.0;
+    }
+    let Some(frame) = app.anim.frame(row, Some(breath_behaviour(state))) else {
+        return 0.0;
+    };
+    let Some(behaviour) = frame.behaviour else {
+        return 0.0;
+    };
+    // A card is one object, so its breaths are uniform and every cell of the
+    // notional extent resolves the same. Asking for the first cell of a 1×1
+    // extent is asking for the envelope itself.
+    let raw = behaviour.strength(CellPos::new(0, 0), CellExtent::new(1, 1), frame.progress);
+    quantize(raw, CARD_BREATH_STEPS)
+}
+
+/// The state wash crossing this card right now, or `None` when none is.
+///
+/// Two conditions, both of which have to hold: the app has to remember a change
+/// this card is still inside — which is what
+/// [`crate::app::card_wash::CardWashes::live`] answers — and the engine has to
+/// still be *playing* it. The second is what actually bounds the sweep: a wash
+/// is a mount stage, so it is live exactly while the element is mounting, and it
+/// ends because the mount ends rather than because anything here counts frames.
+fn wash(app: &AppState, row: crate::anim::CardRow) -> Option<CardWashFrame> {
+    if !app.sidebar_cards.wash {
+        return None;
+    }
+    let live = app.sidebar_card_washes.live(&row)?;
+    let from = live.from;
+    let frame = app
+        .anim
+        .frame(&crate::anim::ElementId::CardWash(live), None)?;
+    if frame.phase != crate::anim::Phase::Mount {
+        return None;
+    }
+    Some(CardWashFrame {
+        from,
+        progress: quantize(frame.progress, CARD_WASH_STEPS),
+        behaviour: *frame.behaviour?,
+    })
+}
+
+/// One value snapped to a ladder of `steps` over `0.0..=1.0`.
+///
+/// Quantized where it is *read* rather than where it is hashed, so the number
+/// that reaches the signature and the number that reaches the pixels are the
+/// same number. Rounded to the ladder and not merely hashed against it: a card
+/// carried forward on a matching signature keeps the pixels it was drawn with,
+/// and those pixels have to be the ones the ladder's step means.
+fn quantize(value: f32, steps: f32) -> f32 {
+    (value.clamp(0.0, 1.0) * steps).round() / steps
+}
+
 /// The card for one tree row, whichever kind of row it is.
 ///
 /// A mate is a Space and a worker is a pane, and both are rows in the one tree
@@ -1143,6 +1539,8 @@ fn content_for(
             let age = workspace
                 .aggregate_state_changed_at(&app.terminals)
                 .map(|at| app.state_age_now.saturating_duration_since(at));
+            let row = crate::anim::ElementId::workspace_row(&workspace.id);
+            let breath = breath(app, &row, state);
             Some(CardContent {
                 title: tokens.get("doing").cloned().unwrap_or(label),
                 tidbit: tidbit_parts(tokens.get("project"), tokens.get("context"), age),
@@ -1152,6 +1550,8 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.active == Some(*ws_idx),
                 mark: None,
+                breath,
+                wash: wash(app, crate::anim::CardRow::Space(workspace.id.clone())),
             })
         }
         super::WorkspaceListEntry::Agent { entry_idx, .. } => {
@@ -1159,6 +1559,8 @@ fn content_for(
             let age = detail
                 .last_agent_state_change_at
                 .map(|at| app.state_age_now.saturating_duration_since(at));
+            let row = crate::anim::ElementId::agent_row(detail.pane_id);
+            let breath = breath(app, &row, detail.state);
             Some(CardContent {
                 title: title_text(detail),
                 tidbit: tidbit_line(detail, age),
@@ -1168,6 +1570,8 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
                 mark: None,
+                breath,
+                wash: wash(app, crate::anim::CardRow::Agent(detail.pane_id)),
             })
         }
     }
@@ -3469,11 +3873,11 @@ mod tests {
             AgentState::Idle,
             AgentState::Unknown,
         ] {
-            let (sat, lum, bloom) = card_intensity(state);
-            assert!((0.0..=1.0).contains(&sat));
-            assert!((0.0..=1.0).contains(&lum));
-            assert!((0.0..=1.0).contains(&bloom));
-            let restated = measured::STROKE_A.restate(sat, lum);
+            let light = CardLight::of(state);
+            assert!((0.0..=1.0).contains(&light.sat));
+            assert!((0.0..=1.0).contains(&light.lum));
+            assert!((0.0..=1.0).contains(&light.bloom));
+            let restated = measured::STROKE_A.restate(light.sat, light.lum);
             // Desaturating toward grey is allowed; rotating the hue is not.
             let (r, g, b) = (restated.0, restated.1, restated.2);
             assert!(
@@ -5991,5 +6395,472 @@ mod shape_capture {
 
         std::fs::write(format!("{out}/manifest.tsv"), manifest).expect("writes");
         println!("wrote {} shapes to {out}", layers.len());
+    }
+}
+
+/// What the two card effects do to a card's light.
+///
+/// Both are read through the real engine and the real catalogue — nothing here
+/// constructs an envelope by hand — so what is pinned is the contract a reader
+/// sees on screen, not the arithmetic that produces it.
+#[cfg(test)]
+mod cards_breathe_and_wash {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The fleet with card motion configured on and its rows published, so the
+    /// engine really is running the breaths.
+    ///
+    /// The lifecycle is built from [`crate::config::SidebarCardsConfig`]'s own
+    /// answer rather than from `AppState::sidebar_row_lifecycle`, which
+    /// additionally requires this machine to have a proportional face —
+    /// something a container running the suite routinely does not. The
+    /// behaviours declared are the same ones either way, and the read path
+    /// under test is the same read path.
+    fn breathing_fleet() -> (AppState, Instant) {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        let now = Instant::now();
+        let mut lifecycle = crate::anim::Lifecycle::still();
+        for behaviour in app.sidebar_cards.pulse_behaviours() {
+            lifecycle = lifecycle.with_idle(*behaviour);
+        }
+        publish_rows(&mut app, &lifecycle, now);
+        (app, now)
+    }
+
+    fn publish_rows(app: &mut AppState, lifecycle: &crate::anim::Lifecycle, now: Instant) {
+        let agents: Vec<_> = super::super::sidebar_agent_live_entries(app)
+            .iter()
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::AgentRow, lifecycle, agents);
+        let spaces: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    crate::anim::ElementId::workspace_row(&workspace.id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.anim
+            .observe(now, crate::anim::Family::WorkspaceRow, lifecycle, spaces);
+    }
+
+    /// Every card the tree would draw, in layout order, as the renderer sees
+    /// them.
+    fn contents(app: &AppState) -> Vec<CardContent> {
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        let entries = super::super::workspace_list_entries(app);
+        let agents = super::super::sidebar_agent_entries(app);
+        cards
+            .iter()
+            .filter(|card| card.card_frame.is_some())
+            .filter_map(|card| entries.get(card.entry_idx))
+            .filter_map(|entry| content_for(app, entry, &agents))
+            .collect()
+    }
+
+    /// One card in a given state, or `None` when the fixture has none.
+    fn card_in(app: &AppState, state: AgentState) -> Option<CardContent> {
+        contents(app).into_iter().find(|card| card.state == state)
+    }
+
+    /// The pane behind the first card in `state`, and that card's row key.
+    fn agent_in(app: &AppState, state: AgentState) -> Option<crate::layout::PaneId> {
+        super::super::sidebar_agent_live_entries(app)
+            .into_iter()
+            .find(|entry| entry.state == state)
+            .map(|entry| entry.pane_id)
+    }
+
+    fn set_pane_state(app: &mut AppState, pane: crate::layout::PaneId, state: AgentState) {
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+            terminal.state = state;
+        }
+    }
+
+    /// Publish this frame's washes exactly as the app loop does, and return
+    /// whether any are live.
+    fn observe_washes(app: &mut AppState, now: Instant) {
+        let window = app.sidebar_cards.wash_duration();
+        let cards: Vec<_> = super::super::sidebar_agent_live_entries(app)
+            .iter()
+            .map(|entry| (crate::anim::CardRow::Agent(entry.pane_id), entry.state))
+            .collect();
+        let members = app.sidebar_card_washes.observe(now, window, cards);
+        let lifecycle = crate::app::card_wash::CardWashes::lifecycle(window);
+        app.anim
+            .observe(now, crate::anim::Family::CardWash, &lifecycle, members);
+    }
+
+    /// Sample the ink one card is drawn from, across its whole width.
+    ///
+    /// [`CardInks`] and not [`CardLight`], because the ink is what reaches the
+    /// pixels: the two states either side of a wash's front are mixed as
+    /// resolved colour, so asserting on the light before that mix would be
+    /// testing a number the rasteriser never sees.
+    fn across(card: &CardContent) -> Vec<CardInk> {
+        let inks = CardInks::of(card);
+        (0..=32).map(|i| inks.at(i as f32 / 32.0)).collect()
+    }
+
+    /// The ink at the middle of a card.
+    fn mid(card: &CardContent) -> CardInk {
+        CardInks::of(card).at(0.5)
+    }
+
+    // ---- the breath ------------------------------------------------------
+
+    /// A card at rest breathes, and the breath only ever sets it *back*.
+    ///
+    /// The captain's words the effect answers to are *"on the back burner —
+    /// dimmed or recessed slightly"*, and the two halves of that are separate
+    /// claims with separate checks: the card genuinely moves over its loop (it
+    /// breathes at all), and it never once goes above its own settled light (it
+    /// is recessed rather than attention-seeking). A breath that brightened
+    /// would make an idle card periodically outshine a working one, which
+    /// inverts the only thing a card's light is for.
+    #[test]
+    fn at_rest_a_cards_breath_only_ever_sets_it_back() {
+        let (mut app, now) = breathing_fleet();
+        let Some(idle) = card_in(&app, AgentState::Idle) else {
+            return;
+        };
+        let settled = CardLight::of(idle.state);
+
+        let mut lums = Vec::new();
+        let mut blooms = Vec::new();
+        // A full loop of the resting breath, sampled well inside its own frame
+        // tier so the walk is of the curve rather than of the quantiser.
+        for step in 0..=120 {
+            app.anim.advance(now + Duration::from_millis(step * 50));
+            let Some(card) = card_in(&app, AgentState::Idle) else {
+                return;
+            };
+            let light = card.arrived_light();
+            assert!(
+                light.lum <= settled.lum + 1e-6 && light.bloom <= settled.bloom + 1e-6,
+                "the breath took a resting card above its own light: {light:?} against {settled:?}"
+            );
+            assert!(
+                light.sat == settled.sat,
+                "a breath must not desaturate: a card losing its hue reads as \
+                 losing its state, not as resting"
+            );
+            lums.push(light.lum);
+            blooms.push(light.bloom);
+        }
+
+        let swing = |values: &[f32]| {
+            let hi = values.iter().cloned().fold(f32::MIN, f32::max);
+            let lo = values.iter().cloned().fold(f32::MAX, f32::min);
+            (hi - lo) / hi.max(1e-6)
+        };
+        let lum_swing = swing(&lums);
+        let bloom_swing = swing(&blooms);
+        assert!(
+            lum_swing > 0.02,
+            "the card did not breathe at all: its light moved by {lum_swing:.4}"
+        );
+        assert!(
+            bloom_swing > lum_swing * 2.0,
+            "the depth cue is the point: the bloom swung {bloom_swing:.3} against \
+             the ink's {lum_swing:.3}, so this reads as a dimmer rather than as \
+             a card settling back into the panel"
+        );
+        // And it stays readable at the trough. The spec's digestibility
+        // condition does not take a break for half of every cycle.
+        assert!(
+            lums.iter().all(|lum| *lum > settled.lum * 0.8),
+            "a resting card dimmed past four fifths of its own light"
+        );
+    }
+
+    /// A working card breathes on a different rhythm from a resting one — which
+    /// is the whole reason there are two entries and not one with a knob.
+    #[test]
+    fn a_working_card_and_a_resting_one_do_not_move_together() {
+        let (mut app, now) = breathing_fleet();
+        let (Some(_), Some(_)) = (
+            card_in(&app, AgentState::Idle),
+            card_in(&app, AgentState::Working),
+        ) else {
+            return;
+        };
+        let mut differed = false;
+        for step in 0..=60 {
+            app.anim.advance(now + Duration::from_millis(step * 50));
+            let (Some(idle), Some(working)) = (
+                card_in(&app, AgentState::Idle),
+                card_in(&app, AgentState::Working),
+            ) else {
+                return;
+            };
+            if (idle.breath - working.breath).abs() > 0.05 {
+                differed = true;
+            }
+        }
+        assert!(
+            differed,
+            "the two card states breathed in lockstep, so rhythm is carrying \
+             nothing and the state ladder is colour alone"
+        );
+    }
+
+    /// With the pulse switched off a card is drawn at exactly its settled
+    /// light, which is what a host with no card animation already gets.
+    #[test]
+    fn switching_the_pulse_off_settles_every_card() {
+        let (mut app, now) = breathing_fleet();
+        app.sidebar_cards.pulse = false;
+        app.anim.advance(now + Duration::from_millis(900));
+        for card in contents(&app) {
+            assert_eq!(card.breath, 0.0);
+            assert_eq!(mid(&card), CardLight::of(card.state).inks());
+        }
+    }
+
+    /// **The cost claim, as a test rather than as a measurement.**
+    ///
+    /// A card that breathes is a card whose artwork changes, and artwork
+    /// changing means a rasterisation and an upload. If every frame of every
+    /// card's breath cost one, a tree of a dozen cards would put the whole card
+    /// path on the frame-time tail — which is the one thing this effect could
+    /// plausibly break.
+    ///
+    /// [`CARD_BREATH_STEPS`] is what stops it: a card whose quantised envelope
+    /// has not moved hashes to the same signature and is carried forward with
+    /// nothing redrawn. So over two seconds of frames at the render floor, the
+    /// great majority of card-frames have to be held rather than drawn. The
+    /// numbers are a band and not a fixed count, because what is being pinned
+    /// is that the quantiser is load-bearing, not what a particular period
+    /// divides to.
+    #[test]
+    fn a_breathing_tree_holds_most_of_its_artwork_between_frames() {
+        let (mut app, now) = breathing_fleet();
+        let rect = sidebar_rect();
+        if !is_available(&app, super::super::row_fold_width(&app, rect)) {
+            return;
+        }
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let mut previous: Vec<SidebarCardLayer> = Vec::new();
+        let mut card_frames = 0usize;
+        let mut redrawn = 0usize;
+        // Two seconds at the app's own 16 ms render floor: the fastest anything
+        // could ask these cards for a frame.
+        for step in 0..125u64 {
+            app.anim.advance(now + Duration::from_millis(step * 16));
+            let built = build_cards(&app, &cards, rect, app.host_cell_size, &previous).update;
+            let CardsUpdate::Rebuilt(layers) = built else {
+                card_frames += previous.len();
+                continue;
+            };
+            for (index, layer) in layers.iter().enumerate() {
+                card_frames += 1;
+                if previous
+                    .get(index)
+                    .is_none_or(|held| held.signature != layer.signature)
+                {
+                    redrawn += 1;
+                }
+            }
+            previous = layers;
+        }
+        assert!(card_frames > 0, "the fixture drew no cards at all");
+        assert!(
+            redrawn > 0,
+            "no card was ever redrawn, so nothing is breathing and this test              is measuring a still panel"
+        );
+        let share = redrawn as f32 / card_frames as f32;
+        assert!(
+            share < 0.35,
+            "{redrawn} of {card_frames} card-frames were rasterised ({:.0}%). The              breath is being drawn at the loop's rate rather than at its own              quantised step, which is exactly the frame-time tail this ladder              exists to keep off.",
+            share * 100.0
+        );
+    }
+
+    // ---- the wash --------------------------------------------------------
+
+    /// Drive one card from `from` to `into` and return the app the moment the
+    /// wash starts, with the pane it happened on.
+    fn washing(from: AgentState, into: AgentState) -> Option<(AppState, Instant, AgentState)> {
+        let (mut app, now) = breathing_fleet();
+        let pane = agent_in(&app, from)?;
+        observe_washes(&mut app, now);
+        set_pane_state(&mut app, pane, into);
+        observe_washes(&mut app, now);
+        Some((app, now, from))
+    }
+
+    /// **The acceptance criterion.** A state change leaves the *whole* card
+    /// changed, not a highlight that passes over and leaves nothing behind.
+    ///
+    /// Checked at the end of the sweep across every column of the card: all of
+    /// them are the new state's light, none of them have gone back. A band
+    /// would end with the card exactly as it started, which is the thing this
+    /// is not.
+    #[test]
+    fn a_finished_wash_leaves_the_whole_card_in_the_new_state() {
+        let Some((mut app, now, _)) = washing(AgentState::Idle, AgentState::Working) else {
+            return;
+        };
+        let window = app.sidebar_cards.wash_duration();
+        app.anim.advance(now + window);
+        observe_washes(&mut app, now + window);
+
+        let Some(card) = card_in(&app, AgentState::Working) else {
+            return;
+        };
+        assert!(card.wash.is_none(), "the sweep outlived its own window");
+        // The new state's light, still breathing — the breath does not stop
+        // because a wash finished, so what every column has to agree on is the
+        // destination *as the card is drawn*, not the raw state constant.
+        let arrived = CardLight::of(AgentState::Working)
+            .breathed(card.breath)
+            .inks();
+        for (index, ink) in across(&card).into_iter().enumerate() {
+            assert_eq!(
+                ink, arrived,
+                "column {index} of 32 was left in a state the card is no longer in"
+            );
+        }
+        // And the state it left is genuinely gone from the card, rather than
+        // the two states having happened to resolve alike.
+        assert_ne!(
+            arrived,
+            CardLight::of(AgentState::Idle).breathed(card.breath).inks()
+        );
+    }
+
+    /// And while it is crossing, the card really is two states: the new one
+    /// behind the front and the one it left ahead of it.
+    ///
+    /// This is what makes the change legible *as a change* rather than as a
+    /// card that is suddenly a different colour, and it is the reason the wash
+    /// has to remember the state the card came from at all.
+    #[test]
+    fn a_wash_in_flight_is_new_on_its_left_and_old_on_its_right() {
+        let Some((mut app, now, from)) = washing(AgentState::Idle, AgentState::Working) else {
+            return;
+        };
+        let window = app.sidebar_cards.wash_duration();
+        let left_behind = CardLight::of(from).bloom;
+        let arriving = CardLight::of(AgentState::Working).bloom;
+
+        // Somewhere in the middle of the sweep. Sampled across several steps
+        // rather than at one, because where the front is at any single instant
+        // is the curve's business and not this test's.
+        let mut saw_two_sides = false;
+        for step in 1..=8 {
+            let at = now + window / 12 * step;
+            app.anim.advance(at);
+            observe_washes(&mut app, at);
+            let Some(card) = card_in(&app, AgentState::Working) else {
+                return;
+            };
+            let Some(_) = card.wash else { continue };
+            let columns = across(&card);
+            let left = columns.first().copied().expect("sampled");
+            let right = columns.last().copied().expect("sampled");
+            // Read as the *bloom strength*: it is the number the two states
+            // differ in most, and it is what the halo — the depth cue the whole
+            // effect is about — is laid from.
+            if left.bloom > right.bloom + 1e-3 {
+                saw_two_sides = true;
+                assert!(
+                    left.bloom <= arriving + 1e-6,
+                    "the left of the card overshot the state it was arriving at"
+                );
+                assert!(
+                    right.bloom <= left_behind + 1e-6,
+                    "the right of the card had already passed the state it is \
+                     still meant to be in"
+                );
+                // And every column between the two is on the ramp between them,
+                // in order: a front, not two halves.
+                for pair in columns.windows(2) {
+                    assert!(
+                        pair[0].bloom >= pair[1].bloom - 1e-3,
+                        "the front doubled back on itself inside the card"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_two_sides,
+            "the card was never two states at once, so nothing swept across it"
+        );
+    }
+
+    /// A card that has just arrived does not wash, and a card whose state has
+    /// not moved does not either. Otherwise every row in the tree would sweep
+    /// on the frame Herdr started.
+    #[test]
+    fn a_card_washes_on_a_change_and_never_on_arrival() {
+        let (mut app, now) = breathing_fleet();
+        observe_washes(&mut app, now);
+        assert!(
+            contents(&app).iter().all(|card| card.wash.is_none()),
+            "the tree washed every card the first time it saw them"
+        );
+        observe_washes(&mut app, now + Duration::from_millis(10));
+        assert!(contents(&app).iter().all(|card| card.wash.is_none()));
+    }
+
+    /// With the wash switched off a state change is simply a card in a
+    /// different state, and nothing sweeps.
+    #[test]
+    fn switching_the_wash_off_leaves_a_state_change_still() {
+        let Some((mut app, now, _)) = washing(AgentState::Idle, AgentState::Working) else {
+            return;
+        };
+        app.sidebar_cards.wash = false;
+        app.anim.advance(now + Duration::from_millis(100));
+        for card in contents(&app) {
+            assert!(card.wash.is_none());
+            let inks = CardInks::of(&card);
+            assert_eq!(inks.at(0.0), inks.at(1.0));
+        }
+    }
+
+    /// The breath keeps running underneath a wash.
+    ///
+    /// Both sides of the front are breathed, not just the destination —
+    /// otherwise a state change would look like the moment the card's breath
+    /// was switched on.
+    #[test]
+    fn a_card_breathes_on_both_sides_of_a_wash() {
+        let Some((mut app, now, from)) = washing(AgentState::Idle, AgentState::Working) else {
+            return;
+        };
+        let at = now + app.sidebar_cards.wash_duration() / 3;
+        app.anim.advance(at);
+        observe_washes(&mut app, at);
+        let Some(card) = card_in(&app, AgentState::Working) else {
+            return;
+        };
+        if card.wash.is_none() || card.breath <= 0.0 {
+            return;
+        }
+        let unbreathed_old = CardLight::of(from).inks();
+        let right = CardInks::of(&card).at(1.0);
+        assert!(
+            right.bloom < unbreathed_old.bloom || unbreathed_old.bloom == 0.0,
+            "the far side of the front was drawn without the breath the rest of \
+             the card has: {right:?} against {unbreathed_old:?}"
+        );
     }
 }

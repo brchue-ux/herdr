@@ -11,6 +11,7 @@ pub(crate) mod agent_view;
 mod agents;
 mod api;
 mod api_helpers;
+pub(crate) mod card_wash;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 mod creation;
@@ -735,6 +736,8 @@ impl App {
             headless_animation_interval: config.advanced.headless_animation_interval(),
             sidebar_notifications: config.ui.sidebar.notifications,
             sidebar_signal_tray: config.ui.sidebar.signal_tray,
+            sidebar_cards: config.ui.sidebar.cards,
+            sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -1693,6 +1696,7 @@ impl App {
                     config.advanced.headless_animation_interval();
                 self.state.sidebar_notifications = config.ui.sidebar.notifications;
                 self.state.sidebar_signal_tray = config.ui.sidebar.signal_tray;
+                self.state.sidebar_cards = config.ui.sidebar.cards;
                 // A reload re-owns the config tier only. A plugin- or UI-set
                 // view keeps the panel until its own owner gives it up.
                 self.replace_agent_view(
