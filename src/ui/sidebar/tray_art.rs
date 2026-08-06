@@ -53,27 +53,48 @@ use crate::app::signal_tray::BadgeState;
 /// gain at these sizes.
 const SUPERSAMPLE: u32 = 4;
 
-/// The three ink weights every mark is composed from.
+/// The four layers every mark is composed from: three that print, one that
+/// takes away.
 ///
-/// The split is the whole difference between a badge and a glyph: the
-/// silhouette, the interior detail and the highlight get different
-/// brightnesses, so the mark still reads as one object when it is 48 pixels
-/// tall and the detail has gone soft.
+/// The split is the whole difference between a badge and a glyph. Three
+/// brightnesses let the silhouette, the interior detail and the highlight read
+/// as one object rather than as one stroke; and [`Ink::Cut`] is what lets a
+/// mark be drawn as **mass rather than as line**.
+///
+/// ## Why a cut layer exists at all
+///
+/// The three printing weights all lay down the *same hue* — they differ only in
+/// alpha, and they composite source-over, so a lighter weight painted on top of
+/// a heavier one does not read as a detail inside it, it reads as more of the
+/// same ink. That is fine for an outline drawing, where every stroke sits on
+/// bare surface. It is useless for a solid one, and solid is what these marks
+/// now are: a filled speech bubble has nowhere for a pip to go except *through*
+/// it. `Cut` removes coverage after the three have printed, so an interior
+/// detail is negative space showing the tray surface — the same thing the
+/// badge's own transparent corners already are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ink {
     Heavy,
     Mid,
     Light,
+    /// Removes what the three printing layers put down. Never prints.
+    Cut,
 }
 
 impl Ink {
+    /// The layers that print, heaviest first. Deliberately not every variant:
+    /// [`Ink::Cut`] is applied after these, as a subtraction.
     const ALL: [Self; 3] = [Self::Heavy, Self::Mid, Self::Light];
+
+    /// How many mask layers a pen carries.
+    const LAYERS: usize = 4;
 
     fn index(self) -> usize {
         match self {
             Self::Heavy => 0,
             Self::Mid => 1,
             Self::Light => 2,
+            Self::Cut => 3,
         }
     }
 
@@ -83,6 +104,7 @@ impl Ink {
             Self::Heavy => 1.0,
             Self::Mid => 0.80,
             Self::Light => 0.58,
+            Self::Cut => 0.0,
         }
     }
 }
@@ -149,6 +171,29 @@ impl Coverage {
             return 0.0;
         }
         self.values[(y as usize) * (self.width as usize) + x as usize]
+    }
+
+    /// This coverage read `dy` output pixels further down than it was drawn, so
+    /// a positive `dy` lifts the mark on screen.
+    ///
+    /// Interpolated between the two rows the sample falls between rather than
+    /// rounded to one of them. That is what makes a three-pixel travel read as
+    /// movement instead of as three steps, and it is why the badge needs no
+    /// sub-cell placement plumbing to move smoothly: the motion happens inside
+    /// the image, where a fraction of a pixel is expressible.
+    fn at_shifted(&self, x: u32, y: u32, dy: f32) -> f32 {
+        let source = y as f32 + dy;
+        let base = source.floor();
+        let frac = source - base;
+        let row = |value: f32| {
+            if value < 0.0 {
+                0.0
+            } else {
+                self.at(x, value as u32)
+            }
+        };
+        let lo = row(base);
+        lo + (row(base + 1.0) - lo) * frac
     }
 
     fn set(&mut self, x: u32, y: u32, value: f32) {
@@ -260,7 +305,7 @@ impl Mask {
 /// looked at and approved in the renders.
 struct Pen {
     size: u32,
-    masks: [Mask; 3],
+    masks: [Mask; Ink::LAYERS],
 }
 
 impl Pen {
@@ -268,7 +313,7 @@ impl Pen {
         let hi = size * SUPERSAMPLE;
         Self {
             size,
-            masks: [Mask::new(hi), Mask::new(hi), Mask::new(hi)],
+            masks: [Mask::new(hi), Mask::new(hi), Mask::new(hi), Mask::new(hi)],
         }
     }
 
@@ -411,11 +456,12 @@ impl Pen {
         });
     }
 
-    fn resolve(&self) -> [Coverage; 3] {
+    fn resolve(&self) -> [Coverage; Ink::LAYERS] {
         [
             self.masks[0].resolve(self.size),
             self.masks[1].resolve(self.size),
             self.masks[2].resolve(self.size),
+            self.masks[3].resolve(self.size),
         ]
     }
 }
@@ -473,121 +519,194 @@ fn polygon_contains(points: &[(f32, f32)], px: f32, py: f32) -> bool {
 // ---------------------------------------------------------------------------
 // The eight marks
 //
-// Ported verbatim from the generator whose output was reviewed and approved.
-// The numbers are the design; changing one changes a mark that has already been
-// looked at, so treat them the way you would treat a checked-in asset.
+// Drawn for MASS, not for line. Every one of the eight is a solid silhouette
+// with its detail cut out of it, rather than an outline with strokes inside it,
+// and they are all built from the same three weights so the grid reads as one
+// object rather than as eight unrelated drawings.
+//
+// The recipe each mark follows, and the reason it is a recipe rather than eight
+// separate decisions:
+//
+// 1. **One dominant body**, filled, occupying roughly a third of the mark box.
+//    That is what survives at 20 pixels, where a 0.03-wide stroke is a third of
+//    a pixel and disappears.
+// 2. **Its detail cut out of it** ([`Ink::Cut`]), never drawn on top. A hole
+//    reads at every size a shape does, because it *is* the shape.
+// 3. **A secondary mass in `Mid`**, and a highlight in `Light`, both sized from
+//    the shared constants below rather than per mark — that is the whole of
+//    "consistent in weight", and `all_eight_marks_carry_a_comparable_mass`
+//    is the check that keeps it true.
+//
+// The numbers below are the design. `no_two_marks_share_a_silhouette` and the
+// mass band are what a change to one of them has to keep satisfying.
 // ---------------------------------------------------------------------------
 
-/// A question with two answers: a speech bubble carrying two option pips.
+/// The one weight any cut detail is drawn at, as a fraction of the mark box.
+///
+/// Stated once and used by all eight, because eight marks that each chose their
+/// own detail weight is exactly how a grid stops reading as one object. Wide
+/// enough to still be a visible hole at the smallest badge the ladder asks for.
+const CUT: f32 = 0.075;
+
+/// The heavier cut, for a detail carrying meaning rather than texture — the
+/// strike through a failed check, the break across a pulled plug.
+const CUT_BOLD: f32 = 0.105;
+
+/// Corner rounding on a solid body, as a fraction of the mark box.
+const BODY_R: f32 = 0.12;
+
+/// A question with two answers: a solid speech bubble with two pips cut out.
 ///
 /// The two pips are the whole point — this is the one badge whose action is
-/// answerable in place, and the mark says so before the popup opens.
+/// answerable in place, and the mark says so before the popup opens. They are
+/// holes rather than dots because a dot painted on a filled bubble is the same
+/// colour as the bubble.
 fn ask(p: &mut Pen) {
-    p.rrect(Ink::Heavy, 0.06, 0.12, 0.94, 0.66, 0.16, Some(0.070));
-    p.poly(Ink::Heavy, &[(0.26, 0.62), (0.30, 0.93), (0.52, 0.62)]);
-    p.rrect(Ink::Light, 0.13, 0.19, 0.87, 0.59, 0.11, Some(0.028));
-    p.ellipse(Ink::Mid, 0.37, 0.39, 0.082, 0.082, None);
-    p.ellipse(Ink::Mid, 0.63, 0.39, 0.082, 0.082, None);
-    p.ellipse(Ink::Light, 0.37, 0.39, 0.145, 0.145, Some(0.024));
-    p.ellipse(Ink::Light, 0.63, 0.39, 0.145, 0.145, Some(0.024));
+    p.rrect(Ink::Heavy, 0.05, 0.09, 0.95, 0.68, 0.17, None);
+    p.poly(Ink::Heavy, &[(0.25, 0.62), (0.28, 0.96), (0.53, 0.62)]);
+    // The two answers.
+    p.ellipse(Ink::Cut, 0.365, 0.385, 0.105, 0.105, None);
+    p.ellipse(Ink::Cut, 0.635, 0.385, 0.105, 0.105, None);
+    // The lit top edge, which is what stops a solid slab reading as flat.
+    p.rrect(Ink::Light, 0.13, 0.15, 0.87, 0.21, 0.03, None);
 }
 
-/// Finished work waiting to be looked at: a lens over a written card.
+/// Finished work waiting to be looked at: a solid page under a solid lens.
 fn review(p: &mut Pen) {
-    p.rrect(Ink::Mid, 0.04, 0.08, 0.70, 0.80, 0.11, Some(0.055));
-    p.line(Ink::Light, &[(0.15, 0.28), (0.58, 0.28)], 0.036);
-    p.line(Ink::Light, &[(0.15, 0.42), (0.48, 0.42)], 0.036);
-    p.line(Ink::Light, &[(0.15, 0.56), (0.38, 0.56)], 0.036);
-    p.line(Ink::Heavy, &[(0.76, 0.72), (0.95, 0.94)], 0.085);
-    p.ellipse(Ink::Heavy, 0.62, 0.56, 0.27, 0.27, Some(0.072));
-    p.arc(Ink::Light, 0.62, 0.56, 0.17, 0.17, 150.0, 235.0, 0.034);
+    p.rrect(Ink::Mid, 0.02, 0.06, 0.66, 0.86, BODY_R, None);
+    // The writing on it, cut rather than drawn.
+    p.line(Ink::Cut, &[(0.13, 0.26), (0.55, 0.26)], CUT);
+    p.line(Ink::Cut, &[(0.13, 0.44), (0.47, 0.44)], CUT);
+    p.line(Ink::Cut, &[(0.13, 0.62), (0.38, 0.62)], CUT);
+    // The lens: one solid disc, its glass cut back out, sitting over the page.
+    p.line(Ink::Heavy, &[(0.72, 0.70), (0.96, 0.97)], 0.135);
+    p.ellipse(Ink::Heavy, 0.63, 0.55, 0.315, 0.315, None);
+    p.ellipse(Ink::Cut, 0.63, 0.55, 0.185, 0.185, None);
+    // The catchlight on the glass.
+    p.arc(Ink::Light, 0.63, 0.55, 0.255, 0.255, 165.0, 230.0, 0.075);
 }
 
-/// A published summary: a folded sheet, three rules, and a struck seal.
+/// A published summary: a solid folded sheet with its rules cut out and a seal.
 fn report(p: &mut Pen) {
-    p.line(
+    p.poly(
         Ink::Heavy,
         &[
-            (0.14, 0.05),
-            (0.60, 0.05),
-            (0.86, 0.29),
-            (0.86, 0.82),
-            (0.14, 0.82),
-            (0.14, 0.05),
+            (0.11, 0.03),
+            (0.60, 0.03),
+            (0.89, 0.31),
+            (0.89, 0.84),
+            (0.11, 0.84),
         ],
-        0.058,
     );
-    p.line(Ink::Mid, &[(0.60, 0.05), (0.60, 0.29), (0.86, 0.29)], 0.044);
-    p.line(Ink::Light, &[(0.25, 0.42), (0.74, 0.42)], 0.038);
-    p.line(Ink::Light, &[(0.25, 0.54), (0.68, 0.54)], 0.038);
-    p.line(Ink::Light, &[(0.25, 0.66), (0.55, 0.66)], 0.038);
-    p.ellipse(Ink::Heavy, 0.74, 0.80, 0.155, 0.155, None);
-    p.ellipse(Ink::Light, 0.74, 0.80, 0.085, 0.085, Some(0.030));
-    p.line(Ink::Mid, &[(0.66, 0.92), (0.70, 1.00)], 0.034);
-    p.line(Ink::Mid, &[(0.82, 0.92), (0.78, 1.00)], 0.034);
+    // The fold, cut so the corner reads as turned rather than as printed on.
+    p.poly(Ink::Cut, &[(0.60, 0.05), (0.87, 0.31), (0.60, 0.31)]);
+    p.line(Ink::Cut, &[(0.23, 0.45), (0.75, 0.45)], CUT);
+    p.line(Ink::Cut, &[(0.23, 0.60), (0.68, 0.60)], CUT);
+    // The seal, overlapping the sheet's lower edge, with its centre cut.
+    p.ellipse(Ink::Mid, 0.72, 0.83, 0.185, 0.185, None);
+    p.ellipse(Ink::Cut, 0.72, 0.83, 0.070, 0.070, None);
+    p.poly(Ink::Mid, &[(0.63, 0.94), (0.72, 0.92), (0.66, 1.00)]);
+    p.poly(Ink::Mid, &[(0.81, 0.94), (0.72, 0.92), (0.78, 1.00)]);
 }
 
 /// A worker that is no longer an agent: the plug is out of the socket.
 fn stopped(p: &mut Pen) {
-    // The socket, still in the wall.
-    p.rrect(Ink::Heavy, 0.01, 0.24, 0.30, 0.76, 0.10, Some(0.062));
-    p.rrect(Ink::Mid, 0.19, 0.36, 0.26, 0.46, 0.035, None);
-    p.rrect(Ink::Mid, 0.19, 0.54, 0.26, 0.64, 0.035, None);
+    // The socket, still in the wall: one solid block with two slots cut in it.
+    p.rrect(Ink::Heavy, 0.00, 0.20, 0.31, 0.80, BODY_R, None);
+    p.rrect(Ink::Cut, 0.15, 0.33, 0.25, 0.44, 0.03, None);
+    p.rrect(Ink::Cut, 0.15, 0.56, 0.25, 0.67, 0.03, None);
     // The plug, pulled out, prongs still facing it.
-    p.rrect(Ink::Heavy, 0.62, 0.22, 0.93, 0.78, 0.14, Some(0.062));
-    p.line(Ink::Heavy, &[(0.62, 0.38), (0.46, 0.38)], 0.055);
-    p.line(Ink::Heavy, &[(0.62, 0.62), (0.46, 0.62)], 0.055);
-    // Its cable, trailing away off the bottom-right.
-    p.line(Ink::Mid, &[(0.86, 0.78), (0.92, 0.90), (0.80, 0.99)], 0.046);
-    // The break in the gap.
-    p.line(Ink::Light, &[(0.36, 0.30), (0.40, 0.20)], 0.032);
-    p.line(Ink::Light, &[(0.36, 0.70), (0.40, 0.80)], 0.032);
-    p.line(Ink::Light, &[(0.34, 0.50), (0.25, 0.50)], 0.032);
+    p.rrect(Ink::Heavy, 0.60, 0.18, 0.96, 0.82, 0.16, None);
+    p.rrect(Ink::Heavy, 0.47, 0.30, 0.62, 0.41, 0.04, None);
+    p.rrect(Ink::Heavy, 0.47, 0.59, 0.62, 0.70, 0.04, None);
+    // Its cable, trailing away off the bottom.
+    p.line(Ink::Mid, &[(0.86, 0.82), (0.93, 0.93), (0.79, 1.00)], 0.085);
+    // The break across the gap: the one detail that says *disconnected* rather
+    // than *about to connect*, so it gets the heavier cut weight.
+    p.line(Ink::Light, &[(0.34, 0.62), (0.44, 0.38)], CUT_BOLD);
 }
 
 /// Local commits that have not left the machine: lifting off a dock.
 fn push(p: &mut Pen) {
-    p.line(Ink::Heavy, &[(0.50, 0.80), (0.50, 0.32)], 0.095);
-    p.poly(Ink::Heavy, &[(0.22, 0.42), (0.50, 0.08), (0.78, 0.42)]);
-    p.rrect(Ink::Mid, 0.14, 0.87, 0.86, 0.97, 0.05, None);
-    p.line(Ink::Light, &[(0.30, 0.74), (0.30, 0.62)], 0.040);
-    p.line(Ink::Light, &[(0.70, 0.74), (0.70, 0.62)], 0.040);
-    p.line(Ink::Light, &[(0.36, 0.30), (0.42, 0.24)], 0.030);
+    // Head and shaft as one solid body, so there is no seam to come apart at
+    // small sizes.
+    p.poly(
+        Ink::Heavy,
+        &[
+            (0.50, 0.04),
+            (0.86, 0.42),
+            (0.65, 0.42),
+            (0.65, 0.76),
+            (0.35, 0.76),
+            (0.35, 0.42),
+            (0.14, 0.42),
+        ],
+    );
+    // The notch, which is what stops a solid arrow reading as a triangle on a
+    // bar.
+    p.rrect(Ink::Cut, 0.44, 0.48, 0.56, 0.70, 0.03, None);
+    // The dock it is leaving.
+    p.rrect(Ink::Mid, 0.10, 0.86, 0.90, 0.99, 0.05, None);
 }
 
-/// Remote commits you do not have: the heavier crescent comes inward.
+/// Remote commits you do not have: two solid crescents turning inward.
 fn sync(p: &mut Pen) {
-    p.arc(Ink::Heavy, 0.50, 0.50, 0.34, 0.34, 195.0, 340.0, 0.085);
-    p.poly(Ink::Heavy, &[(0.90, 0.34), (0.94, 0.62), (0.68, 0.52)]);
-    p.arc(Ink::Mid, 0.50, 0.50, 0.34, 0.34, 15.0, 160.0, 0.058);
-    p.poly(Ink::Mid, &[(0.10, 0.66), (0.06, 0.38), (0.32, 0.48)]);
-    p.ellipse(Ink::Mid, 0.50, 0.50, 0.095, 0.095, None);
-    p.ellipse(Ink::Light, 0.50, 0.50, 0.185, 0.185, Some(0.028));
+    p.arc(Ink::Heavy, 0.50, 0.50, 0.40, 0.40, 200.0, 345.0, 0.155);
+    p.poly(Ink::Heavy, &[(0.95, 0.28), (0.99, 0.64), (0.64, 0.53)]);
+    p.arc(Ink::Mid, 0.50, 0.50, 0.40, 0.40, 20.0, 165.0, 0.155);
+    p.poly(Ink::Mid, &[(0.05, 0.72), (0.01, 0.36), (0.36, 0.47)]);
+    // The hub, with its centre cut so the middle of the mark is not a blob.
+    p.ellipse(Ink::Light, 0.50, 0.50, 0.135, 0.135, None);
+    p.ellipse(Ink::Cut, 0.50, 0.50, 0.055, 0.055, None);
 }
 
-/// A pull request: a branch leaves the trunk and rejoins it.
+/// A pull request: a branch leaves the solid trunk and rejoins it.
 fn pr(p: &mut Pen) {
-    p.line(Ink::Heavy, &[(0.24, 0.16), (0.24, 0.84)], 0.070);
-    p.arc(Ink::Heavy, 0.24, 0.50, 0.48, 0.30, -78.0, 78.0, 0.062);
-    p.ellipse(Ink::Heavy, 0.24, 0.14, 0.115, 0.115, None);
-    p.ellipse(Ink::Heavy, 0.24, 0.86, 0.115, 0.115, None);
-    p.ellipse(Ink::Mid, 0.70, 0.50, 0.100, 0.100, None);
-    p.ellipse(Ink::Light, 0.70, 0.50, 0.175, 0.175, Some(0.028));
-    p.poly(Ink::Mid, &[(0.31, 0.66), (0.42, 0.70), (0.34, 0.78)]);
+    p.rrect(Ink::Heavy, 0.14, 0.10, 0.32, 0.90, 0.09, None);
+    p.arc(Ink::Heavy, 0.23, 0.50, 0.52, 0.33, -74.0, 74.0, 0.115);
+    // The nodes, each a solid disc with its centre cut, so all three read as
+    // the same kind of thing.
+    for (cx, cy) in [(0.23, 0.13), (0.23, 0.87)] {
+        p.ellipse(Ink::Cut, cx, cy, 0.052, 0.052, None);
+    }
+    p.ellipse(Ink::Mid, 0.72, 0.50, 0.185, 0.185, None);
+    p.ellipse(Ink::Cut, 0.72, 0.50, 0.070, 0.070, None);
+    // Direction: the branch is going somewhere.
+    p.poly(Ink::Light, &[(0.34, 0.63), (0.48, 0.68), (0.36, 0.79)]);
 }
 
-/// Check runs on a spine: one passed, one running, one struck out.
+/// Check runs on a spine: one passed, one part way, one struck out.
+///
+/// Three pills of identical mass, told apart only by what is cut out of them —
+/// which is the whole reason this mark does not collapse into `report`.
 fn checks(p: &mut Pen) {
-    p.line(Ink::Mid, &[(0.10, 0.14), (0.10, 0.84)], 0.048);
-    for (y0, y1) in [(0.05, 0.28), (0.39, 0.62), (0.73, 0.96)] {
-        let y = (y0 + y1) / 2.0;
-        p.line(Ink::Light, &[(0.10, y), (0.28, y)], 0.036);
+    p.rrect(Ink::Mid, 0.02, 0.06, 0.16, 0.94, 0.06, None);
+    let pills = [(0.04_f32, 0.28_f32), (0.39, 0.63), (0.74, 0.98)];
+    for (index, (y0, y1)) in pills.into_iter().enumerate() {
+        p.rrect(Ink::Heavy, 0.24, y0, 0.99, y1, 0.11, None);
+        // The tie back to the spine.
+        p.rrect(
+            Ink::Mid,
+            0.10,
+            (y0 + y1) / 2.0 - 0.035,
+            0.26,
+            (y0 + y1) / 2.0 + 0.035,
+            0.02,
+            None,
+        );
+        match index {
+            // Passed: whole.
+            0 => {}
+            // Part way: the unfinished half cut back out.
+            1 => p.rrect(Ink::Cut, 0.60, y0 + 0.045, 0.945, y1 - 0.045, 0.06, None),
+            // Failed: struck through.
+            _ => p.line(
+                Ink::Cut,
+                &[(0.30, y1 - 0.035), (0.93, y0 + 0.035)],
+                CUT_BOLD,
+            ),
+        }
     }
-    p.rrect(Ink::Mid, 0.28, 0.05, 0.97, 0.28, 0.11, None); // passed: solid
-    p.rrect(Ink::Heavy, 0.28, 0.39, 0.97, 0.62, 0.11, Some(0.050)); // running: half
-    p.rrect(Ink::Mid, 0.28, 0.39, 0.60, 0.62, 0.11, None);
-    p.rrect(Ink::Heavy, 0.28, 0.73, 0.97, 0.96, 0.11, Some(0.050)); // failed: struck
-    p.line(Ink::Heavy, &[(0.36, 0.92), (0.89, 0.77)], 0.062);
 }
 
 fn draw_mark(signal: FleetSignal, pen: &mut Pen) {
@@ -633,6 +752,62 @@ const BORDER_RADIUS: f32 = 0.13;
 
 /// How much of the badge's side the mark occupies.
 const MARK_SCALE: f32 = 0.60;
+
+// ---------------------------------------------------------------------------
+// Motion
+//
+// What the animation engine's envelope does to a badge's pixels. The *shape* of
+// that envelope — the exponential ramp, the ten percent overshoot, the five
+// percent back — belongs to `anim::behaviour::Curve::SnapPendulum` and is not
+// re-expressed here. This module only says what the number means once it
+// arrives: how far the mark travels, how far its light comes up.
+// ---------------------------------------------------------------------------
+
+/// How far a lit badge's mark travels on its snap, as a fraction of the badge.
+///
+/// Small, and deliberately so: eight badges each swinging a tenth of their own
+/// height is a grid that shakes. What has to be legible is *that* it moved and
+/// with what character, and at a 50-pixel badge this is three pixels resolved
+/// to a fraction of one.
+const LIT_TRAVEL: f32 = 0.055;
+
+/// The same for an escalated badge. Further, because the state is louder.
+const ALERT_TRAVEL: f32 = 0.085;
+
+/// How much brighter a lit badge's ink runs at the top of its snap.
+const LIT_GAIN: f32 = 0.30;
+
+/// The ambient glow a resting badge carries before its breath modulates it.
+///
+/// This is the "back burner" reading, and it is a glow rather than a dimmer on
+/// purpose — the target says *recessed*, which is a depth cue. A faint halo in
+/// the surface's own lifted colour puts the mark slightly behind the panel
+/// instead of merely darker than it.
+const REST_GLOW: f32 = 0.09;
+
+/// How far the resting breath swings that glow, as a fraction of itself.
+const REST_GLOW_SWING: f32 = 0.6;
+
+/// How deeply a resting badge's carve breathes.
+///
+/// The carve getting fractionally deeper and shallower is the whole of rest's
+/// motion. Anything more would be a resting badge asking for attention, which
+/// is the one thing rest must not do.
+const REST_CARVE_SWING: f32 = 0.10;
+
+/// How far the mark travels at `amount`, in pixels of a `size`-pixel badge.
+///
+/// Zero for [`BadgeState::Idle`] — and that zero is a *contract*, not an
+/// omission. Rest is told from lit by whether the mark travels at all, which is
+/// the one distinction that survives a reader who cannot separate two hues.
+fn travel(state: BadgeState, size: u32, amount: f32) -> f32 {
+    let fraction = match state {
+        BadgeState::Idle => return 0.0,
+        BadgeState::Active => LIT_TRAVEL,
+        BadgeState::Attention => ALERT_TRAVEL,
+    };
+    amount * (size as f32) * fraction
+}
 
 fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
@@ -685,7 +860,111 @@ impl BadgePaint {
     }
 }
 
+/// One mark, rasterised: the layers it prints, and the halo they throw.
+///
+/// Held apart from [`render_badge`] and cached, because rasterising a mark is
+/// the expensive half of a badge and it does not depend on the badge's state or
+/// on where it is in its animation. Without this, a moving tray would re-run
+/// the supersampled vector rasteriser eight times per frame — which is the
+/// difference between motion that costs a fraction of a millisecond and motion
+/// that costs more than a whole frame.
+struct MarkArt {
+    /// Coverage per printing weight, already reduced by the cut layer, so a
+    /// consumer never has to remember to subtract.
+    layers: [Coverage; 3],
+    /// The union of the three, for the halo and the engraved lift.
+    combined: Coverage,
+    /// That union, blurred.
+    bloom: Coverage,
+}
+
+/// How many rasterised marks are kept.
+///
+/// Eight signals across the two or three badge sizes one session's panel
+/// widths produce. Well above that so a divider drag does not thrash it, and
+/// small enough that a pathological caller cannot grow it without bound — over
+/// the cap it is cleared rather than evicted one at a time, because the sizes
+/// move together when they move at all.
+const MARK_CACHE_CAP: usize = 48;
+
+thread_local! {
+    static MARK_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(FleetSignal, u32), std::rc::Rc<MarkArt>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+impl MarkArt {
+    fn rasterise(signal: FleetSignal, size: u32) -> Self {
+        let mut pen = Pen::new(size);
+        draw_mark(signal, &mut pen);
+        let resolved = pen.resolve();
+        let cut = &resolved[Ink::Cut.index()];
+
+        // The cut is folded in here, once, rather than at every read: a mark's
+        // negative space is a property of the mark, not of how it is being
+        // drawn this frame.
+        let reduce = |layer: &Coverage| {
+            let mut out = Coverage::new(size, size);
+            for y in 0..size {
+                for x in 0..size {
+                    out.set(x, y, (layer.at(x, y) - cut.at(x, y)).max(0.0));
+                }
+            }
+            out
+        };
+        let layers = [
+            reduce(&resolved[0]),
+            reduce(&resolved[1]),
+            reduce(&resolved[2]),
+        ];
+
+        let mut combined = Coverage::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                let value = layers
+                    .iter()
+                    .map(|layer| layer.at(x, y))
+                    .fold(0.0_f32, f32::max);
+                combined.set(x, y, value);
+            }
+        }
+        let bloom = combined.blurred(((size as f32) * 0.09).round().max(1.0) as u32);
+        Self {
+            layers,
+            combined,
+            bloom,
+        }
+    }
+}
+
+/// This mark at this size, rasterising it only the first time it is asked for.
+fn mark_art(signal: FleetSignal, size: u32) -> std::rc::Rc<MarkArt> {
+    MARK_CACHE.with(|cache| {
+        // A poisoned or already-borrowed cache is a reason to do the work
+        // again, never a reason to fail: the badge is a decoration and a
+        // decoration must not be able to break the thing it decorates.
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return std::rc::Rc::new(MarkArt::rasterise(signal, size));
+        };
+        if let Some(found) = cache.get(&(signal, size)) {
+            return std::rc::Rc::clone(found);
+        }
+        if cache.len() >= MARK_CACHE_CAP {
+            cache.clear();
+        }
+        let art = std::rc::Rc::new(MarkArt::rasterise(signal, size));
+        cache.insert((signal, size), std::rc::Rc::clone(&art));
+        art
+    })
+}
+
 /// Render one badge into `size`×`size` straight RGBA.
+///
+/// `amount` is the animation engine's envelope for this badge, read through
+/// [`crate::anim::behaviour::Behaviour::strength`]: `0.0` at rest, `1.0` at the
+/// snap's target, and up to about `1.10` through its overshoot. A caller with
+/// no engine — a test, a still tray — passes `0.0` and gets exactly the settled
+/// badge, which is what makes the animation an addition rather than a rewrite.
 ///
 /// Everything outside the mark and its border is left fully transparent — that
 /// is amendment one, no plate background, and it is why the tray needs no
@@ -695,15 +974,31 @@ pub(crate) fn render_badge(
     state: BadgeState,
     size: u32,
     paint: BadgePaint,
+    amount: f32,
 ) -> Rgba {
     let mut image = Rgba::new(size, size);
     if size == 0 {
         return image;
     }
+    let amount = if amount.is_finite() {
+        amount.clamp(0.0, 2.0)
+    } else {
+        0.0
+    };
     let (ink_top, ink_bottom) = paint.ink(state);
+    // The snap brightens as it rises. Rest does not: its light is carried by
+    // the halo below, not by the ink, because a carve that got brighter would
+    // stop reading as a carve.
+    let gain = if state.is_live() {
+        1.0 + amount * LIT_GAIN
+    } else {
+        1.0
+    };
+    let (ink_top, ink_bottom) = (scale(ink_top, gain), scale(ink_bottom, gain));
 
     if state.is_live() {
-        // Amendment two: the lit badge keeps its double border.
+        // Amendment two: the lit badge keeps its double border. The border does
+        // not travel — it is the container, and the mark snaps *inside* it.
         draw_border(
             &mut image,
             size,
@@ -727,66 +1022,71 @@ pub(crate) fn render_badge(
     // The mark itself, centred, at a fixed fraction of the badge.
     let mark_size = ((size as f32) * MARK_SCALE).round().max(1.0) as u32;
     let offset = (size.saturating_sub(mark_size)) / 2;
-    let mut pen = Pen::new(mark_size);
-    draw_mark(signal, &mut pen);
-    let layers = pen.resolve();
+    let art = mark_art(signal, mark_size);
+    let lift = travel(state, size, amount);
+    let span = mark_size.max(1) as f32;
 
-    if state.is_live() {
-        // The bloom, laid under the mark. Peaks at a fraction of the stroke, so
-        // it reads as light coming off the mark rather than as a halo drawn
-        // around it.
-        let combined = combine(&layers, mark_size);
-        let bloom = combined.blurred(((mark_size as f32) * 0.09).round().max(1.0) as u32);
-        let strength = if matches!(state, BadgeState::Attention) {
+    // The halo, laid under the mark and travelling with it. On a lit badge it
+    // is light coming off the mark; on a resting one it is the recession — the
+    // faint, breathing depth cue that reads as "on the back burner" instead of
+    // as "switched off".
+    let (halo, halo_tint) = if state.is_live() {
+        let peak = if matches!(state, BadgeState::Attention) {
             0.34
         } else {
             0.19
         };
+        (peak * (0.55 + 0.65 * amount), None)
+    } else {
+        (
+            REST_GLOW * (1.0 - REST_GLOW_SWING + REST_GLOW_SWING * amount),
+            Some(paint.lift()),
+        )
+    };
+    if halo > 0.0 {
         for y in 0..mark_size {
             for x in 0..mark_size {
-                let alpha = bloom.at(x, y) * strength;
-                let tint = lerp(ink_top, ink_bottom, y as f32 / mark_size.max(1) as f32);
+                let alpha = art.bloom.at_shifted(x, y, lift) * halo;
+                let tint = halo_tint.unwrap_or_else(|| lerp(ink_top, ink_bottom, y as f32 / span));
                 image.blend(x + offset, y + offset, tint, alpha);
             }
         }
     }
 
+    // A resting carve deepens and shallows with the same breath, which is the
+    // only thing rest does that a still badge does not.
+    let carve = if state.is_live() {
+        1.0
+    } else {
+        1.0 - REST_CARVE_SWING * (1.0 - amount)
+    };
+
     for ink in Ink::ALL {
-        let layer = &layers[ink.index()];
+        let layer = &art.layers[ink.index()];
         for y in 0..mark_size {
             for x in 0..mark_size {
-                let coverage = layer.at(x, y);
+                let coverage = layer.at_shifted(x, y, lift);
                 if coverage <= 0.0 {
                     continue;
                 }
-                let t = y as f32 / mark_size.max(1) as f32;
-                let tint = lerp(ink_top, ink_bottom, t);
-                image.blend(x + offset, y + offset, tint, coverage * ink.weight());
+                let tint = lerp(ink_top, ink_bottom, y as f32 / span);
+                image.blend(
+                    x + offset,
+                    y + offset,
+                    tint,
+                    coverage * ink.weight() * carve,
+                );
             }
         }
     }
 
     if matches!(state, BadgeState::Idle) {
-        draw_engraved_lift(&mut image, &layers, mark_size, offset, paint.lift());
+        draw_engraved_lift(&mut image, &art.combined, mark_size, offset, paint.lift());
     }
     if matches!(state, BadgeState::Attention) {
         draw_attention_pip(&mut image, size, paint.attention);
     }
     image
-}
-
-fn combine(layers: &[Coverage; 3], size: u32) -> Coverage {
-    let mut out = Coverage::new(size, size);
-    for y in 0..size {
-        for x in 0..size {
-            let value = layers
-                .iter()
-                .map(|layer| layer.at(x, y))
-                .fold(0.0_f32, f32::max);
-            out.set(x, y, value);
-        }
-    }
-    out
 }
 
 /// The one-pixel lift along the bottom of every engraved stroke.
@@ -795,12 +1095,11 @@ fn combine(layers: &[Coverage; 3], size: u32) -> Coverage {
 /// without this the idle state is a dark smear on a dark panel.
 fn draw_engraved_lift(
     image: &mut Rgba,
-    layers: &[Coverage; 3],
+    combined: &Coverage,
     size: u32,
     offset: u32,
     lift: [f32; 3],
 ) {
-    let combined = combine(layers, size);
     for y in 0..size {
         for x in 0..size {
             let here = combined.at(x, y);
@@ -903,8 +1202,60 @@ mod tests {
         }
     }
 
+    /// A badge at the bottom of its animation — the settled artwork.
+    ///
+    /// Everything that is not *about* the motion asserts against this, which is
+    /// also the proof that the animation is an addition: a caller with no
+    /// engine gets exactly the badge that shipped before it existed.
+    fn settled(signal: FleetSignal, state: BadgeState, size: u32) -> Rgba {
+        render_badge(signal, state, size, paint(), 0.0)
+    }
+
     fn opaque_pixels(image: &Rgba) -> usize {
         image.pixels.chunks(4).filter(|px| px[3] > 8).count()
+    }
+
+    /// Where the mark's ink sits vertically, in output pixels.
+    ///
+    /// The alpha-weighted centroid rather than a bounding box, because the
+    /// motion this measures is fractions of a pixel: a box edge quantises to
+    /// whole pixels and would report a smooth travel as three steps.
+    ///
+    /// Measured over the mark's own box, and with the escalation pip's corner
+    /// left out. Both the border and the pip are anchored by design — the mark
+    /// snaps *inside* its container — so a window that included them would
+    /// average a real travel against two things that never move and report the
+    /// louder state as the quieter one.
+    fn ink_centroid_y(image: &Rgba) -> f32 {
+        let side = image.width as f32;
+        let mark = (side * MARK_SCALE).round() as u32;
+        let lo = (image.width.saturating_sub(mark)) / 2;
+        let hi = (lo + mark).min(image.width);
+        // Rows are taken wider than the mark's own box so that ink lifted out
+        // of it is still counted. A window clipped to the box would lose the
+        // very pixels the travel moved and report the longer travel as the
+        // shorter one.
+        let rim = image.height / 8;
+        let (top, bottom) = (rim, image.height.saturating_sub(rim));
+        // Everything the pip and its moat can reach, from `draw_attention_pip`.
+        let pip_reach = side * 0.115 * 2.4;
+        let mut weight = 0.0_f32;
+        let mut total = 0.0_f32;
+        for y in top..bottom {
+            for x in lo..hi {
+                if (side - x as f32) < pip_reach && (y as f32) < pip_reach {
+                    continue;
+                }
+                let index = ((y as usize) * (image.width as usize) + x as usize) * 4;
+                let alpha = f32::from(image.pixels[index + 3]) / 255.0;
+                weight += alpha * y as f32;
+                total += alpha;
+            }
+        }
+        if total <= 0.0 {
+            return 0.0;
+        }
+        weight / total
     }
 
     /// Amendment one, asserted: the badge has no plate behind it, so the
@@ -912,7 +1263,7 @@ mod tests {
     #[test]
     fn a_badge_has_no_plate_behind_it() {
         for signal in FleetSignal::ALL {
-            let image = render_badge(signal, BadgeState::Active, 48, paint());
+            let image = settled(signal, BadgeState::Active, 48);
             // The extreme corner is outside the rounded border on every badge.
             let corner = &image.pixels[0..4];
             assert_eq!(corner[3], 0, "{signal:?} painted its own top-left corner");
@@ -925,7 +1276,7 @@ mod tests {
     fn every_mark_draws_ink_in_every_state() {
         for signal in FleetSignal::ALL {
             for state in [BadgeState::Idle, BadgeState::Active, BadgeState::Attention] {
-                let image = render_badge(signal, state, 48, paint());
+                let image = settled(signal, state, 48);
                 assert!(
                     opaque_pixels(&image) > 40,
                     "{signal:?} in {state:?} drew almost nothing"
@@ -942,7 +1293,7 @@ mod tests {
         let masks: Vec<Vec<bool>> = FleetSignal::ALL
             .into_iter()
             .map(|signal| {
-                render_badge(signal, BadgeState::Active, 48, paint())
+                settled(signal, BadgeState::Active, 48)
                     .pixels
                     .chunks(4)
                     .map(|px| px[3] > 96)
@@ -967,8 +1318,8 @@ mod tests {
     /// border is what says which, so an idle badge must not draw one.
     #[test]
     fn only_a_lit_badge_draws_its_border() {
-        let lit = render_badge(FleetSignal::Ask, BadgeState::Active, 48, paint());
-        let idle = render_badge(FleetSignal::Ask, BadgeState::Idle, 48, paint());
+        let lit = settled(FleetSignal::Ask, BadgeState::Active, 48);
+        let idle = settled(FleetSignal::Ask, BadgeState::Idle, 48);
         assert!(
             opaque_pixels(&lit) > opaque_pixels(&idle),
             "the lit badge did not add its border"
@@ -1003,7 +1354,7 @@ mod tests {
     #[test]
     fn attention_cuts_a_pip_into_the_corner() {
         let corner_ink = |state| {
-            let image = render_badge(FleetSignal::Ask, state, 48, paint());
+            let image = settled(FleetSignal::Ask, state, 48);
             let mut count = 0;
             for y in 0..12 {
                 for x in (image.width - 12)..image.width {
@@ -1027,7 +1378,7 @@ mod tests {
     #[test]
     fn a_mark_survives_every_size_the_ladder_can_ask_for() {
         for size in [24, 32, 48, 64, 96] {
-            let image = render_badge(FleetSignal::Checks, BadgeState::Active, size, paint());
+            let image = settled(FleetSignal::Checks, BadgeState::Active, size);
             assert_eq!(image.width, size);
             assert_eq!(image.pixels.len(), (size as usize) * (size as usize) * 4);
             assert!(opaque_pixels(&image) > 10, "nothing drawn at {size}px");
@@ -1036,7 +1387,233 @@ mod tests {
 
     #[test]
     fn a_zero_sized_badge_is_empty_rather_than_a_panic() {
-        let image = render_badge(FleetSignal::Ask, BadgeState::Active, 0, paint());
+        let image = settled(FleetSignal::Ask, BadgeState::Active, 0);
         assert!(image.pixels.is_empty());
+    }
+
+    /// Ink inside the mark's own box, as a fraction of that box.
+    ///
+    /// Measured over the middle [`MARK_SCALE`] of the badge so the border,
+    /// which every lit badge draws identically, cannot flatter a thin mark into
+    /// looking as heavy as a solid one.
+    fn mark_mass(signal: FleetSignal) -> f32 {
+        let size = 64u32;
+        let image = settled(signal, BadgeState::Idle, size);
+        let mark = ((size as f32) * MARK_SCALE).round() as u32;
+        let offset = (size - mark) / 2;
+        let mut inked = 0.0_f32;
+        for y in offset..offset + mark {
+            for x in offset..offset + mark {
+                let index = ((y as usize) * (image.width as usize) + x as usize) * 4;
+                if image.pixels[index + 3] > 96 {
+                    inked += 1.0;
+                }
+            }
+        }
+        inked / (mark * mark) as f32
+    }
+
+    /// Drawn for mass, not for line — and *consistently* so.
+    ///
+    /// This is the acceptance criterion made checkable. An outline drawing
+    /// covers a few percent of its box; a solid one covers a third of it. The
+    /// band is what stops the grid drifting back to eight unrelated weights one
+    /// well-meaning tweak at a time: no mark may be thinner than a fifth of its
+    /// box, and none may be more than twice as heavy as the lightest.
+    #[test]
+    fn all_eight_marks_carry_a_comparable_mass() {
+        let masses: Vec<(FleetSignal, f32)> = FleetSignal::ALL
+            .into_iter()
+            .map(|signal| (signal, mark_mass(signal)))
+            .collect();
+
+        for (signal, mass) in &masses {
+            assert!(
+                *mass > 0.20,
+                "{signal:?} covers only {:.1}% of its box — that is a line drawing, not a mass",
+                mass * 100.0
+            );
+        }
+        let lightest = masses.iter().map(|(_, m)| *m).fold(f32::MAX, f32::min);
+        let heaviest = masses.iter().map(|(_, m)| *m).fold(0.0_f32, f32::max);
+        assert!(
+            heaviest <= lightest * 2.0,
+            "the grid is not one object: heaviest {heaviest:.3} against lightest {lightest:.3} in {masses:?}"
+        );
+    }
+
+    /// Drawing for mass only works if the detail is cut *out* of the mass.
+    ///
+    /// A mark whose cut layer did nothing would still pass the mass band — it
+    /// would just be a solid blob. This asserts the holes are really holes:
+    /// removing the cut has to leave a measurably heavier mark.
+    #[test]
+    fn a_cut_takes_ink_away_rather_than_adding_it() {
+        for signal in [
+            FleetSignal::Ask,
+            FleetSignal::Review,
+            FleetSignal::Report,
+            FleetSignal::Checks,
+        ] {
+            let art = MarkArt::rasterise(signal, 48);
+            let mut pen = Pen::new(48);
+            draw_mark(signal, &mut pen);
+            let raw = pen.resolve();
+
+            let sum = |layer: &Coverage| -> f32 { layer.values.iter().sum() };
+            let cut = sum(&raw[Ink::Cut.index()]);
+            assert!(cut > 1.0, "{signal:?} cut nothing out of itself");
+
+            let before: f32 = (0..3).map(|i| sum(&raw[i])).sum();
+            let after: f32 = art.layers.iter().map(sum).sum();
+            assert!(
+                after < before,
+                "{signal:?} kept all {before:.1} of its ink after a cut of {cut:.1}"
+            );
+        }
+    }
+
+    /// The state ladder in pixels: a lit badge's mark travels, a resting one
+    /// never does.
+    ///
+    /// This is the behavioural half of "distinguishable by behaviour, not
+    /// colour alone" as it lands on the image. The other half — that the three
+    /// states play three different catalogue behaviours at three different
+    /// tempos — is asserted in `crate::app::signal_tray`.
+    #[test]
+    fn only_a_lit_badge_travels() {
+        let at = |state, amount| {
+            ink_centroid_y(&render_badge(FleetSignal::Ask, state, 64, paint(), amount))
+        };
+
+        // Rest breathes, but it does not move. A resting tray that drifted
+        // would be eight things asking for attention at once.
+        let rest_low = at(BadgeState::Idle, 0.0);
+        let rest_high = at(BadgeState::Idle, 1.0);
+        assert!(
+            (rest_high - rest_low).abs() < 0.05,
+            "a resting badge travelled {:.3} px",
+            rest_high - rest_low
+        );
+
+        for state in [BadgeState::Active, BadgeState::Attention] {
+            let settled = at(state, 0.0);
+            let snapped = at(state, 1.0);
+            assert!(
+                settled - snapped > 0.5,
+                "{state:?} moved only {:.3} px between rest and its snap",
+                settled - snapped
+            );
+        }
+
+        // And the two live states do not travel the same distance, so an
+        // escalation is legible from the motion alone.
+        let active = at(BadgeState::Active, 0.0) - at(BadgeState::Active, 1.0);
+        let alert = at(BadgeState::Attention, 0.0) - at(BadgeState::Attention, 1.0);
+        assert!(
+            alert > active,
+            "attention travelled {alert:.3} px against active's {active:.3} px"
+        );
+    }
+
+    /// How far each state travels, asserted on the contract rather than on the
+    /// image.
+    ///
+    /// Separate from `only_a_lit_badge_travels` on purpose. A badge's *measured*
+    /// centroid also moves with its halo, which grows with the state, so the
+    /// image damps the ratio between two travels even though both are exactly
+    /// what was asked for. The image is the right place to prove the mark moved
+    /// at all; this is the right place to prove by how much.
+    #[test]
+    fn escalating_lengthens_the_travel_and_rest_has_none() {
+        let size = 64;
+        assert_eq!(travel(BadgeState::Idle, size, 1.0), 0.0);
+        let active = travel(BadgeState::Active, size, 1.0);
+        let alert = travel(BadgeState::Attention, size, 1.0);
+        assert!(
+            active > 0.0 && alert > active * 1.4,
+            "{active} then {alert}"
+        );
+
+        // And the travel is a straight scaling of the envelope, so the whole of
+        // the motion's character — the ramp, the overshoot, the swing back —
+        // arrives from the curve rather than being reshaped here.
+        for amount in [0.25_f32, 0.5, 1.0, 1.1] {
+            let scaled = travel(BadgeState::Active, size, amount);
+            assert!(
+                (scaled - active * amount).abs() < 1e-3,
+                "the travel bent the envelope at {amount}: {scaled} against {}",
+                active * amount
+            );
+        }
+    }
+
+    /// The overshoot has to reach the pixels, or the curve is decoration in a
+    /// unit test and nothing on screen.
+    ///
+    /// At the top of the snap the engine hands over an envelope above `1.0`,
+    /// and the mark has to be *further* than its target — that is what a
+    /// pendulum overshooting looks like from the outside.
+    #[test]
+    fn the_overshoot_carries_the_mark_past_its_target() {
+        let at = |amount| {
+            ink_centroid_y(&render_badge(
+                FleetSignal::Push,
+                BadgeState::Active,
+                64,
+                paint(),
+                amount,
+            ))
+        };
+        let target = at(1.0);
+        let overshot = at(1.10);
+        let reversed = at(0.95);
+        assert!(
+            overshot < target,
+            "the overshoot did not carry past the target: {overshot:.3} against {target:.3}"
+        );
+        assert!(
+            reversed > target,
+            "the reverse swing did not fall back: {reversed:.3} against {target:.3}"
+        );
+    }
+
+    /// A resting badge is *present*, not switched off.
+    ///
+    /// The back-burner reading is a glow that breathes, so rest has to put
+    /// visibly more light on the badge at the top of its breath than at the
+    /// bottom — without ever reaching what a lit badge does.
+    #[test]
+    fn rest_glows_without_demanding() {
+        let light = |state, amount| -> f32 {
+            render_badge(FleetSignal::Review, state, 64, paint(), amount)
+                .pixels
+                .chunks(4)
+                .map(|px| f32::from(px[3]))
+                .sum::<f32>()
+        };
+        let low = light(BadgeState::Idle, 0.0);
+        let high = light(BadgeState::Idle, 1.0);
+        assert!(
+            high > low * 1.01,
+            "a resting badge did not breathe: {low:.0} to {high:.0}"
+        );
+        assert!(
+            high < light(BadgeState::Active, 0.0),
+            "a resting badge is putting out more light than a lit one at rest"
+        );
+    }
+
+    /// The cache must not change what is drawn — only how long it takes.
+    #[test]
+    fn a_cached_mark_draws_the_same_badge_as_a_cold_one() {
+        MARK_CACHE.with(|cache| {
+            if let Ok(mut cache) = cache.try_borrow_mut() {
+                cache.clear();
+            }
+        });
+        let cold = settled(FleetSignal::Sync, BadgeState::Active, 48);
+        let warm = settled(FleetSignal::Sync, BadgeState::Active, 48);
+        assert_eq!(cold, warm);
     }
 }

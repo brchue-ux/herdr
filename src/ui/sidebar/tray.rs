@@ -363,13 +363,75 @@ pub(crate) fn image(app: &AppState, cell_width: u32, cell_height: u32) -> Option
         if size == 0 {
             continue;
         }
-        let badge = tray_art::render_badge(signal, reading.badge(signal).state, size, paint);
+        let state = reading.badge(signal).state;
+        let badge = tray_art::render_badge(signal, state, size, paint, motion(app, signal, state));
         let ox = u32::from(slot.x - grid.x) * cell_width + (slot_w.saturating_sub(size)) / 2;
         let oy = u32::from(slot.y - grid.y) * cell_height + (slot_h.saturating_sub(size)) / 2;
         blit(&mut canvas, &badge, ox, oy);
     }
 
     Some((grid, canvas))
+}
+
+/// Where one badge is in its animation right now, as the engine's envelope.
+///
+/// A **pure read** of the engine, exactly as `render` is a pure read of state:
+/// [`crate::anim::Animator::frame`] takes `&self` and consults no clock, so
+/// asking here cannot make the artwork disagree with anything else drawn this
+/// pass. All the clock work happened in `Animator::advance`, on the app loop.
+///
+/// The state picks which of the element's three declared idle behaviours is
+/// read, and the behaviour supplies the whole motion character. Nothing about
+/// the curve — the ramp, the overshoot, the swing back — is expressed here or
+/// anywhere else in the tray: this asks the catalogue where the badge is and
+/// [`super::tray_art`] says what that means in pixels. That split is the point.
+/// There is no second animation path for badges.
+///
+/// `0.0` whenever the engine has nothing for this badge, which is the settled
+/// artwork — a host with no graphics, animation switched off, or a tray that
+/// has only just been turned on and has not been published yet.
+fn motion(app: &AppState, signal: FleetSignal, state: BadgeState) -> f32 {
+    let id = signal.badge_element_id();
+    let Some(frame) = app.anim.frame(&id, Some(state.behaviour())) else {
+        return 0.0;
+    };
+    let Some(behaviour) = frame.behaviour else {
+        return 0.0;
+    };
+    // A badge is one object, so its behaviours are uniform and every cell of
+    // the notional extent resolves the same. Asking for the first cell of a
+    // 1×1 extent is asking for the envelope itself.
+    behaviour.strength(
+        crate::anim::cell::CellPos::new(0, 0),
+        crate::anim::cell::CellExtent::new(1, 1),
+        frame.progress,
+    )
+}
+
+/// Steps of the envelope the artwork can actually tell apart.
+///
+/// The badge image is re-rasterised when this number moves, so it is the
+/// tray's frame rate expressed as a resolution rather than as a clock. 128
+/// steps over a travel of three pixels is far finer than any pixel could show,
+/// which is what makes the engine's own frame tier — not this — the thing that
+/// decides how often the tray redraws.
+const MOTION_STEPS: f32 = 128.0;
+
+/// Every badge's envelope, quantised and folded into one number.
+///
+/// The tray's artwork is redrawn when its cache key moves, so the key has to
+/// carry the animation or a moving badge would rasterise once and then hold
+/// still forever. Quantised for the same reason the engine quantises its own
+/// positions: a difference no pixel could show is not worth a raster.
+pub(crate) fn motion_fingerprint(app: &AppState) -> u64 {
+    let reading = signal_tray::resolve(app);
+    let mut folded: u64 = 0;
+    for signal in FleetSignal::ALL {
+        let state = reading.badge(signal).state;
+        let step = (motion(app, signal, state) * MOTION_STEPS).round().max(0.0) as u64;
+        folded = folded.wrapping_mul(0x0100_0193) ^ step;
+    }
+    folded
 }
 
 fn blit(canvas: &mut Rgba, badge: &Rgba, ox: u32, oy: u32) {
@@ -620,6 +682,126 @@ mod tests {
         let mut app = app_with_tray(42, 60);
         app.sidebar_signal_tray.enabled = false;
         assert!(image(&app, 9, 18).is_none());
+    }
+
+    /// A tray with one signal standing, and its badges published to the engine
+    /// and advanced by `elapsed`.
+    ///
+    /// Drives the real membership path rather than reaching into the animator,
+    /// for the same reason the signal bar's own test does: the app loop is what
+    /// publishes, and a test that mounted elements by hand would pass over a
+    /// tray that never published any.
+    fn animated_tray(elapsed: std::time::Duration) -> AppState {
+        let mut app = app_with_tray(42, 40);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        // `push` goes live on a branch with commits that have not left.
+        app.workspaces[0].cached_git_ahead_behind = Some((2, 0));
+
+        let now = std::time::Instant::now();
+        let lifecycle = BadgeState::lifecycle();
+        let live: Vec<_> = signal_tray::resolve(&app).animation_membership().collect();
+        app.anim
+            .observe(now, crate::anim::Family::TrayBadge, &lifecycle, live);
+        app.anim.advance(now + elapsed);
+        app
+    }
+
+    /// The engine is what moves a badge, and the movement reaches the pixels.
+    ///
+    /// The whole point of the acceptance criterion "no bespoke badge effects
+    /// path": nothing in the tray holds a clock, so the *only* way this image
+    /// can differ between two calls is the animator having advanced.
+    #[test]
+    fn the_artwork_moves_because_the_engine_moved() {
+        use std::time::Duration;
+
+        let settled = animated_tray(Duration::ZERO);
+        assert_eq!(
+            signal_tray::resolve(&settled)
+                .badge(FleetSignal::Push)
+                .state,
+            BadgeState::Active,
+            "the fixture did not light the badge this test is about"
+        );
+
+        // A quarter of the way up the ramp, and again at the snap.
+        let early = animated_tray(Duration::from_millis(200));
+        let snapped = animated_tray(Duration::from_millis(800));
+
+        let pixels = |app: &AppState| image(app, 9, 18).expect("an enabled tray has an image").1;
+        let (a, b, c) = (pixels(&settled), pixels(&early), pixels(&snapped));
+        assert_ne!(a, c, "the artwork did not move between rest and the snap");
+        assert_ne!(b, c, "the artwork did not move through its ramp");
+
+        // And the fingerprint moved with it, or the app loop would rasterise
+        // once and then believe there was nothing to redraw.
+        assert_ne!(
+            motion_fingerprint(&settled),
+            motion_fingerprint(&snapped),
+            "the graphics cache key did not follow the animation"
+        );
+    }
+
+    /// Every badge is published, not only the ones that are lit.
+    ///
+    /// The bar publishes live signals; the tray publishes all eight, because
+    /// rest is one of the three things a badge says. A tray that only published
+    /// its lit badges would have seven of eight frozen.
+    #[test]
+    fn all_eight_badges_are_published_including_the_resting_ones() {
+        let app = animated_tray(std::time::Duration::from_millis(100));
+        for signal in FleetSignal::ALL {
+            let state = signal_tray::resolve(&app).badge(signal).state;
+            assert!(
+                app.anim
+                    .frame(&signal.badge_element_id(), Some(state.behaviour()))
+                    .is_some_and(|frame| frame.behaviour.is_some()),
+                "{signal:?} in {state:?} has no element to move"
+            );
+        }
+    }
+
+    /// A badge with no element resolves to the settled artwork rather than to
+    /// nothing — the animation is an addition, and it fails off.
+    #[test]
+    fn a_badge_the_engine_has_never_seen_is_simply_still() {
+        let app = app_with_tray(42, 40);
+        assert!(app.anim.is_empty());
+        for signal in FleetSignal::ALL {
+            assert_eq!(motion(&app, signal, BadgeState::Idle), 0.0);
+        }
+        assert!(image(&app, 9, 18).is_some(), "a still tray still draws");
+    }
+
+    /// The gates. Motion is artwork, so it is off wherever the artwork is.
+    #[test]
+    fn the_badges_only_animate_where_the_artwork_can_be_drawn() {
+        let mut app = app_with_tray(42, 40);
+        app.kitty_graphics_enabled = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        assert!(app.signal_tray_animation_active());
+
+        app.sidebar_signal_tray.animate = false;
+        assert!(!app.signal_tray_animation_active());
+        app.sidebar_signal_tray.animate = true;
+
+        app.kitty_graphics_enabled = false;
+        assert!(
+            !app.signal_tray_animation_active(),
+            "a host drawing the fallback marks cannot animate them"
+        );
+        app.kitty_graphics_enabled = true;
+
+        app.sidebar_collapsed = true;
+        assert!(!app.signal_tray_animation_active());
+        app.sidebar_collapsed = false;
+
+        app.sidebar_signal_tray.enabled = false;
+        assert!(!app.signal_tray_animation_active());
     }
 
     /// The fallback marks and the artwork are exclusive.

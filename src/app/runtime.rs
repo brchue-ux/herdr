@@ -471,11 +471,12 @@ impl App {
     pub(crate) fn advance_animations(&mut self, now: Instant, has_viewers: bool) -> bool {
         let tree = has_viewers && self.state.sidebar_animation_active();
         let signals = has_viewers && self.state.fleet_signal_animation_active();
+        let badges = has_viewers && self.state.signal_tray_animation_active();
         // The view switch is gated on neither: a re-root *is* the behaviour
         // rather than a decoration on a row, and one already in flight has to
         // be able to finish even when nothing else in the panel is animating.
         let switching = has_viewers && self.state.tree_view_switch_active();
-        if !tree && !signals && !switching {
+        if !tree && !signals && !switching && !badges {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
@@ -532,7 +533,26 @@ impl App {
             signal_members,
         );
 
-        switch_changed || spaces_changed || agents_changed || signals_changed
+        // The tray's eight badges. Published whole rather than filtered to the
+        // live ones — see `TrayReading::animation_membership` — so the family
+        // is either all eight or none, and a badge going quiet changes which
+        // behaviour it plays rather than whether it exists.
+        let badge_lifecycle = crate::app::signal_tray::BadgeState::lifecycle();
+        let badge_members: Members = if badges {
+            crate::app::signal_tray::resolve(&self.state)
+                .animation_membership()
+                .collect()
+        } else {
+            Members::new()
+        };
+        let badges_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::TrayBadge,
+            &badge_lifecycle,
+            badge_members,
+        );
+
+        switch_changed || spaces_changed || agents_changed || signals_changed || badges_changed
     }
 
     /// Publish the owned agent rows that exist right now, so each second mate's
@@ -734,6 +754,11 @@ impl App {
         for badge in crate::app::signal_tray::resolve(&self.state).badges() {
             badge.state.hash(&mut hasher);
         }
+        // Where every badge is in its animation. Without this the artwork is
+        // rasterised once per state change and then holds still, which is
+        // exactly the shape of a badge that looks animated in the code and is
+        // frozen on the screen.
+        crate::ui::signal_tray_motion_fingerprint(&self.state).hash(&mut hasher);
         format!("{:?}", self.state.palette.peach).hash(&mut hasher);
         format!("{:?}", self.state.host_terminal_theme.background).hash(&mut hasher);
         hasher.finish()
@@ -1562,6 +1587,97 @@ mod tests {
             is_focused: true,
         });
         (app, pane_id)
+    }
+
+    /// A tray with graphics available, its badges reachable by the app loop.
+    fn tray_app() -> super::super::App {
+        let (mut app, _) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.sidebar_signal_tray.enabled = true;
+        app.state.kitty_graphics_enabled = true;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 40);
+        app
+    }
+
+    /// The reason the badges are their own family.
+    ///
+    /// The signal bar reconciles `Family::Named` against the signals that are
+    /// *live*, and a resting badge is not live. Published under the same family
+    /// the tray's eight would be retired by the bar's own pass every frame —
+    /// they would mount, be told to leave, and never move. This asserts the two
+    /// coexist: the bar publishing nothing must leave all eight badges standing.
+    #[test]
+    fn the_signal_bar_cannot_retire_the_trays_badges() {
+        let mut app = tray_app();
+        // The bar is on with nothing lit, which is the case that would evict.
+        app.state.sidebar_notifications.enabled = true;
+        assert!(
+            !crate::app::fleet_signals::FleetSignals::resolve(&app.state).any_live(),
+            "the fixture lit a signal, which is not the case under test"
+        );
+
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        app.advance_animations(now + Duration::from_millis(120), true);
+
+        for signal in crate::app::fleet_signals::FleetSignal::ALL {
+            assert!(
+                app.state
+                    .anim
+                    .frame(&signal.badge_element_id(), None)
+                    .is_some(),
+                "{signal:?} was retired by another family's reconciliation"
+            );
+        }
+    }
+
+    /// Turning the tray's animation off retires exactly its elements, and the
+    /// artwork stops asking the loop for frames.
+    #[test]
+    fn switching_badge_motion_off_retires_the_badges() {
+        let mut app = tray_app();
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        assert!(!app.state.anim.is_empty());
+
+        app.state.sidebar_signal_tray.animate = false;
+        app.advance_animations(now + Duration::from_millis(20), true);
+        for signal in crate::app::fleet_signals::FleetSignal::ALL {
+            assert!(
+                app.state
+                    .anim
+                    .frame(&signal.badge_element_id(), None)
+                    .is_none(),
+                "{signal:?} kept animating after motion was switched off"
+            );
+        }
+    }
+
+    /// The artwork's cache key follows the animation, so the app loop keeps
+    /// re-rasterising while a badge is moving — and stops when it settles.
+    #[test]
+    fn a_moving_badge_makes_the_app_loop_redraw_the_artwork() {
+        let mut app = tray_app();
+        app.state.workspaces[0].cached_git_ahead_behind = Some((3, 0));
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        assert!(app.observe_signal_tray(now), "the tray drew nothing at all");
+
+        let first = app.state.signal_tray_graphics_key;
+        app.advance_animations(now + Duration::from_millis(400), true);
+        assert!(
+            app.observe_signal_tray(now + Duration::from_millis(400)),
+            "the artwork did not follow the animation"
+        );
+        assert_ne!(first, app.state.signal_tray_graphics_key);
+
+        // Asked again at the same instant, nothing has moved and nothing is
+        // redrawn: the badge costs a raster per frame it moves, not per pass.
+        assert!(!app.refresh_signal_tray_graphics());
     }
 
     #[test]

@@ -87,6 +87,16 @@ pub(crate) enum ElementId {
     /// arrives. Driven by [`Animator::enter`]/[`Animator::leave`] rather than
     /// by a membership set, because there is nothing to enumerate.
     TreeView,
+    /// One badge in the notification tray, by the signal it stands for.
+    ///
+    /// Its own family rather than a [`Self::Named`] element, and that is not
+    /// tidiness. The fleet signal bar reconciles `Named` against the signals
+    /// that are *live*, so a tray badge published as `Named` would be retired
+    /// the moment the bar's own pass ran — and a resting badge, which is most
+    /// of them most of the time, would never survive a single frame. The tray
+    /// publishes all eight always, because rest is one of the three things a
+    /// badge has to be able to say.
+    TrayBadge(crate::app::fleet_signals::FleetSignal),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
@@ -99,6 +109,7 @@ pub(crate) enum Family {
     AgentRow,
     Terminal,
     TreeView,
+    TrayBadge,
     Named,
 }
 
@@ -109,6 +120,7 @@ impl ElementId {
             Self::AgentRow(_) => Family::AgentRow,
             Self::Terminal(_) => Family::Terminal,
             Self::TreeView => Family::TreeView,
+            Self::TrayBadge(_) => Family::TrayBadge,
             Self::Named(_) => Family::Named,
         }
     }

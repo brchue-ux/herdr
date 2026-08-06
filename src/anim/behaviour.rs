@@ -293,6 +293,57 @@ pub(crate) enum Curve {
     /// Up and back down on a cosine. Loops seamlessly and with no corner at
     /// the peak, which is what separates breathing from ticking.
     Sine,
+    /// Slow, then a ramp into a snap, then a pendulum that settles.
+    ///
+    /// The one curve in this enum that is a *stated* motion character rather
+    /// than a piece of arithmetic, and the numbers in [`SNAP_OVERSHOOT`] and
+    /// [`SNAP_REVERSE`] are the specification, not taste: exponential
+    /// acceleration into a snap, roughly ten percent past the target, then
+    /// about five percent back the other way before it comes to rest.
+    ///
+    /// It is the only curve that **exceeds 1.0** — that overshoot is the whole
+    /// point, so a consumer reading [`Behaviour::strength`] gets it intact and
+    /// the colour path clamps at the one place it mixes. It also returns to
+    /// exactly `0.0` at the end of its span, so it loops without a seam.
+    SnapPendulum,
+}
+
+/// Steepness of the snap's exponential ramp.
+///
+/// Four is where the ramp reads as accelerating rather than as a slow linear
+/// slide: the first half of the rise covers under a fifth of the distance.
+const SNAP_RAMP_K: f32 = 4.0;
+
+/// Fraction of one span the ramp occupies, before the snap lands.
+const SNAP_RISE: f32 = 0.42;
+
+/// Fraction of one span the pendulum swings through after the snap.
+const SNAP_RING: f32 = 0.26;
+
+/// How far past the target the snap carries, as a fraction of the travel.
+const SNAP_OVERSHOOT: f32 = 0.10;
+
+/// How far back the other way the pendulum swings after the overshoot.
+const SNAP_REVERSE: f32 = 0.05;
+
+/// Normalised exponential acceleration over `0.0..=1.0`.
+fn exp_in(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    ((SNAP_RAMP_K * t).exp() - 1.0) / (SNAP_RAMP_K.exp() - 1.0)
+}
+
+/// The swing after the snap lands, as an offset from the target.
+///
+/// One lobe [`SNAP_OVERSHOOT`] past it, then one [`SNAP_REVERSE`] back the
+/// other way. Both lobes are whole sine humps, so the swing starts at rest,
+/// ends at rest, and never has a corner in it — a pendulum, not a bounce.
+fn pendulum(u: f32) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    if u < 0.5 {
+        SNAP_OVERSHOOT * (std::f32::consts::TAU * u).sin()
+    } else {
+        -SNAP_REVERSE * (std::f32::consts::TAU * (u - 0.5)).sin()
+    }
 }
 
 impl Curve {
@@ -304,6 +355,19 @@ impl Curve {
             Self::EaseInOut => p * p * (3.0 - 2.0 * p),
             Self::Triangle => 1.0 - (2.0 * p - 1.0).abs(),
             Self::Sine => (1.0 - (std::f32::consts::TAU * p).cos()) / 2.0,
+            Self::SnapPendulum => {
+                let settled = SNAP_RISE + SNAP_RING;
+                if p < SNAP_RISE {
+                    exp_in(p / SNAP_RISE)
+                } else if p < settled {
+                    1.0 + pendulum((p - SNAP_RISE) / SNAP_RING)
+                } else {
+                    // The release back to rest is the same acceleration played
+                    // forward, so the return reads as deliberate rather than as
+                    // the effect being switched off.
+                    1.0 - exp_in((p - settled) / (1.0 - settled).max(1e-3))
+                }
+            }
         }
     }
 }
@@ -599,17 +663,23 @@ impl Behaviour {
             }
         }
 
+        // Clamped once, here, because [`Curve::SnapPendulum`] deliberately
+        // overshoots past 1.0 and a mix fraction above one is not a brighter
+        // colour, it is an extrapolation past the ink. The overshoot still
+        // reaches a consumer that wants it, through
+        // [`Behaviour::strength`], which is the un-clamped envelope.
+        let mixed = (amount * depth).clamp(0.0, 1.0);
         if self.paint.reveal {
             // Depth scales how far a reveal gets rather than how bright it is:
             // a reveal driven to half strength arrives half-way and stays, which
             // is the honest reading of "this element is only half here".
-            paint.coverage = (amount * depth).clamp(0.0, 1.0);
+            paint.coverage = mixed;
         }
         if let Some(ink) = self.paint.fg {
-            paint.fg = Some(mix_rgb(palette.own, palette.ink(ink), amount * depth));
+            paint.fg = Some(mix_rgb(palette.own, palette.ink(ink), mixed));
         }
         if let Some(ink) = self.paint.bg {
-            paint.bg = Some(mix_rgb(palette.surface, palette.ink(ink), amount * depth));
+            paint.bg = Some(mix_rgb(palette.surface, palette.ink(ink), mixed));
         }
         if let Some((threshold, attrs)) = self.paint.attrs_above {
             if amount >= threshold {
@@ -673,7 +743,49 @@ pub(crate) mod names {
     /// Bounded: the same travel with no discharge — for a signal that means
     /// something stopped rather than something happening.
     pub(crate) const RELATION_DRIFT: &str = "relation-drift";
+    /// Looping: a tray badge with nothing behind it, on the back burner.
+    ///
+    /// A slow, shallow breath and no travel at all. The absence of movement is
+    /// the reading — a resting badge is *present*, not demanding.
+    pub(crate) const BADGE_REST: &str = "badge-rest";
+    /// Looping: a tray badge that is lit, snapping on the stated motion curve.
+    pub(crate) const BADGE_CHARGE: &str = "badge-charge";
+    /// Looping: a tray badge that has escalated — the same snap, faster and
+    /// deeper, so the difference between lit and waiting is a rhythm rather
+    /// than a hue.
+    pub(crate) const BADGE_ALERT: &str = "badge-alert";
 }
+
+/// How long one rest breath takes.
+///
+/// Deliberately far slower than either live badge. Rest is told apart from lit
+/// by tempo before it is told apart by anything else, and a resting slot that
+/// breathed at a lit slot's speed would just look like a dimmer version of it.
+const BADGE_REST_PERIOD: Duration = Duration::from_millis(4_200);
+
+/// How long one snap-and-settle takes on a lit badge.
+const BADGE_CHARGE_PERIOD: Duration = Duration::from_millis(1_900);
+
+/// How long one snap-and-settle takes on an escalated badge.
+///
+/// Under half the lit period, which is the gap at which two rhythms read as
+/// two rhythms rather than as one that drifted.
+const BADGE_ALERT_PERIOD: Duration = Duration::from_millis(760);
+
+/// Frame spacing for a badge that is moving.
+///
+/// Every frame here re-rasterises the whole eight-badge layer, so this is the
+/// tray's real cost dial and it is set from measurement rather than from taste:
+/// at 50 ms the snap resolves as motion, and the layer's own raster stays a
+/// small fraction of one frame's budget. See the module tests in
+/// [`crate::ui::sidebar::tray_art`] for what one badge costs.
+const BADGE_FRAME_INTERVAL: Duration = SMOOTH_FRAME_INTERVAL;
+
+/// How deeply a resting badge's breath swings.
+///
+/// Shallow on purpose. This is the "dimmed and slightly recessed" reading, and
+/// a rest that swung as far as a lit badge would be competing with it.
+const BADGE_REST_DEPTH: f32 = 0.22;
 
 /// How often a travelling charge needs a frame.
 ///
@@ -777,7 +889,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 14] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 17] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -983,6 +1095,50 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 14] {
                 curve: Curve::EaseInOut,
                 paint: Paint::charge(Ink::Signal, 0.75, 0.2),
                 frame_interval: CHARGE_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        // The three tray badges. All uniform, because a badge is one object
+        // rather than a span of cells: the amount is the whole mark's, and the
+        // pixel path in `tray_art` reads it as an envelope through
+        // `Behaviour::strength` rather than as a cell paint. What separates the
+        // three is *rhythm* — period, curve and depth — which is the one axis
+        // that still reads for someone who cannot tell the hues apart.
+        (
+            names::BADGE_REST,
+            Behaviour {
+                curve: Curve::Sine,
+                paint: Paint::tint(Ink::Surface, BADGE_REST_DEPTH),
+                period: BADGE_REST_PERIOD,
+                // The slow tier, not the smooth one. A four-second breath has
+                // nothing a 50 ms step would show that a 100 ms step does not,
+                // and eight resting badges are the tray's common case.
+                ..BASE
+            },
+        ),
+        (
+            names::BADGE_CHARGE,
+            Behaviour {
+                curve: Curve::SnapPendulum,
+                paint: Paint::tint(Ink::Accent, 1.0),
+                period: BADGE_CHARGE_PERIOD,
+                frame_interval: BADGE_FRAME_INTERVAL,
+                // A working fleet snaps its badges faster. The same reasoning
+                // the `activity` entry gives: tempo is where effort is legible.
+                rate_drive: Drive::Activity {
+                    at_rest: 1.0,
+                    at_full: 1.6,
+                },
+                ..BASE
+            },
+        ),
+        (
+            names::BADGE_ALERT,
+            Behaviour {
+                curve: Curve::SnapPendulum,
+                paint: Paint::tint(Ink::Accent, 1.0),
+                period: BADGE_ALERT_PERIOD,
+                frame_interval: BADGE_FRAME_INTERVAL,
                 ..BASE
             },
         ),
@@ -1580,5 +1736,142 @@ mod tests {
             crate::app::ANIMATION_INTERVAL
         );
         assert!(SMOOTH_FRAME_INTERVAL >= Duration::from_millis(16));
+    }
+
+    /// The stated motion character, asserted as the four things it claims:
+    /// starts slow and accelerates, snaps to its target, overshoots by about a
+    /// tenth, and swings back through about a twentieth.
+    #[test]
+    fn the_snap_accelerates_overshoots_and_pendulums_back() {
+        let at = |p: f32| Curve::SnapPendulum.apply(p);
+
+        // Exponential acceleration: half way through the ramp it has covered
+        // far less than half the distance. A linear or ease-out curve fails
+        // this, which is the point — the target rejected both.
+        let half = at(SNAP_RISE / 2.0);
+        assert!(
+            half < 0.25,
+            "the ramp covered {half:.3} of its distance in half its time — that is not an \
+             acceleration"
+        );
+        assert!(at(SNAP_RISE * 0.25) < at(SNAP_RISE * 0.5) - at(SNAP_RISE * 0.25));
+
+        // It reaches its target exactly at the end of the ramp.
+        assert!((at(SNAP_RISE) - 1.0).abs() < 1e-3);
+
+        // The overshoot, and then the reverse. Sampled as extremes rather than
+        // at a nominated instant, so retuning the ring's shape cannot silently
+        // drop either lobe.
+        let ring: Vec<f32> = (0..=200)
+            .map(|i| at(SNAP_RISE + SNAP_RING * i as f32 / 200.0))
+            .collect();
+        let peak = ring.iter().cloned().fold(f32::MIN, f32::max);
+        let trough = ring.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            (peak - 1.10).abs() < 0.01,
+            "overshoot peaked at {peak:.3} rather than 1.10"
+        );
+        assert!(
+            (trough - 0.95).abs() < 0.01,
+            "the reverse swing reached {trough:.3} rather than 0.95"
+        );
+        // In that order: past the target first, back the other way after.
+        let peak_at = ring.iter().position(|v| *v == peak).unwrap_or(usize::MAX);
+        let trough_at = ring.iter().position(|v| *v == trough).unwrap_or(0);
+        assert!(peak_at < trough_at, "it swung back before it overshot");
+    }
+
+    /// It has to loop, because the badges play it as an unbounded idle phase.
+    /// A curve that ended anywhere but where it started would jump once per
+    /// period, which reads as a glitch rather than as a rhythm.
+    #[test]
+    fn the_snap_returns_to_rest_so_it_can_loop() {
+        assert!(Curve::SnapPendulum.apply(0.0).abs() < 1e-4);
+        assert!(Curve::SnapPendulum.apply(1.0).abs() < 1e-4);
+
+        // And nothing in between is discontinuous: no step between adjacent
+        // samples may be a large fraction of the whole travel.
+        let mut previous = Curve::SnapPendulum.apply(0.0);
+        for i in 1..=1_000 {
+            let value = Curve::SnapPendulum.apply(i as f32 / 1_000.0);
+            assert!(
+                (value - previous).abs() < 0.02,
+                "a step of {:.4} at {i}/1000",
+                value - previous
+            );
+            previous = value;
+        }
+    }
+
+    /// The overshoot survives to a consumer that reads the envelope, and never
+    /// reaches one that reads a colour.
+    #[test]
+    fn the_overshoot_reaches_strength_but_never_a_mix() {
+        let behaviour = get(names::BADGE_CHARGE);
+        let pos = CellPos::new(0, 0);
+        let extent = CellExtent::new(1, 1);
+        let peak = (0..=200)
+            .map(|i| behaviour.strength(pos, extent, i as f32 / 200.0))
+            .fold(f32::MIN, f32::max);
+        assert!(peak > 1.05, "the envelope was flattened to {peak:.3}");
+
+        // And the colour path clamps, so no cell is ever mixed *past* its ink.
+        // An unclamped fraction above 1.0 would extrapolate beyond the target
+        // colour, which saturates at the channel bounds rather than erroring —
+        // so the check is that every channel stays on the segment between where
+        // the cell started and the ink it is moving toward.
+        let (own, accent) = (PALETTE.own, PALETTE.accent);
+        let on_segment =
+            |value: u8, from: u8, to: u8| value >= from.min(to) && value <= from.max(to);
+        for i in 0..=200 {
+            let paint = behaviour.cell(
+                pos,
+                extent,
+                i as f32 / 200.0,
+                DriveInputs::default(),
+                PALETTE,
+            );
+            if let Some(fg) = paint.fg {
+                assert!(
+                    on_segment(fg.0, own.0, accent.0)
+                        && on_segment(fg.1, own.1, accent.1)
+                        && on_segment(fg.2, own.2, accent.2),
+                    "the overshoot extrapolated past the ink: {fg:?} is not between \
+                     {own:?} and {accent:?}"
+                );
+            }
+        }
+    }
+
+    /// The three badge states are three rhythms, and that is what makes them
+    /// readable without colour.
+    #[test]
+    fn the_three_badge_behaviours_are_three_tempos() {
+        let rest = get(names::BADGE_REST);
+        let charge = get(names::BADGE_CHARGE);
+        let alert = get(names::BADGE_ALERT);
+
+        assert!(
+            rest.period > charge.period * 2,
+            "rest at {:?} is not slow enough against a lit badge at {:?}",
+            rest.period,
+            charge.period
+        );
+        assert!(
+            charge.period > alert.period * 2,
+            "an escalation at {:?} is not urgent enough against {:?}",
+            alert.period,
+            charge.period
+        );
+
+        // Rest breathes; the two live states snap. Different curves, not the
+        // same curve at a different speed.
+        assert_eq!(rest.curve, Curve::Sine);
+        assert_eq!(charge.curve, Curve::SnapPendulum);
+        assert_eq!(alert.curve, Curve::SnapPendulum);
+
+        // A resting badge is the tray's common case, so it must not ask the
+        // loop for the smooth tier that a snapping one needs.
+        assert!(rest.frame_interval > charge.frame_interval);
     }
 }

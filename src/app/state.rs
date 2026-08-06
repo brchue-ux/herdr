@@ -2119,6 +2119,21 @@ impl AppState {
         self.fleet_signal_bar_active() && self.sidebar_notifications.animates()
     }
 
+    /// True when the tray's badges are moving.
+    ///
+    /// Gated on the graphics path as well as on the two config switches,
+    /// because the motion *is* the artwork: a badge moves by being rasterised
+    /// at a different offset and glow, and a host with no graphics is drawing
+    /// the fallback marks, which cannot move. Publishing eight elements that
+    /// nothing could show would arm a deadline for a frame no one sees — the
+    /// same trap `sidebar_rows_move` documents for row slides.
+    pub(crate) fn signal_tray_animation_active(&self) -> bool {
+        crate::ui::signal_tray_active(self)
+            && self.sidebar_signal_tray.animate
+            && self.kitty_graphics_enabled
+            && self.host_cell_size.is_known()
+    }
+
     /// True while a view switch still has something to play or to commit.
     ///
     /// The loop consults this before forgetting every element: a switch that
