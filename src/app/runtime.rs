@@ -1867,9 +1867,13 @@ mod tests {
         let (mut app, leaving, _) = fleet_app("fade");
         let now = Instant::now();
         app.advance_animations(now, true);
+        // `left-worker-2` was created second and so entered at the head of its
+        // mate's group - see `crate::ui::sidebar::enter_at_head`. That makes the
+        // departing row below the *first* one here, which is the harder case:
+        // its place has to be held from index zero.
         assert_eq!(
             tree_worker_names(&app),
-            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            vec!["left-worker-2", "left-worker-1", "right-worker"],
             "the fleet did not start in ownership order"
         );
 
@@ -1884,7 +1888,7 @@ mod tests {
         // The other second mate's group never entered into it.
         assert_eq!(
             tree_worker_names(&app),
-            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            vec!["left-worker-2", "left-worker-1", "right-worker"],
             "the row was dropped before it could be seen leaving"
         );
 
@@ -1942,7 +1946,7 @@ mod tests {
         app.advance_animations(now, true);
         assert_eq!(
             tree_worker_names(&app),
-            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            vec!["left-worker-2", "left-worker-1", "right-worker"],
             "the fleet did not start in ownership order with the bar on"
         );
         assert!(
@@ -1957,7 +1961,7 @@ mod tests {
         app.advance_animations(now + Duration::from_millis(10), true);
         assert_eq!(
             tree_worker_names(&app),
-            vec!["left-worker-1", "left-worker-2", "right-worker"],
+            vec!["left-worker-2", "left-worker-1", "right-worker"],
             "a live signal bar cost the departing row its exit"
         );
         assert!(!app.state.sidebar_tree_row_memory.is_empty());

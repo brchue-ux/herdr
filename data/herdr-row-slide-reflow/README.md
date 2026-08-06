@@ -21,10 +21,15 @@ Everything in here is a real headless `kitty` 0.45.0 on `Xvfb`, fed the exact by
 | `cost.tsv` | what each frame costs on the wire |
 
 Read the enter strip left to right: the tree stands still, a card appears at the panel's right
-edge and travels left, and as it travels the two second-mate groups below it pan down to open
-its slot. The leave strip is the same thing backwards, because the engine plays a dismount as
-its mount reversed — that is not a second implementation, it is the same numbers read the other
-way.
+edge and travels left, and as it travels the rows below it pan down to open its slot. The leave
+strip is the same thing backwards, because the engine plays a dismount as its mount reversed —
+that is not a second implementation, it is the same numbers read the other way.
+
+Where it lands is the other half. The newcomer takes the **top** of its own second mate's group,
+not the bottom, and the two workers that were already there are the ones pushed down. That is
+the entry rule in `sidebar::enter_at_head`: a card comes in at the head of the branch that owns
+it — never outside that branch — and the panel's sort owns it from there, free to move it up or
+down among its siblings on any later frame.
 
 ## What it costs
 
