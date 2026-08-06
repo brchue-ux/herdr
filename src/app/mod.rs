@@ -19,6 +19,7 @@ pub(crate) mod fleet_signals;
 mod git_refresh;
 mod ids;
 mod input;
+pub(crate) mod lifecycle;
 pub(crate) mod pane_activity;
 mod popup;
 mod pull_requests;

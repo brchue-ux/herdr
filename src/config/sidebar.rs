@@ -876,6 +876,19 @@ pub struct SidebarCardsConfig {
     pub wash: bool,
     /// How long a wash takes to cross a card, in milliseconds.
     pub wash_ms: u64,
+    /// Whether a card's hue carries which lifecycle stage its work is at and its
+    /// intensity carries how bad the problem on it is.
+    ///
+    /// On. Off draws every card in the one measured hue family the reference was
+    /// sampled from, with its intensity following the detected state — which is
+    /// exactly what shipped before the two channels were split apart, and is the
+    /// honest setting for anyone who does not want five hues in the panel.
+    ///
+    /// Only the *colour* is switched. The escalated breath a serious problem
+    /// puts a card on is on the behaviour side and answers to `pulse`, so
+    /// turning this off leaves severity legible in rhythm rather than removing
+    /// it — see [`crate::anim::behaviour::names::CARD_ALERT`].
+    pub stage_hue: bool,
 }
 
 impl Default for SidebarCardsConfig {
@@ -884,6 +897,7 @@ impl Default for SidebarCardsConfig {
             pulse: true,
             wash: true,
             wash_ms: DEFAULT_CARD_WASH_MS,
+            stage_hue: true,
         }
     }
 }
@@ -910,6 +924,7 @@ impl SidebarCardsConfig {
             &[
                 crate::anim::behaviour::names::CARD_REST,
                 crate::anim::behaviour::names::CARD_LIVE,
+                crate::anim::behaviour::names::CARD_ALERT,
             ]
         } else {
             &[]

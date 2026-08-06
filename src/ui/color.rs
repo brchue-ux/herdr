@@ -52,6 +52,72 @@ pub(crate) fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
+/// Hue in degrees, saturation and lightness in `0.0..=1.0`.
+///
+/// Hue is `0.0` for any achromatic colour, which is a real answer rather than a
+/// missing one — see [`hue_is_meaningful`] for the test a caller needs before
+/// treating it as a colour rather than as a grey.
+pub(crate) fn to_hsl(color: Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = (
+        f32::from(color.0) / 255.0,
+        f32::from(color.1) / 255.0,
+        f32::from(color.2) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d <= f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if (max - r).abs() < f32::EPSILON {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f32::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+/// The inverse of [`to_hsl`].
+pub(crate) fn from_hsl(h: f32, s: f32, l: f32) -> Rgb {
+    let h = h.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to8 = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to8(r), to8(g), to8(b))
+}
+
+/// Below this saturation a colour's hue angle is arithmetic rather than
+/// information: a near-grey's angle is decided by a channel or two of rounding,
+/// so a caller reading a hue *out* of a theme role has to know when the theme
+/// did not supply one.
+const ACHROMATIC_SATURATION: f32 = 0.12;
+
+/// True when this colour is chromatic enough for its hue angle to mean
+/// something.
+pub(crate) fn hue_is_meaningful(color: Rgb) -> bool {
+    let (_, s, l) = to_hsl(color);
+    s >= ACHROMATIC_SATURATION && (0.02..=0.98).contains(&l)
+}
+
 /// Static fallback for named colours when the host terminal did not report a
 /// palette. `Color::Reset` and `Color::Indexed` have no meaning here.
 pub(crate) fn color_to_rgb(color: Color) -> Option<Rgb> {
