@@ -13,7 +13,7 @@
 //! shape whose exact coverage is already known analytically.
 
 /// 8-bit sRGB, the space every sampled constant is quoted in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
@@ -38,32 +38,15 @@ impl Rgb {
         Self::from_hsl(h, (s * sat).clamp(0.0, 1.0), (l * lum).clamp(0.0, 1.0))
     }
 
-    fn to_hsl(self) -> (f32, f32, f32) {
-        let (r, g, b) = (
-            f32::from(self.0) / 255.0,
-            f32::from(self.1) / 255.0,
-            f32::from(self.2) / 255.0,
-        );
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        let l = (max + min) / 2.0;
-        if (max - min).abs() < f32::EPSILON {
-            return (0.0, 0.0, l);
-        }
-        let d = max - min;
-        let s = if l > 0.5 {
-            d / (2.0 - max - min)
-        } else {
-            d / (max + min)
-        };
-        let h = if (max - r).abs() < f32::EPSILON {
-            ((g - b) / d).rem_euclid(6.0)
-        } else if (max - g).abs() < f32::EPSILON {
-            (b - r) / d + 2.0
-        } else {
-            (r - g) / d + 4.0
-        };
-        (h * 60.0, s, l)
+    /// This colour as hue degrees, saturation and lightness.
+    ///
+    /// Delegated to [`crate::ui::color`] rather than written again here. The
+    /// severity channel's whole guarantee is that it moves saturation and
+    /// lightness without moving hue, and two HSL implementations that disagreed
+    /// by a rounding step would be two different answers to *what hue is this* —
+    /// which is exactly the thing that must not be true twice.
+    pub(super) fn to_hsl(self) -> (f32, f32, f32) {
+        crate::ui::color::to_hsl((self.0, self.1, self.2))
     }
 
     /// A colour named the way the reference's own family is quoted.
@@ -72,20 +55,16 @@ impl Rgb {
     /// hue family is a *statement* in: H 181–210 across every state, and only
     /// S and L moving. Spelling them as RGB would hide the invariant.
     pub(super) fn from_hsl(h: f32, s: f32, l: f32) -> Self {
-        let h = h.rem_euclid(360.0);
-        let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-        let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
-        let m = l - c / 2.0;
-        let (r, g, b) = match (h / 60.0) as u32 {
-            0 => (c, x, 0.0),
-            1 => (x, c, 0.0),
-            2 => (0.0, c, x),
-            3 => (0.0, x, c),
-            4 => (x, 0.0, c),
-            _ => (c, 0.0, x),
-        };
-        let to8 = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
-        Self(to8(r), to8(g), to8(b))
+        let (r, g, b) = crate::ui::color::from_hsl(h, s, l);
+        Self(r, g, b)
+    }
+
+    pub(super) fn as_tuple(self) -> crate::ui::color::Rgb {
+        (self.0, self.1, self.2)
+    }
+
+    pub(super) fn from_tuple(rgb: crate::ui::color::Rgb) -> Self {
+        Self(rgb.0, rgb.1, rgb.2)
     }
 }
 

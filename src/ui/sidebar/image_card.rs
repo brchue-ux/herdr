@@ -54,6 +54,7 @@ use ratatui::layout::Rect;
 use canvas::{coverage, Canvas, Rgb, RoundRect};
 use font::{CardFont, FontMetrics};
 
+use crate::anim::cell::{LifecycleStage, Severity};
 use crate::app::state::AppState;
 use crate::detect::AgentState;
 use crate::kitty_graphics::HostCellSize;
@@ -478,12 +479,56 @@ impl CardWashFrame {
     }
 }
 
+/// The five stage hues under the theme in force, resolved once for a card.
+///
+/// A table rather than a palette borrow because a card's content owns its whole
+/// appearance — the same reason [`CardWashFrame`] copies its behaviour out of the
+/// catalogue. It carries all five and not just the card's own because a wash has
+/// two sides and they are two different stages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StageHues([f32; 5]);
+
+impl StageHues {
+    fn resolve(app: &AppState) -> Self {
+        let mut hues = [0.0; 5];
+        for (slot, stage) in hues.iter_mut().zip(LifecycleStage::ALL) {
+            *slot = stage.hue(&app.sidebar_palette, &app.host_terminal_theme);
+        }
+        Self(hues)
+    }
+
+    fn of(self, stage: LifecycleStage) -> f32 {
+        let index = LifecycleStage::ALL
+            .iter()
+            .position(|candidate| *candidate == stage)
+            .unwrap_or(0);
+        self.0[index]
+    }
+}
+
 /// What one card says, and how it is lit while it says it.
 struct CardContent {
     title: String,
     tidbit: Option<String>,
     state_label: String,
     state: AgentState,
+    /// Which stage this card's work is at. **The hue channel, and only that.**
+    stage: LifecycleStage,
+    /// How bad the problem on this card is. **The intensity channel, and only
+    /// that.** Independent of `stage` by construction: neither is derived from
+    /// the other anywhere, so every one of the twenty combinations is a card
+    /// that can actually be on screen.
+    severity: Severity,
+    /// The theme's answer for every stage's hue, so the two sides of a wash can
+    /// each resolve their own.
+    hues: StageHues,
+    /// The panel colour this card's ink is placed against. The severity channel
+    /// is a *distance from the ground*, so the ground is part of resolving it.
+    ground: Rgb,
+    /// Whether the two channels are switched on. Off draws the reference's own
+    /// single hue family with its intensity following the stage, which is what
+    /// shipped before the split — see [`crate::config::SidebarCardsConfig`].
+    split_channels: bool,
     seen: bool,
     depth: u8,
     lifted: bool,
@@ -503,6 +548,16 @@ impl CardContent {
         self.tidbit.hash(hasher);
         self.state_label.hash(hasher);
         (self.state as u8).hash(hasher);
+        self.stage.hash(hasher);
+        self.severity.hash(hasher);
+        // The resolved hues and the ground go in as bits: a theme change moves
+        // them without moving anything else about the card, and a card carried
+        // forward on a stale signature would keep the old theme's ink.
+        for hue in self.hues.0 {
+            hue.to_bits().hash(hasher);
+        }
+        self.ground.hash(hasher);
+        self.split_channels.hash(hasher);
         self.seen.hash(hasher);
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
@@ -515,9 +570,25 @@ impl CardContent {
         self.wash.map(CardWashFrame::step).hash(hasher);
     }
 
-    /// The light this card has arrived at: the state it is in, breathing.
+    /// The light of one stage on this card, at this card's severity.
+    ///
+    /// The two channels are supplied from two different places and meet only in
+    /// [`CardLight::of`]: the stage decides which of the five hues is handed
+    /// over, the severity decides how far off the panel it is placed, and
+    /// neither is consulted about the other's number.
+    fn light_of(&self, stage: LifecycleStage) -> CardLight {
+        CardLight::of(
+            stage,
+            self.severity,
+            self.hues.of(stage),
+            self.ground,
+            self.split_channels,
+        )
+    }
+
+    /// The light this card has arrived at: the stage it is at, breathing.
     fn arrived_light(&self) -> CardLight {
-        CardLight::of(self.state).breathed(self.breath)
+        self.light_of(self.stage).breathed(self.breath)
     }
 
     /// The light ahead of a wash's front: the state the card left, breathing.
@@ -526,9 +597,15 @@ impl CardContent {
     /// result, because a card breathes throughout a state change — breathing
     /// only the destination would make a wash look like the moment the card's
     /// breath was switched on.
+    /// The severity is deliberately *not* swept: a wash carries a change of
+    /// stage, and how bad the row's trouble is did not change because its work
+    /// moved on. Sweeping both would make the two channels one again on exactly
+    /// the frames a reader is looking hardest.
     fn leaving_light(&self) -> Option<CardLight> {
-        self.wash
-            .map(|wash| CardLight::of(wash.from).breathed(self.breath))
+        self.wash.map(|wash| {
+            self.light_of(crate::app::lifecycle::stage(None, wash.from))
+                .breathed(self.breath)
+        })
     }
 
     /// The light the card's chrome and its type are drawn in.
@@ -541,7 +618,16 @@ impl CardContent {
     /// spec's digestibility condition does not take a break for half of every
     /// cycle.
     fn settled_light(&self) -> CardLight {
-        CardLight::of(self.state)
+        self.light_of(self.stage)
+    }
+}
+
+#[cfg(test)]
+impl CardContent {
+    /// The light this card would be drawn in were its work at the stage `state`
+    /// implies, at this card's own severity.
+    fn light_at(&self, state: AgentState) -> CardLight {
+        self.light_of(crate::app::lifecycle::stage(None, state))
     }
 }
 
@@ -566,22 +652,46 @@ fn backdrop_rgb(app: &AppState) -> Rgb {
         .unwrap_or(measured::CANVAS)
 }
 
-/// The chip's ink per state.
+/// The chip's ink.
 ///
-/// The reference's own cards never move hue to signal anything — its inactive
-/// card is the same hue at 24% of the saturation — so the family stays inside
-/// H 181–210 and state is carried by saturation and lightness within it. These
-/// are the values the density and icon passes were rendered and reviewed at.
-fn chip_ink(state: AgentState, seen: bool) -> Rgb {
-    let (h, s, l) = match (state, seen) {
-        (AgentState::Blocked, _) => (181.0, 0.75, 0.72),
-        (AgentState::Working, _) => (192.0, 0.62, 0.66),
-        (AgentState::Idle, false) => (205.0, 0.40, 0.52),
-        (AgentState::Idle, true) => (210.0, 0.16, 0.42),
-        (AgentState::Unknown, _) => (210.0, 0.10, 0.36),
-    };
-    Rgb::from_hsl(h, s, l)
+/// The card's own stage hue, so the chip that *names* the state and the card
+/// that *is* it cannot say two different things.
+///
+/// **At a fixed rung of the severity ramp rather than at the card's own**, and
+/// that is deliberate: the chip carries a *word*. Placed at its card's severity
+/// it goes as dim as [`Severity::Clear`] asks for, and a clear card — the
+/// commonest card in a healthy fleet — then has the one label on it that cannot
+/// be read. This is the same rule #60 applied to the title and the breath: type
+/// is held out of the light effects, because the visual target's digestibility
+/// condition does not take a break for the cards that are fine. Severity is
+/// carried by the card's body, which has no words on it.
+fn chip_ink(content: &CardContent) -> Rgb {
+    if !content.split_channels {
+        // The measured family, exactly as the density and icon passes were
+        // rendered and reviewed at: one hue, and state carried by saturation
+        // and lightness inside it.
+        let (h, s, l) = match (content.state, content.seen) {
+            (AgentState::Blocked, _) => (181.0, 0.75, 0.72),
+            (AgentState::Working, _) => (192.0, 0.62, 0.66),
+            (AgentState::Idle, false) => (205.0, 0.40, 0.52),
+            (AgentState::Idle, true) => (210.0, 0.16, 0.42),
+            (AgentState::Unknown, _) => (210.0, 0.10, 0.36),
+        };
+        return Rgb::from_hsl(h, s, l);
+    }
+    Rgb::from_tuple(crate::anim::cell::signal_ink(
+        content.hues.of(content.stage),
+        CHIP_RUNG,
+        content.ground.as_tuple(),
+    ))
 }
+
+/// The rung of the severity ramp every chip is drawn at.
+///
+/// High enough that the label reads on any theme, and not the top, so a chip on
+/// a critical card is still quieter than the card around it rather than
+/// competing with it.
+const CHIP_RUNG: Severity = Severity::Serious;
 
 /// The light one card is drawn in: how saturated its ink is, how bright, and
 /// how far its bloom lifts it off the panel.
@@ -594,29 +704,68 @@ fn chip_ink(state: AgentState, seen: bool) -> Rgb {
 /// would be a dimmer, which is the thing that spec rules out by name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CardLight {
-    sat: f32,
+    /// The card's own ink at this light: **the hue channel and the intensity
+    /// channel, already resolved into one colour.** Everything below this point
+    /// only ever restates it, and restating in HSL cannot move a hue — which is
+    /// what makes the stage channel inviolable no matter what the breath, the
+    /// wash or the presence cue do afterwards.
+    ink: Rgb,
+    /// What the breath has taken off this card's luminance, in `0.0..=1.0`.
     lum: f32,
     /// How much of the card's measured bloom is laid down, in `0.0..=1.0`.
+    ///
+    /// **The third channel, and neither of the two.** This is depth: the visual
+    /// target asks a card with nothing behind it to read as *"on the back
+    /// burner — dimmed or recessed slightly"*, and names recession as a depth
+    /// cue rather than a dimmer. So presence is carried by the lift alone and
+    /// keeps its hands off the ink, which is what lets the severity channel own
+    /// contrast outright: a queued card and a running card at the same severity
+    /// stand equally far off the panel in *ink* and differently far off it in
+    /// *lift*.
     bloom: f32,
 }
 
 impl CardLight {
-    /// How much saturation and light a card in this state keeps.
+    /// The light one stage at one severity is drawn in, over `ground`.
     ///
-    /// The reference's answer to "what carries state without a rainbow": an
-    /// inactive card is the same hue with S 14.5% where an active one is 59.6%,
-    /// at 57% of the luminance, and with no bloom at all.
-    fn of(state: AgentState) -> Self {
-        let (sat, lum, bloom) = match state {
-            AgentState::Working | AgentState::Blocked => (1.0, 1.0, 1.0),
-            AgentState::Idle => (
-                (1.0 + measured::MUTED_SAT) / 2.0,
-                (1.0 + measured::MUTED_LUM) / 2.0,
-                0.35,
-            ),
-            AgentState::Unknown => (measured::MUTED_SAT, measured::MUTED_LUM, 0.0),
+    /// The one place the two channels meet, and they meet by being handed to
+    /// different arguments of one function that never crosses them: `hue` goes
+    /// only into the hue slot, `severity` only into the saturation and contrast
+    /// slots. `stage` is consulted a second time for the bloom, which is the
+    /// depth cue and not either channel — see [`CardLight::bloom`].
+    fn of(
+        stage: LifecycleStage,
+        severity: Severity,
+        hue: f32,
+        ground: Rgb,
+        split_channels: bool,
+    ) -> Self {
+        let ink = if split_channels {
+            Rgb::from_tuple(crate::anim::cell::signal_ink(
+                hue,
+                severity,
+                ground.as_tuple(),
+            ))
+        } else {
+            // The reference's own answer to "what carries state without a
+            // rainbow": one hue, with saturation and light muted by stage.
+            let (sat, lum) = match stage {
+                LifecycleStage::Running | LifecycleStage::Waiting | LifecycleStage::Failed => {
+                    (1.0, 1.0)
+                }
+                LifecycleStage::Done => (
+                    (1.0 + measured::MUTED_SAT) / 2.0,
+                    (1.0 + measured::MUTED_LUM) / 2.0,
+                ),
+                LifecycleStage::Queued => (measured::MUTED_SAT, measured::MUTED_LUM),
+            };
+            measured::STROKE_A.restate(sat, lum)
         };
-        Self { sat, lum, bloom }
+        Self {
+            ink,
+            lum: 1.0,
+            bloom: presence(stage),
+        }
     }
 
     /// The same light after one frame of this card's breath.
@@ -637,24 +786,51 @@ impl CardLight {
     fn breathed(self, envelope: f32) -> Self {
         let swing = envelope.clamp(0.0, 1.0);
         Self {
-            sat: self.sat,
+            ink: self.ink,
             lum: self.lum * (1.0 - BREATH_LUM_DIP * swing),
             bloom: self.bloom * (1.0 - BREATH_BLOOM_DIP * swing),
         }
     }
 
     /// The stroke's two ends and the bloom's, at this light.
+    ///
+    /// The measured gradient is reproduced as a *travel around* this card's own
+    /// ink rather than as the two sampled cyans: half the measured hue swing
+    /// either side, at the measured saturation ratio. So a card keeps the
+    /// left-to-right gradient the reference has, centred on whatever hue its
+    /// stage supplies.
     fn inks(self) -> CardInk {
-        let stroke_a = measured::STROKE_A.restate(self.sat, self.lum);
-        let stroke_b = measured::STROKE_B.restate(self.sat, self.lum);
-        let red = |c: Rgb| Rgb((f32::from(c.0) * measured::BLOOM_RED_MUL) as u8, c.1, c.2);
+        let (h, s, l) = self.ink.to_hsl();
+        let l = l * self.lum;
+        let stroke_a = Rgb::from_hsl(h - measured::HUE_TRAVEL / 2.0, s, l);
+        let stroke_b = Rgb::from_hsl(
+            h + measured::HUE_TRAVEL / 2.0,
+            s * measured::STROKE_B_SAT_RATIO,
+            l,
+        );
+        let bloomed = |c: Rgb| c.restate(measured::BLOOM_SAT_MUL, measured::BLOOM_LUM_MUL);
         CardInk {
             stroke_a,
             stroke_b,
-            bloom_a: red(stroke_a),
-            bloom_b: red(stroke_b),
+            bloom_a: bloomed(stroke_a),
+            bloom_b: bloomed(stroke_b),
             bloom: self.bloom,
         }
+    }
+}
+
+/// How far off the panel a card at this stage stands, before the breath moves
+/// it.
+///
+/// The depth channel, kept on stage because that is what the visual target puts
+/// there: work in flight comes forward, a queue sits flat in the panel, and a
+/// finished card is part-way back. `Failed` stands as far forward as `Running` —
+/// a failure is not on the back burner.
+fn presence(stage: LifecycleStage) -> f32 {
+    match stage {
+        LifecycleStage::Running | LifecycleStage::Waiting | LifecycleStage::Failed => 1.0,
+        LifecycleStage::Done => 0.35,
+        LifecycleStage::Queued => 0.0,
     }
 }
 
@@ -1258,7 +1434,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let chip_h = column.chip_height;
     let text_left = ox + column.left;
     if column.chip_fits {
-        let ink = chip_ink(content.state, content.seen);
+        let ink = chip_ink(content);
         let fill = measured::FILL_MID.mix(ink, 0.16);
         let edge = fill.mix(ink, 0.50);
         let chip_x = text_right - chip_w;
@@ -1432,7 +1608,16 @@ fn title_text(entry: &AgentPanelEntry) -> String {
 /// cannot separate the hues still reads the tree. Both names are declared on
 /// every row's lifecycle, so a card changing state does not restart the clock of
 /// the state it left.
-fn breath_behaviour(state: AgentState) -> &'static str {
+/// A serious problem escalates over both, and over rest as well as over live: a
+/// card that has gone quiet with something badly wrong on it is not resting, and
+/// this is where the severity channel stops being a colour. The visual target is
+/// explicit that state has to survive a reader who cannot separate the hues, so
+/// severity says it twice — in how far the card stands off the panel, and in how
+/// fast it breathes.
+fn breath_behaviour(state: AgentState, severity: Severity) -> &'static str {
+    if severity.escalates() {
+        return crate::anim::behaviour::names::CARD_ALERT;
+    }
     match state {
         AgentState::Working | AgentState::Blocked => crate::anim::behaviour::names::CARD_LIVE,
         AgentState::Idle | AgentState::Unknown => crate::anim::behaviour::names::CARD_REST,
@@ -1451,12 +1636,17 @@ fn breath_behaviour(state: AgentState) -> &'static str {
 /// whenever the engine has nothing — animation off, a host with no cards, or a
 /// row that has only just been published — which is the card at its own settled
 /// light.
-fn breath(app: &AppState, row: &crate::anim::ElementId, state: AgentState) -> f32 {
+fn breath(
+    app: &AppState,
+    row: &crate::anim::ElementId,
+    state: AgentState,
+    severity: Severity,
+) -> f32 {
     use crate::anim::cell::{CellExtent, CellPos};
     if !app.sidebar_cards.pulse {
         return 0.0;
     }
-    let Some(frame) = app.anim.frame(row, Some(breath_behaviour(state))) else {
+    let Some(frame) = app.anim.frame(row, Some(breath_behaviour(state, severity))) else {
         return 0.0;
     };
     let Some(behaviour) = frame.behaviour else {
@@ -1540,12 +1730,28 @@ fn content_for(
                 .aggregate_state_changed_at(&app.terminals)
                 .map(|at| app.state_age_now.saturating_duration_since(at));
             let row = crate::anim::ElementId::workspace_row(&workspace.id);
-            let breath = breath(app, &row, state);
+            let stage = crate::app::lifecycle::stage(
+                tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                state,
+            );
+            let severity = crate::app::lifecycle::severity(
+                tokens
+                    .get(crate::app::lifecycle::SEVERITY_TOKEN)
+                    .map(String::as_str),
+            );
+            let breath = breath(app, &row, state, severity);
             Some(CardContent {
                 title: tokens.get("doing").cloned().unwrap_or(label),
                 tidbit: tidbit_parts(tokens.get("project"), tokens.get("context"), age),
                 state_label: crate::ui::status::state_label(state, seen).to_string(),
                 state,
+                stage,
+                severity,
+                hues: StageHues::resolve(app),
+                ground: backdrop_rgb(app),
+                split_channels: app.sidebar_cards.stage_hue,
                 seen,
                 depth: entry.depth(),
                 lifted: app.active == Some(*ws_idx),
@@ -1560,12 +1766,30 @@ fn content_for(
                 .last_agent_state_change_at
                 .map(|at| app.state_age_now.saturating_duration_since(at));
             let row = crate::anim::ElementId::agent_row(detail.pane_id);
-            let breath = breath(app, &row, detail.state);
+            let stage = crate::app::lifecycle::stage(
+                detail
+                    .tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                detail.state,
+            );
+            let severity = crate::app::lifecycle::severity(
+                detail
+                    .tokens
+                    .get(crate::app::lifecycle::SEVERITY_TOKEN)
+                    .map(String::as_str),
+            );
+            let breath = breath(app, &row, detail.state, severity);
             Some(CardContent {
                 title: title_text(detail),
                 tidbit: tidbit_line(detail, age),
                 state_label: super::agent_status_label(detail).to_string(),
                 state: detail.state,
+                stage,
+                severity,
+                hues: StageHues::resolve(app),
+                ground: backdrop_rgb(app),
+                split_channels: app.sidebar_cards.stage_hue,
                 seen: detail.seen,
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
@@ -3857,35 +4081,200 @@ mod tests {
         assert_eq!(wrap(font, "Ship PR", TITLE_PX, 400.0, TITLE_LINES).len(), 1);
     }
 
-    /// The reference never moves hue to signal state: it changes saturation and
-    /// bloom and nothing else. A future edit that reaches for a red card fails
-    /// here first.
+    /// With the split switched off the card is exactly what it was: the
+    /// reference's one hue family, with state carried by saturation and bloom.
+    ///
+    /// This is the invariant the card shipped with, kept as the `stage_hue =
+    /// false` contract rather than deleted, so the fallback really is the old
+    /// look and not an untested branch nobody has drawn.
     #[test]
-    fn state_changes_intensity_and_bloom_but_never_hue() {
-        let hue_of = |c: Rgb| {
-            let restated = c.restate(1.0, 1.0);
-            (restated.0, restated.1, restated.2)
-        };
-        let base = hue_of(measured::STROKE_A);
+    fn without_the_split_a_card_stays_inside_the_measured_hue_family() {
+        for stage in LifecycleStage::ALL {
+            let light = CardLight::of(stage, Severity::Critical, 0.0, measured::CANVAS, false);
+            assert!((0.0..=1.0).contains(&light.lum));
+            assert!((0.0..=1.0).contains(&light.bloom));
+            // Desaturating toward grey is allowed; rotating the hue is not, and
+            // no severity may rotate it either — the whole channel is off.
+            let Rgb(r, g, b) = light.ink;
+            assert!(
+                b >= r && g >= r,
+                "{stage:?} moved the stroke out of the blue-cyan family: {r},{g},{b}"
+            );
+        }
+    }
+
+    /// **Channel independence, on the card's own ink.**
+    ///
+    /// Two claims, and they are the two halves of the split: changing the
+    /// severity may not move the hue by so much as a degree, and changing the
+    /// stage may not move what the severity is saying. The second is checked as
+    /// the *saturation and the distance from the panel* — the two numbers the
+    /// severity channel owns — being the same at every stage.
+    #[test]
+    fn a_cards_hue_answers_only_to_its_stage_and_its_intensity_only_to_its_severity() {
+        let ground = measured::CANVAS;
+        let hues = [30.0, 120.0, 200.0, 280.0, 340.0];
+
+        for (stage, hue) in LifecycleStage::ALL.into_iter().zip(hues) {
+            let inks: Vec<_> = Severity::ALL
+                .into_iter()
+                .map(|severity| {
+                    CardLight::of(stage, severity, hue, ground, true)
+                        .ink
+                        .to_hsl()
+                })
+                .collect();
+            for (severity, (h, _, _)) in Severity::ALL.into_iter().zip(&inks) {
+                assert!(
+                    (h - hue).abs() < 1.5,
+                    "{stage:?} at {severity:?} landed on hue {h:.1} instead of {hue:.1}: \
+                     the severity channel reached into the stage channel"
+                );
+            }
+        }
+
+        for severity in Severity::ALL {
+            let placed = crate::anim::cell::signal_light(severity, ground.as_tuple());
+            for (stage, hue) in LifecycleStage::ALL.into_iter().zip(hues) {
+                let (_, sat, light) = CardLight::of(stage, severity, hue, ground, true)
+                    .ink
+                    .to_hsl();
+                assert!(
+                    (light - placed).abs() < 0.02,
+                    "{stage:?} is placed at lightness {light:.3} where {severity:?} \
+                     asks for {placed:.3}: the stage channel reached into the \
+                     severity channel"
+                );
+                let first = CardLight::of(LifecycleStage::Queued, severity, hues[0], ground, true)
+                    .ink
+                    .to_hsl()
+                    .1;
+                assert!(
+                    (sat - first).abs() < 0.02,
+                    "{stage:?} is drawn at saturation {sat:.3} where {severity:?} \
+                     asks for {first:.3}"
+                );
+            }
+        }
+    }
+
+    /// Every one of the twenty cards the two channels can express is a card
+    /// somebody could tell from the other nineteen.
+    ///
+    /// The point of the split: a severe problem at one stage must not render as
+    /// a mild one at another. Two inks count as told apart when they differ in
+    /// hue by more than the card's own gradient can account for, or in the
+    /// intensity the severity channel places them at.
+    #[test]
+    fn every_stage_by_severity_combination_is_distinguishable() {
+        let ground = measured::CANVAS;
+        let matrix: Vec<_> = LifecycleStage::ALL
+            .into_iter()
+            .flat_map(|stage| {
+                Severity::ALL.into_iter().map(move |severity| {
+                    let hue = stage.hue(
+                        &crate::app::state::Palette::catppuccin(),
+                        &crate::terminal_theme::TerminalTheme::default(),
+                    );
+                    let (h, _, l) = CardLight::of(stage, severity, hue, ground, true)
+                        .ink
+                        .to_hsl();
+                    (stage, severity, h, l)
+                })
+            })
+            .collect();
+        assert_eq!(matrix.len(), 20);
+
+        for (i, a) in matrix.iter().enumerate() {
+            for b in &matrix[i + 1..] {
+                // Hue distance the short way round the wheel.
+                let hue_gap = {
+                    let raw = (a.2 - b.2).abs() % 360.0;
+                    raw.min(360.0 - raw)
+                };
+                let light_gap = (a.3 - b.3).abs();
+                assert!(
+                    hue_gap > measured::HUE_TRAVEL || light_gap > 0.06,
+                    "{:?}/{:?} and {:?}/{:?} render alike: {hue_gap:.1}° apart at \
+                     {light_gap:.3} lightness",
+                    a.0,
+                    a.1,
+                    b.0,
+                    b.1
+                );
+            }
+        }
+    }
+
+    /// **Severity survives the colour being taken away.**
+    ///
+    /// The visual target is explicit that state has to read for someone who
+    /// cannot separate two hues, so the severity channel is placed by *contrast
+    /// against the panel* — a quantity defined on relative luminance alone.
+    /// Convert the whole matrix to greyscale and the four severities are still
+    /// four, in order, at every stage.
+    #[test]
+    fn severity_is_still_four_steps_in_greyscale() {
+        let ground = measured::CANVAS;
+        for stage in LifecycleStage::ALL {
+            let hue = stage.hue(
+                &crate::app::state::Palette::catppuccin(),
+                &crate::terminal_theme::TerminalTheme::default(),
+            );
+            let greys: Vec<f32> = Severity::ALL
+                .into_iter()
+                .map(|severity| {
+                    let ink = CardLight::of(stage, severity, hue, ground, true).ink;
+                    crate::ui::color::relative_luminance(ink.as_tuple())
+                })
+                .collect();
+            for pair in greys.windows(2) {
+                assert!(
+                    pair[1] > pair[0] * 1.2,
+                    "{stage:?} in greyscale: {pair:?} is not a step anyone could see"
+                );
+            }
+        }
+    }
+
+    /// And it says it a second time, in rhythm.
+    ///
+    /// Contrast alone would still be a *light* channel, and the visual target's
+    /// answer to "colour measurably fails" is behaviour. A serious problem puts
+    /// the card on the escalated rung of the same ladder the tray badges climb —
+    /// over rest and over live alike, because a card that has gone quiet with
+    /// something badly wrong on it is not resting.
+    #[test]
+    fn a_serious_problem_escalates_the_cards_rhythm_whatever_it_was_doing() {
+        use crate::anim::behaviour::names;
         for state in [
             AgentState::Working,
             AgentState::Blocked,
             AgentState::Idle,
             AgentState::Unknown,
         ] {
-            let light = CardLight::of(state);
-            assert!((0.0..=1.0).contains(&light.sat));
-            assert!((0.0..=1.0).contains(&light.lum));
-            assert!((0.0..=1.0).contains(&light.bloom));
-            let restated = measured::STROKE_A.restate(light.sat, light.lum);
-            // Desaturating toward grey is allowed; rotating the hue is not.
-            let (r, g, b) = (restated.0, restated.1, restated.2);
-            assert!(
-                b >= r && g >= r,
-                "{state:?} moved the stroke out of the blue-cyan family: {r},{g},{b} from \
-                 {base:?}"
-            );
+            let quiet = breath_behaviour(state, Severity::Clear);
+            assert_ne!(quiet, names::CARD_ALERT);
+            assert_eq!(breath_behaviour(state, Severity::Mild), quiet);
+            for severity in [Severity::Serious, Severity::Critical] {
+                assert_eq!(breath_behaviour(state, severity), names::CARD_ALERT);
+            }
         }
+
+        // The rungs are genuinely different rhythms, not the same one relabelled.
+        let catalogue = crate::anim::behaviour::Catalogue::built_in();
+        let period = |name| {
+            catalogue
+                .get(name)
+                .expect("a built-in")
+                .effective_period(crate::anim::behaviour::DriveInputs { activity: 1.0 })
+        };
+        assert!(
+            period(names::CARD_ALERT) * 2 < period(names::CARD_LIVE),
+            "the escalated rung has to be better than twice the live one, or the \
+             two read as one rhythm that drifted"
+        );
+        assert!(period(names::CARD_ALERT) < period(names::CARD_REST));
     }
 
     /// A card's chrome is measured against the tier's nominal height, so a card
@@ -6539,7 +6928,7 @@ mod cards_breathe_and_wash {
         let Some(idle) = card_in(&app, AgentState::Idle) else {
             return;
         };
-        let settled = CardLight::of(idle.state);
+        let settled = idle.settled_light();
 
         let mut lums = Vec::new();
         let mut blooms = Vec::new();
@@ -6556,9 +6945,9 @@ mod cards_breathe_and_wash {
                 "the breath took a resting card above its own light: {light:?} against {settled:?}"
             );
             assert!(
-                light.sat == settled.sat,
-                "a breath must not desaturate: a card losing its hue reads as \
-                 losing its state, not as resting"
+                light.ink == settled.ink,
+                "a breath must not restate the card's own ink: a card losing its \
+                 hue reads as losing its stage, not as resting"
             );
             lums.push(light.lum);
             blooms.push(light.bloom);
@@ -6629,7 +7018,7 @@ mod cards_breathe_and_wash {
         app.anim.advance(now + Duration::from_millis(900));
         for card in contents(&app) {
             assert_eq!(card.breath, 0.0);
-            assert_eq!(mid(&card), CardLight::of(card.state).inks());
+            assert_eq!(mid(&card), card.settled_light().inks());
         }
     }
 
@@ -6728,7 +7117,8 @@ mod cards_breathe_and_wash {
         // The new state's light, still breathing — the breath does not stop
         // because a wash finished, so what every column has to agree on is the
         // destination *as the card is drawn*, not the raw state constant.
-        let arrived = CardLight::of(AgentState::Working)
+        let arrived = card
+            .light_at(AgentState::Working)
             .breathed(card.breath)
             .inks();
         for (index, ink) in across(&card).into_iter().enumerate() {
@@ -6741,7 +7131,7 @@ mod cards_breathe_and_wash {
         // the two states having happened to resolve alike.
         assert_ne!(
             arrived,
-            CardLight::of(AgentState::Idle).breathed(card.breath).inks()
+            card.light_at(AgentState::Idle).breathed(card.breath).inks()
         );
     }
 
@@ -6757,8 +7147,8 @@ mod cards_breathe_and_wash {
             return;
         };
         let window = app.sidebar_cards.wash_duration();
-        let left_behind = CardLight::of(from).bloom;
-        let arriving = CardLight::of(AgentState::Working).bloom;
+        let left_behind = presence(crate::app::lifecycle::stage(None, from));
+        let arriving = presence(crate::app::lifecycle::stage(None, AgentState::Working));
 
         // Somewhere in the middle of the sweep. Sampled across several steps
         // rather than at one, because where the front is at any single instant
@@ -6855,7 +7245,7 @@ mod cards_breathe_and_wash {
         if card.wash.is_none() || card.breath <= 0.0 {
             return;
         }
-        let unbreathed_old = CardLight::of(from).inks();
+        let unbreathed_old = card.light_at(from).inks();
         let right = CardInks::of(&card).at(1.0);
         assert!(
             right.bloom < unbreathed_old.bloom || unbreathed_old.bloom == 0.0,

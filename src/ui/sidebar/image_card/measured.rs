@@ -27,7 +27,32 @@ pub(super) const STROKE_A: Rgb = Rgb(127, 226, 228);
 /// runs H 181 at its own left edge and H 212 at its own right edge regardless
 /// of where it sits, so it is normalised to card width and not to panel
 /// position.
+///
+/// A card's hue is its own now — it carries which stage its work is at — so the
+/// renderer runs this gradient as a *travel around* whatever hue that is, using
+/// [`HUE_TRAVEL`] and [`STROKE_B_SAT_RATIO`] below. The sampled pair stays on
+/// record because those two are derived from it and
+/// `the_gradient_ratios_reproduce_the_sampled_pair` checks that they still
+/// reproduce it.
+#[allow(dead_code)] // the measurement [`HUE_TRAVEL`] and [`STROKE_B_SAT_RATIO`] come from
 pub(super) const STROKE_B: Rgb = Rgb(126, 165, 209);
+
+/// The hue travel across one card, in degrees: H 181.2 to H 211.8 in the sample.
+///
+/// Half either side of the card's own hue, so a stage's hue is the card's
+/// midpoint rather than its left edge — the gradient is a property of the
+/// card's *shape*, not a statement about which stage it is at.
+pub(super) const HUE_TRAVEL: f32 = 30.6;
+
+/// How saturated the card's right edge is against its left.
+///
+/// Only this ratio is carried from the pair, because their lightness is within
+/// a point of each other. Taken off the sampled RGB rather than off the
+/// percentages quoted beside them — `#7EA5D1` is HSL S 47.5% against `#7FE2E4`'s
+/// 65.1%, not the 51/60 the sampling pass wrote down, and the pixels are what
+/// the card is drawn from. `the_gradient_ratios_reproduce_the_sampled_pair` is
+/// what keeps this tied to them.
+pub(super) const STROKE_B_SAT_RATIO: f32 = 0.73;
 
 /// Geometric stroke width, as a fraction of `h`. Measured FWHM was 3 px on a
 /// 61 px card (0.049 h) including antialiasing; the geometric core is ~2 px.
@@ -52,8 +77,17 @@ pub(super) const BLOOM_PEAK: f32 = 0.19;
 /// reading zero by 26–28 px.
 pub(super) const BLOOM_SIGMA: f32 = 0.19;
 /// The bloom is *more saturated* than the stroke: its excess is (8,40,39) where
-/// the stroke's R/G is 0.52, so red is scaled by this on the way out.
-pub(super) const BLOOM_RED_MUL: f32 = 0.40;
+/// the stroke's R/G is 0.52.
+///
+/// Quoted as a saturation and a lightness ratio rather than as the red-channel
+/// multiplier it was sampled as (`R × 0.40`), because scaling one named channel
+/// is only "more saturated" for a colour whose red channel happens to be its
+/// minimum — true of the measured cyan, false the moment a card's hue is its
+/// own. These two reproduce the sampled bloom to within a level on that cyan and
+/// mean the same thing on every other hue: `#7FE2E4` restated by them lands on
+/// `#31E1E4` against the sampled `#32E2E4`.
+pub(super) const BLOOM_SAT_MUL: f32 = 1.18;
+pub(super) const BLOOM_LUM_MUL: f32 = 0.78;
 
 /// Two lobes rather than one: a single gaussian fitted to the peak undershoots
 /// the tail and one fitted to the tail undershoots the peak.
@@ -99,3 +133,49 @@ pub(super) const MUTED_LUM: f32 = 111.5 / 196.5;
 /// a quarter of the amplitude. Left (30,60,71) → right (35,61,86).
 pub(super) const FILL_TRAVEL_A: Rgb = Rgb(30, 60, 71);
 pub(super) const FILL_TRAVEL_B: Rgb = Rgb(35, 61, 86);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two derived gradient ratios still reproduce the pair they came from.
+    ///
+    /// [`HUE_TRAVEL`] and [`STROKE_B_SAT_RATIO`] replaced the second sampled
+    /// stroke in the renderer, so this is what keeps them honest: run the
+    /// measured left edge through them and the measured right edge comes back.
+    #[test]
+    fn the_gradient_ratios_reproduce_the_sampled_pair() {
+        let (h, s, l) = STROKE_A.to_hsl();
+        let a = Rgb::from_hsl(h - HUE_TRAVEL / 2.0, s, l);
+        let b = Rgb::from_hsl(h + HUE_TRAVEL / 2.0, s * STROKE_B_SAT_RATIO, l);
+        // The travel is re-centred, so the sample's own two ends sit half a
+        // travel either side of where they were measured — what has to survive
+        // is the *span* between them and the saturation ratio across it.
+        let (ha, sa, _) = a.to_hsl();
+        let (hb, sb, _) = b.to_hsl();
+        assert!((hb - ha - HUE_TRAVEL).abs() < 1.0, "{ha} to {hb}");
+        assert!((sb / sa - STROKE_B_SAT_RATIO).abs() < 0.02);
+
+        let (measured_a, measured_b) = (STROKE_A.to_hsl(), STROKE_B.to_hsl());
+        assert!(
+            (measured_b.0 - measured_a.0 - HUE_TRAVEL).abs() < 1.0,
+            "the sampled pair no longer spans {HUE_TRAVEL}°"
+        );
+        assert!((measured_b.1 / measured_a.1 - STROKE_B_SAT_RATIO).abs() < 0.02);
+    }
+
+    /// And the bloom ratios reproduce the sampled bloom on the sampled stroke.
+    #[test]
+    fn the_bloom_ratios_reproduce_the_sampled_bloom() {
+        let bloomed = STROKE_A.restate(BLOOM_SAT_MUL, BLOOM_LUM_MUL);
+        // The sample: red scaled to 0.40 of itself on the measured cyan.
+        let sampled = Rgb((f32::from(STROKE_A.0) * 0.40) as u8, STROKE_A.1, STROKE_A.2);
+        let gap = |a: u8, b: u8| i32::from(a).abs_diff(i32::from(b));
+        assert!(
+            gap(bloomed.0, sampled.0) <= 2
+                && gap(bloomed.1, sampled.1) <= 2
+                && gap(bloomed.2, sampled.2) <= 2,
+            "{bloomed:?} against the sampled {sampled:?}"
+        );
+    }
+}

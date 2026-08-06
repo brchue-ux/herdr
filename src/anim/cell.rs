@@ -182,9 +182,244 @@ pub(crate) enum Ink {
     /// the caller resolves it from the category of the thing it is drawing —
     /// work arriving, work finishing, a failure, a branch going quiet — and the
     /// same catalogue entry then reads as four different signals.
+    ///
+    /// The role is resolved from *two* facts, not one: which [`LifecycleStage`]
+    /// the work is at, which decides the hue, and how bad the problem on it is
+    /// ([`Severity`]), which decides how far off the surface it stands. See
+    /// [`InkPalette::with_signal`].
     Signal,
     /// A literal colour, for a behaviour that genuinely means one hue.
     Fixed(Rgb),
+}
+
+/// Which stage of its own life the work behind an element is at.
+///
+/// **This carries hue and nothing else.** The five are the stages a unit of work
+/// passes through, not five degrees of anything: a card at any one of them can
+/// be perfectly healthy or in serious trouble, and saying which is
+/// [`Severity`]'s job. Keeping them on separate channels is what makes "running,
+/// but badly" expressible at all — with one channel it collapses into either a
+/// stage that is really a warning or a warning that is really a stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LifecycleStage {
+    /// Accepted, nothing running yet.
+    Queued,
+    /// Work is happening.
+    Running,
+    /// Stopped on something outside itself — usually a person.
+    Waiting,
+    /// Finished the work it was given.
+    Done,
+    /// Did not finish the work it was given.
+    Failed,
+}
+
+impl LifecycleStage {
+    /// The palette role this stage takes its hue from.
+    ///
+    /// Roles rather than literal hues, because the visual target's *theme
+    /// blending* condition is explicit that state colours "must sit inside the
+    /// active theme". Four of the five are the role the palette already
+    /// documents itself as meaning — `yellow` is commented *"Working / running
+    /// states"*, `green` *"Done / idle states"*, `red` *"Needs attention"*,
+    /// `peach` *"Interrupted / warning states"*. `Queued` takes `teal`, the
+    /// coolest chromatic role, because a queue is the absence of demand.
+    pub(crate) fn role(self, p: &crate::app::state::Palette) -> ratatui::style::Color {
+        match self {
+            Self::Queued => p.teal,
+            Self::Running => p.yellow,
+            Self::Waiting => p.mauve,
+            Self::Done => p.green,
+            Self::Failed => p.red,
+        }
+    }
+
+    /// The hue this stage falls back to when the theme's own role has none.
+    ///
+    /// A monochrome or near-monochrome theme supplies a role whose hue angle is
+    /// decided by a channel of rounding (see
+    /// [`crate::ui::color::hue_is_meaningful`]). Reading it anyway would collapse
+    /// the whole vocabulary onto one or two accidental angles, which is the one
+    /// failure this channel cannot survive — so the stated angles stand in. They
+    /// are the Catppuccin Mocha roles' own angles, which is where the default
+    /// theme puts them.
+    fn fallback_hue(self) -> f32 {
+        match self {
+            Self::Queued => 170.0,
+            Self::Running => 41.0,
+            Self::Waiting => 267.0,
+            Self::Done => 115.0,
+            Self::Failed => 343.0,
+        }
+    }
+
+    /// This stage's hue angle under the palette and the host's own colours.
+    pub(crate) fn hue(
+        self,
+        p: &crate::app::state::Palette,
+        host: &crate::terminal_theme::TerminalTheme,
+    ) -> f32 {
+        crate::ui::color::resolve_color_rgb(self.role(p), host)
+            .filter(|rgb| crate::ui::color::hue_is_meaningful(*rgb))
+            .map_or_else(
+                || self.fallback_hue(),
+                |rgb| crate::ui::color::to_hsl(rgb).0,
+            )
+    }
+
+    /// Every stage, in lifecycle order. For a legend, a matrix, or a test.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Queued,
+        Self::Running,
+        Self::Waiting,
+        Self::Done,
+        Self::Failed,
+    ];
+}
+
+/// How bad the problem on an element is, whatever stage it is at.
+///
+/// **This carries intensity and nothing else.** It never touches hue, because
+/// hue is spoken for: a card that got louder because it is in trouble must not
+/// also look like it changed what it is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub(crate) enum Severity {
+    /// Nothing wrong. The stage speaking on its own.
+    #[default]
+    Clear,
+    /// Something worth knowing about, nothing that stops the work.
+    Mild,
+    /// A real problem. The work is compromised.
+    Serious,
+    /// The loudest thing this vocabulary can say.
+    Critical,
+}
+
+/// How far each severity stands off the surface, as a fraction of the room
+/// there is between the surface and the end of the scale it is heading for.
+///
+/// # Why lightness distance and not the WCAG contrast ratio
+///
+/// The obvious metric is contrast, and it is wrong here for a reason the
+/// vocabulary's own floor already recorded: contrast is defined on *relative
+/// luminance*, and equal luminance across hues is unreachable without washing
+/// the dark ones toward white. Pure blue tops out at 2.2:1 on a near-black panel
+/// where pure green reaches 13.9:1, so normalising the two to one ratio means
+/// whitening the blue until it is no longer blue — "destroying exactly the hue
+/// separation the vocabulary exists to carry", which is the thing the hue
+/// channel cannot survive.
+///
+/// Lightness distance has no such cost. `L` is hue-agnostic by construction, so
+/// every hue reaches every step of this ramp at full saturation and none of them
+/// is bleached to get there.
+///
+/// # Why a fraction of the headroom rather than an absolute distance
+///
+/// Because a mid-grey panel has half the room a dark one does, and an absolute
+/// ramp run against it clamps — collapsing the two loudest severities onto the
+/// same ink, which is the one failure this channel cannot have. Scaling to the
+/// headroom keeps four distinct steps on every possible surface, and it stays a
+/// pure function of the severity and the theme, never of the stage.
+///
+/// # It is still legible without colour
+///
+/// Within one hue, luminance is monotone in `L`, so the four steps are four
+/// steps in greyscale as well — see
+/// `severity_is_still_four_steps_in_greyscale`. What is given up is
+/// *cross-hue* luminance comparison, which nothing here asks for: severity is
+/// read against the same card a moment earlier, not against a different card of
+/// a different stage.
+const SEVERITY_LIGHT_REACH: [f32; 4] = [0.38, 0.56, 0.74, 0.92];
+
+/// How near black or white a signal ink may be placed.
+///
+/// A hue at either extreme is not a hue, so this is where the ramp's headroom is
+/// measured to rather than a clamp applied afterwards.
+const SIGNAL_LIGHT_BOUNDS: (f32, f32) = (0.10, 0.92);
+
+/// Saturation every signal ink is drawn at, whatever its severity.
+///
+/// **One value and not a ramp, and that is a finding rather than a
+/// simplification.** Saturation was a second intensity cue here until it was
+/// measured: raising it moves a colour's *maximum* channel up, which brightens
+/// the ink on a dark panel — the direction wanted — and brightens it on a light
+/// one too, which is the direction not wanted. On a light theme a luminance-heavy
+/// hue then gets louder and quieter at once and the two cancel; green stopped
+/// being four distinguishable steps entirely. Lightness distance alone is
+/// monotone on every theme, so it carries the channel by itself and saturation
+/// is held still.
+///
+/// At the reference's own S 60–65% for an active card, so a signal sits in the
+/// family the cards were sampled from rather than louder than all of them.
+const SIGNAL_SATURATION: f32 = 0.66;
+
+impl Severity {
+    fn index(self) -> usize {
+        match self {
+            Self::Clear => 0,
+            Self::Mild => 1,
+            Self::Serious => 2,
+            Self::Critical => 3,
+        }
+    }
+
+    /// How far off the surface an element at this severity stands, as a
+    /// fraction of the room between the surface and the end of the scale.
+    pub(crate) fn light_reach(self) -> f32 {
+        SEVERITY_LIGHT_REACH[self.index()]
+    }
+
+    /// Position on the ramp, in `0.0..=1.0`, for a consumer that wants the
+    /// severity as an amount rather than as two colour numbers.
+    pub(crate) fn amount(self) -> f32 {
+        self.index() as f32 / (SEVERITY_LIGHT_REACH.len() - 1) as f32
+    }
+
+    /// True when this severity is loud enough to change how an element *moves*
+    /// rather than only how it looks.
+    ///
+    /// The escalation threshold, and the reason it exists: colour is a poor
+    /// carrier of type on its own, so past this point the element climbs the
+    /// behavioural ladder the tray badges and the card breath already use, and
+    /// says it in rhythm as well as in light.
+    pub(crate) fn escalates(self) -> bool {
+        matches!(self, Self::Serious | Self::Critical)
+    }
+
+    /// Every severity, quietest first. For a legend, a matrix, or a test.
+    pub(crate) const ALL: [Self; 4] = [Self::Clear, Self::Mild, Self::Serious, Self::Critical];
+}
+
+/// The ink one stage at one severity resolves to, over `surface`.
+///
+/// The two channels meet here and nowhere else. The stage supplies a hue angle
+/// and stops; the severity supplies a saturation and a distance from the
+/// surface and stops. Neither can reach into the other's number, which is not a
+/// convention this function follows but the only thing it does.
+///
+/// The hue is handed straight to [`crate::ui::color::from_hsl`] and nothing
+/// downstream may rotate it, so this is genuinely orthogonal rather than
+/// approximately so.
+pub(crate) fn signal_ink(hue: f32, severity: Severity, surface: Rgb) -> Rgb {
+    crate::ui::color::from_hsl(hue, SIGNAL_SATURATION, signal_light(severity, surface))
+}
+
+/// The lightness one severity is placed at over `surface`.
+///
+/// Split out from [`signal_ink`] because it is the severity channel's whole
+/// observable, and a test that asserts the channel is independent of the stage
+/// should be able to ask for it without going through a hue.
+pub(crate) fn signal_light(severity: Severity, surface: Rgb) -> f32 {
+    let (low, high) = SIGNAL_LIGHT_BOUNDS;
+    let ground = crate::ui::color::to_hsl(surface).2;
+    // Away from the panel, whichever way that is. The same rule
+    // [`crate::ui::color::ensure_contrast`] picks its direction by, so a light
+    // theme darkens where a dark theme lightens rather than both brightening.
+    if ground >= 0.5 {
+        ground - (ground - low).max(0.0) * severity.light_reach()
+    } else {
+        ground + (high - ground).max(0.0) * severity.light_reach()
+    }
 }
 
 /// The concrete colours [`Ink`] resolves against for one element.
@@ -239,15 +474,20 @@ impl InkPalette {
         }
     }
 
-    /// Bind [`Ink::Signal`] to the colour of what is actually being signalled.
+    /// Bind [`Ink::Signal`] to a stage's hue at a severity's intensity.
     ///
-    /// The colour is lifted away from the surface first, so a vocabulary
-    /// entry that happens to sit close to the host terminal's background — a
-    /// muted grey on a grey theme, a green on a green one — still arrives
-    /// visible rather than invisible.
-    pub(crate) fn with_signal(mut self, signal: Rgb) -> Self {
-        self.signal =
-            crate::ui::color::ensure_contrast(signal, self.surface, SIGNAL_CONTRAST_FLOOR);
+    /// The two arguments are the two channels, and taking them separately is the
+    /// point: there is no way to spell a signal here that says its stage with
+    /// its intensity or its severity with its hue. A caller that knows only what
+    /// kind of thing it is drawing passes [`Severity::Clear`] and gets exactly
+    /// the vocabulary that shipped before this channel existed.
+    ///
+    /// Resolved against `self.surface`, so a vocabulary entry that happens to
+    /// sit close to the host terminal's background — a muted grey on a grey
+    /// theme, a green on a green one — still arrives at the distance its
+    /// severity asked for rather than invisible.
+    pub(crate) fn with_signal(mut self, hue: f32, severity: Severity) -> Self {
+        self.signal = signal_ink(hue, severity, self.surface);
         self
     }
 
@@ -261,15 +501,6 @@ impl InkPalette {
         }
     }
 }
-
-/// Contrast a signal colour must clear against the surface it lights up.
-///
-/// Below WCAG's text floors on purpose: a charge is a mark, not a label, and
-/// forcing 4.5:1 would wash a whole vocabulary toward the same near-white on a
-/// dark theme and the same near-black on a light one — destroying exactly the
-/// hue separation the vocabulary exists to carry. This is the floor at which a
-/// mark is unmistakably present.
-const SIGNAL_CONTRAST_FLOOR: f32 = 2.2;
 
 /// The eighth-block ramp, lightest first.
 ///
@@ -605,6 +836,225 @@ mod tests {
             base,
             "a glyph offer must not leak into a label's styling either"
         );
+    }
+
+    /// **The two channels do not touch each other.**
+    ///
+    /// The contract the whole split rests on, asserted on the observable ink and
+    /// not on how it is spelled: every severity at one stage resolves to the
+    /// same hue, and every stage at one severity resolves to the same saturation
+    /// and the same distance from the surface.
+    #[test]
+    fn a_signals_hue_answers_only_to_its_stage_and_its_intensity_only_to_its_severity() {
+        use crate::ui::color::to_hsl;
+        // A dark ground and a light one, because the intensity channel is a
+        // distance *from the surface* and the two themes place it in opposite
+        // directions.
+        for surface in [(9, 17, 28), (239, 241, 245)] {
+            for hue in [23.0, 41.0, 115.0, 170.0, 217.0, 267.0, 343.0] {
+                for severity in Severity::ALL {
+                    let (h, _, _) = to_hsl(signal_ink(hue, severity, surface));
+                    let gap = {
+                        let raw = (h - hue).abs() % 360.0;
+                        raw.min(360.0 - raw)
+                    };
+                    assert!(
+                        gap < 1.5,
+                        "{severity:?} moved hue {hue} to {h} on {surface:?}: the \
+                         intensity channel reached into the hue channel"
+                    );
+                }
+            }
+
+            for severity in Severity::ALL {
+                let placed = signal_light(severity, surface);
+                for hue in [23.0, 41.0, 115.0, 170.0, 217.0, 267.0, 343.0] {
+                    let (_, s, l) = to_hsl(signal_ink(hue, severity, surface));
+                    assert!(
+                        (s - SIGNAL_SATURATION).abs() < 0.02,
+                        "hue {hue} at {severity:?} is drawn at saturation {s:.3} \
+                         rather than the shared {SIGNAL_SATURATION:.3}"
+                    );
+                    assert!(
+                        (l - placed).abs() < 0.02,
+                        "hue {hue} at {severity:?} is placed at lightness {l:.3} \
+                         rather than the {placed:.3} its severity asks for"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every stage at every severity is a signal somebody could tell from the
+    /// other nineteen.
+    #[test]
+    fn every_stage_by_severity_combination_resolves_to_its_own_ink() {
+        let palette = crate::app::state::Palette::catppuccin();
+        let host = crate::terminal_theme::TerminalTheme::default();
+        let surface = (9, 17, 28);
+        let matrix: Vec<_> = LifecycleStage::ALL
+            .into_iter()
+            .flat_map(|stage| {
+                let hue = stage.hue(&palette, &host);
+                Severity::ALL
+                    .into_iter()
+                    .map(move |severity| (stage, severity, signal_ink(hue, severity, surface)))
+            })
+            .collect();
+        assert_eq!(matrix.len(), 20);
+        for (i, a) in matrix.iter().enumerate() {
+            for b in &matrix[i + 1..] {
+                assert_ne!(
+                    a.2, b.2,
+                    "{:?}/{:?} and {:?}/{:?} resolve to the same ink",
+                    a.0, a.1, b.0, b.1
+                );
+            }
+        }
+    }
+
+    /// The five stage hues are far enough apart to survive the card's own
+    /// left-to-right gradient running through them.
+    #[test]
+    fn the_stage_hues_are_separated_under_every_shipped_theme() {
+        let host = crate::terminal_theme::TerminalTheme::default();
+        for palette in [
+            crate::app::state::Palette::catppuccin(),
+            crate::app::state::Palette::catppuccin_latte(),
+        ] {
+            let hues: Vec<f32> = LifecycleStage::ALL
+                .into_iter()
+                .map(|stage| stage.hue(&palette, &host))
+                .collect();
+            for (i, a) in hues.iter().enumerate() {
+                for b in &hues[i + 1..] {
+                    let raw = (a - b).abs() % 360.0;
+                    let gap = raw.min(360.0 - raw);
+                    assert!(gap > 40.0, "two stages sit {gap:.1}° apart: {hues:?}");
+                }
+            }
+        }
+    }
+
+    /// A theme with no colour in it still gets five distinct stage hues.
+    ///
+    /// Reading a hue angle out of a grey is reading rounding noise, so the
+    /// stated angles stand in. Without this the whole vocabulary collapses onto
+    /// one or two accidental angles on a monochrome theme.
+    #[test]
+    fn a_monochrome_theme_falls_back_to_the_stated_angles() {
+        let mut palette = crate::app::state::Palette::catppuccin();
+        let grey = ratatui::style::Color::Rgb(128, 128, 128);
+        palette.teal = grey;
+        palette.yellow = grey;
+        palette.mauve = grey;
+        palette.green = grey;
+        palette.red = grey;
+        let host = crate::terminal_theme::TerminalTheme::default();
+        for stage in LifecycleStage::ALL {
+            assert_eq!(stage.hue(&palette, &host), stage.fallback_hue());
+        }
+    }
+
+    /// Severity is monotone: worse is louder, at every hue and on either theme,
+    /// *and in greyscale* — which is the claim that makes this channel readable
+    /// without colour discrimination at all.
+    ///
+    /// Read as the WCAG contrast against the panel, which is a pure function of
+    /// relative luminance and therefore exactly what survives desaturation.
+    ///
+    /// Checked on a dark panel and a light one, which is what Herdr draws on —
+    /// `backdrop_rgb` resolves the host's own background and falls back to the
+    /// reference's `#09111C`. A panel at exactly mid grey is the one surface
+    /// where this cannot hold for every hue, because a luminance-heavy hue is
+    /// *brighter* than mid grey at a lightness well below it, so the quiet end
+    /// of the ramp crosses the panel's own luminance on the way out. Lightness
+    /// separation still holds there — see
+    /// `the_four_severities_are_four_inks_on_any_surface` — and the escalated
+    /// rhythm is what carries the reading.
+    #[test]
+    fn worse_is_always_louder_including_in_greyscale() {
+        for surface in [(9, 17, 28), (239, 241, 245)] {
+            for hue in [23.0, 115.0, 217.0, 343.0] {
+                let mut previous = 0.0;
+                for severity in Severity::ALL {
+                    let ink = signal_ink(hue, severity, surface);
+                    let contrast = crate::ui::color::contrast_ratio(ink, surface);
+                    assert!(
+                        contrast > previous * 1.10,
+                        "{severity:?} at hue {hue} on {surface:?} is not a step \
+                         louder than the one below it: {contrast:.2} after {previous:.2}"
+                    );
+                    previous = contrast;
+                }
+                let quietest = crate::ui::color::contrast_ratio(
+                    signal_ink(hue, Severity::Clear, surface),
+                    surface,
+                );
+                // A mid-grey panel has about half the lightness headroom a real
+                // theme does and is the binding case here, at about 2.8×. A
+                // Herdr theme reaches 6× and better.
+                assert!(
+                    previous > quietest * 2.5,
+                    "hue {hue} on {surface:?} spans only {:.2}× from clear to \
+                     critical, which is not a channel",
+                    previous / quietest
+                );
+            }
+        }
+    }
+
+    /// Whatever the panel, the four severities are four different inks, placed
+    /// in order and far enough apart to see.
+    #[test]
+    fn the_four_severities_are_four_inks_on_any_surface() {
+        for surface in [(9, 17, 28), (239, 241, 245), (128, 128, 128), (0, 0, 0)] {
+            for hue in [23.0, 115.0, 217.0, 343.0] {
+                let mut previous: Option<f32> = None;
+                for severity in Severity::ALL {
+                    let light = crate::ui::color::to_hsl(signal_ink(hue, severity, surface)).2;
+                    if let Some(previous) = previous {
+                        assert!(
+                            (light - previous).abs() > 0.06,
+                            "{severity:?} at hue {hue} on {surface:?} landed at \
+                             lightness {light:.3}, {:.3} from the step below it",
+                            (light - previous).abs()
+                        );
+                    }
+                    previous = Some(light);
+                }
+            }
+        }
+    }
+
+    /// And every hue stays a hue at every severity: normalising the intensity
+    /// must not bleach the channel that carries the stage.
+    #[test]
+    fn no_severity_washes_a_hue_out() {
+        for surface in [(9, 17, 28), (239, 241, 245)] {
+            for hue in [23.0, 115.0, 217.0, 343.0] {
+                for severity in Severity::ALL {
+                    let ink = signal_ink(hue, severity, surface);
+                    assert!(
+                        crate::ui::color::hue_is_meaningful(ink),
+                        "{severity:?} at hue {hue} on {surface:?} resolved to {ink:?}, \
+                         which no longer has a hue to read"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A caller with no severity of its own gets the quietest rung, and only
+    /// a genuinely serious problem changes how an element moves.
+    #[test]
+    fn clear_is_the_default_and_only_serious_escalates() {
+        assert_eq!(Severity::default(), Severity::Clear);
+        assert_eq!(Severity::Clear.light_reach(), SEVERITY_LIGHT_REACH[0]);
+        assert!(!Severity::Clear.escalates());
+        assert!(!Severity::Mild.escalates());
+        assert!(Severity::Serious.escalates());
+        assert!(Severity::Critical.escalates());
     }
 
     #[test]

@@ -801,6 +801,18 @@ pub(crate) mod names {
     /// this one snaps where [`CARD_REST`] drifts, and takes its tempo from the
     /// pane's own work volume.
     pub(crate) const CARD_LIVE: &str = "card-live";
+    /// Looping: a card with a serious problem on it, breathing escalated.
+    ///
+    /// The third rung of the card ladder, and the exact counterpart of
+    /// [`BADGE_ALERT`]: the same snap as [`CARD_LIVE`], faster and deeper, so
+    /// that a card in trouble is told apart from a card merely working by
+    /// *rhythm*. That is what makes the severity channel survive a reader who
+    /// cannot separate two hues — the light says how bad it is and the tempo
+    /// says it again.
+    ///
+    /// It escalates over rest and over live alike. A card that has gone quiet
+    /// with a serious problem on it is not resting.
+    pub(crate) const CARD_ALERT: &str = "card-alert";
     /// Bounded: a card's state change washing left to right across it.
     ///
     /// A [`super::Field::Linear`] front rather than a band, which is the whole
@@ -891,6 +903,31 @@ const CARD_REST_DEPTH: f32 = 0.20;
 
 /// How far a live card's breath swings.
 const CARD_LIVE_DEPTH: f32 = 0.55;
+
+/// How long one snap-and-settle takes on a card with a serious problem on it.
+///
+/// Under half the live period, which is the same gap [`BADGE_ALERT_PERIOD`]
+/// takes against [`BADGE_CHARGE_PERIOD`] and for the same measured reason: two
+/// rhythms read as two rhythms rather than as one that drifted only once they
+/// are better than twice apart.
+///
+/// Measured against the *fastest* a live card can go, not against its stated
+/// period. A working card drives its own breath to 1.7× through
+/// [`Drive::Activity`], so live spans 2,400 ms down to 1,412 ms — and an alert
+/// at half the stated period would sit inside that span and read as a card
+/// merely working hard. Half of 1,412 is where the escalation is unambiguous,
+/// which lands within a breath of [`BADGE_ALERT_PERIOD`]'s own 760 ms.
+const CARD_ALERT_PERIOD: Duration = Duration::from_millis(680);
+
+/// How far an escalated card's breath swings.
+///
+/// Deeper than live, and the deepest in the catalogue. The consumer subtracts
+/// the swing, so this is a card that settles further back into the panel and
+/// comes further forward again — the same motion at greater amplitude, not a
+/// different one. Short of a full swing because the card has to stay legible at
+/// the trough; a card whose text disappeared periodically would be a card you
+/// cannot read the problem off.
+const CARD_ALERT_DEPTH: f32 = 0.80;
 
 /// Frame spacing for a card that is moving.
 ///
@@ -993,7 +1030,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 20] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 21] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -1278,6 +1315,20 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 20] {
                     at_rest: 1.0,
                     at_full: 1.7,
                 },
+                ..BASE
+            },
+        ),
+        (
+            names::CARD_ALERT,
+            Behaviour {
+                curve: Curve::SnapPendulum,
+                paint: Paint::tint(Ink::Signal, CARD_ALERT_DEPTH),
+                period: CARD_ALERT_PERIOD,
+                frame_interval: CARD_FRAME_INTERVAL,
+                // No activity drive, and that is deliberate. The live breath's
+                // tempo says how hard the pane is working; this one's says how
+                // much trouble it is in, and a card in trouble that had gone
+                // quiet would slow down exactly when it should not.
                 ..BASE
             },
         ),

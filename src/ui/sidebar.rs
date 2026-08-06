@@ -3342,26 +3342,23 @@ fn push_connector_spans(
     }
 }
 
-/// The colour vocabulary: what each kind of relation signal reads as.
+/// The stage each kind of relation signal is about.
 ///
-/// Palette roles rather than literal hues, so the vocabulary follows whatever
-/// theme is in force — including onto a light background — instead of being
-/// written down twice and drifting. The four are chosen to be separable by hue
-/// alone, because motion is a poor channel for category: telling a completion
-/// from a failure should not require watching which way an 800 ms animation
-/// went.
-///
-/// `Transfer` deliberately keeps the accent the connector charge has always
-/// used, so the one signal that already existed does not change meaning when
-/// the vocabulary arrives around it.
-fn relation_signal_color(kind: RelationSignalKind, p: &Palette) -> ratatui::style::Color {
+/// The vocabulary is not written down here any more: a signal says something
+/// happened to a row's *work*, so it names the stage that work moved to and the
+/// hue follows from [`crate::anim::cell::LifecycleStage`] like every other
+/// stage hue in the tree. That is what stops the connector and the card it runs
+/// into from having two different opinions about what "finished" looks like.
+fn relation_signal_stage(kind: RelationSignalKind) -> crate::anim::cell::LifecycleStage {
+    use crate::anim::cell::LifecycleStage;
     match kind {
-        RelationSignalKind::Transfer => p.accent,
-        RelationSignalKind::Completed => p.green,
-        RelationSignalKind::Failed => p.red,
+        RelationSignalKind::Transfer => LifecycleStage::Running,
+        RelationSignalKind::Completed => LifecycleStage::Done,
+        RelationSignalKind::Failed => LifecycleStage::Failed,
         // The quiet one, and the only one that must not compete for attention:
-        // "this branch stopped" is the least urgent thing a fleet can say.
-        RelationSignalKind::Idle => p.overlay1,
+        // "this branch stopped" is the least urgent thing a fleet can say, and a
+        // row with nothing left to do is back where it started.
+        RelationSignalKind::Idle => LifecycleStage::Queued,
     }
 }
 
@@ -3396,16 +3393,25 @@ struct ConnectorCharge<'a> {
 }
 
 impl<'a> ConnectorCharge<'a> {
-    fn new(app: &'a AppState, base: Style, phase: Option<RelationSignalPhase>) -> Option<Self> {
+    /// `severity` is the carrier row's own, not the signal's. A charge is a
+    /// report about a row, so it arrives as loud as the row it is about: a
+    /// completion off a row in serious trouble is not the same event as a
+    /// completion off a healthy one, and reading the severity from the row is
+    /// what lets the connector and the card it runs into agree about that
+    /// without either being told by the other.
+    fn new(
+        app: &'a AppState,
+        base: Style,
+        phase: Option<RelationSignalPhase>,
+        severity: crate::anim::cell::Severity,
+    ) -> Option<Self> {
         let phase = phase?;
         let behaviour = app
             .anim
             .catalogue()
             .get(relation_signal_behaviour(phase.kind))?;
-        let signal = crate::ui::color::resolve_color_rgb(
-            relation_signal_color(phase.kind, &app.sidebar_palette),
-            &app.host_terminal_theme,
-        )?;
+        let hue =
+            relation_signal_stage(phase.kind).hue(&app.sidebar_palette, &app.host_terminal_theme);
         Some(Self {
             behaviour,
             progress: phase.progress,
@@ -3415,7 +3421,7 @@ impl<'a> ConnectorCharge<'a> {
                 &app.palette,
                 &app.host_terminal_theme,
             )
-            .with_signal(signal),
+            .with_signal(hue, severity),
             host: &app.host_terminal_theme,
         })
     }
@@ -3890,6 +3896,13 @@ fn render_workspace_list(
             .map(|(key, _)| space_aggregate_state_and_age(app, key))
             .unwrap_or_else(|| (agg_state, agg_seen, space_state_age(app, ws)));
         let mark = state_icon(display_state, display_seen, app.status_indicators, p);
+        // The severity channel, read once for this row: the connector charge and
+        // the row's own card both draw from it, so the branch line and the card
+        // it points at cannot disagree about how bad this row's trouble is.
+        let row_severity = crate::app::lifecycle::severity(
+            ws.metadata_tokens
+                .get(crate::app::lifecycle::SEVERITY_TOKEN),
+        );
         let card_shell = card.card_frame.and_then(|rect| {
             Card::new(
                 rect,
@@ -4009,7 +4022,7 @@ fn render_workspace_list(
         if let Some(shell) = &card_shell {
             let mut connector = Vec::new();
             let connector_style = Style::default().fg(p.overlay0);
-            let top_charge = ConnectorCharge::new(app, connector_style, signal_phase);
+            let top_charge = ConnectorCharge::new(app, connector_style, signal_phase, row_severity);
             if own_depth > 0 {
                 let (mut owned, _) = agent_row_prefix(
                     own_depth,
@@ -4079,7 +4092,8 @@ fn render_workspace_list(
             // and its behaviour are the same for every cell of the route, and
             // only its position along that route differs.
             let connector_style = Style::default().fg(p.overlay0);
-            let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase);
+            let row_charge =
+                ConnectorCharge::new(app, connector_style, row_signal_phase, row_severity);
             let token_budget = match &card_shell {
                 // The connector is on the card's *name* row — its first content
                 // row — because that is the thing the tree is pointing at. Every
@@ -7469,20 +7483,39 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         let (_, app) = render_signalled_tree(None, 0);
         let child = app.view.workspace_card_areas[1].rect;
 
+        // The cell the charge has taken furthest from the line's own ink, rather
+        // than the brightest one. A stage's hue is placed at the distance from
+        // the panel its *severity* asks for, so a quiet signal can legitimately
+        // sit no brighter than the connector it runs along — brightness stopped
+        // being a proxy for "most charged" when the two channels split apart.
+        let settled = {
+            let (buffer, _) = render_signalled_tree(None, 0);
+            buffer[(child.x + 1, child.y)]
+                .style()
+                .fg
+                .and_then(crate::ui::color::color_to_rgb)
+        };
+
         let mut inks = Vec::new();
         for kind in EVERY_SIGNAL_KIND {
             // Half-way along, where every kind has its charge on the connector.
             let (buffer, _) = render_signalled_tree(Some(kind), 14);
-            let brightest = (0..u16::from(CONNECTOR_CELLS))
+            let charged = (0..u16::from(CONNECTOR_CELLS))
                 .map(|cell| buffer[(child.x + 1 + cell, child.y)].style().fg)
                 .max_by_key(|fg| {
-                    fg.and_then(crate::ui::color::color_to_rgb)
-                        .map(|(r, g, b)| u32::from(r) + u32::from(g) + u32::from(b))
-                        .unwrap_or(0)
+                    let Some((r, g, b)) = fg.and_then(crate::ui::color::color_to_rgb) else {
+                        return 0;
+                    };
+                    let Some((br, bg, bb)) = settled else {
+                        return 0;
+                    };
+                    u32::from(r.abs_diff(br))
+                        + u32::from(g.abs_diff(bg))
+                        + u32::from(b.abs_diff(bb))
                 })
                 .flatten()
                 .unwrap_or_else(|| panic!("{kind:?} lit no connector cell"));
-            inks.push((kind, brightest));
+            inks.push((kind, charged));
         }
 
         for (index, (kind, ink)) in inks.iter().enumerate() {
