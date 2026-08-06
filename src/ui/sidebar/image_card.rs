@@ -1605,58 +1605,210 @@ impl Rasteriser<'_> {
             return Ok(None);
         }
 
+        // Matched first, drawn second, assembled third, and the *matching* stays
+        // strictly serial. It is the only part of this with a carried
+        // dependency — `taken` — and it is also the cheap part: comparing two
+        // `u64`s a few dozen times against rasterising a card. Splitting it out
+        // is what lets the expensive half fan out over threads without any of
+        // the ordering questions, because by the time a thread starts drawing,
+        // every decision about *which* cards are drawn has already been made,
+        // in order, by one thread.
+        let sources = self.match_held(&planned, previous);
+
+        // The expensive half, and the only part that is parallel.
+        let mut drawn = self.draw_shapes(&planned, &sources, placed);
+
         let clip = self.clip();
         let mut layers = Vec::with_capacity(planned.len());
-        // Which held cards have already been claimed, so two rows that really
-        // are the same picture cannot both take the same one.
-        let mut taken = vec![false; previous.len()];
         for (index, planned) in planned.iter().enumerate() {
-            // Matched by what a card *is*, not by which slot it stood in. A row
-            // inserted or removed in the middle of the tree shifts every slot
-            // under it while changing not one of their signatures — the
-            // signature is content and size, deliberately not position (see
-            // [`Self::hash_common`]) — so slot matching would declare all of
-            // them different and redraw the lot. That was measured: a departure
-            // finishing re-uploaded better than half the tree.
-            //
-            // Two cards that hash the same are the same pixels, so which of them
-            // claims a held image cannot be observable.
-            let held = (0..previous.len())
-                .find(|slot| !taken[*slot] && previous[*slot].signature == planned.signature);
-            let mut layer = match held {
+            let mut layer = match &sources[index] {
                 // Untouched, or moved and nothing more. The bytes are copied but
                 // the drawing is not redone, and the drawing is the expensive
                 // half by an order of magnitude. This is the case every frame of
                 // a slide takes.
-                Some(slot) => {
-                    taken[slot] = true;
-                    SidebarCardLayer::clone(&previous[slot])
-                }
-                None => {
-                    let base = (0..previous.len())
-                        .find(|slot| {
-                            !taken[*slot]
-                                && previous[*slot].content_signature == planned.content_signature
-                        })
-                        .and_then(|slot| previous[slot].undissolved.clone());
-                    // One card, drawn into an image that is only as large as
-                    // that card and the reach of its own bloom, with no
-                    // background painted anywhere. Everything outside the glow
-                    // stays at alpha zero.
-                    let one = &placed[index..index + 1];
-                    self.finish(
-                        planned.rect,
-                        base,
-                        planned.signature,
-                        planned.content_signature,
-                        || self.rasterise(one, planned.rect, false),
-                    )?
-                }
+                ShapeSource::Held(slot) => SidebarCardLayer::clone(&previous[*slot]),
+                // Assembled in layout order out of slots keyed by index, so what
+                // comes back does not depend on which thread finished first, or
+                // on how many threads there were. A slot that is still empty
+                // means the thread that owned it unwound; that is a failed
+                // rasterisation like any other and the frame keeps the artwork
+                // it already has.
+                ShapeSource::Draw(_) => drawn[index].take().ok_or(())??,
             };
             layer.aim_at(planned.rect, clip, planned.viewport);
             layers.push(layer);
         }
         Ok(Some(layers))
+    }
+
+    /// Decide, in order, which planned cards can take a held image and which
+    /// have to be drawn.
+    ///
+    /// Serial on purpose: `taken` carries from one card to the next, and it is
+    /// what stops two rows that really are the same picture from both claiming
+    /// the same held image.
+    fn match_held(
+        &self,
+        planned: &[PlannedShape],
+        previous: &[SidebarCardLayer],
+    ) -> Vec<ShapeSource> {
+        // Which held cards have already been claimed.
+        let mut taken = vec![false; previous.len()];
+        planned
+            .iter()
+            .map(|planned| {
+                // Matched by what a card *is*, not by which slot it stood in. A
+                // row inserted or removed in the middle of the tree shifts every
+                // slot under it while changing not one of their signatures — the
+                // signature is content and size, deliberately not position (see
+                // [`Self::hash_common`]) — so slot matching would declare all of
+                // them different and redraw the lot. That was measured: a
+                // departure finishing re-uploaded better than half the tree.
+                //
+                // Two cards that hash the same are the same pixels, so which of
+                // them claims a held image cannot be observable.
+                let held = (0..previous.len())
+                    .find(|slot| !taken[*slot] && previous[*slot].signature == planned.signature);
+                match held {
+                    Some(slot) => {
+                        taken[slot] = true;
+                        ShapeSource::Held(slot)
+                    }
+                    // A base is *borrowed*, not claimed: it is only the
+                    // undissolved pixels this card is about to lay a new mask
+                    // over, so unlike a held image two cards may legitimately
+                    // read the same one. `taken` is deliberately not set here.
+                    None => ShapeSource::Draw(
+                        (0..previous.len())
+                            .find(|slot| {
+                                !taken[*slot]
+                                    && previous[*slot].content_signature
+                                        == planned.content_signature
+                            })
+                            .and_then(|slot| previous[slot].undissolved.clone()),
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// Rasterise and encode every card that needs it, across a bounded number of
+    /// threads.
+    ///
+    /// Returns one slot per planned card, indexed like `planned`: `Some` for a
+    /// card that was drawn, `None` for one taking a held image — and `None` too
+    /// for one whose drawing thread unwound.
+    ///
+    /// This is the [`crate::ui::sidebar::image_card`] hot spot. A card is drawn
+    /// into its own `Canvas` out of `&self` and its own slice of `placed`, with
+    /// nothing shared and nothing written outside its own slot, so the work is
+    /// parallel by construction rather than by refactor. Twelve cards measured
+    /// 8.24 ms on one thread and 1.89 ms on sixteen; the point of it is not the
+    /// average frame, which is cached and free, but the frame where the tree's
+    /// content actually changes and pays for all twelve at once.
+    ///
+    /// **Determinism.** A card's pixels are a pure function of `self`, its own
+    /// `placed` entry and its own [`ShapeSource`] base — none of which any other
+    /// card can touch — and results land in slots keyed by index rather than by
+    /// completion. So the bytes this returns are identical to the serial ones,
+    /// for any thread count, including one.
+    fn draw_shapes(
+        &self,
+        planned: &[PlannedShape],
+        sources: &[ShapeSource],
+        placed: &[(Rect, CardContent)],
+    ) -> Vec<Option<Result<SidebarCardLayer, ()>>> {
+        let todo: Vec<usize> = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| matches!(source, ShapeSource::Draw(_)))
+            .map(|(index, _)| index)
+            .collect();
+
+        let mut out: Vec<Option<Result<SidebarCardLayer, ()>>> = std::iter::repeat_with(|| None)
+            .take(planned.len())
+            .collect();
+
+        let threads = raster_threads(todo.len());
+        if threads <= 1 {
+            // One card to draw, or a machine with no width to draw it on. No
+            // scope, no spawn, no atomic — the settled and near-settled frames
+            // this path takes most often are exactly the ones that would only
+            // pay for the machinery.
+            for &index in &todo {
+                out[index] = Some(self.draw_one(index, planned, sources, placed));
+            }
+            return out;
+        }
+
+        // Cards are not all the same size — a card with a tidbit is taller than
+        // one without, and a depth-0 card is over twice the area of a depth-2 one
+        // — so the work is handed out one card at a time rather than sliced into
+        // equal chunks up front. A static split would leave the thread that drew
+        // the big cards still working while the others sat idle.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let todo = &todo;
+        let collected: Vec<Vec<(usize, Result<SidebarCardLayer, ()>)>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let next = &next;
+                        scope.spawn(move || {
+                            let mut local = Vec::new();
+                            loop {
+                                let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some(&index) = todo.get(slot) else {
+                                    break;
+                                };
+                                local.push((index, self.draw_one(index, planned, sources, placed)));
+                            }
+                            local
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    // A panic in one card's rasterisation costs that card's
+                    // slot and nothing else: the slot stays `None`, the caller
+                    // reads that as a failed build, and the panel keeps the
+                    // artwork it is already holding. It must not take the other
+                    // eleven cards or the render loop with it.
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+
+        for (index, result) in collected.into_iter().flatten() {
+            out[index] = Some(result);
+        }
+        out
+    }
+
+    /// Draw and encode exactly one card.
+    ///
+    /// Takes `&self` and reads nothing else that any other card writes, which is
+    /// the whole reason [`Self::draw_shapes`] can call it from several threads.
+    fn draw_one(
+        &self,
+        index: usize,
+        planned: &[PlannedShape],
+        sources: &[ShapeSource],
+        placed: &[(Rect, CardContent)],
+    ) -> Result<SidebarCardLayer, ()> {
+        let ShapeSource::Draw(base) = &sources[index] else {
+            return Err(());
+        };
+        let planned = &planned[index];
+        // One card, drawn into an image that is only as large as that card and
+        // the reach of its own bloom, with no background painted anywhere.
+        // Everything outside the glow stays at alpha zero.
+        let one = &placed[index..index + 1];
+        self.finish(
+            planned.rect,
+            base.clone(),
+            planned.signature,
+            planned.content_signature,
+            || self.rasterise(one, planned.rect, false),
+        )
     }
 
     /// The box on the panel a card may draw in: everything the tree's own rects
@@ -1918,6 +2070,69 @@ struct PlannedShape {
     signature: u64,
     content_signature: u64,
 }
+
+/// Where one planned card's image comes from, decided before any of them are
+/// drawn.
+///
+/// The split exists so the decision and the drawing are two passes: the decision
+/// carries state from card to card and has to stay in order, the drawing carries
+/// nothing and does not. See [`Rasteriser::match_held`].
+enum ShapeSource {
+    /// Slot in the previous frame's layers whose image this card takes as-is.
+    Held(usize),
+    /// This card is drawn. Carries a held *undissolved* canvas for the same
+    /// content when one exists, which is what makes a transition frame cost a
+    /// mask instead of a rasterisation.
+    Draw(Option<UndissolvedSheet>),
+}
+
+/// The most threads a card rebuild may take, whatever the machine has.
+///
+/// Six, against a measured ceiling of 4.36× at sixteen threads on a 12-core box:
+/// six of those threads already reached 3.77×, so the cap gives up about an
+/// eighth of the available speedup. What it buys is that a Herdr running a fleet
+/// — every agent on the box is a child of this process — never has a sidebar
+/// repaint take the whole machine. The work being bounded matters more than the
+/// last 0.3 ms of it: twelve cards is a few milliseconds once, on the rare frame
+/// where the tree's content changed, not a steady load.
+const CARD_RASTER_MAX_THREADS: usize = 6;
+
+/// How many threads to draw `work` cards on.
+///
+/// Bounded three ways, and the tightest wins: never more threads than cards to
+/// draw, never more than [`CARD_RASTER_MAX_THREADS`], and never more than half
+/// the machine's parallelism — the other half belongs to the fleet this process
+/// is hosting. One card, or a machine reporting fewer than four ways of
+/// parallelism, draws on the calling thread with no scope at all.
+fn raster_threads(work: usize) -> usize {
+    #[cfg(test)]
+    {
+        let forced = test_thread_override();
+        if forced > 0 {
+            return work.min(forced).max(1);
+        }
+    }
+    if work < 2 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    work.min(CARD_RASTER_MAX_THREADS).min((cores / 2).max(1))
+}
+
+/// Pin the thread count for a test that needs to compare two of them.
+///
+/// Zero means "use the real bound". Test-only: there is no runtime knob for
+/// this, because the bound is a property of the machine and not a preference.
+#[cfg(test)]
+fn test_thread_override() -> usize {
+    RASTER_THREADS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static RASTER_THREADS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// One card's frame and content, fed into a signature.
 ///
@@ -2231,13 +2446,13 @@ mod tests {
     /// fit ladder was measured against — including the one that says
     /// "Investigateing", because a layout that only survives clean input has
     /// not been tested.
-    struct FleetRow {
-        name: &'static str,
+    pub(super) struct FleetRow {
+        pub(super) name: &'static str,
         owner: Option<&'static str>,
-        doing: &'static str,
-        state: AgentState,
-        project: &'static str,
-        context: &'static str,
+        pub(super) doing: &'static str,
+        pub(super) state: AgentState,
+        pub(super) project: &'static str,
+        pub(super) context: &'static str,
     }
 
     const fn row(
@@ -2258,7 +2473,7 @@ mod tests {
         }
     }
 
-    const FLEET: &[FleetRow] = &[
+    pub(super) const FLEET: &[FleetRow] = &[
         row(
             "2ndmate-herdr",
             Some("firstmate"),
@@ -3992,6 +4207,415 @@ mod a_card_is_its_own_shape {
                     "an unchanged card was re-encoded anyway"
                 );
             }
+        }
+    }
+
+    /// The thread bound, pinned for one test and released however that test
+    /// ends.
+    ///
+    /// Serialised against the other tests that pin it, so this holds under a
+    /// parallel harness as well as the single-threaded one the suite is run
+    /// with.
+    struct ThreadPin(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl ThreadPin {
+        fn at(threads: usize) -> Self {
+            // A test that panicked while pinned poisoned this; the data it
+            // guards is `()`, so there is nothing to be suspicious of.
+            let guard = PIN_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+            RASTER_THREADS_FOR_TEST.store(threads, std::sync::atomic::Ordering::Relaxed);
+            Self(guard)
+        }
+    }
+
+    impl Drop for ThreadPin {
+        fn drop(&mut self) {
+            RASTER_THREADS_FOR_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Everything about a published card that a client can observe.
+    ///
+    /// The encoded bytes are in it, which is the whole point: two builds that
+    /// agree here agree on the pixels the terminal is handed, not merely on the
+    /// geometry around them.
+    #[derive(PartialEq, Eq)]
+    struct Observable<'a> {
+        rect: Rect,
+        clip: Rect,
+        signature: u64,
+        content_signature: u64,
+        viewport: (i32, i32),
+        image: (u32, u32),
+        data: &'a [u8],
+    }
+
+    fn observable(layer: &SidebarCardLayer) -> Observable<'_> {
+        Observable {
+            rect: layer.rect,
+            clip: layer.clip,
+            signature: layer.signature,
+            content_signature: layer.content_signature,
+            viewport: layer.viewport(),
+            image: (layer.layer.image_width, layer.layer.image_height),
+            data: layer.layer.data.as_slice(),
+        }
+    }
+
+    /// Build the tree's cards at a pinned thread count.
+    fn built_on(app: &AppState, threads: usize, previous: &[SidebarCardLayer]) -> CardsUpdate {
+        let _pin = ThreadPin::at(threads);
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        build_cards(app, &cards, sidebar_rect(), app.host_cell_size, previous).update
+    }
+
+    /// Drawing the cards on many threads produces the same bytes as drawing them
+    /// on one.
+    ///
+    /// This is the contract the parallel path is allowed to exist under, and it
+    /// is asserted on the encoded PNG rather than on anything about how the work
+    /// was scheduled. A card's pixels are a pure function of the rasteriser, that
+    /// card's own content and its own held base, and results land in slots keyed
+    /// by index — so neither the number of threads nor the order they finish in
+    /// may reach the output. If it ever does, this fails on the bytes.
+    #[test]
+    fn a_parallel_rebuild_is_byte_identical_to_a_serial_one() {
+        let app = shape_fleet_app();
+        let CardsUpdate::Rebuilt(serial) = built_on(&app, 1, &[]) else {
+            return; // No face on this machine.
+        };
+        assert!(serial.len() > 1, "one card cannot show that several agree");
+
+        // Past the real bound as well as under it, so the assertion covers a
+        // machine wider than this one and a queue that hands several cards to
+        // the same thread.
+        for threads in [2usize, 3, 6, 16] {
+            let CardsUpdate::Rebuilt(parallel) = built_on(&app, threads, &[]) else {
+                panic!("a rebuild on {threads} threads produced no cards");
+            };
+            assert_eq!(
+                serial.len(),
+                parallel.len(),
+                "{threads} threads published a different number of cards"
+            );
+            for (index, (a, b)) in serial.iter().zip(&parallel).enumerate() {
+                assert!(
+                    observable(a) == observable(b),
+                    "card {index} differs between 1 thread and {threads}"
+                );
+            }
+        }
+    }
+
+    /// Threads do not make cards rasterise more often than one thread does.
+    ///
+    /// The cache is the reason the steady-state cost of this whole path is a
+    /// fraction of a millisecond, and parallelising the expensive half would be a
+    /// net loss if it cost the cheap half its hit rate. So: a settled tree
+    /// reports `Unchanged` at every thread count, and changing exactly one card
+    /// rebuilds exactly the cards that changed — no more at six threads than at
+    /// one.
+    #[test]
+    fn threads_do_not_change_how_often_a_card_rasterises() {
+        const LADDER: [usize; 4] = [1, 2, 6, 16];
+        let mut app = shape_fleet_app();
+        let CardsUpdate::Rebuilt(first) = built_on(&app, 1, &[]) else {
+            return; // No face on this machine.
+        };
+
+        // A settled tree, first: whatever the thread count, a frame that changed
+        // nothing must rasterise nothing.
+        for threads in LADDER {
+            assert!(
+                matches!(built_on(&app, threads, &first), CardsUpdate::Unchanged),
+                "a settled tree rebuilt on {threads} threads"
+            );
+        }
+
+        // Change what exactly one card says, and nothing else about the tree.
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let pane = cards
+            .iter()
+            .find_map(|card| card.agent.as_ref())
+            .expect("the fleet has no agent card to change");
+        let terminal_id = app.workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .find(|(id, _)| **id == pane.pane_id)
+            .map(|(_, state)| state.attached_terminal_id.clone())
+            .expect("the changed pane has no terminal");
+        let now = app.state_age_now;
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("the changed terminal went away")
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([(
+                    "doing".to_string(),
+                    Some("Rewiring the card's own outline".to_string()),
+                )]),
+                None,
+                now,
+            );
+
+        let mut rebuilt_counts = Vec::new();
+        for threads in LADDER {
+            let CardsUpdate::Rebuilt(second) = built_on(&app, threads, &first) else {
+                panic!("a tree whose card changed did not rebuild on {threads} threads");
+            };
+            for (a, b) in first.iter().zip(&second) {
+                if a.signature == b.signature {
+                    assert_eq!(
+                        a.layer.data_fingerprint, b.layer.data_fingerprint,
+                        "an unchanged card was re-encoded on {threads} threads"
+                    );
+                }
+            }
+            rebuilt_counts.push(
+                first
+                    .iter()
+                    .zip(&second)
+                    .filter(|(a, b)| a.signature != b.signature)
+                    .count(),
+            );
+        }
+        assert!(
+            rebuilt_counts[0] > 0,
+            "nothing rebuilt, so the cache is a freeze and this proves nothing"
+        );
+        assert!(
+            rebuilt_counts
+                .iter()
+                .all(|count| *count == rebuilt_counts[0]),
+            "the number of cards rasterised moved with the thread count: {rebuilt_counts:?}"
+        );
+    }
+
+    /// The thread bound never exceeds the work, the cap, or half the machine.
+    ///
+    /// The cap is a promise to the fleet sharing this box, so it is asserted
+    /// rather than left to be read off the source.
+    #[test]
+    fn the_raster_thread_bound_stays_inside_its_budget() {
+        for work in [0usize, 1, 2, 5, 12, 64] {
+            let threads = raster_threads(work);
+            assert!(threads >= 1, "{work} cards were given no thread at all");
+            assert!(
+                threads <= CARD_RASTER_MAX_THREADS,
+                "{work} cards took {threads} threads, past the cap"
+            );
+            assert!(
+                threads <= work.max(1),
+                "{work} cards took {threads} threads, more than there is work for"
+            );
+        }
+        assert_eq!(raster_threads(1), 1, "one card spawned a thread to draw it");
+    }
+
+    /// A tree of exactly `cards` rows, on a panel tall enough to frame all of
+    /// them.
+    ///
+    /// The fleet the other tests use is ten rows, which is what the reference
+    /// artwork was drawn against. The rebuild measurement wants twelve, because
+    /// twelve is the number every figure in `data/herdr-compute-offload-map/`
+    /// was taken at.
+    #[cfg(test)]
+    fn raster_fleet_app(cards: usize) -> (AppState, Rect) {
+        let mut app = shape_fleet_app();
+        let now = app.state_age_now;
+        while app.workspaces[0].tabs[0].panes.len() < cards {
+            let index = app.workspaces[0].tabs[0].panes.len();
+            let pane = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+            app.ensure_test_terminals();
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let row = &tests::FLEET[index % tests::FLEET.len()];
+            let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            // Distinct per row, so no two cards hash the same and the rebuild
+            // really does draw every one of them.
+            terminal.set_agent_name(format!("{}-{index}", row.name));
+            terminal.state = row.state;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([
+                    ("doing".to_string(), Some(format!("{} {index}", row.doing))),
+                    ("project".to_string(), Some(row.project.to_string())),
+                    ("context".to_string(), Some(row.context.to_string())),
+                    // Hung off the fleet's own root. A worker naming no owner is
+                    // not reachable from the tree root and never becomes a row,
+                    // so it would be a pane that costs nothing to draw.
+                    ("owner".to_string(), Some("firstmate".to_string())),
+                ]),
+                None,
+                now,
+            );
+            terminal.last_agent_state_change_at = Some(now - std::time::Duration::from_secs(31));
+        }
+        // Tall enough that every row gets a frame; a row the layout cannot fit
+        // is a row that is never rasterised.
+        let rect = Rect::new(0, 0, sidebar_rect().width, 8 + 8 * cards as u16);
+        (app, rect)
+    }
+
+    /// What parallelising the per-card rasterisation actually bought, measured
+    /// rather than reasoned about.
+    ///
+    /// Ignored by default because it prints tables and times things; run it with
+    /// `cargo test --release --bin herdr card_raster_cost -- --ignored
+    /// --nocapture`. Release matters: a debug build reports several times the
+    /// per-card cost and would flatter the speedup.
+    ///
+    /// Two tables, because the average and the tail are different questions.
+    /// The first is the rebuild itself across a thread ladder — the speedup. The
+    /// second is a burst: alternating frames where the tree's content changes
+    /// and frames where it does not, which is the shape that produces the
+    /// stall the parallel path exists to remove, reported as a distribution
+    /// rather than a mean.
+    #[test]
+    #[ignore = "measurement, not an assertion: run with --ignored --nocapture"]
+    fn card_raster_cost() {
+        const CARDS: usize = 12;
+        const RUNS: usize = 60;
+
+        let (app, rect) = raster_fleet_app(CARDS);
+        let cell = app.host_cell_size;
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let framed = cards
+            .iter()
+            .filter(|card| card.card_frame.is_some())
+            .count();
+        {
+            let _pin = ThreadPin::at(1);
+            if !matches!(
+                build_cards(&app, &cards, rect, cell, &[]).update,
+                CardsUpdate::Rebuilt(_)
+            ) {
+                println!("SKIP: no proportional face on this machine");
+                return;
+            }
+        }
+        println!(
+            "panel {}x{} cells, host cell {}x{} px, {framed} framed cards, \
+             {} cores, bound {} threads",
+            rect.width,
+            rect.height,
+            cell.width_px,
+            cell.height_px,
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(0),
+            raster_threads(framed),
+        );
+
+        // A cold rebuild: no held artwork at all, so every card is drawn. This
+        // is the frame that costs, and the one the whole change is about.
+        println!("\nthreads | med ms | p90 ms | p99 ms |  max ms | speedup");
+        println!("--------+--------+--------+--------+---------+--------");
+        let mut serial_median = 0.0f64;
+        for threads in [1usize, 2, 4, 6, 8, 12, 16] {
+            let _pin = ThreadPin::at(threads);
+            let mut samples = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let started = std::time::Instant::now();
+                let update = build_cards(&app, &cards, rect, cell, &[]).update;
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert!(matches!(update, CardsUpdate::Rebuilt(_)));
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            if threads == 1 {
+                serial_median = at(0.5);
+            }
+            println!(
+                "{threads:>7} | {:>6.2} | {:>6.2} | {:>6.2} | {:>7.2} | {:>5.2}x",
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                samples[samples.len() - 1],
+                serial_median / at(0.5),
+            );
+        }
+
+        // The burst, through the whole per-frame pass rather than through
+        // `build_cards` alone, because a rasterisation spike is only interesting
+        // as a share of a frame. Every other frame changes one agent's `doing`
+        // string — which is what a fleet under load actually does — and the
+        // frames between are settled, so the run is a realistic mixture of
+        // cache hits and rebuilds rather than a worst case held open.
+        //
+        // The distribution is the deliverable. A mean over this hides exactly
+        // the stall the parallel path exists to remove: half these frames cost
+        // nothing at all.
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 100, rect.height);
+        println!(
+            "\nburst of {RUNS} compute_view passes, one card's content changing every other frame"
+        );
+        println!("threads | med ms | p90 ms | p99 ms |  max ms | rebuilt frames");
+        println!("--------+--------+--------+--------+---------+---------------");
+        for threads in [1usize, raster_threads(framed)] {
+            let (mut burst, _) = raster_fleet_app(CARDS);
+            burst.sidebar_width = rect.width;
+            let _pin = ThreadPin::at(threads);
+            let mut samples = Vec::with_capacity(RUNS);
+            let mut rebuilt = 0usize;
+            // Off the drawn rows, in layout order, so every mutation lands on a
+            // card that is actually rasterised and the two thread counts are
+            // handed identical work. Taking them off the pane map instead would
+            // hash-order them and include panes that are not rows.
+            let terminals: Vec<_> = super::super::compute_workspace_card_areas(&burst, rect)
+                .iter()
+                .filter_map(|card| card.agent.as_ref())
+                .filter_map(|agent| {
+                    burst.workspaces[0].tabs[0]
+                        .panes
+                        .iter()
+                        .find(|(id, _)| **id == agent.pane_id)
+                        .map(|(_, pane)| pane.attached_terminal_id.clone())
+                })
+                .collect();
+            let mut held: Vec<u64> = Vec::new();
+            for frame in 0..RUNS {
+                if frame % 2 == 0 {
+                    let now = burst.state_age_now;
+                    let id = &terminals[(frame / 2) % terminals.len()];
+                    if let Some(terminal) = burst.terminals.get_mut(id) {
+                        terminal.metadata_tokens.patch(
+                            std::collections::HashMap::from([(
+                                "doing".to_string(),
+                                Some(format!("burst frame {frame}")),
+                            )]),
+                            None,
+                            now,
+                        );
+                    }
+                }
+                let started = std::time::Instant::now();
+                crate::ui::compute_view_with_cell_size(&mut burst, &runtimes, area, cell);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                let now: Vec<u64> = burst
+                    .sidebar_card_layers
+                    .iter()
+                    .map(|layer| layer.signature)
+                    .collect();
+                if now != held {
+                    rebuilt += 1;
+                    held = now;
+                }
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            println!(
+                "{threads:>7} | {:>6.2} | {:>6.2} | {:>6.2} | {:>7.2} | {rebuilt:>14}",
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                samples[samples.len() - 1],
+            );
         }
     }
 
