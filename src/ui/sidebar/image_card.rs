@@ -515,22 +515,20 @@ impl CardContent {
         self.wash.map(CardWashFrame::step).hash(hasher);
     }
 
-    /// The light this card is drawn in at `t` across it, left to right.
+    /// The light this card has arrived at: the state it is in, breathing.
+    fn arrived_light(&self) -> CardLight {
+        CardLight::of(self.state).breathed(self.breath)
+    }
+
+    /// The light ahead of a wash's front: the state the card left, breathing.
     ///
-    /// The one place the breath and the wash meet the card's ink, so there is
-    /// no way for the two to be applied in different orders by different parts
-    /// of the drawing. The breath is applied to *both* sides of the wash rather
-    /// than to the result: a card breathes throughout a state change, and
-    /// breathing only the destination would make the sweep look like it was
-    /// also turning the breath on.
-    fn light_at(&self, t: f32) -> CardLight {
-        let into = CardLight::of(self.state).breathed(self.breath);
-        match self.wash {
-            None => into,
-            Some(wash) => CardLight::of(wash.from)
-                .breathed(self.breath)
-                .mix(into, wash.amount(t)),
-        }
+    /// The breath is applied to *both* sides of the front rather than to the
+    /// result, because a card breathes throughout a state change — breathing
+    /// only the destination would make a wash look like the moment the card's
+    /// breath was switched on.
+    fn leaving_light(&self) -> Option<CardLight> {
+        self.wash
+            .map(|wash| CardLight::of(wash.from).breathed(self.breath))
     }
 
     /// The light the card's chrome and its type are drawn in.
@@ -645,23 +643,54 @@ impl CardLight {
         }
     }
 
-    /// This light `t` of the way toward `other`.
-    fn mix(self, other: Self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
-        let lerp = |a: f32, b: f32| a + (b - a) * t;
-        Self {
-            sat: lerp(self.sat, other.sat),
-            lum: lerp(self.lum, other.lum),
-            bloom: lerp(self.bloom, other.bloom),
-        }
-    }
-
     /// The stroke's two ends and the bloom's, at this light.
-    fn inks(self) -> (Rgb, Rgb, Rgb, Rgb) {
+    fn inks(self) -> CardInk {
         let stroke_a = measured::STROKE_A.restate(self.sat, self.lum);
         let stroke_b = measured::STROKE_B.restate(self.sat, self.lum);
         let red = |c: Rgb| Rgb((f32::from(c.0) * measured::BLOOM_RED_MUL) as u8, c.1, c.2);
-        (stroke_a, stroke_b, red(stroke_a), red(stroke_b))
+        CardInk {
+            stroke_a,
+            stroke_b,
+            bloom_a: red(stroke_a),
+            bloom_b: red(stroke_b),
+            bloom: self.bloom,
+        }
+    }
+}
+
+/// The colours one column of a card is drawn from.
+///
+/// The stroke runs a gradient from its own left end to its own right one and
+/// the bloom runs the same gradient in a more saturated form, so a column needs
+/// both ends rather than one colour — the *column's* position in that gradient
+/// is a separate axis from where the state wash has reached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CardInk {
+    stroke_a: Rgb,
+    stroke_b: Rgb,
+    bloom_a: Rgb,
+    bloom_b: Rgb,
+    /// How much of the card's measured bloom this column lays down.
+    bloom: f32,
+}
+
+impl CardInk {
+    /// This ink `t` of the way toward `other`.
+    ///
+    /// Mixed as resolved colour rather than as [`CardLight`], and that is the
+    /// cheap half of the wash: the two states either side of the front are
+    /// fixed for a whole frame, so they are converted out of HSL once each and
+    /// a column is three channel lerps. Converting per column would cost more
+    /// arithmetic than drawing the card's pixels does.
+    fn mix(self, other: Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        Self {
+            stroke_a: self.stroke_a.mix(other.stroke_a, t),
+            stroke_b: self.stroke_b.mix(other.stroke_b, t),
+            bloom_a: self.bloom_a.mix(other.bloom_a, t),
+            bloom_b: self.bloom_b.mix(other.bloom_b, t),
+            bloom: self.bloom + (other.bloom - self.bloom) * t,
+        }
     }
 }
 
@@ -817,16 +846,17 @@ impl PlacedCard<'_> {
         (((x as f32 + 0.5) - self.rect.x) / self.rect.w).clamp(0.0, 1.0)
     }
 
-    /// The stroke's two ends and the bloom's, at one column across the card.
+    /// This card's inks, resolved once, ready to be read at any column.
     ///
-    /// Per column and not per card, because the state wash is a *field sweep*:
-    /// its whole shape is that the two sides of its front are two different
-    /// states. Without the wash every column resolves the same value and this
-    /// is the constant it always was.
-    fn inks_at(&self, t: f32) -> (Rgb, Rgb, Rgb, Rgb, f32) {
-        let light = self.content.light_at(t);
-        let (stroke_a, stroke_b, bloom_a, bloom_b) = light.inks();
-        (stroke_a, stroke_b, bloom_a, bloom_b, light.bloom)
+    /// Resolving them per column would be the obvious way to write the wash and
+    /// it is the expensive one: [`Rgb::restate`] is an HSL round trip, a card is
+    /// a few hundred pixels wide, and its bloom band is wider still — so a
+    /// per-column resolve costs more arithmetic than drawing the card's pixels
+    /// does. The two states either side of the front are *fixed* for the whole
+    /// of a frame; only the amount between them varies. So both are converted
+    /// once and a column is three channel mixes.
+    fn inks(&self) -> CardInks {
+        CardInks::of(self.content)
     }
 
     /// The card's ink and luminance at its settled light, for the chrome and
@@ -834,8 +864,50 @@ impl PlacedCard<'_> {
     /// [`CardContent::settled_light`].
     fn settled_inks(&self) -> (Rgb, f32) {
         let light = self.content.settled_light();
-        let (stroke_a, _, _, _) = light.inks();
-        (stroke_a, light.lum)
+        (light.inks().stroke_a, light.lum)
+    }
+}
+
+/// One card's inks, and the front between its two states.
+///
+/// The whole cost argument of the wash lives here. A card resolves two inks at
+/// most — the state it is leaving and the state it arrived at — and reading a
+/// column is a mix between them at the amount the engine's own field gives that
+/// column. With no wash there is one ink and a column is a copy.
+#[derive(Debug, Clone, Copy)]
+struct CardInks {
+    into: CardInk,
+    from: Option<CardInk>,
+    wash: Option<CardWashFrame>,
+}
+
+impl CardInks {
+    fn of(content: &CardContent) -> Self {
+        Self {
+            into: content.arrived_light().inks(),
+            from: content.leaving_light().map(CardLight::inks),
+            wash: content.wash,
+        }
+    }
+
+    /// The ink at `t` across the card, left to right.
+    fn at(self, t: f32) -> CardInk {
+        let (Some(from), Some(wash)) = (self.from, self.wash) else {
+            return self.into;
+        };
+        from.mix(self.into, wash.amount(t))
+    }
+
+    /// The strongest bloom this card lays down anywhere across itself.
+    ///
+    /// Asked of the whole card rather than of one column because a wash's two
+    /// sides can differ: a card arriving from `Unknown` has no bloom ahead of
+    /// its front and a full one behind it, and skipping the lay on the strength
+    /// of either alone would drop half the halo.
+    fn peak_bloom(self) -> f32 {
+        self.into
+            .bloom
+            .max(self.from.map_or(0.0, |from| from.bloom))
     }
 }
 
@@ -849,6 +921,10 @@ impl PlacedCard<'_> {
 /// anything; maxed, each card's halo is exactly the one it was measured to
 /// have.
 fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
+    let inks = card.inks();
+    if inks.peak_bloom() <= 0.0 {
+        return;
+    }
     let rect = card.rect;
     let reach = rect.h * BLOOM_REACH;
     let near_sigma = card.geometry.bloom_sigma;
@@ -883,18 +959,10 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
     let columns: Vec<(Rgb, f32)> = (x0..x1)
         .map(|x| {
             let t = card.column_t(x);
-            let (_, _, bloom_a, bloom_b, bloom_mul) = card.inks_at(t);
-            (bloom_a.mix(bloom_b, t), bloom_mul)
+            let ink = inks.at(t);
+            (ink.bloom_a.mix(ink.bloom_b, t), ink.bloom)
         })
         .collect();
-    // Nothing to lay down at all is the common case for an unknown-state card,
-    // and it was an early return before the strength went per column. Asked of
-    // the whole card now, because a wash's two sides can differ: a card
-    // arriving from `Unknown` has no bloom ahead of its front and a full one
-    // behind it.
-    if columns.iter().all(|(_, mul)| *mul <= 0.0) {
-        return;
-    }
 
     for y in y0..y1 {
         let py = y as f32 + 0.5;
@@ -1095,14 +1163,15 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // for the card, which is what carries the wash: with none they are the same
     // pair every column and this is the gradient it always was, and with one
     // the column ahead of the front is still lit by the state the card left.
+    let inks = card.inks();
     let columns: Vec<(Rgb, Rgb)> = (x0..x1)
         .map(|x| {
             let t = card.column_t(x);
-            let (a, b, _, _, _) = card.inks_at(t);
+            let ink = inks.at(t);
             (
                 measured::FILL_MID
                     .mix(measured::FILL_TRAVEL_A.mix(measured::FILL_TRAVEL_B, t), 0.5),
-                a.mix(b, t),
+                ink.stroke_a.mix(ink.stroke_b, t),
             )
         })
         .collect();
@@ -6437,11 +6506,20 @@ mod cards_breathe_and_wash {
             .observe(now, crate::anim::Family::CardWash, &lifecycle, members);
     }
 
-    /// Sample one card's light across its whole width.
-    fn across(card: &CardContent) -> Vec<CardLight> {
-        (0..=32)
-            .map(|i| card.light_at(i as f32 / 32.0))
-            .collect::<Vec<_>>()
+    /// Sample the ink one card is drawn from, across its whole width.
+    ///
+    /// [`CardInks`] and not [`CardLight`], because the ink is what reaches the
+    /// pixels: the two states either side of a wash's front are mixed as
+    /// resolved colour, so asserting on the light before that mix would be
+    /// testing a number the rasteriser never sees.
+    fn across(card: &CardContent) -> Vec<CardInk> {
+        let inks = CardInks::of(card);
+        (0..=32).map(|i| inks.at(i as f32 / 32.0)).collect()
+    }
+
+    /// The ink at the middle of a card.
+    fn mid(card: &CardContent) -> CardInk {
+        CardInks::of(card).at(0.5)
     }
 
     // ---- the breath ------------------------------------------------------
@@ -6472,7 +6550,7 @@ mod cards_breathe_and_wash {
             let Some(card) = card_in(&app, AgentState::Idle) else {
                 return;
             };
-            let light = card.light_at(0.5);
+            let light = card.arrived_light();
             assert!(
                 light.lum <= settled.lum + 1e-6 && light.bloom <= settled.bloom + 1e-6,
                 "the breath took a resting card above its own light: {light:?} against {settled:?}"
@@ -6551,7 +6629,7 @@ mod cards_breathe_and_wash {
         app.anim.advance(now + Duration::from_millis(900));
         for card in contents(&app) {
             assert_eq!(card.breath, 0.0);
-            assert_eq!(card.light_at(0.5), CardLight::of(card.state));
+            assert_eq!(mid(&card), CardLight::of(card.state).inks());
         }
     }
 
@@ -6650,10 +6728,12 @@ mod cards_breathe_and_wash {
         // The new state's light, still breathing — the breath does not stop
         // because a wash finished, so what every column has to agree on is the
         // destination *as the card is drawn*, not the raw state constant.
-        let arrived = CardLight::of(AgentState::Working).breathed(card.breath);
-        for (index, light) in across(&card).into_iter().enumerate() {
+        let arrived = CardLight::of(AgentState::Working)
+            .breathed(card.breath)
+            .inks();
+        for (index, ink) in across(&card).into_iter().enumerate() {
             assert_eq!(
-                light, arrived,
+                ink, arrived,
                 "column {index} of 32 was left in a state the card is no longer in"
             );
         }
@@ -6661,7 +6741,7 @@ mod cards_breathe_and_wash {
         // the two states having happened to resolve alike.
         assert_ne!(
             arrived,
-            CardLight::of(AgentState::Idle).breathed(card.breath)
+            CardLight::of(AgentState::Idle).breathed(card.breath).inks()
         );
     }
 
@@ -6677,8 +6757,8 @@ mod cards_breathe_and_wash {
             return;
         };
         let window = app.sidebar_cards.wash_duration();
-        let left_behind = CardLight::of(from);
-        let arriving = CardLight::of(AgentState::Working);
+        let left_behind = CardLight::of(from).bloom;
+        let arriving = CardLight::of(AgentState::Working).bloom;
 
         // Somewhere in the middle of the sweep. Sampled across several steps
         // rather than at one, because where the front is at any single instant
@@ -6695,22 +6775,25 @@ mod cards_breathe_and_wash {
             let columns = across(&card);
             let left = columns.first().copied().expect("sampled");
             let right = columns.last().copied().expect("sampled");
-            if left.lum > right.lum + 1e-3 {
+            // Read as the *bloom strength*: it is the number the two states
+            // differ in most, and it is what the halo — the depth cue the whole
+            // effect is about — is laid from.
+            if left.bloom > right.bloom + 1e-3 {
                 saw_two_sides = true;
                 assert!(
-                    left.lum <= arriving.lum + 1e-6,
+                    left.bloom <= arriving + 1e-6,
                     "the left of the card overshot the state it was arriving at"
                 );
                 assert!(
-                    right.lum >= left_behind.lum * 0.9,
-                    "the right of the card had already left the state it is \
+                    right.bloom <= left_behind + 1e-6,
+                    "the right of the card had already passed the state it is \
                      still meant to be in"
                 );
                 // And every column between the two is on the ramp between them,
                 // in order: a front, not two halves.
                 for pair in columns.windows(2) {
                     assert!(
-                        pair[0].lum >= pair[1].lum - 1e-3,
+                        pair[0].bloom >= pair[1].bloom - 1e-3,
                         "the front doubled back on itself inside the card"
                     );
                 }
@@ -6748,7 +6831,8 @@ mod cards_breathe_and_wash {
         app.anim.advance(now + Duration::from_millis(100));
         for card in contents(&app) {
             assert!(card.wash.is_none());
-            assert_eq!(card.light_at(0.0), card.light_at(1.0));
+            let inks = CardInks::of(&card);
+            assert_eq!(inks.at(0.0), inks.at(1.0));
         }
     }
 
@@ -6771,8 +6855,8 @@ mod cards_breathe_and_wash {
         if card.wash.is_none() || card.breath <= 0.0 {
             return;
         }
-        let unbreathed_old = CardLight::of(from);
-        let right = card.light_at(1.0);
+        let unbreathed_old = CardLight::of(from).inks();
+        let right = CardInks::of(&card).at(1.0);
         assert!(
             right.bloom < unbreathed_old.bloom || unbreathed_old.bloom == 0.0,
             "the far side of the front was drawn without the breath the rest of \
