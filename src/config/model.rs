@@ -1023,7 +1023,7 @@ impl Default for RemoteConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
@@ -1036,7 +1036,7 @@ pub struct ExperimentalConfig {
     /// `kitty_graphics` is on, and only at startup.
     pub sidebar_card_font: String,
     /// Draw each sidebar card as its own transparent shape rather than as one
-    /// opaque sheet covering the whole tree. Default: false.
+    /// opaque sheet covering the whole tree. Default: true.
     ///
     /// With the sheet, a card is a region painted inside one rectangle whose
     /// background is matched to the theme, so the card's glow terminates at that
@@ -1045,7 +1045,9 @@ pub struct ExperimentalConfig {
     /// outside its own glow, so there is no rectangle to clip and two cards that
     /// overlap have their glows blended by the terminal.
     ///
-    /// Only read while `kitty_graphics` is on.
+    /// Only read while `kitty_graphics` is on, which is itself off by default —
+    /// so on a stock config this field decides nothing, and setting it false is
+    /// how a host with graphics on goes back to the sheet.
     pub sidebar_card_shapes: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
@@ -1083,6 +1085,27 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            allow_nested: false,
+            kitty_graphics: false,
+            sidebar_card_font: String::new(),
+            // The shape path is the one every card effect since it landed has
+            // been built on — the glow that falls off its own rect, the breath,
+            // the wash, the per-card raster reuse. The sheet is now the
+            // fallback, kept for a host that wants one opaque image. Inert
+            // until `kitty_graphics` is on.
+            sidebar_card_shapes: true,
+            pane_history: false,
+            reveal_hidden_cursor_for_cjk_ime: false,
+            cjk_ime_agents: Vec::new(),
+            cjk_ime_cursor_shape: ImeCursorShape::default(),
+            switch_ascii_input_source_in_prefix: false,
+        }
+    }
 }
 
 impl Default for KeysConfig {

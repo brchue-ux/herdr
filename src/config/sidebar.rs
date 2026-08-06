@@ -962,7 +962,13 @@ pub struct SidebarNotificationsConfig {
 impl Default for SidebarNotificationsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // On by default. Note what that buys and what it costs: five of the
+            // eight slots read state the detector and the sidebar already hold,
+            // but `dirty`, `push` and `pr` are backed by a `git status` scan and
+            // a request to the forge, and those refreshes are armed by the bar
+            // being drawn. A session that never looked at the sidebar now pays
+            // for them. Set `enabled = false` to stop paying.
+            enabled: true,
             // Colour alone is a weak signal on a one-cell mark, so the live
             // state breathes by default. It is still overridable to `none` for
             // anyone who wants colour and nothing else.
@@ -1124,8 +1130,13 @@ const MAX_VIEW_SWITCH_PARTICLES_PER_CELL: u16 = 256;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SidebarRowMotion {
-    /// Rows are drawn where the layout puts them, on every frame. The default,
-    /// and exactly what the panel has always done.
+    /// Rows are drawn where the layout puts them, on every frame — exactly what
+    /// the panel has always done, and what a host drawing character rows gets
+    /// whatever this is set to.
+    ///
+    /// Still the `#[default]` variant so a bare `SidebarRowMotion` is the inert
+    /// one, but no longer what a stock config resolves to: that comes from
+    /// [`SidebarAnimationConfig::default`], which now asks for `Slide`.
     #[default]
     None,
     /// An arriving row slides in from the panel's right edge while every row
@@ -1176,7 +1187,17 @@ pub struct SidebarAnimationConfig {
     /// `sidebar_card_shapes` is left exactly as it was — including the phase
     /// motion would have invented, which is why the gate is
     /// [`crate::app::state::AppState::sidebar_rows_move`] rather than this
-    /// field.
+    /// field. `kitty_graphics` is off by default, so on a stock config this
+    /// field decides nothing; `none` is how a host with graphics on turns the
+    /// slide back off.
+    ///
+    /// Defaults to `slide`. Note what that ships today: a row travels at whole
+    /// cells, about four 18px steps on a 9x18 cell, because the engine's finest
+    /// step is `SMOOTH_FRAME_INTERVAL` and a character connector cannot follow a
+    /// card to a fraction of a row. That reads as stepping rather than as a
+    /// glide, and closing the gap needs sub-cell placement, a finer frame tier,
+    /// and the trunk drawn as pixel artwork together — measured in
+    /// `data/herdr-row-slide-reflow/subcell-test/RESULT.md`.
     pub row_motion: SidebarRowMotion,
     /// Behaviour the whole tree plays when it is re-rooted onto one second
     /// mate, and again on the way back out.
@@ -1227,7 +1248,7 @@ impl Default for SidebarAnimationConfig {
             row_enter_ms: DEFAULT_ROW_ENTER_MS,
             row_exit: SidebarTokenEmphasis::None,
             row_exit_ms: DEFAULT_ROW_EXIT_MS,
-            row_motion: SidebarRowMotion::None,
+            row_motion: SidebarRowMotion::Slide,
             view_switch: SidebarTokenEmphasis::Dissolve,
             view_switch_ms: DEFAULT_VIEW_SWITCH_MS,
             view_switch_particles_per_cell: DEFAULT_VIEW_SWITCH_PARTICLES_PER_CELL,
@@ -1354,15 +1375,47 @@ row_exit_ms = 5
         );
     }
 
+    /// `row_motion` now defaults to `slide`, so the guarantee this test holds
+    /// has moved rather than gone: it is the *host* that decides, not the
+    /// config. On a terminal drawing character rows there is nothing to offset,
+    /// the caller passes `moves = false`, and an unconfigured Herdr must still
+    /// drop a closed pane's row on the very next frame — synthesizing a phase
+    /// nothing can play is what once left a dead row on screen for the whole of
+    /// `row_exit_ms`. On a pixel-card host the same config does get the phases,
+    /// because there the slide has something to move.
     #[test]
-    fn rows_neither_arrive_nor_leave_unless_asked_to() {
+    fn rows_move_on_a_pixel_host_and_cut_on_a_character_one() {
         let animation = SidebarAnimationConfig::default();
-        assert!(animation.row_enter_stage(animation.rows_move()).is_none());
+        assert!(animation.rows_move(), "slide is the default");
+
+        // The character host: `AppState::sidebar_rows_move` resolved to false.
+        assert!(animation.row_enter_stage(false).is_none());
         assert!(
-            animation.row_exit_stage(animation.rows_move()).is_none(),
-            "an unconfigured Herdr must drop a closed pane's row on the next frame"
+            animation.row_exit_stage(false).is_none(),
+            "a closed pane's row must go on the next frame where nothing can move"
         );
-        assert!(!animation.rows_move(), "motion must not arrive switched on");
+
+        // The pixel host: motion invents the bounded phases it needs.
+        assert!(animation.row_enter_stage(true).is_some());
+        assert!(animation.row_exit_stage(true).is_some());
+    }
+
+    /// The opt-out, which is the setting a character-first fleet actually wants:
+    /// `none` must take the phases back down even where cards could have moved.
+    #[test]
+    fn motion_can_be_switched_back_off() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.animation]
+row_motion = "none"
+"#,
+        )
+        .expect("row motion config");
+
+        let animation = config.ui.sidebar.animation;
+        assert!(!animation.rows_move());
+        assert!(animation.row_enter_stage(false).is_none());
+        assert!(animation.row_exit_stage(false).is_none());
     }
 
     /// Motion and a cell effect are two settings, and either one alone is a
@@ -1466,14 +1519,26 @@ row_motion = "slide"
         }
     }
 
-    /// Off by default, and off means the engine is asked for nothing. Turning
-    /// it on is what pays for the Git scan and the forge request behind three
-    /// of its slots, so it must never arrive switched on.
+    /// On by default, which is a deliberate reversal of the rule this test used
+    /// to hold ("it must never arrive switched on"). The cost it was guarding is
+    /// real and has not gone away — `dirty`, `push` and `pr` are armed by the
+    /// bar being drawn, and they are a `git status` scan and a forge request —
+    /// so the escape hatch is what is guarded now: `enabled = false` has to
+    /// still take the engine and both refreshes back down to nothing.
     #[test]
-    fn the_signal_bar_is_off_until_it_is_asked_for() {
+    fn the_signal_bar_ships_on_and_can_be_switched_off() {
         let config = SidebarConfig::default();
-        assert!(!config.notifications.enabled);
-        assert!(!config.notifications.animates());
+        assert!(config.notifications.enabled);
+
+        let off: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.notifications]
+enabled = false
+"#,
+        )
+        .expect("signal bar config");
+        assert!(!off.ui.sidebar.notifications.enabled);
+        assert!(!off.ui.sidebar.notifications.animates());
     }
 
     #[test]
