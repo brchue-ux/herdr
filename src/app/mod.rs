@@ -45,11 +45,6 @@ const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 /// attached TUI, and the one a behaviour gets when it does not ask for
 /// anything smoother.
 pub(crate) const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
-/// Floor under every behaviour's frame interval on the headless server, which
-/// repaints for every connected client over a socket. Behaviours keep their own
-/// periods, so a headless server draws the same animation at a coarser step
-/// rather than at a different speed.
-pub(crate) const HEADLESS_ANIMATION_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -737,6 +732,7 @@ impl App {
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             sidebar_animation: config.ui.sidebar.animation,
+            headless_animation_interval: config.advanced.headless_animation_interval(),
             sidebar_notifications: config.ui.sidebar.notifications,
             sidebar_signal_tray: config.ui.sidebar.signal_tray,
             next_agent_state_change_seq: 0,
@@ -1693,6 +1689,8 @@ impl App {
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.sidebar_animation = config.ui.sidebar.animation;
+                self.state.headless_animation_interval =
+                    config.advanced.headless_animation_interval();
                 self.state.sidebar_notifications = config.ui.sidebar.notifications;
                 self.state.sidebar_signal_tray = config.ui.sidebar.signal_tray;
                 // A reload re-owns the config tier only. A plugin- or UI-set
