@@ -477,6 +477,35 @@ impl WorkspaceListEntry {
             }
         }
     }
+
+    /// The rank this row draws at: what it **is**, never who opened it.
+    ///
+    /// Deliberately not [`Self::depth`]. Depth says where a row *hangs* — it is
+    /// the ownership edge, and it is what the connectors are measured from.
+    /// Rank says what the row *is*, and it is what the card's size is measured
+    /// from. The two agree for a Space, and they come apart for exactly one
+    /// row: a worker the first mate opened directly.
+    ///
+    /// That row hangs off the first mate, because that is genuinely who owns
+    /// it, so its connector is a branch off the trunk at depth 1 — the same
+    /// column a second mate's is. Reading its rank off that depth would then
+    /// promote it to second mate purely because of who spawned it, which is the
+    /// one outcome the captain ruled out: *"sub agent size card, not secondmate
+    /// or first mate ssize."* A mate is a Space; an agent pane is a worker or a
+    /// sub agent wherever it hangs, so the row's *kind* is the honest answer and
+    /// its depth is not.
+    ///
+    /// See [`rank_right_inset`] for what a rank is actually worth on screen,
+    /// and [`tie_workers_to_a_second_mate`] for the re-parenting that runs
+    /// before this and keeps the fallback rare.
+    pub(crate) fn rank(&self) -> crate::app::agent_tree::AgentRelation {
+        match self {
+            Self::Workspace { depth, .. } => {
+                crate::app::agent_tree::AgentRelation::from_depth(*depth)
+            }
+            Self::Agent { .. } => crate::app::agent_tree::AgentRelation::Worker,
+        }
+    }
 }
 
 pub(crate) fn next_entry_is_worktree_child(entries: &[WorkspaceListEntry], idx: usize) -> bool {
@@ -862,6 +891,103 @@ fn space_rows(blocks: &[SpaceBlock]) -> Vec<SpaceRow> {
     rows
 }
 
+/// Hang a first-mate-opened worker off the second mate whose scope fits it.
+///
+/// The captain's rule, verbatim: *"if the firstmate opens a worker or subagent
+/// it should always be tied to a secondmate. if there is no relevant secondmate
+/// have it create the card as a sub agent as a branch under it."*
+///
+/// This is the first half — the tie. The second half is not here and is not a
+/// re-parenting at all: a worker with no fitting mate keeps the first mate as
+/// its owner, because that is who genuinely opened it, and it is
+/// [`WorkspaceListEntry::rank`] that stops the resulting depth from promoting
+/// it. Moving it deeper instead would draw a `├─` in the second mate column
+/// with no second mate above it to hang from, which is a broken branch rather
+/// than a sub agent.
+///
+/// **What "fits" means, and why it is this:** the Space the worker is actually
+/// running in. A pane is *in* one checkout and one Space, and that is the scope
+/// it is working on — so a worker running inside a second mate's Space belongs
+/// to that mate whatever a token says about who spawned it. Nothing else
+/// available is a scope: `owner` is provenance, and a name is a label.
+///
+/// It is expressed through [`OwnedNode::parent`] rather than by rewriting
+/// `owner` for the same reason worktree membership is: it is a fact about where
+/// the pane *is*, not a preference about who it answers to, and the parent
+/// channel is the one that outranks the token. It joins the same cycle scan, so
+/// it can stand a node up as a root but never strand it.
+///
+/// Narrow on purpose. It fires only for a worker whose owner resolves to a
+/// Space at the **root** of the tree — a first mate — because that is the only
+/// case the rule governs. A worker already under a second mate is untouched,
+/// and so is one owned by another pane.
+fn tie_workers_to_a_second_mate(
+    rows: &[SpaceRow],
+    names: &[Option<String>],
+    agents: &[AgentPanelEntry],
+    nodes: &mut [crate::app::agent_tree::OwnedNode<'_>],
+) {
+    let space_count = rows.len();
+    if space_count == 0 || nodes.len() <= space_count {
+        return;
+    }
+    let space_parents = crate::app::agent_tree::resolve_parents(&nodes[..space_count]);
+    let root_of = |mut row: usize| {
+        // Bounded by the node count: `resolve_parents` has already broken every
+        // cycle, so this walk terminates.
+        for _ in 0..space_count {
+            match space_parents[row] {
+                Some(parent) => row = parent,
+                None => break,
+            }
+        }
+        row
+    };
+    let depth_of = |row: usize| {
+        let mut depth = 0usize;
+        let mut cursor = space_parents[row];
+        while let Some(parent) = cursor {
+            depth += 1;
+            cursor = space_parents[parent];
+        }
+        depth
+    };
+
+    // First writer wins, exactly as in the walk's own name table, so a name
+    // resolved here can never point at a different row than the walk picks.
+    let mut space_by_name: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (idx, name) in names.iter().enumerate().take(space_count) {
+        if let Some(name) = name {
+            space_by_name.entry(name.as_str()).or_insert(idx);
+        }
+    }
+
+    for (offset, node) in nodes[space_count..].iter_mut().enumerate() {
+        let Some(agent) = agents.get(offset) else {
+            continue;
+        };
+        let Some(owner_row) = node
+            .owner
+            .and_then(|owner| space_by_name.get(owner).copied())
+        else {
+            continue;
+        };
+        if depth_of(owner_row) != 0 {
+            continue;
+        }
+        // A second mate of *this* first mate, running the Space this worker is
+        // in. Two first mates in one panel is not the captain's fleet, but a
+        // worker must not be re-homed across trees on a bare Space match.
+        let fitting = (0..space_count).find(|row| {
+            rows[*row].ws_idx == agent.ws_idx && depth_of(*row) == 1 && root_of(*row) == owner_row
+        });
+        if let Some(mate) = fitting {
+            node.parent = Some(mate);
+        }
+    }
+}
+
 /// Arrange `blocks` and the owned agent panes into one tree, then flatten it.
 ///
 /// Every Space and every owned pane goes through
@@ -910,6 +1036,7 @@ fn arrange_space_tree(
                 parent: None,
             }),
     );
+    tie_workers_to_a_second_mate(&rows, &names, agents, &mut nodes);
 
     crate::app::agent_tree::arrange_owner_tree(&nodes)
         .into_iter()
@@ -1142,15 +1269,85 @@ pub(crate) fn card_shell_min_sidebar_width() -> u16 {
 /// answer rather than on the limit.
 const MAX_PROBE_SIDEBAR_WIDTH: u16 = 512;
 
-/// Columns a row has for its tokens once its prefix, its shell and any trailing
-/// control are taken out.
-fn row_content_width(fold_width: u16, depth: u8, trailing_width: usize) -> usize {
+/// Columns a row has for its tokens once its prefix, its rank's inset, its
+/// shell and any trailing control are taken out.
+fn row_content_width(
+    fold_width: u16,
+    depth: u8,
+    rank: crate::app::agent_tree::AgentRelation,
+    trailing_width: usize,
+) -> usize {
     (fold_width as usize)
         .saturating_sub(tree_prefix_width(depth, 0))
+        .saturating_sub(usize::from(rank_right_inset(rank, fold_width)))
         .saturating_sub(usize::from(
             RowShell::for_fold_width(fold_width).chrome_cols(),
         ))
         .saturating_sub(trailing_width)
+}
+
+/// Columns per rank the card's right edge pulls in, so width reads as rank.
+///
+/// Three, because that is the number the tree already spends indenting one
+/// level on the left; the right edge mirrors it rather than inventing a second
+/// step size.
+const RANK_INSET_STEP: u16 = 3;
+
+/// How many steps in from the top rank a rank sits.
+///
+/// Not [`crate::app::agent_tree::MAX_DISPLAY_DEPTH`] by coincidence — the ranks
+/// and the drawn columns are the same three levels — but it is spelled from the
+/// rank so a change to the display cap cannot silently restripe the ladder.
+fn rank_steps(rank: crate::app::agent_tree::AgentRelation) -> u16 {
+    use crate::app::agent_tree::AgentRelation;
+    match rank {
+        AgentRelation::FirstMate => 0,
+        AgentRelation::SecondMate => 1,
+        AgentRelation::Worker => 2,
+    }
+}
+
+/// Columns this rank gives up at the card's **right** edge.
+///
+/// # Why the right edge
+///
+/// A width difference between the ranks already existed and it did not read as
+/// one. The left edge alone carried it — a card starts at its connector's
+/// column, so each level was three columns narrower than its parent — but every
+/// card still *ended* in the same column, and a reader comparing two cards
+/// compares their right edges. Flush right edges say "same size" however far
+/// apart the left ones are, and the left step reads as indentation, which is
+/// what it is. So the captain saw ranks that were 7% apart and no ladder:
+/// *"i just mean the sub agent width difference compared to 2ndmate."*
+///
+/// Mirroring the indent on the right doubles the step to six columns a rank —
+/// 39/33/27 on his 42-column sidebar — and turns the right edges into a
+/// staircase, which is the part that actually reads.
+///
+/// # Why it is spent out of slack
+///
+/// [`card::MIN_FOLD_WIDTH`] is the width at which the deepest row stops fitting
+/// a pill and a readable subtitle, and [`card_shell_min_sidebar_width`] turns
+/// that into the column the sidebar drag detent sticks at. A ladder that spent
+/// columns unconditionally would push the deepest card under that floor and
+/// move the detent — a drag behaviour nobody asked to change — so the ladder is
+/// paid for only out of what a panel has *above* the floor. At the floor the
+/// step is zero and every rank draws exactly the width it always did; the full
+/// mirror is in force from six columns of slack up, which the captain's sidebar
+/// has eight of.
+///
+/// A pure function of `(rank, fold_width)`, like everything else the fold is
+/// measured with, so the layout and the renderer cannot disagree about where a
+/// card ends and no width decision feeds its own input.
+fn rank_right_inset(rank: crate::app::agent_tree::AgentRelation, fold_width: u16) -> u16 {
+    let steps = rank_steps(rank);
+    if steps == 0 {
+        return 0;
+    }
+    let deepest_steps = rank_steps(crate::app::agent_tree::AgentRelation::Worker);
+    let slack = fold_width.saturating_sub(card::MIN_FOLD_WIDTH);
+    let step = (slack / deepest_steps).min(RANK_INSET_STEP);
+    step * steps
 }
 
 /// Columns reserved at the right edge of a Space row's first line for the
@@ -1200,9 +1397,12 @@ fn list_entry_content_width(
         } => row_content_width(
             fold_width,
             entry.depth(),
+            entry.rank(),
             space_trailing_width(app, *ws_idx, *worktree_child) + badge,
         ),
-        WorkspaceListEntry::Agent { .. } => row_content_width(fold_width, entry.depth(), badge),
+        WorkspaceListEntry::Agent { .. } => {
+            row_content_width(fold_width, entry.depth(), entry.rank(), badge)
+        }
     }
 }
 
@@ -1597,16 +1797,25 @@ pub(crate) fn compute_workspace_list_areas(
 /// Where this row's card shell stands, if the panel is wide enough to draw one.
 ///
 /// The box begins in the column the row's connector points at — which is why
-/// the `├─` lands on the card's top-left corner rather than beside the name —
-/// and ends at the fold width, never at the drawn width. Both edges are
-/// measured with the same functions the fold is, so the layout and the renderer
-/// cannot disagree about which columns are frame.
+/// the `├──` runs into the card's left border rather than stopping beside the
+/// name — and ends at the fold width less what its rank gives up. Both edges
+/// are measured with the same functions the fold is, so the layout and the
+/// renderer cannot disagree about which columns are frame.
+///
+/// The two edges answer two different questions and are deliberately measured
+/// from two different things: the left one from [`WorkspaceListEntry::depth`],
+/// because it is where the row *hangs*, and the right one from
+/// [`WorkspaceListEntry::rank`], because it is what the row *is*. That is the
+/// whole of the captain's size rule — a worker the first mate opened hangs at
+/// depth 1 and still ends where a sub agent ends.
 fn card_frame_for(rect: Rect, entry: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
     if !RowShell::for_fold_width(fold_width).is_card() {
         return None;
     }
     let prefix = tree_prefix_width(entry.depth(), 0) as u16;
-    let width = fold_width.saturating_sub(prefix);
+    let width = fold_width
+        .saturating_sub(prefix)
+        .saturating_sub(rank_right_inset(entry.rank(), fold_width));
     (width > card::CHROME_COLS && rect.height > card::CHROME_ROWS)
         .then(|| Rect::new(rect.x.saturating_add(prefix), rect.y, width, rect.height))
 }
@@ -2610,9 +2819,10 @@ fn render_agent_row(
             entry.ancestors_continue(),
             0,
             p,
-            // The Agents panel lists panes, and a relation signal is keyed on a
-            // workspace, so there is nothing here for a charge to belong to.
+            // A relation signal is keyed on a workspace, and this row is a
+            // pane, so there is nothing here for a charge to belong to.
             None,
+            true,
         );
         let (mut above, _) = card_rail_prefix(
             entry.depth(),
@@ -2628,6 +2838,9 @@ fn render_agent_row(
             CardRailSegment::BelowConnector,
             p,
         );
+        if entry.depth() > 0 {
+            connector.push(connector_joint_span(p));
+        }
         animate_row_spans(&mut connector, &row_anim);
         animate_row_spans(&mut above, &row_anim);
         animate_row_spans(&mut below, &row_anim);
@@ -2689,6 +2902,7 @@ fn render_agent_row(
                         0,
                         p,
                         None,
+                        true,
                     )
                 } else {
                     card_rail_prefix(
@@ -2699,10 +2913,16 @@ fn render_agent_row(
                         p,
                     )
                 };
-                // The frame's own column and the pad inside it, drawn blank so
-                // the border can be laid over the first of them once the row
-                // has had its say.
-                spans.push(Span::raw("  "));
+                // The frame's own column and the pad inside it. Blank, so the
+                // border can be laid over the first of them once the row has
+                // had its say — except on the connector row of a nested card,
+                // where that column is where the branch meets the border.
+                if row_index == 0 && entry.depth() > 0 {
+                    spans.push(connector_joint_span(p));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::raw(" "));
                 (spans, usize::from(shell.content_width()))
             }
             None => {
@@ -2713,6 +2933,7 @@ fn render_agent_row(
                     row_index,
                     p,
                     None,
+                    false,
                 );
                 (
                     spans,
@@ -2928,6 +3149,11 @@ fn render_worker_summary_badge(
 /// Continuation rows sit two columns further right than their first row, which
 /// is what keeps wrapped text aligned under the name rather than under the
 /// state dot.
+///
+/// `meets_a_card` says whether a card's border stands in the column this prefix
+/// ends at, which decides the connector's joint — see [`push_connector_spans`].
+/// It changes no width: the prefix is [`tree_prefix_width`] either way, so the
+/// layout does not have to know which shell the renderer chose.
 fn agent_row_prefix(
     depth: u8,
     is_last_child: bool,
@@ -2935,6 +3161,7 @@ fn agent_row_prefix(
     row_index: usize,
     p: &Palette,
     charge: Option<&ConnectorCharge<'_>>,
+    meets_a_card: bool,
 ) -> (Vec<Span<'static>>, usize) {
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
@@ -2966,7 +3193,7 @@ fn agent_row_prefix(
     }
 
     if row_index == 0 {
-        push_connector_spans(&mut spans, is_last_child, charge, line_style);
+        push_connector_spans(&mut spans, is_last_child, charge, line_style, meets_a_card);
         (spans, 3 * depth as usize + 1)
     } else {
         if is_last_child {
@@ -3054,19 +3281,61 @@ fn card_rail_prefix(
     (spans, 3 * depth as usize + 1)
 }
 
-/// The `├─ ` / `└─ ` connector of a child row's first line, charge and all.
+/// The card frame's own column, on the row the connector lands on.
 ///
-/// One function for both panels' connectors so a charge cannot run one shape in
-/// the Spaces tree and another in the owned-Space tree; the sidebar already
-/// insists those be the same three glyphs, and this is what keeps them the same
-/// three glyphs while something is travelling them.
+/// A card's prefix is followed by two columns before its first token: the
+/// column its left border stands in, and the pad inside it. On the connector
+/// row the border's column is not blank — it is the last stretch of the branch,
+/// running into the border it points at.
+///
+/// Under the character shell this is invisible: the frame is drawn over it, and
+/// the two glyphs already met, because a `─` and a `│` are both centred in
+/// their cells. It exists for the pixel card, whose border is a stroke standing
+/// at the column's centre rather than at its left edge — see
+/// [`super::sidebar::image_card::RAIL_INK_COLUMN_FRACTION`] for why it stands
+/// there. Without this the branch would stop half a column short of the card,
+/// which is the residue of the gap the joint in [`push_connector_spans`]
+/// closes. The pixel card is drawn over the text, so its own body hides the
+/// half of this glyph that falls inside it and the line reads as ending exactly
+/// at the border.
+fn connector_joint_span(p: &Palette) -> Span<'static> {
+    Span::styled("─", Style::default().fg(p.overlay0))
+}
+
+/// The `├──` / `└──` connector of a child row's first line, charge and all.
+///
+/// One function for both kinds of row so a charge cannot run one shape for a
+/// Space and another for a pane; the sidebar already insists those be the same
+/// three glyphs, and this is what keeps them the same three glyphs while
+/// something is travelling them.
+///
+/// # Why the third cell depends on what follows
+///
+/// It used to be a space unconditionally, which left the connector stopping one
+/// whole column short of the card it points at. Under the character shell that
+/// read as padding, because the card's own border was a `│` in the next column
+/// and the eye joined them up. Under a pixel card it does not: the card is a
+/// drawn shape with a real edge, and a connector that ends a column early is a
+/// branch hanging in space beside it — one half of *"branches not aligned with
+/// secondmates."* So against a card the joint carries the line all the way to
+/// the border, and against a bare line it stays the space that keeps `├─` off
+/// the name.
 fn push_connector_spans(
     spans: &mut Vec<Span<'static>>,
     is_last_child: bool,
     charge: Option<&ConnectorCharge<'_>>,
     base: Style,
+    meets_a_card: bool,
 ) {
-    let connector = if is_last_child { "└─ " } else { "├─ " };
+    // The third cell is the joint. Against a card it is the connector's own
+    // line running into the border it points at; against a bare line it is the
+    // space that keeps the glyphs off the name.
+    let connector = match (is_last_child, meets_a_card) {
+        (true, true) => "└──",
+        (true, false) => "└─ ",
+        (false, true) => "├──",
+        (false, false) => "├─ ",
+    };
     for (cell, settled) in connector.chars().enumerate() {
         let (glyph, style) = connector_cell(charge, cell as u16, settled, base);
         spans.push(Span::styled(glyph.to_string(), style));
@@ -3703,7 +3972,16 @@ fn render_workspace_list(
         let content_width = entries
             .get(card.entry_idx)
             .map(|entry| list_entry_content_width(app, &agents, entry, fold_width))
-            .unwrap_or_else(|| row_content_width(fold_width, own_depth, 0));
+            .unwrap_or_else(|| {
+                // A Space with no entry to read a rank off is drawn as the mate
+                // its depth makes it, which is what its entry would have said.
+                row_content_width(
+                    fold_width,
+                    own_depth,
+                    crate::app::agent_tree::AgentRelation::from_depth(own_depth),
+                    0,
+                )
+            });
         let shell = RowShell::for_fold_width(fold_width);
         let content_rows = row_height
             .saturating_sub(if card_shell.is_some() {
@@ -3740,8 +4018,10 @@ fn render_workspace_list(
                     0,
                     p,
                     top_charge.as_ref(),
+                    true,
                 );
                 connector.append(&mut owned);
+                connector.push(connector_joint_span(p));
             } else {
                 connector.push(Span::raw(" "));
             }
@@ -3814,6 +4094,7 @@ fn render_workspace_list(
                             0,
                             p,
                             row_charge.as_ref(),
+                            true,
                         )
                     } else {
                         card_rail_prefix(
@@ -3825,10 +4106,17 @@ fn render_workspace_list(
                         )
                     };
                     spans.append(&mut prefix);
-                    // The frame's own column and the pad inside it, drawn blank
-                    // so the border can be laid over the first of them once the
-                    // row has had its say.
-                    spans.push(Span::raw("  "));
+                    // The frame's own column and the pad inside it. Blank, so
+                    // the border can be laid over the first of them once the
+                    // row has had its say — except on the connector row of a
+                    // nested card, where that column is where the branch meets
+                    // the border.
+                    if row_index == 0 && own_depth > 0 {
+                        spans.push(connector_joint_span(p));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::raw(" "));
                     usize::from(shell.content_width())
                 }
                 None => {
@@ -3855,6 +4143,7 @@ fn render_workspace_list(
                             row_index,
                             p,
                             row_charge.as_ref(),
+                            false,
                         );
                         spans.append(&mut owned);
                         width
@@ -4452,7 +4741,7 @@ mod tests {
     /// would satisfy a single-group fixture by luck; here the two groups have to
     /// come out head-first *independently* of each other, which is what "the
     /// highest branch its parent allows" actually means.
-    fn interleaved_worker_fleet() -> crate::app::state::AppState {
+    pub(super) fn interleaved_worker_fleet() -> crate::app::state::AppState {
         let mut app = crate::app::state::AppState::test_new();
         let mut mate_a = Workspace::test_new("2ndmate-a");
         let mut mate_b = Workspace::test_new("2ndmate-b");
@@ -4515,7 +4804,7 @@ mod tests {
     /// Read through the flattened tree rather than off the entry list, so what
     /// is asserted is what a viewer would see rather than an intermediate the
     /// arranger is still free to reorder.
-    fn drawn_tree_rows(app: &crate::app::state::AppState) -> Vec<String> {
+    pub(super) fn drawn_tree_rows(app: &crate::app::state::AppState) -> Vec<String> {
         let agents = sidebar_agent_entries(app);
         workspace_list_entries_expanded(app)
             .into_iter()
@@ -4534,7 +4823,11 @@ mod tests {
     /// subtree in one unbroken block, so a card that had escaped into another
     /// mate's group would show up as the wrong name inside this slice rather
     /// than merely as a different order.
-    fn rows_under(app: &crate::app::state::AppState, parent: &str, count: usize) -> Vec<String> {
+    pub(super) fn rows_under(
+        app: &crate::app::state::AppState,
+        parent: &str,
+        count: usize,
+    ) -> Vec<String> {
         let rows = drawn_tree_rows(app);
         let at = rows
             .iter()
@@ -5109,14 +5402,27 @@ mod tests {
         for depth in 0u8..5 {
             for row_index in [0usize, 1] {
                 for is_last_child in [true, false] {
-                    let ancestors = vec![true; depth as usize + 1];
-                    let (_, drawn) =
-                        agent_row_prefix(depth, is_last_child, &ancestors, row_index, &p, None);
-                    assert_eq!(
-                        drawn,
-                        tree_prefix_width(depth, row_index),
-                        "depth {depth} row {row_index} last={is_last_child}"
-                    );
+                    // The joint changes a glyph, never a column: both shells
+                    // are measured, so a card row and a line row cannot be
+                    // handed different budgets for the same prefix.
+                    for meets_a_card in [true, false] {
+                        let ancestors = vec![true; depth as usize + 1];
+                        let (_, drawn) = agent_row_prefix(
+                            depth,
+                            is_last_child,
+                            &ancestors,
+                            row_index,
+                            &p,
+                            None,
+                            meets_a_card,
+                        );
+                        assert_eq!(
+                            drawn,
+                            tree_prefix_width(depth, row_index),
+                            "depth {depth} row {row_index} last={is_last_child} \
+                             card={meets_a_card}"
+                        );
+                    }
                 }
             }
         }
@@ -8435,5 +8741,487 @@ rows = [
         );
 
         assert_eq!(row, "Rebuild fitne…");
+    }
+}
+
+/// The tree draws ownership: where a line meets a card, where a card hangs, and
+/// how wide it is drawn.
+///
+/// One module because the three are one structure. The captain reported the
+/// first as two findings — *"tree trunk not aligned with firstmate/workers.
+/// branches not aligned with secondmates"* — and settled the other two in the
+/// same breath as one rule: a worker the first mate opens is tied to a second
+/// mate if one fits, is a sub agent under the first mate if none does, and is
+/// drawn at *"sub agent size card, not secondmate or first mate ssize"* either
+/// way.
+///
+/// Everything here is asserted through the flattened tree or the geometry the
+/// renderer is handed, never against the source of a glyph.
+#[cfg(test)]
+mod ownership_is_drawn_as_written {
+    use super::tests::{drawn_tree_rows, interleaved_worker_fleet, rows_under};
+    use super::*;
+    use crate::app::agent_tree::AgentRelation;
+    use crate::workspace::Workspace;
+
+    /// The width the captain runs, and the fold width it produces.
+    const CAPTAIN_SIDEBAR_WIDTH: u16 = 42;
+
+    fn fold_width_at(sidebar_width: u16) -> u16 {
+        workspace_list_body_width(
+            workspace_list_rect(Rect::new(0, 0, sidebar_width, 40)),
+            true,
+        )
+    }
+
+    /// The tree the captain's own fleet has: a first mate, two second mates
+    /// under it, and workers under each mate.
+    fn mate_fleet() -> crate::app::state::AppState {
+        interleaved_worker_fleet()
+    }
+
+    /// Where each row's card starts and ends, by name, on a panel this wide.
+    fn card_frames(
+        app: &crate::app::state::AppState,
+        sidebar_width: u16,
+    ) -> Vec<(String, Rect, u8, AgentRelation)> {
+        let agents = sidebar_agent_entries(app);
+        let fold = fold_width_at(sidebar_width);
+        let row = Rect::new(0, 0, fold, 4);
+        workspace_list_entries_expanded(app)
+            .into_iter()
+            .filter_map(|entry| {
+                let name = match &entry {
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
+                    WorkspaceListEntry::Agent { entry_idx, .. } => agents
+                        .get(*entry_idx)
+                        .and_then(|agent| agent.agent_name.clone()),
+                }?;
+                let frame = card_frame_for(row, &entry, fold)?;
+                Some((name, frame, entry.depth(), entry.rank()))
+            })
+            .collect()
+    }
+
+    fn frame_of(
+        app: &crate::app::state::AppState,
+        sidebar_width: u16,
+        name: &str,
+    ) -> (Rect, u8, AgentRelation) {
+        card_frames(app, sidebar_width)
+            .into_iter()
+            .find(|(row, ..)| row == name)
+            .map(|(_, frame, depth, rank)| (frame, depth, rank))
+            .unwrap_or_else(|| panic!("{name} draws no card"))
+    }
+
+    // ---------------------------------------------------------------- alignment
+
+    /// The column a row of this depth puts its `├`/`└` in, read off the prefix
+    /// the renderer actually draws rather than recomputed from the maths the
+    /// prefix is measured with.
+    fn connector_column(depth: u8, ancestors: &[bool]) -> u16 {
+        let p = Palette::catppuccin();
+        let (spans, _) = agent_row_prefix(depth, false, ancestors, 0, &p, None, true);
+        let mut column = 0u16;
+        for span in &spans {
+            for glyph in span.content.chars() {
+                if glyph == '\u{251c}' || glyph == '\u{2514}' {
+                    return column;
+                }
+                column += 1;
+            }
+        }
+        panic!("depth {depth} drew no connector at all");
+    }
+
+    /// **The alignment contract, stated once.** A child's connector lands in the
+    /// column its parent's card border stands in — that is what "the trunk is
+    /// aligned with the first mate" and "the branches are aligned with the
+    /// second mates" both mean, and they are the same fact asked at two levels.
+    ///
+    /// Asserted across the two functions that have to agree — the prefix the
+    /// renderer draws and the frame [`card_frame_for`] hands the card — because
+    /// a tree whose lines miss its cards is exactly those two disagreeing.
+    #[test]
+    fn every_branch_starts_in_the_column_its_parents_border_stands_in() {
+        let app = mate_fleet();
+        let frames = card_frames(&app, CAPTAIN_SIDEBAR_WIDTH);
+        assert!(frames.len() >= 6, "the fixture lost rows: {frames:?}");
+
+        let entries = workspace_list_entries_expanded(&app);
+        // The card a row of this depth hangs off is the nearest row above it one
+        // level shallower, which is exactly how the walk emits a subtree.
+        for (index, (name, _, depth, _)) in frames.iter().enumerate() {
+            if *depth == 0 {
+                continue;
+            }
+            let parent = frames[..index]
+                .iter()
+                .rev()
+                .find(|(_, _, parent_depth, _)| *parent_depth < *depth)
+                .unwrap_or_else(|| panic!("{name} has no parent above it"));
+            let ancestors = entries[index].ancestors_continue();
+            assert_eq!(
+                connector_column(*depth, ancestors),
+                parent.1.x,
+                "{name}'s connector column is not the column {}'s border stands in",
+                parent.0
+            );
+        }
+    }
+
+    /// The trunk itself: the first mate's card border stands in the column every
+    /// row hanging off it points at.
+    #[test]
+    fn the_trunk_stands_in_the_first_mates_own_border_column() {
+        let app = mate_fleet();
+        let (first_mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "firstmate");
+        assert_eq!(
+            first_mate.x,
+            connector_column(1, &[false]),
+            "the trunk and the first mate's border are in different columns"
+        );
+    }
+
+    /// The connector reaches the card instead of stopping a column short of it.
+    ///
+    /// Read off the drawn buffer, at the narrow end where the shell is a line
+    /// and at the captain's width where it is a card, because the joint is the
+    /// one part of the prefix that differs between the two: against a card the
+    /// third cell carries the line, against a bare name it stays a space.
+    #[test]
+    fn a_branch_meets_the_card_it_points_at_and_keeps_its_gap_from_a_name() {
+        let p = Palette::catppuccin();
+        for is_last_child in [true, false] {
+            let (card, card_cols) = agent_row_prefix(1, is_last_child, &[false], 0, &p, None, true);
+            let (line, line_cols) =
+                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, false);
+            let text = |spans: &[Span<'static>]| -> String {
+                spans.iter().map(|span| span.content.to_string()).collect()
+            };
+
+            assert!(
+                text(&card).ends_with("──"),
+                "the branch stopped short of the card: {:?}",
+                text(&card)
+            );
+            assert!(
+                text(&line).ends_with("─ "),
+                "the branch ran into the name: {:?}",
+                text(&line)
+            );
+            // The joint changes a glyph and never a column, so the layout does
+            // not have to know which shell the renderer picked.
+            assert_eq!(card_cols, line_cols);
+            assert_eq!(card_cols, tree_prefix_width(1, 0));
+        }
+    }
+
+    // ---------------------------------------------------------------- parentage
+
+    /// A worker the first mate opened, running in a second mate's Space, hangs
+    /// off **that mate** — the captain's *"it should always be tied to a
+    /// secondmate."*
+    ///
+    /// It publishes `owner: firstmate`, which is the strongest claim a fleet can
+    /// make about provenance, and it is still the Space it runs in that decides
+    /// where it hangs, because that is its scope.
+    #[test]
+    fn a_worker_the_first_mate_opened_hangs_off_the_second_mate_whose_scope_fits() {
+        let mut app = mate_fleet();
+        let pane = app.workspaces[1].test_split(ratatui::layout::Direction::Vertical);
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the new pane has a terminal");
+        terminal.set_agent_name("fm-opened".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+
+        let under_a = rows_under(&app, "2ndmate-a", 4);
+        assert!(
+            under_a.contains(&"fm-opened".to_string()),
+            "the worker did not join the mate whose Space it runs in: {under_a:?}"
+        );
+        let (_, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "fm-opened");
+        assert_eq!(depth, 2, "it did not hang at worker depth");
+        assert_eq!(rank, AgentRelation::Worker);
+    }
+
+    /// With no mate whose scope fits, the same worker stays under the first mate
+    /// — *"have it create the card as a sub agent as a branch under it"* — and
+    /// is a sub agent there rather than a second mate.
+    ///
+    /// It is deliberately **not** pushed a level deeper. A `├─` in the second
+    /// mate column with no second mate above it hangs off nothing, which is a
+    /// broken branch rather than a sub agent; what stops the promotion is its
+    /// rank, which is what the card's size is measured from.
+    #[test]
+    fn a_worker_with_no_fitting_mate_is_a_sub_agent_on_the_first_mates_branch() {
+        let mut app = mate_fleet();
+        // In the first mate's *own* Space, so no second mate's scope holds it.
+        let pane = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        app.ensure_test_terminals();
+        let owner_id = app.workspaces[0].id.clone();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the new pane has a terminal");
+        terminal.set_agent_name("fm-direct".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.created_by = Some(crate::api::schema::PaneOrigin {
+            pane_id: "fm-direct".to_string(),
+            workspace_id: owner_id,
+        });
+
+        let rows = drawn_tree_rows(&app);
+        assert!(
+            rows.contains(&"fm-direct".to_string()),
+            "the worker lost its row entirely: {rows:?}"
+        );
+        assert!(
+            rows_under(&app, "firstmate", rows.len()).contains(&"fm-direct".to_string()),
+            "the worker left the first mate's subtree: {rows:?}"
+        );
+
+        let (frame, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "fm-direct");
+        assert_eq!(depth, 1, "it hangs off the first mate, so it is one deep");
+        assert_eq!(
+            rank,
+            AgentRelation::Worker,
+            "being opened by the first mate promoted its rank"
+        );
+
+        // Never a peer of the first mate, and never a second mate: it ends where
+        // the sub agents end and not where the mates do.
+        let (mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "2ndmate-a");
+        let (first_mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "firstmate");
+        let (worker, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "a-one");
+        assert!(
+            frame.x > first_mate.x,
+            "it drew as a peer of the first mate"
+        );
+        assert!(
+            frame.width < mate.width,
+            "a sub agent drew at second mate width: {} vs {}",
+            frame.width,
+            mate.width
+        );
+        assert_eq!(
+            frame.x + frame.width,
+            worker.x + worker.width,
+            "it does not end where the other sub agents end"
+        );
+    }
+
+    /// The rule is narrow. A worker already under a second mate is untouched by
+    /// it, whatever the panel is sorted by.
+    #[test]
+    fn a_workers_own_mate_is_never_taken_away_from_it() {
+        for sort in [
+            crate::app::state::AgentPanelSort::Spaces,
+            crate::app::state::AgentPanelSort::Priority,
+        ] {
+            let mut app = mate_fleet();
+            app.agent_panel_sort = sort;
+            let mut under_a = rows_under(&app, "2ndmate-a", 3);
+            let mut under_b = rows_under(&app, "2ndmate-b", 2);
+            under_a.sort();
+            under_b.sort();
+            assert_eq!(under_a, vec!["a-one", "a-three", "a-two"], "{sort:?}");
+            assert_eq!(under_b, vec!["b-one", "b-two"], "{sort:?}");
+        }
+    }
+
+    /// Entry direction survives the re-parenting, in both modes.
+    ///
+    /// A card enters at the head of *its parent's* children, and a worker tied
+    /// to a second mate by scope has to enter at the head of **that mate's**
+    /// group rather than of whoever its token names. This is the interaction the
+    /// two rules have with each other, so it is asserted rather than assumed.
+    #[test]
+    fn a_worker_tied_to_a_mate_still_enters_at_the_head_of_that_mates_branch() {
+        for sort in [
+            crate::app::state::AgentPanelSort::Spaces,
+            crate::app::state::AgentPanelSort::Priority,
+        ] {
+            let mut app = mate_fleet();
+            app.agent_panel_sort = sort;
+            let pane = app.workspaces[1].test_split(ratatui::layout::Direction::Vertical);
+            app.ensure_test_terminals();
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("the new pane has a terminal");
+            terminal.set_agent_name("fm-opened".to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+
+            assert_eq!(
+                rows_under(&app, "2ndmate-a", 4),
+                vec!["fm-opened", "a-three", "a-two", "a-one"],
+                "the newest card did not enter at the head of the mate it was tied to ({sort:?})"
+            );
+            // ...and it moved nothing in the group it was never part of.
+            assert_eq!(rows_under(&app, "2ndmate-b", 2), vec!["b-two", "b-one"]);
+        }
+    }
+
+    // -------------------------------------------------------------------- width
+
+    /// **Width reads as rank.** At the captain's own width a sub agent's card is
+    /// visibly narrower than a second mate's, which is visibly narrower than the
+    /// first mate's — and the right edges form a staircase, which is the part a
+    /// reader actually compares.
+    #[test]
+    fn a_rank_is_legible_from_the_cards_width_alone() {
+        let app = mate_fleet();
+        let (first_mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "firstmate");
+        let (mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "2ndmate-a");
+        let (worker, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "a-one");
+
+        assert!(
+            first_mate.width > mate.width && mate.width > worker.width,
+            "the ladder is not monotone: {} / {} / {}",
+            first_mate.width,
+            mate.width,
+            worker.width
+        );
+
+        // Right edges step, which is what makes the difference readable without
+        // counting columns: flush right edges say "same size" however far apart
+        // the left ones are.
+        let right = |frame: Rect| frame.x + frame.width;
+        assert!(right(first_mate) > right(mate) && right(mate) > right(worker));
+
+        // The step the captain asked to be able to see. Under the old geometry
+        // it was three columns, about 7%, and it fell out of the connector
+        // indent rather than being a ladder at all.
+        let step = mate.width - worker.width;
+        assert!(
+            step >= 6,
+            "a sub agent is only {step} columns narrower than a second mate"
+        );
+        assert!(
+            f32::from(step) / f32::from(mate.width) > 0.12,
+            "the step is under an eighth of the card and will not read as rank"
+        );
+    }
+
+    /// The ladder is paid for out of slack, so it can never push the deepest
+    /// card below the width the card shell needs — and so the sidebar's drag
+    /// detent, which is anchored on that same floor, does not move.
+    #[test]
+    fn the_ladder_is_spent_only_out_of_what_a_panel_has_above_the_card_floor() {
+        for fold in card::MIN_FOLD_WIDTH..=card::MIN_FOLD_WIDTH + 24 {
+            let deepest = fold
+                .saturating_sub(
+                    tree_prefix_width(crate::app::agent_tree::MAX_DISPLAY_DEPTH, 0) as u16,
+                )
+                .saturating_sub(rank_right_inset(AgentRelation::Worker, fold));
+            let floor = card::MIN_FOLD_WIDTH
+                - tree_prefix_width(crate::app::agent_tree::MAX_DISPLAY_DEPTH, 0) as u16;
+            assert!(
+                deepest >= floor,
+                "at fold {fold} the deepest card is {deepest}, under the {floor} the shell needs"
+            );
+
+            // Monotone at every width, and flat at the floor itself, where there
+            // is nothing to spend.
+            let mate = rank_right_inset(AgentRelation::SecondMate, fold);
+            assert!(rank_right_inset(AgentRelation::FirstMate, fold) == 0);
+            assert!(rank_right_inset(AgentRelation::Worker, fold) >= mate);
+        }
+        assert_eq!(
+            rank_right_inset(AgentRelation::Worker, card::MIN_FOLD_WIDTH),
+            0,
+            "the floor has no slack, so every rank must draw the width it always did"
+        );
+    }
+
+    /// The detent the sidebar drag sticks at is anchored on the card floor, and
+    /// the ladder must not have moved it.
+    #[test]
+    fn the_card_shell_detent_did_not_move() {
+        assert_eq!(card_shell_min_sidebar_width(), card::MIN_FOLD_WIDTH + 2);
+    }
+
+    /// Rank is what a row **is**; depth is where it hangs. The two agree for
+    /// every Space and come apart for the one row the captain's rule is about.
+    #[test]
+    fn rank_follows_what_a_row_is_and_never_who_opened_it() {
+        let app = mate_fleet();
+        for (name, _, depth, rank) in card_frames(&app, CAPTAIN_SIDEBAR_WIDTH) {
+            let expected = match name.as_str() {
+                "firstmate" => AgentRelation::FirstMate,
+                "2ndmate-a" | "2ndmate-b" => AgentRelation::SecondMate,
+                _ => AgentRelation::Worker,
+            };
+            assert_eq!(
+                rank, expected,
+                "{name} at depth {depth} drew the wrong rank"
+            );
+        }
+    }
+
+    /// The whole ladder, at the width the captain runs, written down so a change
+    /// to it is a change somebody had to make on purpose.
+    #[test]
+    fn the_ladder_at_the_captains_own_sidebar_width() {
+        let fold = fold_width_at(CAPTAIN_SIDEBAR_WIDTH);
+        let widths: Vec<u16> = [
+            AgentRelation::FirstMate,
+            AgentRelation::SecondMate,
+            AgentRelation::Worker,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(depth, rank)| {
+            fold - tree_prefix_width(depth as u8, 0) as u16 - rank_right_inset(rank, fold)
+        })
+        .collect();
+        assert_eq!(widths, vec![39, 33, 27]);
+    }
+
+    /// A Space with no worktree group of its own is unaffected by any of this:
+    /// a flat fleet that declares no ownership draws one full-width card per
+    /// Space, exactly as it always did.
+    #[test]
+    fn a_flat_fleet_still_draws_full_width_cards() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+
+        let fold = fold_width_at(CAPTAIN_SIDEBAR_WIDTH);
+        for (name, frame, depth, rank) in card_frames(&app, CAPTAIN_SIDEBAR_WIDTH) {
+            assert_eq!(depth, 0, "{name} nested with nothing to nest under");
+            assert_eq!(rank, AgentRelation::FirstMate);
+            assert_eq!(frame.x, 1);
+            assert_eq!(frame.width, fold - 1);
+        }
     }
 }
