@@ -825,7 +825,13 @@ fn surface_layer_placement_targets(
             .map(|(slot, cards)| {
                 (
                     HostSurfaceId::SidebarCards(slot.try_into().unwrap_or(u16::MAX)),
-                    cards.rect,
+                    // The panel box, not the card's own rect, with the card's
+                    // position carried in the layer's viewport offset. At rest
+                    // the two spell the same placement; while a row is sliding
+                    // they do not, and the clip that falls out of this is what
+                    // keeps a card travelling past the panel's edge from being
+                    // drawn over the terminal panes.
+                    cards.clip,
                     &cards.layer,
                 )
             }),
@@ -1615,6 +1621,67 @@ mod tests {
         assert_eq!(u32::from(clipped.y) + clipped.rows, 2 + 20);
     }
 
+    /// A card part-way through its slide is cropped at the panel's edge.
+    ///
+    /// The slide deliberately puts a card past that edge — that is what makes
+    /// an arrival read as coming in from somewhere — so the thing that stops it
+    /// from being drawn over the terminal panes is this crop, and it is the same
+    /// crop a client's own sidebar layer already gets.
+    #[test]
+    fn a_card_sliding_past_the_panel_edge_is_cropped_at_it() {
+        let panel = Rect::new(0, 1, 26, 20);
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.sidebar_rect = panel;
+        app.view.sidebar_card_layers_published = true;
+        app.sidebar_card_shapes = true;
+
+        let mut card = sidebar_card_layer(Rect::new(2, 3, 20, 6));
+        card.clip = panel;
+        // Most of the card is past the panel's right edge, which is where it is
+        // on the first frames of an arrival.
+        card.layer.render.viewport_col = 18;
+        card.layer.render.viewport_row = 2;
+        app.sidebar_card_layers = vec![card];
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+        let (clipped, _) = clipped_placement(&placements[0]).expect("a card part-way in");
+        assert_eq!((clipped.x, clipped.y), (18, 3));
+        assert_eq!(
+            u32::from(clipped.x) + clipped.cols,
+            u32::from(panel.x) + u32::from(panel.width),
+            "a sliding card reached past the panel and over the panes"
+        );
+        // Cropped by cropping the *source*, so what is on screen is still the
+        // card's own pixels at 1:1 rather than the whole card squeezed into
+        // fewer columns.
+        assert_eq!(clipped.source_x, 0);
+        assert_eq!(
+            clipped.source_width,
+            clipped.cols * test_cell_size().width_px
+        );
+
+        // And once it is entirely off the panel there is nothing to draw at all.
+        app.sidebar_card_layers[0].layer.render.viewport_col = 40;
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            test_cell_size(),
+            &HashMap::new(),
+        );
+        assert!(
+            clipped_placement(&placements[0]).is_none(),
+            "a card clear of the panel was still drawn somewhere"
+        );
+    }
+
     #[test]
     fn sidebar_layer_disappears_when_the_sidebar_has_no_width() {
         // The mobile layout leaves `sidebar_rect` empty; a stored layer must
@@ -1740,6 +1807,9 @@ mod tests {
     fn sidebar_card_layer(rect: Rect) -> crate::ui::sidebar::SidebarCardLayer {
         crate::ui::sidebar::SidebarCardLayer {
             rect,
+            // A settled card clips to nothing wider than itself, which is how
+            // the panel drew before motion existed and what these tests measure.
+            clip: rect,
             signature: 1,
             content_signature: 1,
             undissolved: None,

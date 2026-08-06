@@ -465,6 +465,31 @@ This is what makes an ownership tree read as live. Each worker and sub agent row
 
 A row that is still leaving is drawn but is no longer a target: its pane has already closed, so clicking it does nothing.
 
+### Rows that move
+
+`row_enter` and `row_exit` say what a row's *cells* do while it arrives and leaves. `row_motion` says whether the row also **moves**:
+
+```toml
+[ui.sidebar.animation]
+row_motion = "slide"
+```
+
+With `slide`, an arriving row comes in from the panel's right edge while every row below it pans down to open its slot, and a departing row slides back out the way it came while they pan up to close it. It defaults to `none`, which is how rows have always behaved: they appear and disappear exactly where the layout puts them.
+
+The tree's branch lines move with the rows. A card and the `├─` pointing at it stay attached throughout, and a row that is still crossing the panel draws no branch line yet — it appears with the card, at the moment the card lands. Where a row *is* does not change while it moves: clicking, scrolling and dragging during a transition all still land on the row the layout says they hit.
+
+This is a separate setting rather than another `row_enter` name because position is not something a character cell can express — a glyph cannot leave its cell — so the two are orthogonal choices and either one alone is a whole answer. Turning motion on retires nothing: a row can dissolve *and* slide, dissolve without moving, or move without dissolving. Motion runs on the arrival and departure that `row_enter_ms` and `row_exit_ms` already time, so it needs no duration of its own, and asking for `row_motion` with `row_enter = "none"` still gives the row an arrival to move through.
+
+Motion applies to the **pixel cards** only. It needs `[experimental] kitty_graphics` and `sidebar_card_shapes`, a host that reports its cell size, a panel at least 34 columns wide, and a proportional font on the machine — the same conditions the cards themselves need. Everywhere else the sidebar is characters, so there is nothing to move and rows appear and disappear on the frame the layout says they do, exactly as they always have. A `row_enter` effect still plays on those cells.
+
+With `kitty_graphics` or `sidebar_card_shapes` off, or with no proportional font on the machine, `row_motion` changes nothing at all — not even how long a closed pane's row stays drawn. The remaining two conditions behave differently on purpose: the panel width and the host's cell size can both change while a row is already mid-flight, so they decide what is *drawn* rather than what a row's life is. Dragging the sidebar below 34 columns during a transition therefore stops the movement without cutting the row's arrival short.
+
+### How smooth the movement is
+
+Motion is quantised to **whole cell rows**, and it resolves at the panel's own 50 ms animation step. On a 9×18 px cell a row of vertical travel is about 72 px taken in four 18 px steps, so the movement reads as stepped rather than as a glide. `row_enter_ms` is effectively a frame count — 320 ms is about six frames — but past roughly 500 ms it is the cell grid, not the frame rate, that limits how many distinct positions a card can occupy.
+
+Making it smooth needs two things this release does not have: sub-cell pixel placement, and a finer frame tier than the 50 ms step. Both are needed together — extra frames alone land on the same handful of cell rows. And once a card can sit at a fraction of a cell, the tree's branch lines cannot follow it, because a character occupies a whole cell row and there is no half-row position for `├─` or `│`. Smooth movement therefore also requires the trunk and branches to be drawn as pixel artwork rather than as characters. That is a known, measured boundary and the next piece of work, not an oversight — the measurements are in `data/herdr-row-slide-reflow/subcell-test/RESULT.md`.
+
 ### The fleet signal bar
 
 Eight fixed slots on the row above the Spaces tree, saying what the fleet is waiting on:

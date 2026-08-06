@@ -1,5 +1,6 @@
 mod card;
 pub(crate) mod image_card;
+pub(crate) mod motion;
 mod notifications;
 mod tokens;
 pub(crate) mod tray;
@@ -738,6 +739,7 @@ pub(crate) fn sidebar_agent_live_entries(app: &AppState) -> Vec<AgentPanelEntry>
     // Classify against the whole fleet before dropping the unowned rows, so a
     // pane's relation still reflects where it really sits.
     crate::app::agent_tree::classify_agent_relations(&mut entries);
+    enter_at_head(&mut entries);
     if matches!(
         app.agent_panel_sort,
         crate::app::state::AgentPanelSort::Priority
@@ -751,6 +753,42 @@ pub(crate) fn sidebar_agent_live_entries(app: &AppState) -> Vec<AgentPanelEntry>
     }
     entries.retain(keeps_a_tree_row);
     entries
+}
+
+/// Where a card comes in: at the head of its parent's children, never the tail.
+///
+/// A new pane used to join the panel wherever the session happened to list it,
+/// which is last — [`collect_agent_panel_entries_with_runtimes`] walks
+/// workspaces and then panes in creation order, so a card arrived at the bottom
+/// of its group and the row that was seen to open was the one furthest from the
+/// row the user was looking at. Entry is the *top* of the group instead, so an
+/// arrival happens where attention already is.
+///
+/// **Entry is not the sort, and this runs before it.** The sort still owns the
+/// row from here — under `AgentPanelSort::Priority` it is free to move a
+/// just-arrived card straight back down, and it must be, or a burst of new panes
+/// would outrank a blocked one. What entry order decides is where a card sits
+/// when the sort is indifferent: `sort_by_key` is stable, so a card the sort
+/// ranks equal to its siblings keeps the head position this gave it. Under
+/// `AgentPanelSort::Spaces` nothing sorts at all and entry order is the whole
+/// answer, which is the mode where a card is actually watched arriving.
+///
+/// **"Highest allowed branch" is the parent's, not the panel's.** This only
+/// establishes a *sibling* order; parentage is rebuilt afterwards from the
+/// `owner` tokens by [`crate::app::agent_tree::arrange_owner_tree`], which
+/// groups children by resolved parent and keeps whatever relative order it was
+/// handed. A total order restricted to one parent's children is still that
+/// order, so ordering the flat list newest-first puts the newest card first
+/// inside every group at once and cannot lift a card out of the group that owns
+/// it. Nothing but removal takes a card out of its parent.
+///
+/// Recency is [`crate::layout::PaneId`], which is a process-wide allocation
+/// counter: a higher id is a pane that was created later, by construction. That
+/// is why this needs no "is it new" flag and no remembered previous frame —
+/// stating it as an ordering rule makes "every card entered at the head" an
+/// invariant of the list rather than something one frame has to catch.
+fn enter_at_head(entries: &mut [AgentPanelEntry]) {
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.pane_id.raw()));
 }
 
 /// Put the rows that are mid-exit back among the live ones.
@@ -1545,6 +1583,7 @@ pub(crate) fn compute_workspace_list_areas(
             entry_idx,
             agent,
             card_frame: card_frame_for(rect, entry, fold_width),
+            motion_cells: (0, 0),
         });
         row_y = row_y
             .saturating_add(row_height)
@@ -2466,12 +2505,17 @@ fn resolved_token_spans(
 /// It uses the same connector maths as every other row and its own
 /// `[ui.sidebar.agents]` token layout, so a worker reads as a branch of its
 /// mate rather than as a visitor from somewhere else.
+// The panel's two vertical bounds and its fold width are all the row's caller
+// already knows and the row must not re-derive: measuring them twice is how a
+// row's reserved height and its drawn lines come to disagree.
+#[allow(clippy::too_many_arguments)]
 fn render_agent_row(
     app: &AppState,
     frame: &mut Frame,
     card: &crate::app::state::WorkspaceCardArea,
     entries: &[WorkspaceListEntry],
     agents: &[AgentPanelEntry],
+    list_top: u16,
     list_bottom: u16,
     fold_width: u16,
 ) {
@@ -2497,6 +2541,7 @@ fn render_agent_row(
     // still *constructed* — the row's content width, its rails and its prefix are
     // measured off it — it is just not drawn.
     let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
+    let motion = row_motion_cells(card, covered);
     let content_rows = card
         .rect
         .height
@@ -2593,7 +2638,9 @@ fn render_agent_row(
             above,
             below,
             list_entry_gap(app, entries, card.entry_idx),
+            list_top,
             list_bottom,
+            motion,
         );
         if !covered {
             shell.render_glow(frame, list_bottom);
@@ -2606,6 +2653,15 @@ fn render_agent_row(
         if row_index as u16 >= content_rows || row_y >= list_bottom {
             break;
         }
+        // A row still crossing the panel draws nothing in characters: its own
+        // rail would point at a card that has not arrived, and under a shape
+        // this line carries only that rail anyway.
+        if motion.0 != 0 {
+            continue;
+        }
+        let Some(row_y) = moved_row(row_y, motion.1, list_top, list_bottom) else {
+            continue;
+        };
         // Only the first content row carries the badge, so only it gives up the
         // width; only the last carries the pill.
         let trailing_width = if row_index == 0 {
@@ -2736,12 +2792,45 @@ fn agent_status_label(entry: &AgentPanelEntry) -> &str {
         .unwrap_or_else(|| state_label(entry.state, entry.seen))
 }
 
+/// Where a row is drawn relative to where the layout put it, in whole cells.
+///
+/// `(0, 0)` unless a pixel card was actually placed for this row on this pass:
+/// `motion_cells` is the offset the *placement* took, so applying it to the
+/// characters of a row whose card is not on screen would move a line away from
+/// the thing it belongs to rather than with it.
+fn row_motion_cells(card: &crate::app::state::WorkspaceCardArea, covered: bool) -> (i32, i32) {
+    if covered {
+        card.motion_cells
+    } else {
+        (0, 0)
+    }
+}
+
+/// One of a row's rows, moved by the row's own motion offset, or `None` when
+/// that puts it outside the list.
+fn moved_row(y: u16, dy: i32, list_top: u16, list_bottom: u16) -> Option<u16> {
+    let moved = i32::from(y).checked_add(dy)?;
+    let moved = u16::try_from(moved).ok()?;
+    (moved >= list_top && moved < list_bottom).then_some(moved)
+}
+
 /// Draw the tree rails beside a card's border rows.
 ///
 /// A card's content rows carry their own rails in the line they render; its two
 /// border rows have no line of their own, so the rails beside them are drawn
 /// here. Without this the tree's vertical rules would break every time they
 /// passed a card — which, at four rows an entity, is most of the panel.
+///
+/// `motion` is [`row_motion_cells`]. The rail travels with the card because the
+/// two are one thing seen by two renderers: a connector left at the layout's
+/// row while the card it points at is four rows higher is an arrow at empty
+/// space. Both are whole-cell arithmetic over the same published offset, so
+/// they cannot land a row apart. A row still travelling *sideways* draws no
+/// rail at all — its card has not reached the panel yet.
+// Three pre-rendered span runs, the gap under the card and the three bounds the
+// rail is drawn between: every one of them is a separate fact about this one
+// row, and grouping them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 fn render_card_border_rails(
     frame: &mut Frame,
     card: &crate::app::state::WorkspaceCardArea,
@@ -2749,13 +2838,15 @@ fn render_card_border_rails(
     above: Vec<Span<'static>>,
     below: Vec<Span<'static>>,
     trailing_gap: u16,
+    list_top: u16,
     list_bottom: u16,
+    motion: (i32, i32),
 ) {
     let Some(shell_frame) = card.card_frame else {
         return;
     };
     let width = shell_frame.x.saturating_sub(card.rect.x);
-    if width == 0 || shell_frame.height == 0 {
+    if width == 0 || shell_frame.height == 0 || motion.0 != 0 {
         return;
     }
     // The connector points at the card's *name*, which is its first content
@@ -2771,9 +2862,9 @@ fn render_card_border_rails(
         .saturating_add(shell_frame.height)
         .saturating_add(trailing_gap);
     for y in shell_frame.y..last_y {
-        if y >= list_bottom {
-            break;
-        }
+        let Some(drawn_y) = moved_row(y, motion.1, list_top, list_bottom) else {
+            continue;
+        };
         let spans = if y == connector_y {
             connector.clone()
         } else if y < connector_y {
@@ -2783,7 +2874,7 @@ fn render_card_border_rails(
         };
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(card.rect.x, y, width, 1),
+            Rect::new(card.rect.x, drawn_y, width, 1),
         );
     }
 }
@@ -3474,7 +3565,16 @@ fn render_workspace_list(
 
     for card in cards {
         if card.agent.is_some() {
-            render_agent_row(app, frame, card, &entries, &agents, list_bottom, fold_width);
+            render_agent_row(
+                app,
+                frame,
+                card,
+                &entries,
+                &agents,
+                area.y,
+                list_bottom,
+                fold_width,
+            );
             continue;
         }
         let i = card.ws_idx;
@@ -3495,25 +3595,6 @@ fn render_workspace_list(
         let is_dragged = dragged_ws_idx == Some(i);
         let highlighted = selected || is_active || is_dragged;
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-
-        if highlighted {
-            let bg = if selected {
-                p.surface0
-            } else if is_dragged {
-                p.surface1
-            } else {
-                p.surface_dim
-            };
-            let buf = frame.buffer_mut();
-            for y in row_y..row_y + row_height {
-                if y >= list_bottom {
-                    break;
-                }
-                for x in card.rect.x..card.rect.x + card.rect.width {
-                    buf[(x, y)].set_style(Style::default().bg(bg));
-                }
-            }
-        }
 
         // A card's first content row is its title, and it gets full weight
         // whether or not the cursor is on it: the frame, the chip and the glow
@@ -3554,6 +3635,33 @@ fn render_workspace_list(
         // shell is still constructed — the row's content width, its rails and its
         // prefix are measured off it — it is just not drawn.
         let covered = card_shell.is_some() && image_card::shape_covers_row(app, fold_width);
+        // Where this row is drawn, which is where the layout put it unless its
+        // card is mid-slide. Resolved here rather than earlier because it is
+        // only honoured while a pixel card is actually on this row.
+        let motion = row_motion_cells(card, covered);
+
+        // The selection wash follows the row it belongs to. Drawn after the
+        // shell is known so it can, and before anything else this row paints so
+        // it is still under all of it — it patches the background and leaves
+        // every symbol alone.
+        if highlighted && motion.0 == 0 {
+            let bg = if selected {
+                p.surface0
+            } else if is_dragged {
+                p.surface1
+            } else {
+                p.surface_dim
+            };
+            let buf = frame.buffer_mut();
+            for y in row_y..row_y + row_height {
+                let Some(drawn_y) = moved_row(y, motion.1, area.y, list_bottom) else {
+                    continue;
+                };
+                for x in card.rect.x..card.rect.x + card.rect.width {
+                    buf[(x, drawn_y)].set_style(Style::default().bg(bg));
+                }
+            }
+        }
         // The same mark, padded and plated. The alphabet is untouched: a chip
         // is where a mark is set, not a mark of its own.
         let chip = card_shell.as_ref().map(|shell| shell.chip(mark.0));
@@ -3658,7 +3766,9 @@ fn render_workspace_list(
                 above,
                 below,
                 list_entry_gap(app, &entries, card.entry_idx),
+                area.y,
                 list_bottom,
+                motion,
             );
             if !covered {
                 shell.render_glow(frame, list_bottom);
@@ -3670,6 +3780,17 @@ fn render_workspace_list(
             if row_index as u16 >= content_rows || content_y + row_index as u16 >= list_bottom {
                 break;
             }
+            // A row still crossing the panel draws nothing in characters: its
+            // own rail would point at a card that has not arrived, and under a
+            // shape this line carries only that rail anyway.
+            if motion.0 != 0 {
+                continue;
+            }
+            let Some(drawn_y) =
+                moved_row(content_y + row_index as u16, motion.1, area.y, list_bottom)
+            else {
+                continue;
+            };
             // The branch line only exists on a child card's first row, so that
             // is the only row a signal can travel and the only row it damages.
             let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
@@ -3795,12 +3916,7 @@ fn render_workspace_list(
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
-                Rect::new(
-                    card.rect.x,
-                    content_y + row_index as u16,
-                    card.rect.width,
-                    1,
-                ),
+                Rect::new(card.rect.x, drawn_y, card.rect.width, 1),
             );
         }
 
@@ -4147,9 +4263,13 @@ mod tests {
                 .position(|row| row.contains(name))
                 .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
         };
-        let one = row_of("worker-one");
-        let two = row_of("worker-two");
-        assert!(one < two, "workers drew out of order:\n{screen}");
+        // `worker-two` was created second, so it entered at the head of the
+        // group and draws above `worker-one` - see [`enter_at_head`]. Which of
+        // them is on top is not what this test is about; that there is an
+        // unbroken rail between them is.
+        let upper = row_of("worker-two");
+        let lower = row_of("worker-one");
+        assert!(upper < lower, "workers drew out of order:\n{screen}");
         // Only the columns left of the workers' own frame count. The card's
         // left border is itself a `│`, so a test that looked at the whole row
         // would pass on a rail that was never drawn at all.
@@ -4158,12 +4278,12 @@ mod tests {
             .workspace_card_areas
             .iter()
             .filter(|card| {
-                let row = u16::try_from(one).unwrap_or(u16::MAX);
+                let row = u16::try_from(upper).unwrap_or(u16::MAX);
                 card.rect.y <= row && row < card.rect.y.saturating_add(card.rect.height)
             })
             .find_map(|card| card.card_frame.map(|frame| frame.x))
             .unwrap_or_else(|| panic!("no card frame to measure the rail against:\n{screen}"));
-        for (index, row) in rows.iter().enumerate().take(two).skip(one) {
+        for (index, row) in rows.iter().enumerate().take(lower).skip(upper) {
             let rail: String = row.chars().take(usize::from(rail_columns)).collect();
             assert!(
                 rail.contains('│') || rail.contains('├') || rail.contains('└'),
@@ -4321,6 +4441,231 @@ mod tests {
                 .iter()
                 .all(|entry| entry.agent_name.as_deref() != Some("worker")),
             "a pane with neither an owner nor an origin should stay out"
+        );
+    }
+
+    /// Two second mates under one first mate, each with its own workers, and
+    /// the panes created in an **interleaved** order: `a-one`, `b-one`,
+    /// `a-two`, `b-two`, `a-three`.
+    ///
+    /// The interleaving is the point. A rule that only reversed the whole list
+    /// would satisfy a single-group fixture by luck; here the two groups have to
+    /// come out head-first *independently* of each other, which is what "the
+    /// highest branch its parent allows" actually means.
+    fn interleaved_worker_fleet() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut mate_a = Workspace::test_new("2ndmate-a");
+        let mut mate_b = Workspace::test_new("2ndmate-b");
+        // Pane ids are allocated from one process-wide counter, so this
+        // sequence *is* the creation order the entry rule reads.
+        let a_one = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let b_one = mate_b.test_split(ratatui::layout::Direction::Vertical);
+        let a_two = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let b_two = mate_b.test_split(ratatui::layout::Direction::Vertical);
+        let a_three = mate_a.test_split(ratatui::layout::Direction::Vertical);
+
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate_a, mate_b];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        for ws_idx in [1usize, 2] {
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+
+        let groups = [
+            (
+                1usize,
+                vec![(a_one, "a-one"), (a_two, "a-two"), (a_three, "a-three")],
+            ),
+            (2usize, vec![(b_one, "b-one"), (b_two, "b-two")]),
+        ];
+        for (ws_idx, panes) in groups {
+            let owner_id = app.workspaces[ws_idx].id.clone();
+            for (pane, name) in panes {
+                let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                    .attached_terminal_id
+                    .clone();
+                let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
+                    continue;
+                };
+                terminal.set_agent_name(name.to_string());
+                terminal.state = AgentState::Idle;
+                terminal.created_by = Some(crate::api::schema::PaneOrigin {
+                    pane_id: name.to_string(),
+                    workspace_id: owner_id.clone(),
+                });
+            }
+        }
+        app
+    }
+
+    /// Every row the panel would draw, in drawn order — Spaces by their tree
+    /// name, panes by their agent name.
+    ///
+    /// Read through the flattened tree rather than off the entry list, so what
+    /// is asserted is what a viewer would see rather than an intermediate the
+    /// arranger is still free to reorder.
+    fn drawn_tree_rows(app: &crate::app::state::AppState) -> Vec<String> {
+        let agents = sidebar_agent_entries(app);
+        workspace_list_entries_expanded(app)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, ws_idx),
+                WorkspaceListEntry::Agent { entry_idx, .. } => agents
+                    .get(entry_idx)
+                    .and_then(|agent| agent.agent_name.clone()),
+            })
+            .collect()
+    }
+
+    /// The rows drawn directly beneath `parent`, as a contiguous run.
+    ///
+    /// Contiguity is doing real work here: the tree walk emits a parent's
+    /// subtree in one unbroken block, so a card that had escaped into another
+    /// mate's group would show up as the wrong name inside this slice rather
+    /// than merely as a different order.
+    fn rows_under(app: &crate::app::state::AppState, parent: &str, count: usize) -> Vec<String> {
+        let rows = drawn_tree_rows(app);
+        let at = rows
+            .iter()
+            .position(|row| row == parent)
+            .unwrap_or_else(|| panic!("{parent} is not on screen: {rows:?}"));
+        rows.into_iter().skip(at + 1).take(count).collect()
+    }
+
+    /// The entry rule under `Spaces`, which is the mode a card is actually
+    /// watched arriving in: nothing sorts, so where a card entered is where it
+    /// stays, and the newest is at the top of its own group.
+    #[test]
+    fn a_new_card_enters_at_the_head_of_its_parent_under_the_spaces_sort() {
+        let mut app = interleaved_worker_fleet();
+        app.agent_panel_sort = crate::app::state::AgentPanelSort::Spaces;
+
+        assert_eq!(
+            rows_under(&app, "2ndmate-a", 3),
+            vec!["a-three", "a-two", "a-one"],
+            "the newest worker did not enter at the top of its own mate's group"
+        );
+        assert_eq!(
+            rows_under(&app, "2ndmate-b", 2),
+            vec!["b-two", "b-one"],
+            "the second mate's group did not get the same rule independently"
+        );
+    }
+
+    /// The same rule under `Priority`. The workers are all idle-and-seen with
+    /// no state-change sequence, so the sort ranks them equal and is
+    /// *indifferent* — which is exactly where the entry position has to still
+    /// be visible, because a stable sort is what carries it through.
+    #[test]
+    fn a_new_card_enters_at_the_head_of_its_parent_under_the_priority_sort() {
+        let mut app = interleaved_worker_fleet();
+        app.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
+
+        assert_eq!(
+            rows_under(&app, "2ndmate-a", 3),
+            vec!["a-three", "a-two", "a-one"]
+        );
+        assert_eq!(rows_under(&app, "2ndmate-b", 2), vec!["b-two", "b-one"]);
+    }
+
+    /// Entry position and sort order are two separate things and both hold:
+    /// having entered at the head, a card is the sort's from then on. The
+    /// oldest worker blocks, and `Priority` must pull it to the top of its
+    /// group *over* the entry order — a fleet where a burst of new panes buried
+    /// a blocked one would be the bug this half prevents.
+    #[test]
+    fn the_sort_still_owns_a_card_after_it_has_entered() {
+        let mut app = interleaved_worker_fleet();
+        app.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
+
+        let blocked = sidebar_agent_entries(&app)
+            .into_iter()
+            .find(|entry| entry.agent_name.as_deref() == Some("a-one"))
+            .expect("the oldest worker is on screen");
+        let terminal_id = app.workspaces[blocked.ws_idx].tabs[0].panes[&blocked.pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("the worker has a terminal")
+            .state = AgentState::Blocked;
+
+        assert_eq!(
+            rows_under(&app, "2ndmate-a", 3),
+            vec!["a-one", "a-three", "a-two"],
+            "the sort did not move a card the entry rule had put at the bottom"
+        );
+        // ...and it moved it *within its own parent*. The other mate's group is
+        // untouched, and the blocked worker did not surface above it.
+        assert_eq!(rows_under(&app, "2ndmate-b", 2), vec!["b-two", "b-one"]);
+    }
+
+    /// A card enters at the top of the branch that owns it and no higher.
+    /// Whatever the sort, every worker stays inside its own mate's contiguous
+    /// block — the only thing that ever takes a card out of its parent is
+    /// removal.
+    #[test]
+    fn entry_never_lifts_a_card_out_of_its_own_parent() {
+        for sort in [
+            crate::app::state::AgentPanelSort::Spaces,
+            crate::app::state::AgentPanelSort::Priority,
+        ] {
+            let mut app = interleaved_worker_fleet();
+            app.agent_panel_sort = sort;
+
+            let mut under_a = rows_under(&app, "2ndmate-a", 3);
+            let mut under_b = rows_under(&app, "2ndmate-b", 2);
+            under_a.sort();
+            under_b.sort();
+            assert_eq!(under_a, vec!["a-one", "a-three", "a-two"], "{sort:?}");
+            assert_eq!(under_b, vec!["b-one", "b-two"], "{sort:?}");
+        }
+    }
+
+    /// Entry is about *where a card comes in*, so the test that names it best
+    /// is the one that adds a pane to a fleet that was already drawn: the new
+    /// worker takes the top of its group, and pushes the ones that were there
+    /// down rather than landing beneath them.
+    #[test]
+    fn a_pane_created_later_takes_the_top_of_a_group_that_already_had_rows() {
+        let mut app = interleaved_worker_fleet();
+        app.agent_panel_sort = crate::app::state::AgentPanelSort::Spaces;
+        let before = rows_under(&app, "2ndmate-a", 3);
+
+        let arrival = app.workspaces[1].test_split(ratatui::layout::Direction::Vertical);
+        app.ensure_test_terminals();
+        let owner_id = app.workspaces[1].id.clone();
+        let terminal_id = app.workspaces[1].tabs[0].panes[&arrival]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("the new pane has a terminal");
+        terminal.set_agent_name("a-four".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.created_by = Some(crate::api::schema::PaneOrigin {
+            pane_id: "a-four".to_string(),
+            workspace_id: owner_id,
+        });
+
+        let after = rows_under(&app, "2ndmate-a", 4);
+        assert_eq!(after.first().map(String::as_str), Some("a-four"));
+        assert_eq!(
+            after[1..],
+            before[..],
+            "the rows that were already there should have been pushed down intact"
         );
     }
 
@@ -4490,6 +4835,7 @@ mod tests {
             entry_idx: 0,
             agent: None,
             card_frame: None,
+            motion_cells: (0, 0),
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
@@ -4891,6 +5237,7 @@ mod tests {
             entry_idx: 0,
             agent: None,
             card_frame: Some(frame),
+            motion_cells: (0, 0),
         };
         let chevron = workspace_group_chevron_rect(&card);
         assert_eq!(
@@ -4916,6 +5263,7 @@ mod tests {
         // and reaches its own right edge.
         let line = crate::app::state::WorkspaceCardArea {
             card_frame: None,
+            motion_cells: (0, 0),
             ..card
         };
         assert_eq!(workspace_group_chevron_rect(&line).y, rect.y);
@@ -5720,15 +6068,22 @@ mod tests {
     /// A fleet with a rank past the display cap: `worker` owns `sub`, and
     /// `worker2` is a genuine sibling of `worker` below it. `sub` has nowhere
     /// deeper to draw, so it shares `worker`'s column.
+    ///
+    /// `worker` is the *newest* of the two rank-2 panes on purpose. A card
+    /// enters at the head of its parent's group ([`enter_at_head`]), so making
+    /// the clamped child's parent the newer one is what puts a true sibling
+    /// *below* the clamped row — which is the whole shape under test. Give
+    /// `sub` to the older pane instead and the clamped row is simply last, and
+    /// closing the column would be correct.
     fn capped_fleet_sidebar_rows(width: u16) -> Vec<String> {
         let mut app = crate::app::state::AppState::test_new();
         let mut second_mate = Workspace::test_new("2ndmate-explore");
         let sub_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
-        let worker2_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
-        let worker_pane = *second_mate.tabs[0]
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let worker2_pane = *second_mate.tabs[0]
             .panes
             .keys()
-            .find(|pane| **pane != sub_pane && **pane != worker2_pane)
+            .find(|pane| **pane != sub_pane && **pane != worker_pane)
             .expect("the original pane is still present");
         app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
         app.ensure_test_terminals();
@@ -6465,6 +6820,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             rect: Rect::new(0, 1, 15, 2),
             worktree_child: false,
             card_frame: None,
+            motion_cells: (0, 0),
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(15, 6)).expect("test terminal");

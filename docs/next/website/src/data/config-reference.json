@@ -842,6 +842,16 @@
           "description": "How long a configured row departure takes, in milliseconds. Clamped to 60-1500."
         },
         {
+          "key": "ui.sidebar.animation.row_motion",
+          "type": "enum",
+          "default": "\"none\"",
+          "description": "Whether a sidebar row's arrival and departure also move it. none (the default) draws every row exactly where the layout puts it. slide brings an arriving row in from the panel's right edge while the rows below it pan down to open its slot, and takes a departing row back out the way it came while they pan up to close it. Separate from row_enter rather than another of its names because position is not something a character cell can express, so the two compose: a row can dissolve and slide, or do either alone. Motion runs on the arrival and departure that row_enter_ms and row_exit_ms already time. The tree's branch lines move with the rows, and a row still crossing the panel draws none until its card lands; where a row is does not change while it moves, so a click during a transition still lands on the row the layout says it hit. Pixel cards only - it needs [experimental] kitty_graphics and sidebar_card_shapes, a known host cell size, a panel at least 34 columns wide and a proportional font on the machine; everywhere else rows appear and disappear on the frame the layout says they do. With kitty_graphics or sidebar_card_shapes off, or no proportional font, row_motion changes nothing at all - not even how long a closed pane's row stays drawn. Width and cell size can change while a row is mid-flight, so they decide what is drawn rather than what a row's life is. Movement is quantised to whole cell rows at the panel's 50ms animation step, so it reads as stepped rather than as a glide; smooth sub-cell travel needs both a finer frame tier and the tree's branch lines drawn as pixel artwork, which is the next piece of work.",
+          "values": [
+            "none",
+            "slide"
+          ]
+        },
+        {
           "key": "ui.sidebar.animation.view_switch",
           "type": "enum",
           "default": "\"dissolve\"",
