@@ -301,6 +301,10 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    /// The ratatui terminal for the render the server still runs when nothing
+    /// is attached. Kept beside the per-client ones so that path pays for its
+    /// buffers once too.
+    idle_renderer: crate::server::render_stream::VirtualRenderer,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -502,6 +506,7 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            idle_renderer: crate::server::render_stream::VirtualRenderer::default(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -4078,7 +4083,7 @@ impl HeadlessServer {
             let area = Rect::new(0, 0, cols, rows);
             let resize_panes = self.app.state.view.pane_infos.is_empty();
             let render_started = crate::render_prof::timer();
-            let _ = crate::server::render_stream::render_virtual_with_runtime_registry(
+            let _ = self.idle_renderer.render_app(
                 &mut self.app.state,
                 &self.app.terminal_runtimes,
                 area,
@@ -4100,6 +4105,17 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            // Taken out of the connection for the duration of the render, so the
+            // draw borrows nothing from `self` and can sit beside the app state
+            // and the runtime registry. It goes back below; the paths that drop
+            // it instead are the ones where the client is already gone.
+            let Some(mut renderer) = self
+                .clients
+                .get_mut(&client_id)
+                .map(|client| std::mem::take(&mut client.renderer))
+            else {
+                continue;
+            };
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
@@ -4114,14 +4130,13 @@ impl HeadlessServer {
                         self.app.state.tab_scroll,
                         self.app.state.mobile_switcher_scroll,
                     ));
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_virtual_with_runtime_registry(
-                            &mut self.app.state,
-                            &self.app.terminal_runtimes,
-                            area,
-                            is_foreground,
-                            render_cell_size,
-                        );
+                    let cursor = renderer.render_app(
+                        &mut self.app.state,
+                        &self.app.terminal_runtimes,
+                        area,
+                        is_foreground,
+                        render_cell_size,
+                    );
                     if let Some((workspace, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
                         self.app.state.tab_scroll = tab;
@@ -4142,7 +4157,7 @@ impl HeadlessServer {
                     );
                     let frame_started = crate::render_prof::timer();
                     let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
+                        renderer.buffer(),
                         cursor,
                         &hyperlinks,
                     );
@@ -4164,8 +4179,7 @@ impl HeadlessServer {
                         continue;
                     };
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_terminal_virtual(runtime, area);
+                    let cursor = renderer.render_terminal(runtime, area);
                     crate::render_prof::duration_since(
                         "full_render.render_terminal_virtual",
                         render_started,
@@ -4178,7 +4192,7 @@ impl HeadlessServer {
                     );
                     let frame_started = crate::render_prof::timer();
                     let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
+                        renderer.buffer(),
                         cursor,
                         &hyperlinks,
                     );
@@ -4190,6 +4204,7 @@ impl HeadlessServer {
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
+            client.renderer = renderer;
             let mut next_graphics_cache = client.graphics_cache.clone();
             let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
             if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known() {
@@ -5081,6 +5096,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            idle_renderer: crate::server::render_stream::VirtualRenderer::default(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -7093,6 +7109,76 @@ next_tab = ""
             .pending_agent_resume_plan
             .is_some());
         assert!(server.app.pending_agent_resume_deadline.is_none());
+    }
+
+    /// The reused ratatui terminal is per client, not one shared by the
+    /// server: two clients at different sizes each keep their own screen, and
+    /// neither drags the other through a resize.
+    #[tokio::test]
+    async fn each_client_keeps_its_own_render_terminal() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"pane\r\n"),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        // The receivers stay alive: a dropped one makes the client look broken
+        // and the server drops it before it ever renders.
+        let mut receivers = Vec::new();
+        for (index, size) in [(100u16, 30u16), (60, 20)].into_iter().enumerate() {
+            let (client_tx, control_rx, client_rx) = test_client_writer();
+            receivers.push((control_rx, client_rx));
+            server.clients.insert(
+                index as u64 + 1,
+                ClientConnection::new(
+                    size,
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    index as u64 + 1,
+                    RenderEncoding::SemanticFrame,
+                    Some(client_tx),
+                ),
+            );
+        }
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        for _ in 0..3 {
+            server.render_and_stream();
+        }
+
+        assert_eq!(
+            server.clients[&1].renderer.buffer().area,
+            Rect::new(0, 0, 100, 30),
+        );
+        assert_eq!(
+            server.clients[&2].renderer.buffer().area,
+            Rect::new(0, 0, 60, 20),
+        );
+
+        // One client resizing must move only its own terminal.
+        server
+            .clients
+            .get_mut(&2)
+            .expect("second client")
+            .terminal_size = (140, 45);
+        server.render_and_stream();
+
+        assert_eq!(
+            server.clients[&1].renderer.buffer().area,
+            Rect::new(0, 0, 100, 30),
+        );
+        assert_eq!(
+            server.clients[&2].renderer.buffer().area,
+            Rect::new(0, 0, 140, 45),
+        );
     }
 
     #[test]

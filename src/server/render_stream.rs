@@ -214,6 +214,29 @@ impl CursorTrackingBackend {
         self.inner.buffer()
     }
 
+    /// The backend's current size in cells.
+    ///
+    /// This is what `Terminal::autoresize` reads through `Backend::size`, so it
+    /// is also the thing a caller has to move to tell a reused terminal that its
+    /// viewport changed.
+    fn size_cells(&self) -> (u16, u16) {
+        let area = self.inner.buffer().area;
+        (area.width, area.height)
+    }
+
+    fn resize(&mut self, width: u16, height: u16) {
+        self.inner.resize(width, height);
+    }
+
+    /// Drops the cursor position carried over from the previous frame.
+    ///
+    /// A terminal that is thrown away every frame starts with no tracked
+    /// cursor; a reused one would otherwise report the last frame's cursor for
+    /// any frame that never set one.
+    fn begin_frame(&mut self) {
+        self.rendered_cursor = None;
+    }
+
     fn rendered_cursor(&self) -> Option<CursorState> {
         self.rendered_cursor.map(|pos| CursorState {
             x: pos.x,
@@ -280,12 +303,140 @@ impl Backend for CursorTrackingBackend {
     }
 }
 
-/// Renders the AppState to an in-memory ratatui Buffer.
+/// The ratatui terminal one render target draws through, kept across frames.
 ///
-/// This produces the same output as the monolithic binary's terminal draw,
-/// but writes to a `Buffer` instead of stdout. Cursor visibility is captured
-/// from explicit frame cursor intent rather than incidental backend state.
-#[cfg_attr(not(test), allow(dead_code))]
+/// A `Terminal` is a frame-to-frame object, not a per-frame one. It owns two
+/// viewport-sized buffers and its backend owns a third, and its whole diffing
+/// design assumes the buffer it compares against is the frame that was actually
+/// drawn last. Building one per frame threw all three allocations away every
+/// frame — at a full-screen size that is three times ~47k cells, ~58 times a
+/// second, per attached client — and made every diff a full repaint against a
+/// blank screen.
+///
+/// Reuse is per render target, deliberately: every attached client gets its own
+/// (`ClientConnection::renderer`), and the server's no-client render has one of
+/// its own (`HeadlessServer::idle_renderer`). Two clients at different sizes
+/// sharing one terminal would resize it — which is a full clear and a full
+/// repaint — on every frame, and the smaller client would drag the larger one
+/// through it. Nothing about a target's terminal is shared state; it only ever
+/// holds what that target was last shown.
+#[derive(Default)]
+pub(crate) struct VirtualRenderer {
+    terminal: Option<ratatui::Terminal<CursorTrackingBackend>>,
+}
+
+impl VirtualRenderer {
+    /// The terminal for `area`, built on first use and resized when the
+    /// viewport moved.
+    ///
+    /// Resizing the *backend* is the whole mechanism: `Terminal::draw` calls
+    /// `autoresize`, sees the backend disagree with its own viewport, resizes
+    /// both of its buffers, and clears the backend — which leaves the next diff
+    /// a full repaint onto a blank screen, exactly the state a freshly built
+    /// terminal would have been in.
+    fn terminal_for(&mut self, area: Rect) -> &mut ratatui::Terminal<CursorTrackingBackend> {
+        let terminal = self.terminal.get_or_insert_with(|| {
+            ratatui::Terminal::new(CursorTrackingBackend::new(area.width, area.height))
+                .expect("TestBackend::new should never fail")
+        });
+        if terminal.backend().size_cells() != (area.width, area.height) {
+            crate::render_prof::event("render_virtual.resize");
+            terminal.backend_mut().resize(area.width, area.height);
+        }
+        terminal.backend_mut().begin_frame();
+        terminal
+    }
+
+    /// The frame just drawn. Valid until the next render through this renderer.
+    pub(crate) fn buffer(&self) -> &ratatui::buffer::Buffer {
+        self.terminal
+            .as_ref()
+            .expect("buffer() is only meaningful after a render")
+            .backend()
+            .buffer()
+    }
+
+    /// Renders the AppState into this renderer's buffer.
+    ///
+    /// This produces the same output as the monolithic binary's terminal draw,
+    /// but writes to a `Buffer` instead of stdout. Cursor visibility is captured
+    /// from explicit frame cursor intent rather than incidental backend state.
+    pub(crate) fn render_app(
+        &mut self,
+        app_state: &mut AppState,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        area: Rect,
+        resize_panes: bool,
+        cell_size: crate::kitty_graphics::HostCellSize,
+    ) -> Option<CursorState> {
+        let popup_visible = app_state.popup_pane.is_some();
+        let pre_compute_suppresses_focused_terminal_cursor =
+            !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
+        if resize_panes {
+            crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
+        } else {
+            crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
+        }
+        let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
+            || (!popup_visible
+                && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+
+        let terminal = self.terminal_for(area);
+        terminal
+            .draw(|frame| {
+                crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            })
+            .expect("render to TestBackend should never fail");
+        let rendered_cursor = terminal.backend().rendered_cursor();
+
+        if popup_visible {
+            popup_terminal_cursor(app_state, terminal_runtimes)
+        } else if suppress_focused_terminal_cursor {
+            None
+        } else {
+            focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
+                (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
+                    .then_some(rendered_cursor)
+                    .flatten()
+            })
+        }
+    }
+
+    /// Renders one server-owned terminal into this renderer's buffer, for
+    /// `terminal attach` clients.
+    pub(crate) fn render_terminal(
+        &mut self,
+        runtime: &crate::terminal::TerminalRuntime,
+        area: Rect,
+    ) -> Option<CursorState> {
+        let suppress_cursor = runtime.synchronized_output_active();
+        let terminal = self.terminal_for(area);
+        terminal
+            .draw(|frame| {
+                runtime.render(frame, area, true);
+            })
+            .expect("render to TestBackend should never fail");
+        let rendered_cursor = terminal.backend().rendered_cursor();
+
+        (!suppress_cursor)
+            .then(|| runtime.cursor_state(area, true))
+            .flatten()
+            .map(|cursor| CursorState {
+                x: cursor.x,
+                y: cursor.y,
+                visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+                shape: cursor.shape,
+            })
+            .or_else(|| (!suppress_cursor).then_some(rendered_cursor).flatten())
+    }
+}
+
+/// Renders the AppState to a fresh in-memory ratatui Buffer.
+///
+/// The previous behaviour, kept as the reference the reuse tests compare
+/// against. Nothing in the server renders through it: a render target holds a
+/// [`VirtualRenderer`] and pays for its buffers once rather than once a frame.
+#[cfg(test)]
 pub(crate) fn render_virtual(
     app_state: &mut AppState,
     area: Rect,
@@ -301,6 +452,7 @@ pub(crate) fn render_virtual(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn render_virtual_with_runtime_registry(
     app_state: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -308,41 +460,9 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some();
-    let pre_compute_suppresses_focused_terminal_cursor =
-        !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
-    if resize_panes {
-        crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
-    } else {
-        crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
-    }
-    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
-        || (!popup_visible
-            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
-
-    let backend = CursorTrackingBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
-
-    terminal
-        .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
-        })
-        .expect("render to TestBackend should never fail");
-
-    let buffer = terminal.backend().buffer().clone();
-    let cursor = if popup_visible {
-        popup_terminal_cursor(app_state, terminal_runtimes)
-    } else if suppress_focused_terminal_cursor {
-        None
-    } else {
-        focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
-            (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
-                .then(|| terminal.backend().rendered_cursor())
-                .flatten()
-        })
-    };
-
-    (buffer, cursor)
+    let mut renderer = VirtualRenderer::default();
+    let cursor = renderer.render_app(app_state, terminal_runtimes, area, resize_panes, cell_size);
+    (renderer.buffer().clone(), cursor)
 }
 
 fn popup_terminal_cursor(
@@ -364,38 +484,17 @@ fn popup_terminal_cursor(
     })
 }
 
-/// Renders one server-owned terminal directly for `terminal attach` clients.
+/// Renders one server-owned terminal directly for `terminal attach` clients,
+/// into a fresh buffer. The reference the reuse tests compare against; the
+/// server itself holds a [`VirtualRenderer`] per client instead.
+#[cfg(test)]
 pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let suppress_cursor = runtime.synchronized_output_active();
-    let backend = CursorTrackingBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
-
-    terminal
-        .draw(|frame| {
-            runtime.render(frame, area, true);
-        })
-        .expect("render to TestBackend should never fail");
-
-    let buffer = terminal.backend().buffer().clone();
-    let cursor = (!suppress_cursor)
-        .then(|| runtime.cursor_state(area, true))
-        .flatten()
-        .map(|cursor| CursorState {
-            x: cursor.x,
-            y: cursor.y,
-            visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
-            shape: cursor.shape,
-        })
-        .or_else(|| {
-            (!suppress_cursor)
-                .then(|| terminal.backend().rendered_cursor())
-                .flatten()
-        });
-
-    (buffer, cursor)
+    let mut renderer = VirtualRenderer::default();
+    let cursor = renderer.render_terminal(runtime, area);
+    (renderer.buffer().clone(), cursor)
 }
 
 pub(crate) fn visible_hyperlinks(
@@ -466,4 +565,354 @@ fn focused_terminal_suppresses_host_cursor(
     app_state
         .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+    use crate::app::state::AppState;
+    use crate::kitty_graphics::HostCellSize;
+    use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
+    use crate::workspace::Workspace;
+
+    /// A state with enough on screen that a frame is not mostly blank: several
+    /// Spaces in the sidebar and a live pane whose bytes the script changes.
+    fn scripted_app() -> (AppState, TerminalRuntimeRegistry, crate::layout::PaneId) {
+        let mut state = AppState::test_new();
+        let runtimes = TerminalRuntimeRegistry::new();
+
+        let mut workspaces = Vec::new();
+        let mut focused_pane = None;
+        for name in ["alpha", "bravo", "charlie"] {
+            let mut workspace = Workspace::test_new(name);
+            let pane_id = workspace.focused_pane_id().expect("focused pane");
+            workspace.insert_test_runtime(
+                pane_id,
+                TerminalRuntime::test_with_screen_bytes(
+                    80,
+                    24,
+                    format!("{name} pane\r\nsecond line\r\n").as_bytes(),
+                ),
+            );
+            if focused_pane.is_none() {
+                focused_pane = Some(pane_id);
+            }
+            workspaces.push(workspace);
+        }
+
+        state.workspaces = workspaces;
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+        (state, runtimes, focused_pane.expect("a pane"))
+    }
+
+    /// Moves the frame on: pane output plus a focus change, so consecutive
+    /// frames differ in both the terminal body and the sidebar.
+    fn advance(state: &mut AppState, pane: crate::layout::PaneId, frame: usize) {
+        state.selected = frame % state.workspaces.len();
+        state.active = Some(state.selected);
+        let workspace = &state.workspaces[frame % state.workspaces.len()];
+        if let Some(runtime) = workspace.test_runtimes.get(&pane) {
+            runtime.test_process_pty_bytes(format!("frame {frame}\r\n").as_bytes());
+        }
+    }
+
+    /// Renders `area` through `reused`, then again through the previous
+    /// behaviour — a terminal built for this frame and thrown away — and
+    /// asserts the two agree on every cell and on the cursor.
+    #[track_caller]
+    fn assert_matches_fresh(
+        reused: &mut VirtualRenderer,
+        state: &mut AppState,
+        runtimes: &TerminalRuntimeRegistry,
+        area: Rect,
+        label: &str,
+    ) -> ratatui::buffer::Buffer {
+        let reused_cursor = reused.render_app(state, runtimes, area, true, HostCellSize::default());
+        let reused_buffer = reused.buffer().clone();
+        let (fresh_buffer, fresh_cursor) = render_virtual_with_runtime_registry(
+            state,
+            runtimes,
+            area,
+            true,
+            HostCellSize::default(),
+        );
+        assert_eq!(
+            reused_buffer.area, fresh_buffer.area,
+            "{label}: buffer area"
+        );
+        let first_difference = reused_buffer
+            .content
+            .iter()
+            .zip(fresh_buffer.content.iter())
+            .position(|(reused, fresh)| reused != fresh);
+        if let Some(index) = first_difference {
+            let (x, y) = reused_buffer.pos_of(index);
+            panic!(
+                "{label}: cell ({x}, {y}) differs: reused {:?} vs fresh {:?}",
+                reused_buffer.content[index], fresh_buffer.content[index]
+            );
+        }
+        assert_eq!(reused_cursor, fresh_cursor, "{label}: cursor");
+        reused_buffer
+    }
+
+    /// The reused terminal carries a real previous buffer instead of an empty
+    /// one, so its diff is a different diff. What lands in the backend buffer
+    /// must not be.
+    #[tokio::test]
+    async fn reused_terminal_draws_the_same_frames_as_a_fresh_one() {
+        let (mut state, runtimes, pane) = scripted_app();
+        let mut reused = VirtualRenderer::default();
+        let area = Rect::new(0, 0, 120, 40);
+
+        let mut seen = Vec::new();
+        for frame in 0..8 {
+            advance(&mut state, pane, frame);
+            seen.push(assert_matches_fresh(
+                &mut reused,
+                &mut state,
+                &runtimes,
+                area,
+                &format!("frame {frame}"),
+            ));
+        }
+
+        // Without this the assertions above would pass on eight identical
+        // frames, which proves nothing about the diff.
+        assert!(
+            seen.windows(2).any(|pair| pair[0] != pair[1]),
+            "the script never changed the frame"
+        );
+    }
+
+    /// The cached buffer sized for the old viewport is the obvious failure
+    /// mode. Grow, shrink, and come back.
+    #[tokio::test]
+    async fn reused_terminal_survives_growing_and_shrinking() {
+        let (mut state, runtimes, pane) = scripted_app();
+        let mut reused = VirtualRenderer::default();
+
+        for (frame, (width, height)) in [
+            (100u16, 30u16),
+            (160, 50),
+            (60, 18),
+            (160, 50),
+            (61, 19),
+            (100, 30),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            advance(&mut state, pane, frame);
+            let area = Rect::new(0, 0, width, height);
+            let buffer = assert_matches_fresh(
+                &mut reused,
+                &mut state,
+                &runtimes,
+                area,
+                &format!("{width}x{height}"),
+            );
+            assert_eq!(buffer.area, Rect::new(0, 0, width, height));
+        }
+    }
+
+    /// A client that detaches leaves its renderer holding a frame that is about
+    /// to go stale, and the state moves on without it. Its first frame back has
+    /// to be the whole current screen, not a diff against what it last saw.
+    #[tokio::test]
+    async fn reused_terminal_is_correct_across_a_detach_and_reattach() {
+        let (mut state, runtimes, pane) = scripted_app();
+        let mut reused = VirtualRenderer::default();
+        let area = Rect::new(0, 0, 110, 34);
+
+        for frame in 0..3 {
+            advance(&mut state, pane, frame);
+            assert_matches_fresh(&mut reused, &mut state, &runtimes, area, "attached");
+        }
+
+        // Detached: the server keeps rendering, this renderer does not.
+        let mut idle = VirtualRenderer::default();
+        for frame in 3..9 {
+            advance(&mut state, pane, frame);
+            let _ = idle.render_app(
+                &mut state,
+                &runtimes,
+                Rect::new(0, 0, 80, 24),
+                true,
+                HostCellSize::default(),
+            );
+        }
+
+        // Reattached, at a size it was never shown before and then at its old
+        // one, because a client that comes back in a resized window is the
+        // normal case.
+        assert_matches_fresh(
+            &mut reused,
+            &mut state,
+            &runtimes,
+            Rect::new(0, 0, 90, 28),
+            "reattached resized",
+        );
+        assert_matches_fresh(&mut reused, &mut state, &runtimes, area, "reattached");
+    }
+
+    /// The terminal is per client, not shared, and two clients at different
+    /// sizes drawing the same state must not corrupt each other's screen.
+    #[tokio::test]
+    async fn two_renderers_at_different_sizes_stay_independent() {
+        let (mut state, runtimes, pane) = scripted_app();
+        let mut wide = VirtualRenderer::default();
+        let mut narrow = VirtualRenderer::default();
+        let wide_area = Rect::new(0, 0, 160, 44);
+        let narrow_area = Rect::new(0, 0, 64, 20);
+
+        for frame in 0..6 {
+            advance(&mut state, pane, frame);
+            let wide_buffer =
+                assert_matches_fresh(&mut wide, &mut state, &runtimes, wide_area, "wide");
+            let narrow_buffer =
+                assert_matches_fresh(&mut narrow, &mut state, &runtimes, narrow_area, "narrow");
+            assert_eq!(wide_buffer.area, wide_area);
+            assert_eq!(narrow_buffer.area, narrow_area);
+        }
+    }
+
+    /// The `terminal attach` path reuses a terminal too, and it is the one
+    /// where the whole screen is a single pane rather than app chrome.
+    #[tokio::test]
+    async fn reused_terminal_draws_the_same_attached_terminal() {
+        let runtime = TerminalRuntime::test_with_screen_bytes(80, 24, b"attached\r\n");
+        let mut reused = VirtualRenderer::default();
+
+        for (frame, (width, height)) in [(80u16, 24u16), (120, 40), (50, 16), (80, 24)]
+            .into_iter()
+            .enumerate()
+        {
+            runtime.test_process_pty_bytes(format!("line {frame}\r\n").as_bytes());
+            let area = Rect::new(0, 0, width, height);
+            let reused_cursor = reused.render_terminal(&runtime, area);
+            let reused_buffer = reused.buffer().clone();
+            let (fresh_buffer, fresh_cursor) = render_terminal_virtual(&runtime, area);
+            assert_eq!(
+                reused_buffer, fresh_buffer,
+                "frame {frame} at {width}x{height}"
+            );
+            assert_eq!(reused_cursor, fresh_cursor, "frame {frame} cursor");
+        }
+    }
+
+    /// What reusing the terminal actually bought, measured rather than
+    /// reasoned about.
+    ///
+    /// Ignored by default because it prints tables and times things; run it
+    /// with `cargo test --release --bin herdr render_terminal_reuse_cost --
+    /// --ignored --nocapture`. Release matters: a debug build spends so much
+    /// longer inside `compute_view` that the allocation it removes disappears
+    /// into the noise.
+    ///
+    /// Both columns run the identical `compute_view` and the identical widget
+    /// pass — the only difference is whether the ratatui `Terminal` and its
+    /// backend are built for this frame or kept from the last one — so the
+    /// delta between them is the terminal, and nothing else.
+    ///
+    /// Two scripts, because a server frame is not one thing. `moving` changes
+    /// the pane's output and the focused Space every frame, which is a fleet
+    /// under load. `settled` redraws the same screen, which is what the
+    /// 58 fps animation loop does most of the time and is where a per-frame
+    /// allocation is pure waste.
+    #[tokio::test]
+    #[ignore = "measurement, not an assertion: run with --ignored --nocapture"]
+    async fn render_terminal_reuse_cost() {
+        const RUNS: usize = 200;
+
+        fn quantiles(mut samples: Vec<f64>) -> (f64, f64, f64, f64) {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            (at(0.5), at(0.9), at(0.99), samples[samples.len() - 1])
+        }
+
+        println!("\n{RUNS} frames per cell, release, one client\n");
+        for (script, moving) in [("moving", true), ("settled", false)] {
+            println!(
+                "{script:>7} | cells  |            fresh terminal per frame |                    reused terminal | saved"
+            );
+            println!(
+                "  size  |        |  med ms  p90 ms  p99 ms   max ms |  med ms  p90 ms  p99 ms   max ms | med ms"
+            );
+            println!(
+                "--------+--------+-----------------------------------+-----------------------------------+-------"
+            );
+            for (width, height) in [(100u16, 30u16), (200, 60), (390, 120)] {
+                let area = Rect::new(0, 0, width, height);
+
+                let (mut state, runtimes, pane) = scripted_app();
+                let mut fresh = Vec::with_capacity(RUNS);
+                for frame in 0..RUNS {
+                    if moving {
+                        advance(&mut state, pane, frame);
+                    }
+                    let started = std::time::Instant::now();
+                    let _ = render_virtual_with_runtime_registry(
+                        &mut state,
+                        &runtimes,
+                        area,
+                        true,
+                        HostCellSize::default(),
+                    );
+                    fresh.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                let (mut state, runtimes, pane) = scripted_app();
+                let mut renderer = VirtualRenderer::default();
+                let mut reused = Vec::with_capacity(RUNS);
+                for frame in 0..RUNS {
+                    if moving {
+                        advance(&mut state, pane, frame);
+                    }
+                    let started = std::time::Instant::now();
+                    renderer.render_app(&mut state, &runtimes, area, true, HostCellSize::default());
+                    // The caller reads the buffer; the fresh path clones it, so
+                    // the reused path has to be charged for a read of it too.
+                    std::hint::black_box(renderer.buffer().area);
+                    reused.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+
+                let (fm, fp90, fp99, fmax) = quantiles(fresh);
+                let (rm, rp90, rp99, rmax) = quantiles(reused);
+                println!(
+                    "{:>3}x{:<3} | {:>6} | {fm:>7.2} {fp90:>7.2} {fp99:>7.2} {fmax:>8.2} | \
+                     {rm:>7.2} {rp90:>7.2} {rp99:>7.2} {rmax:>8.2} | {:>6.2}",
+                    width,
+                    height,
+                    u32::from(width) * u32::from(height),
+                    fm - rm,
+                );
+            }
+            println!();
+        }
+    }
+
+    /// The point of the change: the terminal is built once and kept.
+    #[tokio::test]
+    async fn reused_terminal_is_built_once() {
+        let (mut state, runtimes, pane) = scripted_app();
+        let mut reused = VirtualRenderer::default();
+        assert!(reused.terminal.is_none(), "nothing is built until a render");
+
+        let area = Rect::new(0, 0, 100, 30);
+        reused.render_app(&mut state, &runtimes, area, true, HostCellSize::default());
+        let first = reused.buffer().content.as_ptr();
+
+        for frame in 0..5 {
+            advance(&mut state, pane, frame);
+            reused.render_app(&mut state, &runtimes, area, true, HostCellSize::default());
+            assert_eq!(
+                reused.buffer().content.as_ptr(),
+                first,
+                "the backend buffer was reallocated on frame {frame}"
+            );
+        }
+    }
 }
