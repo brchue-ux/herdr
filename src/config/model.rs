@@ -956,12 +956,55 @@ impl ImeCursorShape {
     }
 }
 
+/// Floor under every animation behaviour's frame interval on a server without a
+/// local terminal, in milliseconds.
+///
+/// 16 ms is one frame at 60 Hz, and 60 fps is a floor rather than a target: it
+/// is below every tier the behaviour catalogue declares (100 ms cheap, 50 ms
+/// smooth, 25 ms charge), so out of the box a behaviour on a headless server
+/// runs at exactly the cadence it asked for rather than at a coarser one.
+const DEFAULT_HEADLESS_ANIMATION_INTERVAL_MS: u64 = 16;
+/// A floor of zero would mean "no floor", which is what a 1 ms floor already is
+/// in practice — no behaviour asks for a step that fine — so the bound is 1 and
+/// there is no separate off value to reason about.
+const MIN_HEADLESS_ANIMATION_INTERVAL_MS: u64 = 1;
+/// A second between frames is already well past the point where an animation
+/// reads as motion; beyond it a config could only be asking for the engine to
+/// look broken.
+const MAX_HEADLESS_ANIMATION_INTERVAL_MS: u64 = 1000;
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+    /// Shortest interval, in milliseconds, that a server without a local
+    /// terminal will schedule an animation frame at. Default: 16.
+    ///
+    /// This is a floor applied to each behaviour's own frame interval, so it
+    /// can only ever make an animation *coarser* than the behaviour asked for,
+    /// never finer. A headless server repaints for clients over a socket, so
+    /// raising this buys back wakes and socket traffic at the cost of
+    /// smoothness; the default sits below every declared tier and so leaves
+    /// each behaviour running at its own cadence.
+    ///
+    /// Clamped to 1–1000 ms.
+    pub headless_animation_interval_ms: u64,
+}
+
+impl AdvancedConfig {
+    /// The resolved floor, clamped, as the engine wants it.
+    ///
+    /// Clamping rather than rejecting keeps an out-of-range number from
+    /// invalidating the whole `[advanced]` section, which would take
+    /// `scrollback_limit_bytes` down with it.
+    pub fn headless_animation_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.headless_animation_interval_ms.clamp(
+            MIN_HEADLESS_ANIMATION_INTERVAL_MS,
+            MAX_HEADLESS_ANIMATION_INTERVAL_MS,
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1232,6 +1275,7 @@ impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
             scrollback_limit_bytes: DEFAULT_SCROLLBACK_LIMIT_BYTES,
+            headless_animation_interval_ms: DEFAULT_HEADLESS_ANIMATION_INTERVAL_MS,
         }
     }
 }

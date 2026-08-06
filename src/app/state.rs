@@ -1727,6 +1727,14 @@ pub struct AppState {
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub sidebar_animation: crate::config::SidebarAnimationConfig,
+    /// Floor under every behaviour's frame interval when this app is being
+    /// driven by a server with no local terminal, from
+    /// `[advanced] headless_animation_interval_ms`.
+    ///
+    /// Held resolved rather than read from config at each pass so a reload is
+    /// the only thing that can change it, and so the value the engine is
+    /// actually running on is inspectable from state in a test.
+    pub headless_animation_interval: std::time::Duration,
     pub sidebar_notifications: crate::config::SidebarNotificationsConfig,
     /// The notification tray at the foot of the panel.
     pub sidebar_signal_tray: crate::config::SidebarSignalTrayConfig,
@@ -2625,6 +2633,9 @@ impl AppState {
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             sidebar_animation: crate::config::SidebarAnimationConfig::default(),
+            headless_animation_interval: crate::config::Config::default()
+                .advanced
+                .headless_animation_interval(),
             sidebar_notifications: crate::config::SidebarNotificationsConfig::default(),
             sidebar_signal_tray: crate::config::SidebarSignalTrayConfig::default(),
             next_agent_state_change_seq: 0,

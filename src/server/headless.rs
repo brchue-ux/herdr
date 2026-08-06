@@ -6777,7 +6777,7 @@ next_tab = ""
     }
 
     #[test]
-    fn headless_sidebar_pulse_ticks_in_coarse_steps_and_only_when_configured() {
+    fn headless_sidebar_pulse_ticks_on_its_own_tier_and_only_when_configured() {
         let mut server = test_headless_server();
         // The engine animates rows, so there has to be a row.
         server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
@@ -6823,31 +6823,24 @@ next_tab = ""
             .anim
             .next_deadline(now)
             .expect("pulse arms the clock");
+        let tier = app::ANIMATION_INTERVAL;
         assert_eq!(
             armed,
-            now + app::HEADLESS_ANIMATION_INTERVAL,
-            "the server must not wake on the local TUI's finer cadence"
+            now + tier,
+            "the default floor is below every tier, so the pulse's own period is \
+             what the server wakes on"
         );
 
         assert!(server.handle_scheduled_tasks_headless(armed, false));
         assert_eq!(
             server.app.state.anim.next_deadline(armed),
-            Some(armed + app::HEADLESS_ANIMATION_INTERVAL)
+            Some(armed + tier)
         );
 
         // A detaching client disarms the clock again.
         server.clients.clear();
-        assert!(
-            server.handle_scheduled_tasks_headless(armed + app::HEADLESS_ANIMATION_INTERVAL, false)
-        );
-        assert_eq!(
-            server
-                .app
-                .state
-                .anim
-                .next_deadline(armed + app::HEADLESS_ANIMATION_INTERVAL),
-            None
-        );
+        assert!(server.handle_scheduled_tasks_headless(armed + tier, false));
+        assert_eq!(server.app.state.anim.next_deadline(armed + tier), None);
         assert!(server.app.state.anim.is_empty());
     }
 

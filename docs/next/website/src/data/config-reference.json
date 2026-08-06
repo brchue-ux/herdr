@@ -1295,6 +1295,12 @@
           "type": "integer",
           "default": "10000000",
           "description": "Maximum scrollback buffer size in bytes retained per pane terminal. The legacy key name `scrollback_lines` is accepted as an alias."
+        },
+        {
+          "key": "advanced.headless_animation_interval_ms",
+          "type": "integer",
+          "default": "16",
+          "description": "Shortest interval, in milliseconds, that a server without a local terminal will schedule an animation frame at. Applied as a floor to each behaviour's own frame interval, so it can only make an animation coarser than the behaviour asked for, never finer. The default of 16 ms is one frame at 60 Hz and sits below every behaviour tier, so animations run at their own cadence; raising it buys back server wakes and socket traffic at the cost of smoothness. Clamped to 1-1000."
         }
       ]
     },

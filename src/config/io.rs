@@ -1038,6 +1038,101 @@ agent_panel_sort = "priority"
     }
 
     #[test]
+    fn a_config_without_the_headless_animation_key_keeps_the_sixty_hz_default() {
+        // The observable contract of an absent key: the section is valid, the
+        // file raises nothing, every other advanced setting is untouched, and
+        // the floor lands on one frame at 60 Hz.
+        let loaded = load_live_config_from_str(
+            r#"
+[advanced]
+scrollback_limit_bytes = 4096
+"#,
+            "config.toml",
+        )
+        .unwrap();
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(loaded.config.advanced.scrollback_limit_bytes, 4096);
+        assert_eq!(
+            loaded.config.advanced.headless_animation_interval(),
+            std::time::Duration::from_millis(16)
+        );
+        assert_eq!(
+            loaded.config.advanced.headless_animation_interval(),
+            Config::default().advanced.headless_animation_interval(),
+            "an absent key must resolve to exactly the default"
+        );
+    }
+
+    #[test]
+    fn a_configured_headless_animation_interval_is_honoured_and_clamped() {
+        let loaded = load_live_config_from_str(
+            r#"
+[advanced]
+headless_animation_interval_ms = 33
+"#,
+            "config.toml",
+        )
+        .unwrap();
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(
+            loaded.config.advanced.headless_animation_interval(),
+            std::time::Duration::from_millis(33)
+        );
+
+        // Out of range clamps rather than invalidating, so an implausible
+        // number cannot take `scrollback_limit_bytes` down with it.
+        let loaded = load_live_config_from_str(
+            r#"
+[advanced]
+scrollback_limit_bytes = 4096
+headless_animation_interval_ms = 999999
+"#,
+            "config.toml",
+        )
+        .unwrap();
+
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(loaded.config.advanced.scrollback_limit_bytes, 4096);
+        assert_eq!(
+            loaded.config.advanced.headless_animation_interval(),
+            std::time::Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn a_misspelled_headless_animation_key_is_ignored_rather_than_voiding_the_file() {
+        // An unknown key inside `[advanced]` must cost the file nothing beyond
+        // a diagnostic: the section stays valid, its other settings apply, and
+        // the floor falls back to the default.
+        let loaded = load_live_config_from_str(
+            r#"
+[advanced]
+scrollback_limit_bytes = 4096
+headless_animation_interval = 33
+"#,
+            "config.toml",
+        )
+        .unwrap();
+
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(
+            loaded.diagnostics[0].contains("unknown config key"),
+            "{:?}",
+            loaded.diagnostics
+        );
+        assert_eq!(loaded.config.advanced.scrollback_limit_bytes, 4096);
+        assert_eq!(
+            loaded.config.advanced.headless_animation_interval(),
+            std::time::Duration::from_millis(16)
+        );
+    }
+
+    #[test]
     fn load_live_config_discards_ignored_keys_from_an_invalid_section() {
         let loaded = load_live_config_from_str(
             r#"

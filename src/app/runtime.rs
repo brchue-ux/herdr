@@ -763,17 +763,34 @@ impl App {
             .flatten();
     }
 
-    /// The same advance, on the coarser cadence a server without a local
-    /// terminal runs at.
+    /// The same advance, under the frame floor a server without a local
+    /// terminal is configured to run at.
     ///
     /// A headless server is drawing for a remote client over a socket, so the
-    /// floor trades smoothness for wakes; the behaviours keep their own periods,
-    /// which is what stops the animation running at a different *speed* there
-    /// rather than merely at a coarser step.
+    /// floor is there to trade smoothness for wakes; the behaviours keep their
+    /// own periods, which is what stops the animation running at a different
+    /// *speed* there rather than merely at a coarser step. The floor comes from
+    /// `[advanced] headless_animation_interval_ms` and defaults below every
+    /// declared tier, so out of the box it takes nothing away.
+    ///
+    /// # What the floor actually reaches
+    ///
+    /// Only [`crate::anim::Engine::next_deadline`], which is one candidate
+    /// among many in `next_headless_loop_deadline_with_git_refresh`.
+    /// [`crate::anim::Engine::advance`] is never floored, so while any element
+    /// is animating `handle_scheduled_tasks_headless` reports a change on every
+    /// loop pass, `needs_render` stays true, and `last_render_at +
+    /// MIN_RENDER_INTERVAL` is always the smaller deadline. The animation
+    /// deadline is therefore never the minimum and the floor is never reached.
+    ///
+    /// Measured, not reasoned: `tests/frame_floor_lab.rs` runs a real server
+    /// and a real client at floors of 16, 200 and 1000 ms and gets 58 fps from
+    /// all three, against 0 fps with nothing animating. The hard-coded 200 ms
+    /// this setting replaced was inert on a live server for the same reason.
+    /// The floor becomes load-bearing only once the loop stops free-running.
     pub(crate) fn advance_headless_animations(&mut self, now: Instant, has_viewers: bool) -> bool {
-        self.state
-            .anim
-            .set_frame_floor(crate::app::HEADLESS_ANIMATION_INTERVAL);
+        let floor = self.state.headless_animation_interval;
+        self.state.anim.set_frame_floor(floor);
         self.advance_animations(now, has_viewers)
     }
 
@@ -1474,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn the_headless_clock_uses_the_low_power_interval() {
+    fn the_headless_clock_runs_at_the_behaviours_own_tier_by_default() {
         let (mut app, _) = test_app_with_pane();
         app.state.sidebar_spaces.rows = pulse_space_rows();
         let now = Instant::now();
@@ -1483,11 +1500,44 @@ mod tests {
 
         assert_eq!(
             app.state.anim.next_deadline(now),
-            Some(now + crate::app::HEADLESS_ANIMATION_INTERVAL)
+            Some(now + ANIMATION_INTERVAL),
+            "the default floor is finer than every declared tier, so a pulse on \
+             a headless server is clocked by the pulse rather than by the floor"
         );
         assert!(
-            crate::app::HEADLESS_ANIMATION_INTERVAL > ANIMATION_INTERVAL,
-            "the headless floor exists to buy back wakes, so it must be coarser"
+            app.state.headless_animation_interval <= Duration::from_millis(16),
+            "60 fps is the floor the default has to clear, not a target to approach"
+        );
+    }
+
+    #[test]
+    fn the_headless_clock_honours_a_configured_floor() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        // Coarser than the pulse's own 100 ms tier, so the floor is what the
+        // deadline can only be coming from.
+        let floor = ANIMATION_INTERVAL * 3;
+        app.state.headless_animation_interval = floor;
+        let now = Instant::now();
+
+        app.advance_headless_animations(now, true);
+
+        assert_eq!(app.state.anim.next_deadline(now), Some(now + floor));
+    }
+
+    #[test]
+    fn a_configured_floor_can_only_coarsen_a_behaviour_never_sharpen_it() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.sidebar_spaces.rows = pulse_space_rows();
+        // Finer than the pulse asked for. The floor must not promote it.
+        app.state.headless_animation_interval = Duration::from_millis(1);
+        let now = Instant::now();
+
+        app.advance_headless_animations(now, true);
+
+        assert_eq!(
+            app.state.anim.next_deadline(now),
+            Some(now + ANIMATION_INTERVAL)
         );
     }
 
