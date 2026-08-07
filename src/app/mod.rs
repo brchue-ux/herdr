@@ -15,7 +15,7 @@ pub(crate) mod card_wash;
 pub(crate) mod cmd_ack;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
-mod creation;
+pub(crate) mod creation;
 pub(crate) mod fleet_signals;
 mod git_refresh;
 mod ids;
@@ -643,6 +643,7 @@ impl App {
             detach_exits: no_session,
             detach_requested: false,
             request_new_workspace: false,
+            request_new_scratch_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,
@@ -1203,6 +1204,12 @@ impl App {
                         caller_pane_id: None,
                     },
                 );
+                needs_render = true;
+            }
+
+            if self.state.request_new_scratch_workspace {
+                self.state.request_new_scratch_workspace = false;
+                self.begin_tui_scratch_workspace_create("tui.workspace.create_scratch");
                 needs_render = true;
             }
 

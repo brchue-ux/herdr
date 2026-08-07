@@ -190,6 +190,9 @@ impl App {
             NavigateAction::NewWorkspace => {
                 self.begin_tui_workspace_create("tui.key.workspace.create");
             }
+            NavigateAction::NewScratchWorkspace => {
+                self.begin_tui_scratch_workspace_create("tui.key.workspace.create_scratch");
+            }
             NavigateAction::NewWorktree => {
                 if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
                     workspace_can_start_worktree_action(&self.state, &self.terminal_runtimes, *idx)
@@ -1347,6 +1350,7 @@ pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NavigateAction {
     NewWorkspace,
+    NewScratchWorkspace,
     NewWorktree,
     OpenWorktree,
     RemoveWorktree,
@@ -1493,6 +1497,10 @@ fn non_indexed_action_for_key(
         (&kb.settings, NavigateAction::Settings),
         (&kb.workspace_picker, NavigateAction::WorkspacePicker),
         (&kb.new_workspace, NavigateAction::NewWorkspace),
+        (
+            &kb.new_scratch_workspace,
+            NavigateAction::NewScratchWorkspace,
+        ),
         (&kb.new_worktree, NavigateAction::NewWorktree),
         (&kb.open_worktree, NavigateAction::OpenWorktree),
         (&kb.remove_worktree, NavigateAction::RemoveWorktree),
@@ -1604,6 +1612,10 @@ pub(super) fn execute_navigate_action_in_context(
     match action {
         NavigateAction::NewWorkspace => {
             state.request_new_workspace = true;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::NewScratchWorkspace => {
+            state.request_new_scratch_workspace = true;
             leave_navigate_mode(state);
         }
         NavigateAction::NewWorktree => {
@@ -2214,6 +2226,36 @@ mod tests {
         assert_eq!(app.state.workspaces.len(), 1);
         assert!(app.state.pending_workspace_create_cwd.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn new_scratch_workspace_ignores_active_pane_cwd() {
+        let followed_cwd = unique_temp_path("scratch-follow-source");
+        std::fs::create_dir_all(&followed_cwd).unwrap();
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.new_terminal_cwd =
+            crate::config::NewTerminalCwdConfig::Path(followed_cwd.display().to_string());
+        app.state.mode = Mode::Navigate;
+
+        app.execute_tui_navigate_action(
+            NavigateAction::NewScratchWorkspace,
+            ActionContext::Navigate,
+        );
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        let scratch = &app.state.workspaces[1];
+        assert_eq!(scratch.custom_name.as_deref(), Some("Scratch"));
+        assert_ne!(scratch.identity_cwd, followed_cwd);
+        assert_eq!(
+            scratch.identity_cwd,
+            crate::app::creation::resolve_new_terminal_cwd(
+                &crate::config::NewTerminalCwdConfig::Home,
+                None
+            )
+        );
+        assert_eq!(app.state.mode, Mode::Terminal);
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(&followed_cwd);
     }
 
     #[test]

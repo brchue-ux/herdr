@@ -124,6 +124,29 @@ impl App {
         };
     }
 
+    /// Create a scratch workspace: a plain shell rooted at $HOME, independent
+    /// of whichever workspace is currently focused. Unlike `new_workspace`,
+    /// this never follows the active pane's cwd, so it can't inherit another
+    /// workspace's Git identity and get grouped under it in the sidebar.
+    pub(super) fn begin_tui_scratch_workspace_create(&mut self, request_id: &'static str) {
+        let cwd = resolve_new_terminal_cwd(&NewTerminalCwdConfig::Home, None);
+        self.runtime_workspace_create(
+            request_id,
+            crate::api::schema::WorkspaceCreateParams {
+                cwd: Some(cwd.display().to_string()),
+                focus: true,
+                label: Some("Scratch".to_string()),
+                env: Default::default(),
+                caller_pane_id: None,
+            },
+        );
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+    }
+
     /// Create a workspace with a real PTY (needs event_tx).
     #[cfg(test)]
     pub(crate) fn create_workspace(&mut self) {

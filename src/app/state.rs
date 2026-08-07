@@ -1657,6 +1657,7 @@ pub struct AppState {
     /// The server's event loop checks this and handles client detach.
     pub detach_requested: bool,
     pub request_new_workspace: bool,
+    pub request_new_scratch_workspace: bool,
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
     pub request_open_existing_worktree: Option<usize>,
@@ -2715,6 +2716,7 @@ impl AppState {
             detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
+            request_new_scratch_workspace: false,
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,

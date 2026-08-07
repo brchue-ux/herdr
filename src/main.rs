@@ -196,6 +196,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # workspace_picker = "prefix+w"
 # goto = "prefix+g"
 # new_workspace = "prefix+shift+n"
+# new_scratch_workspace = "prefix+shift+c" # plain shell at $HOME, never grouped under another workspace
 # new_worktree = "prefix+shift+g"
 # open_worktree = ""    # optional, unset by default
 # remove_worktree = ""  # optional, unset by default; opens confirmation
