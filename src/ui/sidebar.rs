@@ -3740,6 +3740,295 @@ fn trunk_rail_cell(trunk: Option<&TrunkRailPaint<'_>>, level: u8, base: Style) -
     (paint.glyph_over(SETTLED), paint.text_style(base, trunk.ink))
 }
 
+/// The failure spider: a persistent, red, pulsing marker that climbs a
+/// failing card's own trunk/branch to rest at its top-centre border, and
+/// stays there until the card clears.
+///
+/// Deliberately not a `glyph_over` substitution — nothing settled already
+/// stands at the cell it rests on that has to keep meaning what it means —
+/// but its own drawn cell, the same way [`render_agent_row`]'s worker-summary
+/// badge is. And deliberately at the *border*, not the card face: the face is
+/// the crowded surface the sidebar's own width rules protect, the border is
+/// not.
+///
+/// Character shell only, for now. A pixel card's sheet is opaque and drawn
+/// over these same cells (see [`image_card::shape_covers_row`]), so a
+/// character-cell marker under it would be invisible rather than merely
+/// covered — see the `AGENTS.md` bullet on the sidebar's two renderers.
+/// Rasterising the spider into `image_card::build_cards` so it survives the
+/// pixel path is a named follow-up, not a gap here.
+fn render_failure_spiders(
+    app: &AppState,
+    frame: &mut Frame,
+    cards: &[crate::app::state::WorkspaceCardArea],
+    entries: &[WorkspaceListEntry],
+    agents: &[AgentPanelEntry],
+    fold_width: u16,
+) {
+    if image_card::shape_covers_row(app, fold_width) {
+        return;
+    }
+    for card in cards {
+        if card.card_frame.is_none() {
+            continue;
+        }
+        let Some(entry) = entries.get(card.entry_idx) else {
+            continue;
+        };
+        let Some(row) = entry_card_row(app, agents, entry) else {
+            continue;
+        };
+        let id = crate::anim::ElementId::failure_spider(row);
+        let Some(elem_frame) = app.anim.frame(
+            &id,
+            Some(crate::anim::behaviour::names::FAILURE_SPIDER_PULSE),
+        ) else {
+            continue;
+        };
+        let t = match elem_frame.phase {
+            crate::anim::Phase::Idle => 1.0,
+            crate::anim::Phase::Mount | crate::anim::Phase::Dismount => elem_frame.progress,
+            crate::anim::Phase::Retired => continue,
+        };
+        let Some((x, y)) = failure_spider_position(card, t) else {
+            continue;
+        };
+        let buf = frame.buffer_mut();
+        if x < buf.area.left()
+            || x >= buf.area.right()
+            || y < buf.area.top()
+            || y >= buf.area.bottom()
+        {
+            continue;
+        }
+
+        // `Severity::Serious`, not `Critical`: severity's light-reach ramp
+        // pushes an ink *toward the light bound* as it escalates (worse
+        // trouble reads as a brighter, more forward light, the same
+        // direction a card's own alert breath moves), so `Critical` on a dark
+        // panel washed the spider to a pale rose rather than reading as red —
+        // caught on the live render this PR's description captures, not by a
+        // unit test. `Serious` stays close enough to the panel to read as a
+        // real red.
+        let ink = crate::anim::cell::InkPalette::resolve(
+            Style::default(),
+            backdrop_rgb(app),
+            &app.palette,
+            &app.host_terminal_theme,
+        )
+        .with_signal(
+            crate::anim::cell::LifecycleStage::Failed.hue(&app.palette, &app.host_terminal_theme),
+            crate::anim::cell::Severity::Serious,
+        );
+        let paint = elem_frame.cell(
+            crate::anim::cell::CellPos::new(0, 0),
+            crate::anim::cell::CellExtent::new(1, 1),
+            ink,
+        );
+        let style = paint
+            .text_style(Style::default(), ink)
+            .add_modifier(Modifier::BOLD);
+        // `Buffer::set_string`, never direct cell indexing: the glyph is
+        // double-width in every terminal that has been checked against this,
+        // and only `set_string`'s own `unicode-width` accounting resets the
+        // cell it would otherwise leave stale — see the `AGENTS.md` bullet on
+        // a decoration's glyph never being free to move a column, which a
+        // raw `set_symbol` on one cell silently violates for anything wider
+        // than the settled glyph it stands on.
+        buf.set_string(x, y, FAILURE_SPIDER_GLYPH, style);
+    }
+}
+
+/// The spider's own glyph. A pictograph rather than a box-drawing run: the
+/// captain's spec is explicit that this reads as a spider, not as a retro
+/// blocky mark, and a character cell's only way to say that is the glyph it
+/// draws — there is no multi-cell shape to compose one from without leaving
+/// the character shell entirely (see [`render_failure_spiders`]'s doc
+/// comment).
+///
+/// The trailing `U+FE0F` (emoji presentation selector) is load-bearing, not
+/// decoration on the literal: without it a live render left a trail of stale
+/// spider glyphs behind every position the climb passed through, one per
+/// animation frame, because `ratatui::buffer::Buffer::diff` only emits an
+/// explicit clear for a wide grapheme's trailing cell when the grapheme
+/// contains `U+FE0F` — its own documented workaround for terminals that do
+/// not reliably clear a wide emoji's trailing cell otherwise. A bare spider
+/// codepoint is ambiguous width without it, so the clear was silently
+/// skipped and the border kept every frame's leftover column live at once.
+/// Caught live at `sidebar_width = 42`, not by a unit test — see this crate's
+/// PR description for the capture.
+const FAILURE_SPIDER_GLYPH: &str = "🕷\u{fe0f}";
+
+/// The waypoints the spider's climb walks, in order: up this row's own trunk
+/// column to its branch, along the branch to the card's own left border, up
+/// that border to the top, then across the top border to centre.
+///
+/// Every leg is a single cell-grid axis move, never a diagonal, because that
+/// is how the tree's own lines are drawn — see the `AGENTS.md` entry on the
+/// character tree being the layout authority. `rect.x` is the trunk column
+/// deliberately rather than a resolved ancestor level's own column: bullet 62
+/// of that file records that a card's left border already stands in its own
+/// connector's column, which is the one column guaranteed to exist for every
+/// card regardless of how deep it is nested, so the climb needs no ancestor
+/// topology to be well-defined.
+fn failure_spider_waypoints(
+    card: &crate::app::state::WorkspaceCardArea,
+) -> Option<[(u16, u16); 5]> {
+    let frame = card.card_frame?;
+    if frame.width == 0 {
+        return None;
+    }
+    let trunk_x = card.rect.x;
+    let connector_y = card.content_y();
+    let border_x = frame.x;
+    let border_y = frame.y;
+    let centre_x = frame.x + frame.width.saturating_sub(1) / 2;
+    let start_y = card
+        .rect
+        .y
+        .saturating_add(card.rect.height)
+        .saturating_sub(1)
+        .max(connector_y);
+    Some([
+        (trunk_x, start_y),
+        (trunk_x, connector_y),
+        (border_x, connector_y),
+        (border_x, border_y),
+        (centre_x, border_y),
+    ])
+}
+
+/// Where the spider sits on its climb, at `t` in `0.0..=1.0`: `0.0` is just
+/// setting out from below the row, `1.0` is arrived and resting at the top
+/// centre border. Each leg gets a share of `t` proportional to its own length
+/// in cells, so a tall card's climb up its own border is not rushed relative
+/// to the jog to centre a short one gets.
+fn failure_spider_position(
+    card: &crate::app::state::WorkspaceCardArea,
+    t: f32,
+) -> Option<(u16, u16)> {
+    let waypoints = failure_spider_waypoints(card)?;
+    let t = t.clamp(0.0, 1.0);
+    let legs: Vec<f32> = waypoints
+        .windows(2)
+        .map(|pair| {
+            let (x0, y0) = pair[0];
+            let (x1, y1) = pair[1];
+            f32::from(x0.abs_diff(x1)) + f32::from(y0.abs_diff(y1))
+        })
+        .collect();
+    let total: f32 = legs.iter().sum();
+    if total <= 0.0 {
+        let (x, y) = waypoints[waypoints.len() - 1];
+        return Some((x, y));
+    }
+    let mut travelled = t * total;
+    for (i, &len) in legs.iter().enumerate() {
+        if travelled <= len || i == legs.len() - 1 {
+            let leg_t = if len > 0.0 {
+                (travelled / len).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let (x0, y0) = waypoints[i];
+            let (x1, y1) = waypoints[i + 1];
+            return Some((lerp_u16(x0, x1, leg_t), lerp_u16(y0, y1, leg_t)));
+        }
+        travelled -= len;
+    }
+    let (x, y) = waypoints[waypoints.len() - 1];
+    Some((x, y))
+}
+
+fn lerp_u16(a: u16, b: u16, t: f32) -> u16 {
+    let a = f32::from(a);
+    let b = f32::from(b);
+    (a + (b - a) * t).round().max(0.0) as u16
+}
+
+#[cfg(test)]
+mod failure_spider_geometry {
+    use super::*;
+
+    fn card(rect: Rect, frame: Rect) -> crate::app::state::WorkspaceCardArea {
+        crate::app::state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect,
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: Some(frame),
+            motion_cells: (0, 0),
+        }
+    }
+
+    #[test]
+    fn a_settled_spider_rests_at_the_top_centre_border() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let (x, y) = failure_spider_position(&area, 1.0).expect("a card frame gives a position");
+        assert_eq!(y, 0, "the top border row");
+        assert_eq!(x, 2 + (26 - 1) / 2, "horizontally centred on the card");
+    }
+
+    #[test]
+    fn a_spider_just_setting_out_starts_in_the_trunk_column_at_or_below_the_branch() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let (x, y) = failure_spider_position(&area, 0.0).expect("a card frame gives a position");
+        assert_eq!(
+            x, area.rect.x,
+            "the trunk column, not the card's own border"
+        );
+        assert!(y >= area.content_y(), "at or below this row's own branch");
+    }
+
+    #[test]
+    fn a_card_with_no_frame_has_no_climb_at_all() {
+        let mut area = card(Rect::new(0, 0, 10, 1), Rect::new(0, 0, 10, 1));
+        area.card_frame = None;
+        assert_eq!(
+            failure_spider_position(&area, 0.5),
+            None,
+            "a bare line has no border to rest on"
+        );
+    }
+
+    /// The tree's own lines never run diagonally, and the climb has to match:
+    /// each step is a move along one axis, the same way a `│` then a `─`
+    /// meets a card rather than a line cutting the gutter on the bias.
+    #[test]
+    fn the_climb_only_ever_moves_one_axis_at_a_time() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let mut previous = failure_spider_position(&area, 0.0).unwrap();
+        for step in 1u16..=20 {
+            let t = f32::from(step) / 20.0;
+            let current = failure_spider_position(&area, t).unwrap();
+            let dx = current.0.abs_diff(previous.0);
+            let dy = current.1.abs_diff(previous.1);
+            assert!(
+                dx == 0 || dy == 0,
+                "a step moved diagonally at t={t}: {previous:?} -> {current:?}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn progress_is_monotonic_along_the_path() {
+        let area = card(Rect::new(0, 0, 30, 8), Rect::new(2, 0, 26, 8));
+        let waypoints = failure_spider_waypoints(&area).unwrap();
+        let total: f32 = waypoints
+            .windows(2)
+            .map(|pair| {
+                f32::from(pair[0].0.abs_diff(pair[1].0)) + f32::from(pair[0].1.abs_diff(pair[1].1))
+            })
+            .sum();
+        assert!(
+            total > 0.0,
+            "a card taller than one row has real distance to climb"
+        );
+    }
+}
+
 /// Emphasis on a row's state icon as a charge reaches it.
 ///
 /// The icon's own colour becomes the block, rather than the signal's, because
@@ -4528,6 +4817,8 @@ fn render_workspace_list(
             }
         }
     }
+
+    render_failure_spiders(app, frame, cards, &entries, &agents, fold_width);
 
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
         let indicator_right = scrollbar_rect
