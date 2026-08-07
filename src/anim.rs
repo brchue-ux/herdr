@@ -135,6 +135,17 @@ pub(crate) enum ElementId {
     /// these; it is still drawn as a plain glyph, and giving it a segment of
     /// its own is a follow-up, not a gap in this one.
     TrunkSegment(TrunkSegmentId),
+    /// One command-acknowledgement marker on one card: a glyph that snaps in,
+    /// holds, and fades — the sidebar's answer to "a shell command ran".
+    ///
+    /// Its own family, for the same reason [`Self::CardWash`] has one: it is a
+    /// bounded event on a row rather than the row itself. Unlike a wash, a card
+    /// can carry *several of these at once* — the captain's own call was one
+    /// independent instance per detected command rather than a coalesced
+    /// counter — so the identity carries a sequence number and not just the
+    /// card, or a second command arriving mid-animation would collide with the
+    /// first instead of mounting beside it.
+    CmdAck(CmdAck),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
@@ -166,6 +177,19 @@ pub(crate) struct CardWash {
     pub(crate) into: crate::detect::AgentState,
 }
 
+/// One command-acknowledgement instance: which card, and which of possibly
+/// several simultaneous acks on it.
+///
+/// `seq` is what lets two commands detected close together mount as two
+/// elements instead of one restarting the other — [`Animator::admit`] never
+/// restarts an id that is still in its membership set, so two acks on the same
+/// card must simply not share an id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CmdAck {
+    pub(crate) row: CardRow,
+    pub(crate) seq: u64,
+}
+
 /// Which row in the tree a card stands on.
 ///
 /// Both kinds, because a mate is a Space and a worker is a pane and the tree
@@ -186,6 +210,7 @@ pub(crate) enum Family {
     TrayBadge,
     CardWash,
     TrunkSegment,
+    CmdAck,
     Named,
 }
 
@@ -199,6 +224,7 @@ impl ElementId {
             Self::TrayBadge(_) => Family::TrayBadge,
             Self::CardWash(_) => Family::CardWash,
             Self::TrunkSegment(_) => Family::TrunkSegment,
+            Self::CmdAck(_) => Family::CmdAck,
             Self::Named(_) => Family::Named,
         }
     }

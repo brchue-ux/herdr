@@ -1864,6 +1864,10 @@ pub struct AppState {
     /// What state each drawn card was last seen in, so a change can be told
     /// from a state. Presentation state for the same reason [`Self::anim`] is.
     pub(crate) sidebar_card_washes: crate::app::card_wash::CardWashes,
+    /// Which command lines each drawn card has already acknowledged, and which
+    /// of those acknowledgements are still live. Presentation state for the
+    /// same reason [`Self::anim`] is.
+    pub(crate) sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks,
     /// The sidebar tree's owned agent rows as of the last loop pass.
     ///
     /// The tree is derived from panes that exist, so a pane closing takes the
@@ -2801,6 +2805,7 @@ impl AppState {
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
+            sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
             sidebar_tree_row_memory: Vec::new(),
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,

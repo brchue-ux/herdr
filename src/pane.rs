@@ -202,6 +202,26 @@ async fn publish_state_changed_event(
     }
 }
 
+async fn publish_command_acknowledged_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    observed_at: std::time::Instant,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::CommandAcknowledged {
+            pane_id,
+            observed_at,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver CommandAcknowledged event"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
     state: AgentState,
@@ -722,6 +742,12 @@ fn spawn_basic_detection_task(
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut screen_identity = ScreenIdentityConfirmation::default();
         let mut screen_identified_agent: Option<Agent> = None;
+        // `None` until the first scan under the current agent has run once —
+        // that first scan seeds this without acknowledging anything, because
+        // the transcript it sees is history the agent printed before this task
+        // was watching, not a command that just ran. See
+        // `crate::detect::diff_new_markers`.
+        let mut acknowledged_command_markers: Option<std::collections::HashSet<String>> = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -755,6 +781,7 @@ fn spawn_basic_detection_task(
                     release_was_active = false;
                     last_detection_text.clear();
                     last_screen_scan_detection_content_seq = None;
+                    acknowledged_command_markers = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                     screen_identity.clear();
@@ -960,6 +987,20 @@ fn spawn_basic_detection_task(
                         agent = ?identified,
                         "agent identified from screen"
                     );
+                }
+            }
+            if agent_changed {
+                // A new agent identity's transcript is unread history, not
+                // something this task watched happen — the next scan re-seeds
+                // rather than acknowledging what is already on screen.
+                acknowledged_command_markers = None;
+            }
+            if !process_exited && (content_changed || agent_changed) {
+                let markers = crate::detect::command_markers(agent, &content);
+                let fresh =
+                    crate::detect::diff_new_markers(markers, &mut acknowledged_command_markers);
+                for _ in &fresh {
+                    publish_command_acknowledged_event(state_events.clone(), pane_id, now).await;
                 }
             }
             if !process_exited && crate::detect::should_skip_state_update(agent, &content) {
@@ -2285,6 +2326,11 @@ impl PaneRuntime {
                     let mut pending_idle = PendingIdleConfirmation::default();
                     let mut screen_identity = ScreenIdentityConfirmation::default();
                     let mut screen_identified_agent: Option<Agent> = None;
+                    // See `crate::detect::diff_new_markers` on why `None`
+                    // primes without acknowledging rather than starting empty.
+                    let mut acknowledged_command_markers: Option<
+                        std::collections::HashSet<String>,
+                    > = None;
 
                     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2330,6 +2376,7 @@ impl PaneRuntime {
                                 last_visible_signal_refresh = None;
                                 last_detection_text.clear();
                                 last_screen_scan_detection_content_seq = None;
+                                acknowledged_command_markers = None;
                                 agent_startup_grace_until = None;
                                 pending_idle.clear();
                                 screen_identity.clear();
@@ -2578,6 +2625,28 @@ impl PaneRuntime {
                                     agent = ?identified,
                                     "agent identified from screen"
                                 );
+                            }
+                        }
+                        if agent_changed {
+                            // A new agent identity's transcript is unread
+                            // history, not something this task watched
+                            // happen — the next scan re-seeds rather than
+                            // acknowledging what is already on screen.
+                            acknowledged_command_markers = None;
+                        }
+                        if !process_exited && (content_changed || agent_changed) {
+                            let markers = detect::command_markers(agent, &content);
+                            let fresh = detect::diff_new_markers(
+                                markers,
+                                &mut acknowledged_command_markers,
+                            );
+                            for _ in &fresh {
+                                publish_command_acknowledged_event(
+                                    state_events.clone(),
+                                    pane_id,
+                                    now,
+                                )
+                                .await;
                             }
                         }
                         if detect::should_skip_state_update(agent, &content) {

@@ -210,4 +210,15 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+    /// A shell command was detected on a pane's screen — the sidebar's
+    /// command-acknowledgement marker fires from this.
+    ///
+    /// Carries no command text and no tool name on purpose: the marker draws
+    /// a glyph, never the command, so there is nothing here for a renderer to
+    /// want. `observed_at` is when the detection task's own scan saw it,
+    /// which is what the marker's visible lifetime is measured from.
+    CommandAcknowledged {
+        pane_id: PaneId,
+        observed_at: Instant,
+    },
 }
