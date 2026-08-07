@@ -66,6 +66,17 @@ pub(crate) struct ClientConnection {
     pub(crate) renderer: VirtualRenderer,
     /// Client-local host Kitty graphics cache.
     pub(crate) graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// Whether this client's own last rendered frame published sidebar card layers.
+    ///
+    /// Set from `ViewState::sidebar_card_layers_published` at the moment this
+    /// client's own full-render pass produced it, next to `graphics_cache`
+    /// because both describe what that pass actually did. The retained
+    /// graphics path does not recompute the view per client — it reuses
+    /// whatever pass wrote `AppState::view` last, which `render_targets`
+    /// sorts to the foreground — so it reads this per-client copy to tell
+    /// whether that shared view still matches what *this* client's own last
+    /// pass published, rather than assuming it does.
+    pub(crate) sidebar_card_layers_published: bool,
     /// Whether the next graphics frame must clear and rebuild host-side Kitty state.
     pub(crate) graphics_surface_reset_pending: bool,
     /// Whether an ordinary render was skipped because the render channel was full.
@@ -136,6 +147,7 @@ impl ClientConnection {
             render_state: ClientRenderState::new(render_encoding),
             renderer: VirtualRenderer::default(),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+            sidebar_card_layers_published: false,
             graphics_surface_reset_pending: false,
             render_pending: false,
             pane_graphics_render_pending: false,

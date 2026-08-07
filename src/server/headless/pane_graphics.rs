@@ -74,7 +74,7 @@ impl HeadlessServer {
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
         let mut app_view_size = None;
-        for (_, terminal_size, _, _, mode) in &render_targets {
+        for (client_id, terminal_size, _, _, mode) in &render_targets {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
             }
@@ -83,6 +83,27 @@ impl HeadlessServer {
                 return RetainedGraphicsOutcome::Fallback;
             }
             app_view_size = Some(*terminal_size);
+
+            // This function never calls `compute_view`; it encodes every app
+            // client from whichever pass last wrote `AppState::view`, which
+            // `render_targets` sorts to the foreground. A client whose own
+            // last full-render pass disagreed with that shared view about
+            // whether sidebar card layers were published would otherwise be
+            // handed (or denied) card placements on the strength of a pass
+            // that was never its own — the doubled border/chip/title under
+            // shapes, or a stray upload-then-delete under the sheet. Falling
+            // back here, beside the geometry check above, keeps this path
+            // deciding only for passes it can vouch for.
+            let Some(client) = self.clients.get(client_id) else {
+                crate::render_prof::event("retained_graphics_fallback.client_missing");
+                return RetainedGraphicsOutcome::Fallback;
+            };
+            if client.sidebar_card_layers_published
+                != self.app.state.view.sidebar_card_layers_published
+            {
+                crate::render_prof::event("retained_graphics_fallback.mixed_sidebar_card_publish");
+                return RetainedGraphicsOutcome::Fallback;
+            }
         }
         let mut deferred = false;
         let mut prepared = Vec::new();

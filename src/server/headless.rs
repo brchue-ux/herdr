@@ -4225,6 +4225,12 @@ impl HeadlessServer {
                 continue;
             };
             client.renderer = renderer;
+            if is_app_client {
+                // This client's own pass just wrote `AppState::view`, so this is
+                // that pass's own fact, not a neighbour's — see the field's doc.
+                client.sidebar_card_layers_published =
+                    self.app.state.view.sidebar_card_layers_published;
+            }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
             if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known() {
@@ -9939,6 +9945,133 @@ next_tab = ""
 
         assert!(!server.render_retained_pty_update_and_stream());
         assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    /// Two same-size app clients with graphics on, so the retained path is
+    /// reachable and its `app_view_size` gate does not fire on its own.
+    fn two_app_client_test_server() -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("test");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.kitty_graphics_enabled = true;
+
+        let cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+
+        let (tx1, _control1, rx1) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                cell_size,
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(tx1),
+            ),
+        );
+        let (tx2, _control2, rx2) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                cell_size,
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(tx2),
+            ),
+        );
+
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        (server, rx1, rx2)
+    }
+
+    /// Reproduces the third finding from `herdr-card-as-alpha-shape`'s
+    /// validation history (PR #52's own accepted-limitation note): this
+    /// function never calls `compute_view`, so it always encodes every app
+    /// client from whichever pass last wrote `AppState::view` — the
+    /// foreground's, since `render_targets` sorts it last (`src/server/clients.rs`).
+    /// A background client whose own last full-render pass disagreed with
+    /// that shared view about sidebar card publication must not silently be
+    /// encoded against it; the retained update has to fall back instead.
+    #[test]
+    fn retained_graphics_falls_back_when_a_client_disagrees_with_the_shared_view_on_sidebar_card_publish(
+    ) {
+        let (mut server, rx1, rx2) = two_app_client_test_server();
+        server.render_and_stream();
+        let _ = rx1
+            .recv_timeout(Duration::from_millis(200))
+            .expect("client 1 initial frame");
+        let _ = rx2
+            .recv_timeout(Duration::from_millis(200))
+            .expect("client 2 initial frame");
+
+        // The foreground's last pass (which `AppState::view` now holds)
+        // published card layers; client 2's own last pass, recorded next to
+        // its `graphics_cache`, did not.
+        server.app.state.view.sidebar_card_layers_published = true;
+        server
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .sidebar_card_layers_published = false;
+
+        assert_eq!(
+            server.render_retained_graphics_update_and_stream(),
+            RetainedGraphicsOutcome::Fallback,
+            "a client whose own pass disagrees with the shared view must not be \
+             encoded from that view"
+        );
+    }
+
+    /// The mirror of the case above: when every app client's own last pass
+    /// agrees with the shared view, the retained path is not forced into a
+    /// full-render fallback by the new guard.
+    #[test]
+    fn retained_graphics_proceeds_when_every_client_agrees_with_the_shared_view_on_sidebar_card_publish(
+    ) {
+        let (mut server, rx1, rx2) = two_app_client_test_server();
+        server.render_and_stream();
+        let _ = rx1
+            .recv_timeout(Duration::from_millis(200))
+            .expect("client 1 initial frame");
+        let _ = rx2
+            .recv_timeout(Duration::from_millis(200))
+            .expect("client 2 initial frame");
+
+        server.app.state.view.sidebar_card_layers_published = false;
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .sidebar_card_layers_published = false;
+        server
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .sidebar_card_layers_published = false;
+
+        assert_eq!(
+            server.render_retained_graphics_update_and_stream(),
+            RetainedGraphicsOutcome::Sent,
+            "clients that agree with the shared view must not be forced into a \
+             full-render fallback"
+        );
     }
 
     #[tokio::test]
