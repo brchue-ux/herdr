@@ -797,8 +797,10 @@ impl App {
             sidebar_tree_row_memory: Vec::new(),
             tree_root: tree_view::TreeRoot::default(),
             pending_tree_root: None,
-            sidebar_palette: theme_palette
-                .for_sidebar(&crate::terminal_theme::TerminalTheme::default()),
+            sidebar_palette: theme_palette.for_sidebar(
+                &theme_palette,
+                &crate::terminal_theme::TerminalTheme::default(),
+            ),
             palette: theme_palette,
             theme_name,
             theme_runtime,

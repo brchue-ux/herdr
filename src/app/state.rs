@@ -723,6 +723,10 @@ impl Palette {
     ///   multiplexers commonly cause) leaves the palette exactly as authored.
     /// - `Color::Reset` means "inherit the host" and is never rewritten, so a
     ///   theme that opts out of painting a surface keeps opting out.
+    ///
+    /// `self` should be the authored palette. This is one of two independent
+    /// floors a token can go through — see [`Self::for_sidebar`] — so its
+    /// result should not be fed back in as the starting point for the other.
     pub fn with_contrast_floor(mut self, host: &crate::terminal_theme::TerminalTheme) -> Self {
         use crate::ui::color::terminal_theme_to_rgb;
 
@@ -730,6 +734,22 @@ impl Palette {
             return self;
         };
         self.floor_quiet_tokens(host, background);
+        self
+    }
+
+    /// Overwrite just the four contrast-floored tokens with `authored`'s
+    /// copies, leaving every other field — including `sidebar_bg` itself —
+    /// untouched.
+    ///
+    /// The counterpart to the token list in [`Self::floor_quiet_tokens`]:
+    /// whichever fields that floors, this one resets to their pre-floor
+    /// value first, so a floor computed from `self` never starts from a
+    /// token another floor already nudged.
+    fn with_quiet_tokens_from(mut self, authored: &Self) -> Self {
+        self.surface0 = authored.surface0;
+        self.surface_dim = authored.surface_dim;
+        self.overlay0 = authored.overlay0;
+        self.overlay1 = authored.overlay1;
         self
     }
 
@@ -743,14 +763,31 @@ impl Palette {
     /// the modal — the two surfaces can straddle mid-grey, and then no one
     /// colour clears both.
     ///
+    /// `authored` must be the palette before either floor ran. Both floors
+    /// are meant to start from the same authored colour and diverge only
+    /// because their backgrounds differ; flooring `self` (which may already
+    /// be host-floored — see [`Self::with_contrast_floor`]) instead chains
+    /// the two, and can drift a token that already clears the sidebar's
+    /// floor on its own away from its authored value for no legibility gain.
+    ///
+    /// Every other field, including `sidebar_bg`, is read from `self` as-is:
+    /// unlike the four quiet tokens, nothing ever floors it, so `self`'s copy
+    /// already *is* the authored one — and callers that override it directly
+    /// (a themed panel fill applied straight to a live palette, for example)
+    /// need that override honoured rather than replaced by `authored`'s.
+    ///
     /// Returns the palette unchanged when the panel has no fill of its own,
     /// which is the default: `Color::Reset` resolves to no colour, so the
     /// sidebar keeps drawing with the host-floored tokens.
-    pub fn for_sidebar(&self, host: &crate::terminal_theme::TerminalTheme) -> Self {
-        let mut sidebar = self.clone();
+    pub fn for_sidebar(
+        &self,
+        authored: &Self,
+        host: &crate::terminal_theme::TerminalTheme,
+    ) -> Self {
         let Some(background) = crate::ui::color::resolve_color_rgb(self.sidebar_bg, host) else {
-            return sidebar;
+            return self.clone();
         };
+        let mut sidebar = self.clone().with_quiet_tokens_from(authored);
         sidebar.floor_quiet_tokens(host, background);
         sidebar
     }
@@ -2693,15 +2730,35 @@ impl AppState {
         ws.active_tab().map(|tab| tab.layout.focused()) == Some(pane_id)
     }
 
-    /// Re-derive [`Self::sidebar_palette`] from the palette and host theme it
-    /// is a function of.
+    /// Re-derive [`Self::sidebar_palette`] from [`Self::palette`] and the
+    /// host theme it is a function of.
     ///
     /// Called from `compute_view`, which every render path runs first, so the
     /// two can only be out of step for a state that was never laid out. It is
     /// the palette itself whenever the panel has no fill of its own, which is
     /// the default.
+    ///
+    /// Re-resolves the theme by name for the four contrast-floored tokens
+    /// specifically: `palette` is already floored against the host
+    /// background (see [`Palette::with_contrast_floor`]), and
+    /// [`Palette::for_sidebar`] must float those four from the authored
+    /// colours, not from a copy already nudged for a different surface. Every
+    /// other field, including a directly overridden `sidebar_bg`, still comes
+    /// from `palette` itself. Falls back to `palette` for the authored copy
+    /// too if `theme_name` no longer names a known theme, which should not
+    /// happen in practice.
     pub fn refresh_sidebar_palette(&mut self) {
-        self.sidebar_palette = self.palette.for_sidebar(&self.host_terminal_theme);
+        let mut authored =
+            Palette::from_name(&self.theme_name).unwrap_or_else(|| self.palette.clone());
+        if let Some(custom) = &self.theme_runtime.custom {
+            authored = authored.with_overrides(custom);
+        }
+        if let Some(accent) = &self.theme_runtime.legacy_accent {
+            authored.accent = crate::config::parse_color(accent);
+        }
+        self.sidebar_palette = self
+            .palette
+            .for_sidebar(&authored, &self.host_terminal_theme);
     }
 }
 
@@ -3451,21 +3508,24 @@ mod tests {
         /// A theme with a sidebar fill on a host whose background is nowhere
         /// near it — the case where the two surfaces straddle mid-grey and no
         /// one colour clears both floors.
-        fn straddling_surfaces() -> (TerminalTheme, Palette) {
+        ///
+        /// Returns the authored palette alongside the host-floored copy:
+        /// [`Palette::for_sidebar`] must derive from the former, never the
+        /// latter, so tests exercising it need both.
+        fn straddling_surfaces() -> (TerminalTheme, Palette, Palette) {
             let host = host_background(239, 241, 245);
             let custom = crate::config::CustomThemeColors {
                 sidebar_bg: Some("#181825".to_string()),
                 ..Default::default()
             };
-            let palette = Palette::catppuccin_latte()
-                .with_overrides(&custom)
-                .with_contrast_floor(&host);
-            (host, palette)
+            let authored = Palette::catppuccin_latte().with_overrides(&custom);
+            let palette = authored.clone().with_contrast_floor(&host);
+            (host, authored, palette)
         }
 
         #[test]
         fn a_sidebar_fill_never_detunes_the_tokens_drawn_outside_the_sidebar() {
-            let (host, palette) = straddling_surfaces();
+            let (host, _authored, palette) = straddling_surfaces();
             let without_fill = Palette::catppuccin_latte().with_contrast_floor(&host);
 
             // `overlay1` is the settings and modal description ink and
@@ -3479,8 +3539,12 @@ mod tests {
 
         #[test]
         fn every_floored_token_clears_its_floor_on_the_surface_it_is_drawn_on() {
-            let (host, palette) = straddling_surfaces();
-            let sidebar = palette.for_sidebar(&host);
+            let (host, authored, palette) = straddling_surfaces();
+            // Quiet tokens derived from the authored palette, not from
+            // `palette` (which is already floored for the host background) —
+            // floor-on-floor would still clear both floors here, so this
+            // alone would not catch a regression back to chaining the two.
+            let sidebar = palette.for_sidebar(&authored, &host);
 
             // Outside the sidebar the tokens land on the host background, and
             // a modal on this theme fills with `panel_bg`, which is the same
@@ -3513,11 +3577,55 @@ mod tests {
         }
 
         #[test]
+        fn a_token_that_already_clears_the_sidebar_floor_keeps_its_authored_value() {
+            // `overlay1` authored at (140, 143, 161): unreadable against this
+            // host background on its own, so `with_contrast_floor` legitimately
+            // nudges it. But it already clears the sidebar floor against the
+            // panel's own (much darker) fill, with headroom to spare.
+            let host = host_background(60, 60, 78);
+            let custom = crate::config::CustomThemeColors {
+                overlay1: Some("#8c8fa1".to_string()),
+                sidebar_bg: Some("#181825".to_string()),
+                ..Default::default()
+            };
+            let authored = Palette::catppuccin_latte().with_overrides(&custom);
+            let overlay1 = authored.overlay1;
+            assert_eq!(overlay1, Color::Rgb(140, 143, 161));
+
+            // Precondition: the host floor really does move this token...
+            let host_floored = authored.clone().with_contrast_floor(&host);
+            assert_ne!(host_floored.overlay1, overlay1);
+            // ...but the authored colour already clears the sidebar's own
+            // floor unaided.
+            let sidebar_bg = resolve_color_rgb(authored.sidebar_bg, &host).expect("panel fill");
+            assert!(ratio_against(overlay1, &host, sidebar_bg) >= 4.5);
+
+            // Deriving the sidebar's quiet tokens straight from the authored
+            // colours leaves overlay1 untouched...
+            let sidebar = host_floored.for_sidebar(&authored, &host);
+            assert_eq!(
+                sidebar.overlay1, overlay1,
+                "overlay1 already clears the sidebar floor, so it should not move"
+            );
+
+            // ...whereas flooring the already host-floored copy against the
+            // sidebar background too — the old floor-on-floor behaviour —
+            // drifts it away from that value even though the panel floor
+            // alone never asked for a change.
+            let chained = host_floored.for_sidebar(&host_floored, &host);
+            assert_ne!(
+                chained.overlay1, overlay1,
+                "sanity: chaining the host floor into the sidebar floor really does drift overlay1"
+            );
+        }
+
+        #[test]
         fn a_panel_with_no_fill_of_its_own_draws_with_the_host_floored_palette() {
             let host = host_background(239, 241, 245);
-            let palette = Palette::catppuccin_latte().with_contrast_floor(&host);
+            let authored = Palette::catppuccin_latte();
+            let palette = authored.clone().with_contrast_floor(&host);
             assert_eq!(palette.sidebar_bg, Color::Reset);
-            assert_eq!(palette.for_sidebar(&host), palette);
+            assert_eq!(palette.for_sidebar(&authored, &host), palette);
         }
 
         #[test]

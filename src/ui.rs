@@ -1281,9 +1281,11 @@ mod tests {
         app.palette.sidebar_bg = Color::Rgb(24, 24, 37);
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
 
+        let authored = crate::app::state::Palette::from_name(&app.theme_name)
+            .expect("test_new's theme name should always resolve");
         assert_eq!(
             app.sidebar_palette,
-            app.palette.for_sidebar(&app.host_terminal_theme)
+            app.palette.for_sidebar(&authored, &app.host_terminal_theme)
         );
         assert_ne!(
             app.sidebar_palette, app.palette,
