@@ -16,6 +16,29 @@ use super::{
 /// dismount: a wash is an event with nothing left to be once it settles, but
 /// a spider that has climbed to a card it is still sitting on has to leave the
 /// same way it arrived, not vanish.
+/// Everything the background scene's ambient loop depends on, folded into one number: the
+/// screen's pixel dimensions and the fleet tree's own shape (which bodies exist, their kind, hue
+/// and severity — a `Vec<TreeNode>`'s field values, since the type itself has no `Hash`).
+fn background_scene_key(
+    nodes: &[crate::solar_system::TreeNode],
+    area: ratatui::layout::Rect,
+    cell: crate::kitty_graphics::HostCellSize,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (area.width, area.height).hash(&mut hasher);
+    (cell.width_px, cell.height_px).hash(&mut hasher);
+    nodes.len().hash(&mut hasher);
+    for node in nodes {
+        node.parent.hash(&mut hasher);
+        (node.kind as u8).hash(&mut hasher);
+        node.hue.to_bits().hash(&mut hasher);
+        node.severity.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn failure_spider_lifecycle() -> crate::anim::Lifecycle {
     use crate::anim::behaviour::{names, FAILURE_SPIDER_CLIMB_PERIOD};
     use crate::anim::{Lifecycle, Stage};
@@ -397,6 +420,9 @@ impl App {
         changed |= self.sample_pane_activity(now);
         changed |= self.observe_signal_tray(now);
         changed |= self.observe_sidebar_particle_field();
+        changed |= self.observe_background_scene();
+        // The app's own loop is by definition its viewer, same as `advance_animations` above.
+        changed |= self.observe_background_effects(now, true);
 
         if self
             .selection_autoscroll_deadline
@@ -1083,6 +1109,155 @@ impl App {
         (area.width, area.height).hash(&mut hasher);
         (cell.width_px, cell.height_px).hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// (Re-)generate the whole-terminal solar-system scene's ambient loop when the fleet's shape
+    /// or the screen size has moved.
+    ///
+    /// Mirrors [`Self::observe_sidebar_particle_field`] exactly: a whole animation sequence is
+    /// not free to regenerate, so it is redone only when [`Self::background_scene_key`] moves,
+    /// never once per tick. See `src/app/background_scene.rs` for why the scene's *placement*
+    /// (`AppState::background_scene_layout`) is cached alongside the rendered loop rather than
+    /// only the encoded bytes: the effects overlay needs real body positions to draw against.
+    pub(crate) fn observe_background_scene(&mut self) -> bool {
+        if !self.state.kitty_graphics_enabled || !self.state.persistent_background_enabled {
+            return self.clear_background_scene();
+        }
+
+        let area = self.state.screen_rect();
+        let cell = self.state.host_cell_size;
+        if area.width == 0 || area.height == 0 || !cell.is_known() {
+            return self.clear_background_scene();
+        }
+
+        let (nodes, identity) = crate::app::background_scene::tree_nodes(&self.state);
+        let key = background_scene_key(&nodes, area, cell);
+        if key == self.state.background_scene_key && self.state.background_scene.is_some() {
+            return false;
+        }
+
+        let width = u32::from(area.width) * cell.width_px;
+        let height = u32::from(area.height) * cell.height_px;
+        let layout = crate::solar_system::build_layout(&nodes, width, height);
+        if layout.is_empty() {
+            // No fleet to mirror yet — nothing ambient to draw.
+            return self.clear_background_scene();
+        }
+        // Whole-terminal frames are far too large for raw RGBA to fit the wire once multiplied
+        // across a whole animation loop — see `solar_system::encode_png`'s own doc for the
+        // measured numbers that forced this.
+        let frames =
+            crate::solar_system::loop_frames_png(&layout, crate::solar_system::FRAME_COUNT);
+        let mut frames = frames.into_iter();
+        let Some(root) = frames.next() else {
+            return self.clear_background_scene();
+        };
+
+        self.state.background_scene_key = key;
+        self.state.background_scene_generated_at = Some(Instant::now());
+        self.state.background_scene_identity = identity;
+        self.state.background_scene = Some(
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Png,
+                width,
+                height,
+                root,
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                    // Above the cell background, below text — a full backdrop for live panes,
+                    // not confined to cells a pane left default
+                    // (`data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`,
+                    // firstmate home). One step below the effects overlay's own `z`, so a comet
+                    // or crater always draws over the ambient scene rather than under it.
+                    z: -2,
+                },
+            )
+            .with_animation(crate::app::state::GraphicsAnimation {
+                frame_gap_ms: crate::app::background_scene::FRAME_GAP_MS,
+                frames: frames.collect(),
+            }),
+        );
+        self.state.background_scene_layout = Some(layout);
+        true
+    }
+
+    fn clear_background_scene(&mut self) -> bool {
+        let had = self.state.background_scene.take().is_some();
+        self.state.background_scene_key = 0;
+        self.state.background_scene_layout = None;
+        self.state.background_scene_identity.clear();
+        self.state.background_scene_generated_at = None;
+        had
+    }
+
+    /// (Re-)generate the background scene's event-driven overlay: in-flight asteroids, fading
+    /// craters, travelling comets.
+    ///
+    /// `has_viewers` is false when no client is rendering the app — a detached server then
+    /// forgets every live effect rather than animating something nobody is looking at, mirroring
+    /// [`Self::advance_animations`]'s own `Animator::forget_all` gate. Regenerated on every pass
+    /// while something is live (unlike the ambient loop above, this is small and
+    /// bounding-box-limited — see `src/solar_system.rs`'s own module doc), and left entirely
+    /// absent whenever nothing is: fade-clean, state-derived persistence, not an accumulator.
+    pub(crate) fn observe_background_effects(&mut self, now: Instant, has_viewers: bool) -> bool {
+        if !self.state.kitty_graphics_enabled || !self.state.persistent_background_enabled {
+            let forgot = self.state.background_effects.forget_all();
+            let had = self.state.background_effects_layer.take().is_some();
+            return forgot || had;
+        }
+
+        if !has_viewers {
+            let forgot = self.state.background_effects.forget_all();
+            let had = self.state.background_effects_layer.take().is_some();
+            return forgot || had;
+        }
+
+        let Some(layout) = self.state.background_scene_layout.clone() else {
+            return false;
+        };
+        let identity = self.state.background_scene_identity.clone();
+
+        let mut effects_state = std::mem::take(&mut self.state.background_effects);
+        crate::app::background_scene::spawn_new_effects(
+            &self.state,
+            &mut effects_state,
+            &identity,
+            now,
+        );
+        let live_before = effects_state.is_live();
+        let effects = crate::app::background_scene::advance_and_build_effects(
+            &mut effects_state,
+            &identity,
+            now,
+        );
+        let live_after = effects_state.is_live();
+        self.state.background_effects = effects_state;
+
+        if !live_after {
+            let had = self.state.background_effects_layer.take().is_some();
+            return live_before || had;
+        }
+
+        let generated_at = self.state.background_scene_generated_at.unwrap_or(now);
+        let phase = crate::app::background_scene::phase_at(generated_at, now);
+        let frame = crate::solar_system::effects_frame_png(&layout, &effects, phase);
+        self.state.background_effects_layer = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            layout.width(),
+            layout.height(),
+            frame,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                z: -1,
+            },
+        ));
+        true
     }
 
     /// Move the clock the sidebar renders elapsed times against.

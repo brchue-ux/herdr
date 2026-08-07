@@ -192,6 +192,15 @@ enum HostSurfaceId {
     /// the same reason `SignalTray` has one: a client's own sidebar backdrop and this wash are
     /// two placements, not one silently replacing the other.
     SidebarParticleField,
+    /// The whole-terminal solar-system background scene's ambient loop, drawn by the TUI itself.
+    /// Its own identity, sibling to `SidebarParticleField`, so this and a client's own sidebar or
+    /// pane images are separate placements rather than one replacing the other.
+    BackgroundScene,
+    /// The same scene's event-driven overlay (asteroid impacts, comets), layered above
+    /// `BackgroundScene` but still below every pane's own text. Separate from `BackgroundScene`
+    /// itself so the (rarely regenerated) ambient loop and the (regenerated only while something
+    /// is live) overlay never have to share one upload/caching lifecycle.
+    BackgroundEffects,
 }
 
 impl HostSurfaceId {
@@ -208,6 +217,8 @@ impl HostSurfaceId {
                 slot.hash(hasher);
             }
             Self::SidebarParticleField => "surface.sidebar.particle-field".hash(hasher),
+            Self::BackgroundScene => "surface.background.scene".hash(hasher),
+            Self::BackgroundEffects => "surface.background.effects".hash(hasher),
         }
     }
 }
@@ -1054,6 +1065,16 @@ fn surface_layer_placement_targets(
                 layer,
             )
         }))
+        .chain(
+            app.background_scene
+                .as_ref()
+                .map(|layer| (HostSurfaceId::BackgroundScene, app.screen_rect(), layer)),
+        )
+        .chain(
+            app.background_effects_layer
+                .as_ref()
+                .map(|layer| (HostSurfaceId::BackgroundEffects, app.screen_rect(), layer)),
+        )
         // The TUI's own sidebar cards join here rather than through the API
         // map, so they travel the same clipping, dedup, signature and
         // delete-by-id path as a client's layer without being reachable — or
