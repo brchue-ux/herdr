@@ -1211,30 +1211,39 @@ pub enum AgentPanelSort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Theme,
+    Animation,
     Indicators,
     Sound,
     Toast,
     PaneLabels,
+    Signals,
+    Legend,
     Integrations,
 }
 
 impl SettingsSection {
     pub const ALL: &[Self] = &[
         Self::Theme,
+        Self::Animation,
         Self::Indicators,
         Self::Sound,
         Self::Toast,
         Self::PaneLabels,
+        Self::Signals,
+        Self::Legend,
         Self::Integrations,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Theme => "theme",
+            Self::Animation => "animation",
             Self::Indicators => "indicators",
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Signals => "signals",
+            Self::Legend => "legend",
             Self::Integrations => "integrations",
         }
     }

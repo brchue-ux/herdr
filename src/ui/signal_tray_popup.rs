@@ -152,7 +152,11 @@ fn body_lines(app: &AppState, badge: &TrayBadge, item_index: usize) -> Vec<Strin
 ///
 /// This is what makes the legend permanent and free — it is the thing that
 /// stops the tray being eight pictures nobody can name.
-fn legend_lines() -> Vec<String> {
+///
+/// `pub(crate)` because the settings menu's own legend tab draws these same
+/// lines — one source of the eight meanings, read from two places, rather
+/// than a second copy that could drift from this one.
+pub(crate) fn legend_lines() -> Vec<String> {
     FleetSignal::ALL
         .into_iter()
         .map(|signal| format!("{:<8} {}", signal.name(), signal.meaning()))

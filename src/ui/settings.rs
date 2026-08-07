@@ -7,8 +7,9 @@ use ratatui::{
 };
 
 use super::widgets::{
-    action_button_row_rects, centered_popup_rect, modal_stack_areas, panel_contrast_fg,
-    render_action_button, render_modal_choice_list, render_panel_shell, ActionButtonSpec,
+    action_button_row_rects, centered_popup_rect, modal_choice_rows, modal_stack_areas,
+    panel_contrast_fg, render_action_button, render_modal_choice_list, render_modal_description,
+    render_panel_shell, ActionButtonSpec,
 };
 use crate::{
     app::{state::Palette, AppState},
@@ -106,6 +107,21 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
         SettingsSection::Theme => {
             render_settings_theme(app, frame, content_area);
         }
+        SettingsSection::Animation => {
+            render_settings_toggle_rows(
+                frame,
+                content_area,
+                p,
+                "how the tree moves — off leaves everything drawn at rest",
+                &[
+                    ("card breathing", app.sidebar_cards.pulse),
+                    ("card state wash", app.sidebar_cards.wash),
+                    ("card stage colour", app.sidebar_cards.stage_hue),
+                    ("signal badge motion", app.sidebar_signal_tray.animate),
+                ],
+                app.settings.list.selected,
+            );
+        }
         SettingsSection::Indicators => {
             render_modal_choice_list(
                 frame,
@@ -162,6 +178,22 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
                 app.agent_border_labels_enabled(),
                 app.settings.list.selected,
             );
+        }
+        SettingsSection::Signals => {
+            render_settings_toggle_rows(
+                frame,
+                content_area,
+                p,
+                "the bottom-left tray — fleet and repository signals waiting on you",
+                &[
+                    ("show tray", app.sidebar_signal_tray.enabled),
+                    ("allow in-place actions", app.sidebar_signal_tray.actions),
+                ],
+                app.settings.list.selected,
+            );
+        }
+        SettingsSection::Legend => {
+            render_settings_legend(app, frame, content_area);
         }
         SettingsSection::Integrations => {
             render_settings_integrations(app, frame, content_area);
@@ -225,6 +257,8 @@ pub(crate) fn settings_show_primary_action(app: &AppState) -> bool {
             .integration_recommendations
             .iter()
             .any(crate::integration::IntegrationRecommendation::needs_install),
+        // Read-only reference content: there is nothing to apply, only to close.
+        crate::app::state::SettingsSection::Legend => false,
         _ => true,
     }
 }
@@ -422,4 +456,73 @@ fn render_settings_toggle(
         p,
         1,
     );
+}
+
+/// A list of independently switched settings, one row each.
+///
+/// [`render_modal_choice_list`] draws one title with several mutually
+/// exclusive values; this draws several titles that each carry their own
+/// on/off, which is what a section like animation needs — turning off card
+/// breathing says nothing about whether the wash is on.
+fn render_settings_toggle_rows(
+    frame: &mut Frame,
+    area: Rect,
+    p: &Palette,
+    description: &str,
+    rows: &[(&str, bool)],
+    selected_idx: usize,
+) {
+    let [desc_area, _, list_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(2),
+    ])
+    .areas::<3>(area);
+
+    render_modal_description(
+        frame,
+        desc_area,
+        description,
+        Style::default().fg(p.overlay1),
+    );
+
+    let list_rows = modal_choice_rows(list_area, rows.len(), 1);
+    for (idx, ((label, value), row)) in rows.iter().zip(list_rows.iter()).enumerate() {
+        let marker = if *value { "on" } else { "off" };
+        let is_selected = idx == selected_idx;
+        let style = if is_selected {
+            Style::default()
+                .bg(p.surface0)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0)
+        };
+        frame.render_widget(
+            Paragraph::new(format!(" {label}: {marker}"))
+                .style(style)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            *row,
+        );
+    }
+}
+
+/// The fleet-signal legend: what each of the eight tray slots means.
+///
+/// Draws the same lines the tray's own `···` popover shows — see
+/// [`super::signal_tray_popup::legend_lines`] — so the meanings live in one
+/// place read from two surfaces rather than a copy that could drift from the
+/// tray's own reference.
+fn render_settings_legend(app: &AppState, frame: &mut Frame, area: Rect) {
+    let p = &app.palette;
+    let lines: Vec<Line> = super::signal_tray_popup::legend_lines()
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                format!(" {line}"),
+                Style::default().fg(p.subtext0),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
