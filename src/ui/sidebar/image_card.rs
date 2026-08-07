@@ -2681,15 +2681,23 @@ impl Rasteriser<'_> {
             None => UndissolvedSheet(std::sync::Arc::new(draw()?)),
         };
         let (width_px, height_px) = (base.0.width(), base.0.height());
-        let data = match self.dissolve {
+        let dissolved;
+        let canvas: &Canvas = match self.dissolve {
             Some(dissolve) => {
                 let mut canvas = Canvas::clone(&base.0);
                 dissolve.apply(&mut canvas, self.dissolve_origin(rect), self.field_px());
-                encode_png(&canvas)
+                dissolved = canvas;
+                &dissolved
             }
-            None => encode_png(&base.0),
-        }
-        .ok_or(())?;
+            None => &base.0,
+        };
+        // Picked once per image rather than per client: the same rasterised
+        // bytes back every attached client's placement of this image, so a
+        // single global "is the host terminal local and known-fast" answer
+        // is what all of them get. See `preferred_card_pixel_format`.
+        let format =
+            crate::kitty_graphics::preferred_card_pixel_format(canvas_is_fully_opaque(canvas));
+        let data = encode_canvas(canvas, format).ok_or(())?;
         Ok(SidebarCardLayer {
             rect,
             // Replaced by `aim_at` before this reaches anything that draws. The
@@ -2702,7 +2710,7 @@ impl Rasteriser<'_> {
             // Only while a transition is running: a settled panel keeps no
             // second copy of artwork it is not about to take apart.
             undissolved: self.dissolve.map(|_| base),
-            layer: card_layer(width_px, height_px, data, rect),
+            layer: card_layer(format, width_px, height_px, data, rect),
         })
     }
 
@@ -2950,13 +2958,14 @@ fn hash_placed(hasher: &mut DefaultHasher, frame: &Rect, rect: &Rect, content: &
 
 /// The placement a finished image is published as.
 fn card_layer(
+    format: crate::api::schema::PaneGraphicsFormat,
     width_px: u32,
     height_px: u32,
     data: Vec<u8>,
     sheet_rect: Rect,
 ) -> crate::app::state::GraphicsLayer {
     crate::app::state::GraphicsLayer::new(
-        crate::api::schema::PaneGraphicsFormat::Png,
+        format,
         width_px,
         height_px,
         data,
@@ -3177,6 +3186,42 @@ fn sheet_dissolve(app: &AppState, cell_size: HostCellSize) -> Option<DissolveFra
     })
 }
 
+/// Whether every pixel is fully opaque — the gate `preferred_card_pixel_format`
+/// needs before it will hand a canvas to an alpha-losing raw format. Herdr's
+/// cards are translucent by design (gutters, glow falloff, rounded corners),
+/// so this is expected to come back `false` for most real card sheets; a
+/// single-image API payload or a full-bleed background wash are the cases
+/// it exists for.
+fn canvas_is_fully_opaque(sheet: &Canvas) -> bool {
+    sheet.rgba8().chunks_exact(4).all(|pixel| pixel[3] == 255)
+}
+
+/// Encodes a finished canvas in whichever format the host terminal is fast
+/// at (`preferred_card_pixel_format`), falling back to PNG for anything else.
+fn encode_canvas(
+    sheet: &Canvas,
+    format: crate::api::schema::PaneGraphicsFormat,
+) -> Option<Vec<u8>> {
+    match format {
+        crate::api::schema::PaneGraphicsFormat::Png => encode_png(sheet),
+        crate::api::schema::PaneGraphicsFormat::Rgba => Some(sheet.rgba8().to_vec()),
+        crate::api::schema::PaneGraphicsFormat::Rgb => Some(rgba_to_rgb(sheet.rgba8())),
+    }
+}
+
+/// Drops the alpha byte from each pixel. The canvas is always fully opaque
+/// where a card draws and transparent elsewhere; RGB has no way to carry
+/// that transparency, so this format is only ever selected for a terminal
+/// (`f=24` kitty) that composites the sheet the same way the RGBA path does
+/// — see `preferred_local_pixel_format`.
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    out
+}
+
 fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, sheet.width(), sheet.height());
@@ -3190,6 +3235,87 @@ fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
     writer.write_image_data(sheet.rgba8()).ok()?;
     drop(writer);
     Some(out)
+}
+
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::*;
+
+    fn opaque_canvas(width: u32, height: u32) -> Canvas {
+        let mut canvas = Canvas::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                canvas.blend(x, y, Rgb(10, 20, 30), 1.0);
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn a_fresh_canvas_is_fully_transparent_not_opaque() {
+        // `Canvas::new` zero-fills, which is alpha 0 everywhere — the gutter
+        // state every real card sheet starts from.
+        let canvas = Canvas::new(4, 4);
+        assert!(!canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn a_canvas_blended_at_full_alpha_everywhere_is_opaque() {
+        let canvas = opaque_canvas(4, 4);
+        assert!(canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn a_single_untouched_pixel_makes_the_whole_canvas_non_opaque() {
+        // Blending translucent paint over an already-opaque pixel keeps it
+        // opaque (source-over composites alpha, it does not overwrite it),
+        // so the only way to get a non-opaque pixel here is to leave one
+        // unpainted — exactly what a real sheet's gutter looks like.
+        let mut canvas = Canvas::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                if (x, y) != (2, 2) {
+                    canvas.blend(x, y, Rgb(10, 20, 30), 1.0);
+                }
+            }
+        }
+        assert!(!canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn rgba_to_rgb_drops_every_fourth_byte() {
+        let rgba = vec![1, 2, 3, 255, 4, 5, 6, 128];
+        assert_eq!(rgba_to_rgb(&rgba), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn encode_canvas_rgba_is_the_canvas_bytes_verbatim() {
+        let canvas = opaque_canvas(2, 2);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgba)
+            .expect("rgba encode");
+        assert_eq!(encoded, canvas.rgba8());
+    }
+
+    #[test]
+    fn encode_canvas_rgb_strips_alpha_from_the_canvas_bytes() {
+        let canvas = opaque_canvas(2, 2);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgb)
+            .expect("rgb encode");
+        assert_eq!(encoded, rgba_to_rgb(canvas.rgba8()));
+        assert_eq!(encoded.len(), canvas.rgba8().len() / 4 * 3);
+    }
+
+    #[test]
+    fn encode_canvas_png_round_trips_through_the_png_decoder() {
+        let canvas = opaque_canvas(3, 3);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Png)
+            .expect("png encode");
+        let decoder = png::Decoder::new(encoded.as_slice());
+        let mut reader = decoder.read_info().expect("png header");
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).expect("png frame");
+        assert_eq!(&buf[..info.buffer_size()], canvas.rgba8());
+    }
 }
 
 #[cfg(test)]
