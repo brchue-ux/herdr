@@ -821,6 +821,18 @@ pub(crate) mod names {
     /// full amount, so when this has crossed, the whole card is in the state it
     /// changed into. The card is different afterwards, and it looks it.
     pub(crate) const CARD_WASH: &str = "card-wash";
+    /// Bounded: a command-acknowledgement marker snapping in.
+    ///
+    /// The same [`super::Curve::SnapArrival`] arrival [`CARD_WASH`] plays,
+    /// reused verbatim rather than a second motion character invented for one
+    /// more effect — see this module's own header on why a new named
+    /// behaviour is a value, not a new curve. [`super::Field::Uniform`]
+    /// because the whole marker is one glyph rather than a span to sweep
+    /// across; it plays once on arrival and, like [`CARD_WASH`], has nothing
+    /// left to be once it lands, so the element's hold and dismount are timed
+    /// by how long its caller keeps publishing it rather than by a second
+    /// stage here.
+    pub(crate) const CMD_ACK: &str = "cmd-ack";
 }
 
 /// How long one rest breath takes.
@@ -948,6 +960,24 @@ const CARD_FRAME_INTERVAL: Duration = SMOOTH_FRAME_INTERVAL;
 /// reader's eye has finished travelling to it.
 pub(crate) const CARD_WASH_PERIOD: Duration = Duration::from_millis(520);
 
+/// How long a command-acknowledgement marker takes to snap in.
+///
+/// Faster than [`CARD_WASH_PERIOD`]: a wash crosses a whole card, a marker is
+/// one glyph, and the snap should read as a flick rather than a sweep.
+pub(crate) const CMD_ACK_MOUNT_PERIOD: Duration = Duration::from_millis(280);
+
+/// How long a command-acknowledgement marker holds at full brightness before
+/// it is allowed to start fading.
+///
+/// Together with [`CMD_ACK_MOUNT_PERIOD`] and [`CMD_ACK_DISMOUNT_PERIOD`] this
+/// totals a visible lifetime of about 1.7s — in the neighbourhood the scoping
+/// report recommended (roughly 1.5–2.0s, alongside every other "notice me"
+/// timing already tuned on this fork).
+pub(crate) const CMD_ACK_HOLD_PERIOD: Duration = Duration::from_millis(1_100);
+
+/// How long a command-acknowledgement marker takes to fade once its hold ends.
+pub(crate) const CMD_ACK_DISMOUNT_PERIOD: Duration = Duration::from_millis(320);
+
 /// How much of the card the wash's leading edge takes to go from nothing to
 /// full, as a fraction of its width.
 ///
@@ -1030,7 +1060,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 21] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 22] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -1345,6 +1375,23 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 21] {
                 curve: Curve::SnapArrival,
                 paint: Paint::tint(Ink::Accent, 1.0),
                 period: CARD_WASH_PERIOD,
+                frame_interval: CARD_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        (
+            names::CMD_ACK,
+            Behaviour {
+                // `BASE`'s own reveal paint, untouched — the same fade-in
+                // [`FADE`] uses for the opposite direction, so a marker's
+                // arrival and its eventual dismount speak the same visual
+                // language: coverage rising from the surface rather than a
+                // colour tinting in. That is also what lets the hold in
+                // between read as seamless — see `CmdAcks::lifecycle`'s own
+                // doc for why the idle phase deliberately declares no
+                // behaviour of its own.
+                curve: Curve::SnapArrival,
+                period: CMD_ACK_MOUNT_PERIOD,
                 frame_interval: CARD_FRAME_INTERVAL,
                 ..BASE
             },

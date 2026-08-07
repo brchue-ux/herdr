@@ -148,6 +148,19 @@ impl App {
             return;
         }
 
+        if let AppEvent::CommandAcknowledged {
+            pane_id,
+            observed_at,
+        } = ev
+        {
+            self.state
+                .sidebar_cmd_acks
+                .record(crate::anim::CardRow::Agent(pane_id), observed_at);
+            self.render_dirty.request_generic();
+            self.render_notify.notify_one();
+            return;
+        }
+
         if let AppEvent::PluginCommandFinished {
             log_id,
             finished_unix_ms,

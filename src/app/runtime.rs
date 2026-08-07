@@ -479,7 +479,13 @@ impl App {
         // rather than a decoration on a row, and one already in flight has to
         // be able to finish even when nothing else in the panel is animating.
         let switching = has_viewers && self.state.tree_view_switch_active();
-        if !tree && !signals && !switching && !badges {
+        // A command ack is an event a screen-detection scan fired moments ago,
+        // not a configured feature — unlike every family above it, it has no
+        // "is this switched on" flag of its own to gate on, only "is one
+        // currently live". `tree` still folds in below so a card breathing for
+        // an unrelated reason does not make this recompute `live` twice.
+        let acks_pending = has_viewers && self.state.sidebar_cmd_acks.any_live();
+        if !tree && !signals && !switching && !badges && !acks_pending {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
@@ -489,7 +495,8 @@ impl App {
             // animating history is exactly what `Animator::forget_all` exists
             // to prevent.
             let washed = self.state.sidebar_card_washes.forget_all();
-            return forgotten || remembered || washed;
+            let acked = self.state.sidebar_cmd_acks.forget_all();
+            return forgotten || remembered || washed || acked;
         }
 
         // Adopting a due root comes first, because it is what decides which
@@ -526,6 +533,7 @@ impl App {
                 .anim
                 .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
         let agents_changed = self.observe_agent_rows(now, &lifecycle, tree, washes);
+        let acks_changed = self.observe_cmd_acks(now, tree || acks_pending);
 
         // One segment per row with a gap still open beneath it — see
         // `sidebar_trunk_segment_members`. Its own lifecycle rather than the
@@ -584,6 +592,7 @@ impl App {
             || spaces_changed
             || agents_changed
             || trunk_changed
+            || acks_changed
             || signals_changed
             || badges_changed
     }
@@ -709,6 +718,43 @@ impl App {
         self.state
             .anim
             .observe(now, crate::anim::Family::CardWash, &lifecycle, members)
+    }
+
+    /// Publish the command-acknowledgement markers live right now, and prune
+    /// the ones this module no longer has any reason to remember.
+    ///
+    /// `active` is false when neither the tree nor a pending marker gives this
+    /// pass a reason to look — see [`Self::advance_animations`]'s own
+    /// `acks_pending` — in which case the live agent rows are not even fetched:
+    /// there is nothing to prune against that a card leaving the tree could
+    /// not already tell [`crate::app::cmd_ack::CmdAcks::observe`] by simply not
+    /// being in `live_rows`.
+    fn observe_cmd_acks(&mut self, now: Instant, active: bool) -> bool {
+        let live_rows: Vec<crate::anim::CardRow> = if active {
+            crate::ui::sidebar_agent_live_entries(&self.state)
+                .into_iter()
+                .map(|entry| crate::anim::CardRow::Agent(entry.pane_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let active_window = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD
+            + crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+        // Has to outlast `active_window` by at least the dismount stage's own
+        // duration — see `CmdAcks::observe`'s own doc on why, or the sidebar
+        // stops drawing a marker mid-fade.
+        let retain_window = active_window + crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD;
+        let members =
+            self.state
+                .sidebar_cmd_acks
+                .observe(now, active_window, retain_window, live_rows);
+        let lifecycle = crate::app::cmd_ack::CmdAcks::lifecycle(
+            crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD,
+            crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD,
+        );
+        self.state
+            .anim
+            .observe(now, crate::anim::Family::CmdAck, &lifecycle, members)
     }
 
     /// Fold the fleet's current state into the notification tray.

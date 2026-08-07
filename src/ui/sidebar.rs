@@ -2864,6 +2864,14 @@ fn render_agent_row(
         .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
         .unwrap_or(0);
     let summary_badge = worker_summary_badge(app, entries, agents, card);
+    let cmd_ack_row = crate::anim::CardRow::Agent(detail.pane_id);
+    let cmd_ack_instances: Vec<u64> = app.sidebar_cmd_acks.live(&cmd_ack_row).collect();
+    let cmd_ack_reserved = summary_badge
+        .as_ref()
+        .map(|(_, count)| worker_summary_badge_rect(card, *count).width)
+        .unwrap_or(0);
+    let cmd_ack_width =
+        cmd_ack_strip_width(cmd_ack_instances.len(), card.rect.width, cmd_ack_reserved);
     // This row's own life, not its Space's: a worker arrives when it starts and
     // leaves when it finishes, which is what makes its second mate's group grow
     // and shrink around it.
@@ -2947,6 +2955,7 @@ fn render_agent_row(
                 .as_ref()
                 .map(|(_, count)| usize::from(worker_summary_badge_rect(card, *count).width))
                 .unwrap_or(0)
+                + usize::from(cmd_ack_width)
         } else {
             0
         } + if row_index == last_content_row {
@@ -3052,6 +3061,19 @@ fn render_agent_row(
         if !covered {
             render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
         }
+    }
+
+    if !cmd_ack_instances.is_empty() && !covered {
+        render_cmd_acks(
+            app,
+            frame,
+            card,
+            &cmd_ack_row,
+            &cmd_ack_instances,
+            cmd_ack_reserved,
+            cmd_ack_width,
+            list_bottom,
+        );
     }
 }
 
@@ -3204,6 +3226,104 @@ fn render_worker_summary_badge(
             .alignment(Alignment::Right),
         rect,
     );
+}
+
+/// Max simultaneous command-ack glyphs one card's row draws at once.
+///
+/// The animation engine tracks every instance independently regardless of
+/// this cap — see [`crate::app::cmd_ack::CmdAcks`]'s own header on why the
+/// captain's call was one instance per detected command rather than a
+/// coalesced counter. This is purely the scoping report's "soft legibility
+/// damping" for a card busy enough that drawing every one of them would be
+/// noise rather than signal: the newest instances win the row's limited
+/// width, and the ones that lose the draw are still animating, just off
+/// screen.
+const CMD_ACK_MAX_VISIBLE: usize = 6;
+
+/// The glyph drawn per acknowledged command.
+///
+/// Deliberately not the command text or its output — the scoping report's
+/// §2/§4, unchanged by the captain's multiplicity answer — a short marker is
+/// the whole content, and the output already lives in the pane's own
+/// scrollback.
+const CMD_ACK_GLYPH: char = '●';
+
+/// Columns a strip of `instance_count` command-ack glyphs takes on a row
+/// `row_width` wide with `reserved` columns already spoken for (the worker
+/// summary badge, if the card has one), or `0` when there is nothing to draw
+/// or no room left to draw it in.
+fn cmd_ack_strip_width(instance_count: usize, row_width: u16, reserved: u16) -> u16 {
+    let glyphs = instance_count.min(CMD_ACK_MAX_VISIBLE) as u16;
+    if glyphs == 0 {
+        return 0;
+    }
+    // Needs the glyphs themselves and something left over for the row's own
+    // name and its chevron; below that the row is better off with just a
+    // name, the same trade `worker_summary_badge_width` makes.
+    let budget = row_width.saturating_sub(reserved + 2);
+    glyphs.min(budget)
+}
+
+/// Where a command-ack strip of `width` columns sits, immediately left of
+/// whatever else (the worker summary badge) has already reserved `reserved`
+/// columns from the card's right edge.
+fn cmd_ack_strip_rect(
+    card: &crate::app::state::WorkspaceCardArea,
+    reserved: u16,
+    width: u16,
+) -> Rect {
+    if card.rect.height == 0 || width == 0 {
+        return Rect::default();
+    }
+    Rect::new(
+        card.control_right().saturating_sub(1 + reserved + width),
+        card.content_y(),
+        width,
+        1,
+    )
+}
+
+/// Draw up to [`CMD_ACK_MAX_VISIBLE`] command-acknowledgement markers at the
+/// right edge of a card's first row.
+///
+/// Each glyph is its own animation element with its own settle clock — see
+/// [`crate::app::cmd_ack::CmdAcks`] — so a burst of commands reads as several
+/// independently ticking markers rather than one that restarted.
+fn render_cmd_acks(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    row: &crate::anim::CardRow,
+    instances: &[u64],
+    reserved: u16,
+    width: u16,
+    list_bottom: u16,
+) {
+    let rect = cmd_ack_strip_rect(card, reserved, width);
+    if rect.width == 0 || rect.y >= list_bottom {
+        return;
+    }
+    let base = Style::default().fg(app.palette.accent);
+    // The newest instances are the ones still worth a reader's attention when
+    // the row cannot show every one of them.
+    let visible = &instances[instances.len().saturating_sub(usize::from(rect.width))..];
+    let mut spans = Vec::with_capacity(visible.len());
+    for &seq in visible {
+        let id = crate::anim::ElementId::CmdAck(crate::anim::CmdAck {
+            row: row.clone(),
+            seq,
+        });
+        push_animated_span(
+            &mut spans,
+            CMD_ACK_GLYPH.to_string(),
+            base,
+            app.anim.frame(&id, None),
+            backdrop_rgb(app),
+            &app.palette,
+            &app.host_terminal_theme,
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
 /// Indent and connector for one row's first column run, in either panel.
@@ -8985,6 +9105,198 @@ rows = [
         );
 
         assert_eq!(row, "Rebuild fitne…");
+    }
+
+    /// A first mate owning one worker, for the command-acknowledgement render
+    /// tests: `summary_fleet`'s shape without the summary, and a plain
+    /// `PaneId` handle back so a test can drive `sidebar_cmd_acks` directly
+    /// against the exact row it renders.
+    fn single_worker_fleet() -> (crate::app::state::AppState, crate::layout::PaneId) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Working;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]),
+            None,
+            now,
+        );
+        (app, worker_pane)
+    }
+
+    /// Renders `app` at the sidebar width the captain runs — see
+    /// `ownership_is_drawn_as_written::CAPTAIN_SIDEBAR_WIDTH`, the same 42
+    /// columns, kept as a separate literal here so this module does not reach
+    /// into a sibling test module for a constant that is really just "how
+    /// wide the captain's panel is" — and returns the drawn buffer.
+    fn render_cmd_ack_fleet(app: &mut crate::app::state::AppState) -> ratatui::buffer::Buffer {
+        const WIDTH: u16 = 42;
+        let area = Rect::new(0, 0, WIDTH, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(app, area);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn find_all_symbol_x(
+        buffer: &ratatui::buffer::Buffer,
+        row: u16,
+        width: u16,
+        symbol: &str,
+    ) -> Vec<u16> {
+        (0..width)
+            .filter(|&x| buffer[(x, row)].symbol() == symbol)
+            .collect()
+    }
+
+    fn worker_row(buffer: &ratatui::buffer::Buffer, width: u16) -> u16 {
+        (0..20)
+            .find(|&y| row_text(buffer, y, width).contains("worker"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no worker row on screen:\n{}",
+                    (0..20)
+                        .map(|y| row_text(buffer, y, width))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+    }
+
+    /// Drives the same fold `App::advance_animations` uses for command acks —
+    /// `CmdAcks::observe` into `Animator::observe` — without pulling in the
+    /// full app-loop tick, so the test controls the wall clock exactly.
+    fn advance_cmd_acks(
+        app: &mut crate::app::state::AppState,
+        pane_id: crate::layout::PaneId,
+        now: std::time::Instant,
+    ) {
+        let mount = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD;
+        let hold = crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+        let dismount = crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD;
+        let active_window = mount + hold;
+        let retain_window = active_window + dismount;
+        let lifecycle = crate::app::cmd_ack::CmdAcks::lifecycle(mount, dismount);
+        let row = crate::anim::CardRow::Agent(pane_id);
+        let members = app
+            .sidebar_cmd_acks
+            .observe(now, active_window, retain_window, [row]);
+        app.anim
+            .observe(now, crate::anim::Family::CmdAck, &lifecycle, members);
+    }
+
+    /// The end-to-end proof this task asked for: a real render, at the
+    /// sidebar width the captain runs, of two commands acknowledged apart in
+    /// time — showing they are two genuinely independent settle clocks rather
+    /// than one marker restarting, and rather than a coalesced "×2" counter.
+    #[test]
+    fn two_commands_recorded_apart_animate_as_two_independent_instances() {
+        let (mut app, pane_id) = single_worker_fleet();
+        let row = crate::anim::CardRow::Agent(pane_id);
+        let glyph = CMD_ACK_GLYPH.to_string();
+        let t0 = std::time::Instant::now();
+        let mount = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD;
+        let window = mount + crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+
+        app.sidebar_cmd_acks.record(row.clone(), t0);
+        advance_cmd_acks(&mut app, pane_id, t0);
+
+        // Snapshot 1, mid-mount: only the first command has run.
+        let mid_mount = t0 + mount / 2;
+        advance_cmd_acks(&mut app, pane_id, mid_mount);
+        let buffer1 = render_cmd_ack_fleet(&mut app);
+        let y = worker_row(&buffer1, 42);
+        let xs1 = find_all_symbol_x(&buffer1, y, 42, &glyph);
+        assert_eq!(
+            xs1.len(),
+            1,
+            "only one command has run so far:\n{}",
+            row_text(&buffer1, y, 42)
+        );
+
+        // The second command runs 600ms later — long after the first has
+        // settled into its hold — so the two are caught at visibly different
+        // points in their own settle at the same wall-clock instant.
+        let t1 = t0 + std::time::Duration::from_millis(600);
+        app.sidebar_cmd_acks.record(row.clone(), t1);
+        advance_cmd_acks(&mut app, pane_id, t1);
+        let buffer2 = render_cmd_ack_fleet(&mut app);
+        let xs2 = find_all_symbol_x(&buffer2, y, 42, &glyph);
+        assert_eq!(
+            xs2.len(),
+            2,
+            "a burst of two commands is two markers, not a coalesced counter:\n{}",
+            row_text(&buffer2, y, 42)
+        );
+        let fg = |buffer: &ratatui::buffer::Buffer, x: u16| buffer[(x, y)].fg;
+        let a_at_t1 = fg(&buffer2, xs2[0]);
+        let b_at_t1 = fg(&buffer2, xs2[1]);
+        assert_ne!(
+            a_at_t1,
+            b_at_t1,
+            "the settled first marker and the still-snapping-in second marker \
+             must not read as the same frame:\n{}",
+            row_text(&buffer2, y, 42)
+        );
+
+        // The first marker's window has now closed and it starts fading out
+        // on its own schedule; the second, meanwhile, has had time to finish
+        // its own mount and settle into its hold. Reaching the boundary is
+        // its own pass — it is what starts the dismount clock — and only a
+        // further pass after that lets the fade actually progress before
+        // this snapshot.
+        advance_cmd_acks(&mut app, pane_id, t0 + window);
+        let t2 = t0 + window + std::time::Duration::from_millis(70);
+        advance_cmd_acks(&mut app, pane_id, t2);
+        let buffer3 = render_cmd_ack_fleet(&mut app);
+        let xs3 = find_all_symbol_x(&buffer3, y, 42, &glyph);
+        assert_eq!(
+            xs3.len(),
+            2,
+            "the second marker must still be live while the first fades:\n{}",
+            row_text(&buffer3, y, 42)
+        );
+        let a_at_t2 = fg(&buffer3, xs3[0]);
+        let b_at_t2 = fg(&buffer3, xs3[1]);
+        assert_ne!(
+            a_at_t1, a_at_t2,
+            "the first marker's own colour must have moved as it faded — a \
+             static marker is not an animation"
+        );
+        assert_ne!(
+            b_at_t1, b_at_t2,
+            "the second marker's own colour must have moved too, as it snapped \
+             in from where it started at t1 to settled at t2 — each marker \
+             ticks its own clock, not a shared one"
+        );
+        assert_eq!(
+            a_at_t1, b_at_t2,
+            "a marker fully settled into its hold reads the same regardless \
+             of which instance it is — the first at t1, the second at t2"
+        );
     }
 }
 
