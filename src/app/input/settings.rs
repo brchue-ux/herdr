@@ -14,10 +14,16 @@ use crate::{
 #[allow(clippy::enum_variant_names)]
 pub(super) enum SettingsAction {
     SaveTheme(String),
+    SaveCardPulse(bool),
+    SaveCardWash(bool),
+    SaveCardStageHue(bool),
     SaveStatusIndicators(StatusIndicatorStyle),
     SaveSound(bool),
     SaveToastDelivery(ToastDelivery),
     SaveAgentBorderLabels(bool),
+    SaveSignalTrayEnabled(bool),
+    SaveSignalTrayActions(bool),
+    SaveSignalTrayAnimate(bool),
     InstallRecommendedIntegrations,
 }
 
@@ -27,11 +33,23 @@ impl App {
         if let Some(action) = update_settings_state(&mut self.state, key) {
             match action {
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                SettingsAction::SaveCardPulse(enabled) => self.save_card_pulse(enabled),
+                SettingsAction::SaveCardWash(enabled) => self.save_card_wash(enabled),
+                SettingsAction::SaveCardStageHue(enabled) => self.save_card_stage_hue(enabled),
                 SettingsAction::SaveStatusIndicators(style) => self.save_status_indicators(style),
                 SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                 SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
                 SettingsAction::SaveAgentBorderLabels(enabled) => {
                     self.save_agent_border_labels(enabled)
+                }
+                SettingsAction::SaveSignalTrayEnabled(enabled) => {
+                    self.save_signal_tray_enabled(enabled)
+                }
+                SettingsAction::SaveSignalTrayActions(enabled) => {
+                    self.save_signal_tray_actions(enabled)
+                }
+                SettingsAction::SaveSignalTrayAnimate(enabled) => {
+                    self.save_signal_tray_animate(enabled)
                 }
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
@@ -121,6 +139,51 @@ fn cancel_settings(state: &mut AppState) {
     super::modal::leave_modal(state);
 }
 
+/// How many independently toggled rows the animation section lists: card
+/// breathing, card wash, card stage colour, and signal badge motion.
+const ANIMATION_ROW_COUNT: usize = 4;
+/// How many independently toggled rows the fleet-signal tray section lists:
+/// whether the tray is shown, and whether it may act in place.
+const SIGNALS_ROW_COUNT: usize = 2;
+
+/// The row highlighted when a section is switched to, before any input.
+///
+/// Centralised because switching sections has to seed a value-matching index
+/// for every section that reads one, and a caller re-deriving that mapping
+/// per call site is exactly how the pane-labels tab and the theme tab drift
+/// apart from each other.
+fn initial_list_index(state: &AppState, section: SettingsSection) -> usize {
+    match section {
+        SettingsSection::Theme => current_theme_index(&state.theme_name),
+        SettingsSection::Animation => 0,
+        SettingsSection::Indicators => status_indicator_index(state.status_indicators),
+        SettingsSection::Sound => usize::from(!state.sound_enabled()),
+        SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
+        SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
+        SettingsSection::Signals => 0,
+        SettingsSection::Legend => 0,
+        SettingsSection::Integrations => 0,
+    }
+}
+
+/// What toggling the highlighted row in the animation section saves.
+fn toggle_animation_row(state: &AppState, row: usize) -> SettingsAction {
+    match row {
+        0 => SettingsAction::SaveCardPulse(!state.sidebar_cards.pulse),
+        1 => SettingsAction::SaveCardWash(!state.sidebar_cards.wash),
+        2 => SettingsAction::SaveCardStageHue(!state.sidebar_cards.stage_hue),
+        _ => SettingsAction::SaveSignalTrayAnimate(!state.sidebar_signal_tray.animate),
+    }
+}
+
+/// What toggling the highlighted row in the fleet-signal tray section saves.
+fn toggle_signals_row(state: &AppState, row: usize) -> SettingsAction {
+    match row {
+        0 => SettingsAction::SaveSignalTrayEnabled(!state.sidebar_signal_tray.enabled),
+        _ => SettingsAction::SaveSignalTrayActions(!state.sidebar_signal_tray.actions),
+    }
+}
+
 fn integrations_need_install(state: &AppState) -> bool {
     state
         .integration_recommendations
@@ -166,8 +229,9 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 }
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                state.settings.section = SettingsSection::Indicators;
-                state.settings.list.selected = status_indicator_index(state.status_indicators);
+                state.settings.section = SettingsSection::Animation;
+                state.settings.list.selected =
+                    initial_list_index(state, SettingsSection::Animation);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 state.settings.section = SettingsSection::Integrations;
@@ -178,6 +242,31 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 Some(super::modal::ModalAction::Close) => cancel_settings(state),
                 _ => {}
             },
+        },
+        SettingsSection::Animation => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.settings.list.move_next(ANIMATION_ROW_COUNT);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return Some(toggle_animation_row(state, state.settings.list.selected));
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::Theme;
+                state.settings.list.selected = initial_list_index(state, SettingsSection::Theme);
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Indicators;
+                state.settings.list.selected =
+                    initial_list_index(state, SettingsSection::Indicators);
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
         },
         SettingsSection::Indicators => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -194,8 +283,9 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 return Some(SettingsAction::SaveStatusIndicators(style));
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::Theme;
-                state.settings.list.selected = current_theme_index(&state.theme_name);
+                state.settings.section = SettingsSection::Animation;
+                state.settings.list.selected =
+                    initial_list_index(state, SettingsSection::Animation);
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Sound;
@@ -269,8 +359,51 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 state.settings.list.selected = toast_delivery_index(state.toast_delivery());
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Signals;
+                state.settings.list.selected = initial_list_index(state, SettingsSection::Signals);
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
+        SettingsSection::Signals => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.settings.list.move_next(SIGNALS_ROW_COUNT);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return Some(toggle_signals_row(state, state.settings.list.selected));
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::PaneLabels;
+                state.settings.list.selected =
+                    initial_list_index(state, SettingsSection::PaneLabels);
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Legend;
+                state.settings.list.selected = initial_list_index(state, SettingsSection::Legend);
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
+        SettingsSection::Legend => match key.code {
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::Signals;
+                state.settings.list.selected = initial_list_index(state, SettingsSection::Signals);
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Integrations;
-                state.settings.list.selected = 0;
+                state.settings.list.selected =
+                    initial_list_index(state, SettingsSection::Integrations);
             }
             _ => {
                 if let Some(super::modal::ModalAction::Close) =
@@ -285,8 +418,8 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 return Some(SettingsAction::InstallRecommendedIntegrations);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::PaneLabels;
-                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
+                state.settings.section = SettingsSection::Legend;
+                state.settings.list.selected = initial_list_index(state, SettingsSection::Legend);
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Theme;
@@ -312,14 +445,7 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
     state.settings.original_palette = Some(state.palette.clone());
     state.settings.original_theme = Some(state.theme_name.clone());
     state.settings.section = section;
-    state.settings.list.selected = match section {
-        SettingsSection::Theme => current_theme_index(&state.theme_name),
-        SettingsSection::Indicators => status_indicator_index(state.status_indicators),
-        SettingsSection::Sound => usize::from(!state.sound_enabled()),
-        SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
-        SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
-        SettingsSection::Integrations => 0,
-    };
+    state.settings.list.selected = initial_list_index(state, section);
     state.mode = Mode::Settings;
 }
 
@@ -424,7 +550,26 @@ impl AppState {
                     None
                 }
             }
-            SettingsSection::Integrations => None,
+            SettingsSection::Animation => {
+                let list_y = area.y + 3;
+                let rows = ANIMATION_ROW_COUNT as u16;
+                if row >= list_y && row < list_y.saturating_add(rows) {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
+            SettingsSection::Signals => {
+                let list_y = area.y + 3;
+                let rows = SIGNALS_ROW_COUNT as u16;
+                if row >= list_y && row < list_y.saturating_add(rows) {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
+            // Read-only reference content: nothing to click.
+            SettingsSection::Legend | SettingsSection::Integrations => None,
         }
     }
 
@@ -432,19 +577,9 @@ impl AppState {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(section) = self.settings_tab_at(mouse.column, mouse.row) {
+                    let idx = initial_list_index(self, section);
                     self.settings.section = section;
-                    self.settings.list.select(match section {
-                        SettingsSection::Theme => current_theme_index(&self.theme_name),
-                        SettingsSection::Indicators => {
-                            status_indicator_index(self.status_indicators)
-                        }
-                        SettingsSection::Sound => usize::from(!self.sound_enabled()),
-                        SettingsSection::Toast => toast_delivery_index(self.toast_delivery()),
-                        SettingsSection::PaneLabels => {
-                            usize::from(!self.agent_border_labels_enabled())
-                        }
-                        SettingsSection::Integrations => 0,
-                    });
+                    self.settings.list.select(idx);
                     return None;
                 }
                 if let Some(idx) = self.settings_list_index_at(mouse.column, mouse.row) {
@@ -469,7 +604,9 @@ impl AppState {
                             let enabled = idx == 0;
                             Some(SettingsAction::SaveAgentBorderLabels(enabled))
                         }
-                        SettingsSection::Integrations => None,
+                        SettingsSection::Animation => Some(toggle_animation_row(self, idx)),
+                        SettingsSection::Signals => Some(toggle_signals_row(self, idx)),
+                        SettingsSection::Legend | SettingsSection::Integrations => None,
                     };
                 }
 
@@ -524,7 +661,7 @@ mod tests {
         );
         assert_eq!(
             state.settings.section,
-            crate::app::state::SettingsSection::Indicators
+            crate::app::state::SettingsSection::Animation
         );
 
         update_settings_state(
@@ -585,29 +722,149 @@ mod tests {
         let mut state = state_with_workspaces(&["test"]);
         open_settings_at(&mut state, SettingsSection::PaneLabels);
 
-        update_settings_state(
-            &mut state,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-        );
-        assert_eq!(state.settings.section, SettingsSection::Integrations);
+        for expected in [
+            SettingsSection::Signals,
+            SettingsSection::Legend,
+            SettingsSection::Integrations,
+            SettingsSection::Theme,
+        ] {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            );
+            assert_eq!(state.settings.section, expected);
+        }
 
+        for expected in [
+            SettingsSection::Integrations,
+            SettingsSection::Legend,
+            SettingsSection::Signals,
+            SettingsSection::PaneLabels,
+        ] {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+            );
+            assert_eq!(state.settings.section, expected);
+        }
+    }
+
+    /// Every section reachable by tabbing forward all the way around is
+    /// exactly the fixed set the tab strip draws — one full lap, no section
+    /// skipped and none visited twice.
+    #[test]
+    fn a_full_tab_lap_visits_every_section_exactly_once() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings(&mut state);
+
+        let mut visited = vec![state.settings.section];
+        for _ in 0..SettingsSection::ALL.len() - 1 {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            );
+            visited.push(state.settings.section);
+        }
+        // One more Tab returns to the start, closing the loop.
         update_settings_state(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
         );
         assert_eq!(state.settings.section, SettingsSection::Theme);
 
-        update_settings_state(
-            &mut state,
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
-        );
-        assert_eq!(state.settings.section, SettingsSection::Integrations);
+        visited.sort_by_key(|section| {
+            SettingsSection::ALL
+                .iter()
+                .position(|candidate| candidate == section)
+                .unwrap()
+        });
+        visited.dedup();
+        assert_eq!(visited, SettingsSection::ALL);
+    }
 
-        update_settings_state(
+    /// The animation section's rows toggle independently: switching one off
+    /// says nothing about the others.
+    #[test]
+    fn animation_rows_toggle_independently() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Animation);
+        assert!(state.sidebar_cards.pulse);
+        assert!(state.sidebar_signal_tray.animate);
+
+        state.settings.list.selected = 0;
+        let action = update_settings_state(
             &mut state,
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
-        assert_eq!(state.settings.section, SettingsSection::PaneLabels);
+        assert_eq!(action, Some(SettingsAction::SaveCardPulse(false)));
+
+        state.settings.list.selected = 3;
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(action, Some(SettingsAction::SaveSignalTrayAnimate(false)));
+        // Neither toggle commits anything itself — the caller applies the
+        // returned action, exactly like every other section.
+        assert!(state.sidebar_cards.pulse);
+        assert!(state.sidebar_signal_tray.animate);
+    }
+
+    /// The fleet-signal tray section's two rows are independent switches too:
+    /// whether the tray is shown, and whether it may act in place.
+    #[test]
+    fn signals_rows_toggle_independently() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Signals);
+
+        state.settings.list.selected = 0;
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveSignalTrayEnabled(
+                !state.sidebar_signal_tray.enabled
+            ))
+        );
+
+        state.settings.list.selected = 1;
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveSignalTrayActions(
+                !state.sidebar_signal_tray.actions
+            ))
+        );
+    }
+
+    /// The legend is read-only reference content: it has nothing to apply, so
+    /// only the close button is shown.
+    #[test]
+    fn legend_shows_no_apply_action() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Legend);
+        assert!(!crate::ui::settings_show_primary_action(&state));
+    }
+
+    /// The legend names all eight signals, exactly like the tray's own
+    /// popover — a single source read from two surfaces.
+    #[test]
+    fn legend_names_all_eight_signals() {
+        use crate::app::fleet_signals::FleetSignal;
+
+        let lines = crate::ui::signal_tray_popup::legend_lines();
+        assert_eq!(lines.len(), FleetSignal::COUNT);
+        for signal in FleetSignal::ALL {
+            assert!(
+                lines.iter().any(|line| line.starts_with(signal.name())),
+                "the legend does not name {signal:?}"
+            );
+        }
     }
 
     #[test]

@@ -23,6 +23,30 @@ These instructions are layered.
   not a verified maintainer, the work is happening in a fork, or the account
   cannot be determined.
 
+## Remotes in this checkout
+
+This text was written for the canonical `herdrdev/herdr` project, but checkouts
+of it are often a fork of a fork, and `git remote -v` is the only reliable way
+to know which repository is actually the push target — do not assume `origin`
+is it.
+
+In this checkout, `origin` is `ogulcancelik/herdr` (fetch-only here; push is
+disabled) and `fork` is the repository this checkout actually pushes branches
+to and opens pull requests against. `fork/master` carries commits that do not
+exist on `origin/master` at all — the notification tray (`src/ui/sidebar/tray.rs`),
+the fleet-signal bar (`src/app/fleet_signals.rs`), and the sidebar card
+animation config (`ui.sidebar.cards`) are examples. **Branch new work from
+`fork/master`, not `origin/master`** — cutting a branch from `origin/master`
+silently drops every fork-only feature from its history, and rebasing across
+that gap produces spurious conflicts on files the branch never touched.
+
+When opening a pull request, pass the fork repository explicitly
+(`gh pr create --repo <owner>/herdr --base master`, or the `gh-axi`
+equivalent) rather than letting `gh` infer the target from `origin`. Letting it
+default has sent a PR to the wrong upstream before, where a third party's bot
+auto-closed it within seconds — still an unauthorized public PR against a repo
+this checkout has no relationship to.
+
 ## Universal Project Rules
 
 ### Principles

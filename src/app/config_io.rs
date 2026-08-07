@@ -105,6 +105,69 @@ impl App {
         }
     }
 
+    pub(super) fn save_card_pulse(&mut self, enabled: bool) {
+        if self.update_config_file("card pulse setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.sidebar.cards", "pulse", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_card_wash(&mut self, enabled: bool) {
+        if self.update_config_file("card wash setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.sidebar.cards", "wash", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_card_stage_hue(&mut self, enabled: bool) {
+        if self.update_config_file("card stage colour setting", |content| {
+            crate::config::upsert_section_bool(content, "ui.sidebar.cards", "stage_hue", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_signal_tray_animate(&mut self, enabled: bool) {
+        if self.update_config_file("badge motion setting", |content| {
+            crate::config::upsert_section_bool(
+                content,
+                "ui.sidebar.signal_tray",
+                "animate",
+                enabled,
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_signal_tray_enabled(&mut self, enabled: bool) {
+        if self.update_config_file("notification tray setting", |content| {
+            crate::config::upsert_section_bool(
+                content,
+                "ui.sidebar.signal_tray",
+                "enabled",
+                enabled,
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_signal_tray_actions(&mut self, enabled: bool) {
+        if self.update_config_file("notification tray actions setting", |content| {
+            crate::config::upsert_section_bool(
+                content,
+                "ui.sidebar.signal_tray",
+                "actions",
+                enabled,
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
     pub(super) fn save_agent_panel_sort(&mut self, sort: crate::app::state::AgentPanelSort) {
         let value = match sort {
             crate::app::state::AgentPanelSort::Spaces => {

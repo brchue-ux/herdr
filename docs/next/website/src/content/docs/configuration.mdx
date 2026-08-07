@@ -265,6 +265,8 @@ dark_name = "catppuccin"
 
 `auto_switch` defaults to `false`, so existing theme configs keep manual behavior. If `light_name` or `dark_name` is omitted, Herdr uses the matching built-in sibling for the configured `name` when one exists, such as `tokyo-night`/`tokyo-night-day` or `gruvbox`/`gruvbox-light`. Manual theme selection in Settings disables `auto_switch`.
 
+Settings bundles theme alongside every other tab covered on this page — animation, status indicators, sound, toasts, pane labels, the notification tray and its legend, and integrations — so most everyday tuning needs no `config.toml` edit at all. Open it with the `settings` keybinding (shown in the Navigate bar) or from the global menu, and tab or click between sections.
+
 You can override individual colors:
 
 ```toml
@@ -566,7 +568,9 @@ the same way.
 
 Clicking a badge opens a popover anchored above it, listing what that badge
 covers by name; `···` at the right of the tray's header opens the same popover
-holding the legend. What the popover offers depends on the badge:
+holding the legend. The same eight meanings are also a standing reference on
+Settings' **legend** tab, so you do not need the tray open to look one up.
+What the popover offers depends on the badge:
 
 | Badge | What a click can do |
 | --- | --- |
@@ -599,6 +603,11 @@ then some. Switching the tray on arms the forge fetch and the branch-upstream
 read that four of its slots need, *and* the `git status` scan that `sync`'s
 refusal reads. That last one costs more the larger your checkout is, and the
 signal bar deliberately does not arm it.
+
+Both switches, plus whether the badges move (`[ui.sidebar.signal_tray]
+animate`, covered with the rest of the tree's motion below), are on Settings'
+**signals** and **animation** tabs — no `config.toml` edit required to turn
+the tray on and try it.
 
 The tray takes ten rows off the bottom of the panel, or eight on a panel that
 cannot spare ten. A panel too short to hold both the tray and a readable tree
