@@ -675,6 +675,65 @@ pub enum PaneZoomReason {
     AlreadyUnzoomed,
 }
 
+/// Minimizes the whole tab a pane belongs to: the tab and every pane inside it detach
+/// from the workspace's live tree together, as one unit, but every pane's terminal (and
+/// its live agent-status detection) stays running untouched. Reattach with
+/// `pane.dormant.reappear`, keyed by whichever pane's `terminal_id` you want back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneMinimizeParams {
+    /// Pane whose tab should be minimized. Defaults to the focused pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneMinimizeResult {
+    pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PaneMinimizeReason>,
+    /// Terminal ids of every pane that was in the minimized tab, in no particular
+    /// order — the handle to pass to a later `pane.dormant.reappear` call.
+    pub terminal_ids: Vec<String>,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneMinimizeReason {
+    /// The pane's tab is the only tab left in its workspace — minimizing it would
+    /// leave the workspace with no visible tab at all, so the call is refused instead.
+    OnlyTabInWorkspace,
+}
+
+/// Reattaches a dormant (minimized) pane's tab, keyed by `terminal_id` — a dormant
+/// pane's `pane_id` no longer resolves, so `terminal_id` is the only handle that
+/// survives minimize. Idempotent: calling this again for an already-visible pane is a
+/// no-op success, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneDormantReappearParams {
+    pub terminal_id: String,
+    /// Focus the reappeared pane once it's back. Defaults to `false` so an automatic
+    /// or answered-in-the-background reappear doesn't steal the user's attention.
+    #[serde(default)]
+    pub focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneDormantReappearResult {
+    pub changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PaneDormantReappearReason>,
+    /// The pane's current state — including its freshly assigned `pane_id`, which is
+    /// the only place a caller learns it (no `terminal_id`-keyed pane lookup exists).
+    pub pane: Box<PaneInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneDormantReappearReason {
+    AlreadyVisible,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneLayoutSnapshot {
     pub workspace_id: String,

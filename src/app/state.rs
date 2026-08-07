@@ -1879,6 +1879,15 @@ pub struct AppState {
     /// [`crate::app::pending_effects`]'s own doc for why it is a sibling to
     /// `Self::anim` rather than a new element kind inside it.
     pub(crate) pending_effects: crate::app::pending_effects::PendingEffects,
+    /// Tabs detached from every workspace's live tree but still holding live
+    /// `TerminalRuntime`s — the tab-level minimize/reappear mechanism. See
+    /// [`crate::app::dormant`].
+    pub(crate) dormant_tabs: crate::app::dormant::DormantTabRegistry,
+    /// Tabs the bucket-B auto-reappear rule (dormant `AgentState` transitioning into
+    /// `Working`) has already reinserted into `Workspace.tabs` this pass, waiting for
+    /// the runtime layer (which owns event emission, unlike this pure state) to emit
+    /// their `pane.created`/`layout.updated` events. Drained every time it is read.
+    pub(crate) dormant_reappeared_pending: Vec<crate::app::dormant::ReappearedTab>,
     /// The sidebar tree's owned agent rows as of the last loop pass.
     ///
     /// The tree is derived from panes that exist, so a pane closing takes the
@@ -2869,6 +2878,8 @@ impl AppState {
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
             pending_effects: crate::app::pending_effects::PendingEffects::default(),
+            dormant_tabs: crate::app::dormant::DormantTabRegistry::new(),
+            dormant_reappeared_pending: Vec::new(),
             sidebar_tree_row_memory: Vec::new(),
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,

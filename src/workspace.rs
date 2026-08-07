@@ -662,8 +662,19 @@ impl Workspace {
     }
 
     pub fn close_tab(&mut self, idx: usize) -> bool {
+        self.remove_tab_from_tree(idx).is_some()
+    }
+
+    /// Removes tab `idx` from the live tree exactly like `close_tab`, but hands the
+    /// removed `Tab` back instead of dropping it, so a caller can hold it dormant
+    /// (register it in a dormant-tab registry) rather than kill its terminals.
+    pub(crate) fn take_tab_for_dormancy(&mut self, idx: usize) -> Option<Tab> {
+        self.remove_tab_from_tree(idx)
+    }
+
+    fn remove_tab_from_tree(&mut self, idx: usize) -> Option<Tab> {
         if self.tabs.len() <= 1 || idx >= self.tabs.len() {
-            return false;
+            return None;
         }
         let tab = self.tabs.remove(idx);
         for pane_id in tab.panes.keys() {
@@ -674,7 +685,23 @@ impl Workspace {
         } else if idx <= self.active_tab && self.active_tab > 0 {
             self.active_tab -= 1;
         }
-        true
+        Some(tab)
+    }
+
+    /// Inserts a previously-dormant `Tab` back into `Workspace.tabs`, appended at the
+    /// end, and re-registers its panes' public numbers. Mirrors the insertion half of
+    /// `create_tab_with_runtime`, minus terminal allocation — the tab's terminals are
+    /// already alive.
+    pub(crate) fn insert_dormant_tab(&mut self, tab: Tab) -> usize {
+        let pane_ids: Vec<PaneId> = tab.panes.keys().copied().collect();
+        self.tabs.push(tab);
+        let tab_idx = self.tabs.len() - 1;
+        for pane_id in pane_ids {
+            if !self.public_pane_numbers.contains_key(&pane_id) {
+                self.register_new_pane_with_number(pane_id, self.next_public_pane_number);
+            }
+        }
+        tab_idx
     }
 
     pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) -> bool {

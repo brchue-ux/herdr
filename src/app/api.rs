@@ -276,6 +276,22 @@ impl App {
             None
         };
 
+        // Captured before `handle_app_event` runs — it will remove this pane from the
+        // dormant registry as part of the PaneDied-for-dormant-panes fix, so the lookup
+        // has to happen now or there is nothing left to find afterward.
+        let dormant_pane_died = if let AppEvent::PaneDied { pane_id, exit } = &ev {
+            if self.find_pane(*pane_id).is_none() {
+                self.state
+                    .dormant_tabs
+                    .terminal_id_for_pane(*pane_id)
+                    .map(|terminal_id| (terminal_id, exit.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let released_agent = if let AppEvent::HookAgentReleased {
             pane_id,
             known_agent,
@@ -305,6 +321,37 @@ impl App {
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
+
+        if let Some((terminal_id, exit)) = dormant_pane_died {
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneDormantExited,
+                data: crate::api::schema::EventData::PaneDormantExited {
+                    terminal_id: terminal_id.to_string(),
+                    exit_code: exit.as_ref().map(|exit| exit.code),
+                    exit_signal: exit.as_ref().and_then(|exit| exit.signal.clone()),
+                },
+            });
+        }
+
+        // Bucket B: `handle_app_event` may have just reinserted a dormant tab into
+        // `Workspace.tabs` (its own `AgentState` transitioned into `Working`). `AppState`
+        // does not emit events itself, so this is where the same `pane.created` +
+        // `layout.updated` pair an explicit `pane.dormant.reappear` call emits gets sent
+        // for the automatic path too — deliberately identical, so a subscriber cannot
+        // tell an auto-reappear apart from an explicit one any more than either can be
+        // told apart from a genuine new pane spawn.
+        for reappeared in std::mem::take(&mut self.state.dormant_reappeared_pending) {
+            for pane_id in &reappeared.pane_ids {
+                if let Some(pane) = self.pane_info(reappeared.ws_idx, *pane_id) {
+                    self.emit_event(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneCreated,
+                        data: crate::api::schema::EventData::PaneCreated { pane },
+                    });
+                }
+            }
+            self.emit_layout_updated_event(reappeared.ws_idx, reappeared.tab_idx);
+        }
+
         if let Some(agents) = manifest_update_agents {
             self.reset_agent_detection_for_agents(&agents);
         }
@@ -1091,6 +1138,10 @@ impl App {
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
+            Method::PaneMinimize(params) => return self.handle_pane_minimize(request.id, params),
+            Method::PaneDormantReappear(params) => {
+                return self.handle_pane_dormant_reappear(request.id, params)
+            }
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
             Method::PaneProcessInfo(params) => {
                 return self.handle_pane_process_info(request.id, params);

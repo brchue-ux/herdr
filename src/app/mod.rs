@@ -13,6 +13,7 @@ mod api;
 mod api_helpers;
 pub(crate) mod card_wash;
 pub(crate) mod cmd_ack;
+pub(crate) mod dormant;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 pub(crate) mod creation;
@@ -747,6 +748,8 @@ impl App {
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
             pending_effects: crate::app::pending_effects::PendingEffects::default(),
+            dormant_tabs: crate::app::dormant::DormantTabRegistry::new(),
+            dormant_reappeared_pending: Vec::new(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
