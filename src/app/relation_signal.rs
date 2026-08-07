@@ -132,16 +132,31 @@ pub(crate) struct RelationSignalPhase {
     pub(crate) progress: f32,
 }
 
+/// The row a signal is drawn on.
+///
+/// A carrier is whatever row owns the branch-line connector the signal
+/// travels: a workspace's own row for a mate, or a specific pane's row for a
+/// worker nested under one. Both hold a canonical id resolved the same way
+/// `workspace.report_metadata` and `pane.report_metadata` already resolve
+/// theirs, so a report naming an id that no longer exists never reaches here
+/// in the first place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CarrierId {
+    Workspace(String),
+    Pane(String),
+}
+
 /// One accepted signal, mid-flight.
 #[derive(Debug, Clone)]
 pub(crate) struct RelationSignal {
     kind: RelationSignalKind,
-    /// Canonical id of the workspace whose row draws this signal.
+    /// The row that draws this signal.
     ///
-    /// The workspace at the other end is validated when the report is accepted
-    /// and then deliberately not kept: both directions travel the carrier's own
-    /// branch line, whose trunk already *is* the relation being drawn.
-    carrier_workspace_id: String,
+    /// The workspace or pane at the other end is validated when the report is
+    /// accepted and then deliberately not kept: both directions travel the
+    /// carrier's own branch line, whose trunk already *is* the relation being
+    /// drawn.
+    carrier_id: CarrierId,
     started_at: Instant,
     expires_at: Instant,
     /// Quantized position along the route, in `0..=positions`, recomputed by
@@ -158,8 +173,8 @@ pub(crate) struct RelationSignal {
 }
 
 impl RelationSignal {
-    pub(crate) fn carrier_workspace_id(&self) -> &str {
-        &self.carrier_workspace_id
+    pub(crate) fn carrier_id(&self) -> &CarrierId {
+        &self.carrier_id
     }
 
     fn lifetime(&self) -> Duration {
@@ -264,10 +279,9 @@ impl RelationSignals {
 
     /// Records a signal against the row that will carry it.
     ///
-    /// `carrier_workspace_id` and `peer_workspace_id` are canonical workspace
-    /// ids the caller has already resolved, so an id that no longer exists is
-    /// filtered out before it reaches here rather than being stored and
-    /// dangling.
+    /// `carrier_id` and the peer id are canonical ids the caller has already
+    /// resolved, so an id that no longer exists is filtered out before it
+    /// reaches here rather than being stored and dangling.
     ///
     /// Replaces any signal already travelling that row rather than queueing
     /// behind it — a queue would animate history.
@@ -284,7 +298,7 @@ impl RelationSignals {
         source: &str,
         seq: Option<u64>,
         kind: RelationSignalKind,
-        carrier_workspace_id: String,
+        carrier_id: CarrierId,
         ttl: Option<Duration>,
         now: Instant,
     ) -> Result<(), SignalDropped> {
@@ -297,7 +311,7 @@ impl RelationSignals {
         let lifetime = Self::effective_ttl(ttl);
         let signal = RelationSignal {
             kind,
-            carrier_workspace_id,
+            carrier_id,
             started_at: now,
             expires_at: now + lifetime,
             position: 0,
@@ -307,7 +321,7 @@ impl RelationSignals {
         if let Some(existing) = self
             .live
             .iter_mut()
-            .find(|live| live.carrier_workspace_id == signal.carrier_workspace_id)
+            .find(|live| live.carrier_id == signal.carrier_id)
         {
             if now.saturating_duration_since(existing.started_at) < existing.step() {
                 return Err(SignalDropped::Coalesced);
@@ -362,7 +376,19 @@ impl RelationSignals {
     pub(crate) fn phase_for_workspace(&self, workspace_id: &str) -> Option<RelationSignalPhase> {
         self.live
             .iter()
-            .find(|signal| signal.carrier_workspace_id == workspace_id)
+            .find(|signal| matches!(&signal.carrier_id, CarrierId::Workspace(id) if id == workspace_id))
+            .map(RelationSignal::phase)
+    }
+
+    /// Where the signal on `pane_id` has reached, if one is travelling it.
+    ///
+    /// A worker's own row is a pane, not a workspace — this is what lets the
+    /// mate→worker connector carry a signal at all, the same way
+    /// [`Self::phase_for_workspace`] lets a Space-level connector carry one.
+    pub(crate) fn phase_for_pane(&self, pane_id: &str) -> Option<RelationSignalPhase> {
+        self.live
+            .iter()
+            .find(|signal| matches!(&signal.carrier_id, CarrierId::Pane(id) if id == pane_id))
             .map(RelationSignal::phase)
     }
 }
@@ -373,7 +399,14 @@ mod tests {
 
     fn accepted(signals: &mut RelationSignals, kind: RelationSignalKind, now: Instant) {
         signals
-            .accept("firstmate", None, kind, "w4N".into(), None, now)
+            .accept(
+                "firstmate",
+                None,
+                kind,
+                CarrierId::Workspace("w4N".into()),
+                None,
+                now,
+            )
             .expect("unsequenced report is always accepted");
     }
 
@@ -518,7 +551,7 @@ mod tests {
                 "firstmate",
                 Some(7),
                 RelationSignalKind::Transfer,
-                "w4N".into(),
+                CarrierId::Workspace("w4N".into()),
                 None,
                 now,
             )
@@ -529,7 +562,7 @@ mod tests {
                 "firstmate",
                 Some(7),
                 RelationSignalKind::Completed,
-                "w4N".into(),
+                CarrierId::Workspace("w4N".into()),
                 None,
                 now,
             ),
@@ -540,7 +573,7 @@ mod tests {
                 "firstmate",
                 Some(6),
                 RelationSignalKind::Completed,
-                "w4N".into(),
+                CarrierId::Workspace("w4N".into()),
                 None,
                 now,
             ),
@@ -561,7 +594,7 @@ mod tests {
                 "secondmate",
                 Some(1),
                 RelationSignalKind::Completed,
-                "w4A".into(),
+                CarrierId::Workspace("w4A".into()),
                 None,
                 now,
             )
@@ -621,7 +654,7 @@ mod tests {
                     "firstmate",
                     None,
                     RelationSignalKind::Transfer,
-                    "w4N".into(),
+                    CarrierId::Workspace("w4N".into()),
                     None,
                     now + Duration::from_millis(offset),
                 ),
@@ -641,7 +674,7 @@ mod tests {
                 "firstmate",
                 None,
                 RelationSignalKind::Transfer,
-                "w4N".into(),
+                CarrierId::Workspace("w4N".into()),
                 None,
                 now + step + Duration::from_millis(1),
             )
@@ -654,7 +687,7 @@ mod tests {
                     "firstmate",
                     None,
                     RelationSignalKind::Transfer,
-                    other.into(),
+                    CarrierId::Workspace(other.into()),
                     None,
                     now,
                 )
@@ -673,7 +706,7 @@ mod tests {
                     "firstmate",
                     None,
                     RelationSignalKind::Transfer,
-                    format!("w{index}"),
+                    CarrierId::Workspace(format!("w{index}")),
                     None,
                     now,
                 )
@@ -681,6 +714,73 @@ mod tests {
             assert!(signals.iter().count() <= MAX_LIVE_SIGNALS);
         }
         assert_eq!(signals.iter().count(), MAX_LIVE_SIGNALS);
+    }
+
+    #[test]
+    fn a_pane_can_carry_a_signal_a_workspace_of_the_same_id_cannot() {
+        // Workers are panes: this is the case the whole feature exists for. A
+        // pane carrier and a workspace carrier are different rows even when
+        // they happen to share a spelling, so accepting one must never answer
+        // a lookup for the other.
+        let now = Instant::now();
+        let mut signals = RelationSignals::default();
+        signals
+            .accept(
+                "firstmate",
+                None,
+                RelationSignalKind::Transfer,
+                CarrierId::Pane("w4N:p1".into()),
+                None,
+                now,
+            )
+            .expect("unsequenced report is always accepted");
+
+        assert!(signals.phase_for_pane("w4N:p1").is_some());
+        assert_eq!(signals.phase_for_workspace("w4N:p1"), None);
+        assert_eq!(signals.phase_for_pane("w4N"), None);
+    }
+
+    #[test]
+    fn a_workspace_carrier_and_a_pane_carrier_travel_independently() {
+        // Regression guard for the existing workspace-carrier path: widening
+        // the carrier to also resolve a pane must not fold the two id spaces
+        // together, coalesce across them, or make one evict the other.
+        let now = Instant::now();
+        let mut signals = RelationSignals::default();
+        signals
+            .accept(
+                "firstmate",
+                None,
+                RelationSignalKind::Transfer,
+                CarrierId::Workspace("w4N".into()),
+                None,
+                now,
+            )
+            .expect("unsequenced report is always accepted");
+        signals
+            .accept(
+                "firstmate",
+                None,
+                RelationSignalKind::Completed,
+                CarrierId::Pane("w4N:p1".into()),
+                None,
+                now,
+            )
+            .expect("unsequenced report is always accepted");
+
+        assert_eq!(signals.iter().count(), 2);
+        assert_eq!(
+            signals
+                .phase_for_workspace("w4N")
+                .map(|phase| phase.direction),
+            Some(SignalDirection::Toward),
+        );
+        assert_eq!(
+            signals
+                .phase_for_pane("w4N:p1")
+                .map(|phase| phase.direction),
+            Some(SignalDirection::Away),
+        );
     }
 
     #[test]

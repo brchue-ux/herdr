@@ -1795,7 +1795,7 @@ mod tests {
                 "firstmate",
                 None,
                 crate::app::relation_signal::RelationSignalKind::Transfer,
-                carrier,
+                crate::app::relation_signal::CarrierId::Workspace(carrier),
                 None,
                 now,
             )

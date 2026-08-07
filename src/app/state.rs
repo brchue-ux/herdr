@@ -2455,13 +2455,32 @@ impl AppState {
     /// end of the list or hidden inside a collapsed group. A signal aimed
     /// anywhere else damages nothing, so the loop is never woken to repaint for
     /// it — while the signal itself still expires on schedule, because expiry
-    /// does not go through here.
+    /// does not go through here. Checked against both carriers a card can be:
+    /// a Space's own row, or — the row this feature exists for — a worker's
+    /// pane row nested under one.
     pub(crate) fn relation_signal_damage(&self) -> bool {
+        use crate::app::relation_signal::CarrierId;
+
         self.relation_signals.iter().any(|signal| {
             self.view.workspace_card_areas.iter().any(|card| {
-                self.workspaces
-                    .get(card.ws_idx)
-                    .is_some_and(|workspace| workspace.id == signal.carrier_workspace_id())
+                match (&card.agent, signal.carrier_id()) {
+                    (Some(agent), CarrierId::Pane(pane_id)) => self
+                        .workspaces
+                        .get(card.ws_idx)
+                        .and_then(|workspace| workspace.public_pane_number(agent.pane_id))
+                        .is_some_and(|number| {
+                            *pane_id
+                                == crate::workspace::public_pane_id_for_number(
+                                    &self.workspaces[card.ws_idx].id,
+                                    number,
+                                )
+                        }),
+                    (None, CarrierId::Workspace(workspace_id)) => self
+                        .workspaces
+                        .get(card.ws_idx)
+                        .is_some_and(|workspace| workspace.id == *workspace_id),
+                    _ => false,
+                }
             })
         })
     }
@@ -2474,6 +2493,23 @@ impl AppState {
     ) -> Option<crate::app::relation_signal::RelationSignalPhase> {
         let workspace = self.workspaces.get(ws_idx)?;
         self.relation_signals.phase_for_workspace(&workspace.id)
+    }
+
+    /// Where a relation signal has reached on this pane's row, if one is
+    /// travelling it.
+    ///
+    /// A worker's row is a pane, not a workspace, so this is the lookup that
+    /// lets a mate→worker connector carry a signal at all — see
+    /// [`crate::app::relation_signal::RelationSignals::phase_for_pane`].
+    pub(crate) fn pane_relation_signal_phase(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::app::relation_signal::RelationSignalPhase> {
+        let workspace = self.workspaces.get(ws_idx)?;
+        let number = workspace.public_pane_number(pane_id)?;
+        let public_pane_id = crate::workspace::public_pane_id_for_number(&workspace.id, number);
+        self.relation_signals.phase_for_pane(&public_pane_id)
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -3508,6 +3544,106 @@ mod tests {
         state.ensure_test_terminals();
 
         state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn relation_signal_damage_covers_a_pane_carrier_and_leaves_the_workspace_row_alone() {
+        let mut state = AppState::test_new();
+        let mut ws = Workspace::test_new("mate");
+        let worker_pane = ws.test_split(Direction::Horizontal);
+        state.workspaces = vec![ws];
+        let worker_number = state.workspaces[0]
+            .public_pane_number(worker_pane)
+            .expect("split pane has a public number");
+        let worker_public_id =
+            crate::workspace::public_pane_id_for_number(&state.workspaces[0].id, worker_number);
+
+        // A card for the worker's own row, as the sidebar would lay it out —
+        // the mate->worker connector this feature exists for.
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: Some(AgentCardTarget {
+                tab_idx: 0,
+                pane_id: worker_pane,
+            }),
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+
+        assert!(
+            !state.relation_signal_damage(),
+            "no live signal yet, nothing should be damaged"
+        );
+
+        state
+            .relation_signals
+            .accept(
+                "firstmate",
+                None,
+                crate::app::relation_signal::RelationSignalKind::Transfer,
+                crate::app::relation_signal::CarrierId::Pane(worker_public_id),
+                None,
+                Instant::now(),
+            )
+            .expect("a fresh row always accepts its first signal");
+        assert!(
+            state.relation_signal_damage(),
+            "a signal on the worker's own pane must damage the laid-out worker row"
+        );
+
+        // The same live signal must not read as damage against the mate's own
+        // Space row: a pane carrier and a workspace carrier are different
+        // rows even when one nests under the other.
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+        assert!(
+            !state.relation_signal_damage(),
+            "a pane carrier must not be mistaken for the workspace it lives in"
+        );
+    }
+
+    #[test]
+    fn relation_signal_damage_is_unchanged_for_a_workspace_carrier() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("mate")];
+        let workspace_id = state.workspaces[0].id.clone();
+
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+        assert!(!state.relation_signal_damage());
+
+        state
+            .relation_signals
+            .accept(
+                "firstmate",
+                None,
+                crate::app::relation_signal::RelationSignalKind::Transfer,
+                crate::app::relation_signal::CarrierId::Workspace(workspace_id),
+                None,
+                Instant::now(),
+            )
+            .expect("a fresh row always accepts its first signal");
+        assert!(
+            state.relation_signal_damage(),
+            "a signal on the workspace's own row must still damage a laid-out Space card"
+        );
     }
 
     fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {

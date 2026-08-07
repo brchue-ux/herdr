@@ -2882,6 +2882,20 @@ fn render_agent_row(
         Some(crate::anim::CardRow::Agent(detail.pane_id)),
         Style::default().fg(p.overlay0),
     );
+    // A worker's own row is a pane, which is what makes it a carrier at all —
+    // see `AppState::pane_relation_signal_phase`. Severity comes from the
+    // pane's own tokens, the same way a Space's connector reads its own,
+    // so the charge and the card it runs into cannot disagree about how bad
+    // this row's trouble is.
+    let signal_phase = app.pane_relation_signal_phase(detail.ws_idx, detail.pane_id);
+    let row_severity = crate::app::lifecycle::severity(
+        detail
+            .tokens
+            .get(crate::app::lifecycle::SEVERITY_TOKEN)
+            .map(String::as_str),
+    );
+    let connector_style = Style::default().fg(p.overlay0);
+    let top_charge = ConnectorCharge::new(app, connector_style, signal_phase, row_severity);
 
     if let Some(shell) = &card_shell {
         let (mut connector, _) = agent_row_prefix(
@@ -2890,9 +2904,7 @@ fn render_agent_row(
             entry.ancestors_continue(),
             0,
             p,
-            // A relation signal is keyed on a workspace, and this row is a
-            // pane, so there is nothing here for a charge to belong to.
-            None,
+            top_charge.as_ref(),
             true,
             trunk.as_ref(),
         );
@@ -2949,6 +2961,11 @@ fn render_agent_row(
         let Some(row_y) = moved_row(row_y, motion.1, list_top, list_bottom) else {
             continue;
         };
+        // The branch line only exists on the card's first content row, so
+        // that is the only row a signal can travel and the only row it
+        // damages.
+        let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
+        let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase, row_severity);
         // Only the first content row carries the badge, so only it gives up the
         // width; only the last carries the pill.
         let trailing_width = if row_index == 0 {
@@ -2976,7 +2993,7 @@ fn render_agent_row(
                         entry.ancestors_continue(),
                         0,
                         p,
-                        None,
+                        row_charge.as_ref(),
                         true,
                         trunk.as_ref(),
                     )
@@ -3009,7 +3026,7 @@ fn render_agent_row(
                     entry.ancestors_continue(),
                     row_index,
                     p,
-                    None,
+                    row_charge.as_ref(),
                     false,
                     trunk.as_ref(),
                 );
@@ -3036,7 +3053,10 @@ fn render_agent_row(
         if !covered {
             spans.extend(resolved_token_spans(
                 resolved,
-                state_icon,
+                (
+                    state_icon.0,
+                    arrived_state_icon_style(state_icon.1, row_charge.as_ref(), p),
+                ),
                 status_style,
                 name_style,
                 secondary_style,
@@ -7883,7 +7903,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             let now = std::time::Instant::now();
             let carrier = app.workspaces[1].id.clone();
             app.relation_signals
-                .accept("firstmate", None, kind, carrier, None, now)
+                .accept(
+                    "firstmate",
+                    None,
+                    kind,
+                    crate::app::relation_signal::CarrierId::Workspace(carrier),
+                    None,
+                    now,
+                )
                 .expect("a fresh row always accepts its first signal");
             // Walk the clock to the requested position the same way the runtime
             // tick does, rather than reaching into the signal's internals.
@@ -7999,6 +8026,154 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             moved += changed.len();
         }
         assert!(moved > 0, "the signal has to actually draw something");
+    }
+
+    /// A mate's Space owning one worker pane, with the worker's own row wired
+    /// up as a relation-signal carrier — the mate->worker connector the whole
+    /// feature exists for. Mirrors [`render_signalled_tree`], but the carrier
+    /// is the worker's pane id rather than a workspace id.
+    fn render_signalled_worker_tree(
+        kind: Option<crate::app::relation_signal::RelationSignalKind>,
+        position: u16,
+    ) -> (ratatui::buffer::Buffer, AppState) {
+        let mut app = AppState::test_new();
+        let mut mate = Workspace::test_new("firstmate");
+        let worker_pane = mate.test_split(ratatui::layout::Direction::Vertical);
+        let worker_public_id = crate::workspace::public_pane_id_for_number(
+            &mate.id,
+            mate.public_pane_number(worker_pane)
+                .expect("split pane has a public number"),
+        );
+        app.workspaces = vec![mate];
+        app.ensure_test_terminals();
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        // `test_split` is a raw layout split, so it stamps no creation origin
+        // — unlike the real `pane.split` API path, it does not read as
+        // delegated-in-space. An explicit `owner` token, published the same
+        // way a real fleet publishes one, is what puts the worker on its
+        // mate's row.
+        let worker_terminal = app.workspaces[0].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+
+        if let Some(kind) = kind {
+            let now = std::time::Instant::now();
+            app.relation_signals
+                .accept(
+                    "firstmate",
+                    None,
+                    kind,
+                    crate::app::relation_signal::CarrierId::Pane(worker_public_id),
+                    None,
+                    now,
+                )
+                .expect("a fresh row always accepts its first signal");
+            let step = crate::app::relation_signal::DEFAULT_SIGNAL_TTL
+                / u32::from(crate::app::relation_signal::SIGNAL_POSITIONS);
+            app.relation_signals
+                .advance(now + step * u32::from(position) + std::time::Duration::from_millis(1));
+        }
+
+        let list_area = workspace_list_rect(area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    list_area,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (buffer, app)
+    }
+
+    #[test]
+    fn a_pane_carrier_renders_the_charge_on_the_workers_own_connector() {
+        // The case the whole carrier extension exists for: workers are panes,
+        // so the mate->worker connector has to carry a signal, not only the
+        // Space-level connector `render_signalled_tree` already covers.
+        use crate::app::relation_signal::{RelationSignalKind, SIGNAL_POSITIONS};
+
+        let mut frames = vec![render_signalled_worker_tree(None, 0).0];
+        for position in 0..SIGNAL_POSITIONS {
+            frames
+                .push(render_signalled_worker_tree(Some(RelationSignalKind::Transfer), position).0);
+        }
+        frames.push(render_signalled_worker_tree(None, 0).0);
+
+        let (_, app) = render_signalled_worker_tree(None, 0);
+        let worker_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_some())
+            .expect("the worker's own row is laid out");
+        let child = worker_card.rect;
+
+        let mut moved = 0;
+        for pair in frames.windows(2) {
+            let changed = changed_cells(&pair[0], &pair[1]);
+            for (x, y) in &changed {
+                assert_eq!(
+                    *y, child.y,
+                    "a signal on the worker's pane must not touch any row but the worker's own"
+                );
+                let _ = x;
+            }
+            moved += changed.len();
+        }
+        assert!(
+            moved > 0,
+            "the worker's own connector has to actually draw the crackle"
+        );
+    }
+
+    #[test]
+    fn a_pane_carrier_does_not_light_a_workspace_row_with_the_same_number() {
+        // Regression guard: a pane carrier and a workspace row are different
+        // rows even when nested one under the other. Confirms the render
+        // path reads `pane_relation_signal_phase`, not `workspace_relation_signal_phase`,
+        // for the mate's own Space row.
+        let (unsignalled, _) = render_signalled_worker_tree(None, 0);
+        let (signalled, app) = render_signalled_worker_tree(
+            Some(crate::app::relation_signal::RelationSignalKind::Transfer),
+            0,
+        );
+        let mate_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_none())
+            .expect("the mate's own Space row is laid out");
+        for x in mate_card.rect.x..mate_card.rect.x + mate_card.rect.width {
+            assert_eq!(
+                unsignalled[(x, mate_card.rect.y)].symbol(),
+                signalled[(x, mate_card.rect.y)].symbol(),
+                "a worker's signal must not draw on its mate's own Space row"
+            );
+            assert_eq!(
+                unsignalled[(x, mate_card.rect.y)].style(),
+                signalled[(x, mate_card.rect.y)].style(),
+                "a worker's signal must not draw on its mate's own Space row"
+            );
+        }
     }
 
     /// Every kind, so the vocabulary is exercised rather than just the two that
