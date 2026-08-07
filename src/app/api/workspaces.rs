@@ -6,7 +6,7 @@ use crate::api::schema::{
     WorkspaceReportMetadataParams, WorkspaceReportSignalParams, WorkspaceSignalKind,
     WorkspaceTarget,
 };
-use crate::app::relation_signal::RelationSignalKind;
+use crate::app::relation_signal::{CarrierId, RelationSignalKind};
 use crate::app::App;
 
 use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_ttl};
@@ -416,10 +416,19 @@ impl App {
             );
         };
 
+        // The id names either end of the relation, and either end can be a
+        // Space or a worker's own pane — workers are panes, so this is what
+        // lets a mate->worker connector carry a signal at all. Workspace
+        // resolution is tried first since a canonical workspace id and a
+        // canonical pane id never collide.
         let Some(carrier) = self
             .parse_workspace_id(carrier_id)
             .and_then(|index| self.state.workspaces.get(index))
-            .map(|workspace| workspace.id.clone())
+            .map(|workspace| CarrierId::Workspace(workspace.id.clone()))
+            .or_else(|| {
+                let (ws_idx, pane_id) = self.parse_pane_id(carrier_id)?;
+                Some(CarrierId::Pane(self.public_pane_id(ws_idx, pane_id)?))
+            })
         else {
             return encode_success(id, ResponseResult::Ok {});
         };
@@ -852,6 +861,42 @@ mod tests {
                 .phase_for_workspace(&other)
                 .is_none());
         }
+    }
+
+    #[test]
+    fn a_transfer_can_land_on_a_worker_pane_rather_than_a_workspace() {
+        // Workers are panes: this is the case the whole carrier extension is
+        // for. Reporting a transfer to a pane id must resolve to a pane
+        // carrier, not fall through to nothing and not get mistaken for a
+        // workspace with a similarly shaped id.
+        let mut app = app_with_two_workspaces();
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(1, pane_id).unwrap();
+
+        let response = report_signal(
+            &mut app,
+            WorkspaceReportSignalParams {
+                to_workspace_id: Some(public_pane_id.clone()),
+                ..signal_params(WorkspaceSignalKind::Transfer)
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        assert!(app
+            .state
+            .relation_signals
+            .phase_for_pane(&public_pane_id)
+            .is_some());
+        // The pane's own workspace must not answer for it: the two carriers
+        // are different rows even though one nests under the other.
+        let workspace_id = app.state.workspaces[1].id.clone();
+        assert!(app
+            .state
+            .relation_signals
+            .phase_for_workspace(&workspace_id)
+            .is_none());
     }
 
     #[test]

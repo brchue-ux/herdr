@@ -84,11 +84,11 @@ pub(crate) use self::{
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_toggle_rect,
         normalized_workspace_scroll, rows_with_departing, sidebar_agent_entries,
         sidebar_agent_live_entries, sidebar_tree_breadcrumb_rect, sidebar_tree_handle,
-        worker_summary_badge, worker_summary_badge_rect, workspace_drop_slots,
-        workspace_group_chevron_rect, workspace_list_entries, workspace_list_entries_expanded,
-        workspace_list_entries_whole_fleet, workspace_list_rect, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry,
+        sidebar_trunk_segment_members, worker_summary_badge, worker_summary_badge_rect,
+        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
+        workspace_list_entries_expanded, workspace_list_entries_whole_fleet, workspace_list_rect,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        AgentPanelEntry, WorkspaceListEntry,
     },
     worker_summary::{
         worker_summaries_action_row, worker_summaries_close_button_rect,
@@ -119,6 +119,15 @@ pub(crate) fn signal_tray_graphics_rect(
 ) -> ratatui::layout::Rect {
     let area = self::sidebar::sidebar_content_rect(app.view.sidebar_rect);
     self::sidebar::tray::grid_rect(self::sidebar::tray::tray_rect(app, area))
+}
+
+/// Where the sidebar's ambient particle-field wash is composited: the same content column
+/// [`self::sidebar::particle_background::image`] generated pixels for, so the placement's grid
+/// always matches the image it is displaying.
+pub(crate) fn sidebar_particle_field_rect(
+    app: &crate::app::state::AppState,
+) -> ratatui::layout::Rect {
+    self::sidebar::sidebar_content_rect(app.view.sidebar_rect)
 }
 
 pub(crate) use self::{

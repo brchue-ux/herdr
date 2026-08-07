@@ -12,6 +12,7 @@ mod agents;
 mod api;
 mod api_helpers;
 pub(crate) mod card_wash;
+pub(crate) mod cmd_ack;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 pub(crate) mod creation;
@@ -21,6 +22,7 @@ mod ids;
 mod input;
 pub(crate) mod lifecycle;
 pub(crate) mod pane_activity;
+pub(crate) mod pending_effects;
 mod popup;
 mod pull_requests;
 pub(crate) mod relation_signal;
@@ -472,6 +474,9 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::kitty_graphics::set_local_transport_enabled(
+            config.experimental.kitty_graphics_local_transport,
+        );
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -740,6 +745,8 @@ impl App {
             sidebar_signal_tray: config.ui.sidebar.signal_tray,
             sidebar_cards: config.ui.sidebar.cards,
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
+            sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
+            pending_effects: crate::app::pending_effects::PendingEffects::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
@@ -767,6 +774,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
             sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
             default_shell: config.terminal.default_shell.clone(),
@@ -807,6 +815,8 @@ impl App {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            sidebar_particle_field: None,
+            sidebar_particle_field_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),
@@ -1725,6 +1735,9 @@ impl App {
             let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+            crate::kitty_graphics::set_local_transport_enabled(
+                config.experimental.kitty_graphics_local_transport,
+            );
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.state.pane_graphics_layers.clear();
@@ -1732,6 +1745,18 @@ impl App {
                 self.state.sidebar_card_layers.clear();
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                self.state.sidebar_particle_field = None;
+                self.state.sidebar_particle_field_key = 0;
+            }
+            // Toggling the wash on/off invalidates whatever loop is cached: a stale one left
+            // behind while off would resurface armed on a terminal that never saw it re-armed.
+            if self.state.sidebar_particle_field_enabled
+                != config.experimental.sidebar_particle_field
+            {
+                self.state.sidebar_particle_field_enabled =
+                    config.experimental.sidebar_particle_field;
+                self.state.sidebar_particle_field = None;
+                self.state.sidebar_particle_field_key = 0;
             }
             self.state.sidebar_card_font =
                 sidebar_card_font(&config.experimental.sidebar_card_font);

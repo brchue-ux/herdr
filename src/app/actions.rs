@@ -2976,6 +2976,18 @@ impl AppState {
             // AppState. Kept for AppEvent exhaustiveness.
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
+            AppEvent::CommandAcknowledged { .. } => Vec::new(),
+            AppEvent::PaneIssueDetected {
+                pane_id,
+                observed_at,
+            } => {
+                self.pending_effects.record(
+                    pane_id,
+                    crate::app::pending_effects::EffectKind::PaneIssue,
+                    observed_at,
+                );
+                Vec::new()
+            }
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     return Vec::new();
@@ -5017,6 +5029,30 @@ mod tests {
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert_eq!(state.workspaces[0].panes.keys().next().unwrap(), &first_id);
         state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn pane_issue_detected_reaches_the_single_dispatch_point_and_populates_a_pending_effect() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let observed_at = std::time::Instant::now();
+
+        let updates = state.handle_app_event(AppEvent::PaneIssueDetected {
+            pane_id,
+            observed_at,
+        });
+
+        // No terminal state changed — this trigger is not a `PaneStateUpdate`.
+        assert!(updates.is_empty());
+
+        let live = state.pending_effects.live(observed_at);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].pane_id, pane_id);
+        assert_eq!(
+            live[0].kind,
+            crate::app::pending_effects::EffectKind::PaneIssue
+        );
+        assert_eq!(live[0].spawned_at, observed_at);
     }
 
     #[test]

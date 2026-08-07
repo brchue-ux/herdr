@@ -20,6 +20,18 @@ pub(crate) struct PluginPaneRecord {
     pub entrypoint: String,
 }
 
+/// A looping frame sequence attached to a [`GraphicsLayer`], armed once via Kitty's native
+/// animation-frame transport (`a=f`/`a=a` in `src/kitty_graphics.rs`) instead of being
+/// re-uploaded every tick. `GraphicsLayer::data` above carries the root/first frame; `frames`
+/// here are the rest, in loop order. Only looping/ambient content benefits — anything
+/// event-driven still needs a fresh `GraphicsLayer` per change, same as before this existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GraphicsAnimation {
+    /// Milliseconds each frame is shown before the terminal advances to the next one.
+    pub frame_gap_ms: u32,
+    pub frames: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GraphicsLayer {
     pub format: crate::api::schema::PaneGraphicsFormat,
@@ -28,6 +40,7 @@ pub(crate) struct GraphicsLayer {
     pub data: Vec<u8>,
     pub data_fingerprint: u64,
     pub render: crate::api::schema::PaneGraphicsPlacementParams,
+    pub animation: Option<GraphicsAnimation>,
 }
 
 impl GraphicsLayer {
@@ -46,7 +59,15 @@ impl GraphicsLayer {
             data,
             data_fingerprint,
             render,
+            animation: None,
         }
+    }
+
+    /// Attaches a looping frame sequence, transmitted once and then played back by the terminal
+    /// on its own clock. See [`GraphicsAnimation`].
+    pub(crate) fn with_animation(mut self, animation: GraphicsAnimation) -> Self {
+        self.animation = Some(animation);
+        self
     }
 }
 
@@ -1211,30 +1232,39 @@ pub enum AgentPanelSort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Theme,
+    Animation,
     Indicators,
     Sound,
     Toast,
     PaneLabels,
+    Signals,
+    Legend,
     Integrations,
 }
 
 impl SettingsSection {
     pub const ALL: &[Self] = &[
         Self::Theme,
+        Self::Animation,
         Self::Indicators,
         Self::Sound,
         Self::Toast,
         Self::PaneLabels,
+        Self::Signals,
+        Self::Legend,
         Self::Integrations,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Theme => "theme",
+            Self::Animation => "animation",
             Self::Indicators => "indicators",
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Signals => "signals",
+            Self::Legend => "legend",
             Self::Integrations => "integrations",
         }
     }
@@ -1779,6 +1809,9 @@ pub struct AppState {
     /// `[experimental] switch_ascii_input_source_in_prefix`.
     pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
+    /// `[experimental] sidebar_particle_field`: draw the sidebar's ambient particle-field wash.
+    /// Only read while `kitty_graphics_enabled` is also true.
+    pub sidebar_particle_field_enabled: bool,
     /// `[experimental] sidebar_card_font`: an explicit face for the sidebar's
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
@@ -1832,6 +1865,20 @@ pub struct AppState {
     /// What state each drawn card was last seen in, so a change can be told
     /// from a state. Presentation state for the same reason [`Self::anim`] is.
     pub(crate) sidebar_card_washes: crate::app::card_wash::CardWashes,
+    /// Which command lines each drawn card has already acknowledged, and which
+    /// of those acknowledgements are still live. Presentation state for the
+    /// same reason [`Self::anim`] is.
+    pub(crate) sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks,
+    /// Identity-scoped triggers for a bounded-lifetime visual effect, waiting
+    /// for a renderer that does not exist yet.
+    ///
+    /// Unlike [`Self::anim`] and [`Self::sidebar_cmd_acks`], this is not
+    /// presentation state re-derivable from what a client is currently
+    /// showing: it is the record of "this happened," independent of whether
+    /// any client was attached to see it. See
+    /// [`crate::app::pending_effects`]'s own doc for why it is a sibling to
+    /// `Self::anim` rather than a new element kind inside it.
+    pub(crate) pending_effects: crate::app::pending_effects::PendingEffects,
     /// The sidebar tree's owned agent rows as of the last loop pass.
     ///
     /// The tree is derived from panes that exist, so a pane closing takes the
@@ -1900,6 +1947,14 @@ pub struct AppState {
     /// the cell size, folded into one number. Rasterising eight badges is not
     /// free, so it is redone when this moves and not once per frame.
     pub(crate) signal_tray_graphics_key: u64,
+    /// The sidebar's ambient particle-field wash, its loop frames included via
+    /// [`GraphicsLayer::animation`]. `None` when disabled, not yet generated, or the sidebar
+    /// column has no area.
+    pub(crate) sidebar_particle_field: Option<GraphicsLayer>,
+    /// What the wash above was generated for: its pixel dimensions, folded into one number.
+    /// Generating a whole loop is not free, so it is redone only when this moves — a resize —
+    /// and never once per tick.
+    pub(crate) sidebar_particle_field_key: u64,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
     /// The same layers, anchored to a named non-pane region of the client
@@ -2149,6 +2204,25 @@ impl AppState {
         lifecycle
     }
 
+    /// The life a trunk segment is given when its gap opens.
+    ///
+    /// Reads the same `[ui.sidebar.animation]` `row_enter`/`row_exit` config a
+    /// row's own arrival does — a segment extending or retracting is the same
+    /// event as the row it is attached to arriving or leaving, so one config
+    /// pair serves both rather than inventing a second. `moves` is
+    /// deliberately not threaded through the way [`Self::sidebar_row_lifecycle`]
+    /// threads it: `row_motion` slides a card's *position*, and a trunk
+    /// segment has none to slide, so it is not given a synthesized phase for a
+    /// feature it takes no part in. No idle behaviours are declared — a
+    /// segment's steady state is unanimated until something is asked to
+    /// travel it, which is a later piece of work, not this one.
+    pub(crate) fn sidebar_trunk_lifecycle(&self) -> crate::anim::Lifecycle {
+        let mut lifecycle = crate::anim::Lifecycle::still();
+        lifecycle.mount = self.sidebar_animation.row_enter_stage(false);
+        lifecycle.dismount = self.sidebar_animation.row_exit_stage(false);
+        lifecycle
+    }
+
     /// True when the fleet signal bar is drawn.
     ///
     /// The bar lives on the reserved header row of the expanded panel, so a
@@ -2382,13 +2456,32 @@ impl AppState {
     /// end of the list or hidden inside a collapsed group. A signal aimed
     /// anywhere else damages nothing, so the loop is never woken to repaint for
     /// it — while the signal itself still expires on schedule, because expiry
-    /// does not go through here.
+    /// does not go through here. Checked against both carriers a card can be:
+    /// a Space's own row, or — the row this feature exists for — a worker's
+    /// pane row nested under one.
     pub(crate) fn relation_signal_damage(&self) -> bool {
+        use crate::app::relation_signal::CarrierId;
+
         self.relation_signals.iter().any(|signal| {
             self.view.workspace_card_areas.iter().any(|card| {
-                self.workspaces
-                    .get(card.ws_idx)
-                    .is_some_and(|workspace| workspace.id == signal.carrier_workspace_id())
+                match (&card.agent, signal.carrier_id()) {
+                    (Some(agent), CarrierId::Pane(pane_id)) => self
+                        .workspaces
+                        .get(card.ws_idx)
+                        .and_then(|workspace| workspace.public_pane_number(agent.pane_id))
+                        .is_some_and(|number| {
+                            *pane_id
+                                == crate::workspace::public_pane_id_for_number(
+                                    &self.workspaces[card.ws_idx].id,
+                                    number,
+                                )
+                        }),
+                    (None, CarrierId::Workspace(workspace_id)) => self
+                        .workspaces
+                        .get(card.ws_idx)
+                        .is_some_and(|workspace| workspace.id == *workspace_id),
+                    _ => false,
+                }
             })
         })
     }
@@ -2401,6 +2494,23 @@ impl AppState {
     ) -> Option<crate::app::relation_signal::RelationSignalPhase> {
         let workspace = self.workspaces.get(ws_idx)?;
         self.relation_signals.phase_for_workspace(&workspace.id)
+    }
+
+    /// Where a relation signal has reached on this pane's row, if one is
+    /// travelling it.
+    ///
+    /// A worker's row is a pane, not a workspace, so this is the lookup that
+    /// lets a mate→worker connector carry a signal at all — see
+    /// [`crate::app::relation_signal::RelationSignals::phase_for_pane`].
+    pub(crate) fn pane_relation_signal_phase(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::app::relation_signal::RelationSignalPhase> {
+        let workspace = self.workspaces.get(ws_idx)?;
+        let number = workspace.public_pane_number(pane_id)?;
+        let public_pane_id = crate::workspace::public_pane_id_for_number(&workspace.id, number);
+        self.relation_signals.phase_for_pane(&public_pane_id)
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -2723,6 +2833,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
+            sidebar_particle_field_enabled: false,
             sidebar_card_font: None,
             sidebar_card_shapes: false,
             default_shell: String::new(),
@@ -2742,6 +2853,8 @@ impl AppState {
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
+            sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
+            pending_effects: crate::app::pending_effects::PendingEffects::default(),
             sidebar_tree_row_memory: Vec::new(),
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,
@@ -2774,6 +2887,8 @@ impl AppState {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            sidebar_particle_field: None,
+            sidebar_particle_field_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),
@@ -3431,6 +3546,106 @@ mod tests {
         state.ensure_test_terminals();
 
         state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn relation_signal_damage_covers_a_pane_carrier_and_leaves_the_workspace_row_alone() {
+        let mut state = AppState::test_new();
+        let mut ws = Workspace::test_new("mate");
+        let worker_pane = ws.test_split(Direction::Horizontal);
+        state.workspaces = vec![ws];
+        let worker_number = state.workspaces[0]
+            .public_pane_number(worker_pane)
+            .expect("split pane has a public number");
+        let worker_public_id =
+            crate::workspace::public_pane_id_for_number(&state.workspaces[0].id, worker_number);
+
+        // A card for the worker's own row, as the sidebar would lay it out —
+        // the mate->worker connector this feature exists for.
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: Some(AgentCardTarget {
+                tab_idx: 0,
+                pane_id: worker_pane,
+            }),
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+
+        assert!(
+            !state.relation_signal_damage(),
+            "no live signal yet, nothing should be damaged"
+        );
+
+        state
+            .relation_signals
+            .accept(
+                "firstmate",
+                None,
+                crate::app::relation_signal::RelationSignalKind::Transfer,
+                crate::app::relation_signal::CarrierId::Pane(worker_public_id),
+                None,
+                Instant::now(),
+            )
+            .expect("a fresh row always accepts its first signal");
+        assert!(
+            state.relation_signal_damage(),
+            "a signal on the worker's own pane must damage the laid-out worker row"
+        );
+
+        // The same live signal must not read as damage against the mate's own
+        // Space row: a pane carrier and a workspace carrier are different
+        // rows even when one nests under the other.
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+        assert!(
+            !state.relation_signal_damage(),
+            "a pane carrier must not be mistaken for the workspace it lives in"
+        );
+    }
+
+    #[test]
+    fn relation_signal_damage_is_unchanged_for_a_workspace_carrier() {
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("mate")];
+        let workspace_id = state.workspaces[0].id.clone();
+
+        state.view.workspace_card_areas = vec![WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 0, 20, 1),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: None,
+            motion_cells: (0, 0),
+        }];
+        assert!(!state.relation_signal_damage());
+
+        state
+            .relation_signals
+            .accept(
+                "firstmate",
+                None,
+                crate::app::relation_signal::RelationSignalKind::Transfer,
+                crate::app::relation_signal::CarrierId::Workspace(workspace_id),
+                None,
+                Instant::now(),
+            )
+            .expect("a fresh row always accepts its first signal");
+        assert!(
+            state.relation_signal_damage(),
+            "a signal on the workspace's own row must still damage a laid-out Space card"
+        );
     }
 
     fn navigator_row_for_display(is_workspace: bool) -> NavigatorRow {

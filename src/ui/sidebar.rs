@@ -2,6 +2,7 @@ mod card;
 pub(crate) mod image_card;
 pub(crate) mod motion;
 mod notifications;
+pub(crate) mod particle_background;
 mod tokens;
 pub(crate) mod tray;
 pub(crate) mod tray_art;
@@ -551,6 +552,59 @@ pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceLi
 /// or three rows that happen to be on screen.
 pub(crate) fn workspace_list_entries_whole_fleet(app: &AppState) -> Vec<WorkspaceListEntry> {
     workspace_list_entries_inner(app, true, &crate::app::tree_view::TreeRoot::Fleet)
+}
+
+/// The stable identity a row draws its trunk segments and card wash under.
+///
+/// `None` for a row whose backing entry has already gone — `entry_idx`/`ws_idx`
+/// briefly dangle between a pane closing and the next tree rebuild — which a
+/// caller treats as "this row owns no segment right now" rather than an error.
+fn entry_card_row(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<crate::anim::CardRow> {
+    match entry {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => app
+            .workspaces
+            .get(*ws_idx)
+            .map(|ws| crate::anim::CardRow::Space(ws.id.clone())),
+        WorkspaceListEntry::Agent { entry_idx, .. } => agents
+            .get(*entry_idx)
+            .map(|entry| crate::anim::CardRow::Agent(entry.pane_id)),
+    }
+}
+
+/// Every trunk segment on screen right now: one per row with a gap still open
+/// beneath it, at each ancestor column that gap belongs to.
+///
+/// This is what the app loop publishes to [`crate::anim::Animator`] so a
+/// segment mounts the frame its gap opens and dismounts the frame it closes,
+/// exactly mirroring the `│` cells [`agent_row_prefix`] and
+/// [`card_rail_prefix`] already draw — a level counts as open here under
+/// precisely the condition that makes those functions draw a rail glyph
+/// there rather than blank space.
+pub(crate) fn sidebar_trunk_segment_members(
+    app: &AppState,
+) -> Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)> {
+    let agents = sidebar_agent_entries(app);
+    workspace_list_entries(app)
+        .iter()
+        .filter_map(|entry| entry_card_row(app, &agents, entry).map(|row| (row, entry.clone())))
+        .flat_map(|(row, entry)| {
+            let depth = crate::app::agent_tree::display_depth(entry.depth());
+            let ancestors = entry.ancestors_continue().to_vec();
+            (1..depth).filter_map(move |level| {
+                let open = ancestors.get(level as usize).copied().unwrap_or(false);
+                open.then(|| {
+                    (
+                        crate::anim::ElementId::trunk_segment(row.clone(), level),
+                        crate::anim::behaviour::DriveInputs::default(),
+                    )
+                })
+            })
+        })
+        .collect()
 }
 
 /// The tree name a row answers to, which is the handle an `owner` token uses.
@@ -1576,7 +1630,11 @@ fn list_entry_height(
     // both kinds of row are drawn by the same card: a mate is a Space and a
     // worker is a pane, and a tree that skinned one and not the other would be
     // two designs stacked on each other.
-    if let Some(rows) = image_card::row_height_cells(app, entry.depth(), fold_width) {
+    //
+    // It does not take the entry either: card height is uniform across every
+    // rank by the captain's decision, and width is the rank signal. See
+    // `image_card::BASE_HEIGHT_PX`.
+    if let Some(rows) = image_card::row_height_cells(app, fold_width) {
         return rows.min(body_height);
     }
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
@@ -2807,10 +2865,37 @@ fn render_agent_row(
         .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
         .unwrap_or(0);
     let summary_badge = worker_summary_badge(app, entries, agents, card);
+    let cmd_ack_row = crate::anim::CardRow::Agent(detail.pane_id);
+    let cmd_ack_instances: Vec<u64> = app.sidebar_cmd_acks.live(&cmd_ack_row).collect();
+    let cmd_ack_reserved = summary_badge
+        .as_ref()
+        .map(|(_, count)| worker_summary_badge_rect(card, *count).width)
+        .unwrap_or(0);
+    let cmd_ack_width =
+        cmd_ack_strip_width(cmd_ack_instances.len(), card.rect.width, cmd_ack_reserved);
     // This row's own life, not its Space's: a worker arrives when it starts and
     // leaves when it finishes, which is what makes its second mate's group grow
     // and shrink around it.
     let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
+    let trunk = TrunkRailPaint::new(
+        app,
+        Some(crate::anim::CardRow::Agent(detail.pane_id)),
+        Style::default().fg(p.overlay0),
+    );
+    // A worker's own row is a pane, which is what makes it a carrier at all —
+    // see `AppState::pane_relation_signal_phase`. Severity comes from the
+    // pane's own tokens, the same way a Space's connector reads its own,
+    // so the charge and the card it runs into cannot disagree about how bad
+    // this row's trouble is.
+    let signal_phase = app.pane_relation_signal_phase(detail.ws_idx, detail.pane_id);
+    let row_severity = crate::app::lifecycle::severity(
+        detail
+            .tokens
+            .get(crate::app::lifecycle::SEVERITY_TOKEN)
+            .map(String::as_str),
+    );
+    let connector_style = Style::default().fg(p.overlay0);
+    let top_charge = ConnectorCharge::new(app, connector_style, signal_phase, row_severity);
 
     if let Some(shell) = &card_shell {
         let (mut connector, _) = agent_row_prefix(
@@ -2819,10 +2904,9 @@ fn render_agent_row(
             entry.ancestors_continue(),
             0,
             p,
-            // A relation signal is keyed on a workspace, and this row is a
-            // pane, so there is nothing here for a charge to belong to.
-            None,
+            top_charge.as_ref(),
             true,
+            trunk.as_ref(),
         );
         let (mut above, _) = card_rail_prefix(
             entry.depth(),
@@ -2830,6 +2914,7 @@ fn render_agent_row(
             entry.ancestors_continue(),
             CardRailSegment::AboveConnector,
             p,
+            trunk.as_ref(),
         );
         let (mut below, _) = card_rail_prefix(
             entry.depth(),
@@ -2837,6 +2922,7 @@ fn render_agent_row(
             entry.ancestors_continue(),
             CardRailSegment::BelowConnector,
             p,
+            trunk.as_ref(),
         );
         if entry.depth() > 0 {
             connector.push(connector_joint_span(p));
@@ -2875,6 +2961,11 @@ fn render_agent_row(
         let Some(row_y) = moved_row(row_y, motion.1, list_top, list_bottom) else {
             continue;
         };
+        // The branch line only exists on the card's first content row, so
+        // that is the only row a signal can travel and the only row it
+        // damages.
+        let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
+        let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase, row_severity);
         // Only the first content row carries the badge, so only it gives up the
         // width; only the last carries the pill.
         let trailing_width = if row_index == 0 {
@@ -2882,6 +2973,7 @@ fn render_agent_row(
                 .as_ref()
                 .map(|(_, count)| usize::from(worker_summary_badge_rect(card, *count).width))
                 .unwrap_or(0)
+                + usize::from(cmd_ack_width)
         } else {
             0
         } + if row_index == last_content_row {
@@ -2901,8 +2993,9 @@ fn render_agent_row(
                         entry.ancestors_continue(),
                         0,
                         p,
-                        None,
+                        row_charge.as_ref(),
                         true,
+                        trunk.as_ref(),
                     )
                 } else {
                     card_rail_prefix(
@@ -2911,6 +3004,7 @@ fn render_agent_row(
                         entry.ancestors_continue(),
                         CardRailSegment::BelowConnector,
                         p,
+                        trunk.as_ref(),
                     )
                 };
                 // The frame's own column and the pad inside it. Blank, so the
@@ -2932,8 +3026,9 @@ fn render_agent_row(
                     entry.ancestors_continue(),
                     row_index,
                     p,
-                    None,
+                    row_charge.as_ref(),
                     false,
+                    trunk.as_ref(),
                 );
                 (
                     spans,
@@ -2958,7 +3053,10 @@ fn render_agent_row(
         if !covered {
             spans.extend(resolved_token_spans(
                 resolved,
-                state_icon,
+                (
+                    state_icon.0,
+                    arrived_state_icon_style(state_icon.1, row_charge.as_ref(), p),
+                ),
                 status_style,
                 name_style,
                 secondary_style,
@@ -2984,6 +3082,19 @@ fn render_agent_row(
         if !covered {
             render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
         }
+    }
+
+    if !cmd_ack_instances.is_empty() && !covered {
+        render_cmd_acks(
+            app,
+            frame,
+            card,
+            &cmd_ack_row,
+            &cmd_ack_instances,
+            cmd_ack_reserved,
+            cmd_ack_width,
+            list_bottom,
+        );
     }
 }
 
@@ -3138,6 +3249,104 @@ fn render_worker_summary_badge(
     );
 }
 
+/// Max simultaneous command-ack glyphs one card's row draws at once.
+///
+/// The animation engine tracks every instance independently regardless of
+/// this cap — see [`crate::app::cmd_ack::CmdAcks`]'s own header on why the
+/// captain's call was one instance per detected command rather than a
+/// coalesced counter. This is purely the scoping report's "soft legibility
+/// damping" for a card busy enough that drawing every one of them would be
+/// noise rather than signal: the newest instances win the row's limited
+/// width, and the ones that lose the draw are still animating, just off
+/// screen.
+const CMD_ACK_MAX_VISIBLE: usize = 6;
+
+/// The glyph drawn per acknowledged command.
+///
+/// Deliberately not the command text or its output — the scoping report's
+/// §2/§4, unchanged by the captain's multiplicity answer — a short marker is
+/// the whole content, and the output already lives in the pane's own
+/// scrollback.
+const CMD_ACK_GLYPH: char = '●';
+
+/// Columns a strip of `instance_count` command-ack glyphs takes on a row
+/// `row_width` wide with `reserved` columns already spoken for (the worker
+/// summary badge, if the card has one), or `0` when there is nothing to draw
+/// or no room left to draw it in.
+fn cmd_ack_strip_width(instance_count: usize, row_width: u16, reserved: u16) -> u16 {
+    let glyphs = instance_count.min(CMD_ACK_MAX_VISIBLE) as u16;
+    if glyphs == 0 {
+        return 0;
+    }
+    // Needs the glyphs themselves and something left over for the row's own
+    // name and its chevron; below that the row is better off with just a
+    // name, the same trade `worker_summary_badge_width` makes.
+    let budget = row_width.saturating_sub(reserved + 2);
+    glyphs.min(budget)
+}
+
+/// Where a command-ack strip of `width` columns sits, immediately left of
+/// whatever else (the worker summary badge) has already reserved `reserved`
+/// columns from the card's right edge.
+fn cmd_ack_strip_rect(
+    card: &crate::app::state::WorkspaceCardArea,
+    reserved: u16,
+    width: u16,
+) -> Rect {
+    if card.rect.height == 0 || width == 0 {
+        return Rect::default();
+    }
+    Rect::new(
+        card.control_right().saturating_sub(1 + reserved + width),
+        card.content_y(),
+        width,
+        1,
+    )
+}
+
+/// Draw up to [`CMD_ACK_MAX_VISIBLE`] command-acknowledgement markers at the
+/// right edge of a card's first row.
+///
+/// Each glyph is its own animation element with its own settle clock — see
+/// [`crate::app::cmd_ack::CmdAcks`] — so a burst of commands reads as several
+/// independently ticking markers rather than one that restarted.
+fn render_cmd_acks(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    row: &crate::anim::CardRow,
+    instances: &[u64],
+    reserved: u16,
+    width: u16,
+    list_bottom: u16,
+) {
+    let rect = cmd_ack_strip_rect(card, reserved, width);
+    if rect.width == 0 || rect.y >= list_bottom {
+        return;
+    }
+    let base = Style::default().fg(app.palette.accent);
+    // The newest instances are the ones still worth a reader's attention when
+    // the row cannot show every one of them.
+    let visible = &instances[instances.len().saturating_sub(usize::from(rect.width))..];
+    let mut spans = Vec::with_capacity(visible.len());
+    for &seq in visible {
+        let id = crate::anim::ElementId::CmdAck(crate::anim::CmdAck {
+            row: row.clone(),
+            seq,
+        });
+        push_animated_span(
+            &mut spans,
+            CMD_ACK_GLYPH.to_string(),
+            base,
+            app.anim.frame(&id, None),
+            backdrop_rgb(app),
+            &app.palette,
+            &app.host_terminal_theme,
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+}
+
 /// Indent and connector for one row's first column run, in either panel.
 ///
 /// Deliberately the same vocabulary as the Spaces panel's child cards —
@@ -3162,6 +3371,7 @@ fn agent_row_prefix(
     p: &Palette,
     charge: Option<&ConnectorCharge<'_>>,
     meets_a_card: bool,
+    trunk: Option<&TrunkRailPaint<'_>>,
 ) -> (Vec<Span<'static>>, usize) {
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
@@ -3185,7 +3395,8 @@ fn agent_row_prefix(
             .copied()
             .unwrap_or(false);
         if open {
-            spans.push(Span::styled("│", line_style));
+            let (glyph, style) = trunk_rail_cell(trunk, level, line_style);
+            spans.push(Span::styled(glyph.to_string(), style));
             spans.push(Span::raw("  "));
         } else {
             spans.push(Span::raw("   "));
@@ -3241,6 +3452,7 @@ fn card_rail_prefix(
     ancestors_continue: &[bool],
     segment: CardRailSegment,
     p: &Palette,
+    trunk: Option<&TrunkRailPaint<'_>>,
 ) -> (Vec<Span<'static>>, usize) {
     let line_style = Style::default().fg(p.overlay0);
     // Above the connector the rail is the parent's, and a parent's line reaches
@@ -3271,7 +3483,8 @@ fn card_rail_prefix(
             .copied()
             .unwrap_or(false)
         {
-            spans.push(Span::styled("│", line_style));
+            let (glyph, style) = trunk_rail_cell(trunk, level, line_style);
+            spans.push(Span::styled(glyph.to_string(), style));
             spans.push(Span::raw("  "));
         } else {
             spans.push(Span::raw("   "));
@@ -3472,6 +3685,368 @@ fn connector_cell(
         paint.glyph_over(settled),
         paint.text_style(base, charge.ink),
     )
+}
+
+/// One row's trunk-rail paint, resolved once and asked about per ancestor
+/// level.
+///
+/// The vertical-line counterpart of [`ConnectorCharge`]: where a charge
+/// travels the three cells of one row's own branch, this reaches the `│`
+/// cells beside it that belong to an *ancestor's* line — each ancestor column
+/// is its own [`crate::anim::ElementId::TrunkSegment`], addressed by
+/// [`entry_card_row`], so a level that has nothing configured for it is left
+/// exactly as it always drew.
+///
+/// A segment is asked about at one fixed cell in a `1×1` extent rather than
+/// across the several terminal rows it may visually span, which is what makes
+/// it *one* object rather than a per-cell gradient: [`CellExtent::normalize`]
+/// resolves a one-cell axis to `0.0`, so every behaviour reads it as settled
+/// at a single point in its run and every cell of the segment agrees. A
+/// segment that travels smoothly along its own length — a charge, eventually
+/// the spider this unblocks — is later work built on this same identity, not
+/// a widening of what this paints.
+struct TrunkRailPaint<'a> {
+    anim: &'a crate::anim::Animator,
+    below: crate::anim::CardRow,
+    ink: crate::anim::cell::InkPalette,
+}
+
+impl<'a> TrunkRailPaint<'a> {
+    fn new(app: &'a AppState, below: Option<crate::anim::CardRow>, base: Style) -> Option<Self> {
+        Some(Self {
+            anim: &app.anim,
+            below: below?,
+            ink: crate::anim::cell::InkPalette::resolve(
+                base,
+                backdrop_rgb(app),
+                &app.palette,
+                &app.host_terminal_theme,
+            ),
+        })
+    }
+
+    /// The paint for the `│` at this ancestor level, or `None` when that
+    /// segment has nothing to play — no mount/dismount configured, or the
+    /// segment is not (yet) tracked by the engine — which a caller reads as
+    /// "draw the settled glyph."
+    fn cell(&self, level: u8) -> Option<crate::anim::cell::CellPaint> {
+        let frame = self.anim.frame(
+            &crate::anim::ElementId::trunk_segment(self.below.clone(), level),
+            None,
+        )?;
+        frame.behaviour?;
+        Some(frame.cell(
+            crate::anim::cell::CellPos::col(0),
+            crate::anim::cell::CellExtent::new(1, 1),
+            self.ink,
+        ))
+    }
+}
+
+/// One `│` cell of an ancestor's trunk rail, charge and all.
+///
+/// Mirrors [`connector_cell`] for the vertical rail rather than the branch:
+/// with no [`TrunkRailPaint`] — the ordinary case, nothing configured to
+/// animate row arrival — this returns the settled glyph unchanged, so the
+/// mechanism costs nothing when it is not asked to do anything.
+fn trunk_rail_cell(trunk: Option<&TrunkRailPaint<'_>>, level: u8, base: Style) -> (char, Style) {
+    const SETTLED: char = '│';
+    let Some(trunk) = trunk else {
+        return (SETTLED, base);
+    };
+    let Some(paint) = trunk.cell(level) else {
+        return (SETTLED, base);
+    };
+    (paint.glyph_over(SETTLED), paint.text_style(base, trunk.ink))
+}
+
+/// The failure spider: a persistent, red, pulsing marker that climbs a
+/// failing card's own trunk/branch to rest at its top-centre border, and
+/// stays there until the card clears.
+///
+/// Deliberately not a `glyph_over` substitution — nothing settled already
+/// stands at the cell it rests on that has to keep meaning what it means —
+/// but its own drawn cell, the same way [`render_agent_row`]'s worker-summary
+/// badge is. And deliberately at the *border*, not the card face: the face is
+/// the crowded surface the sidebar's own width rules protect, the border is
+/// not.
+///
+/// Character shell only, for now. A pixel card's sheet is opaque and drawn
+/// over these same cells (see [`image_card::shape_covers_row`]), so a
+/// character-cell marker under it would be invisible rather than merely
+/// covered — see the `AGENTS.md` bullet on the sidebar's two renderers.
+/// Rasterising the spider into `image_card::build_cards` so it survives the
+/// pixel path is a named follow-up, not a gap here.
+fn render_failure_spiders(
+    app: &AppState,
+    frame: &mut Frame,
+    cards: &[crate::app::state::WorkspaceCardArea],
+    entries: &[WorkspaceListEntry],
+    agents: &[AgentPanelEntry],
+    fold_width: u16,
+) {
+    if image_card::shape_covers_row(app, fold_width) {
+        return;
+    }
+    for card in cards {
+        if card.card_frame.is_none() {
+            continue;
+        }
+        let Some(entry) = entries.get(card.entry_idx) else {
+            continue;
+        };
+        let Some(row) = entry_card_row(app, agents, entry) else {
+            continue;
+        };
+        let id = crate::anim::ElementId::failure_spider(row);
+        let Some(elem_frame) = app.anim.frame(
+            &id,
+            Some(crate::anim::behaviour::names::FAILURE_SPIDER_PULSE),
+        ) else {
+            continue;
+        };
+        let t = match elem_frame.phase {
+            crate::anim::Phase::Idle => 1.0,
+            crate::anim::Phase::Mount | crate::anim::Phase::Dismount => elem_frame.progress,
+            crate::anim::Phase::Retired => continue,
+        };
+        let Some((x, y)) = failure_spider_position(card, t) else {
+            continue;
+        };
+        let buf = frame.buffer_mut();
+        if x < buf.area.left()
+            || x >= buf.area.right()
+            || y < buf.area.top()
+            || y >= buf.area.bottom()
+        {
+            continue;
+        }
+
+        // `Severity::Serious`, not `Critical`: severity's light-reach ramp
+        // pushes an ink *toward the light bound* as it escalates (worse
+        // trouble reads as a brighter, more forward light, the same
+        // direction a card's own alert breath moves), so `Critical` on a dark
+        // panel washed the spider to a pale rose rather than reading as red —
+        // caught on the live render this PR's description captures, not by a
+        // unit test. `Serious` stays close enough to the panel to read as a
+        // real red.
+        let ink = crate::anim::cell::InkPalette::resolve(
+            Style::default(),
+            backdrop_rgb(app),
+            &app.palette,
+            &app.host_terminal_theme,
+        )
+        .with_signal(
+            crate::anim::cell::LifecycleStage::Failed.hue(&app.palette, &app.host_terminal_theme),
+            crate::anim::cell::Severity::Serious,
+        );
+        let paint = elem_frame.cell(
+            crate::anim::cell::CellPos::new(0, 0),
+            crate::anim::cell::CellExtent::new(1, 1),
+            ink,
+        );
+        let style = paint
+            .text_style(Style::default(), ink)
+            .add_modifier(Modifier::BOLD);
+        // `Buffer::set_string`, never direct cell indexing: the glyph is
+        // double-width in every terminal that has been checked against this,
+        // and only `set_string`'s own `unicode-width` accounting resets the
+        // cell it would otherwise leave stale — see the `AGENTS.md` bullet on
+        // a decoration's glyph never being free to move a column, which a
+        // raw `set_symbol` on one cell silently violates for anything wider
+        // than the settled glyph it stands on.
+        buf.set_string(x, y, FAILURE_SPIDER_GLYPH, style);
+    }
+}
+
+/// The spider's own glyph. A pictograph rather than a box-drawing run: the
+/// captain's spec is explicit that this reads as a spider, not as a retro
+/// blocky mark, and a character cell's only way to say that is the glyph it
+/// draws — there is no multi-cell shape to compose one from without leaving
+/// the character shell entirely (see [`render_failure_spiders`]'s doc
+/// comment).
+///
+/// The trailing `U+FE0F` (emoji presentation selector) is load-bearing, not
+/// decoration on the literal: without it a live render left a trail of stale
+/// spider glyphs behind every position the climb passed through, one per
+/// animation frame, because `ratatui::buffer::Buffer::diff` only emits an
+/// explicit clear for a wide grapheme's trailing cell when the grapheme
+/// contains `U+FE0F` — its own documented workaround for terminals that do
+/// not reliably clear a wide emoji's trailing cell otherwise. A bare spider
+/// codepoint is ambiguous width without it, so the clear was silently
+/// skipped and the border kept every frame's leftover column live at once.
+/// Caught live at `sidebar_width = 42`, not by a unit test — see this crate's
+/// PR description for the capture.
+const FAILURE_SPIDER_GLYPH: &str = "🕷\u{fe0f}";
+
+/// The waypoints the spider's climb walks, in order: up this row's own trunk
+/// column to its branch, along the branch to the card's own left border, up
+/// that border to the top, then across the top border to centre.
+///
+/// Every leg is a single cell-grid axis move, never a diagonal, because that
+/// is how the tree's own lines are drawn — see the `AGENTS.md` entry on the
+/// character tree being the layout authority. `rect.x` is the trunk column
+/// deliberately rather than a resolved ancestor level's own column: bullet 62
+/// of that file records that a card's left border already stands in its own
+/// connector's column, which is the one column guaranteed to exist for every
+/// card regardless of how deep it is nested, so the climb needs no ancestor
+/// topology to be well-defined.
+fn failure_spider_waypoints(
+    card: &crate::app::state::WorkspaceCardArea,
+) -> Option<[(u16, u16); 5]> {
+    let frame = card.card_frame?;
+    if frame.width == 0 {
+        return None;
+    }
+    let trunk_x = card.rect.x;
+    let connector_y = card.content_y();
+    let border_x = frame.x;
+    let border_y = frame.y;
+    let centre_x = frame.x + frame.width.saturating_sub(1) / 2;
+    let start_y = card
+        .rect
+        .y
+        .saturating_add(card.rect.height)
+        .saturating_sub(1)
+        .max(connector_y);
+    Some([
+        (trunk_x, start_y),
+        (trunk_x, connector_y),
+        (border_x, connector_y),
+        (border_x, border_y),
+        (centre_x, border_y),
+    ])
+}
+
+/// Where the spider sits on its climb, at `t` in `0.0..=1.0`: `0.0` is just
+/// setting out from below the row, `1.0` is arrived and resting at the top
+/// centre border. Each leg gets a share of `t` proportional to its own length
+/// in cells, so a tall card's climb up its own border is not rushed relative
+/// to the jog to centre a short one gets.
+fn failure_spider_position(
+    card: &crate::app::state::WorkspaceCardArea,
+    t: f32,
+) -> Option<(u16, u16)> {
+    let waypoints = failure_spider_waypoints(card)?;
+    let t = t.clamp(0.0, 1.0);
+    let legs: Vec<f32> = waypoints
+        .windows(2)
+        .map(|pair| {
+            let (x0, y0) = pair[0];
+            let (x1, y1) = pair[1];
+            f32::from(x0.abs_diff(x1)) + f32::from(y0.abs_diff(y1))
+        })
+        .collect();
+    let total: f32 = legs.iter().sum();
+    if total <= 0.0 {
+        let (x, y) = waypoints[waypoints.len() - 1];
+        return Some((x, y));
+    }
+    let mut travelled = t * total;
+    for (i, &len) in legs.iter().enumerate() {
+        if travelled <= len || i == legs.len() - 1 {
+            let leg_t = if len > 0.0 {
+                (travelled / len).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let (x0, y0) = waypoints[i];
+            let (x1, y1) = waypoints[i + 1];
+            return Some((lerp_u16(x0, x1, leg_t), lerp_u16(y0, y1, leg_t)));
+        }
+        travelled -= len;
+    }
+    let (x, y) = waypoints[waypoints.len() - 1];
+    Some((x, y))
+}
+
+fn lerp_u16(a: u16, b: u16, t: f32) -> u16 {
+    let a = f32::from(a);
+    let b = f32::from(b);
+    (a + (b - a) * t).round().max(0.0) as u16
+}
+
+#[cfg(test)]
+mod failure_spider_geometry {
+    use super::*;
+
+    fn card(rect: Rect, frame: Rect) -> crate::app::state::WorkspaceCardArea {
+        crate::app::state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect,
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: Some(frame),
+            motion_cells: (0, 0),
+        }
+    }
+
+    #[test]
+    fn a_settled_spider_rests_at_the_top_centre_border() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let (x, y) = failure_spider_position(&area, 1.0).expect("a card frame gives a position");
+        assert_eq!(y, 0, "the top border row");
+        assert_eq!(x, 2 + (26 - 1) / 2, "horizontally centred on the card");
+    }
+
+    #[test]
+    fn a_spider_just_setting_out_starts_in_the_trunk_column_at_or_below_the_branch() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let (x, y) = failure_spider_position(&area, 0.0).expect("a card frame gives a position");
+        assert_eq!(
+            x, area.rect.x,
+            "the trunk column, not the card's own border"
+        );
+        assert!(y >= area.content_y(), "at or below this row's own branch");
+    }
+
+    #[test]
+    fn a_card_with_no_frame_has_no_climb_at_all() {
+        let mut area = card(Rect::new(0, 0, 10, 1), Rect::new(0, 0, 10, 1));
+        area.card_frame = None;
+        assert_eq!(
+            failure_spider_position(&area, 0.5),
+            None,
+            "a bare line has no border to rest on"
+        );
+    }
+
+    /// The tree's own lines never run diagonally, and the climb has to match:
+    /// each step is a move along one axis, the same way a `│` then a `─`
+    /// meets a card rather than a line cutting the gutter on the bias.
+    #[test]
+    fn the_climb_only_ever_moves_one_axis_at_a_time() {
+        let area = card(Rect::new(0, 0, 30, 6), Rect::new(2, 0, 26, 6));
+        let mut previous = failure_spider_position(&area, 0.0).unwrap();
+        for step in 1u16..=20 {
+            let t = f32::from(step) / 20.0;
+            let current = failure_spider_position(&area, t).unwrap();
+            let dx = current.0.abs_diff(previous.0);
+            let dy = current.1.abs_diff(previous.1);
+            assert!(
+                dx == 0 || dy == 0,
+                "a step moved diagonally at t={t}: {previous:?} -> {current:?}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn progress_is_monotonic_along_the_path() {
+        let area = card(Rect::new(0, 0, 30, 8), Rect::new(2, 0, 26, 8));
+        let waypoints = failure_spider_waypoints(&area).unwrap();
+        let total: f32 = waypoints
+            .windows(2)
+            .map(|pair| {
+                f32::from(pair[0].0.abs_diff(pair[1].0)) + f32::from(pair[0].1.abs_diff(pair[1].1))
+            })
+            .sum();
+        assert!(
+            total > 0.0,
+            "a card taller than one row has real distance to climb"
+        );
+    }
 }
 
 /// Emphasis on a row's state icon as a charge reaches it.
@@ -4018,6 +4593,11 @@ fn render_workspace_list(
             .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
             .unwrap_or(0);
         let content_y = card.content_y();
+        let trunk = TrunkRailPaint::new(
+            app,
+            Some(crate::anim::CardRow::Space(ws.id.clone())),
+            Style::default().fg(p.overlay0),
+        );
 
         if let Some(shell) = &card_shell {
             let mut connector = Vec::new();
@@ -4032,6 +4612,7 @@ fn render_workspace_list(
                     p,
                     top_charge.as_ref(),
                     true,
+                    trunk.as_ref(),
                 );
                 connector.append(&mut owned);
                 connector.push(connector_joint_span(p));
@@ -4044,6 +4625,7 @@ fn render_workspace_list(
                 own_ancestors,
                 CardRailSegment::AboveConnector,
                 p,
+                trunk.as_ref(),
             );
             let (below, _) = card_rail_prefix(
                 own_depth,
@@ -4051,6 +4633,7 @@ fn render_workspace_list(
                 own_ancestors,
                 CardRailSegment::BelowConnector,
                 p,
+                trunk.as_ref(),
             );
             render_card_border_rails(
                 frame,
@@ -4109,6 +4692,7 @@ fn render_workspace_list(
                             p,
                             row_charge.as_ref(),
                             true,
+                            trunk.as_ref(),
                         )
                     } else {
                         card_rail_prefix(
@@ -4117,6 +4701,7 @@ fn render_workspace_list(
                             own_ancestors,
                             CardRailSegment::BelowConnector,
                             p,
+                            trunk.as_ref(),
                         )
                     };
                     spans.append(&mut prefix);
@@ -4158,6 +4743,7 @@ fn render_workspace_list(
                             p,
                             row_charge.as_ref(),
                             false,
+                            trunk.as_ref(),
                         );
                         spans.append(&mut owned);
                         width
@@ -4251,6 +4837,8 @@ fn render_workspace_list(
             }
         }
     }
+
+    render_failure_spiders(app, frame, cards, &entries, &agents, fold_width);
 
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
         let indicator_right = scrollbar_rect
@@ -4409,6 +4997,60 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    /// A worker's own row owns the ancestor gap that is still open beneath
+    /// it, and nothing else in the tree does.
+    ///
+    /// Two second mates share one first mate, with a worker under the first
+    /// of them. The worker sits at depth 2, and the ancestor column at level
+    /// 1 — the first mate's own column, running past the first second mate —
+    /// is still open, because the second mate follows: exactly the gap
+    /// `agent_row_prefix` already draws a `│` for. Neither mate carries a
+    /// segment of its own: both sit at depth 1, and the loop `agent_row_prefix`
+    /// draws rails from starts at level 1, which for a depth-1 row is already
+    /// past its own depth.
+    #[test]
+    fn a_workers_own_row_owns_the_open_ancestor_gap_beneath_it() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut mate_a = Workspace::test_new("2ndmate-a");
+        let worker_pane = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let mate_b = Workspace::test_new("2ndmate-b");
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate_a, mate_b];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let now = std::time::Instant::now();
+        for idx in [1, 2] {
+            app.workspaces[idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("2ndmate-a".to_string()))]),
+            None,
+            now,
+        );
+
+        let members = sidebar_trunk_segment_members(&app);
+        assert_eq!(
+            members,
+            vec![(
+                crate::anim::ElementId::trunk_segment(crate::anim::CardRow::Agent(worker_pane), 1,),
+                crate::anim::behaviour::DriveInputs::default(),
+            )],
+        );
     }
 
     /// The same miniature fleet with **nothing hand-stamped on the worker**.
@@ -5429,6 +6071,7 @@ mod tests {
                             &p,
                             None,
                             meets_a_card,
+                            None,
                         );
                         assert_eq!(
                             drawn,
@@ -5456,7 +6099,7 @@ mod tests {
                 ] {
                     let ancestors = vec![true; depth as usize + 1];
                     let (_, drawn) =
-                        card_rail_prefix(depth, is_last_child, &ancestors, segment, &p);
+                        card_rail_prefix(depth, is_last_child, &ancestors, segment, &p, None);
                     assert_eq!(
                         drawn,
                         tree_prefix_width(depth, 0),
@@ -5476,7 +6119,7 @@ mod tests {
         let p = Palette::catppuccin();
         let ancestors = vec![true, true];
         let ink = |segment| {
-            let (spans, _) = card_rail_prefix(1, true, &ancestors, segment, &p);
+            let (spans, _) = card_rail_prefix(1, true, &ancestors, segment, &p, None);
             spans.iter().any(|span| span.content.contains('│'))
         };
         assert!(
@@ -5489,7 +6132,7 @@ mod tests {
         );
 
         let ink_middle = |segment| {
-            let (spans, _) = card_rail_prefix(1, false, &ancestors, segment, &p);
+            let (spans, _) = card_rail_prefix(1, false, &ancestors, segment, &p, None);
             spans.iter().any(|span| span.content.contains('│'))
         };
         assert!(ink_middle(CardRailSegment::AboveConnector));
@@ -7260,7 +7903,14 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             let now = std::time::Instant::now();
             let carrier = app.workspaces[1].id.clone();
             app.relation_signals
-                .accept("firstmate", None, kind, carrier, None, now)
+                .accept(
+                    "firstmate",
+                    None,
+                    kind,
+                    crate::app::relation_signal::CarrierId::Workspace(carrier),
+                    None,
+                    now,
+                )
                 .expect("a fresh row always accepts its first signal");
             // Walk the clock to the requested position the same way the runtime
             // tick does, rather than reaching into the signal's internals.
@@ -7376,6 +8026,154 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             moved += changed.len();
         }
         assert!(moved > 0, "the signal has to actually draw something");
+    }
+
+    /// A mate's Space owning one worker pane, with the worker's own row wired
+    /// up as a relation-signal carrier — the mate->worker connector the whole
+    /// feature exists for. Mirrors [`render_signalled_tree`], but the carrier
+    /// is the worker's pane id rather than a workspace id.
+    fn render_signalled_worker_tree(
+        kind: Option<crate::app::relation_signal::RelationSignalKind>,
+        position: u16,
+    ) -> (ratatui::buffer::Buffer, AppState) {
+        let mut app = AppState::test_new();
+        let mut mate = Workspace::test_new("firstmate");
+        let worker_pane = mate.test_split(ratatui::layout::Direction::Vertical);
+        let worker_public_id = crate::workspace::public_pane_id_for_number(
+            &mate.id,
+            mate.public_pane_number(worker_pane)
+                .expect("split pane has a public number"),
+        );
+        app.workspaces = vec![mate];
+        app.ensure_test_terminals();
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        // `test_split` is a raw layout split, so it stamps no creation origin
+        // — unlike the real `pane.split` API path, it does not read as
+        // delegated-in-space. An explicit `owner` token, published the same
+        // way a real fleet publishes one, is what puts the worker on its
+        // mate's row.
+        let worker_terminal = app.workspaces[0].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+
+        if let Some(kind) = kind {
+            let now = std::time::Instant::now();
+            app.relation_signals
+                .accept(
+                    "firstmate",
+                    None,
+                    kind,
+                    crate::app::relation_signal::CarrierId::Pane(worker_public_id),
+                    None,
+                    now,
+                )
+                .expect("a fresh row always accepts its first signal");
+            let step = crate::app::relation_signal::DEFAULT_SIGNAL_TTL
+                / u32::from(crate::app::relation_signal::SIGNAL_POSITIONS);
+            app.relation_signals
+                .advance(now + step * u32::from(position) + std::time::Duration::from_millis(1));
+        }
+
+        let list_area = workspace_list_rect(area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    list_area,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (buffer, app)
+    }
+
+    #[test]
+    fn a_pane_carrier_renders_the_charge_on_the_workers_own_connector() {
+        // The case the whole carrier extension exists for: workers are panes,
+        // so the mate->worker connector has to carry a signal, not only the
+        // Space-level connector `render_signalled_tree` already covers.
+        use crate::app::relation_signal::{RelationSignalKind, SIGNAL_POSITIONS};
+
+        let mut frames = vec![render_signalled_worker_tree(None, 0).0];
+        for position in 0..SIGNAL_POSITIONS {
+            frames
+                .push(render_signalled_worker_tree(Some(RelationSignalKind::Transfer), position).0);
+        }
+        frames.push(render_signalled_worker_tree(None, 0).0);
+
+        let (_, app) = render_signalled_worker_tree(None, 0);
+        let worker_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_some())
+            .expect("the worker's own row is laid out");
+        let child = worker_card.rect;
+
+        let mut moved = 0;
+        for pair in frames.windows(2) {
+            let changed = changed_cells(&pair[0], &pair[1]);
+            for (x, y) in &changed {
+                assert_eq!(
+                    *y, child.y,
+                    "a signal on the worker's pane must not touch any row but the worker's own"
+                );
+                let _ = x;
+            }
+            moved += changed.len();
+        }
+        assert!(
+            moved > 0,
+            "the worker's own connector has to actually draw the crackle"
+        );
+    }
+
+    #[test]
+    fn a_pane_carrier_does_not_light_a_workspace_row_with_the_same_number() {
+        // Regression guard: a pane carrier and a workspace row are different
+        // rows even when nested one under the other. Confirms the render
+        // path reads `pane_relation_signal_phase`, not `workspace_relation_signal_phase`,
+        // for the mate's own Space row.
+        let (unsignalled, _) = render_signalled_worker_tree(None, 0);
+        let (signalled, app) = render_signalled_worker_tree(
+            Some(crate::app::relation_signal::RelationSignalKind::Transfer),
+            0,
+        );
+        let mate_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_none())
+            .expect("the mate's own Space row is laid out");
+        for x in mate_card.rect.x..mate_card.rect.x + mate_card.rect.width {
+            assert_eq!(
+                unsignalled[(x, mate_card.rect.y)].symbol(),
+                signalled[(x, mate_card.rect.y)].symbol(),
+                "a worker's signal must not draw on its mate's own Space row"
+            );
+            assert_eq!(
+                unsignalled[(x, mate_card.rect.y)].style(),
+                signalled[(x, mate_card.rect.y)].style(),
+                "a worker's signal must not draw on its mate's own Space row"
+            );
+        }
     }
 
     /// Every kind, so the vocabulary is exercised rather than just the two that
@@ -8775,6 +9573,198 @@ rows = [
 
         assert_eq!(row, "Rebuild fitne…");
     }
+
+    /// A first mate owning one worker, for the command-acknowledgement render
+    /// tests: `summary_fleet`'s shape without the summary, and a plain
+    /// `PaneId` handle back so a test can drive `sidebar_cmd_acks` directly
+    /// against the exact row it renders.
+    fn single_worker_fleet() -> (crate::app::state::AppState, crate::layout::PaneId) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Working;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]),
+            None,
+            now,
+        );
+        (app, worker_pane)
+    }
+
+    /// Renders `app` at the sidebar width the captain runs — see
+    /// `ownership_is_drawn_as_written::CAPTAIN_SIDEBAR_WIDTH`, the same 42
+    /// columns, kept as a separate literal here so this module does not reach
+    /// into a sibling test module for a constant that is really just "how
+    /// wide the captain's panel is" — and returns the drawn buffer.
+    fn render_cmd_ack_fleet(app: &mut crate::app::state::AppState) -> ratatui::buffer::Buffer {
+        const WIDTH: u16 = 42;
+        let area = Rect::new(0, 0, WIDTH, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(app, area);
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn find_all_symbol_x(
+        buffer: &ratatui::buffer::Buffer,
+        row: u16,
+        width: u16,
+        symbol: &str,
+    ) -> Vec<u16> {
+        (0..width)
+            .filter(|&x| buffer[(x, row)].symbol() == symbol)
+            .collect()
+    }
+
+    fn worker_row(buffer: &ratatui::buffer::Buffer, width: u16) -> u16 {
+        (0..20)
+            .find(|&y| row_text(buffer, y, width).contains("worker"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no worker row on screen:\n{}",
+                    (0..20)
+                        .map(|y| row_text(buffer, y, width))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+    }
+
+    /// Drives the same fold `App::advance_animations` uses for command acks —
+    /// `CmdAcks::observe` into `Animator::observe` — without pulling in the
+    /// full app-loop tick, so the test controls the wall clock exactly.
+    fn advance_cmd_acks(
+        app: &mut crate::app::state::AppState,
+        pane_id: crate::layout::PaneId,
+        now: std::time::Instant,
+    ) {
+        let mount = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD;
+        let hold = crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+        let dismount = crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD;
+        let active_window = mount + hold;
+        let retain_window = active_window + dismount;
+        let lifecycle = crate::app::cmd_ack::CmdAcks::lifecycle(mount, dismount);
+        let row = crate::anim::CardRow::Agent(pane_id);
+        let members = app
+            .sidebar_cmd_acks
+            .observe(now, active_window, retain_window, [row]);
+        app.anim
+            .observe(now, crate::anim::Family::CmdAck, &lifecycle, members);
+    }
+
+    /// The end-to-end proof this task asked for: a real render, at the
+    /// sidebar width the captain runs, of two commands acknowledged apart in
+    /// time — showing they are two genuinely independent settle clocks rather
+    /// than one marker restarting, and rather than a coalesced "×2" counter.
+    #[test]
+    fn two_commands_recorded_apart_animate_as_two_independent_instances() {
+        let (mut app, pane_id) = single_worker_fleet();
+        let row = crate::anim::CardRow::Agent(pane_id);
+        let glyph = CMD_ACK_GLYPH.to_string();
+        let t0 = std::time::Instant::now();
+        let mount = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD;
+        let window = mount + crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+
+        app.sidebar_cmd_acks.record(row.clone(), t0);
+        advance_cmd_acks(&mut app, pane_id, t0);
+
+        // Snapshot 1, mid-mount: only the first command has run.
+        let mid_mount = t0 + mount / 2;
+        advance_cmd_acks(&mut app, pane_id, mid_mount);
+        let buffer1 = render_cmd_ack_fleet(&mut app);
+        let y = worker_row(&buffer1, 42);
+        let xs1 = find_all_symbol_x(&buffer1, y, 42, &glyph);
+        assert_eq!(
+            xs1.len(),
+            1,
+            "only one command has run so far:\n{}",
+            row_text(&buffer1, y, 42)
+        );
+
+        // The second command runs 600ms later — long after the first has
+        // settled into its hold — so the two are caught at visibly different
+        // points in their own settle at the same wall-clock instant.
+        let t1 = t0 + std::time::Duration::from_millis(600);
+        app.sidebar_cmd_acks.record(row.clone(), t1);
+        advance_cmd_acks(&mut app, pane_id, t1);
+        let buffer2 = render_cmd_ack_fleet(&mut app);
+        let xs2 = find_all_symbol_x(&buffer2, y, 42, &glyph);
+        assert_eq!(
+            xs2.len(),
+            2,
+            "a burst of two commands is two markers, not a coalesced counter:\n{}",
+            row_text(&buffer2, y, 42)
+        );
+        let fg = |buffer: &ratatui::buffer::Buffer, x: u16| buffer[(x, y)].fg;
+        let a_at_t1 = fg(&buffer2, xs2[0]);
+        let b_at_t1 = fg(&buffer2, xs2[1]);
+        assert_ne!(
+            a_at_t1,
+            b_at_t1,
+            "the settled first marker and the still-snapping-in second marker \
+             must not read as the same frame:\n{}",
+            row_text(&buffer2, y, 42)
+        );
+
+        // The first marker's window has now closed and it starts fading out
+        // on its own schedule; the second, meanwhile, has had time to finish
+        // its own mount and settle into its hold. Reaching the boundary is
+        // its own pass — it is what starts the dismount clock — and only a
+        // further pass after that lets the fade actually progress before
+        // this snapshot.
+        advance_cmd_acks(&mut app, pane_id, t0 + window);
+        let t2 = t0 + window + std::time::Duration::from_millis(70);
+        advance_cmd_acks(&mut app, pane_id, t2);
+        let buffer3 = render_cmd_ack_fleet(&mut app);
+        let xs3 = find_all_symbol_x(&buffer3, y, 42, &glyph);
+        assert_eq!(
+            xs3.len(),
+            2,
+            "the second marker must still be live while the first fades:\n{}",
+            row_text(&buffer3, y, 42)
+        );
+        let a_at_t2 = fg(&buffer3, xs3[0]);
+        let b_at_t2 = fg(&buffer3, xs3[1]);
+        assert_ne!(
+            a_at_t1, a_at_t2,
+            "the first marker's own colour must have moved as it faded — a \
+             static marker is not an animation"
+        );
+        assert_ne!(
+            b_at_t1, b_at_t2,
+            "the second marker's own colour must have moved too, as it snapped \
+             in from where it started at t1 to settled at t2 — each marker \
+             ticks its own clock, not a shared one"
+        );
+        assert_eq!(
+            a_at_t1, b_at_t2,
+            "a marker fully settled into its hold reads the same regardless \
+             of which instance it is — the first at t1, the second at t2"
+        );
+    }
 }
 
 /// The tree draws ownership: where a line meets a card, where a card hangs, and
@@ -8855,7 +9845,7 @@ mod ownership_is_drawn_as_written {
     /// prefix is measured with.
     fn connector_column(depth: u8, ancestors: &[bool]) -> u16 {
         let p = Palette::catppuccin();
-        let (spans, _) = agent_row_prefix(depth, false, ancestors, 0, &p, None, true);
+        let (spans, _) = agent_row_prefix(depth, false, ancestors, 0, &p, None, true, None);
         let mut column = 0u16;
         for span in &spans {
             for glyph in span.content.chars() {
@@ -8927,9 +9917,10 @@ mod ownership_is_drawn_as_written {
     fn a_branch_meets_the_card_it_points_at_and_keeps_its_gap_from_a_name() {
         let p = Palette::catppuccin();
         for is_last_child in [true, false] {
-            let (card, card_cols) = agent_row_prefix(1, is_last_child, &[false], 0, &p, None, true);
+            let (card, card_cols) =
+                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, true, None);
             let (line, line_cols) =
-                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, false);
+                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, false, None);
             let text = |spans: &[Span<'static>]| -> String {
                 spans.iter().map(|span| span.content.to_string()).collect()
             };

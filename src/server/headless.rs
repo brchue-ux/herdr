@@ -4543,6 +4543,7 @@ impl HeadlessServer {
         // back to its character marks on every server-backed session — which is
         // every session — because nothing ever rasterises the badges.
         changed |= self.app.observe_signal_tray(now);
+        changed |= self.app.observe_sidebar_particle_field();
         self.app.sync_state_age_timer(now, has_viewers);
         changed
     }

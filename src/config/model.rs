@@ -1055,6 +1055,34 @@ pub struct ExperimentalConfig {
     ///
     /// Only read while `kitty_graphics` is on.
     pub sidebar_card_shapes: bool,
+    /// Draw an ambient particle-field wash behind the sidebar tree. Default: false.
+    ///
+    /// Generated once per sidebar size and played back by the terminal's own Kitty
+    /// animation-frame clock (`a=f`/`a=a`) rather than re-uploaded every tick, so steady-state
+    /// wire cost is near zero once armed — see `src/kitty_graphics.rs` and
+    /// `src/ui/sidebar/particle_background.rs`. Kitty-only for now: a terminal that does not
+    /// honour `a=f`/`a=a` still shows the root frame, just static.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub sidebar_particle_field: bool,
+    /// Hand Kitty graphics pixels to the host terminal as a local temp file
+    /// (`t=f`) instead of base64 inside the escape stream (`t=d`), and pick a
+    /// raw pixel format the detected terminal is fast at, when both the host
+    /// terminal is local and the terminal is one herdr recognises. Default:
+    /// false.
+    ///
+    /// "Local" is read from this process's own environment (`SSH_TTY`,
+    /// `SSH_CONNECTION`, `SSH_CLIENT`): unset means locality is positively
+    /// established. In split server/client
+    /// mode that is the *server* process's environment, which only agrees with
+    /// the terminal's when server and client are co-located — the common case,
+    /// but not guaranteed for a server started as a long-lived daemon detached
+    /// from the shell that will later attach a client. Leave this off unless
+    /// that matches your setup; whenever locality cannot be positively
+    /// established, herdr keeps sending `t=d`.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub kitty_graphics_local_transport: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
@@ -1942,6 +1970,19 @@ kitty_graphics = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.kitty_graphics);
+    }
+
+    #[test]
+    fn kitty_graphics_local_transport_default_off_and_parse() {
+        let config = Config::default();
+        assert!(!config.experimental.kitty_graphics_local_transport);
+
+        let toml = r#"
+[experimental]
+kitty_graphics_local_transport = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.experimental.kitty_graphics_local_transport);
     }
 
     #[test]

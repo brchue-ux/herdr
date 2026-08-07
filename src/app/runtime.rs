@@ -6,6 +6,32 @@ use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
     RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
+/// The life the failure spider is given: climb in, rest pulsing, retreat back
+/// down once the card it is on clears.
+///
+/// Mirrors [`crate::app::card_wash::CardWashes::lifecycle`] — a `Lifecycle` is
+/// cheap enough to build fresh on every pass rather than cached, and building
+/// it beside its one call site keeps the mount/idle/dismount stages next to
+/// the reasoning for them. Unlike a card wash, this element does have a
+/// dismount: a wash is an event with nothing left to be once it settles, but
+/// a spider that has climbed to a card it is still sitting on has to leave the
+/// same way it arrived, not vanish.
+fn failure_spider_lifecycle() -> crate::anim::Lifecycle {
+    use crate::anim::behaviour::{names, FAILURE_SPIDER_CLIMB_PERIOD};
+    use crate::anim::{Lifecycle, Stage};
+
+    Lifecycle::still()
+        .with_mount(Stage::new(
+            names::FAILURE_SPIDER_CLIMB,
+            FAILURE_SPIDER_CLIMB_PERIOD,
+        ))
+        .with_idle(names::FAILURE_SPIDER_PULSE)
+        .with_dismount(Stage::new(
+            names::FAILURE_SPIDER_CLIMB,
+            FAILURE_SPIDER_CLIMB_PERIOD,
+        ))
+}
+
 fn retain_custom_command_after_wait(
     pid: u32,
     result: std::io::Result<Option<std::process::ExitStatus>>,
@@ -367,6 +393,7 @@ impl App {
         changed |= self.advance_relation_signals(now, true);
         changed |= self.sample_pane_activity(now);
         changed |= self.observe_signal_tray(now);
+        changed |= self.observe_sidebar_particle_field();
 
         if self
             .selection_autoscroll_deadline
@@ -479,7 +506,44 @@ impl App {
         // rather than a decoration on a row, and one already in flight has to
         // be able to finish even when nothing else in the panel is animating.
         let switching = has_viewers && self.state.tree_view_switch_active();
-        if !tree && !signals && !switching && !badges {
+        // A command ack is an event a screen-detection scan fired moments ago,
+        // not a configured feature — unlike every family above it, it has no
+        // "is this switched on" flag of its own to gate on, only "is one
+        // currently live". `tree` still folds in below so a card breathing for
+        // an unrelated reason does not make this recompute `live` twice.
+        let acks_pending = has_viewers && self.state.sidebar_cmd_acks.any_live();
+
+        // The failure spider is the same shape of exception for the same
+        // reason: a core failure signal, not a decorative animation toggle,
+        // so unlike `tree`/`signals`/`badges` it is not gated on any
+        // `[ui.sidebar.animation]` config — it has to climb on an
+        // unconfigured Herdr. Its membership is read eagerly, ahead of the
+        // cheap-exit check below, because that check would otherwise forget a
+        // spider that has nothing else in the panel keeping the loop alive —
+        // the same reason `switching` is in the check though it has no
+        // feature gate either. `Animator::has_any` covers the falling edge:
+        // once a card clears, its row drops out of `spider_members` on this
+        // very pass, and the spider still needs the pass after that, and the
+        // one after, to finish retreating back down the trunk.
+        let spider_live = has_viewers && !self.state.sidebar_collapsed;
+        let spider_members: Members = if spider_live {
+            self.failing_card_rows(&crate::ui::sidebar_agent_live_entries(&self.state))
+                .into_iter()
+                .map(|row| {
+                    (
+                        crate::anim::ElementId::failure_spider(row),
+                        crate::anim::behaviour::DriveInputs::default(),
+                    )
+                })
+                .collect()
+        } else {
+            Members::new()
+        };
+        let spiders = spider_live
+            && (!spider_members.is_empty()
+                || self.state.anim.has_any(crate::anim::Family::FailureSpider));
+
+        if !tree && !signals && !switching && !badges && !acks_pending && !spiders {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
@@ -489,7 +553,8 @@ impl App {
             // animating history is exactly what `Animator::forget_all` exists
             // to prevent.
             let washed = self.state.sidebar_card_washes.forget_all();
-            return forgotten || remembered || washed;
+            let acked = self.state.sidebar_cmd_acks.forget_all();
+            return forgotten || remembered || washed || acked;
         }
 
         // Adopting a due root comes first, because it is what decides which
@@ -526,6 +591,26 @@ impl App {
                 .anim
                 .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
         let agents_changed = self.observe_agent_rows(now, &lifecycle, tree, washes);
+        let acks_changed = self.observe_cmd_acks(now, tree || acks_pending);
+
+        // One segment per row with a gap still open beneath it — see
+        // `sidebar_trunk_segment_members`. Its own lifecycle rather than the
+        // rows' own: a segment's arrival is `row_enter`/`row_exit` timed the
+        // same as a row's, but it declares none of a row's idle behaviours,
+        // so a card's own pulse or glow cannot leak onto a rail through this
+        // path.
+        let trunk_lifecycle = self.state.sidebar_trunk_lifecycle();
+        let trunk_members: Members = if tree {
+            crate::ui::sidebar_trunk_segment_members(&self.state)
+        } else {
+            Members::new()
+        };
+        let trunk_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::TrunkSegment,
+            &trunk_lifecycle,
+            trunk_members,
+        );
 
         let signal_lifecycle = self.state.sidebar_notifications.lifecycle();
         let signal_members: Members = if signals {
@@ -561,7 +646,70 @@ impl App {
             badge_members,
         );
 
-        switch_changed || spaces_changed || agents_changed || signals_changed || badges_changed
+        let spider_lifecycle = failure_spider_lifecycle();
+        let spiders_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::FailureSpider,
+            &spider_lifecycle,
+            spider_members,
+        );
+
+        switch_changed
+            || spaces_changed
+            || agents_changed
+            || trunk_changed
+            || acks_changed
+            || signals_changed
+            || badges_changed
+            || spiders_changed
+    }
+
+    /// Every card currently in [`crate::anim::cell::LifecycleStage::Failed`],
+    /// as the row identity the failure spider mounts under.
+    ///
+    /// Reads the same published `lifecycle` token and detected state
+    /// [`crate::ui::sidebar::image_card::content_for`] resolves a row's stage
+    /// from, so a card reads as failing here exactly when it draws as failing.
+    /// `live` is the tree's own agent rows, handed in rather than gathered
+    /// again, because [`Self::observe_agent_rows`] already computes the same
+    /// list when the tree is being drawn; the one extra computation this
+    /// causes when the tree is *not* being drawn (no row animation
+    /// configured) is the cost of the spider working on an unconfigured
+    /// Herdr, and it is bounded by the fleet's own size rather than by
+    /// anything else in the panel.
+    fn failing_card_rows(
+        &self,
+        live: &[crate::ui::sidebar::AgentPanelEntry],
+    ) -> Vec<crate::anim::CardRow> {
+        use crate::anim::cell::LifecycleStage;
+
+        let mut rows = Vec::new();
+        for workspace in &self.state.workspaces {
+            let (state, _seen) = workspace.aggregate_state(&self.state.terminals);
+            let tokens = workspace.metadata_tokens.values();
+            let stage = crate::app::lifecycle::stage(
+                tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                state,
+            );
+            if stage == LifecycleStage::Failed {
+                rows.push(crate::anim::CardRow::Space(workspace.id.clone()));
+            }
+        }
+        for entry in live {
+            let stage = crate::app::lifecycle::stage(
+                entry
+                    .tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                entry.state,
+            );
+            if stage == LifecycleStage::Failed {
+                rows.push(crate::anim::CardRow::Agent(entry.pane_id));
+            }
+        }
+        rows
     }
 
     /// Publish the owned agent rows that exist right now, so each second mate's
@@ -685,6 +833,43 @@ impl App {
         self.state
             .anim
             .observe(now, crate::anim::Family::CardWash, &lifecycle, members)
+    }
+
+    /// Publish the command-acknowledgement markers live right now, and prune
+    /// the ones this module no longer has any reason to remember.
+    ///
+    /// `active` is false when neither the tree nor a pending marker gives this
+    /// pass a reason to look — see [`Self::advance_animations`]'s own
+    /// `acks_pending` — in which case the live agent rows are not even fetched:
+    /// there is nothing to prune against that a card leaving the tree could
+    /// not already tell [`crate::app::cmd_ack::CmdAcks::observe`] by simply not
+    /// being in `live_rows`.
+    fn observe_cmd_acks(&mut self, now: Instant, active: bool) -> bool {
+        let live_rows: Vec<crate::anim::CardRow> = if active {
+            crate::ui::sidebar_agent_live_entries(&self.state)
+                .into_iter()
+                .map(|entry| crate::anim::CardRow::Agent(entry.pane_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let active_window = crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD
+            + crate::anim::behaviour::CMD_ACK_HOLD_PERIOD;
+        // Has to outlast `active_window` by at least the dismount stage's own
+        // duration — see `CmdAcks::observe`'s own doc on why, or the sidebar
+        // stops drawing a marker mid-fade.
+        let retain_window = active_window + crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD;
+        let members =
+            self.state
+                .sidebar_cmd_acks
+                .observe(now, active_window, retain_window, live_rows);
+        let lifecycle = crate::app::cmd_ack::CmdAcks::lifecycle(
+            crate::anim::behaviour::CMD_ACK_MOUNT_PERIOD,
+            crate::anim::behaviour::CMD_ACK_DISMOUNT_PERIOD,
+        );
+        self.state
+            .anim
+            .observe(now, crate::anim::Family::CmdAck, &lifecycle, members)
     }
 
     /// Fold the fleet's current state into the notification tray.
@@ -824,6 +1009,76 @@ impl App {
         crate::ui::signal_tray_motion_fingerprint(&self.state).hash(&mut hasher);
         format!("{:?}", self.state.palette.peach).hash(&mut hasher);
         format!("{:?}", self.state.host_terminal_theme.background).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// (Re-)generate the sidebar's ambient particle-field wash when its size has moved.
+    ///
+    /// Unlike the tray's badges, this loop is not free to regenerate — it is a whole animation
+    /// sequence — so it is redone only when [`Self::sidebar_particle_field_key`] moves (a
+    /// resize), never once per tick. Once generated, uploading and arming playback is
+    /// `kitty_graphics`'s job (`GraphicsLayer::animation`); this only owns producing the pixels.
+    pub(crate) fn observe_sidebar_particle_field(&mut self) -> bool {
+        if !self.state.kitty_graphics_enabled
+            || !self.state.sidebar_particle_field_enabled
+            || !self.state.host_cell_size.is_known()
+        {
+            let had = self.state.sidebar_particle_field.take().is_some();
+            self.state.sidebar_particle_field_key = 0;
+            return had;
+        }
+
+        let cell = self.state.host_cell_size;
+        let key = self.sidebar_particle_field_key(cell);
+        if key == self.state.sidebar_particle_field_key
+            && self.state.sidebar_particle_field.is_some()
+        {
+            return false;
+        }
+
+        let Some(generated) = crate::ui::sidebar::particle_background::image(
+            &self.state,
+            cell.width_px,
+            cell.height_px,
+        ) else {
+            let had = self.state.sidebar_particle_field.take().is_some();
+            self.state.sidebar_particle_field_key = 0;
+            return had;
+        };
+
+        self.state.sidebar_particle_field_key = key;
+        self.state.sidebar_particle_field = Some(
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                generated.width,
+                generated.height,
+                generated.root,
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                    // Under any text the sidebar draws over it, over the cell background: an
+                    // ambient backdrop rather than something that could obscure a row.
+                    z: -1,
+                },
+            )
+            .with_animation(crate::app::state::GraphicsAnimation {
+                frame_gap_ms: crate::ui::sidebar::particle_background::FRAME_GAP_MS,
+                frames: generated.extra_frames,
+            }),
+        );
+        true
+    }
+
+    /// Everything the wash's pixels depend on, folded into one number.
+    fn sidebar_particle_field_key(&self, cell: crate::kitty_graphics::HostCellSize) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let area = crate::ui::sidebar_particle_field_rect(&self.state);
+        (area.width, area.height).hash(&mut hasher);
+        (cell.width_px, cell.height_px).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1232,6 +1487,157 @@ mod tests {
         );
     }
 
+    /// A trunk segment mounts, settles, and retracts on its own clock — driven
+    /// by the same `row_enter`/`row_exit` config a row's own arrival reads,
+    /// but tracked as its own element rather than riding the row's.
+    ///
+    /// `fleet_app` gives `2ndmate-left` a sibling, `2ndmate-right`, so the
+    /// ancestor column beside `2ndmate-left`'s own two workers is still open —
+    /// one segment per worker row, both at that same level, since the column
+    /// only closes once every one of `2ndmate-left`'s rows has been passed.
+    /// Unpublishing `2ndmate-right`'s owner closes that gap without touching
+    /// either worker's own row at all, which is the case this test exists to
+    /// pin: a segment's life is not a side effect of its row's.
+    #[test]
+    fn a_trunk_segment_mounts_settles_and_retracts_on_its_own_clock() {
+        let (mut app, _left_second, _right_only) = fleet_app("wipe");
+        app.state.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Wipe;
+        app.state.sidebar_animation.row_enter_ms = 200;
+        let now = Instant::now();
+
+        let members = crate::ui::sidebar_trunk_segment_members(&app.state);
+        assert_eq!(
+            members.len(),
+            2,
+            "both of 2ndmate-left's worker rows pass the still-open column \
+             beside 2ndmate-right: {members:?}"
+        );
+        let segment_id = members[0].0.clone();
+
+        assert!(app.handle_scheduled_tasks(now, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("the segment is tracked from its first pass")
+                .phase,
+            crate::anim::Phase::Mount,
+        );
+
+        let settled = now + Duration::from_millis(250);
+        assert!(app.handle_scheduled_tasks(settled, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("still tracked")
+                .phase,
+            crate::anim::Phase::Idle,
+            "past its mount duration the segment has settled, same as any row",
+        );
+
+        // Closing the gap: `2ndmate-right` no longer names the first mate as
+        // its owner, so `2ndmate-left` becomes the only — and therefore last
+        // — child, and the ancestor column `left-worker-1` stood beside closes.
+        app.state.workspaces[2].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), None)]),
+            None,
+            settled,
+        );
+        assert!(app.handle_scheduled_tasks(settled, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("still drawable mid-retract")
+                .phase,
+            crate::anim::Phase::Dismount,
+        );
+
+        let gone = settled + Duration::from_millis(250);
+        app.handle_scheduled_tasks(gone, false);
+        assert!(
+            app.state.anim.frame(&segment_id, None).is_none(),
+            "the segment is gone once its retract finishes"
+        );
+    }
+
+    /// The failure spider climbs, rests, and retreats on a fleet with nothing
+    /// else configured to animate at all — the core requirement it exists
+    /// for, since it is a failure signal rather than a decorative toggle.
+    #[test]
+    fn a_failing_card_mounts_a_spider_with_nothing_else_configured() {
+        let (mut app, _pane_id) = test_app_with_pane();
+        let now = Instant::now();
+
+        assert!(!app.advance_animations(now, true));
+        assert!(
+            app.state.anim.is_empty(),
+            "a healthy fleet tracks nothing at all"
+        );
+
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "lifecycle".to_string(),
+                Some("failed".to_string()),
+            )]),
+            None,
+            now,
+        );
+        let row = crate::anim::ElementId::failure_spider(crate::anim::CardRow::Space(
+            app.state.workspaces[0].id.clone(),
+        ));
+
+        assert!(app.advance_animations(now, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("mounted the frame the card started failing")
+                .phase,
+            crate::anim::Phase::Mount,
+        );
+
+        let settled =
+            now + crate::anim::behaviour::FAILURE_SPIDER_CLIMB_PERIOD + Duration::from_millis(50);
+        assert!(app.advance_animations(settled, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("still tracked")
+                .phase,
+            crate::anim::Phase::Idle,
+            "past its climb duration the spider has arrived and rests",
+        );
+
+        // Clearing the failure: the card stops being failing, but the spider
+        // has to retreat rather than vanish on the spot.
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([("lifecycle".to_string(), None)]),
+            None,
+            settled,
+        );
+        assert!(app.advance_animations(settled, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("still drawable mid-retreat")
+                .phase,
+            crate::anim::Phase::Dismount,
+        );
+
+        let gone = settled
+            + crate::anim::behaviour::FAILURE_SPIDER_CLIMB_PERIOD
+            + Duration::from_millis(50);
+        app.advance_animations(gone, true);
+        assert!(
+            app.state.anim.frame(&row, None).is_none(),
+            "gone once the retreat finishes"
+        );
+    }
+
     #[test]
     fn a_pulse_token_arms_the_clock_and_moves_the_row() {
         let (mut app, _) = test_app_with_pane();
@@ -1389,7 +1795,7 @@ mod tests {
                 "firstmate",
                 None,
                 crate::app::relation_signal::RelationSignalKind::Transfer,
-                carrier,
+                crate::app::relation_signal::CarrierId::Workspace(carrier),
                 None,
                 now,
             )
@@ -1681,6 +2087,19 @@ mod tests {
         app
     }
 
+    fn particle_field_app() -> super::super::App {
+        let (mut app, _) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.kitty_graphics_enabled = true;
+        app.state.sidebar_particle_field_enabled = true;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 24, 30);
+        app
+    }
+
     fn set_first_pane_state(app: &mut super::super::App, state: crate::detect::AgentState) {
         let pane = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
@@ -1868,6 +2287,68 @@ mod tests {
         // Asked again at the same instant, nothing has moved and nothing is
         // redrawn: the badge costs a raster per frame it moves, not per pass.
         assert!(!app.refresh_signal_tray_graphics());
+    }
+
+    #[test]
+    fn sidebar_particle_field_generates_once_and_holds_still_on_a_repeat_pass() {
+        let mut app = particle_field_app();
+
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "an enabled, sized wash generated nothing"
+        );
+        let layer = app
+            .state
+            .sidebar_particle_field
+            .as_ref()
+            .expect("wash generated");
+        assert!(layer
+            .animation
+            .as_ref()
+            .is_some_and(|a| !a.frames.is_empty()));
+        let key = app.state.sidebar_particle_field_key;
+
+        // Nothing about the sidebar moved, so the whole loop is not regenerated: generating a
+        // full animation sequence per tick is exactly the per-frame cost this transport exists
+        // to avoid paying.
+        assert!(!app.observe_sidebar_particle_field());
+        assert_eq!(key, app.state.sidebar_particle_field_key);
+    }
+
+    #[test]
+    fn sidebar_particle_field_regenerates_when_the_sidebar_is_resized() {
+        let mut app = particle_field_app();
+        assert!(app.observe_sidebar_particle_field());
+        let first_key = app.state.sidebar_particle_field_key;
+
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 30);
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "a resize did not regenerate the wash"
+        );
+        assert_ne!(first_key, app.state.sidebar_particle_field_key);
+    }
+
+    #[test]
+    fn sidebar_particle_field_disabled_generates_nothing() {
+        let mut app = particle_field_app();
+        app.state.sidebar_particle_field_enabled = false;
+        assert!(!app.observe_sidebar_particle_field());
+        assert!(app.state.sidebar_particle_field.is_none());
+    }
+
+    #[test]
+    fn sidebar_particle_field_retires_when_turned_off_after_generating() {
+        let mut app = particle_field_app();
+        assert!(app.observe_sidebar_particle_field());
+        assert!(app.state.sidebar_particle_field.is_some());
+
+        app.state.sidebar_particle_field_enabled = false;
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "turning the wash off did not report a change to redraw"
+        );
+        assert!(app.state.sidebar_particle_field.is_none());
     }
 
     #[test]

@@ -60,20 +60,31 @@ use crate::detect::AgentState;
 use crate::kitty_graphics::HostCellSize;
 use crate::ui::sidebar::AgentPanelEntry;
 
-/// The base card height, in pixels, at depth 0.
+/// The height every card is drawn at, in pixels.
 ///
-/// REC-TIGHT from `data/herdr-card-iteration-2/`: the tier ratios were
-/// originally calibrated for type that grew with the box, and once the title
-/// stopped scaling the 96 px top card was mostly air.
+/// REC-TIGHT from `data/herdr-card-iteration-2/`: the ratios were originally
+/// calibrated for type that grew with the box, and once the title stopped
+/// scaling the 96 px card was mostly air.
+///
+/// # Why one number and not a ladder
+///
+/// There was a per-depth scale here — `TIER_SCALE = [1.00, 0.65, 0.4225]`,
+/// applied to the card's height and to every fraction of it the chrome is
+/// measured in. It is gone, by the captain's decision of 2026-08-06:
+///
+/// > *"i dont want height of the cards adjusted. it was only the width that
+/// > changed depending on relationship"*
+///
+/// **Rank is carried by width, and only by width.** A row's right edge steps in
+/// by rank in `super::rank_right_inset`, and that step is now the whole signal.
+/// So there is nothing left for a depth to scale: the height, the padding, the
+/// stroke, the radius, the plate and the bloom's sigma are all fractions of this
+/// one number on every rank, and a card's size says *what it is* in one
+/// dimension rather than in two that disagreed about which of depth and rank
+/// they were reading.
 const BASE_HEIGHT_PX: f32 = 68.0;
 
-/// What each depth scales the base by.
-///
-/// A 65% step: 1.00 / 0.65 / 0.42. Applied to everything on the card *except*
-/// the title's type size — see [`TITLE_PX`].
-const TIER_SCALE: [f32; 3] = [1.00, 0.65, 0.4225];
-
-/// The title's type size, in pixels, at every tier.
+/// The title's type size, on every card.
 ///
 /// Fixed rather than scaled, and never smaller: the fit ladder in
 /// `data/herdr-card-iteration-2/` measured the legibility floor at two numbers
@@ -82,11 +93,9 @@ const TIER_SCALE: [f32; 3] = [1.00, 0.65, 0.4225];
 /// rasteriser hands back grey instead of ink. The card is set at the Light
 /// floor, which is the comfortable one.
 ///
-/// It is also why the tier scale cannot own the card's height. Two lines at
-/// this size plus the tidbit is about 54 px of block, so a card at the 0.42
-/// tier's nominal 29 px could not hold its own title. The tier scale therefore
-/// sets a *floor* the card is never shorter than, and the content sets the
-/// height when it needs more. See [`tier_height_px`].
+/// Fixed at *every* rank, and both title lines are kept at every rank: shrinking
+/// the title at depth was one of the two ways offered to reach a height ladder,
+/// and the captain rejected it along with the ladder. See [`BASE_HEIGHT_PX`].
 const TITLE_PX: f32 = 14.0;
 
 /// Lines of title reserved on every card, whatever this card's title is.
@@ -110,10 +119,10 @@ const TITLE_LEADING: f32 = 1.25;
 /// Gap between the title block and the tidbit line, as a multiple of the
 /// tidbit's line height.
 ///
-/// Cut from 0.55 in the reality pass. It is air, and air is the only thing a
-/// card below the top tier has left to give: with the title's size fixed, this
-/// gap and [`MIN_VERTICAL_PAD_PX`] are the whole difference between a tier that
-/// reads smaller and one that does not. See [`tier_height_px`].
+/// Cut from 0.55 in the reality pass, when this gap and [`MIN_VERTICAL_PAD_PX`]
+/// were the only air a sub-top-tier card had left to give. The tiers are gone
+/// and the pressure with them, but the tighter gap was judged on screen at the
+/// top tier too and is kept on its own merits.
 const TIDBIT_GAP: f32 = 0.35;
 
 /// The narrowest panel the image card draws on, in columns.
@@ -138,11 +147,13 @@ const BLOOM_PAINT_FLOOR: f32 = 0.002;
 /// # Why a count of sigmas, and not a fraction of the card's height
 ///
 /// This was `BLOOM_REACH = 0.45`, a fraction of the card's *drawn* height,
-/// while the sigma it truncates is a fraction of the tier's *nominal* height.
-/// Those are not the same number, and their ratio is different on every tier —
-/// a top-tier card is drawn at its nominal 68 px, a mate's content pushes it to
-/// 1.52× its nominal, a worker's to 1.85×. So one constant produced three
-/// different truncations, measured on the real layers:
+/// while the sigma it truncates is a fraction of the nominal height. Those are
+/// not the same number whenever the content pushes a card past its nominal, and
+/// at the time this was measured that ratio differed across the tier scale that
+/// has since been retired ([`BASE_HEIGHT_PX`]) — a top-tier card drawn at its
+/// nominal 68 px, a mate's content pushing it to 1.52× its (then-smaller)
+/// nominal, a worker's to 1.85×. So one constant produced three different
+/// truncations, measured on the real layers:
 ///
 /// ```text
 ///   tier        drawn/nominal   cut lands at   value there   last painted alpha
@@ -150,6 +161,12 @@ const BLOOM_PAINT_FLOOR: f32 = 0.002;
 ///   mate             1.52          3.60 σ         4.8% of peak        3/255
 ///   worker           1.85          2.84 σ         9.3% of peak        5/255
 /// ```
+///
+/// The tiers are gone, so every card now has the same nominal and, on a given
+/// face, the same drawn/nominal ratio — but the constant is still a sigma count
+/// rather than a fixed fraction for the reason below, and the day any two cards
+/// on a face disagree on that ratio again, this argument is why the fix is not
+/// a smaller `BLOOM_REACH`.
 ///
 /// `lay_bloom`'s `profile.get(..)` returns `None` past the reach, so the glow
 /// **stops dead** rather than fading — a cut at 15% of peak is a visible hard
@@ -182,25 +199,28 @@ const BLOOM_REACH_SIGMAS: f32 = 3.7;
 /// A sigma under a pixel or two is not a gradient, it is a stroke with a fringe.
 const BLOOM_SIGMA_MIN_PX: f32 = 1.6;
 
-/// The height a card at `depth` gets *as a tier*, before its content pushes it
-/// taller.
+/// The height a card gets *nominally*, before its content pushes it taller.
 ///
 /// Every ratio in the measured table is a fraction of this and not of the drawn
 /// height — see [`CardGeometry::new`]. Named because the bloom needs it in two
 /// places that must agree exactly: the field [`lay_bloom`] paints, and the image
 /// [`card_image_rect`] sizes to hold it.
-fn nominal_height_px(depth: u8, cell_height: f32) -> f32 {
-    (BASE_HEIGHT_PX * tier(depth)).max(cell_height)
+///
+/// The same on every rank since the tiers were retired ([`BASE_HEIGHT_PX`]);
+/// still a function because the cell height is a floor on it, and a host with
+/// tall cells is a host where one cell is already more than the base.
+fn nominal_height_px(cell_height: f32) -> f32 {
+    BASE_HEIGHT_PX.max(cell_height)
 }
 
 /// The sigma of the near lobe of a card's bloom, in pixels.
-fn bloom_sigma_px(depth: u8, cell_height: f32) -> f32 {
-    (measured::BLOOM_SIGMA * nominal_height_px(depth, cell_height)).max(BLOOM_SIGMA_MIN_PX)
+fn bloom_sigma_px(cell_height: f32) -> f32 {
+    (measured::BLOOM_SIGMA * nominal_height_px(cell_height)).max(BLOOM_SIGMA_MIN_PX)
 }
 
 /// How far a card's bloom is carried past its stroke, in pixels.
-fn bloom_reach_px(depth: u8, cell_height: f32) -> f32 {
-    bloom_sigma_px(depth, cell_height) * BLOOM_REACH_SIGMAS
+fn bloom_reach_px(cell_height: f32) -> f32 {
+    bloom_sigma_px(cell_height) * BLOOM_REACH_SIGMAS
 }
 
 /// Where across a column the tree's rails put their ink.
@@ -391,36 +411,24 @@ pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
         && is_available(app, fold_width)
 }
 
-/// The tier a row at `depth` is drawn at.
-fn tier(depth: u8) -> f32 {
-    TIER_SCALE[usize::from(depth).min(TIER_SCALE.len() - 1)]
-}
-
-/// The height a card at `depth` wants, in pixels.
+/// The height a card wants, in pixels. The same on every rank.
 ///
-/// `max(tier floor, what the content needs)`. The tier's nominal height is a
-/// floor and not a ceiling because the title's size is fixed: a card is allowed
-/// to be taller than its tier when two lines of 14 px type and a tidbit will
-/// not fit in it, and that is the case at every tier below the first. The tier
-/// still reads — the padding, the plate, the chip, the stroke and the radius
-/// all scale with it — it just cannot squeeze the words.
+/// `max(base, what the content needs)`. [`BASE_HEIGHT_PX`] is a floor and not a
+/// ceiling because the title's size is fixed: on a face whose line height runs
+/// large, two lines of 14 px type and a tidbit want more than 68 px, and the
+/// card grows rather than clipping its own words. It is the same growth on every
+/// card, because every card carries the same block.
 ///
-/// # Why the ladder is not 1.00 / 0.65 / 0.42 on screen
+/// # Nothing here reads `depth`, and that is the point
 ///
-/// It cannot be, and the arithmetic says so rather than the implementation.
-/// Two 14 px lines at 1.25 leading is about 2.25 line heights, the tidbit under
-/// them adds its own line and the gap above it, and the whole block will not go
-/// below roughly 0.85 of the 68 px base without shrinking type the captain
-/// fixed at 14 px. Tier 1's nominal is 0.65 of base and tier 2's is 0.42, so
-/// *both* land on that floor and both come out the same height. The step that
-/// survives is the one between the top tier and everything under it, which is
-/// the one that carries the meaning — a worker is visibly shorter than the
-/// first mate. Anything more needs either a smaller title or a card that drops
-/// the tidbit below the top tier, and both are the captain's call, not this
-/// function's.
-fn tier_height_px(depth: u8, metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
-    let nominal = BASE_HEIGHT_PX * tier(depth);
-    nominal.max(content_floor_px(metrics, tidbit_metrics))
+/// This used to be `max(tier floor, content)` with the tier read off the row's
+/// depth, and its own doc conceded the ladder never reached the screen: the
+/// content floor sits at about 0.75 of base, so the 0.65 and 0.42 rungs both
+/// landed on it and rendered identical. That is retired rather than repaired —
+/// see [`BASE_HEIGHT_PX`]. Rank is width, height is one number, and a row's
+/// depth no longer changes anything about how tall it is drawn.
+fn card_height_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
+    BASE_HEIGHT_PX.max(content_floor_px(metrics, tidbit_metrics))
 }
 
 /// The shortest a card carrying the full D-MID block can be.
@@ -437,26 +445,31 @@ fn content_block_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
 
 /// The least air a card keeps above and below its content.
 ///
-/// This, and not the measured 0.148 h padding, is what sets a card's height
-/// once the content stops fitting the tier: the measured padding is what a card
-/// *wants*, and at the top tier it gets it — 68 px is almost exactly two 14 px
+/// This, and not the measured 0.148 h padding, is what would set a card's height
+/// if the content ever outgrew [`BASE_HEIGHT_PX`]: the measured padding is what
+/// a card *wants*, and at 68 px it gets it — that is almost exactly two 14 px
 /// lines, a tidbit and 0.148 h on each side, which is why the captain's base
-/// height is that number. Below the top tier the same block no longer fits the
-/// nominal at all, so the padding gives way first and the height only grows
-/// once it has nothing left to give.
+/// height is that number. On a face whose line height runs larger than the one
+/// the base was measured on, the padding gives way to this floor first and the
+/// card only grows once it has nothing left to give.
 ///
-/// Cut from 5 px in the reality pass, for the reason spelled out on
-/// [`tier_height_px`]: the floor this sets is what a sub-top-tier card's height
-/// actually is, so every pixel of it is a pixel the tier scale does not get.
+/// Cut from 5 px in the reality pass, when every pixel of it was a pixel the
+/// tier scale did not get. The tier scale is gone ([`BASE_HEIGHT_PX`]) and this
+/// is now slack on nearly every face, but it is still the thing standing between
+/// a tall face and a title with no air above it.
 const MIN_VERTICAL_PAD_PX: f32 = 3.0;
 
-/// Rows a card at `depth` occupies, or `None` when the pixel path is not live.
+/// Rows a card occupies, or `None` when the pixel path is not live.
 ///
 /// This is the one place the pixel design reaches back into the character
 /// layout. Everything else about a row — where it starts, what it can be
 /// clicked to select, whether it scrolls off — is unchanged, but its *height*
 /// has to come from the card being drawn or the image would not fill its cells.
-pub(crate) fn row_height_cells(app: &AppState, depth: u8, fold_width: u16) -> Option<u16> {
+///
+/// The same answer for every row, whatever its depth or rank: that is what
+/// "uniform height" is, measured at the layout boundary rather than only in the
+/// rasteriser.
+pub(crate) fn row_height_cells(app: &AppState, fold_width: u16) -> Option<u16> {
     if !is_available(app, fold_width) {
         return None;
     }
@@ -465,8 +478,7 @@ pub(crate) fn row_height_cells(app: &AppState, depth: u8, fold_width: u16) -> Op
     if cell_height <= 0.0 {
         return None;
     }
-    let wanted = tier_height_px(
-        depth,
+    let wanted = card_height_px(
         font.metrics(TITLE_PX),
         font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
     );
@@ -1042,23 +1054,28 @@ struct CardGeometry {
 }
 
 impl CardGeometry {
-    /// Resolved against the tier's *nominal* height rather than the card's
-    /// drawn height.
+    /// Resolved against the *nominal* height rather than the card's drawn
+    /// height.
     ///
     /// Every ratio in the measured table is a fraction of `h`, and the card's
     /// drawn height is `max(nominal, content)` — so measuring the padding and
-    /// the plate against the drawn height would silently undo the tier scale
-    /// on exactly the cards the content pushed taller. The nominal is what the
-    /// tier means; the extra height is slack, and slack belongs to the gap
-    /// around the content, not to the chrome.
+    /// the plate against the drawn height would give a card the content pushed
+    /// taller thicker chrome than its neighbours. The extra height is slack, and
+    /// slack belongs to the gap around the content, not to the chrome.
+    ///
+    /// Takes no depth: since the tiers were retired ([`BASE_HEIGHT_PX`]) the
+    /// nominal is one number, so the padding, the stroke, the radius, the plate
+    /// and the bloom's sigma are identical on every rank. That is deliberate —
+    /// the chrome was the second, quieter size signal the tier scale carried,
+    /// and rank is width alone.
     ///
     /// `has_mark` collapses the icon slot. An empty plate is not a placeholder,
     /// it is a box; and at 0.70 h plus its gap it was the single widest thing
     /// on the card that carried no information, taking that width from the one
     /// thing that does. The slot keeps its measured size for the day something
     /// goes in it and is worth nothing until then.
-    fn new(depth: u8, cell_height: f32, has_mark: bool) -> Self {
-        let nominal = nominal_height_px(depth, cell_height);
+    fn new(cell_height: f32, has_mark: bool) -> Self {
+        let nominal = nominal_height_px(cell_height);
         Self {
             radius: (measured::RADIUS * nominal).max(2.0),
             stroke: (measured::STROKE_W * nominal).max(1.2),
@@ -1075,7 +1092,7 @@ impl CardGeometry {
             } else {
                 0.0
             },
-            bloom_sigma: bloom_sigma_px(depth, cell_height),
+            bloom_sigma: bloom_sigma_px(cell_height),
         }
     }
 
@@ -2131,10 +2148,7 @@ fn build_cards_inner(
     // instead would give every card the same local dissolve at a different scale,
     // and the wave that is supposed to cross the tree would break at every card's
     // edge.
-    let extents: Vec<(u8, Rect)> = placed
-        .iter()
-        .map(|(frame, content)| (content.depth, *frame))
-        .collect();
+    let extents: Vec<Rect> = placed.iter().map(|(frame, _)| *frame).collect();
     let field_rect =
         dissolve_field_rect(&extents, (cell_w, cell_h), bounds, bloom_floor).ok_or(())?;
 
@@ -2193,25 +2207,18 @@ fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f3
 /// The cells one card's own image covers: its frame plus the reach of its own
 /// bloom, clamped into the panel.
 ///
-/// Its *own* bloom and not the tree's largest, because the reach scales with the
-/// card's tier (see [`bloom_reach_px`]) and a worker's card is two thirds of a
-/// mate's. Giving every card the top tier's margin would make every smaller
-/// card's image bigger than it needs to be, and the margin is transparent
-/// padding that still has to be encoded and uploaded.
+/// The margin is [`bloom_reach_px`] and not a fraction of the height the card is
+/// *drawn* at, because that is the reach [`lay_bloom`] paints to. The two used to
+/// be spelled differently and a card whose content pushed it past its nominal
+/// carried transparent padding it never lit.
 ///
-/// The margin is the tier's own [`bloom_reach_px`] and not a fraction of the
-/// height the card is *drawn* at, because that is the reach [`lay_bloom`] paints
-/// to. The two used to be spelled differently and a card whose content pushed it
-/// past its tier carried transparent padding it never lit.
-fn card_image_rect(
-    depth: u8,
-    frame: Rect,
-    cell: (f32, f32),
-    bounds: Rect,
-    bloom_floor: u16,
-) -> Option<Rect> {
+/// The reach is now the same on every card, since the tiers it used to scale with
+/// are gone ([`BASE_HEIGHT_PX`]) — so this is a per-card *frame* plus a shared
+/// margin, rather than a per-card margin. It stays a function of the frame
+/// because the frames still differ: width reads as rank.
+fn card_image_rect(frame: Rect, cell: (f32, f32), bounds: Rect, bloom_floor: u16) -> Option<Rect> {
     let (cell_w, cell_h) = cell;
-    let reach = bloom_reach_px(depth, cell_h);
+    let reach = bloom_reach_px(cell_h);
     clamp_bloomed(
         frame,
         (reach / cell_w).ceil() as u16,
@@ -2229,18 +2236,18 @@ fn card_image_rect(
 /// [`DissolveFrame::apply`] clamps to the field's grid, so the part of that card
 /// outside the field simply keeps full alpha for the whole transition while its
 /// neighbours fade. A constant margin is exactly how the two drift apart —
-/// [`tier_height_px`] floors a card at what its content needs, so a proportional
-/// face with a tall line height draws the top tier past [`BASE_HEIGHT_PX`] and
-/// gives it a larger margin than a constant read off that base.
+/// [`card_height_px`] floors a card at what its content needs, so a proportional
+/// face with a tall line height draws a card past [`BASE_HEIGHT_PX`] and gives it
+/// a larger margin than a constant read off that base.
 fn dissolve_field_rect(
-    cards: &[(u8, Rect)],
+    frames: &[Rect],
     cell: (f32, f32),
     bounds: Rect,
     bloom_floor: u16,
 ) -> Option<Rect> {
-    cards
+    frames
         .iter()
-        .filter_map(|(depth, frame)| card_image_rect(*depth, *frame, cell, bounds, bloom_floor))
+        .filter_map(|frame| card_image_rect(*frame, cell, bounds, bloom_floor))
         .reduce(|field, rect| field.union(rect))
         .filter(|field| field.width > 0 && field.height > 0)
 }
@@ -2633,7 +2640,7 @@ impl Rasteriser<'_> {
     /// What one card's image will be, and where it goes, before anything is
     /// drawn.
     fn plan(&self, frame: Rect, content: &CardContent, offset: (i32, i32)) -> Option<PlannedShape> {
-        let rect = self.card_rect(frame, content)?;
+        let rect = self.card_rect(frame)?;
         let mut hasher = DefaultHasher::new();
         self.hash_common(&mut hasher, rect);
         hash_placed(&mut hasher, &frame, &rect, content);
@@ -2674,15 +2681,23 @@ impl Rasteriser<'_> {
             None => UndissolvedSheet(std::sync::Arc::new(draw()?)),
         };
         let (width_px, height_px) = (base.0.width(), base.0.height());
-        let data = match self.dissolve {
+        let dissolved;
+        let canvas: &Canvas = match self.dissolve {
             Some(dissolve) => {
                 let mut canvas = Canvas::clone(&base.0);
                 dissolve.apply(&mut canvas, self.dissolve_origin(rect), self.field_px());
-                encode_png(&canvas)
+                dissolved = canvas;
+                &dissolved
             }
-            None => encode_png(&base.0),
-        }
-        .ok_or(())?;
+            None => &base.0,
+        };
+        // Picked once per image rather than per client: the same rasterised
+        // bytes back every attached client's placement of this image, so a
+        // single global "is the host terminal local and known-fast" answer
+        // is what all of them get. See `preferred_card_pixel_format`.
+        let format =
+            crate::kitty_graphics::preferred_card_pixel_format(canvas_is_fully_opaque(canvas));
+        let data = encode_canvas(canvas, format).ok_or(())?;
         Ok(SidebarCardLayer {
             rect,
             // Replaced by `aim_at` before this reaches anything that draws. The
@@ -2695,7 +2710,7 @@ impl Rasteriser<'_> {
             // Only while a transition is running: a settled panel keeps no
             // second copy of artwork it is not about to take apart.
             undissolved: self.dissolve.map(|_| base),
-            layer: card_layer(width_px, height_px, data, rect),
+            layer: card_layer(format, width_px, height_px, data, rect),
         })
     }
 
@@ -2767,16 +2782,14 @@ impl Rasteriser<'_> {
 
     /// One card's rounded rect, in the coordinates of an image covering `rect`.
     fn place<'c>(&self, frame: Rect, content: &'c CardContent, rect: Rect) -> PlacedCard<'c> {
-        let geometry = CardGeometry::new(content.depth, self.cell_h, content.mark.is_some());
-        // The card is drawn at the height its tier asked for, centred in the
-        // cells the row was given. The leftover is the gutter — this is where the
-        // measured 0.19 h sibling gap comes back, and it is also what makes the
-        // tier scale visible again after the row height was rounded up to a whole
-        // number of cells.
+        let geometry = CardGeometry::new(self.cell_h, content.mark.is_some());
+        // The card is drawn at the one height every card is drawn at, centred in
+        // the cells the row was given. The leftover is the gutter — this is where
+        // the measured 0.19 h sibling gap comes back after the row height was
+        // rounded up to a whole number of cells.
         let cell_top = f32::from(frame.y.saturating_sub(rect.y)) * self.cell_h;
         let cell_height = f32::from(frame.height) * self.cell_h;
-        let wanted =
-            tier_height_px(content.depth, self.title_metrics, self.tidbit_metrics).min(cell_height);
+        let wanted = card_height_px(self.title_metrics, self.tidbit_metrics).min(cell_height);
         // The left border stands where the tree's rails have their ink, not
         // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
         let left =
@@ -2800,9 +2813,8 @@ impl Rasteriser<'_> {
 
     /// The cells one card's own image covers, from the same [`card_image_rect`]
     /// the dissolve field is built out of.
-    fn card_rect(&self, frame: Rect, content: &CardContent) -> Option<Rect> {
+    fn card_rect(&self, frame: Rect) -> Option<Rect> {
         card_image_rect(
-            content.depth,
             frame,
             (self.cell_w, self.cell_h),
             self.bounds,
@@ -2946,13 +2958,14 @@ fn hash_placed(hasher: &mut DefaultHasher, frame: &Rect, rect: &Rect, content: &
 
 /// The placement a finished image is published as.
 fn card_layer(
+    format: crate::api::schema::PaneGraphicsFormat,
     width_px: u32,
     height_px: u32,
     data: Vec<u8>,
     sheet_rect: Rect,
 ) -> crate::app::state::GraphicsLayer {
     crate::app::state::GraphicsLayer::new(
-        crate::api::schema::PaneGraphicsFormat::Png,
+        format,
         width_px,
         height_px,
         data,
@@ -3173,6 +3186,42 @@ fn sheet_dissolve(app: &AppState, cell_size: HostCellSize) -> Option<DissolveFra
     })
 }
 
+/// Whether every pixel is fully opaque — the gate `preferred_card_pixel_format`
+/// needs before it will hand a canvas to an alpha-losing raw format. Herdr's
+/// cards are translucent by design (gutters, glow falloff, rounded corners),
+/// so this is expected to come back `false` for most real card sheets; a
+/// single-image API payload or a full-bleed background wash are the cases
+/// it exists for.
+fn canvas_is_fully_opaque(sheet: &Canvas) -> bool {
+    sheet.rgba8().chunks_exact(4).all(|pixel| pixel[3] == 255)
+}
+
+/// Encodes a finished canvas in whichever format the host terminal is fast
+/// at (`preferred_card_pixel_format`), falling back to PNG for anything else.
+fn encode_canvas(
+    sheet: &Canvas,
+    format: crate::api::schema::PaneGraphicsFormat,
+) -> Option<Vec<u8>> {
+    match format {
+        crate::api::schema::PaneGraphicsFormat::Png => encode_png(sheet),
+        crate::api::schema::PaneGraphicsFormat::Rgba => Some(sheet.rgba8().to_vec()),
+        crate::api::schema::PaneGraphicsFormat::Rgb => Some(rgba_to_rgb(sheet.rgba8())),
+    }
+}
+
+/// Drops the alpha byte from each pixel. The canvas is always fully opaque
+/// where a card draws and transparent elsewhere; RGB has no way to carry
+/// that transparency, so this format is only ever selected for a terminal
+/// (`f=24` kitty) that composites the sheet the same way the RGBA path does
+/// — see `preferred_local_pixel_format`.
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    out
+}
+
 fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, sheet.width(), sheet.height());
@@ -3186,6 +3235,87 @@ fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
     writer.write_image_data(sheet.rgba8()).ok()?;
     drop(writer);
     Some(out)
+}
+
+#[cfg(test)]
+mod pixel_format_tests {
+    use super::*;
+
+    fn opaque_canvas(width: u32, height: u32) -> Canvas {
+        let mut canvas = Canvas::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                canvas.blend(x, y, Rgb(10, 20, 30), 1.0);
+            }
+        }
+        canvas
+    }
+
+    #[test]
+    fn a_fresh_canvas_is_fully_transparent_not_opaque() {
+        // `Canvas::new` zero-fills, which is alpha 0 everywhere — the gutter
+        // state every real card sheet starts from.
+        let canvas = Canvas::new(4, 4);
+        assert!(!canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn a_canvas_blended_at_full_alpha_everywhere_is_opaque() {
+        let canvas = opaque_canvas(4, 4);
+        assert!(canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn a_single_untouched_pixel_makes_the_whole_canvas_non_opaque() {
+        // Blending translucent paint over an already-opaque pixel keeps it
+        // opaque (source-over composites alpha, it does not overwrite it),
+        // so the only way to get a non-opaque pixel here is to leave one
+        // unpainted — exactly what a real sheet's gutter looks like.
+        let mut canvas = Canvas::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                if (x, y) != (2, 2) {
+                    canvas.blend(x, y, Rgb(10, 20, 30), 1.0);
+                }
+            }
+        }
+        assert!(!canvas_is_fully_opaque(&canvas));
+    }
+
+    #[test]
+    fn rgba_to_rgb_drops_every_fourth_byte() {
+        let rgba = vec![1, 2, 3, 255, 4, 5, 6, 128];
+        assert_eq!(rgba_to_rgb(&rgba), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn encode_canvas_rgba_is_the_canvas_bytes_verbatim() {
+        let canvas = opaque_canvas(2, 2);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgba)
+            .expect("rgba encode");
+        assert_eq!(encoded, canvas.rgba8());
+    }
+
+    #[test]
+    fn encode_canvas_rgb_strips_alpha_from_the_canvas_bytes() {
+        let canvas = opaque_canvas(2, 2);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgb)
+            .expect("rgb encode");
+        assert_eq!(encoded, rgba_to_rgb(canvas.rgba8()));
+        assert_eq!(encoded.len(), canvas.rgba8().len() / 4 * 3);
+    }
+
+    #[test]
+    fn encode_canvas_png_round_trips_through_the_png_decoder() {
+        let canvas = opaque_canvas(3, 3);
+        let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Png)
+            .expect("png encode");
+        let decoder = png::Decoder::new(encoded.as_slice());
+        let mut reader = decoder.read_info().expect("png header");
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).expect("png frame");
+        assert_eq!(&buf[..info.buffer_size()], canvas.rgba8());
+    }
 }
 
 #[cfg(test)]
@@ -3397,6 +3527,54 @@ mod tests {
     /// machine having a proportional face, which [`is_available`] decides.
     pub(super) fn pixel_fleet_app() -> AppState {
         let mut app = fleet_app();
+        app.kitty_graphics_enabled = true;
+        app.host_cell_size = HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        app
+    }
+
+    /// A first mate owning a second mate owning a worker, with the pixel path
+    /// live — the same shape as `super::super::tests::owned_fleet_sidebar_rows`,
+    /// but the mates are real `Workspace`s so `entry.rank()` actually resolves
+    /// to `SecondMate` rather than every non-first-mate row collapsing to
+    /// `Worker` the way it does when a fleet is one workspace of agent panes.
+    /// [`fleet_app`] cannot produce a `SecondMate` at all: `AgentRelation::rank`
+    /// only reads `Worker` off an `Agent` row, whatever its depth, so a second
+    /// mate has to be its own Space.
+    pub(super) fn three_rank_pixel_app() -> AppState {
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]),
+            None,
+            now,
+        );
+
         app.kitty_graphics_enabled = true;
         app.host_cell_size = HostCellSize {
             width_px: 10,
@@ -3678,7 +3856,11 @@ mod tests {
     #[test]
     fn the_card_sheet_stops_at_the_notification_tray() {
         let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let area = Rect::new(0, 0, 100, 46);
+        // Tall enough that the fleet's ten uniform-height rows still reach the
+        // tray exactly: since height stopped stepping down by rank, every row
+        // below the top tier is now as tall as the top tier's, so the fixture
+        // needs more room than it did when depth 1 and 2 rows were shorter.
+        let area = Rect::new(0, 0, 100, 52);
 
         let sheet_for = |tray_on: bool| {
             let mut app = pixel_fleet_app();
@@ -3768,27 +3950,28 @@ mod tests {
         let title = metrics(40.0);
         let tidbit = metrics(30.0);
         assert!(
-            tier_height_px(0, title, tidbit) > BASE_HEIGHT_PX,
+            card_height_px(title, tidbit) > BASE_HEIGHT_PX,
             "the fixture's face is not tall enough to test anything"
         );
         let cell = (10.0f32, 21.0f32);
         let bounds = Rect::new(0, 0, 40, 60);
         let bloom_floor = bounds.y + bounds.height;
+        // Three ranks, narrowing to the right the way `rank_right_inset` does.
         let cards = [
-            (0u8, Rect::new(1, 2, 38, 8)),
-            (1u8, Rect::new(3, 10, 36, 6)),
-            (2u8, Rect::new(5, 16, 34, 5)),
+            Rect::new(1, 2, 38, 8),
+            Rect::new(3, 10, 36, 6),
+            Rect::new(5, 16, 34, 5),
         ];
 
         let field = dissolve_field_rect(&cards, cell, bounds, bloom_floor)
             .expect("a tree of three cards has a field");
-        for (depth, frame) in cards {
-            let rect = card_image_rect(depth, frame, cell, bounds, bloom_floor)
+        for frame in cards {
+            let rect = card_image_rect(frame, cell, bounds, bloom_floor)
                 .expect("a card with a frame has an image");
             assert_eq!(
                 field.union(rect),
                 field,
-                "the card at depth {depth} reaches outside the field it is \
+                "the card at {frame:?} reaches outside the field it is \
                  dissolved against"
             );
         }
@@ -3802,59 +3985,44 @@ mod tests {
         assert_eq!(MIN_FOLD_WIDTH, super::super::card::MIN_FOLD_WIDTH);
     }
 
-    /// The tier scale has to actually shrink something, or the three depths are
-    /// one card drawn three times.
+    /// Card height does not read `depth` at all: the captain's decision of
+    /// 2026-08-06 retired the per-rank height ladder in favour of width alone,
+    /// so a first mate, a second mate and a worker's card all want the same
+    /// height on the same face.
     #[test]
-    fn each_tier_is_smaller_than_the_one_above_it() {
-        for depth in 1..TIER_SCALE.len() {
-            assert!(
-                tier(depth as u8) < tier(depth as u8 - 1),
-                "tier {depth} did not shrink"
-            );
-        }
-        // Past the deepest tier the scale holds rather than vanishing: the tree
-        // caps display depth, and a card at the cap is still a card.
-        assert_eq!(tier(9), tier(2));
-    }
-
-    /// The settled table's own arithmetic does not survive contact with a title
-    /// that may not shrink: two lines at 14 px plus a tidbit is more block than
-    /// the 0.65 and 0.42 tiers have nominal height for. The tier is therefore a
-    /// floor, and this is the test that says so out loud — if someone later
-    /// makes the height literal, the titles start clipping and this fails.
-    ///
-    /// The consequence, spelled out because it is the one place the settled
-    /// table could not be implemented as written: the top tier lands on its
-    /// settled 68 px, and every deeper tier is floored by the title rather than
-    /// by its own scale, so the 0.65 and 0.42 steps show in the chrome and not
-    /// in the height.
-    #[test]
-    fn a_tier_is_a_floor_and_the_title_is_allowed_to_push_past_it() {
-        // The real face's numbers at 14 px: a line box of exactly the em size,
-        // and the tidbit at 0.72 of it.
+    fn card_height_is_the_same_at_every_depth() {
         let title = metrics(TITLE_PX);
         let tidbit = metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
-        let block = content_block_px(title, tidbit);
-
-        for depth in 0..3u8 {
-            let height = tier_height_px(depth, title, tidbit);
-            assert!(
-                height >= block + MIN_VERTICAL_PAD_PX * 2.0,
-                "depth {depth} at {height}px cannot hold {block}px of title and tidbit"
-            );
-            assert!(
-                height >= BASE_HEIGHT_PX * tier(depth),
-                "depth {depth} fell below its tier floor"
-            );
+        let height = card_height_px(title, tidbit);
+        for depth in 0..5u8 {
+            // No depth parameter exists to pass; this asserts the one height
+            // function every depth resolves to is a single number, not a table.
+            let _ = depth;
+            assert_eq!(card_height_px(title, tidbit), height);
         }
+        // The real face's numbers at 14 px land exactly on the settled base:
+        // two 14 px lines, a tidbit and the measured padding, which is why
+        // that is the number.
+        assert_eq!(height, BASE_HEIGHT_PX);
+    }
+
+    /// [`BASE_HEIGHT_PX`] is a floor and not a ceiling: on a face whose line
+    /// height runs large, two lines of 14 px type and a tidbit want more room
+    /// than the base gives, and the card grows rather than clipping its words.
+    #[test]
+    fn card_height_grows_past_the_base_when_the_content_needs_it() {
+        let title = metrics(40.0);
+        let tidbit = metrics(30.0);
+        let block = content_block_px(title, tidbit);
+        let height = card_height_px(title, tidbit);
         assert!(
-            tier_height_px(0, title, tidbit) > tier_height_px(2, title, tidbit),
-            "the top tier stopped reading taller than the deepest"
+            height >= block + MIN_VERTICAL_PAD_PX * 2.0,
+            "the fixture's block ({block}px) does not fit the card ({height}px)"
         );
-        // The top tier is the settled base and reaches it by its own nominal,
-        // not by the title floor: 68 px is two 14 px lines, a tidbit and the
-        // measured padding, which is why that is the number.
-        assert_eq!(tier_height_px(0, title, tidbit), BASE_HEIGHT_PX);
+        assert!(
+            height > BASE_HEIGHT_PX,
+            "a tall face did not push the card past the base"
+        );
     }
 
     /// Never truncate, never shrink: the wrap fills whole words and stops. No
@@ -3925,9 +4093,8 @@ mod tests {
             3 * u16::from(depth) + 1
         };
         let frame_cells = sidebar_width.saturating_sub(1).saturating_sub(prefix);
-        let geometry = CardGeometry::new(depth, 16.0, false);
-        let height = tier_height_px(
-            depth,
+        let geometry = CardGeometry::new(16.0, false);
+        let height = card_height_px(
             font.metrics(TITLE_PX),
             font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
         );
@@ -4009,6 +4176,21 @@ mod tests {
     /// fails. Measuring every face is the fix, and it is why the guarantee below
     /// is stated against a cell width rather than against a panel width: with
     /// the chip yielding, the panel width stopped being the binding constraint.
+    ///
+    /// # The one accepted exception
+    ///
+    /// Retiring the tier scale (`BASE_HEIGHT_PX`) means every rank now measures
+    /// its title column against the same chrome — the chrome no longer shrinks
+    /// with depth, because depth no longer carries a size signal at all. At the
+    /// narrowest guaranteed floor (34-column panel, 8 px cell) a depth-2 card
+    /// used to get *smaller* padding than the top tier, which bought it more
+    /// text width than it has now; the longest fixture title no longer sets
+    /// whole there. The captain's call on 2026-08-06 (`leave it for now`,
+    /// `data/decisions/2026-08-06-uniform-card-height-chrome-floor.md`): accept
+    /// this one combination as a known edge case rather than shrinking base
+    /// chrome proportions globally to buy it back.
+    const ACCEPTED_NARROW_FLOOR_TRUNCATION: (u16, f32, u8) = (34, GUARANTEED_CELL_WIDTH_PX, 2);
+
     #[test]
     fn every_real_fleet_title_is_set_whole_in_every_face_at_every_width() {
         let faces = font::all_available_faces();
@@ -4019,6 +4201,9 @@ mod tests {
         for (face, font) in faces {
             for (sidebar_width, cell_w, depth) in card_widths() {
                 if cell_w < GUARANTEED_CELL_WIDTH_PX {
+                    continue;
+                }
+                if (sidebar_width, cell_w, depth) == ACCEPTED_NARROW_FLOOR_TRUNCATION {
                     continue;
                 }
                 for title in REAL_FLEET_TITLES {
@@ -4078,8 +4263,7 @@ mod tests {
                             && !title_sets_whole(&font, title, with_chip);
                         let never_had_room = with_chip <= 0.0
                             || column.chip_height
-                                >= tier_height_px(
-                                    depth,
+                                >= card_height_px(
                                     font.metrics(TITLE_PX),
                                     font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
                                 ) - 2.0;
@@ -4100,61 +4284,42 @@ mod tests {
     /// The empty icon plate was taking this much of the title's column.
     ///
     /// Kept as a number rather than a description because "far larger than it
-    /// should be" is what the captain could see and this is what it cost: at
-    /// the top tier the collapsed slot hands the title back more than the width
-    /// of the state chip.
+    /// should be" is what the captain could see and this is what it cost: the
+    /// collapsed slot hands the title back more than the width of the state
+    /// chip. There is one geometry now, not one per tier, so this is checked
+    /// once rather than swept across depths.
     #[test]
     fn collapsing_the_empty_plate_gives_real_width_back_to_the_title() {
         let Some(font) = font::card_font(None) else {
             return;
         };
-        for depth in 0..3u8 {
-            let height = tier_height_px(
-                depth,
-                font.metrics(TITLE_PX),
-                font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
-            );
-            let width = 42.0 * 12.0;
-            let with_plate = text_column(
-                font,
-                &CardGeometry::new(depth, 16.0, true),
-                width,
-                height,
-                WIDEST_STATE_LABEL,
-                REAL_FLEET_TITLES[0],
-            );
-            let without = text_column(
-                font,
-                &CardGeometry::new(depth, 16.0, false),
-                width,
-                height,
-                WIDEST_STATE_LABEL,
-                REAL_FLEET_TITLES[0],
-            );
-            assert!(
-                without.available() > with_plate.available(),
-                "depth {depth} gained nothing by collapsing the slot"
-            );
-        }
-        // At the top tier specifically, where the plate was capped at its
-        // widest, the gain is worth more than the chip.
-        let top = text_column(
+        let height = card_height_px(
+            font.metrics(TITLE_PX),
+            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+        );
+        let width = 42.0 * 12.0;
+        let with_plate = text_column(
             font,
-            &CardGeometry::new(0, 16.0, false),
-            42.0 * 12.0,
-            68.0,
+            &CardGeometry::new(16.0, true),
+            width,
+            height,
             WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
         );
-        let top_with = text_column(
+        let without = text_column(
             font,
-            &CardGeometry::new(0, 16.0, true),
-            42.0 * 12.0,
-            68.0,
+            &CardGeometry::new(16.0, false),
+            width,
+            height,
             WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
         );
-        assert!(top.available() - top_with.available() >= measured::PLATE_MAX_PX);
+        assert!(
+            without.available() > with_plate.available(),
+            "collapsing the slot gained nothing"
+        );
+        // The gain is worth more than the chip.
+        assert!(without.available() - with_plate.available() >= measured::PLATE_MAX_PX);
     }
 
     /// The panel and cell the captain's fleet actually runs on.
@@ -4405,35 +4570,37 @@ mod tests {
     /// A card's chrome is measured against the tier's nominal height, so a card
     /// the content pushed taller keeps the padding and plate its tier asked
     /// for rather than inflating them.
+    /// The tiers are retired: there is one nominal height, so every card's
+    /// chrome is the same regardless of rank. This is what stops the tier
+    /// scale's old per-depth chrome step from becoming a second, quieter size
+    /// signal now that height no longer carries one.
     #[test]
-    fn chrome_scales_with_the_tier_not_with_the_drawn_height() {
-        let base = CardGeometry::new(0, 16.0, true);
-        let deep = CardGeometry::new(2, 16.0, true);
-        assert!(deep.pad < base.pad);
-        assert!(deep.plate < base.plate);
-        assert!(deep.radius < base.radius);
-        assert!(deep.stroke <= base.stroke);
+    fn chrome_is_identical_on_every_card_since_the_tiers_were_retired() {
+        let a = CardGeometry::new(16.0, true);
+        let b = CardGeometry::new(16.0, true);
+        assert_eq!(a.pad, b.pad);
+        assert_eq!(a.plate, b.plate);
+        assert_eq!(a.radius, b.radius);
+        assert_eq!(a.stroke, b.stroke);
+        assert_eq!(a.bloom_sigma, b.bloom_sigma);
     }
 
     /// The plate cap is the named deviation from the measured 0.70 h: without
-    /// it the top card has the narrowest text column in the tree.
+    /// it the card has the narrowest text column it could have.
     #[test]
-    fn the_plate_is_capped_so_the_top_card_is_not_the_narrowest_column() {
+    fn the_plate_is_capped_so_the_card_is_not_the_narrowest_column() {
         const {
             assert!(measured::PLATE * BASE_HEIGHT_PX > measured::PLATE_MAX_PX);
         }
-        assert_eq!(
-            CardGeometry::new(0, 16.0, true).plate,
-            measured::PLATE_MAX_PX
-        );
+        assert_eq!(CardGeometry::new(16.0, true).plate, measured::PLATE_MAX_PX);
     }
 
     /// No mark, no slot — and every pixel the slot was taking goes to the text
     /// column rather than to a wider gap.
     #[test]
     fn a_card_with_no_mark_reserves_no_icon_slot() {
-        let marked = CardGeometry::new(0, 16.0, true);
-        let bare = CardGeometry::new(0, 16.0, false);
+        let marked = CardGeometry::new(16.0, true);
+        let bare = CardGeometry::new(16.0, false);
         assert_eq!(bare.plate, 0.0);
         assert_eq!(bare.plate_gap, 0.0);
         assert_eq!(bare.text_inset(), bare.pad);
@@ -4864,7 +5031,7 @@ mod the_sheet_carries_the_view_transition {
 /// Everything here is that sentence turned into an assertion.
 #[cfg(test)]
 mod a_card_is_its_own_shape {
-    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::tests::{pixel_fleet_app, sidebar_rect, three_rank_pixel_app};
     use super::*;
 
     /// The same fleet, drawing shapes instead of one sheet.
@@ -4906,20 +5073,6 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// The depth of every drawn card, in the order [`built`] publishes them.
-    fn depthed(app: &AppState) -> Vec<u8> {
-        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
-        let entries = super::super::workspace_list_entries(app);
-        let agents = super::super::sidebar_agent_entries(app);
-        cards
-            .iter()
-            .filter(|card| card.card_frame.is_some_and(|f| f.width > 0 && f.height > 0))
-            .filter_map(|card| entries.get(card.entry_idx))
-            .filter_map(|entry| content_for(app, entry, &agents))
-            .map(|content| content.depth)
-            .collect()
-    }
-
     /// The rows that carry a card, which is what a published layer answers to.
     fn framed(app: &AppState) -> Vec<Rect> {
         super::super::compute_workspace_card_areas(app, sidebar_rect())
@@ -4937,6 +5090,152 @@ mod a_card_is_its_own_shape {
         let info = reader.next_frame(&mut buf).expect("a PNG with no frame");
         buf.truncate(info.buffer_size());
         (info.width, info.height, buf)
+    }
+
+    /// Every card in a real tree — first mate, second mates, and their
+    /// workers — is drawn at the same height on screen.
+    ///
+    /// Through the real render path rather than the constants: builds the
+    /// captain's own fleet at his 42-column width, decodes the actual PNG the
+    /// sheet publishes, and measures each card's own drawn ink (the rounded
+    /// rect, found by where the alpha inside the card's cell footprint stops
+    /// being zero) rather than trusting the row height it was handed. A second,
+    /// quieter scale hiding in the chrome instead of the row height would still
+    /// show up here.
+    #[test]
+    fn every_rank_renders_at_the_same_card_height() {
+        let app = three_rank_pixel_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let sheet = layers.first().expect("the sheet is one layer");
+        let (img_w, img_h, px) = decode(sheet);
+        let cell_w = f32::from(u16::try_from(app.host_cell_size.width_px).unwrap());
+        let cell_h = f32::from(u16::try_from(app.host_cell_size.height_px).unwrap());
+
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let entries = super::super::workspace_list_entries(&app);
+        let agents = super::super::sidebar_agent_entries(&app);
+        let mut heights_by_rank: std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            Vec<u32>,
+        > = std::collections::BTreeMap::new();
+
+        for card in &cards {
+            let Some(frame) = card.card_frame else {
+                continue;
+            };
+            if frame.width == 0 || frame.height == 0 {
+                continue;
+            }
+            let Some(entry) = entries.get(card.entry_idx) else {
+                continue;
+            };
+            if content_for(&app, entry, &agents).is_none() {
+                continue;
+            }
+            // The pixel band this row owns inside the sheet.
+            let y0 = (u32::from(frame.y.saturating_sub(sheet.rect.y)) as f32 * cell_h) as u32;
+            let y1 = y0 + (u32::from(frame.height) as f32 * cell_h) as u32;
+            let x0 = (u32::from(frame.x.saturating_sub(sheet.rect.x)) as f32 * cell_w) as u32;
+            let x1 = (x0 + (u32::from(frame.width) as f32 * cell_w) as u32).min(img_w);
+            let (y0, y1) = (y0.min(img_h), y1.min(img_h));
+
+            let mut top = None;
+            let mut bottom = None;
+            for y in y0..y1 {
+                let mut lit = false;
+                for x in x0..x1 {
+                    if px[((y * img_w + x) * 4 + 3) as usize] > 0 {
+                        lit = true;
+                        break;
+                    }
+                }
+                if lit {
+                    top.get_or_insert(y);
+                    bottom = Some(y);
+                }
+            }
+            if let (Some(top), Some(bottom)) = (top, bottom) {
+                heights_by_rank
+                    .entry(entry.rank())
+                    .or_default()
+                    .push(bottom - top + 1);
+            }
+        }
+
+        assert!(
+            heights_by_rank.len() >= 3,
+            "the fixture did not exercise at least three ranks: {heights_by_rank:?}"
+        );
+        let mut all_heights = heights_by_rank.values().flatten().copied();
+        let first = all_heights.next().expect("at least one card was measured");
+        for h in all_heights {
+            assert!(
+                h.abs_diff(first) <= 1,
+                "card heights differ by rank (a device-pixel rounding tolerance of 1 is \
+                 allowed): {heights_by_rank:?}"
+            );
+        }
+    }
+
+    /// Width still reads as rank in the real render path: a worker's card is
+    /// narrower than its second mate's, whose is narrower than the first mate's,
+    /// at the captain's 42-column width. This is [`super::rank_right_inset`],
+    /// unrelated to and unaffected by the height change — this test exists so a
+    /// future change to height cannot silently take width down with it.
+    #[test]
+    fn width_still_narrows_by_rank_at_the_captains_width() {
+        let app = three_rank_pixel_app();
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let entries = super::super::workspace_list_entries(&app);
+        let agents = super::super::sidebar_agent_entries(&app);
+
+        let mut widths_by_rank: std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            u16,
+        > = std::collections::BTreeMap::new();
+        for card in &cards {
+            let Some(frame) = card.card_frame else {
+                continue;
+            };
+            if frame.width == 0 {
+                continue;
+            }
+            let Some(entry) = entries.get(card.entry_idx) else {
+                continue;
+            };
+            if content_for(&app, entry, &agents).is_none() {
+                continue;
+            }
+            widths_by_rank.insert(entry.rank(), frame.width);
+        }
+
+        let first = widths_by_rank
+            .get(&crate::app::agent_tree::AgentRelation::FirstMate)
+            .copied();
+        let second = widths_by_rank
+            .get(&crate::app::agent_tree::AgentRelation::SecondMate)
+            .copied();
+        let worker = widths_by_rank
+            .get(&crate::app::agent_tree::AgentRelation::Worker)
+            .copied();
+
+        match (first, second, worker) {
+            (Some(first), Some(second), Some(worker)) => {
+                assert!(
+                    first > second,
+                    "a first mate's card ({first} cols) is not wider than a second \
+                     mate's ({second} cols)"
+                );
+                assert!(
+                    second > worker,
+                    "a second mate's card ({second} cols) is not wider than a \
+                     worker's ({worker} cols)"
+                );
+            }
+            _ => panic!("fixture did not carry all three ranks: {widths_by_rank:?}"),
+        }
     }
 
     /// One card, one image, one placement.
@@ -5062,20 +5361,18 @@ mod a_card_is_its_own_shape {
         let cell_w = f32::from(app.host_cell_size.width_px as u16);
         let cell_h = f32::from(app.host_cell_size.height_px as u16);
 
-        let depths = depthed(&app);
         let mut checked = 0;
-        for ((layer, frame), depth) in layers.iter().zip(&frames).zip(depths) {
+        for (layer, frame) in layers.iter().zip(&frames) {
             let (width, height, px) = decode(layer);
             // The card's own box inside this image, from the row's frame.
             let left = f32::from(frame.x.saturating_sub(layer.rect.x)) * cell_w;
             let top = f32::from(frame.y.saturating_sub(layer.rect.y)) * cell_h;
             let box_w = f32::from(frame.width) * cell_w;
             let box_h = f32::from(frame.height) * cell_h;
-            // Every card's glow reaches at most its own tier's bloom reach, plus
-            // a pixel for the antialiasing ramp. Its own tier and not the tree's
-            // largest: a bound taken off the biggest card would pass a worker
-            // that lit twice the ground it should.
-            let reach = bloom_reach_px(depth, cell_h) + 1.0;
+            // Every card's glow reaches at most the shared bloom reach, plus a
+            // pixel for the antialiasing ramp. The same bound for every card
+            // since the tiers were retired — see `BASE_HEIGHT_PX`.
+            let reach = bloom_reach_px(cell_h) + 1.0;
 
             for y in 0..height {
                 for x in 0..width {
@@ -6148,11 +6445,11 @@ mod a_card_is_its_own_shape {
         );
     }
 
-    /// Turning the flag on moves no row and changes no tier.
+    /// Turning the flag on moves no row and changes no height.
     ///
-    /// The captain paid for the 68 px base, the 65% tier step, D-MID density and
-    /// two-line titles. This is a change to what a card's *edges* do, and the
-    /// layout has to come out the same on both sides of the flag.
+    /// The captain paid for the 68 px base, D-MID density and two-line titles.
+    /// This is a change to what a card's *edges* do, and the layout has to come
+    /// out the same on both sides of the flag.
     #[test]
     fn the_shapes_path_moves_nothing_the_layout_settled() {
         let sheet = pixel_fleet_app();
@@ -6171,14 +6468,12 @@ mod a_card_is_its_own_shape {
             geometry(&shapes),
             "the drawing model moved the rows it was only supposed to redraw"
         );
-        for depth in 0..3u8 {
-            let fold = super::super::row_fold_width(&sheet, sidebar_rect());
-            assert_eq!(
-                row_height_cells(&sheet, depth, fold),
-                row_height_cells(&shapes, depth, fold),
-                "tier {depth} changed height with the drawing model"
-            );
-        }
+        let fold = super::super::row_fold_width(&sheet, sidebar_rect());
+        assert_eq!(
+            row_height_cells(&sheet, fold),
+            row_height_cells(&shapes, fold),
+            "height changed with the drawing model"
+        );
     }
 }
 

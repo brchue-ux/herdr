@@ -1,0 +1,24 @@
+                         │ 1       +
+   firstmate             │bchue@homeserver:/tmp$ [2;12Heee
+ ├─ > 2ndmate-left       │
+ │  ├─ - 2ndmate-left    │
+ │  │    left-worker-2   │
+ │  └─ > 2ndmate-left    │
+ │       left-worker-1   │
+ └─ - 2ndmate-right      │
+    └─ - 2ndmate-right   │
+         right-worker    │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+ new                menu«│

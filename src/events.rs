@@ -210,4 +210,34 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+    /// A shell command was detected on a pane's screen — the sidebar's
+    /// command-acknowledgement marker fires from this.
+    ///
+    /// Carries no command text and no tool name on purpose: the marker draws
+    /// a glyph, never the command, so there is nothing here for a renderer to
+    /// want. `observed_at` is when the detection task's own scan saw it,
+    /// which is what the marker's visible lifetime is measured from.
+    CommandAcknowledged {
+        pane_id: PaneId,
+        observed_at: Instant,
+    },
+    /// A bug or failure was detected in a pane's own output or state — the
+    /// "meteor" visual-effect trigger candidate.
+    ///
+    /// Sourced only from herdr's own screen/state observation of `pane_id`.
+    /// Never emitted for a firstmate/CI-originated fact (a green test run, a
+    /// merged PR): those ride `herdr-outcome-publisher`'s existing
+    /// `report-signal`/`report-metadata` channels instead, not this one.
+    /// Carries no location, matching every other `AppEvent`: identity travels
+    /// through the server, and a client resolves `pane_id` to a screen
+    /// position at render time.
+    // Next step: a producer that decides "this pane's output/state is a
+    // failure" is separate, later work (see `src/app/pending_effects.rs`'s
+    // module doc); this variant's dispatch into `PendingEffects` is exercised
+    // by tests only until that producer is wired.
+    #[allow(dead_code)]
+    PaneIssueDetected {
+        pane_id: PaneId,
+        observed_at: Instant,
+    },
 }

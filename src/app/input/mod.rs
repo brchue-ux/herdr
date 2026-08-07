@@ -413,6 +413,11 @@ impl App {
                     }
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                        SettingsAction::SaveCardPulse(enabled) => self.save_card_pulse(enabled),
+                        SettingsAction::SaveCardWash(enabled) => self.save_card_wash(enabled),
+                        SettingsAction::SaveCardStageHue(enabled) => {
+                            self.save_card_stage_hue(enabled)
+                        }
                         SettingsAction::SaveStatusIndicators(style) => {
                             self.save_status_indicators(style)
                         }
@@ -422,6 +427,15 @@ impl App {
                         }
                         SettingsAction::SaveAgentBorderLabels(enabled) => {
                             self.save_agent_border_labels(enabled)
+                        }
+                        SettingsAction::SaveSignalTrayEnabled(enabled) => {
+                            self.save_signal_tray_enabled(enabled)
+                        }
+                        SettingsAction::SaveSignalTrayActions(enabled) => {
+                            self.save_signal_tray_actions(enabled)
+                        }
+                        SettingsAction::SaveSignalTrayAnimate(enabled) => {
+                            self.save_signal_tray_animate(enabled)
                         }
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()

@@ -113,9 +113,73 @@ pub(crate) enum ElementId {
     /// new one mounts. See [`Animator::admit`], which deliberately never
     /// restarts an element that is still there.
     CardWash(CardWash),
+    /// One gap between two adjacent tree rows, at one ancestor column.
+    ///
+    /// Before this existed the vertical `│` beside a row was a character
+    /// drawn fresh every frame with no identity behind it — a monolithic run
+    /// with no way to say "the third gap down this branch" rather than "this
+    /// column, generally." Keying a segment on the row that stands just above
+    /// its gap (see [`TrunkSegmentId::below`]) is what makes each gap
+    /// addressable on its own: a row's arrival and departure already have a
+    /// stable identity ([`Self::WorkspaceRow`]/[`Self::AgentRow`]), and the
+    /// segment immediately below it borrows that same identity rather than
+    /// inventing a second one keyed on position, which would drift the moment
+    /// a row above it arrived or left. Its own family, for the reason every
+    /// other bounded-event element here has one: reconciling `AgentRow` or
+    /// `WorkspaceRow` down to nothing must not retire a segment mid-retract.
+    ///
+    /// Scoped to the ancestor rail — the columns in
+    /// [`crate::ui::sidebar::WorkspaceListEntry::ancestors_continue`] a row
+    /// passes through on its way down from the root. The vertical rail below
+    /// a row's *own* connector, toward its next sibling, is not yet one of
+    /// these; it is still drawn as a plain glyph, and giving it a segment of
+    /// its own is a follow-up, not a gap in this one.
+    TrunkSegment(TrunkSegmentId),
+    /// One command-acknowledgement marker on one card: a glyph that snaps in,
+    /// holds, and fades — the sidebar's answer to "a shell command ran".
+    ///
+    /// Its own family, for the same reason [`Self::CardWash`] has one: it is a
+    /// bounded event on a row rather than the row itself. Unlike a wash, a card
+    /// can carry *several of these at once* — the captain's own call was one
+    /// independent instance per detected command rather than a coalesced
+    /// counter — so the identity carries a sequence number and not just the
+    /// card, or a second command arriving mid-animation would collide with the
+    /// first instead of mounting beside it.
+    CmdAck(CmdAck),
+    /// The failure spider resting on one card: a persistent marker that climbs
+    /// the trunk/branch to a failing card's top-centre border and stays there
+    /// until the card clears.
+    ///
+    /// Its own family for the same reason [`Self::CardWash`] has one: this is
+    /// not the row itself — reconciling `AgentRow`/`WorkspaceRow` down to
+    /// nothing must not retire a spider still mid-climb or mid-retreat — and
+    /// it is not [`Self::Named`], because it is one of a membership set (one
+    /// card can fail while another clears) rather than a singleton. The climb
+    /// is this element's own mount, built on the addressing
+    /// [`Self::TrunkSegment`] introduced: the sidebar renderer walks the same
+    /// trunk/branch/border geometry a settled `TrunkSegment` chain draws, and
+    /// reads this element's own bounded `progress` — never a `TrunkSegment`'s,
+    /// since each of those is fixed to a single `1×1` point — to say how far
+    /// along that geometry the spider has climbed.
+    FailureSpider(CardRow),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
+}
+
+/// Which row a trunk segment's gap sits below, and at which ancestor column.
+///
+/// `below` is deliberately the identity of a *row*, not a coordinate: a
+/// segment's gap moves with the row it is attached to when rows above it
+/// arrive or leave, the same way [`CardRow`] already lets a card wash follow
+/// its row rather than a slot index that a reflow would shift out from under
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TrunkSegmentId {
+    pub(crate) below: CardRow,
+    /// Index into the row's own `ancestors_continue`, matching the ancestor
+    /// column this segment's `│` stands in.
+    pub(crate) level: u8,
 }
 
 /// One state change on one card: which card, and which way.
@@ -127,6 +191,19 @@ pub(crate) struct CardWash {
     pub(crate) from: crate::detect::AgentState,
     /// The state it changed into, which is what the front leaves behind it.
     pub(crate) into: crate::detect::AgentState,
+}
+
+/// One command-acknowledgement instance: which card, and which of possibly
+/// several simultaneous acks on it.
+///
+/// `seq` is what lets two commands detected close together mount as two
+/// elements instead of one restarting the other — [`Animator::admit`] never
+/// restarts an id that is still in its membership set, so two acks on the same
+/// card must simply not share an id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CmdAck {
+    pub(crate) row: CardRow,
+    pub(crate) seq: u64,
 }
 
 /// Which row in the tree a card stands on.
@@ -148,6 +225,9 @@ pub(crate) enum Family {
     TreeView,
     TrayBadge,
     CardWash,
+    TrunkSegment,
+    CmdAck,
+    FailureSpider,
     Named,
 }
 
@@ -160,6 +240,9 @@ impl ElementId {
             Self::TreeView => Family::TreeView,
             Self::TrayBadge(_) => Family::TrayBadge,
             Self::CardWash(_) => Family::CardWash,
+            Self::TrunkSegment(_) => Family::TrunkSegment,
+            Self::CmdAck(_) => Family::CmdAck,
+            Self::FailureSpider(_) => Family::FailureSpider,
             Self::Named(_) => Family::Named,
         }
     }
@@ -170,6 +253,14 @@ impl ElementId {
 
     pub(crate) fn agent_row(pane_id: crate::layout::PaneId) -> Self {
         Self::AgentRow(pane_id)
+    }
+
+    pub(crate) fn trunk_segment(below: CardRow, level: u8) -> Self {
+        Self::TrunkSegment(TrunkSegmentId { below, level })
+    }
+
+    pub(crate) fn failure_spider(row: CardRow) -> Self {
+        Self::FailureSpider(row)
     }
 }
 
@@ -257,7 +348,6 @@ impl Lifecycle {
         self
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_dismount(mut self, stage: Stage) -> Self {
         self.dismount = Some(stage);
         self
@@ -633,6 +723,18 @@ impl Animator {
             progress,
             inputs: element.inputs,
         })
+    }
+
+    /// True when at least one element of `family` is currently tracked.
+    ///
+    /// For a caller deciding whether a cheap "nothing to animate" exit is
+    /// still safe: a membership set that has dropped to empty this pass can
+    /// still have an element mid-dismount, and forgetting it early would cut
+    /// its exit short rather than let it finish — the same problem the tree
+    /// view switch's own comment names for a singleton, generalised to a
+    /// membership set. The failure spider's own advance pass reads this.
+    pub(crate) fn has_any(&self, family: Family) -> bool {
+        self.elements.keys().any(|id| id.family() == family)
     }
 
     /// Elements that are leaving but still have frames to draw.
