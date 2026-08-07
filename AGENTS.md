@@ -2,6 +2,10 @@
 
 Terminal based agent runtime for coding agents.
 
+Domain terminology (workspace, tab, pane, space, agent detection, manifest, session, sockets,
+etc.) is defined in `CONTEXT.md` at the repo root — check it before guessing at herdr-specific
+vocabulary.
+
 ## Scope and Audience
 
 These instructions are layered.
