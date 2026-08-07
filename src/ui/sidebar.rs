@@ -1576,7 +1576,11 @@ fn list_entry_height(
     // both kinds of row are drawn by the same card: a mate is a Space and a
     // worker is a pane, and a tree that skinned one and not the other would be
     // two designs stacked on each other.
-    if let Some(rows) = image_card::row_height_cells(app, entry.depth(), fold_width) {
+    //
+    // It does not take the entry either: card height is uniform across every
+    // rank by the captain's decision, and width is the rank signal. See
+    // `image_card::BASE_HEIGHT_PX`.
+    if let Some(rows) = image_card::row_height_cells(app, fold_width) {
         return rows.min(body_height);
     }
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
