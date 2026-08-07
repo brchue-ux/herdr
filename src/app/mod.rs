@@ -766,6 +766,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
             sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
             default_shell: config.terminal.default_shell.clone(),
@@ -806,6 +807,8 @@ impl App {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            sidebar_particle_field: None,
+            sidebar_particle_field_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),
@@ -1725,6 +1728,18 @@ impl App {
                 self.state.sidebar_card_layers.clear();
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+                self.state.sidebar_particle_field = None;
+                self.state.sidebar_particle_field_key = 0;
+            }
+            // Toggling the wash on/off invalidates whatever loop is cached: a stale one left
+            // behind while off would resurface armed on a terminal that never saw it re-armed.
+            if self.state.sidebar_particle_field_enabled
+                != config.experimental.sidebar_particle_field
+            {
+                self.state.sidebar_particle_field_enabled =
+                    config.experimental.sidebar_particle_field;
+                self.state.sidebar_particle_field = None;
+                self.state.sidebar_particle_field_key = 0;
             }
             self.state.sidebar_card_font =
                 sidebar_card_font(&config.experimental.sidebar_card_font);

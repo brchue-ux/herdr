@@ -121,6 +121,15 @@ pub(crate) fn signal_tray_graphics_rect(
     self::sidebar::tray::grid_rect(self::sidebar::tray::tray_rect(app, area))
 }
 
+/// Where the sidebar's ambient particle-field wash is composited: the same content column
+/// [`self::sidebar::particle_background::image`] generated pixels for, so the placement's grid
+/// always matches the image it is displaying.
+pub(crate) fn sidebar_particle_field_rect(
+    app: &crate::app::state::AppState,
+) -> ratatui::layout::Rect {
+    self::sidebar::sidebar_content_rect(app.view.sidebar_rect)
+}
+
 pub(crate) use self::{
     keybind_help::keybind_help_lines,
     mobile::{

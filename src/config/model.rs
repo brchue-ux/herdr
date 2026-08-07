@@ -1047,6 +1047,16 @@ pub struct ExperimentalConfig {
     ///
     /// Only read while `kitty_graphics` is on.
     pub sidebar_card_shapes: bool,
+    /// Draw an ambient particle-field wash behind the sidebar tree. Default: false.
+    ///
+    /// Generated once per sidebar size and played back by the terminal's own Kitty
+    /// animation-frame clock (`a=f`/`a=a`) rather than re-uploaded every tick, so steady-state
+    /// wire cost is near zero once armed — see `src/kitty_graphics.rs` and
+    /// `src/ui/sidebar/particle_background.rs`. Kitty-only for now: a terminal that does not
+    /// honour `a=f`/`a=a` still shows the root frame, just static.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub sidebar_particle_field: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when

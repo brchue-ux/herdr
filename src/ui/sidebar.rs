@@ -2,6 +2,7 @@ mod card;
 pub(crate) mod image_card;
 pub(crate) mod motion;
 mod notifications;
+pub(crate) mod particle_background;
 mod tokens;
 pub(crate) mod tray;
 pub(crate) mod tray_art;

@@ -10,9 +10,10 @@
 //! reproduced here: the captain's decision explicitly picked the flat-background rung, and the
 //! glow was measured to cost 3.5x the entire particle field on its own.
 //!
-//! This module is not wired into any render loop or graphics surface yet. It exists to let cost
-//! be measured and tested against real fork code instead of a standalone benchmark harness; live
-//! wiring is separate, gated work.
+//! Wired into the sidebar's ambient wash behind `[experimental] sidebar_particle_field` (see
+//! `src/ui/sidebar/particle_background.rs`), which calls [`loop_frames`] once per sidebar size
+//! and hands the sequence to Kitty's native animation-frame transport
+//! (`src/kitty_graphics.rs`) so the terminal plays it back without further per-frame uploads.
 //!
 //! Measured on this module (`cargo test --release --bin herdr particle_field::tests::profile_cost_curve
 //! -- --ignored --nocapture`), Rung 2 (13k particles, dof, bloom) at its shipped 480x312 wire size:
@@ -25,11 +26,6 @@
 //! report's figure. Rung 2 stays affordable either way (an order of magnitude under the
 //! full-resolution-with-glow ceiling), but sizing decisions on top of this generator should use
 //! 1122 KB/s, not 328 KB/s, until indexed-PNG output exists.
-
-// Not wired into any render loop or graphics surface yet (see module docs above), so nothing in
-// the fork calls this module's public API outside of its own tests. Remove once the gated
-// `herdr-enable-pixel-path` / `herdr-pixel-rendering-path` work adds a real caller.
-#![allow(dead_code)]
 
 use std::f32::consts::PI;
 
@@ -393,6 +389,25 @@ pub fn quantize_channels(rgba: &mut [u8], bits: u8) {
     }
 }
 
+/// Renders one full seamless loop as `frame_count` evenly-spaced phase samples over a full
+/// rotation: `phase.sin_cos()` (in [`Field::frame`]) returns to its starting value every 2π, so
+/// the step from the last frame back to frame 0 is the same size as every other step.
+///
+/// Generation only, same as [`Field::frame`] — the caller owns transmitting the sequence and
+/// arming playback.
+pub fn loop_frames(w: usize, h: usize, cfg: &Cfg, frame_count: usize) -> Vec<Vec<u8>> {
+    let frame_count = frame_count.max(1);
+    let mut field = Field::new(w, h, cfg.particles);
+    (0..frame_count)
+        .map(|i| {
+            let phase = (i as f32 / frame_count as f32) * 2.0 * PI;
+            let mut out = Vec::new();
+            field.frame(cfg, phase, &mut out);
+            out
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +493,39 @@ mod tests {
         let mut rgba = vec![0b1111_1111, 0b0000_0111, 0b1010_1010, 42];
         quantize_channels(&mut rgba, 5);
         assert_eq!(rgba, vec![0b1111_1000, 0b0000_0000, 0b1010_1000, 42]);
+    }
+
+    #[test]
+    fn loop_frames_returns_requested_count_at_correct_size() {
+        let cfg = Cfg::rung2();
+        let frames = loop_frames(64, 48, &cfg, 6);
+        assert_eq!(frames.len(), 6);
+        for frame in &frames {
+            assert_eq!(frame.len(), 64 * 48 * 4);
+        }
+    }
+
+    #[test]
+    fn loop_frames_samples_a_full_rotation() {
+        // Frame 0 is phase 0.0; with 4 frames over a full 2π rotation, frame 2 sits at π,
+        // matching a direct two-phase call to `Field::frame` on a fresh field with the same seed.
+        let cfg = Cfg::rung2();
+        let frames = loop_frames(64, 48, &cfg, 4);
+
+        let mut field = Field::new(64, 48, cfg.particles);
+        let mut expected_first = Vec::new();
+        field.frame(&cfg, 0.0, &mut expected_first);
+        let mut expected_third = Vec::new();
+        field.frame(&cfg, PI, &mut expected_third);
+
+        assert_eq!(frames[0], expected_first);
+        assert_eq!(frames[2], expected_third);
+    }
+
+    #[test]
+    fn loop_frames_rejects_zero_by_generating_one() {
+        let cfg = Cfg::rung2();
+        assert_eq!(loop_frames(16, 16, &cfg, 0).len(), 1);
     }
 
     /// Cost-vs-density profile against real fork code (this crate's actual `png = "0.17"` dep,
