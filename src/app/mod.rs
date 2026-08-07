@@ -22,6 +22,7 @@ mod ids;
 mod input;
 pub(crate) mod lifecycle;
 pub(crate) mod pane_activity;
+pub(crate) mod pending_effects;
 mod popup;
 mod pull_requests;
 pub(crate) mod relation_signal;
@@ -741,6 +742,7 @@ impl App {
             sidebar_cards: config.ui.sidebar.cards,
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
+            pending_effects: crate::app::pending_effects::PendingEffects::default(),
             next_agent_state_change_seq: 0,
             mouse_capture: config.ui.mouse_capture,
             copy_on_select: config.ui.copy_on_select,
