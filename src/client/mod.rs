@@ -763,6 +763,11 @@ fn do_handshake(
         } else {
             ClientLaunchMode::App
         },
+        // The host-capability probe: this client process *is* the process
+        // attached to the terminal, so its own environment is the terminal's
+        // — unlike the server's, which may not be co-located. See
+        // `crate::kitty_graphics::host_terminal_report_from_env`.
+        host_terminal: crate::kitty_graphics::host_terminal_report_from_env(),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;

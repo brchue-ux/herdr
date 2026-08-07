@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -336,6 +336,30 @@ impl ClientInputEvent {
     }
 }
 
+/// Host-capability facts the client reads from its own environment at
+/// attach time and reports to the server in `ClientMessage::Hello`.
+///
+/// These name environment variables (`TERM_PROGRAM`, `TERM`,
+/// `KITTY_WINDOW_ID`) and SSH client markers (`SSH_TTY`, `SSH_CONNECTION`,
+/// `SSH_CLIENT`) that only exist in the process actually attached to the
+/// terminal. The server process reading its own environment for these is
+/// only correct when server and client are co-located; this report is what
+/// makes terminal-aware pixel format selection correct for the general
+/// (possibly remote, possibly multi-client) split-server case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostTerminalReport {
+    /// `TERM_PROGRAM` from the client's environment.
+    pub term_program: Option<String>,
+    /// `TERM` from the client's environment.
+    pub term: Option<String>,
+    /// Whether `KITTY_WINDOW_ID` is set in the client's environment.
+    pub kitty_window_id_set: bool,
+    /// Whether the client positively established that it shares a
+    /// filesystem with the terminal it is attached to (no SSH_TTY /
+    /// SSH_CONNECTION / SSH_CLIENT in the client's own environment).
+    pub is_local: bool,
+}
+
 /// Messages sent from the client to the server over the client protocol socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -357,6 +381,13 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Client-observed host terminal capability facts, read from the
+        /// client's own environment. The server's own environment does not
+        /// reflect the attaching terminal once server and client are not
+        /// co-located, so format selection must use this rather than the
+        /// server process's env. See `crate::kitty_graphics::HostTerminalKind`.
+        #[serde(default)]
+        host_terminal: HostTerminalReport,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -1000,6 +1031,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            host_terminal: HostTerminalReport::default(),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1037,6 +1069,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                host_terminal: HostTerminalReport::default(),
             }),
             0
         );
@@ -1568,6 +1601,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            host_terminal: HostTerminalReport::default(),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1642,6 +1676,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    host_terminal: HostTerminalReport::default(),
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2078,6 +2113,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            host_terminal: HostTerminalReport::default(),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2114,6 +2150,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                host_terminal: HostTerminalReport::default(),
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

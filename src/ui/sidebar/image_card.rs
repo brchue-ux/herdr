@@ -2164,6 +2164,8 @@ fn build_cards_inner(
         bloom_floor,
         backdrop,
         dissolve: sheet_dissolve(app, cell_size),
+        host_terminal_kind: app.host_terminal_kind,
+        host_graphics_is_local: app.host_graphics_is_local,
     };
 
     if app.sidebar_card_shapes {
@@ -2299,6 +2301,10 @@ struct Rasteriser<'a> {
     bloom_floor: u16,
     backdrop: Rgb,
     dissolve: Option<DissolveFrame<'a>>,
+    /// The foreground client's detected host terminal, from `AppState`. See
+    /// `crate::kitty_graphics::preferred_card_pixel_format`.
+    host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    host_graphics_is_local: bool,
 }
 
 impl Rasteriser<'_> {
@@ -2693,10 +2699,14 @@ impl Rasteriser<'_> {
         };
         // Picked once per image rather than per client: the same rasterised
         // bytes back every attached client's placement of this image, so a
-        // single global "is the host terminal local and known-fast" answer
-        // is what all of them get. See `preferred_card_pixel_format`.
-        let format =
-            crate::kitty_graphics::preferred_card_pixel_format(canvas_is_fully_opaque(canvas));
+        // single "is the host terminal local and known-fast" answer — the
+        // foreground client's, detected at attach — is what all of them get.
+        // See `preferred_card_pixel_format`.
+        let format = crate::kitty_graphics::preferred_card_pixel_format(
+            canvas_is_fully_opaque(canvas),
+            self.host_terminal_kind,
+            self.host_graphics_is_local,
+        );
         let data = encode_canvas(canvas, format).ok_or(())?;
         Ok(SidebarCardLayer {
             rect,

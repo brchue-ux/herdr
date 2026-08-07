@@ -1992,6 +1992,15 @@ pub struct AppState {
     pub host_terminal_theme: TerminalTheme,
     /// Last known foreground host terminal cell size in pixels.
     pub(crate) host_cell_size: crate::kitty_graphics::HostCellSize,
+    /// Foreground client's host terminal kind, from its own attach-time
+    /// host-capability probe. `Other` (no format upgrade) until a client with
+    /// a positively identified terminal is foreground. See
+    /// `crate::kitty_graphics::preferred_card_pixel_format`.
+    pub(crate) host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    /// Whether the foreground client positively established that it shares a
+    /// filesystem with its terminal. `false` — including "unknown" — is the
+    /// safe default.
+    pub(crate) host_graphics_is_local: bool,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
     /// Terminal runtimes that should be shut down by the app/runtime layer
@@ -2901,6 +2910,8 @@ impl AppState {
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
+            host_graphics_is_local: false,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         }

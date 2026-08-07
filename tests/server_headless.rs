@@ -181,6 +181,10 @@ fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+            &encode_varint_u32(0),  // HostTerminalReport.term_program: None
+            &encode_varint_u32(0),  // HostTerminalReport.term: None
+            &encode_varint_u32(0),  // HostTerminalReport.kitty_window_id_set: false
+            &encode_varint_u32(0),  // HostTerminalReport.is_local: false
         ],
     );
     let framed = frame_message(&hello_payload);
