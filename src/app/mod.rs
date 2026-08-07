@@ -774,6 +774,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            kitty_graphics_capability_confirmed: false,
             sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
             sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
@@ -1163,6 +1164,9 @@ impl App {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        if self.state.kitty_graphics_enabled {
+            self.query_kitty_graphics_capability();
+        }
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;
@@ -1346,7 +1350,7 @@ impl App {
                         frame,
                     );
                 })?;
-                if kitty_graphics_enabled {
+                if kitty_graphics_enabled && self.state.kitty_graphics_capability_confirmed {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
                         &self.terminal_runtimes,
@@ -2084,6 +2088,11 @@ impl App {
                 // is drawn on. The foreground client's own report is the only
                 // one that speaks for the screen.
                 crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => {}
+                crate::raw_input::RawInputEvent::KittyGraphicsCapability(confirmed) => {
+                    if apply_host_terminal_theme {
+                        self.update_kitty_graphics_capability(confirmed);
+                    }
+                }
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);
@@ -6768,6 +6777,16 @@ last_pane = "prefix+tab"
                 b: 0xff,
             })
         );
+    }
+
+    #[test]
+    fn route_client_input_confirms_kitty_graphics_capability_from_probe_response() {
+        let mut app = test_app();
+        assert!(!app.state.kitty_graphics_capability_confirmed);
+
+        app.route_client_input(b"\x1b_Gi=1;OK\x1b\\".to_vec());
+
+        assert!(app.state.kitty_graphics_capability_confirmed);
     }
 
     #[tokio::test]
