@@ -1868,6 +1868,16 @@ pub struct AppState {
     /// of those acknowledgements are still live. Presentation state for the
     /// same reason [`Self::anim`] is.
     pub(crate) sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks,
+    /// Identity-scoped triggers for a bounded-lifetime visual effect, waiting
+    /// for a renderer that does not exist yet.
+    ///
+    /// Unlike [`Self::anim`] and [`Self::sidebar_cmd_acks`], this is not
+    /// presentation state re-derivable from what a client is currently
+    /// showing: it is the record of "this happened," independent of whether
+    /// any client was attached to see it. See
+    /// [`crate::app::pending_effects`]'s own doc for why it is a sibling to
+    /// `Self::anim` rather than a new element kind inside it.
+    pub(crate) pending_effects: crate::app::pending_effects::PendingEffects,
     /// The sidebar tree's owned agent rows as of the last loop pass.
     ///
     /// The tree is derived from panes that exist, so a pane closing takes the
@@ -2806,6 +2816,7 @@ impl AppState {
             anim: crate::anim::Animator::default(),
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
+            pending_effects: crate::app::pending_effects::PendingEffects::default(),
             sidebar_tree_row_memory: Vec::new(),
             tree_root: crate::app::tree_view::TreeRoot::default(),
             pending_tree_root: None,
