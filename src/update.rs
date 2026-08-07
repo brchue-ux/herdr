@@ -1823,7 +1823,11 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-#[cfg(unix)]
+/// Portable path-string matching only (`Path::file_name`/`parent`/`starts_with`,
+/// no platform APIs) — safe to compile and call on every target. Windows has
+/// no Homebrew/mise/Nix convention to match, so this simply reports `false`
+/// there today; it was `#[cfg(unix)]` only because nothing called it from a
+/// Windows-reachable path before `--remote` was ported to Windows.
 pub(crate) fn is_package_manager_managed_exe_path(path: &Path) -> bool {
     is_homebrew_managed_exe_path_following_links(path)
         || is_mise_managed_exe_path_following_links(path)
