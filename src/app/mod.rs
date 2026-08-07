@@ -474,6 +474,9 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::kitty_graphics::set_local_transport_enabled(
+            config.experimental.kitty_graphics_local_transport,
+        );
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -1725,6 +1728,9 @@ impl App {
             let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+            crate::kitty_graphics::set_local_transport_enabled(
+                config.experimental.kitty_graphics_local_transport,
+            );
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
                 self.state.pane_graphics_layers.clear();

@@ -296,6 +296,8 @@ During release review, finalize `docs/next` and run `just release-docs-check`. D
 
 Put local PRDs, planning notes, and exploratory specs under `.local/prd/`; `.local/` is ignored and locally controlled.
 
+Every `pub` field added to a `src/config/*.rs` struct needs a matching entry in `docs/next/website/src/data/config-reference.json` (key, type, default, description) or `just check` fails on `scripts.test_config_reference_check`. Entries are ordered to match the Rust struct's field order, not alphabetically; `scripts/config_reference_check.py` walks the struct fields to build the expected key set.
+
 ## Commit Style
 
 Use lowercase conventional commits, no emojis, and no AI co-author lines. Commit subjects feed preview release notes, so keep them descriptive.
