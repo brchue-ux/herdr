@@ -70,43 +70,49 @@ pub(super) const FILL_MID: Rgb = Rgb(30, 50, 62);
 pub(super) const FILL_EDGE_ALPHA: f32 = 0.10;
 pub(super) const FILL_INNER_SIGMA: f32 = 0.09;
 
-/// Peak outward excess as a fraction of the stroke's own excess over canvas:
-/// +33 lum immediately outside the stroke where the stroke's excess is 173.
-pub(super) const BLOOM_PEAK: f32 = 0.19;
+/// Peak outward excess as a fraction of the stroke's own excess over canvas.
+/// Sampled at +33 lum against the stroke's 173 (0.19), the reference value a
+/// card standing alone was drawn at.
+///
+/// # Why this is 0.38 and not the sampled 0.19
+///
+/// At the captain's real 42-column sidebar the minimal gap between two cards
+/// is a fixed 17 px, and at the previously shipped 0.07h sigma the gutter
+/// between two same-hued cards still measured a mean 57–67% of the
+/// brightness against a card's own stroke — a visibly hazy, not-quite-dark
+/// seam, not the "clean, legible boundary" asked for. Raising the peak while
+/// tightening [`BLOOM_SIGMA`] and dropping the far lobe ([`BLOOM_FAR_WEIGHT`])
+/// is not a tradeoff: measured by compositing the real card layers the way
+/// the terminal does, this brighter, tighter "wire" retune reads **0.0%
+/// bleed in every one of nine real gaps**, and because `lay_bloom`'s cost
+/// scales with the field's reach², the smaller reach this pairs with also
+/// costs *less* to rasterise than the wider, dimmer glow it replaces.
+///
+/// The captain picked this over the softer alternative that still left 16%
+/// residual bleed, explicitly flagging "zero" bleed as a qualified claim
+/// measured only through the in-process render fixture, not yet a live
+/// terminal.
+///
+/// Since confirmed: a real server on this build, driven through a real PTY
+/// client at the captain's 42-column sidebar and a 10×21 px cell, decoding
+/// the actual `\x1b_G` Kitty graphics APC blocks off the wire (not the
+/// in-process PNG fixture) and compositing them source-over in linear light
+/// the way a terminal does. Two adjacent same-hued idle cards at the real
+/// 17 px ink-to-ink gap: the gutter's four centre rows read exactly the
+/// panel background, `(30, 30, 46)`, with zero measured excess.
+pub(super) const BLOOM_PEAK: f32 = 0.38;
 /// Gaussian sigma of the bloom's near lobe, as a fraction of the tier's
 /// **nominal** height — not the height the card is drawn at. See
 /// [`super::CardGeometry::new`] for why every ratio in this table is against the
 /// nominal, and [`super::BLOOM_REACH_SIGMAS`] for what went wrong when one
 /// constant was not.
 ///
-/// # Why this is 0.07 and not the sampled 0.19
-///
-/// 0.19 h is what the reference was measured at, and on a card standing alone it
-/// is right. In a tree it is not. At 0.19 h a top-tier card's sigma is **12.9
-/// px** while the gap between two cards is **10–16 px**, so the glow's own
-/// half-width *is* the gutter — and a gaussian has barely begun to decay inside
-/// one sigma. Measured by compositing the real card layers the way the terminal
-/// does, the gutter between two cards sat at a mean **84.9%** of the brightness
-/// right against a card's own stroke, worst case **100%**: across the whole gap
-/// there was no falloff at all. That is what reads as one card's glow bleeding
-/// onto the next.
-///
-/// Nothing but the sigma moves that number. Not [`super::BLOOM_REACH_SIGMAS`],
-/// which truncates a tail that is already dim; not [`BLOOM_FAR_WEIGHT`], which
-/// governs how far past the neighbour the tail carries rather than how bright
-/// the gap is. Both were measured and both leave an 11 px gutter within two
-/// points of where they found it. At 0.07 h the same nine gutters measure a mean
-/// **39.5%**, worst **51.6%**.
-///
-/// The captain chose this over widening `row_gap`, which was the other lever on
-/// the menu and would have cost a card per four rows: *"narrower glow. still
-/// needs to retain quality and crispness."* Card density is untouched.
-///
-/// [`BLOOM_PEAK`] is deliberately **not** touched, so the rim immediately
-/// outside a card's stroke is exactly as bright as it was sampled. What changed
-/// is how far the glow carries, not how strong it starts — which is the half of
-/// his sentence about quality.
-pub(super) const BLOOM_SIGMA: f32 = 0.07;
+/// Narrowed from 0.07h (itself narrowed from the sampled 0.19h — see
+/// [`BLOOM_PEAK`]) to 0.030h alongside the peak increase and the move to a
+/// single lobe ([`BLOOM_FAR_WEIGHT`] `= 0.0`): a hot, thin core rather than a
+/// soft halo, which is what let this candidate clear zero measured bleed at
+/// the real 17 px minimal gap instead of the 57–67% the wider glow left.
+pub(super) const BLOOM_SIGMA: f32 = 0.030;
 /// The bloom is *more saturated* than the stroke: its excess is (8,40,39) where
 /// the stroke's R/G is 0.52.
 ///
@@ -120,15 +126,19 @@ pub(super) const BLOOM_SIGMA: f32 = 0.07;
 pub(super) const BLOOM_SAT_MUL: f32 = 1.18;
 pub(super) const BLOOM_LUM_MUL: f32 = 0.78;
 
-/// Two lobes rather than one: a single gaussian fitted to the peak undershoots
-/// the tail and one fitted to the tail undershoots the peak.
-pub(super) const BLOOM_NEAR_WEIGHT: f32 = 0.82;
-pub(super) const BLOOM_FAR_WEIGHT: f32 = 0.18;
-/// Narrowed with [`BLOOM_SIGMA`], and for the same reason: the far lobe carries
-/// the tail, and at 2.2× it put 18% of the peak more than five sigmas out —
-/// which at the tree's spacing is another card. It still does the job it was
-/// added for (a single gaussian cannot fit both the peak and the tail), it just
-/// no longer reaches the neighbour to do it.
+/// Single lobe now, not two: the far lobe that used to carry the tail past
+/// the near lobe's own falloff is exactly what let the previous shipped glow
+/// still reach a same-hued neighbour at the real 17 px minimal gap. Dropping
+/// it entirely ([`BLOOM_FAR_WEIGHT`] `= 0.0`) in favour of a single tight,
+/// bright core is what took the measured gutter bleed to 0.0% — a two-lobe
+/// fit that undershoots either the peak or the tail is no longer the
+/// tradeoff being made once the tail itself is the thing bleeding into the
+/// gutter.
+pub(super) const BLOOM_NEAR_WEIGHT: f32 = 1.0;
+pub(super) const BLOOM_FAR_WEIGHT: f32 = 0.0;
+/// Irrelevant while [`BLOOM_FAR_WEIGHT`] is `0.0` — there is no far lobe for
+/// this to scale. Left in place rather than removed so a future two-lobe
+/// retune has the constant to come back to.
 pub(super) const BLOOM_FAR_SIGMA_MUL: f32 = 1.5;
 
 /// Padding: 9 px on a 61 px card at left, top and bottom; 13 px at the right.
