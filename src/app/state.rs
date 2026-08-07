@@ -2157,6 +2157,25 @@ impl AppState {
         lifecycle
     }
 
+    /// The life a trunk segment is given when its gap opens.
+    ///
+    /// Reads the same `[ui.sidebar.animation]` `row_enter`/`row_exit` config a
+    /// row's own arrival does — a segment extending or retracting is the same
+    /// event as the row it is attached to arriving or leaving, so one config
+    /// pair serves both rather than inventing a second. `moves` is
+    /// deliberately not threaded through the way [`Self::sidebar_row_lifecycle`]
+    /// threads it: `row_motion` slides a card's *position*, and a trunk
+    /// segment has none to slide, so it is not given a synthesized phase for a
+    /// feature it takes no part in. No idle behaviours are declared — a
+    /// segment's steady state is unanimated until something is asked to
+    /// travel it, which is a later piece of work, not this one.
+    pub(crate) fn sidebar_trunk_lifecycle(&self) -> crate::anim::Lifecycle {
+        let mut lifecycle = crate::anim::Lifecycle::still();
+        lifecycle.mount = self.sidebar_animation.row_enter_stage(false);
+        lifecycle.dismount = self.sidebar_animation.row_exit_stage(false);
+        lifecycle
+    }
+
     /// True when the fleet signal bar is drawn.
     ///
     /// The bar lives on the reserved header row of the expanded panel, so a

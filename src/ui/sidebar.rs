@@ -553,6 +553,59 @@ pub(crate) fn workspace_list_entries_whole_fleet(app: &AppState) -> Vec<Workspac
     workspace_list_entries_inner(app, true, &crate::app::tree_view::TreeRoot::Fleet)
 }
 
+/// The stable identity a row draws its trunk segments and card wash under.
+///
+/// `None` for a row whose backing entry has already gone — `entry_idx`/`ws_idx`
+/// briefly dangle between a pane closing and the next tree rebuild — which a
+/// caller treats as "this row owns no segment right now" rather than an error.
+fn entry_card_row(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<crate::anim::CardRow> {
+    match entry {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => app
+            .workspaces
+            .get(*ws_idx)
+            .map(|ws| crate::anim::CardRow::Space(ws.id.clone())),
+        WorkspaceListEntry::Agent { entry_idx, .. } => agents
+            .get(*entry_idx)
+            .map(|entry| crate::anim::CardRow::Agent(entry.pane_id)),
+    }
+}
+
+/// Every trunk segment on screen right now: one per row with a gap still open
+/// beneath it, at each ancestor column that gap belongs to.
+///
+/// This is what the app loop publishes to [`crate::anim::Animator`] so a
+/// segment mounts the frame its gap opens and dismounts the frame it closes,
+/// exactly mirroring the `│` cells [`agent_row_prefix`] and
+/// [`card_rail_prefix`] already draw — a level counts as open here under
+/// precisely the condition that makes those functions draw a rail glyph
+/// there rather than blank space.
+pub(crate) fn sidebar_trunk_segment_members(
+    app: &AppState,
+) -> Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)> {
+    let agents = sidebar_agent_entries(app);
+    workspace_list_entries(app)
+        .iter()
+        .filter_map(|entry| entry_card_row(app, &agents, entry).map(|row| (row, entry.clone())))
+        .flat_map(|(row, entry)| {
+            let depth = crate::app::agent_tree::display_depth(entry.depth());
+            let ancestors = entry.ancestors_continue().to_vec();
+            (1..depth).filter_map(move |level| {
+                let open = ancestors.get(level as usize).copied().unwrap_or(false);
+                open.then(|| {
+                    (
+                        crate::anim::ElementId::trunk_segment(row.clone(), level),
+                        crate::anim::behaviour::DriveInputs::default(),
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
 /// The tree name a row answers to, which is the handle an `owner` token uses.
 ///
 /// `None` for a row that never named itself; such a row can be drawn and can be
@@ -2815,6 +2868,11 @@ fn render_agent_row(
     // leaves when it finishes, which is what makes its second mate's group grow
     // and shrink around it.
     let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
+    let trunk = TrunkRailPaint::new(
+        app,
+        Some(crate::anim::CardRow::Agent(detail.pane_id)),
+        Style::default().fg(p.overlay0),
+    );
 
     if let Some(shell) = &card_shell {
         let (mut connector, _) = agent_row_prefix(
@@ -2827,6 +2885,7 @@ fn render_agent_row(
             // pane, so there is nothing here for a charge to belong to.
             None,
             true,
+            trunk.as_ref(),
         );
         let (mut above, _) = card_rail_prefix(
             entry.depth(),
@@ -2834,6 +2893,7 @@ fn render_agent_row(
             entry.ancestors_continue(),
             CardRailSegment::AboveConnector,
             p,
+            trunk.as_ref(),
         );
         let (mut below, _) = card_rail_prefix(
             entry.depth(),
@@ -2841,6 +2901,7 @@ fn render_agent_row(
             entry.ancestors_continue(),
             CardRailSegment::BelowConnector,
             p,
+            trunk.as_ref(),
         );
         if entry.depth() > 0 {
             connector.push(connector_joint_span(p));
@@ -2907,6 +2968,7 @@ fn render_agent_row(
                         p,
                         None,
                         true,
+                        trunk.as_ref(),
                     )
                 } else {
                     card_rail_prefix(
@@ -2915,6 +2977,7 @@ fn render_agent_row(
                         entry.ancestors_continue(),
                         CardRailSegment::BelowConnector,
                         p,
+                        trunk.as_ref(),
                     )
                 };
                 // The frame's own column and the pad inside it. Blank, so the
@@ -2938,6 +3001,7 @@ fn render_agent_row(
                     p,
                     None,
                     false,
+                    trunk.as_ref(),
                 );
                 (
                     spans,
@@ -3166,6 +3230,7 @@ fn agent_row_prefix(
     p: &Palette,
     charge: Option<&ConnectorCharge<'_>>,
     meets_a_card: bool,
+    trunk: Option<&TrunkRailPaint<'_>>,
 ) -> (Vec<Span<'static>>, usize) {
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
@@ -3189,7 +3254,8 @@ fn agent_row_prefix(
             .copied()
             .unwrap_or(false);
         if open {
-            spans.push(Span::styled("│", line_style));
+            let (glyph, style) = trunk_rail_cell(trunk, level, line_style);
+            spans.push(Span::styled(glyph.to_string(), style));
             spans.push(Span::raw("  "));
         } else {
             spans.push(Span::raw("   "));
@@ -3245,6 +3311,7 @@ fn card_rail_prefix(
     ancestors_continue: &[bool],
     segment: CardRailSegment,
     p: &Palette,
+    trunk: Option<&TrunkRailPaint<'_>>,
 ) -> (Vec<Span<'static>>, usize) {
     let line_style = Style::default().fg(p.overlay0);
     // Above the connector the rail is the parent's, and a parent's line reaches
@@ -3275,7 +3342,8 @@ fn card_rail_prefix(
             .copied()
             .unwrap_or(false)
         {
-            spans.push(Span::styled("│", line_style));
+            let (glyph, style) = trunk_rail_cell(trunk, level, line_style);
+            spans.push(Span::styled(glyph.to_string(), style));
             spans.push(Span::raw("  "));
         } else {
             spans.push(Span::raw("   "));
@@ -3476,6 +3544,79 @@ fn connector_cell(
         paint.glyph_over(settled),
         paint.text_style(base, charge.ink),
     )
+}
+
+/// One row's trunk-rail paint, resolved once and asked about per ancestor
+/// level.
+///
+/// The vertical-line counterpart of [`ConnectorCharge`]: where a charge
+/// travels the three cells of one row's own branch, this reaches the `│`
+/// cells beside it that belong to an *ancestor's* line — each ancestor column
+/// is its own [`crate::anim::ElementId::TrunkSegment`], addressed by
+/// [`entry_card_row`], so a level that has nothing configured for it is left
+/// exactly as it always drew.
+///
+/// A segment is asked about at one fixed cell in a `1×1` extent rather than
+/// across the several terminal rows it may visually span, which is what makes
+/// it *one* object rather than a per-cell gradient: [`CellExtent::normalize`]
+/// resolves a one-cell axis to `0.0`, so every behaviour reads it as settled
+/// at a single point in its run and every cell of the segment agrees. A
+/// segment that travels smoothly along its own length — a charge, eventually
+/// the spider this unblocks — is later work built on this same identity, not
+/// a widening of what this paints.
+struct TrunkRailPaint<'a> {
+    anim: &'a crate::anim::Animator,
+    below: crate::anim::CardRow,
+    ink: crate::anim::cell::InkPalette,
+}
+
+impl<'a> TrunkRailPaint<'a> {
+    fn new(app: &'a AppState, below: Option<crate::anim::CardRow>, base: Style) -> Option<Self> {
+        Some(Self {
+            anim: &app.anim,
+            below: below?,
+            ink: crate::anim::cell::InkPalette::resolve(
+                base,
+                backdrop_rgb(app),
+                &app.palette,
+                &app.host_terminal_theme,
+            ),
+        })
+    }
+
+    /// The paint for the `│` at this ancestor level, or `None` when that
+    /// segment has nothing to play — no mount/dismount configured, or the
+    /// segment is not (yet) tracked by the engine — which a caller reads as
+    /// "draw the settled glyph."
+    fn cell(&self, level: u8) -> Option<crate::anim::cell::CellPaint> {
+        let frame = self.anim.frame(
+            &crate::anim::ElementId::trunk_segment(self.below.clone(), level),
+            None,
+        )?;
+        frame.behaviour?;
+        Some(frame.cell(
+            crate::anim::cell::CellPos::col(0),
+            crate::anim::cell::CellExtent::new(1, 1),
+            self.ink,
+        ))
+    }
+}
+
+/// One `│` cell of an ancestor's trunk rail, charge and all.
+///
+/// Mirrors [`connector_cell`] for the vertical rail rather than the branch:
+/// with no [`TrunkRailPaint`] — the ordinary case, nothing configured to
+/// animate row arrival — this returns the settled glyph unchanged, so the
+/// mechanism costs nothing when it is not asked to do anything.
+fn trunk_rail_cell(trunk: Option<&TrunkRailPaint<'_>>, level: u8, base: Style) -> (char, Style) {
+    const SETTLED: char = '│';
+    let Some(trunk) = trunk else {
+        return (SETTLED, base);
+    };
+    let Some(paint) = trunk.cell(level) else {
+        return (SETTLED, base);
+    };
+    (paint.glyph_over(SETTLED), paint.text_style(base, trunk.ink))
 }
 
 /// Emphasis on a row's state icon as a charge reaches it.
@@ -4022,6 +4163,11 @@ fn render_workspace_list(
             .map(|(pill, shell)| usize::from(shell.pill_reservation(&pill.label)))
             .unwrap_or(0);
         let content_y = card.content_y();
+        let trunk = TrunkRailPaint::new(
+            app,
+            Some(crate::anim::CardRow::Space(ws.id.clone())),
+            Style::default().fg(p.overlay0),
+        );
 
         if let Some(shell) = &card_shell {
             let mut connector = Vec::new();
@@ -4036,6 +4182,7 @@ fn render_workspace_list(
                     p,
                     top_charge.as_ref(),
                     true,
+                    trunk.as_ref(),
                 );
                 connector.append(&mut owned);
                 connector.push(connector_joint_span(p));
@@ -4048,6 +4195,7 @@ fn render_workspace_list(
                 own_ancestors,
                 CardRailSegment::AboveConnector,
                 p,
+                trunk.as_ref(),
             );
             let (below, _) = card_rail_prefix(
                 own_depth,
@@ -4055,6 +4203,7 @@ fn render_workspace_list(
                 own_ancestors,
                 CardRailSegment::BelowConnector,
                 p,
+                trunk.as_ref(),
             );
             render_card_border_rails(
                 frame,
@@ -4113,6 +4262,7 @@ fn render_workspace_list(
                             p,
                             row_charge.as_ref(),
                             true,
+                            trunk.as_ref(),
                         )
                     } else {
                         card_rail_prefix(
@@ -4121,6 +4271,7 @@ fn render_workspace_list(
                             own_ancestors,
                             CardRailSegment::BelowConnector,
                             p,
+                            trunk.as_ref(),
                         )
                     };
                     spans.append(&mut prefix);
@@ -4162,6 +4313,7 @@ fn render_workspace_list(
                             p,
                             row_charge.as_ref(),
                             false,
+                            trunk.as_ref(),
                         );
                         spans.append(&mut owned);
                         width
@@ -4413,6 +4565,60 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..20).map(|row| row_text(buffer, row, width)).collect()
+    }
+
+    /// A worker's own row owns the ancestor gap that is still open beneath
+    /// it, and nothing else in the tree does.
+    ///
+    /// Two second mates share one first mate, with a worker under the first
+    /// of them. The worker sits at depth 2, and the ancestor column at level
+    /// 1 — the first mate's own column, running past the first second mate —
+    /// is still open, because the second mate follows: exactly the gap
+    /// `agent_row_prefix` already draws a `│` for. Neither mate carries a
+    /// segment of its own: both sit at depth 1, and the loop `agent_row_prefix`
+    /// draws rails from starts at level 1, which for a depth-1 row is already
+    /// past its own depth.
+    #[test]
+    fn a_workers_own_row_owns_the_open_ancestor_gap_beneath_it() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut mate_a = Workspace::test_new("2ndmate-a");
+        let worker_pane = mate_a.test_split(ratatui::layout::Direction::Vertical);
+        let mate_b = Workspace::test_new("2ndmate-b");
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate_a, mate_b];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let now = std::time::Instant::now();
+        for idx in [1, 2] {
+            app.workspaces[idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("2ndmate-a".to_string()))]),
+            None,
+            now,
+        );
+
+        let members = sidebar_trunk_segment_members(&app);
+        assert_eq!(
+            members,
+            vec![(
+                crate::anim::ElementId::trunk_segment(crate::anim::CardRow::Agent(worker_pane), 1,),
+                crate::anim::behaviour::DriveInputs::default(),
+            )],
+        );
     }
 
     /// The same miniature fleet with **nothing hand-stamped on the worker**.
@@ -5433,6 +5639,7 @@ mod tests {
                             &p,
                             None,
                             meets_a_card,
+                            None,
                         );
                         assert_eq!(
                             drawn,
@@ -5460,7 +5667,7 @@ mod tests {
                 ] {
                     let ancestors = vec![true; depth as usize + 1];
                     let (_, drawn) =
-                        card_rail_prefix(depth, is_last_child, &ancestors, segment, &p);
+                        card_rail_prefix(depth, is_last_child, &ancestors, segment, &p, None);
                     assert_eq!(
                         drawn,
                         tree_prefix_width(depth, 0),
@@ -5480,7 +5687,7 @@ mod tests {
         let p = Palette::catppuccin();
         let ancestors = vec![true, true];
         let ink = |segment| {
-            let (spans, _) = card_rail_prefix(1, true, &ancestors, segment, &p);
+            let (spans, _) = card_rail_prefix(1, true, &ancestors, segment, &p, None);
             spans.iter().any(|span| span.content.contains('│'))
         };
         assert!(
@@ -5493,7 +5700,7 @@ mod tests {
         );
 
         let ink_middle = |segment| {
-            let (spans, _) = card_rail_prefix(1, false, &ancestors, segment, &p);
+            let (spans, _) = card_rail_prefix(1, false, &ancestors, segment, &p, None);
             spans.iter().any(|span| span.content.contains('│'))
         };
         assert!(ink_middle(CardRailSegment::AboveConnector));
@@ -8859,7 +9066,7 @@ mod ownership_is_drawn_as_written {
     /// prefix is measured with.
     fn connector_column(depth: u8, ancestors: &[bool]) -> u16 {
         let p = Palette::catppuccin();
-        let (spans, _) = agent_row_prefix(depth, false, ancestors, 0, &p, None, true);
+        let (spans, _) = agent_row_prefix(depth, false, ancestors, 0, &p, None, true, None);
         let mut column = 0u16;
         for span in &spans {
             for glyph in span.content.chars() {
@@ -8931,9 +9138,10 @@ mod ownership_is_drawn_as_written {
     fn a_branch_meets_the_card_it_points_at_and_keeps_its_gap_from_a_name() {
         let p = Palette::catppuccin();
         for is_last_child in [true, false] {
-            let (card, card_cols) = agent_row_prefix(1, is_last_child, &[false], 0, &p, None, true);
+            let (card, card_cols) =
+                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, true, None);
             let (line, line_cols) =
-                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, false);
+                agent_row_prefix(1, is_last_child, &[false], 0, &p, None, false, None);
             let text = |spans: &[Span<'static>]| -> String {
                 spans.iter().map(|span| span.content.to_string()).collect()
             };

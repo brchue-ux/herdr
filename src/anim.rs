@@ -113,9 +113,46 @@ pub(crate) enum ElementId {
     /// new one mounts. See [`Animator::admit`], which deliberately never
     /// restarts an element that is still there.
     CardWash(CardWash),
+    /// One gap between two adjacent tree rows, at one ancestor column.
+    ///
+    /// Before this existed the vertical `│` beside a row was a character
+    /// drawn fresh every frame with no identity behind it — a monolithic run
+    /// with no way to say "the third gap down this branch" rather than "this
+    /// column, generally." Keying a segment on the row that stands just above
+    /// its gap (see [`TrunkSegmentId::below`]) is what makes each gap
+    /// addressable on its own: a row's arrival and departure already have a
+    /// stable identity ([`Self::WorkspaceRow`]/[`Self::AgentRow`]), and the
+    /// segment immediately below it borrows that same identity rather than
+    /// inventing a second one keyed on position, which would drift the moment
+    /// a row above it arrived or left. Its own family, for the reason every
+    /// other bounded-event element here has one: reconciling `AgentRow` or
+    /// `WorkspaceRow` down to nothing must not retire a segment mid-retract.
+    ///
+    /// Scoped to the ancestor rail — the columns in
+    /// [`crate::ui::sidebar::WorkspaceListEntry::ancestors_continue`] a row
+    /// passes through on its way down from the root. The vertical rail below
+    /// a row's *own* connector, toward its next sibling, is not yet one of
+    /// these; it is still drawn as a plain glyph, and giving it a segment of
+    /// its own is a follow-up, not a gap in this one.
+    TrunkSegment(TrunkSegmentId),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
+}
+
+/// Which row a trunk segment's gap sits below, and at which ancestor column.
+///
+/// `below` is deliberately the identity of a *row*, not a coordinate: a
+/// segment's gap moves with the row it is attached to when rows above it
+/// arrive or leave, the same way [`CardRow`] already lets a card wash follow
+/// its row rather than a slot index that a reflow would shift out from under
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TrunkSegmentId {
+    pub(crate) below: CardRow,
+    /// Index into the row's own `ancestors_continue`, matching the ancestor
+    /// column this segment's `│` stands in.
+    pub(crate) level: u8,
 }
 
 /// One state change on one card: which card, and which way.
@@ -148,6 +185,7 @@ pub(crate) enum Family {
     TreeView,
     TrayBadge,
     CardWash,
+    TrunkSegment,
     Named,
 }
 
@@ -160,6 +198,7 @@ impl ElementId {
             Self::TreeView => Family::TreeView,
             Self::TrayBadge(_) => Family::TrayBadge,
             Self::CardWash(_) => Family::CardWash,
+            Self::TrunkSegment(_) => Family::TrunkSegment,
             Self::Named(_) => Family::Named,
         }
     }
@@ -170,6 +209,10 @@ impl ElementId {
 
     pub(crate) fn agent_row(pane_id: crate::layout::PaneId) -> Self {
         Self::AgentRow(pane_id)
+    }
+
+    pub(crate) fn trunk_segment(below: CardRow, level: u8) -> Self {
+        Self::TrunkSegment(TrunkSegmentId { below, level })
     }
 }
 
