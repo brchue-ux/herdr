@@ -429,6 +429,10 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // RenderEncoding::SemanticFrame
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientKeybindings::Server
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
+    payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.term_program: None
+    payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.term: None
+    payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.kitty_window_id_set: false
+    payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.is_local: false
 
     stream
         .write_all(&frame_message(&payload))

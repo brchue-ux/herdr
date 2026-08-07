@@ -307,14 +307,15 @@ pub(crate) fn local_transport_enabled() -> bool {
 /// throughput here rather than nothing, because a terminal's *worst* raw
 /// format can be slower than PNG (Rio's `f=24` is 2.9x slower than its
 /// `f=32`, measured — see the PR description).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostTerminalKind {
     Kitty,
     Rio,
+    #[default]
     Other,
 }
 
-fn host_terminal_kind_for_env(
+pub(crate) fn host_terminal_kind_for_env(
     term_program: Option<&str>,
     term: Option<&str>,
     kitty_window_id_set: bool,
@@ -348,7 +349,11 @@ pub(crate) fn host_terminal_kind() -> HostTerminalKind {
 /// standard SSH client env vars means this process is running inside a
 /// remote shell, so its stdout is reaching the real terminal over the
 /// network rather than sharing a filesystem with it.
-fn host_graphics_locality_for_env(ssh_tty: bool, ssh_connection: bool, ssh_client: bool) -> bool {
+pub(crate) fn host_graphics_locality_for_env(
+    ssh_tty: bool,
+    ssh_connection: bool,
+    ssh_client: bool,
+) -> bool {
     !(ssh_tty || ssh_connection || ssh_client)
 }
 
@@ -358,6 +363,30 @@ pub(crate) fn host_graphics_is_local() -> bool {
         std::env::var_os("SSH_CONNECTION").is_some(),
         std::env::var_os("SSH_CLIENT").is_some(),
     )
+}
+
+/// The host-capability probe run by a client at attach time, before it sends
+/// `ClientMessage::Hello`.
+///
+/// Reads the *client* process's own environment — which, unlike the split
+/// server's environment, is guaranteed to be the environment of the terminal
+/// this client is actually attached to — and packages it for the server to
+/// classify with [`host_terminal_kind_for_env`] / [`host_graphics_locality_for_env`].
+/// Sending the raw facts rather than a pre-classified [`HostTerminalKind`]
+/// keeps the classification rule itself in one place, exercised the same way
+/// for a client's own report and for the monolithic (`--no-session`) path's
+/// direct env read.
+pub(crate) fn host_terminal_report_from_env() -> crate::protocol::HostTerminalReport {
+    crate::protocol::HostTerminalReport {
+        term_program: std::env::var("TERM_PROGRAM").ok(),
+        term: std::env::var("TERM").ok(),
+        kitty_window_id_set: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        is_local: host_graphics_locality_for_env(
+            std::env::var_os("SSH_TTY").is_some(),
+            std::env::var_os("SSH_CONNECTION").is_some(),
+            std::env::var_os("SSH_CLIENT").is_some(),
+        ),
+    }
 }
 
 /// The raw pixel format `host_terminal_kind` is known to be fast at when fed
@@ -387,15 +416,19 @@ fn preferred_local_pixel_format(kind: HostTerminalKind) -> Option<KittyImageForm
 /// refuse or warn, it would silently clip every soft edge to hard opaque,
 /// which is a worse regression than staying on PNG. RGBA has no such
 /// caveat — it carries alpha same as PNG — so Rio's upgrade is unconditional.
+///
+/// `kind` and `is_local` come from `AppState::host_terminal_kind` /
+/// `AppState::host_graphics_is_local`, which are populated from the actually
+/// attached client's own host-capability probe (see
+/// `host_terminal_report_from_env` and `ClientConnection::host_terminal_kind`)
+/// — never from this process's own environment, which for the split server is
+/// not necessarily the attached terminal's.
 pub(crate) fn preferred_card_pixel_format(
     is_opaque: bool,
+    kind: HostTerminalKind,
+    is_local: bool,
 ) -> crate::api::schema::PaneGraphicsFormat {
-    preferred_card_pixel_format_for(
-        local_transport_enabled(),
-        host_graphics_is_local(),
-        host_terminal_kind(),
-        is_opaque,
-    )
+    preferred_card_pixel_format_for(local_transport_enabled(), is_local, kind, is_opaque)
 }
 
 fn preferred_card_pixel_format_for(

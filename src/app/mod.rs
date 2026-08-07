@@ -829,6 +829,18 @@ impl App {
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
+            // Monolithic mode *is* the terminal-attached process, so its own
+            // environment is the attached terminal's — probe it once here.
+            // The split server has no attached client yet at construction
+            // time; `sync_foreground_client_state` populates these from each
+            // client's own attach-time probe instead (see
+            // `crate::protocol::HostTerminalReport`).
+            host_terminal_kind: if no_session {
+                crate::kitty_graphics::host_terminal_kind()
+            } else {
+                crate::kitty_graphics::HostTerminalKind::default()
+            },
+            host_graphics_is_local: no_session && crate::kitty_graphics::host_graphics_is_local(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         };

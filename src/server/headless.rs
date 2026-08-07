@@ -1114,6 +1114,8 @@ impl HeadlessServer {
             self.effective_size = (MIN_COLS, MIN_ROWS);
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            self.app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::default();
+            self.app.state.host_graphics_is_local = false;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -1124,6 +1126,8 @@ impl HeadlessServer {
             self.effective_size = (MIN_COLS, MIN_ROWS);
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            self.app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::default();
+            self.app.state.host_graphics_is_local = false;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -1147,6 +1151,8 @@ impl HeadlessServer {
         let host_terminal_theme = client.host_terminal_theme;
         let host_terminal_appearance = client.host_terminal_appearance;
         let host_terminal_appearance_explicit = client.host_terminal_appearance_explicit;
+        let host_terminal_kind = client.host_terminal_kind;
+        let host_graphics_is_local = client.host_graphics_is_local;
         let uses_local_keybindings = client.keybindings.is_some();
         let keybindings = client
             .keybindings
@@ -1157,6 +1163,8 @@ impl HeadlessServer {
         self.effective_size = terminal_size;
         self.app.state.outer_terminal_focus = outer_terminal_focus;
         self.app.state.host_cell_size = host_cell_size;
+        self.app.state.host_terminal_kind = host_terminal_kind;
+        self.app.state.host_graphics_is_local = host_graphics_is_local;
         apply_keybindings(&mut self.app, &keybindings);
         self.sync_visible_server_config_diagnostic(uses_local_keybindings);
         if outer_terminal_focus == Some(true) {
@@ -2837,6 +2845,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                host_terminal,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2880,6 +2889,9 @@ impl HeadlessServer {
                         Some(writer),
                     ),
                 );
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.set_host_terminal(&host_terminal);
+                }
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
                 }
@@ -5588,6 +5600,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
         assert_eq!(
@@ -5612,6 +5625,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -5626,6 +5640,73 @@ new_tab = "prefix+t"
             .bindings
             .iter()
             .any(|binding| binding.label == "prefix+c"));
+    }
+
+    #[test]
+    fn client_hello_host_terminal_report_is_classified_and_synced_to_foreground_state() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport {
+                term_program: Some("rio".to_owned()),
+                term: None,
+                kitty_window_id_set: false,
+                is_local: true,
+            },
+            writer,
+        }));
+
+        let client = server.clients.get(&1).expect("client connected");
+        assert_eq!(
+            client.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Rio
+        );
+        assert!(client.host_graphics_is_local);
+        // Foreground sync copies the connected client's own probe onto
+        // AppState, not the server process's environment.
+        assert_eq!(
+            server.app.state.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Rio
+        );
+        assert!(server.app.state.host_graphics_is_local);
+    }
+
+    #[test]
+    fn client_hello_host_terminal_report_defaults_unrecognized_terminal_to_other() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport {
+                term_program: Some("some-unheard-of-terminal".to_owned()),
+                term: Some("xterm-256color".to_owned()),
+                kitty_window_id_set: false,
+                is_local: true,
+            },
+            writer,
+        }));
+
+        assert_eq!(
+            server.app.state.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Other
+        );
     }
 
     #[test]
@@ -5652,6 +5733,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -5665,6 +5747,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -5708,6 +5791,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5783,6 +5867,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -5803,6 +5888,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -5837,6 +5923,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -5902,6 +5989,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         control_rx
@@ -6315,6 +6403,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
 
@@ -6349,6 +6438,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
 
@@ -6382,6 +6472,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         assert!(server.has_app_client());
@@ -6484,6 +6575,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         assert!(
@@ -8668,6 +8760,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
         assert!(

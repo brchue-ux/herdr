@@ -291,6 +291,9 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        /// This client's own attach-time host-capability probe. See
+        /// `crate::protocol::HostTerminalReport`.
+        host_terminal: crate::protocol::HostTerminalReport,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -515,6 +518,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        host_terminal,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -525,6 +529,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            host_terminal,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -564,6 +569,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
+                host_terminal,
             )
         }
         _ => {
@@ -618,6 +624,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        host_terminal,
         writer,
     });
 
@@ -1171,6 +1178,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                host_terminal: protocol::HostTerminalReport::default(),
             },
         )
         .expect("write hello");
@@ -1203,6 +1211,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                host_terminal: _,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1246,6 +1255,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                host_terminal: protocol::HostTerminalReport::default(),
             },
         )
         .expect("write hello");

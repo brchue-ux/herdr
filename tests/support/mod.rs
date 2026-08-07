@@ -15,7 +15,7 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 19;
+pub const CURRENT_PROTOCOL: u32 = 20;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -241,6 +241,10 @@ pub fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+            &encode_varint_u32(0),  // HostTerminalReport.term_program: None
+            &encode_varint_u32(0),  // HostTerminalReport.term: None
+            &encode_varint_u32(0),  // HostTerminalReport.kitty_window_id_set: false
+            &encode_varint_u32(0),  // HostTerminalReport.is_local: false
         ],
     );
     let framed = frame_message(&hello_payload);

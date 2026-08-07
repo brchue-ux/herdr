@@ -53,6 +53,12 @@ pub(crate) struct ClientConnection {
     pub(crate) host_terminal_appearance_explicit: bool,
     /// Last reported focus state for this client's outer terminal.
     pub(crate) outer_terminal_focus: Option<bool>,
+    /// This client's own host terminal, classified from its attach-time
+    /// host-capability probe. See `crate::protocol::HostTerminalReport`.
+    pub(crate) host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    /// Whether this client positively established that it shares a
+    /// filesystem with its terminal.
+    pub(crate) host_graphics_is_local: bool,
     /// Stateful parser for app-client input split across transport reads.
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
@@ -131,6 +137,8 @@ impl ClientConnection {
             host_terminal_appearance_explicit: false,
             host_terminal_theme,
             outer_terminal_focus,
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
+            host_graphics_is_local: false,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
@@ -169,6 +177,30 @@ impl ClientConnection {
     /// cannot forget it.
     pub(crate) fn set_cell_size(&mut self, cell_size: crate::kitty_graphics::HostCellSize) {
         self.cell_size = cell_size.plausible_or_unknown();
+    }
+
+    /// Classifies and records this client's attach-time host-capability
+    /// probe (`crate::protocol::HostTerminalReport`).
+    ///
+    /// Classification lives in `crate::kitty_graphics::host_terminal_kind_for_env`
+    /// / `host_graphics_locality_for_env` — the same pure rule the monolithic
+    /// (`--no-session`) path applies to its own process environment — so a
+    /// client's reported facts and a live env read are judged identically.
+    pub(crate) fn set_host_terminal(&mut self, report: &crate::protocol::HostTerminalReport) {
+        self.host_terminal_kind = crate::kitty_graphics::host_terminal_kind_for_env(
+            report.term_program.as_deref(),
+            report.term.as_deref(),
+            report.kitty_window_id_set,
+        );
+        self.host_graphics_is_local = report.is_local;
+        tracing::info!(
+            term_program = ?report.term_program,
+            term = ?report.term,
+            kitty_window_id_set = report.kitty_window_id_set,
+            is_local = report.is_local,
+            classified_kind = ?self.host_terminal_kind,
+            "client host-capability probe classified"
+        );
     }
 
     pub(crate) fn deferred_render(&self) -> DeferredRender {
