@@ -128,12 +128,17 @@ pub(crate) enum ElementId {
     /// other bounded-event element here has one: reconciling `AgentRow` or
     /// `WorkspaceRow` down to nothing must not retire a segment mid-retract.
     ///
-    /// Scoped to the ancestor rail — the columns in
+    /// Covers both rails a row can carry: the ancestor columns in
     /// [`crate::ui::sidebar::WorkspaceListEntry::ancestors_continue`] a row
-    /// passes through on its way down from the root. The vertical rail below
-    /// a row's *own* connector, toward its next sibling, is not yet one of
-    /// these; it is still drawn as a plain glyph, and giving it a segment of
-    /// its own is a follow-up, not a gap in this one.
+    /// passes through on its way down from the root, and the row's *own* rail
+    /// running on toward its next sibling — see [`TrunkSegmentId::level`] for
+    /// how one index space holds both.
+    ///
+    /// One thing here is still a plain glyph on purpose: the own-level rail on
+    /// a card's rows *above* its connector. That run is the parent's line
+    /// arriving at this child rather than anything this row owns, so animating
+    /// it from this row's identity would play a child's arrival on its
+    /// parent's reach.
     TrunkSegment(TrunkSegmentId),
     /// One command-acknowledgement marker on one card: a glyph that snaps in,
     /// holds, and fades — the sidebar's answer to "a shell command ran".
@@ -177,8 +182,13 @@ pub(crate) enum ElementId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TrunkSegmentId {
     pub(crate) below: CardRow,
-    /// Index into the row's own `ancestors_continue`, matching the ancestor
-    /// column this segment's `│` stands in.
+    /// Which column of this row's prefix the segment's `│` stands in.
+    ///
+    /// `1..depth` indexes the row's own `ancestors_continue`, matching the
+    /// ancestor column the glyph stands in. `depth` itself — one past the last
+    /// ancestor, and so the one index no ancestor of this row can ever claim —
+    /// is the row's *own* column, the one its connector stands in, whose rail
+    /// runs on toward its next sibling.
     pub(crate) level: u8,
 }
 

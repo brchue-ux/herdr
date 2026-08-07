@@ -1498,6 +1498,13 @@ mod tests {
     /// Unpublishing `2ndmate-right`'s owner closes that gap without touching
     /// either worker's own row at all, which is the case this test exists to
     /// pin: a segment's life is not a side effect of its row's.
+    ///
+    /// Two more segments are published beside those, and they are the *own*
+    /// rails rather than ancestor ones: `2ndmate-left` runs on to
+    /// `2ndmate-right`, and `left-worker-1` runs on to `left-worker-2`. This
+    /// test is about an ancestor gap specifically, so it picks its segment by
+    /// identity rather than by position in the list — an own rail would close
+    /// for a different reason and prove something else.
     #[test]
     fn a_trunk_segment_mounts_settles_and_retracts_on_its_own_clock() {
         let (mut app, _left_second, _right_only) = fleet_app("wipe");
@@ -1508,11 +1515,28 @@ mod tests {
         let members = crate::ui::sidebar_trunk_segment_members(&app.state);
         assert_eq!(
             members.len(),
-            2,
+            4,
             "both of 2ndmate-left's worker rows pass the still-open column \
-             beside 2ndmate-right: {members:?}"
+             beside 2ndmate-right, and 2ndmate-left and left-worker-1 each \
+             carry their own rail on to a sibling: {members:?}"
         );
-        let segment_id = members[0].0.clone();
+        // The worker rows' *ancestor* segment, at level 1: a worker sits at
+        // depth 2, so level 1 is the first mate's column running past
+        // 2ndmate-left, while a worker's own rail would be published at level
+        // 2. Picked by identity because that distinction is the whole point.
+        let segment_id = members
+            .iter()
+            .map(|(id, _)| id)
+            .find(|id| {
+                matches!(
+                    id,
+                    crate::anim::ElementId::TrunkSegment(segment)
+                        if matches!(segment.below, crate::anim::CardRow::Agent(_))
+                            && segment.level == 1
+                )
+            })
+            .expect("a worker row carries the open ancestor column beside it")
+            .clone();
 
         assert!(app.handle_scheduled_tasks(now, false));
         assert_eq!(

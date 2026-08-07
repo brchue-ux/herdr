@@ -1,4 +1,5 @@
 mod card;
+pub(crate) mod carrier;
 pub(crate) mod image_card;
 pub(crate) mod motion;
 mod notifications;
@@ -594,15 +595,32 @@ pub(crate) fn sidebar_trunk_segment_members(
         .flat_map(|(row, entry)| {
             let depth = crate::app::agent_tree::display_depth(entry.depth());
             let ancestors = entry.ancestors_continue().to_vec();
-            (1..depth).filter_map(move |level| {
-                let open = ancestors.get(level as usize).copied().unwrap_or(false);
-                open.then(|| {
-                    (
-                        crate::anim::ElementId::trunk_segment(row.clone(), level),
-                        crate::anim::behaviour::DriveInputs::default(),
-                    )
+            // The row's own sibling rail, at `level == depth`. Deliberately one
+            // past the ancestor columns rather than a second id shape: the
+            // ancestor levels published below are `1..depth`, so `depth` itself
+            // is the one index in this row's own namespace that no ancestor can
+            // ever claim, and the column it names is the row's own — the column
+            // its connector stands in. Open under exactly the condition
+            // `card_rail_prefix`'s `branch` and `agent_row_prefix`'s
+            // continuation row draw a glyph there: something follows this row
+            // at its own level.
+            let own = (!entry.is_last_child() && depth > 0).then(|| {
+                (
+                    crate::anim::ElementId::trunk_segment(row.clone(), depth),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            });
+            (1..depth)
+                .filter_map(move |level| {
+                    let open = ancestors.get(level as usize).copied().unwrap_or(false);
+                    open.then(|| {
+                        (
+                            crate::anim::ElementId::trunk_segment(row.clone(), level),
+                            crate::anim::behaviour::DriveInputs::default(),
+                        )
+                    })
                 })
-            })
+                .chain(own)
         })
         .collect()
 }
@@ -3410,7 +3428,12 @@ fn agent_row_prefix(
         if is_last_child {
             spans.push(Span::raw("   "));
         } else {
-            spans.push(Span::styled("│", line_style));
+            // The row's own rail, running on toward its next sibling — its own
+            // segment at `level == depth`, not a bare glyph. See
+            // [`sidebar_trunk_segment_members`] for why that level is the row's
+            // own and cannot collide with an ancestor's.
+            let (glyph, style) = trunk_rail_cell(trunk, depth, line_style);
+            spans.push(Span::styled(glyph.to_string(), style));
             spans.push(Span::raw("  "));
         }
         spans.push(Span::raw("  "));
@@ -3462,19 +3485,31 @@ fn card_rail_prefix(
         CardRailSegment::AboveConnector => true,
         CardRailSegment::BelowConnector => !is_last_child,
     };
-    let branch = |spans: &mut Vec<Span<'static>>| {
-        if own_level_continues {
-            spans.push(Span::styled("│", line_style));
-            spans.push(Span::raw("  "));
-        } else {
-            spans.push(Span::raw("   "));
-        }
-    };
 
     let depth = crate::app::agent_tree::display_depth(depth);
     if depth == 0 {
         return (vec![Span::raw(" ")], 1);
     }
+
+    let branch = |spans: &mut Vec<Span<'static>>| {
+        if !own_level_continues {
+            spans.push(Span::raw("   "));
+            return;
+        }
+        // Only *below* the connector is this the row's own rail. Above it the
+        // line belongs to the parent — it is the parent's reach arriving at
+        // this child, and the segment addressing for that gap is the previous
+        // row's, not this one's. Animating it from this row's id would make one
+        // ancestor's line play a child's arrival, so it stays the plain glyph
+        // it has always been; giving the above-connector run its own identity
+        // is a separate question from the one this level answers.
+        let glyph_style = match segment {
+            CardRailSegment::AboveConnector => ('│', line_style),
+            CardRailSegment::BelowConnector => trunk_rail_cell(trunk, depth, line_style),
+        };
+        spans.push(Span::styled(glyph_style.0.to_string(), glyph_style.1));
+        spans.push(Span::raw("  "));
+    };
 
     let mut spans = vec![Span::raw(" ")];
     for level in 1..depth {
@@ -3687,12 +3722,12 @@ fn connector_cell(
     )
 }
 
-/// One row's trunk-rail paint, resolved once and asked about per ancestor
-/// level.
+/// One row's trunk-rail paint, resolved once and asked about per rail level.
 ///
 /// The vertical-line counterpart of [`ConnectorCharge`]: where a charge
 /// travels the three cells of one row's own branch, this reaches the `│`
-/// cells beside it that belong to an *ancestor's* line — each ancestor column
+/// cells beside and below it — an *ancestor's* line, or at `level == depth`
+/// this row's own rail running on to its next sibling. Each such column
 /// is its own [`crate::anim::ElementId::TrunkSegment`], addressed by
 /// [`entry_card_row`], so a level that has nothing configured for it is left
 /// exactly as it always drew.
@@ -3920,50 +3955,19 @@ fn failure_spider_waypoints(
 
 /// Where the spider sits on its climb, at `t` in `0.0..=1.0`: `0.0` is just
 /// setting out from below the row, `1.0` is arrived and resting at the top
-/// centre border. Each leg gets a share of `t` proportional to its own length
-/// in cells, so a tall card's climb up its own border is not rushed relative
-/// to the jog to centre a short one gets.
+/// centre border.
+///
+/// The walk itself is [`carrier::CarrierPath`], not this function's own: the
+/// arc-length parameterisation that keeps a tall card's climb up its own border
+/// from being rushed relative to a short one's jog to centre is the same
+/// machinery any travelling marker on the tree wants, and the next one is
+/// already named. This supplies the route; the path supplies the motion along
+/// it.
 fn failure_spider_position(
     card: &crate::app::state::WorkspaceCardArea,
     t: f32,
 ) -> Option<(u16, u16)> {
-    let waypoints = failure_spider_waypoints(card)?;
-    let t = t.clamp(0.0, 1.0);
-    let legs: Vec<f32> = waypoints
-        .windows(2)
-        .map(|pair| {
-            let (x0, y0) = pair[0];
-            let (x1, y1) = pair[1];
-            f32::from(x0.abs_diff(x1)) + f32::from(y0.abs_diff(y1))
-        })
-        .collect();
-    let total: f32 = legs.iter().sum();
-    if total <= 0.0 {
-        let (x, y) = waypoints[waypoints.len() - 1];
-        return Some((x, y));
-    }
-    let mut travelled = t * total;
-    for (i, &len) in legs.iter().enumerate() {
-        if travelled <= len || i == legs.len() - 1 {
-            let leg_t = if len > 0.0 {
-                (travelled / len).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            let (x0, y0) = waypoints[i];
-            let (x1, y1) = waypoints[i + 1];
-            return Some((lerp_u16(x0, x1, leg_t), lerp_u16(y0, y1, leg_t)));
-        }
-        travelled -= len;
-    }
-    let (x, y) = waypoints[waypoints.len() - 1];
-    Some((x, y))
-}
-
-fn lerp_u16(a: u16, b: u16, t: f32) -> u16 {
-    let a = f32::from(a);
-    let b = f32::from(b);
-    (a + (b - a) * t).round().max(0.0) as u16
+    Some(carrier::CarrierPath::new(failure_spider_waypoints(card)?)?.position(t))
 }
 
 #[cfg(test)]
@@ -4999,17 +5003,25 @@ mod tests {
         (0..20).map(|row| row_text(buffer, row, width)).collect()
     }
 
-    /// A worker's own row owns the ancestor gap that is still open beneath
-    /// it, and nothing else in the tree does.
+    /// Every rail on screen is owned by exactly one row, and the two kinds of
+    /// rail live in one index space without colliding.
     ///
     /// Two second mates share one first mate, with a worker under the first
-    /// of them. The worker sits at depth 2, and the ancestor column at level
-    /// 1 — the first mate's own column, running past the first second mate —
-    /// is still open, because the second mate follows: exactly the gap
-    /// `agent_row_prefix` already draws a `│` for. Neither mate carries a
-    /// segment of its own: both sit at depth 1, and the loop `agent_row_prefix`
-    /// draws rails from starts at level 1, which for a depth-1 row is already
-    /// past its own depth.
+    /// of them. Two rails are open, and they are different kinds:
+    ///
+    /// - The worker sits at depth 2, and the *ancestor* column at level 1 —
+    ///   the first mate's own column, running past the first second mate — is
+    ///   still open, because the second mate follows.
+    /// - The first second mate sits at depth 1 and is not the last child, so
+    ///   its *own* rail runs on to its sibling: its own column, published at
+    ///   `level == depth == 1`.
+    ///
+    /// That both land on level 1 for different rows is the point: a level is
+    /// only ever read against the row that owns it, so one row's own column
+    /// and another row's ancestor column are two elements, not one.
+    ///
+    /// The last second mate carries neither: nothing follows it at its level,
+    /// and it has no open ancestor column of its own.
     #[test]
     fn a_workers_own_row_owns_the_open_ancestor_gap_beneath_it() {
         let mut app = crate::app::state::AppState::test_new();
@@ -5043,13 +5055,26 @@ mod tests {
             now,
         );
 
+        let mate_a_id = app.workspaces[1].id.clone();
         let members = sidebar_trunk_segment_members(&app);
         assert_eq!(
             members,
-            vec![(
-                crate::anim::ElementId::trunk_segment(crate::anim::CardRow::Agent(worker_pane), 1,),
-                crate::anim::behaviour::DriveInputs::default(),
-            )],
+            vec![
+                (
+                    crate::anim::ElementId::trunk_segment(
+                        crate::anim::CardRow::Space(mate_a_id),
+                        1,
+                    ),
+                    crate::anim::behaviour::DriveInputs::default(),
+                ),
+                (
+                    crate::anim::ElementId::trunk_segment(
+                        crate::anim::CardRow::Agent(worker_pane),
+                        1,
+                    ),
+                    crate::anim::behaviour::DriveInputs::default(),
+                ),
+            ],
         );
     }
 
