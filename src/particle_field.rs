@@ -26,6 +26,16 @@
 //! report's figure. Rung 2 stays affordable either way (an order of magnitude under the
 //! full-resolution-with-glow ceiling), but sizing decisions on top of this generator should use
 //! 1122 KB/s, not 328 KB/s, until indexed-PNG output exists.
+//!
+//! Every per-pixel and per-particle pass in [`Field::frame`] (zero, splat, bloom, tonemap) runs
+//! across up to [`FIELD_MAX_THREADS`] row bands via `std::thread::scope`, following the same
+//! fleet-friendly cap `src/ui/sidebar/image_card.rs` already uses for card rasterisation.
+//! Measured on this module at the captain's confirmed 1440p target (`cargo test --release --bin
+//! herdr particle_field::tests::bench_1440p -- --ignored --nocapture`, 12-core box, Rung 2):
+//! **94.2 ms/frame single-threaded to 28.6 ms/frame threaded — 3.3x, 10.6 fps to 35.0 fps**,
+//! consistent with the feasibility report's own ~32 fps CPU-thread ceiling at 1440p
+//! (`data/herdr-terminal-field-and-gpu/report.md`, `cpubench.rs`). Frame bytes are identical
+//! regardless of thread count — see `frame_is_identical_across_thread_counts` and its siblings.
 
 use std::f32::consts::PI;
 
@@ -33,6 +43,44 @@ const MAX_SPLAT_RADIUS: i32 = 7;
 
 /// Background floor colour measured from the reference field (deep plum, not black).
 const BG_FLOOR: (f32, f32, f32) = (20.0 / 255.0, 19.0 / 255.0, 32.0 / 255.0);
+
+/// Cap on how many row bands a single frame's phases will split across.
+///
+/// Mirrors [`crate::ui::sidebar::image_card`]'s `CARD_RASTER_MAX_THREADS`: this process hosts a
+/// fleet of agent panes, so a frame's generation must not be free to take the whole machine even
+/// when it is the bottleneck. Six threads already captured most of the measured speedup on a
+/// 12-core box in the feasibility report (`cpubench.rs`: six threads beat twelve at both 4K and
+/// 1440p because per-thread contention past six ate the rest of the win).
+const FIELD_MAX_THREADS: usize = 6;
+
+/// How many row bands to split a `rows`-tall phase across.
+///
+/// Bounded three ways, tightest wins: never more bands than rows, never more than
+/// [`FIELD_MAX_THREADS`], and never more than half the machine's parallelism — the other half is
+/// the fleet this process is hosting. A machine reporting fewer than four ways of parallelism, or
+/// a phase with fewer than two rows, runs on the calling thread with no scope at all.
+fn field_threads(rows: usize) -> usize {
+    #[cfg(test)]
+    {
+        let forced = FIELD_THREADS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
+        if forced > 0 {
+            return rows.min(forced).max(1);
+        }
+    }
+    if rows < 2 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    rows.min(FIELD_MAX_THREADS).min((cores / 2).max(1))
+}
+
+/// Pin the thread count for a test that needs to compare two of them. Zero means "use the real
+/// bound".
+#[cfg(test)]
+static FIELD_THREADS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Fidelity configuration for one field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +133,15 @@ pub struct Field {
     pz: Vec<f32>,
     pb: Vec<f32>,
     pt: Vec<f32>,
+    /// Per-particle screen-space transform, recomputed once per frame in [`Field::transform`]
+    /// and then read by every splat band — so the trig and perspective divide happen once
+    /// instead of once per band.
+    sx: Vec<f32>,
+    sy: Vec<f32>,
+    sr: Vec<i32>,
+    scr: Vec<f32>,
+    scg: Vec<f32>,
+    scb: Vec<f32>,
 }
 
 impl Field {
@@ -151,6 +208,7 @@ impl Field {
             pt.push(temp);
         }
 
+        let n = px.len();
         Field {
             w,
             h,
@@ -161,122 +219,35 @@ impl Field {
             pz,
             pb,
             pt,
+            sx: vec![0.0; n],
+            sy: vec![0.0; n],
+            sr: vec![0; n],
+            scr: vec![0.0; n],
+            scg: vec![0.0; n],
+            scb: vec![0.0; n],
         }
     }
 
-    #[inline]
-    fn splat(&mut self, cx: f32, cy: f32, r: i32, cr: f32, cg: f32, cb: f32) {
-        let ix = cx.floor() as i32;
-        let iy = cy.floor() as i32;
-        let (w, h) = (self.w as i32, self.h as i32);
-        if ix < r || iy < r || ix >= w - r || iy >= h - r {
+    /// Zero the accumulator across up to [`FIELD_MAX_THREADS`] row bands.
+    fn zero_acc(&mut self) {
+        let w = self.w;
+        let threads = field_threads(self.h);
+        if threads <= 1 {
+            self.acc.iter_mut().for_each(|v| *v = 0.0);
             return;
         }
-        let k = 2 * r + 1;
-        for dy in -r..=r {
-            let row = ((iy + dy) as usize) * self.w;
-            let ko = ((dy + r) * k) as usize;
-            for dx in -r..=r {
-                let kv = self.kernels[r as usize][ko + (dx + r) as usize];
-                let o = (row + (ix + dx) as usize) * 3;
-                self.acc[o] += cr * kv;
-                self.acc[o + 1] += cg * kv;
-                self.acc[o + 2] += cb * kv;
+        let band_rows = self.h.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for band in self.acc.chunks_mut(band_rows * w * 3) {
+                scope.spawn(move || band.iter_mut().for_each(|v| *v = 0.0));
             }
-        }
+        });
     }
 
-    fn bloom(&mut self, div: usize) {
-        let d = div;
-        let (bw, bh) = (self.w / d, self.h / d);
-        if bw < 8 || bh < 8 {
-            return;
-        }
-        let mut lo = vec![0.0f32; bw * bh * 3];
-        for y in 0..bh {
-            for x in 0..bw {
-                let o = (y * bw + x) * 3;
-                let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
-                for sy in 0..d {
-                    for sx in 0..d {
-                        let so = ((y * d + sy) * self.w + (x * d + sx)) * 3;
-                        r += self.acc[so];
-                        g += self.acc[so + 1];
-                        b += self.acc[so + 2];
-                    }
-                }
-                let inv = 1.0 / (d * d) as f32;
-                // Only bright cores bloom (threshold), like a real glare filter.
-                let l = (r + g + b) * inv / 3.0;
-                let kf = ((l - 0.16).max(0.0) * 2.2).min(3.0);
-                lo[o] = r * inv * kf;
-                lo[o + 1] = g * inv * kf;
-                lo[o + 2] = b * inv * kf;
-            }
-        }
-        let mut buf = vec![0.0f32; bw * bh * 3];
-        let rad = 5i32;
-        for _ in 0..3 {
-            for y in 0..bh {
-                for x in 0..bw {
-                    let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
-                    for dx in -rad..=rad {
-                        let xx = x as i32 + dx;
-                        if xx < 0 || xx >= bw as i32 {
-                            continue;
-                        }
-                        let o = (y * bw + xx as usize) * 3;
-                        r += lo[o];
-                        g += lo[o + 1];
-                        b += lo[o + 2];
-                        n += 1.0;
-                    }
-                    let o = (y * bw + x) * 3;
-                    buf[o] = r / n;
-                    buf[o + 1] = g / n;
-                    buf[o + 2] = b / n;
-                }
-            }
-            for y in 0..bh {
-                for x in 0..bw {
-                    let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
-                    for dy in -rad..=rad {
-                        let yy = y as i32 + dy;
-                        if yy < 0 || yy >= bh as i32 {
-                            continue;
-                        }
-                        let o = (yy as usize * bw + x) * 3;
-                        r += buf[o];
-                        g += buf[o + 1];
-                        b += buf[o + 2];
-                        n += 1.0;
-                    }
-                    let o = (y * bw + x) * 3;
-                    lo[o] = r / n;
-                    lo[o + 1] = g / n;
-                    lo[o + 2] = b / n;
-                }
-            }
-        }
-        for y in 0..self.h {
-            let sy = (y / d).min(bh - 1);
-            for x in 0..self.w {
-                let sx = (x / d).min(bw - 1);
-                let so = (sy * bw + sx) * 3;
-                let o = (y * self.w + x) * 3;
-                self.acc[o] += lo[so] * 0.55;
-                self.acc[o + 1] += lo[so + 1] * 0.55;
-                self.acc[o + 2] += lo[so + 2] * 0.55;
-            }
-        }
-    }
-
-    /// Render one frame at the given rotation phase. `out` is resized to `w * h * 4` RGBA8.
-    pub fn frame(&mut self, cfg: &Cfg, phase: f32, out: &mut Vec<u8>) {
-        for v in self.acc.iter_mut() {
-            *v = 0.0;
-        }
-
+    /// Compute each particle's screen-space position, splat radius and colour for this frame's
+    /// `phase`, once, ahead of splatting. Cheap relative to the splat and per-pixel passes at
+    /// Rung 2's particle count, so it stays on the calling thread.
+    fn transform(&mut self, cfg: &Cfg, phase: f32) {
         let (w, h) = (self.w as f32, self.h as f32);
         let scale = h * 0.30;
         let (ox, oy) = (w * 0.52, h * 0.50);
@@ -309,30 +280,381 @@ impl Field {
             };
             let b = self.pb[i] * (0.22 + 0.95 * depth) * persp * 14.0;
             let t = self.pt[i] * (0.45 + 0.55 * depth);
-            let cr = b * (0.72 + 0.28 * t);
-            let cg = b * (0.30 + 0.52 * t);
-            let cb = b * (0.11 + 0.36 * t);
-            self.splat(sx, sy, r, cr, cg, cb);
+            self.sx[i] = sx;
+            self.sy[i] = sy;
+            self.sr[i] = r;
+            self.scr[i] = b * (0.72 + 0.28 * t);
+            self.scg[i] = b * (0.30 + 0.52 * t);
+            self.scb[i] = b * (0.11 + 0.36 * t);
         }
+    }
+
+    /// Splat every particle, transformed by [`Field::transform`], into [`Self::acc`] across up
+    /// to [`FIELD_MAX_THREADS`] disjoint row bands.
+    ///
+    /// **Determinism.** Each band owns a disjoint slice of rows and walks the full particle list
+    /// in the same index order a single thread would, skipping only the rows outside its own
+    /// slice — so the accumulated value at any pixel is the same sum in the same order no matter
+    /// how many threads did the work, including one.
+    fn splat_parallel(&mut self) {
+        let w = self.w;
+        let h = self.h;
+        let full_h = h as i32;
+        let threads = field_threads(h);
+
+        let Field {
+            acc,
+            kernels,
+            sx,
+            sy,
+            sr,
+            scr,
+            scg,
+            scb,
+            ..
+        } = self;
+        let kernels: &[Vec<f32>] = kernels;
+        let sx: &[f32] = sx;
+        let sy: &[f32] = sy;
+        let sr: &[i32] = sr;
+        let scr: &[f32] = scr;
+        let scg: &[f32] = scg;
+        let scb: &[f32] = scb;
+
+        if threads <= 1 {
+            splat_band(acc, w, 0, h, full_h, kernels, sx, sy, sr, scr, scg, scb);
+            return;
+        }
+
+        let band_rows = h.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let mut row0 = 0usize;
+            for band in acc.chunks_mut(band_rows * w * 3) {
+                let rows = band.len() / (w * 3);
+                let this_row0 = row0;
+                scope.spawn(move || {
+                    splat_band(
+                        band, w, this_row0, rows, full_h, kernels, sx, sy, sr, scr, scg, scb,
+                    );
+                });
+                row0 += rows;
+            }
+        });
+    }
+
+    fn downsample_bloom(&self, d: usize, bw: usize, bh: usize, lo: &mut [f32]) {
+        let acc = &self.acc;
+        let w = self.w;
+        let threads = field_threads(bh);
+        if threads <= 1 {
+            downsample_band(acc, w, d, bw, 0, bh, lo);
+            return;
+        }
+        let band_rows = bh.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let mut y0 = 0usize;
+            for band in lo.chunks_mut(band_rows * bw * 3) {
+                let rows = band.len() / (bw * 3);
+                let this_y0 = y0;
+                scope.spawn(move || downsample_band(acc, w, d, bw, this_y0, rows, band));
+                y0 += rows;
+            }
+        });
+    }
+
+    fn upsample_add(&mut self, d: usize, bw: usize, bh: usize, lo: &[f32]) {
+        let w = self.w;
+        let h = self.h;
+        let threads = field_threads(h);
+        if threads <= 1 {
+            upsample_band(&mut self.acc, w, d, bw, bh, 0, h, lo);
+            return;
+        }
+        let band_rows = h.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let mut y0 = 0usize;
+            for band in self.acc.chunks_mut(band_rows * w * 3) {
+                let rows = band.len() / (w * 3);
+                let this_y0 = y0;
+                scope.spawn(move || upsample_band(band, w, d, bw, bh, this_y0, rows, lo));
+                y0 += rows;
+            }
+        });
+    }
+
+    fn bloom(&mut self, div: usize) {
+        let d = div;
+        let (bw, bh) = (self.w / d, self.h / d);
+        if bw < 8 || bh < 8 {
+            return;
+        }
+        let mut lo = vec![0.0f32; bw * bh * 3];
+        self.downsample_bloom(d, bw, bh, &mut lo);
+        let mut buf = vec![0.0f32; bw * bh * 3];
+        let rad = 5i32;
+        for _ in 0..3 {
+            blur_pass(&lo, &mut buf, bw, bh, rad, Axis::Horizontal);
+            blur_pass(&buf, &mut lo, bw, bh, rad, Axis::Vertical);
+        }
+        self.upsample_add(d, bw, bh, &lo);
+    }
+
+    /// Render one frame at the given rotation phase. `out` is resized to `w * h * 4` RGBA8.
+    ///
+    /// Each phase below (zero, transform, splat, bloom, tonemap) runs to completion before the
+    /// next starts, so within a frame there is only ever one phase's threads touching `self` at
+    /// a time — sequenced parallelism, not concurrent access to shared state.
+    pub fn frame(&mut self, cfg: &Cfg, phase: f32, out: &mut Vec<u8>) {
+        self.zero_acc();
+        self.transform(cfg, phase);
+        self.splat_parallel();
 
         if cfg.bloom {
             self.bloom(4);
         }
 
+        self.tonemap(out);
+    }
+
+    fn tonemap(&self, out: &mut Vec<u8>) {
         out.clear();
         out.resize(self.w * self.h * 4, 255);
-        let (fr, fg, fb) = BG_FLOOR;
-        for i in 0..self.w * self.h {
-            let o = i * 3;
-            let tm = |v: f32, floor: f32| -> u8 {
-                let t = v / (1.0 + v * 0.92); // Reinhard, gentle shoulder
-                let q = ((t.powf(0.90) + floor) * 255.0) as i32;
-                q.clamp(0, 255) as u8
-            };
-            let d = i * 4;
-            out[d] = tm(self.acc[o], fr);
-            out[d + 1] = tm(self.acc[o + 1], fg);
-            out[d + 2] = tm(self.acc[o + 2], fb);
+        let acc = &self.acc;
+        let w = self.w;
+        let threads = field_threads(self.h);
+        if threads <= 1 {
+            tonemap_band(acc, w, 0, self.h, out);
+            return;
+        }
+        let band_rows = self.h.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let mut y0 = 0usize;
+            for band in out.chunks_mut(band_rows * w * 4) {
+                let rows = band.len() / (w * 4);
+                let this_y0 = y0;
+                scope.spawn(move || tonemap_band(acc, w, this_y0, rows, band));
+                y0 += rows;
+            }
+        });
+    }
+}
+
+/// The rows-of-`acc` this band owns: `[row0, row0 + rows)` out of `full_h` total rows. Splats a
+/// particle's kernel only where it overlaps this band, so a particle whose kernel spans a band
+/// boundary is split correctly across the two bands that own its rows.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn splat_band(
+    acc: &mut [f32],
+    w: usize,
+    row0: usize,
+    rows: usize,
+    full_h: i32,
+    kernels: &[Vec<f32>],
+    sx: &[f32],
+    sy: &[f32],
+    sr: &[i32],
+    scr: &[f32],
+    scg: &[f32],
+    scb: &[f32],
+) {
+    let full_w = w as i32;
+    let row0_i = row0 as i32;
+    let rows_i = rows as i32;
+    for i in 0..sx.len() {
+        let r = sr[i];
+        let ix = sx[i].floor() as i32;
+        let iy = sy[i].floor() as i32;
+        if ix < r || iy < r || ix >= full_w - r || iy >= full_h - r {
+            continue;
+        }
+        let lo_row = (iy - r).max(row0_i);
+        let hi_row = (iy + r).min(row0_i + rows_i - 1);
+        if lo_row > hi_row {
+            continue;
+        }
+        let (cr, cg, cb) = (scr[i], scg[i], scb[i]);
+        let k = 2 * r + 1;
+        for global_row in lo_row..=hi_row {
+            let dy = global_row - iy;
+            let row = (global_row - row0_i) as usize * w;
+            let ko = ((dy + r) * k) as usize;
+            for dx in -r..=r {
+                let kv = kernels[r as usize][ko + (dx + r) as usize];
+                let o = (row + (ix + dx) as usize) * 3;
+                acc[o] += cr * kv;
+                acc[o + 1] += cg * kv;
+                acc[o + 2] += cb * kv;
+            }
+        }
+    }
+}
+
+/// Downsample rows `[y0, y0 + rows)` of the low-res bloom buffer from the full-res accumulator.
+fn downsample_band(
+    acc: &[f32],
+    w: usize,
+    d: usize,
+    bw: usize,
+    y0: usize,
+    rows: usize,
+    lo: &mut [f32],
+) {
+    for y_local in 0..rows {
+        let y = y0 + y_local;
+        for x in 0..bw {
+            let o = (y_local * bw + x) * 3;
+            let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+            for sy in 0..d {
+                for sx in 0..d {
+                    let so = ((y * d + sy) * w + (x * d + sx)) * 3;
+                    r += acc[so];
+                    g += acc[so + 1];
+                    b += acc[so + 2];
+                }
+            }
+            let inv = 1.0 / (d * d) as f32;
+            // Only bright cores bloom (threshold), like a real glare filter.
+            let l = (r + g + b) * inv / 3.0;
+            let kf = ((l - 0.16).max(0.0) * 2.2).min(3.0);
+            lo[o] = r * inv * kf;
+            lo[o + 1] = g * inv * kf;
+            lo[o + 2] = b * inv * kf;
+        }
+    }
+}
+
+/// Which way [`blur_pass`] walks its box filter. The bloom low-res buffer is small relative to
+/// the full-res passes, but at 1440p it is still 640×360 — three iterations of both a horizontal
+/// and a vertical pass over that buffer measured as the single largest unthreaded cost in this
+/// module before this axis was added, so it gets the same row-band treatment as everything else.
+#[derive(Clone, Copy)]
+enum Axis {
+    /// Output row `y` reads only row `y` of `src` (varying taps in `x`), so bands can never read
+    /// outside their own output rows.
+    Horizontal,
+    /// Output row `y` reads rows `[y - rad, y + rad]` of `src`, so a band's threads read outside
+    /// their own output rows — safe because `src` is a distinct, fully-populated buffer from
+    /// `dst` and is only ever read here, never written.
+    Vertical,
+}
+
+/// Box-blur `src` into `dst` (same shape, `bw * bh * 3`) along `axis`, across up to
+/// [`FIELD_MAX_THREADS`] disjoint row bands of `dst`.
+fn blur_pass(src: &[f32], dst: &mut [f32], bw: usize, bh: usize, rad: i32, axis: Axis) {
+    let threads = field_threads(bh);
+    if threads <= 1 {
+        blur_band(src, dst, bw, bh, rad, axis, 0, bh);
+        return;
+    }
+    let band_rows = bh.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let mut y0 = 0usize;
+        for band in dst.chunks_mut(band_rows * bw * 3) {
+            let rows = band.len() / (bw * 3);
+            let this_y0 = y0;
+            scope.spawn(move || blur_band(src, band, bw, bh, rad, axis, this_y0, rows));
+            y0 += rows;
+        }
+    });
+}
+
+/// Box-blur rows `[y0, y0 + rows)` of `dst` from `src`, along `axis`. `src` spans the full `bh`
+/// rows regardless of which band this is — only `dst` is restricted to the band's own slice.
+fn blur_band(
+    src: &[f32],
+    dst: &mut [f32],
+    bw: usize,
+    bh: usize,
+    rad: i32,
+    axis: Axis,
+    y0: usize,
+    rows: usize,
+) {
+    for y_local in 0..rows {
+        let y = y0 + y_local;
+        for x in 0..bw {
+            let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
+            match axis {
+                Axis::Horizontal => {
+                    for dx in -rad..=rad {
+                        let xx = x as i32 + dx;
+                        if xx < 0 || xx >= bw as i32 {
+                            continue;
+                        }
+                        let o = (y * bw + xx as usize) * 3;
+                        r += src[o];
+                        g += src[o + 1];
+                        b += src[o + 2];
+                        n += 1.0;
+                    }
+                }
+                Axis::Vertical => {
+                    for dy in -rad..=rad {
+                        let yy = y as i32 + dy;
+                        if yy < 0 || yy >= bh as i32 {
+                            continue;
+                        }
+                        let o = (yy as usize * bw + x) * 3;
+                        r += src[o];
+                        g += src[o + 1];
+                        b += src[o + 2];
+                        n += 1.0;
+                    }
+                }
+            }
+            let o = (y_local * bw + x) * 3;
+            dst[o] = r / n;
+            dst[o + 1] = g / n;
+            dst[o + 2] = b / n;
+        }
+    }
+}
+
+/// Add the blurred low-res bloom buffer back into rows `[y0, y0 + rows)` of the full-res
+/// accumulator.
+#[allow(clippy::too_many_arguments)]
+fn upsample_band(
+    acc: &mut [f32],
+    w: usize,
+    d: usize,
+    bw: usize,
+    bh: usize,
+    y0: usize,
+    rows: usize,
+    lo: &[f32],
+) {
+    for y_local in 0..rows {
+        let y = y0 + y_local;
+        let sy = (y / d).min(bh - 1);
+        for x in 0..w {
+            let sx = (x / d).min(bw - 1);
+            let so = (sy * bw + sx) * 3;
+            let o = (y_local * w + x) * 3;
+            acc[o] += lo[so] * 0.55;
+            acc[o + 1] += lo[so + 1] * 0.55;
+            acc[o + 2] += lo[so + 2] * 0.55;
+        }
+    }
+}
+
+/// Tonemap rows `[y0, y0 + rows)` of the accumulator into RGBA8 `out`, which owns only those
+/// rows.
+fn tonemap_band(acc: &[f32], w: usize, y0: usize, rows: usize, out: &mut [u8]) {
+    let (fr, fg, fb) = BG_FLOOR;
+    let tm = |v: f32, floor: f32| -> u8 {
+        let t = v / (1.0 + v * 0.92); // Reinhard, gentle shoulder
+        let q = ((t.powf(0.90) + floor) * 255.0) as i32;
+        q.clamp(0, 255) as u8
+    };
+    for y_local in 0..rows {
+        let y = y0 + y_local;
+        for x in 0..w {
+            let o = (y * w + x) * 3;
+            let d = (y_local * w + x) * 4;
+            out[d] = tm(acc[o], fr);
+            out[d + 1] = tm(acc[o + 1], fg);
+            out[d + 2] = tm(acc[o + 2], fb);
         }
     }
 }
@@ -428,6 +750,175 @@ mod tests {
         let mut out = Vec::new();
         field.frame(&cfg, 0.0, &mut out);
         assert!(out.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    /// The thread bound, pinned for one test and released however that test ends (including a
+    /// panicking `assert_eq!`, via `Drop`). Serialised against the other tests that pin it, so
+    /// this holds under a parallel harness as well as the single-threaded one the suite is run
+    /// with. Mirrors [`crate::ui::sidebar::image_card::tests::ThreadPin`].
+    struct ThreadPin(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    static PIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl ThreadPin {
+        fn at(threads: usize) -> Self {
+            let guard = PIN_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+            FIELD_THREADS_FOR_TEST.store(threads, std::sync::atomic::Ordering::Relaxed);
+            Self(guard)
+        }
+    }
+
+    impl Drop for ThreadPin {
+        fn drop(&mut self) {
+            FIELD_THREADS_FOR_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The core acceptance test for this change: a frame's bytes must not depend on how many
+    /// threads generated it, at a size and particle count that forces splat kernels (radius up
+    /// to [`MAX_SPLAT_RADIUS`]) to straddle band boundaries at every thread count above one.
+    #[test]
+    fn frame_is_identical_across_thread_counts() {
+        let cfg = Cfg::rung2();
+        let (w, h) = (200, 150);
+        let phase = 1.1;
+
+        let baseline = {
+            let _pin = ThreadPin::at(1);
+            let mut field = Field::new(w, h, cfg.particles);
+            let mut out = Vec::new();
+            field.frame(&cfg, phase, &mut out);
+            out
+        };
+
+        for threads in [2, 3, 6, 12] {
+            let out = {
+                let _pin = ThreadPin::at(threads);
+                let mut field = Field::new(w, h, cfg.particles);
+                let mut out = Vec::new();
+                field.frame(&cfg, phase, &mut out);
+                out
+            };
+            assert_eq!(
+                out, baseline,
+                "frame bytes differed at {threads} threads vs. single-threaded"
+            );
+        }
+    }
+
+    /// Same determinism check with bloom off and dof off, so the plain `r = 2` splat path (no
+    /// per-particle radius variation) and the bloom-skipping frame path are covered too.
+    #[test]
+    fn frame_is_identical_across_thread_counts_without_bloom_or_dof() {
+        let cfg = Cfg {
+            particles: 4_000,
+            dof: false,
+            bloom: false,
+        };
+        let (w, h) = (200, 150);
+
+        let baseline = {
+            let _pin = ThreadPin::at(1);
+            let mut field = Field::new(w, h, cfg.particles);
+            let mut out = Vec::new();
+            field.frame(&cfg, 0.4, &mut out);
+            out
+        };
+
+        for threads in [2, 6, 12] {
+            let out = {
+                let _pin = ThreadPin::at(threads);
+                let mut field = Field::new(w, h, cfg.particles);
+                let mut out = Vec::new();
+                field.frame(&cfg, 0.4, &mut out);
+                out
+            };
+            assert_eq!(out, baseline, "mismatch at {threads} threads");
+        }
+    }
+
+    /// Repeated frames from one [`Field`] must also be stable under threading — not just the
+    /// first frame, since `acc` is reused across calls and a leftover-state bug would only show
+    /// up on frame two onward.
+    #[test]
+    fn repeated_frames_are_identical_across_thread_counts() {
+        let cfg = Cfg::rung2();
+        let (w, h) = (160, 130);
+        let phases = [0.0f32, 0.6, 1.9, 3.4, 5.0];
+
+        let baseline = {
+            let _pin = ThreadPin::at(1);
+            let mut field = Field::new(w, h, cfg.particles);
+            phases
+                .iter()
+                .map(|&phase| {
+                    let mut out = Vec::new();
+                    field.frame(&cfg, phase, &mut out);
+                    out
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let threaded = {
+            let _pin = ThreadPin::at(6);
+            let mut field = Field::new(w, h, cfg.particles);
+            phases
+                .iter()
+                .map(|&phase| {
+                    let mut out = Vec::new();
+                    field.frame(&cfg, phase, &mut out);
+                    out
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(threaded, baseline);
+    }
+
+    /// Several [`Field`]s, each with their own internally-threaded generation, running at the
+    /// same time from independent OS threads must not corrupt each other's output or panic. This
+    /// is the concurrent-generation correctness case: no torn frames, no shared mutable state
+    /// leaking between fields generating in parallel (e.g. the sidebar's field and a future
+    /// whole-screen field running side by side).
+    #[test]
+    fn concurrent_fields_do_not_corrupt_each_other() {
+        let cfg = Cfg::rung2();
+        let (w, h) = (180, 140);
+
+        // What each phase should produce, computed serially, once, up front.
+        let phases: Vec<f32> = (0..8).map(|i| i as f32 * 0.37).collect();
+        let expected: Vec<Vec<u8>> = phases
+            .iter()
+            .map(|&phase| {
+                let mut field = Field::new(w, h, cfg.particles);
+                let mut out = Vec::new();
+                field.frame(&cfg, phase, &mut out);
+                out
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = phases
+                .iter()
+                .zip(expected.iter())
+                .map(|(&phase, expected)| {
+                    let cfg = &cfg;
+                    scope.spawn(move || {
+                        let mut field = Field::new(w, h, cfg.particles);
+                        let mut out = Vec::new();
+                        field.frame(cfg, phase, &mut out);
+                        assert_eq!(
+                            &out, expected,
+                            "field generated concurrently with others produced different bytes \
+                             than the same field generated in isolation"
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("generation thread panicked");
+            }
+        });
     }
 
     #[test]
@@ -526,6 +1017,50 @@ mod tests {
     fn loop_frames_rejects_zero_by_generating_one() {
         let cfg = Cfg::rung2();
         assert_eq!(loop_frames(16, 16, &cfg, 0).len(), 1);
+    }
+
+    /// Before/after cost of this change at the captain's confirmed 1440p target, single core vs.
+    /// the real thread bound on this box. Multithreading is internal to [`Field::frame`]; this
+    /// pins [`field_threads`] to one to get the "before" number from the same code path rather
+    /// than from a separate unthreaded copy.
+    ///
+    /// Run explicitly: `cargo test --release particle_field::tests::bench_1440p -- \
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: prints ms/frame, run explicitly with --release --ignored --nocapture"]
+    fn bench_1440p() {
+        use std::time::Instant;
+
+        fn median(v: &mut [f64]) -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        }
+
+        let cfg = Cfg::rung2();
+        let (w, h) = (2560usize, 1440usize);
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+
+        println!("\n# particle_field 1440p bench ({cores} logical cores on this box)");
+        for (label, pin) in [
+            ("single core (before)", Some(1)),
+            ("real thread bound (after)", None),
+        ] {
+            let _guard = pin.map(ThreadPin::at);
+            let mut field = Field::new(w, h, cfg.particles);
+            let mut out = Vec::new();
+            // Warm up (first frame pays one-time allocator/cache costs).
+            field.frame(&cfg, 0.0, &mut out);
+            let mut samples = Vec::new();
+            for k in 0..9 {
+                let t = Instant::now();
+                field.frame(&cfg, k as f32 * 0.31, &mut out);
+                samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let ms = median(&mut samples);
+            println!("{label:<28} {ms:>8.2} ms/frame  ({:>6.1} fps)", 1000.0 / ms);
+        }
     }
 
     /// Cost-vs-density profile against real fork code (this crate's actual `png = "0.17"` dep,
