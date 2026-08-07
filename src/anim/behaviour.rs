@@ -833,6 +833,26 @@ pub(crate) mod names {
     /// by how long its caller keeps publishing it rather than by a second
     /// stage here.
     pub(crate) const CMD_ACK: &str = "cmd-ack";
+    /// Bounded: the failure spider's climb (and, reversed, its retreat) to a
+    /// failing card's top-centre border.
+    ///
+    /// One shot, the same as [`CARD_WASH`] — the spider is not resolved as a
+    /// field sweep across cells the way a wash is, it is one marker whose
+    /// *position* is recomputed each frame from this stage's own `progress`
+    /// (see [`crate::ui::sidebar::render_failure_spiders`]) — so this entry's
+    /// job is only to carry that timer and the ink it climbs in, at the depth
+    /// [`FAILURE_SPIDER_PULSE`] rests at, so the colour does not jump the
+    /// instant the climb ends.
+    pub(crate) const FAILURE_SPIDER_CLIMB: &str = "failure-spider-climb";
+    /// Looping: the failure spider resting on a card, pulsing red.
+    ///
+    /// The same snap ladder [`CARD_ALERT`]/[`BADGE_ALERT`] escalate on, at a
+    /// comparable rhythm — a persistent failure marker is exactly the kind of
+    /// thing that channel exists for, so it reuses the ladder rather than
+    /// inventing a second pulse. `Ink::Signal` is resolved by the caller
+    /// against [`crate::anim::cell::LifecycleStage::Failed`]'s own hue, which
+    /// is what makes it read as red on every theme rather than as a fixed RGB.
+    pub(crate) const FAILURE_SPIDER_PULSE: &str = "failure-spider-pulse";
 }
 
 /// How long one rest breath takes.
@@ -978,6 +998,31 @@ pub(crate) const CMD_ACK_HOLD_PERIOD: Duration = Duration::from_millis(1_100);
 /// How long a command-acknowledgement marker takes to fade once its hold ends.
 pub(crate) const CMD_ACK_DISMOUNT_PERIOD: Duration = Duration::from_millis(320);
 
+/// How long the failure spider takes to climb to a card, or to retreat back
+/// down it.
+///
+/// In the same span [`CARD_WASH_PERIOD`] plays a state sweep in: long enough
+/// that the climb reads as travel along the trunk/branch rather than a jump,
+/// short enough that it has arrived before a reader's eye has finished moving
+/// to the card that just failed.
+pub(crate) const FAILURE_SPIDER_CLIMB_PERIOD: Duration = Duration::from_millis(650);
+
+/// How long one snap-and-settle takes on a resting failure spider.
+///
+/// Between [`BADGE_ALERT_PERIOD`] and [`CARD_ALERT_PERIOD`] — a persistent
+/// marker of its own rather than a card's or a badge's, but on the same rung
+/// of the escalated ladder those two play, so a failing card's own alert
+/// breath and the spider sitting on its border read as one rhythm rather than
+/// two competing ones.
+const FAILURE_SPIDER_PULSE_PERIOD: Duration = Duration::from_millis(720);
+
+/// How far the resting failure spider's pulse swings.
+///
+/// Short of a full swing, the same reason [`CARD_ALERT_DEPTH`] is: the marker
+/// has to stay legible as a spider at the trough, not disappear into the
+/// border it sits on.
+const FAILURE_SPIDER_PULSE_DEPTH: f32 = 0.75;
+
 /// How much of the card the wash's leading edge takes to go from nothing to
 /// full, as a fraction of its width.
 ///
@@ -1060,7 +1105,7 @@ const CHARGE_HEAD_CELLS: f32 = 1.0;
 /// reads as the charge's core rather than as the whole connector shaking.
 const CHARGE_ARC_ABOVE: f32 = 0.72;
 
-fn built_in_behaviours() -> [(&'static str, Behaviour); 22] {
+fn built_in_behaviours() -> [(&'static str, Behaviour); 24] {
     /// Every built-in starts from this and overrides what it means to change,
     /// so a new entry inherits the cheap frame interval and the fixed drives
     /// rather than having to remember them.
@@ -1393,6 +1438,31 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 22] {
                 curve: Curve::SnapArrival,
                 period: CMD_ACK_MOUNT_PERIOD,
                 frame_interval: CARD_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        // The failure spider's own two behaviours: the one-shot climb/retreat
+        // and the escalated rest it climbs into. Both uniform, the same reason
+        // the badges and the card breaths are: the spider is one marker, and
+        // its position — not its cell paint — is what a `Field`/`Shape` would
+        // otherwise be asked to place.
+        (
+            names::FAILURE_SPIDER_CLIMB,
+            Behaviour {
+                curve: Curve::SnapArrival,
+                paint: Paint::tint(Ink::Signal, 1.0),
+                period: FAILURE_SPIDER_CLIMB_PERIOD,
+                frame_interval: SMOOTH_FRAME_INTERVAL,
+                ..BASE
+            },
+        ),
+        (
+            names::FAILURE_SPIDER_PULSE,
+            Behaviour {
+                curve: Curve::SnapPendulum,
+                paint: Paint::tint(Ink::Signal, FAILURE_SPIDER_PULSE_DEPTH),
+                period: FAILURE_SPIDER_PULSE_PERIOD,
+                frame_interval: SMOOTH_FRAME_INTERVAL,
                 ..BASE
             },
         ),

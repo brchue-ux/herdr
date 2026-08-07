@@ -6,6 +6,32 @@ use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
     RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
+/// The life the failure spider is given: climb in, rest pulsing, retreat back
+/// down once the card it is on clears.
+///
+/// Mirrors [`crate::app::card_wash::CardWashes::lifecycle`] — a `Lifecycle` is
+/// cheap enough to build fresh on every pass rather than cached, and building
+/// it beside its one call site keeps the mount/idle/dismount stages next to
+/// the reasoning for them. Unlike a card wash, this element does have a
+/// dismount: a wash is an event with nothing left to be once it settles, but
+/// a spider that has climbed to a card it is still sitting on has to leave the
+/// same way it arrived, not vanish.
+fn failure_spider_lifecycle() -> crate::anim::Lifecycle {
+    use crate::anim::behaviour::{names, FAILURE_SPIDER_CLIMB_PERIOD};
+    use crate::anim::{Lifecycle, Stage};
+
+    Lifecycle::still()
+        .with_mount(Stage::new(
+            names::FAILURE_SPIDER_CLIMB,
+            FAILURE_SPIDER_CLIMB_PERIOD,
+        ))
+        .with_idle(names::FAILURE_SPIDER_PULSE)
+        .with_dismount(Stage::new(
+            names::FAILURE_SPIDER_CLIMB,
+            FAILURE_SPIDER_CLIMB_PERIOD,
+        ))
+}
+
 fn retain_custom_command_after_wait(
     pid: u32,
     result: std::io::Result<Option<std::process::ExitStatus>>,
@@ -486,7 +512,38 @@ impl App {
         // currently live". `tree` still folds in below so a card breathing for
         // an unrelated reason does not make this recompute `live` twice.
         let acks_pending = has_viewers && self.state.sidebar_cmd_acks.any_live();
-        if !tree && !signals && !switching && !badges && !acks_pending {
+
+        // The failure spider is the same shape of exception for the same
+        // reason: a core failure signal, not a decorative animation toggle,
+        // so unlike `tree`/`signals`/`badges` it is not gated on any
+        // `[ui.sidebar.animation]` config — it has to climb on an
+        // unconfigured Herdr. Its membership is read eagerly, ahead of the
+        // cheap-exit check below, because that check would otherwise forget a
+        // spider that has nothing else in the panel keeping the loop alive —
+        // the same reason `switching` is in the check though it has no
+        // feature gate either. `Animator::has_any` covers the falling edge:
+        // once a card clears, its row drops out of `spider_members` on this
+        // very pass, and the spider still needs the pass after that, and the
+        // one after, to finish retreating back down the trunk.
+        let spider_live = has_viewers && !self.state.sidebar_collapsed;
+        let spider_members: Members = if spider_live {
+            self.failing_card_rows(&crate::ui::sidebar_agent_live_entries(&self.state))
+                .into_iter()
+                .map(|row| {
+                    (
+                        crate::anim::ElementId::failure_spider(row),
+                        crate::anim::behaviour::DriveInputs::default(),
+                    )
+                })
+                .collect()
+        } else {
+            Members::new()
+        };
+        let spiders = spider_live
+            && (!spider_members.is_empty()
+                || self.state.anim.has_any(crate::anim::Family::FailureSpider));
+
+        if !tree && !signals && !switching && !badges && !acks_pending && !spiders {
             let forgotten = self.state.anim.forget_all();
             let remembered = !self.state.sidebar_tree_row_memory.is_empty();
             self.state.sidebar_tree_row_memory.clear();
@@ -589,6 +646,14 @@ impl App {
             badge_members,
         );
 
+        let spider_lifecycle = failure_spider_lifecycle();
+        let spiders_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::FailureSpider,
+            &spider_lifecycle,
+            spider_members,
+        );
+
         switch_changed
             || spaces_changed
             || agents_changed
@@ -596,6 +661,55 @@ impl App {
             || acks_changed
             || signals_changed
             || badges_changed
+            || spiders_changed
+    }
+
+    /// Every card currently in [`crate::anim::cell::LifecycleStage::Failed`],
+    /// as the row identity the failure spider mounts under.
+    ///
+    /// Reads the same published `lifecycle` token and detected state
+    /// [`crate::ui::sidebar::image_card::content_for`] resolves a row's stage
+    /// from, so a card reads as failing here exactly when it draws as failing.
+    /// `live` is the tree's own agent rows, handed in rather than gathered
+    /// again, because [`Self::observe_agent_rows`] already computes the same
+    /// list when the tree is being drawn; the one extra computation this
+    /// causes when the tree is *not* being drawn (no row animation
+    /// configured) is the cost of the spider working on an unconfigured
+    /// Herdr, and it is bounded by the fleet's own size rather than by
+    /// anything else in the panel.
+    fn failing_card_rows(
+        &self,
+        live: &[crate::ui::sidebar::AgentPanelEntry],
+    ) -> Vec<crate::anim::CardRow> {
+        use crate::anim::cell::LifecycleStage;
+
+        let mut rows = Vec::new();
+        for workspace in &self.state.workspaces {
+            let (state, _seen) = workspace.aggregate_state(&self.state.terminals);
+            let tokens = workspace.metadata_tokens.values();
+            let stage = crate::app::lifecycle::stage(
+                tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                state,
+            );
+            if stage == LifecycleStage::Failed {
+                rows.push(crate::anim::CardRow::Space(workspace.id.clone()));
+            }
+        }
+        for entry in live {
+            let stage = crate::app::lifecycle::stage(
+                entry
+                    .tokens
+                    .get(crate::app::lifecycle::STAGE_TOKEN)
+                    .map(String::as_str),
+                entry.state,
+            );
+            if stage == LifecycleStage::Failed {
+                rows.push(crate::anim::CardRow::Agent(entry.pane_id));
+            }
+        }
+        rows
     }
 
     /// Publish the owned agent rows that exist right now, so each second mate's
@@ -1445,6 +1559,82 @@ mod tests {
         assert!(
             app.state.anim.frame(&segment_id, None).is_none(),
             "the segment is gone once its retract finishes"
+        );
+    }
+
+    /// The failure spider climbs, rests, and retreats on a fleet with nothing
+    /// else configured to animate at all — the core requirement it exists
+    /// for, since it is a failure signal rather than a decorative toggle.
+    #[test]
+    fn a_failing_card_mounts_a_spider_with_nothing_else_configured() {
+        let (mut app, _pane_id) = test_app_with_pane();
+        let now = Instant::now();
+
+        assert!(!app.advance_animations(now, true));
+        assert!(
+            app.state.anim.is_empty(),
+            "a healthy fleet tracks nothing at all"
+        );
+
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "lifecycle".to_string(),
+                Some("failed".to_string()),
+            )]),
+            None,
+            now,
+        );
+        let row = crate::anim::ElementId::failure_spider(crate::anim::CardRow::Space(
+            app.state.workspaces[0].id.clone(),
+        ));
+
+        assert!(app.advance_animations(now, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("mounted the frame the card started failing")
+                .phase,
+            crate::anim::Phase::Mount,
+        );
+
+        let settled =
+            now + crate::anim::behaviour::FAILURE_SPIDER_CLIMB_PERIOD + Duration::from_millis(50);
+        assert!(app.advance_animations(settled, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("still tracked")
+                .phase,
+            crate::anim::Phase::Idle,
+            "past its climb duration the spider has arrived and rests",
+        );
+
+        // Clearing the failure: the card stops being failing, but the spider
+        // has to retreat rather than vanish on the spot.
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([("lifecycle".to_string(), None)]),
+            None,
+            settled,
+        );
+        assert!(app.advance_animations(settled, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("still drawable mid-retreat")
+                .phase,
+            crate::anim::Phase::Dismount,
+        );
+
+        let gone = settled
+            + crate::anim::behaviour::FAILURE_SPIDER_CLIMB_PERIOD
+            + Duration::from_millis(50);
+        app.advance_animations(gone, true);
+        assert!(
+            app.state.anim.frame(&row, None).is_none(),
+            "gone once the retreat finishes"
         );
     }
 

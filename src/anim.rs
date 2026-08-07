@@ -146,6 +146,22 @@ pub(crate) enum ElementId {
     /// card, or a second command arriving mid-animation would collide with the
     /// first instead of mounting beside it.
     CmdAck(CmdAck),
+    /// The failure spider resting on one card: a persistent marker that climbs
+    /// the trunk/branch to a failing card's top-centre border and stays there
+    /// until the card clears.
+    ///
+    /// Its own family for the same reason [`Self::CardWash`] has one: this is
+    /// not the row itself — reconciling `AgentRow`/`WorkspaceRow` down to
+    /// nothing must not retire a spider still mid-climb or mid-retreat — and
+    /// it is not [`Self::Named`], because it is one of a membership set (one
+    /// card can fail while another clears) rather than a singleton. The climb
+    /// is this element's own mount, built on the addressing
+    /// [`Self::TrunkSegment`] introduced: the sidebar renderer walks the same
+    /// trunk/branch/border geometry a settled `TrunkSegment` chain draws, and
+    /// reads this element's own bounded `progress` — never a `TrunkSegment`'s,
+    /// since each of those is fixed to a single `1×1` point — to say how far
+    /// along that geometry the spider has climbed.
+    FailureSpider(CardRow),
     /// A singleton surface a subsystem names for itself — a notification bar,
     /// an overlay.
     Named(&'static str),
@@ -211,6 +227,7 @@ pub(crate) enum Family {
     CardWash,
     TrunkSegment,
     CmdAck,
+    FailureSpider,
     Named,
 }
 
@@ -225,6 +242,7 @@ impl ElementId {
             Self::CardWash(_) => Family::CardWash,
             Self::TrunkSegment(_) => Family::TrunkSegment,
             Self::CmdAck(_) => Family::CmdAck,
+            Self::FailureSpider(_) => Family::FailureSpider,
             Self::Named(_) => Family::Named,
         }
     }
@@ -239,6 +257,10 @@ impl ElementId {
 
     pub(crate) fn trunk_segment(below: CardRow, level: u8) -> Self {
         Self::TrunkSegment(TrunkSegmentId { below, level })
+    }
+
+    pub(crate) fn failure_spider(row: CardRow) -> Self {
+        Self::FailureSpider(row)
     }
 }
 
@@ -326,7 +348,6 @@ impl Lifecycle {
         self
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_dismount(mut self, stage: Stage) -> Self {
         self.dismount = Some(stage);
         self
@@ -702,6 +723,18 @@ impl Animator {
             progress,
             inputs: element.inputs,
         })
+    }
+
+    /// True when at least one element of `family` is currently tracked.
+    ///
+    /// For a caller deciding whether a cheap "nothing to animate" exit is
+    /// still safe: a membership set that has dropped to empty this pass can
+    /// still have an element mid-dismount, and forgetting it early would cut
+    /// its exit short rather than let it finish — the same problem the tree
+    /// view switch's own comment names for a singleton, generalised to a
+    /// membership set. The failure spider's own advance pass reads this.
+    pub(crate) fn has_any(&self, family: Family) -> bool {
+        self.elements.keys().any(|id| id.family() == family)
     }
 
     /// Elements that are leaving but still have frames to draw.
