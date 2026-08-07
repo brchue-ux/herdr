@@ -2001,6 +2001,11 @@ pub struct AppState {
     /// filesystem with its terminal. `false` — including "unknown" — is the
     /// safe default.
     pub(crate) host_graphics_is_local: bool,
+    /// Whether the real outer terminal has confirmed it understands the Kitty
+    /// Graphics Protocol, via `query_kitty_graphics_capability`. Painting must
+    /// gate on this in addition to `kitty_graphics_enabled`: the config flag is
+    /// only the user's opt-in, not proof the attached terminal can render it.
+    pub(crate) kitty_graphics_capability_confirmed: bool,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
     /// Terminal runtimes that should be shut down by the app/runtime layer
@@ -2912,6 +2917,7 @@ impl AppState {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
             host_graphics_is_local: false,
+            kitty_graphics_capability_confirmed: false,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         }

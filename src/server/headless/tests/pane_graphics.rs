@@ -14,6 +14,7 @@ fn enable_graphics_and_render(
     client_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> FrameData {
     server.app.state.kitty_graphics_enabled = true;
+    server.app.state.kitty_graphics_capability_confirmed = true;
     server
         .clients
         .get_mut(&1)

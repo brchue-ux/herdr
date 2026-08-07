@@ -1009,6 +1009,7 @@ fn collect_visible_placements(
             });
         }
     }
+
     tracing::debug!(
         placements_len = placements.len(),
         "collect_visible_placements: done"
@@ -2399,6 +2400,52 @@ mod tests {
             layer_host_image_id(HostSurfaceId::Pane(pane_id), signature),
             PANE_GRAPHICS_IMAGE_ID_BIT | ((legacy as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
         );
+    }
+
+    #[test]
+    fn pane_graphics_layer_full_pane_grid_tracks_pane_resize() {
+        let layer = crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Rgba,
+            80,
+            30,
+            vec![255; 80 * 30 * 4],
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        let cell_size = HostCellSize {
+            width_px: 10,
+            height_px: 10,
+        };
+        let pane_id = PaneId::from_raw(9);
+
+        let wide_rect = Rect::new(2, 1, 20, 10);
+        let wide_placement = layer_host_placement(
+            HostSurfaceId::Pane(pane_id),
+            wide_rect,
+            cell_size,
+            &layer,
+            &HashMap::new(),
+            true,
+        );
+        let (wide_clipped, _) = clipped_placement(&wide_placement).expect("visible layer");
+        assert_eq!(wide_clipped.cols, 20);
+        assert_eq!(wide_clipped.rows, 10);
+
+        // A resize (e.g. a split or a terminal resize) recomputes `PaneInfo`
+        // fresh every frame; the placement must follow it to the new full rect
+        // without any extra addressing work, matching the funding spike's
+        // finding that pane-content overlays already reach whole-pane rects.
+        let narrow_rect = Rect::new(2, 1, 6, 4);
+        let narrow_placement = layer_host_placement(
+            HostSurfaceId::Pane(pane_id),
+            narrow_rect,
+            cell_size,
+            &layer,
+            &HashMap::new(),
+            true,
+        );
+        let (narrow_clipped, _) = clipped_placement(&narrow_placement).expect("visible layer");
+        assert_eq!(narrow_clipped.cols, 6);
+        assert_eq!(narrow_clipped.rows, 4);
     }
 
     #[test]

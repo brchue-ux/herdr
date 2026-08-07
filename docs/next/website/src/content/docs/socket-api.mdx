@@ -223,10 +223,14 @@ never produced output has no `activity` object at all.
 
 Pane graphics let a plugin place image data over a pane. They are available
 only when `[experimental].kitty_graphics = true`; otherwise every pane graphics
-method returns `feature_disabled`. Calling `pane.graphics.info` returns the
-attached client's cell width and height in pixels without creating a graphics
-layer. `pane.graphics.set` accepts `png`, `rgb`, or `rgba` data in `data_base64`,
-and `pane.graphics.clear` removes the layer.
+method returns `feature_disabled`. Herdr also probes the real attached
+terminal for Kitty Graphics Protocol support at startup; until that probe is
+confirmed, graphics are accepted and cached but not painted, so a
+non-supporting terminal never receives garbage escape sequences. Calling
+`pane.graphics.info` returns the attached client's cell width and height in
+pixels without creating a graphics layer. `pane.graphics.set` accepts `png`,
+`rgb`, or `rgba` data in `data_base64`, and `pane.graphics.clear` removes the
+layer.
 
 ```json
 {"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}

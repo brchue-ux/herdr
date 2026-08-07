@@ -59,6 +59,9 @@ pub(crate) struct ClientConnection {
     /// Whether this client positively established that it shares a
     /// filesystem with its terminal.
     pub(crate) host_graphics_is_local: bool,
+    /// Whether this client's real outer terminal confirmed Kitty Graphics
+    /// Protocol support. Monotonic: once true, stays true for the connection.
+    pub(crate) kitty_graphics_capability_confirmed: bool,
     /// Stateful parser for app-client input split across transport reads.
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
@@ -150,6 +153,7 @@ impl ClientConnection {
             outer_terminal_focus,
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
             host_graphics_is_local: false,
+            kitty_graphics_capability_confirmed: false,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
@@ -307,6 +311,26 @@ impl ClientConnection {
         self.host_terminal_appearance = appearance;
         self.host_terminal_appearance_explicit = explicit;
         true
+    }
+
+    /// Returns `true` if this client's capability flag flipped to confirmed.
+    pub(crate) fn update_kitty_graphics_capability_from_events(
+        &mut self,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> bool {
+        if self.kitty_graphics_capability_confirmed {
+            return false;
+        }
+        let confirmed = events.iter().any(|event| {
+            matches!(
+                event,
+                crate::raw_input::RawInputEvent::KittyGraphicsCapability(true)
+            )
+        });
+        if confirmed {
+            self.kitty_graphics_capability_confirmed = true;
+        }
+        confirmed
     }
 
     pub(crate) fn update_outer_focus_from_events(
