@@ -11,6 +11,7 @@ pub(crate) mod agent_view;
 mod agents;
 mod api;
 mod api_helpers;
+pub(crate) mod background_scene;
 pub(crate) mod card_wash;
 pub(crate) mod cmd_ack;
 pub(crate) mod dormant;
@@ -780,6 +781,7 @@ impl App {
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             kitty_graphics_capability_confirmed: false,
             sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
+            persistent_background_enabled: config.experimental.persistent_background,
             sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
             default_shell: config.terminal.default_shell.clone(),
@@ -825,6 +827,13 @@ impl App {
             signal_tray_graphics_key: 0,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
+            background_scene: None,
+            background_scene_key: 0,
+            background_scene_layout: None,
+            background_scene_identity: Vec::new(),
+            background_scene_generated_at: None,
+            background_effects_layer: None,
+            background_effects: crate::app::background_scene::BackgroundEffectsState::default(),
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),
@@ -1770,6 +1779,13 @@ impl App {
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
                 self.state.sidebar_particle_field = None;
                 self.state.sidebar_particle_field_key = 0;
+                self.state.background_scene = None;
+                self.state.background_scene_key = 0;
+                self.state.background_scene_layout = None;
+                self.state.background_scene_identity.clear();
+                self.state.background_scene_generated_at = None;
+                self.state.background_effects_layer = None;
+                self.state.background_effects.forget_all();
             }
             // Toggling the wash on/off invalidates whatever loop is cached: a stale one left
             // behind while off would resurface armed on a terminal that never saw it re-armed.
@@ -1780,6 +1796,19 @@ impl App {
                     config.experimental.sidebar_particle_field;
                 self.state.sidebar_particle_field = None;
                 self.state.sidebar_particle_field_key = 0;
+            }
+            // Same invalidation, for the background scene's own ambient loop and overlay.
+            if self.state.persistent_background_enabled != config.experimental.persistent_background
+            {
+                self.state.persistent_background_enabled =
+                    config.experimental.persistent_background;
+                self.state.background_scene = None;
+                self.state.background_scene_key = 0;
+                self.state.background_scene_layout = None;
+                self.state.background_scene_identity.clear();
+                self.state.background_scene_generated_at = None;
+                self.state.background_effects_layer = None;
+                self.state.background_effects.forget_all();
             }
             self.state.sidebar_card_font =
                 sidebar_card_font(&config.experimental.sidebar_card_font);

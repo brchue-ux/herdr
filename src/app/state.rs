@@ -1849,6 +1849,10 @@ pub struct AppState {
     /// `[experimental] sidebar_particle_field`: draw the sidebar's ambient particle-field wash.
     /// Only read while `kitty_graphics_enabled` is also true.
     pub sidebar_particle_field_enabled: bool,
+    /// `[experimental] persistent_background`: draw the whole-terminal solar-system scene (see
+    /// `src/solar_system.rs`, `src/app/background_scene.rs`). Only read while
+    /// `kitty_graphics_enabled` is also true.
+    pub persistent_background_enabled: bool,
     /// `[experimental] sidebar_card_font`: an explicit face for the sidebar's
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
@@ -2012,6 +2016,36 @@ pub struct AppState {
     /// Generating a whole loop is not free, so it is redone only when this moves — a resize —
     /// and never once per tick.
     pub(crate) sidebar_particle_field_key: u64,
+    /// The whole-terminal solar-system scene's ambient loop (sun/planets/moons in slow orbit),
+    /// its loop frames included via [`GraphicsLayer::animation`]. `None` when disabled, not yet
+    /// generated, or the screen has no area. See `src/app/background_scene.rs`.
+    pub(crate) background_scene: Option<GraphicsLayer>,
+    /// What the ambient loop above was generated for: the fleet tree's own shape (which bodies
+    /// exist, their kind, hue and severity) plus pixel dimensions, folded into one number.
+    /// Regenerated only when this moves — a fleet change or a resize — never once per tick.
+    pub(crate) background_scene_key: u64,
+    /// The same scene's placed bodies, kept alongside the rendered loop above so the effects
+    /// overlay can resolve an asteroid/comet's screen position without rebuilding the layout
+    /// every tick. Index-aligned with `background_scene_identity`.
+    pub(crate) background_scene_layout: Option<crate::solar_system::SceneLayout>,
+    /// Which fleet identity (`crate::anim::CardRow`) each index of
+    /// `background_scene_layout` resolves to.
+    pub(crate) background_scene_identity: Vec<crate::anim::CardRow>,
+    /// When the ambient loop currently cached above was (re)generated — the effects overlay
+    /// derives its own animation phase from elapsed time since this instant, so a struck moon's
+    /// crater tracks roughly where the terminal's own autonomously-played-back loop visually is,
+    /// without herdr ever being able to ask the terminal which exact frame it is currently
+    /// showing.
+    pub(crate) background_scene_generated_at: Option<std::time::Instant>,
+    /// The struck-moon/comet overlay composited over the ambient loop above. `None` whenever
+    /// nothing is currently live, which both matches the fade-clean persistence model and means
+    /// steady-state cost is exactly the ambient loop's (zero, once armed) whenever nothing is
+    /// happening.
+    pub(crate) background_effects_layer: Option<GraphicsLayer>,
+    /// Every in-flight asteroid, fading crater and travelling comet, plus the transition markers
+    /// that stop a durable token from re-firing its comet on every tick it stays published. See
+    /// [`crate::app::background_scene::BackgroundEffectsState`].
+    pub(crate) background_effects: crate::app::background_scene::BackgroundEffectsState,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
     /// The same layers, anchored to a named non-pane region of the client
@@ -2925,6 +2959,7 @@ impl AppState {
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             sidebar_particle_field_enabled: false,
+            persistent_background_enabled: false,
             sidebar_card_font: None,
             sidebar_card_shapes: false,
             default_shell: String::new(),
@@ -2983,6 +3018,13 @@ impl AppState {
             signal_tray_graphics_key: 0,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
+            background_scene: None,
+            background_scene_key: 0,
+            background_scene_layout: None,
+            background_scene_identity: Vec::new(),
+            background_scene_generated_at: None,
+            background_effects_layer: None,
+            background_effects: crate::app::background_scene::BackgroundEffectsState::default(),
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),

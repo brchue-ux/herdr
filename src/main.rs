@@ -107,6 +107,7 @@ mod render_signal;
 mod selection;
 mod server;
 mod session;
+mod solar_system;
 mod sound;
 mod state_age;
 mod terminal;

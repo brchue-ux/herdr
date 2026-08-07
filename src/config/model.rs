@@ -1065,6 +1065,18 @@ pub struct ExperimentalConfig {
     ///
     /// Only read while `kitty_graphics` is on.
     pub sidebar_particle_field: bool,
+    /// Draw a persistent whole-terminal background scene: firstmate as the sun, second mates as
+    /// planets, workers as moons, mirroring the same owner tree the sidebar draws. Default:
+    /// false.
+    ///
+    /// Whole-terminal, not sidebar-confined — see `src/solar_system.rs` and
+    /// `src/app/background_scene.rs`. Generated as a looping animation the same way
+    /// `sidebar_particle_field` is, so steady-state cost is near zero once armed; a bug/failure
+    /// impact or a win comet regenerates only the small overlay layer, and only while at least
+    /// one is live. Kitty-only for now.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub persistent_background: bool,
     /// Hand Kitty graphics pixels to the host terminal as a local temp file
     /// (`t=f`) instead of base64 inside the escape stream (`t=d`), and pick a
     /// raw pixel format the detected terminal is fast at, when both the host

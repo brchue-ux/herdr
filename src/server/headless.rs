@@ -4590,6 +4590,8 @@ impl HeadlessServer {
         // every session — because nothing ever rasterises the badges.
         changed |= self.app.observe_signal_tray(now);
         changed |= self.app.observe_sidebar_particle_field();
+        changed |= self.app.observe_background_scene();
+        changed |= self.app.observe_background_effects(now, has_viewers);
         self.app.sync_state_age_timer(now, has_viewers);
         changed
     }
