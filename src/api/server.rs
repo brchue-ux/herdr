@@ -494,7 +494,7 @@ fn read_initial_request_line_with_limits(
         };
         match read {
             LocalStreamRead::Closed => break Ok(None),
-            LocalStreamRead::Data => {
+            LocalStreamRead::Data(_) => {
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
                     break String::from_utf8(bytes)

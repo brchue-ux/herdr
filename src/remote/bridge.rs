@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use interprocess::local_socket::traits::Listener as _;
+use interprocess::local_socket::ListenerNonblockingMode;
+use interprocess::TryClone as _;
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,6 +16,8 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crate::ipc::{self, LocalListener, LocalStream};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -23,6 +27,7 @@ const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+#[cfg(unix)]
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
@@ -195,7 +200,7 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
 
     let socket_path = crate::server::socket_paths::client_socket_path();
-    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+    let stream = ipc::connect_local_stream(&socket_path).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
@@ -209,10 +214,18 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     let mut socket_to_stdout = stream.try_clone()?;
     let mut stdin_to_socket = stream;
 
+    // `interprocess` exposes no portable half-close (Windows named pipes have
+    // no equivalent to shutting down one direction while keeping the other
+    // open), so unlike the historical Unix-only version of this bridge, this
+    // side does not signal write-closed early. The peer instead notices the
+    // socket close when this whole process exits, which happens as soon as
+    // the download direction below returns. In practice this bridge is only
+    // ever exec'd by `run_remote`'s ssh child on the remote host, which is
+    // always Linux under this architecture (the server stays on Linux), so
+    // the loss of the early signal has no real-world deployment path anyway.
     let _upload = thread::spawn(move || {
         let mut stdin = io::stdin();
         let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
-        let _ = stdin_to_socket.shutdown(std::net::Shutdown::Write);
     });
 
     copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
@@ -457,20 +470,32 @@ struct RemoteSsh {
 
 impl RemoteSsh {
     fn new(target: String, manage_ssh_config: bool) -> Self {
-        let managed_config = if manage_ssh_config {
-            write_managed_ssh_config()
-                .inspect_err(|err| {
-                    tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
-                })
-                .ok()
-        } else {
-            None
-        };
-
         Self {
             target,
-            managed_config,
+            managed_config: Self::managed_config(manage_ssh_config),
         }
+    }
+
+    #[cfg(unix)]
+    fn managed_config(manage_ssh_config: bool) -> Option<ManagedSshConfig> {
+        if !manage_ssh_config {
+            return None;
+        }
+        write_managed_ssh_config()
+            .inspect_err(|err| {
+                tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
+            })
+            .ok()
+    }
+
+    // The managed config's whole purpose is ControlMaster/ControlPersist
+    // multiplexing over a Unix control socket, which Windows OpenSSH does not
+    // support. Every ssh invocation on Windows runs plain instead of reusing
+    // a shared connection; see `bridge_connection`, which already pays for
+    // one ssh child per local connection either way.
+    #[cfg(windows)]
+    fn managed_config(_manage_ssh_config: bool) -> Option<ManagedSshConfig> {
+        None
     }
 
     fn target(&self) -> &str {
@@ -1708,9 +1733,9 @@ impl SshStdioBridge {
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
-        let listener = UnixListener::bind(&local_socket)?;
-        crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
-        listener.set_nonblocking(true)?;
+        let listener: LocalListener = ipc::bind_local_listener(&local_socket)?;
+        ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
@@ -1718,8 +1743,8 @@ impl SshStdioBridge {
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        if let Err(err) = stream.set_nonblocking(false) {
+                    Ok(mut stream) => {
+                        if let Err(err) = ipc::set_local_stream_polling(&mut stream, false) {
                             eprintln!(
                                 "herdr: remote bridge failed to prepare client socket: {err}"
                             );
@@ -1771,6 +1796,10 @@ impl Drop for SshStdioBridge {
 /// than a predictable file in the world-writable temp dir — stops a local user
 /// from pre-planting a symlink or world-writable file that herdr would write
 /// and `ssh -F` would then read.
+///
+/// Unix-only: it exists to hold the ControlMaster socket, which
+/// [`RemoteSsh::managed_config`] only sets up on Unix.
+#[cfg(unix)]
 fn private_ssh_config_dir() -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
 
@@ -1810,6 +1839,7 @@ fn private_ssh_config_dir() -> io::Result<PathBuf> {
 /// glob metacharacters) is treated as one literal token instead of being split
 /// or expanded by ssh — otherwise the user's config might not be Included and
 /// herdr's fallback would wrongly take effect.
+#[cfg(unix)]
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -1821,6 +1851,9 @@ fn ssh_config_quote(path: &str) -> String {
 /// first-value-wins rule keeps any `ServerAlive*` the user set there (including
 /// an explicit `0` to disable it). Herdr's keepalive values apply only when
 /// the user has none.
+///
+/// Unix-only: see [`private_ssh_config_dir`].
+#[cfg(unix)]
 fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1860,7 +1893,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 }
 
 fn bridge_connection(
-    stream: UnixStream,
+    stream: LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -1888,20 +1921,37 @@ fn bridge_connection(
         .stdout
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let mut stream_to_child = stream.try_clone()?;
-    let mut child_to_stream = stream;
 
+    // `interprocess` exposes no portable half-close (a Windows named pipe has
+    // no equivalent to shutting down one direction while keeping the other
+    // open, unlike a Unix domain socket's `shutdown(SHUT_WR)`). Instead of
+    // relying on that signal to unblock the upload side once the ssh session
+    // ends, the upload side polls nonblocking against `should_stop`, and both
+    // of this connection's stream handles are dropped once both directions
+    // are done — which the peer (the local `herdr client` process) observes
+    // as a closed connection either way.
+    //
+    // On Unix, `try_clone()` dups the fd, and `O_NONBLOCK` lives on the
+    // shared open file description rather than per-fd — so setting polling
+    // mode on `stream_to_child` also makes `child_to_stream`'s writes
+    // (below) nonblocking-capable, even though only one clone asked for it.
+    // `write_all_polling_safe` is written to tolerate that.
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let mut stream_to_child = stream.try_clone()?;
+    ipc::set_local_stream_polling(&mut stream_to_child, true)?;
+
+    let upload_stop = Arc::clone(&should_stop);
     let upload = thread::spawn(move || {
-        let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
+        let _ = copy_flush_cancelable(&mut stream_to_child, &mut child_stdin, &upload_stop);
     });
-    let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
-        let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
-    });
+
+    let mut child_to_stream = stream;
+    let _ = copy_child_stdout_to_local_stream(&mut child_stdout, &mut child_to_stream);
+    should_stop.store(true, Ordering::Release);
+    drop(child_to_stream);
 
     let status = child.wait()?;
     let _ = upload.join();
-    let _ = download.join();
 
     if status.success() {
         Ok(())
@@ -1929,6 +1979,84 @@ fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::
         writer.flush()?;
         total += bytes_read as u64;
     }
+}
+
+/// Copies from a [`LocalStream`] already in polling mode to `writer`,
+/// stopping either at a closed connection or as soon as `should_stop` is set
+/// — checked between each poll rather than only before a blocking read, so a
+/// stop request is not left waiting behind a read that would otherwise block
+/// indefinitely for more local input.
+fn copy_flush_cancelable(
+    stream: &mut LocalStream,
+    writer: &mut impl io::Write,
+    should_stop: &AtomicBool,
+) -> io::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    let mut buffer = [0_u8; 16 * 1024];
+
+    loop {
+        if should_stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        match ipc::poll_local_stream_read(stream, &mut buffer) {
+            Ok(ipc::LocalStreamRead::Data(read)) => {
+                writer.write_all(&buffer[..read])?;
+                writer.flush()?;
+            }
+            Ok(ipc::LocalStreamRead::Closed) => return Ok(()),
+            Ok(ipc::LocalStreamRead::Pending) => thread::sleep(POLL_INTERVAL),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Copies ssh's stdout to the local socket, retrying on `WouldBlock` instead
+/// of failing outright.
+///
+/// `reader` is a plain OS pipe (always blocking), but `stream`'s write side
+/// may be in nonblocking mode here — see the comment in [`bridge_connection`]
+/// on why setting polling mode on one clone of a Unix socket pair can put the
+/// other clone's writes in that state too. On Windows, [`LocalStream`]
+/// writes stay blocking regardless (`set_local_stream_polling` is a no-op
+/// there), so the `WouldBlock` arm is simply never reached on that platform.
+fn copy_child_stdout_to_local_stream(
+    reader: &mut impl io::Read,
+    stream: &mut LocalStream,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        write_all_polling_safe(stream, &buffer[..read])?;
+    }
+}
+
+fn write_all_polling_safe(stream: &mut LocalStream, buf: &[u8]) -> io::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
+    let mut remaining = buf;
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer to local socket",
+                ))
+            }
+            Ok(written) => remaining = &remaining[written..],
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    stream.flush()
 }
 
 fn run_client_process(
@@ -1971,7 +2099,7 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let readable = tmpdir.join(format!(
         "herdr-remote-{pid}-{target_clean}-{session_clean}.sock"
     ));
-    if fits_unix_socket_path(&readable) {
+    if fits_local_socket_path(&readable) {
         return readable;
     }
 
@@ -1985,18 +2113,53 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let hash = short_socket_hash(target, session_name);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
     let short_in_tmp = tmpdir.join(&short_name);
-    if fits_unix_socket_path(&short_in_tmp) {
+    if fits_local_socket_path(&short_in_tmp) {
         return short_in_tmp;
     }
+    last_resort_short_socket_path(short_name)
+}
+
+#[cfg(unix)]
+fn last_resort_short_socket_path(short_name: String) -> PathBuf {
     PathBuf::from("/tmp").join(short_name)
 }
 
+#[cfg(windows)]
+fn last_resort_short_socket_path(short_name: String) -> PathBuf {
+    // There is no shorter conventional temp root on Windows than
+    // `std::env::temp_dir()`, and `fits_local_socket_path`'s 200-byte budget
+    // is generous enough that this branch is not expected to be reached in
+    // practice; return the best available name rather than fail outright.
+    std::env::temp_dir().join(short_name)
+}
+
+fn fits_local_socket_path(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        fits_unix_socket_path(path)
+    }
+    #[cfg(windows)]
+    {
+        fits_windows_pipe_path(path)
+    }
+}
+
+/// `sun_path` is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve 1
+/// byte for the trailing NUL and use the smaller cap for portability.
+#[cfg(unix)]
 fn fits_unix_socket_path(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    // sun_path is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve
-    // 1 byte for the trailing NUL and use the smaller cap for portability.
     const MAX: usize = 103;
     path.as_os_str().as_bytes().len() <= MAX
+}
+
+/// Named pipe full paths (`\\.\pipe\<name>`) are limited to 256 characters
+/// total; this budget leaves headroom for that prefix plus
+/// `interprocess`'s namespacing.
+#[cfg(windows)]
+fn fits_windows_pipe_path(path: &Path) -> bool {
+    const MAX: usize = 200;
+    path.as_os_str().len() <= MAX
 }
 
 fn short_socket_hash(target: &str, session: &str) -> String {
@@ -2028,6 +2191,7 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -2056,6 +2220,7 @@ mod tests {
         let _ = std::fs::remove_file(socket);
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_ssh_config_includes_user_config_then_fallback() {
         use std::os::unix::fs::PermissionsExt;
@@ -2116,6 +2281,7 @@ mod tests {
         drop(managed_config);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
@@ -2124,6 +2290,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_ssh_command_uses_managed_config_when_present() {
         let managed_config = write_managed_ssh_config().expect("write managed config");
@@ -3014,11 +3181,13 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    #[cfg(unix)]
     fn socket_path_byte_len(path: &Path) -> usize {
         use std::os::unix::ffi::OsStrExt;
         path.as_os_str().as_bytes().len()
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_uses_readable_name_when_it_fits() {
         let _guard = remote_env_lock().lock().unwrap();
@@ -3043,6 +3212,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_fits_in_sun_path() {
         let _guard = remote_env_lock().lock().unwrap();
@@ -3060,6 +3230,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
         let _guard = remote_env_lock().lock().unwrap();
@@ -3091,6 +3262,25 @@ mod tests {
             filename.starts_with("herdr-r-"),
             "expected hashed fallback, got {filename}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_forward_socket_path_fits_windows_pipe_budget() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let path = local_forward_socket_path("dev", "default");
+        assert!(
+            fits_windows_pipe_path(&path),
+            "socket path too long for the named pipe budget: {}",
+            path.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fits_windows_pipe_path_rejects_names_past_the_budget() {
+        let too_long = std::env::temp_dir().join("a".repeat(250));
+        assert!(!fits_windows_pipe_path(&too_long));
     }
 
     #[test]
