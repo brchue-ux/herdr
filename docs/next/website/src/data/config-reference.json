@@ -236,6 +236,12 @@
           "description": "Create a new workspace."
         },
         {
+          "key": "keys.new_scratch_workspace",
+          "type": "keybinding",
+          "default": "\"prefix+shift+c\"",
+          "description": "Create a scratch workspace: a plain shell at $HOME, independent of the active pane's cwd so it never groups under another workspace's Git worktree in the sidebar."
+        },
+        {
           "key": "keys.new_worktree",
           "type": "keybinding",
           "default": "\"prefix+shift+g\"",

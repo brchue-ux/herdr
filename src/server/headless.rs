@@ -877,6 +877,26 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.deferred_new_workspace");
         }
 
+        if self.app.state.request_new_scratch_workspace {
+            self.app.state.request_new_scratch_workspace = false;
+            let cwd =
+                app::creation::resolve_new_terminal_cwd(&config::NewTerminalCwdConfig::Home, None);
+            let response = self.headless_workspace_create(
+                "headless.workspace.create_scratch",
+                Some(cwd.display().to_string()),
+                Some("Scratch".to_string()),
+            );
+            if let Err(error) = response {
+                error!(
+                    code = %error.code,
+                    message = %error.message,
+                    "failed to create scratch workspace"
+                );
+            }
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_new_scratch_workspace");
+        }
+
         if self.app.state.request_new_tab {
             self.app.state.request_new_tab = false;
             let label = self.app.state.requested_new_tab_name.take();
