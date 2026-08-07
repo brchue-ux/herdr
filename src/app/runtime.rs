@@ -527,6 +527,25 @@ impl App {
                 .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
         let agents_changed = self.observe_agent_rows(now, &lifecycle, tree, washes);
 
+        // One segment per row with a gap still open beneath it — see
+        // `sidebar_trunk_segment_members`. Its own lifecycle rather than the
+        // rows' own: a segment's arrival is `row_enter`/`row_exit` timed the
+        // same as a row's, but it declares none of a row's idle behaviours,
+        // so a card's own pulse or glow cannot leak onto a rail through this
+        // path.
+        let trunk_lifecycle = self.state.sidebar_trunk_lifecycle();
+        let trunk_members: Members = if tree {
+            crate::ui::sidebar_trunk_segment_members(&self.state)
+        } else {
+            Members::new()
+        };
+        let trunk_changed = self.state.anim.observe(
+            now,
+            crate::anim::Family::TrunkSegment,
+            &trunk_lifecycle,
+            trunk_members,
+        );
+
         let signal_lifecycle = self.state.sidebar_notifications.lifecycle();
         let signal_members: Members = if signals {
             crate::app::fleet_signals::FleetSignals::resolve(&self.state)
@@ -561,7 +580,12 @@ impl App {
             badge_members,
         );
 
-        switch_changed || spaces_changed || agents_changed || signals_changed || badges_changed
+        switch_changed
+            || spaces_changed
+            || agents_changed
+            || trunk_changed
+            || signals_changed
+            || badges_changed
     }
 
     /// Publish the owned agent rows that exist right now, so each second mate's
@@ -1229,6 +1253,81 @@ mod tests {
         assert_eq!(
             app.next_loop_deadline(now, false),
             Some(app.next_resize_poll)
+        );
+    }
+
+    /// A trunk segment mounts, settles, and retracts on its own clock — driven
+    /// by the same `row_enter`/`row_exit` config a row's own arrival reads,
+    /// but tracked as its own element rather than riding the row's.
+    ///
+    /// `fleet_app` gives `2ndmate-left` a sibling, `2ndmate-right`, so the
+    /// ancestor column beside `2ndmate-left`'s own two workers is still open —
+    /// one segment per worker row, both at that same level, since the column
+    /// only closes once every one of `2ndmate-left`'s rows has been passed.
+    /// Unpublishing `2ndmate-right`'s owner closes that gap without touching
+    /// either worker's own row at all, which is the case this test exists to
+    /// pin: a segment's life is not a side effect of its row's.
+    #[test]
+    fn a_trunk_segment_mounts_settles_and_retracts_on_its_own_clock() {
+        let (mut app, _left_second, _right_only) = fleet_app("wipe");
+        app.state.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Wipe;
+        app.state.sidebar_animation.row_enter_ms = 200;
+        let now = Instant::now();
+
+        let members = crate::ui::sidebar_trunk_segment_members(&app.state);
+        assert_eq!(
+            members.len(),
+            2,
+            "both of 2ndmate-left's worker rows pass the still-open column \
+             beside 2ndmate-right: {members:?}"
+        );
+        let segment_id = members[0].0.clone();
+
+        assert!(app.handle_scheduled_tasks(now, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("the segment is tracked from its first pass")
+                .phase,
+            crate::anim::Phase::Mount,
+        );
+
+        let settled = now + Duration::from_millis(250);
+        assert!(app.handle_scheduled_tasks(settled, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("still tracked")
+                .phase,
+            crate::anim::Phase::Idle,
+            "past its mount duration the segment has settled, same as any row",
+        );
+
+        // Closing the gap: `2ndmate-right` no longer names the first mate as
+        // its owner, so `2ndmate-left` becomes the only — and therefore last
+        // — child, and the ancestor column `left-worker-1` stood beside closes.
+        app.state.workspaces[2].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), None)]),
+            None,
+            settled,
+        );
+        assert!(app.handle_scheduled_tasks(settled, false));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&segment_id, None)
+                .expect("still drawable mid-retract")
+                .phase,
+            crate::anim::Phase::Dismount,
+        );
+
+        let gone = settled + Duration::from_millis(250);
+        app.handle_scheduled_tasks(gone, false);
+        assert!(
+            app.state.anim.frame(&segment_id, None).is_none(),
+            "the segment is gone once its retract finishes"
         );
     }
 
