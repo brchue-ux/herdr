@@ -2870,6 +2870,7 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 host_terminal,
+                wants_client_rasterized_cards,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2915,6 +2916,7 @@ impl HeadlessServer {
                 );
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.set_host_terminal(&host_terminal);
+                    client.wants_client_rasterized_cards = wants_client_rasterized_cards;
                 }
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -3968,6 +3970,7 @@ impl HeadlessServer {
                 &self.app.terminal_runtimes,
                 self.app.state.view.tab_surface(),
                 *cell_size,
+                !client.wants_client_rasterized_cards,
             )
         {
             retained_fallback!("visible_kitty_graphics");
@@ -4269,6 +4272,7 @@ impl HeadlessServer {
             }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
+            let wants_client_rasterized_cards = client.wants_client_rasterized_cards;
             if is_app_client
                 && self.app.state.kitty_graphics_enabled
                 && self.app.state.kitty_graphics_capability_confirmed
@@ -4286,6 +4290,7 @@ impl HeadlessServer {
                         self.app.state.view.tab_surface(),
                         cell_size,
                         &mut next_graphics_cache,
+                        !wants_client_rasterized_cards,
                     ));
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
             } else {
@@ -4296,6 +4301,40 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render.writer_missing");
                 continue;
             };
+
+            // A client that rasterises cards itself gets the same layout and
+            // content build_cards_inner would have painted, as an opaque
+            // CardScene, instead of the pixels this loop just withheld above.
+            if wants_client_rasterized_cards
+                && is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && self.app.state.kitty_graphics_capability_confirmed
+                && cell_size.is_known()
+            {
+                if let Some(scene) = crate::ui::sidebar::image_card::build_card_scene(
+                    &self.app.state,
+                    &self.app.state.view.workspace_card_areas,
+                    self.app.state.view.sidebar_rect,
+                    cell_size,
+                ) {
+                    match crate::ui::sidebar::image_card::encode_card_scene(&scene) {
+                        Ok(bytes) => match Self::frame_server_message_with_max(
+                            &ServerMessage::CardScene { bytes },
+                            MAX_GRAPHICS_FRAME_SIZE,
+                        ) {
+                            Ok(framed) => {
+                                let _ = writer.render.try_send(framed);
+                            }
+                            Err(err) => {
+                                warn!(client_id, err = %err, "failed to serialize card scene for client");
+                            }
+                        },
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode card scene for client");
+                        }
+                    }
+                }
+            }
 
             let mut commit_graphics_cache = true;
             if frame.graphics.len() > MAX_GRAPHICS_FRAME_SIZE {
@@ -5636,6 +5675,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5661,6 +5701,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -5692,6 +5733,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("rio".to_owned()),
                 term: None,
@@ -5730,6 +5772,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("some-unheard-of-terminal".to_owned()),
                 term: Some("xterm-256color".to_owned()),
@@ -5769,6 +5812,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5783,6 +5827,7 @@ new_tab = "prefix+t"
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -5827,6 +5872,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -5903,6 +5949,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5924,6 +5971,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -5959,6 +6007,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6025,6 +6074,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6439,6 +6489,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6474,6 +6525,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6508,6 +6560,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6611,6 +6664,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -8863,6 +8917,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            wants_client_rasterized_cards: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));

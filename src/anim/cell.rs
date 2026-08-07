@@ -200,7 +200,7 @@ pub(crate) enum Ink {
 /// [`Severity`]'s job. Keeping them on separate channels is what makes "running,
 /// but badly" expressible at all — with one channel it collapses into either a
 /// stage that is really a warning or a warning that is really a stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum LifecycleStage {
     /// Accepted, nothing running yet.
     Queued,
@@ -282,7 +282,19 @@ impl LifecycleStage {
 /// **This carries intensity and nothing else.** It never touches hue, because
 /// hue is spoken for: a card that got louder because it is in trouble must not
 /// also look like it changed what it is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub(crate) enum Severity {
     /// Nothing wrong. The stage speaking on its own.
     #[default]

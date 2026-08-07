@@ -533,6 +533,7 @@ fn client_handshake(
             &encode_varint_u32(0),  // HostTerminalReport.term: None
             &encode_varint_u32(0),  // HostTerminalReport.kitty_window_id_set: false
             &encode_varint_u32(0),  // HostTerminalReport.is_local: false
+            &encode_varint_u32(0),  // wants_client_rasterized_cards: false
         ],
     );
     stream

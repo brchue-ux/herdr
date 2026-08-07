@@ -433,6 +433,7 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.term: None
     payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.kitty_window_id_set: false
     payload.extend_from_slice(&encode_varint_u32(0)); // HostTerminalReport.is_local: false
+    payload.extend_from_slice(&encode_varint_u32(0)); // wants_client_rasterized_cards: false
 
     stream
         .write_all(&frame_message(&payload))

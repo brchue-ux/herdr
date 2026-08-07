@@ -127,6 +127,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         keybindings: crate::protocol::ClientKeybindings::Server,
         launch_mode: crate::protocol::ClientLaunchMode::App,
         host_terminal: crate::protocol::HostTerminalReport::default(),
+        wants_client_rasterized_cards: false,
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {
