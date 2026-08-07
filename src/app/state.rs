@@ -20,6 +20,18 @@ pub(crate) struct PluginPaneRecord {
     pub entrypoint: String,
 }
 
+/// A looping frame sequence attached to a [`GraphicsLayer`], armed once via Kitty's native
+/// animation-frame transport (`a=f`/`a=a` in `src/kitty_graphics.rs`) instead of being
+/// re-uploaded every tick. `GraphicsLayer::data` above carries the root/first frame; `frames`
+/// here are the rest, in loop order. Only looping/ambient content benefits — anything
+/// event-driven still needs a fresh `GraphicsLayer` per change, same as before this existed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GraphicsAnimation {
+    /// Milliseconds each frame is shown before the terminal advances to the next one.
+    pub frame_gap_ms: u32,
+    pub frames: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GraphicsLayer {
     pub format: crate::api::schema::PaneGraphicsFormat,
@@ -28,6 +40,7 @@ pub(crate) struct GraphicsLayer {
     pub data: Vec<u8>,
     pub data_fingerprint: u64,
     pub render: crate::api::schema::PaneGraphicsPlacementParams,
+    pub animation: Option<GraphicsAnimation>,
 }
 
 impl GraphicsLayer {
@@ -46,7 +59,15 @@ impl GraphicsLayer {
             data,
             data_fingerprint,
             render,
+            animation: None,
         }
+    }
+
+    /// Attaches a looping frame sequence, transmitted once and then played back by the terminal
+    /// on its own clock. See [`GraphicsAnimation`].
+    pub(crate) fn with_animation(mut self, animation: GraphicsAnimation) -> Self {
+        self.animation = Some(animation);
+        self
     }
 }
 
@@ -1787,6 +1808,9 @@ pub struct AppState {
     /// `[experimental] switch_ascii_input_source_in_prefix`.
     pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
+    /// `[experimental] sidebar_particle_field`: draw the sidebar's ambient particle-field wash.
+    /// Only read while `kitty_graphics_enabled` is also true.
+    pub sidebar_particle_field_enabled: bool,
     /// `[experimental] sidebar_card_font`: an explicit face for the sidebar's
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
@@ -1908,6 +1932,14 @@ pub struct AppState {
     /// the cell size, folded into one number. Rasterising eight badges is not
     /// free, so it is redone when this moves and not once per frame.
     pub(crate) signal_tray_graphics_key: u64,
+    /// The sidebar's ambient particle-field wash, its loop frames included via
+    /// [`GraphicsLayer::animation`]. `None` when disabled, not yet generated, or the sidebar
+    /// column has no area.
+    pub(crate) sidebar_particle_field: Option<GraphicsLayer>,
+    /// What the wash above was generated for: its pixel dimensions, folded into one number.
+    /// Generating a whole loop is not free, so it is redone only when this moves — a resize —
+    /// and never once per tick.
+    pub(crate) sidebar_particle_field_key: u64,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
     /// The same layers, anchored to a named non-pane region of the client
@@ -2749,6 +2781,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
+            sidebar_particle_field_enabled: false,
             sidebar_card_font: None,
             sidebar_card_shapes: false,
             default_shell: String::new(),
@@ -2800,6 +2833,8 @@ impl AppState {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            sidebar_particle_field: None,
+            sidebar_particle_field_key: 0,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),

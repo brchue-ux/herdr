@@ -1363,6 +1363,12 @@
           "description": "Draw each sidebar card as its own transparent shape rather than as one opaque sheet covering the whole tree. With the sheet, a card's glow terminates at the sheet's rectangle instead of falling off into what is behind it; with shapes, each card is its own RGBA image at its own placement, so there is no rectangle to clip and two overlapping cards have their glows blended by the terminal. Only read while kitty_graphics is on."
         },
         {
+          "key": "experimental.sidebar_particle_field",
+          "type": "boolean",
+          "default": "false",
+          "description": "Draw an ambient particle-field wash behind the sidebar tree. Generated once per sidebar size and played back by the terminal's own Kitty animation-frame clock (a=f/a=a) rather than re-uploaded every tick, so steady-state wire cost is near zero once armed. Kitty-only for now: a terminal that does not honour a=f/a=a still shows the root frame, just static. Only read while kitty_graphics is on."
+        },
+        {
           "key": "experimental.pane_history",
           "type": "boolean",
           "default": "false",

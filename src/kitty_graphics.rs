@@ -154,6 +154,10 @@ struct HostPlacement {
     source_key: HostSourceKey,
     placement: KittyImagePlacement,
     scrollback_offset: u32,
+    /// A looping frame sequence to transmit and arm the moment `placement`'s root frame is
+    /// (re-)uploaded. `None` for every terminal-sourced placement and for any layer that never
+    /// called [`crate::app::state::GraphicsLayer::with_animation`].
+    animation: Option<crate::app::state::GraphicsAnimation>,
 }
 
 /// Which rect of the host viewport a placement is anchored to.
@@ -184,6 +188,10 @@ enum HostSurfaceId {
     /// disturbing the others. The sheet path publishes a single layer and uses
     /// slot `0`.
     SidebarCards(u16),
+    /// The sidebar's ambient particle-field wash, drawn by the TUI itself. Its own identity for
+    /// the same reason `SignalTray` has one: a client's own sidebar backdrop and this wash are
+    /// two placements, not one silently replacing the other.
+    SidebarParticleField,
 }
 
 impl HostSurfaceId {
@@ -199,6 +207,7 @@ impl HostSurfaceId {
                 "surface.sidebar.cards".hash(hasher);
                 slot.hash(hasher);
             }
+            Self::SidebarParticleField => "surface.sidebar.particle-field".hash(hasher),
         }
     }
 }
@@ -428,6 +437,7 @@ pub(crate) fn has_visible_pane_graphics(
                     },
                     placement,
                     scrollback_offset,
+                    animation: None,
                 };
                 if clipped_placement(&host_placement).is_some() {
                     return true;
@@ -498,6 +508,12 @@ fn encode_graphics_update(
         let placement_key = (host_id, host_placement_id);
         current_placements.insert(placement_key);
 
+        // Newly (re-)uploaded here means the loop frames must be transmitted and playback armed
+        // — but not yet: kitty only picks up `a=a`'s autonomous clock for a placement that
+        // already exists on screen. Deferred past `encode_display_placement` below for exactly
+        // that reason; arming it here, before the image has a placement, left the terminal
+        // stuck showing the root frame forever in live testing.
+        let mut needs_animation_arm = false;
         match host_images.get(&host_id).copied() {
             Some(existing) if existing == image_signature => {}
             Some(_) => {
@@ -514,12 +530,14 @@ fn encode_graphics_update(
                     continue;
                 }
                 host_images.insert(host_id, image_signature);
+                needs_animation_arm = placement.animation.is_some();
             }
             None => {
                 if !encode_upload_image(bytes, placement, format_code, host_id) {
                     continue;
                 }
                 host_images.insert(host_id, image_signature);
+                needs_animation_arm = placement.animation.is_some();
             }
         }
 
@@ -557,6 +575,19 @@ fn encode_graphics_update(
                     placement.placement.z,
                 );
                 host_placements.insert(placement_key, placement_signature);
+            }
+        }
+
+        if needs_animation_arm {
+            if let Some(animation) = &placement.animation {
+                encode_animation_frames(
+                    bytes,
+                    host_id,
+                    format_code,
+                    placement.placement.image_width,
+                    placement.placement.image_height,
+                    animation,
+                );
             }
         }
     }
@@ -752,6 +783,7 @@ fn collect_visible_placements(
                 },
                 placement,
                 scrollback_offset,
+                animation: None,
             });
         }
     }
@@ -789,6 +821,13 @@ fn surface_layer_placement_targets(
             (
                 HostSurfaceId::SignalTray,
                 crate::ui::signal_tray_graphics_rect(app),
+                layer,
+            )
+        }))
+        .chain(app.sidebar_particle_field.as_ref().map(|layer| {
+            (
+                HostSurfaceId::SidebarParticleField,
+                crate::ui::sidebar_particle_field_rect(app),
                 layer,
             )
         }))
@@ -861,10 +900,20 @@ fn layer_host_placement(
         data_fingerprint: layer.data_fingerprint,
     };
     let host_id = layer_host_image_id(surface, signature);
-    let data = if !include_data || uploaded_images.get(&host_id).copied() == Some(signature) {
+    let already_uploaded = uploaded_images.get(&host_id).copied() == Some(signature);
+    let data = if !include_data || already_uploaded {
         Vec::new()
     } else {
         layer.data.clone()
+    };
+    // Loop frames only matter the moment the root frame above is actually (re-)uploaded — see
+    // `encode_graphics_update`, which reaches them through this same `data.is_empty()` gate via
+    // `encode_upload_image`. Skipped otherwise so a visibility-only caller like
+    // `has_visible_pane_graphics` never clones a whole frame sequence just to check geometry.
+    let animation = if !include_data || already_uploaded {
+        None
+    } else {
+        layer.animation.clone()
     };
     let render = layer.render;
     let grid_cols = if render.grid_cols == 0 {
@@ -884,6 +933,7 @@ fn layer_host_placement(
         cell_size,
         source_key: HostSourceKey::Layer { surface },
         scrollback_offset: 0,
+        animation,
         placement: KittyImagePlacement {
             image_id: 1,
             placement_id: 1,
@@ -987,8 +1037,64 @@ fn encode_upload_image(
         "a=t,t=d,f={format_code},s={},v={},i={host_id},q=2",
         placement.placement.image_width, placement.placement.image_height,
     );
-    encode_kitty_data(out, &control, &placement.placement.data);
+    encode_kitty_data(out, &control, "", &placement.placement.data);
     true
+}
+
+/// Appends one additional loop frame to an image whose root frame was just transmitted (Kitty's
+/// `a=f`, "transmit frame"). Shares the root frame's dimensions and format; `gap_ms` is how long
+/// the terminal shows it once autonomous playback is armed.
+fn encode_transmit_frame(
+    out: &mut Vec<u8>,
+    host_id: u32,
+    format_code: u32,
+    width: u32,
+    height: u32,
+    gap_ms: u32,
+    data: &[u8],
+) {
+    let control = format!("a=f,i={host_id},f={format_code},s={width},v={height},z={gap_ms},q=2");
+    encode_kitty_data(out, &control, ",a=f", data);
+}
+
+/// Arms autonomous playback of the frames already transmitted for `host_id` (Kitty's `a=a`,
+/// "control animation"). The root frame carries no gap of its own by spec, so it is set
+/// explicitly here for the loop-back leg before `s=3,v=1` starts looped playback. From here the
+/// terminal runs its own clock — see `data/herdr-native-animation-playback-verify` for the
+/// empirical confirmation that this sends zero further protocol bytes once armed.
+fn encode_arm_animation(out: &mut Vec<u8>, host_id: u32, root_gap_ms: u32) {
+    let _ = write!(out, "\x1b_Ga=a,i={host_id},r=1,z={root_gap_ms},q=2;\x1b\\");
+    let _ = write!(out, "\x1b_Ga=a,i={host_id},s=3,v=1,q=2;\x1b\\");
+}
+
+/// Transmits every extra loop frame and arms playback for an image whose root frame was just
+/// (re-)uploaded by [`encode_upload_image`]. Only called from the two `encode_graphics_update`
+/// branches that just did that upload, so this runs exactly once per distinct image signature —
+/// the same cache that gives every other layer a no-op on an unchanged frame is what keeps this
+/// from re-arming on every tick.
+fn encode_animation_frames(
+    out: &mut Vec<u8>,
+    host_id: u32,
+    format_code: u32,
+    width: u32,
+    height: u32,
+    animation: &crate::app::state::GraphicsAnimation,
+) {
+    if animation.frames.is_empty() {
+        return;
+    }
+    for frame in &animation.frames {
+        encode_transmit_frame(
+            out,
+            host_id,
+            format_code,
+            width,
+            height,
+            animation.frame_gap_ms,
+            frame,
+        );
+    }
+    encode_arm_animation(out, host_id, animation.frame_gap_ms);
 }
 
 fn encode_display_placement(
@@ -1225,7 +1331,14 @@ fn kitty_format_code(format: KittyImageFormat) -> u32 {
     }
 }
 
-fn encode_kitty_data(out: &mut Vec<u8>, control: &str, data: &[u8]) {
+/// `continuation_extra` is appended to every continuation chunk's control data after `m=`.
+/// Plain image transmission needs nothing here — the spec has a continuation chunk carry only
+/// `m` and optionally `q`. Animation frame transmission (`a=f`) is the one exception: the spec
+/// requires every continuation chunk to also repeat `a=f`, or the terminal has no way to tell a
+/// continuation apart from the default `a=t` action and silently misroutes it. Confirmed live:
+/// without this, a chunked (>3072-byte) loop frame reached kitty but playback never advanced
+/// past the frame after it — see `sidebar_particle_field` verification notes.
+fn encode_kitty_data(out: &mut Vec<u8>, control: &str, continuation_extra: &str, data: &[u8]) {
     let mut chunks = data.chunks(KITTY_CHUNK_BYTES).peekable();
     let Some(first) = chunks.next() else {
         return;
@@ -1237,7 +1350,7 @@ fn encode_kitty_data(out: &mut Vec<u8>, control: &str, data: &[u8]) {
     while let Some(chunk) = chunks.next() {
         let more = if chunks.peek().is_some() { 1 } else { 0 };
         let encoded = base64::engine::general_purpose::STANDARD.encode(chunk);
-        let _ = write!(out, "\x1b_Gm={more};{encoded}\x1b\\");
+        let _ = write!(out, "\x1b_Gm={more}{continuation_extra};{encoded}\x1b\\");
     }
 }
 
@@ -1393,6 +1506,7 @@ mod tests {
                 image_id: 7,
             },
             scrollback_offset: 0,
+            animation: None,
             placement: KittyImagePlacement {
                 image_id: 7,
                 placement_id: 3,
@@ -1775,6 +1889,64 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    /// End-to-end through the same [`encode_local_pane_graphics`] entry point the real pty write
+    /// uses: the sidebar's ambient wash reaches the terminal as one `a=t` upload, its loop
+    /// frames as `a=f`, playback armed with `a=a`, and a second pass with nothing changed writes
+    /// nothing at all — the property `data/herdr-native-animation-playback-verify` confirmed on
+    /// a real terminal.
+    #[test]
+    fn sidebar_particle_field_arms_playback_through_the_full_pipeline() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        app.sidebar_particle_field = Some(
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                4,
+                4,
+                vec![1; 4 * 4 * 4],
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    z: -1,
+                    ..Default::default()
+                },
+            )
+            .with_animation(crate::app::state::GraphicsAnimation {
+                frame_gap_ms: 100,
+                frames: vec![vec![2; 4 * 4 * 4], vec![3; 4 * 4 * 4]],
+            }),
+        );
+
+        let mut cache = HostGraphicsCache::default();
+        let runtimes = TerminalRuntimeRegistry::new();
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("a=t"), "root frame uploaded");
+        assert_eq!(
+            text.matches("a=f").count(),
+            2,
+            "both loop frames transmitted"
+        );
+        assert!(text.contains("s=3,v=1"), "playback armed");
+
+        let bytes = encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            empty_surface(),
+            test_cell_size(),
+            &mut cache,
+        );
+        assert!(
+            bytes.is_empty(),
+            "an unchanged wash writes nothing on the next pass — the terminal owns the clock"
+        );
+    }
+
     #[test]
     fn sidebar_and_pane_layers_never_share_a_host_id() {
         let signature = ImageSignature {
@@ -2027,6 +2199,164 @@ mod tests {
         let moved_bytes = String::from_utf8_lossy(&bytes);
         assert!(!moved_bytes.contains("a=t"));
         assert!(moved_bytes.contains("a=p"));
+    }
+
+    #[test]
+    fn encode_transmit_frame_emits_a_f_with_dims_format_and_gap() {
+        let mut out = Vec::new();
+        encode_transmit_frame(&mut out, 42, 32, 10, 20, 600, &[1, 2, 3, 4]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("\x1b_Ga=f,i=42,f=32,s=10,v=20,z=600,q=2"));
+    }
+
+    /// A frame over one chunk (`KITTY_CHUNK_BYTES`) must repeat `a=f` on every continuation
+    /// chunk. Confirmed live against a real terminal: without this, kitty has no way to tell a
+    /// continuation chunk apart from the default `a=t` action, and a chunked frame's data never
+    /// properly lands — playback advances to it once and then stalls.
+    #[test]
+    fn encode_transmit_frame_repeats_a_f_on_every_continuation_chunk() {
+        let mut out = Vec::new();
+        let data = vec![7u8; KITTY_CHUNK_BYTES * 2 + 100];
+        encode_transmit_frame(&mut out, 42, 32, 100, 100, 600, &data);
+        let text = String::from_utf8_lossy(&out);
+        let chunks: Vec<&str> = text.split("\x1b_G").filter(|s| !s.is_empty()).collect();
+        assert_eq!(chunks.len(), 3, "3072*2+100 bytes needs 3 chunks");
+        assert!(chunks[0].starts_with("a=f,i=42,f=32,s=100,v=100,z=600,q=2,m=1;"));
+        assert!(
+            chunks[1].starts_with("m=1,a=f;"),
+            "continuation chunk missing the required a=f repeat: {:?}",
+            chunks[1]
+        );
+        assert!(
+            chunks[2].starts_with("m=0,a=f;"),
+            "final continuation chunk missing the required a=f repeat: {:?}",
+            chunks[2]
+        );
+    }
+
+    /// The plain (non-frame) upload path must NOT gain an `a=f` on its continuation chunks —
+    /// only animation frame transmission needs that repeat.
+    #[test]
+    fn encode_upload_image_continuation_chunks_stay_bare() {
+        let mut out = Vec::new();
+        let mut placement = test_placement(0, 0);
+        placement.placement.data = vec![7u8; KITTY_CHUNK_BYTES * 2 + 100];
+        encode_upload_image(
+            &mut out,
+            &placement,
+            kitty_format_code(placement.placement.format),
+            42,
+        );
+        let text = String::from_utf8_lossy(&out);
+        let chunks: Vec<&str> = text.split("\x1b_G").filter(|s| !s.is_empty()).collect();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[1].starts_with("m=1;"), "{:?}", chunks[1]);
+        assert!(chunks[2].starts_with("m=0;"), "{:?}", chunks[2]);
+    }
+
+    #[test]
+    fn encode_arm_animation_sets_root_gap_before_starting_loop_playback() {
+        let mut out = Vec::new();
+        encode_arm_animation(&mut out, 42, 600);
+        let text = String::from_utf8_lossy(&out);
+        let root_gap = "\x1b_Ga=a,i=42,r=1,z=600,q=2;\x1b\\";
+        let play = "\x1b_Ga=a,i=42,s=3,v=1,q=2;\x1b\\";
+        assert!(
+            text.starts_with(root_gap),
+            "the root frame carries no gap of its own by spec, so it must be set before the \
+             loop-back leg plays"
+        );
+        assert!(text.ends_with(play));
+    }
+
+    #[test]
+    fn encode_animation_frames_is_a_noop_with_no_extra_frames() {
+        let mut out = Vec::new();
+        encode_animation_frames(
+            &mut out,
+            1,
+            32,
+            10,
+            10,
+            &crate::app::state::GraphicsAnimation {
+                frame_gap_ms: 100,
+                frames: Vec::new(),
+            },
+        );
+        assert!(
+            out.is_empty(),
+            "a layer that opted into animation but has no extra frames must not arm playback \
+             it never uploaded frames for"
+        );
+    }
+
+    /// The same property proved on a real terminal in
+    /// `data/herdr-native-animation-playback-verify`: one upload transmits every loop frame and
+    /// arms playback, and a second pass over an unchanged animated layer produces zero further
+    /// bytes — from there the terminal's own clock is what advances frames, not another Herdr
+    /// write.
+    #[test]
+    fn animated_layer_transmits_frames_and_arms_playback_exactly_once() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+
+        fn animation() -> crate::app::state::GraphicsAnimation {
+            // Under one KITTY_CHUNK_BYTES chunk each, so "one a=f per frame" holds exactly —
+            // chunking's own "a=f" repeat-per-continuation-chunk behavior has its own dedicated
+            // test (`encode_transmit_frame_repeats_a_f_on_every_continuation_chunk`).
+            crate::app::state::GraphicsAnimation {
+                frame_gap_ms: 100,
+                frames: vec![vec![9; 20 * 20 * 4], vec![10; 20 * 20 * 4]],
+            }
+        }
+
+        let mut placement = test_placement(0, 0);
+        placement.animation = Some(animation());
+
+        encode_graphics_update(
+            &mut bytes,
+            &[placement],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        let first = String::from_utf8_lossy(&bytes);
+        assert!(
+            first.contains("a=t"),
+            "the root frame still uploads via the existing path"
+        );
+        assert_eq!(
+            first.matches("a=f").count(),
+            2,
+            "one a=f per extra loop frame"
+        );
+        assert!(
+            first.contains("a=a"),
+            "playback armed after the frames land"
+        );
+        assert!(
+            first.contains("s=3,v=1"),
+            "loop mode armed, not just the root gap set"
+        );
+
+        bytes.clear();
+        let mut same = test_placement(0, 0);
+        same.animation = Some(animation());
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        assert!(
+            bytes.is_empty(),
+            "an unchanged animated layer re-arms nothing on a later pass"
+        );
     }
 
     #[test]

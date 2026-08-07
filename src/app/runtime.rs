@@ -367,6 +367,7 @@ impl App {
         changed |= self.advance_relation_signals(now, true);
         changed |= self.sample_pane_activity(now);
         changed |= self.observe_signal_tray(now);
+        changed |= self.observe_sidebar_particle_field();
 
         if self
             .selection_autoscroll_deadline
@@ -848,6 +849,76 @@ impl App {
         crate::ui::signal_tray_motion_fingerprint(&self.state).hash(&mut hasher);
         format!("{:?}", self.state.palette.peach).hash(&mut hasher);
         format!("{:?}", self.state.host_terminal_theme.background).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// (Re-)generate the sidebar's ambient particle-field wash when its size has moved.
+    ///
+    /// Unlike the tray's badges, this loop is not free to regenerate — it is a whole animation
+    /// sequence — so it is redone only when [`Self::sidebar_particle_field_key`] moves (a
+    /// resize), never once per tick. Once generated, uploading and arming playback is
+    /// `kitty_graphics`'s job (`GraphicsLayer::animation`); this only owns producing the pixels.
+    pub(crate) fn observe_sidebar_particle_field(&mut self) -> bool {
+        if !self.state.kitty_graphics_enabled
+            || !self.state.sidebar_particle_field_enabled
+            || !self.state.host_cell_size.is_known()
+        {
+            let had = self.state.sidebar_particle_field.take().is_some();
+            self.state.sidebar_particle_field_key = 0;
+            return had;
+        }
+
+        let cell = self.state.host_cell_size;
+        let key = self.sidebar_particle_field_key(cell);
+        if key == self.state.sidebar_particle_field_key
+            && self.state.sidebar_particle_field.is_some()
+        {
+            return false;
+        }
+
+        let Some(generated) = crate::ui::sidebar::particle_background::image(
+            &self.state,
+            cell.width_px,
+            cell.height_px,
+        ) else {
+            let had = self.state.sidebar_particle_field.take().is_some();
+            self.state.sidebar_particle_field_key = 0;
+            return had;
+        };
+
+        self.state.sidebar_particle_field_key = key;
+        self.state.sidebar_particle_field = Some(
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                generated.width,
+                generated.height,
+                generated.root,
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                    // Under any text the sidebar draws over it, over the cell background: an
+                    // ambient backdrop rather than something that could obscure a row.
+                    z: -1,
+                },
+            )
+            .with_animation(crate::app::state::GraphicsAnimation {
+                frame_gap_ms: crate::ui::sidebar::particle_background::FRAME_GAP_MS,
+                frames: generated.extra_frames,
+            }),
+        );
+        true
+    }
+
+    /// Everything the wash's pixels depend on, folded into one number.
+    fn sidebar_particle_field_key(&self, cell: crate::kitty_graphics::HostCellSize) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let area = crate::ui::sidebar_particle_field_rect(&self.state);
+        (area.width, area.height).hash(&mut hasher);
+        (cell.width_px, cell.height_px).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -1780,6 +1851,19 @@ mod tests {
         app
     }
 
+    fn particle_field_app() -> super::super::App {
+        let (mut app, _) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.kitty_graphics_enabled = true;
+        app.state.sidebar_particle_field_enabled = true;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 24, 30);
+        app
+    }
+
     fn set_first_pane_state(app: &mut super::super::App, state: crate::detect::AgentState) {
         let pane = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
@@ -1967,6 +2051,68 @@ mod tests {
         // Asked again at the same instant, nothing has moved and nothing is
         // redrawn: the badge costs a raster per frame it moves, not per pass.
         assert!(!app.refresh_signal_tray_graphics());
+    }
+
+    #[test]
+    fn sidebar_particle_field_generates_once_and_holds_still_on_a_repeat_pass() {
+        let mut app = particle_field_app();
+
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "an enabled, sized wash generated nothing"
+        );
+        let layer = app
+            .state
+            .sidebar_particle_field
+            .as_ref()
+            .expect("wash generated");
+        assert!(layer
+            .animation
+            .as_ref()
+            .is_some_and(|a| !a.frames.is_empty()));
+        let key = app.state.sidebar_particle_field_key;
+
+        // Nothing about the sidebar moved, so the whole loop is not regenerated: generating a
+        // full animation sequence per tick is exactly the per-frame cost this transport exists
+        // to avoid paying.
+        assert!(!app.observe_sidebar_particle_field());
+        assert_eq!(key, app.state.sidebar_particle_field_key);
+    }
+
+    #[test]
+    fn sidebar_particle_field_regenerates_when_the_sidebar_is_resized() {
+        let mut app = particle_field_app();
+        assert!(app.observe_sidebar_particle_field());
+        let first_key = app.state.sidebar_particle_field_key;
+
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 30);
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "a resize did not regenerate the wash"
+        );
+        assert_ne!(first_key, app.state.sidebar_particle_field_key);
+    }
+
+    #[test]
+    fn sidebar_particle_field_disabled_generates_nothing() {
+        let mut app = particle_field_app();
+        app.state.sidebar_particle_field_enabled = false;
+        assert!(!app.observe_sidebar_particle_field());
+        assert!(app.state.sidebar_particle_field.is_none());
+    }
+
+    #[test]
+    fn sidebar_particle_field_retires_when_turned_off_after_generating() {
+        let mut app = particle_field_app();
+        assert!(app.observe_sidebar_particle_field());
+        assert!(app.state.sidebar_particle_field.is_some());
+
+        app.state.sidebar_particle_field_enabled = false;
+        assert!(
+            app.observe_sidebar_particle_field(),
+            "turning the wash off did not report a change to redraw"
+        );
+        assert!(app.state.sidebar_particle_field.is_none());
     }
 
     #[test]
