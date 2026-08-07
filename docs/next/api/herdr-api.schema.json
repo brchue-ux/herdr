@@ -4528,7 +4528,7 @@
           "description": "A transient relation between two runtime entities.\n\nFire-and-forget: never persisted, never part of agent state, never part of\nseen/unseen. A report that is dropped costs a decoration and nothing else,\nwhich is why every reason to drop one — an unknown workspace, a replayed\n`seq`, a layout with nowhere to put it — answers success rather than an\nerror. A publisher can retry blindly and can never fail a turn on this call.",
           "properties": {
             "from_workspace_id": {
-              "description": "Required for `completed`; the origin of a `transfer`.",
+              "description": "Required for `completed`; the origin of a `transfer`.\n\nA workspace id or a pane id: a worker is a pane, so a report about a\nworker's own outcome names its pane, and a report about a mate names\nits workspace. Herdr resolves whichever the id spells.",
               "type": [
                 "string",
                 "null"
@@ -4551,7 +4551,7 @@
               "type": "string"
             },
             "to_workspace_id": {
-              "description": "Required for `transfer`.",
+              "description": "Required for `transfer`. A workspace id or a pane id, as above.",
               "type": [
                 "string",
                 "null"

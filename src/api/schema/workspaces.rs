@@ -96,9 +96,13 @@ pub struct WorkspaceReportSignalParams {
     pub source: String,
     pub kind: WorkspaceSignalKind,
     /// Required for `completed`; the origin of a `transfer`.
+    ///
+    /// A workspace id or a pane id: a worker is a pane, so a report about a
+    /// worker's own outcome names its pane, and a report about a mate names
+    /// its workspace. Herdr resolves whichever the id spells.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_workspace_id: Option<String>,
-    /// Required for `transfer`.
+    /// Required for `transfer`. A workspace id or a pane id, as above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_workspace_id: Option<String>,
     /// Monotonic per source. A report at or below the last accepted value is
