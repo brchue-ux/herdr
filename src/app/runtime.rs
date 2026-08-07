@@ -1268,6 +1268,7 @@ impl App {
     /// past `now` on every pass and it would never fire.
     pub(crate) fn refresh_state_age_clock(&mut self, now: Instant) {
         self.state.state_age_now = now;
+        self.state.wall_now = std::time::SystemTime::now();
     }
 
     /// Arm the deadline that forces a repaint when nothing else would.
@@ -1279,6 +1280,7 @@ impl App {
     /// is reading.
     pub(crate) fn sync_state_age_timer(&mut self, now: Instant, has_viewers: bool) {
         self.state.state_age_now = now;
+        self.state.wall_now = std::time::SystemTime::now();
         self.next_state_age_tick = has_viewers
             .then(|| self.state.next_sidebar_state_age_tick(now))
             .flatten();

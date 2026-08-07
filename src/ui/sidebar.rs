@@ -318,6 +318,7 @@ fn workspace_row_height(
             terminal_title_stripped: terminal_title.stripped.as_deref(),
             tokens: &token_values,
             suppress_git_details: worktree_child,
+            wall_now: app.wall_now,
         },
     );
     shell_row_height(
@@ -2375,6 +2376,8 @@ fn flexible_token_width(token: &ResolvedToken) -> usize {
         | ResolvedTokenKind::Agent(text)
         | ResolvedTokenKind::TerminalTitle(text)
         | ResolvedTokenKind::Branch(text)
+        | ResolvedTokenKind::QuotaSession(text)
+        | ResolvedTokenKind::QuotaWeekly(text)
         | ResolvedTokenKind::Custom(text) => display_width(text),
         _ => 0,
     }
@@ -2758,6 +2761,29 @@ fn resolved_token_spans(
                     &mut spans,
                     truncate_end(text, budgets[index]),
                     custom_style,
+                    token.style,
+                    anim,
+                );
+            }
+            // The two quota windows draw in two different hues rather than
+            // sharing `custom_style` on purpose: they are already two rows
+            // and two label words apart, and a colour split is the third,
+            // cheapest axis the readability requirement asks for - a reader
+            // who cannot separate the words still separates the colour.
+            ResolvedTokenKind::QuotaSession(text) => {
+                push_token_span(
+                    &mut spans,
+                    truncate_end(text, budgets[index]),
+                    Style::default().fg(p.blue),
+                    token.style,
+                    anim,
+                );
+            }
+            ResolvedTokenKind::QuotaWeekly(text) => {
+                push_token_span(
+                    &mut spans,
+                    truncate_end(text, budgets[index]),
+                    Style::default().fg(p.mauve),
                     token.style,
                     anim,
                 );
@@ -4552,6 +4578,7 @@ fn render_workspace_list(
                 terminal_title_stripped: terminal_title.stripped.as_deref(),
                 tokens: &token_values,
                 suppress_git_details: card.worktree_child,
+                wall_now: app.wall_now,
             },
         );
         // The same call the layout made when it decided this row's height, so
