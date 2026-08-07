@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.minimize`, `pane.dormant.reappear`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
 | Surface | `surface.graphics.info`, `surface.graphics.set`, `surface.graphics.clear` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio`, `layout.arrange` |
@@ -403,6 +403,57 @@ Omitting `pane_id` targets the server's active focused pane. The response is
 `reason`, `pane_id`, `focused_pane_id`, `zoomed`, and `layout`. `changed` is
 true when either zoom state or focus changed. Reason values are `single_pane`,
 `already_zoomed`, and `already_unzoomed`.
+
+`pane.minimize` detaches the whole tab `pane_id` belongs to from its
+workspace's live tree — the tab and every pane inside it, together, as one
+unit — without touching any of their `TerminalRuntime`s. A minimized tab's
+processes keep running and its panes keep reporting live agent status; it is
+simply not attached anywhere a client can see it:
+
+```json
+{"id":"req_minimize","method":"pane.minimize","params":{"pane_id":"w1:p2"}}
+```
+
+Omitting `pane_id` targets the server's active focused pane. The response is
+`type: "pane_minimize"` with `changed`, optional `reason`, `terminal_ids` (the
+terminal id of every pane that was in the minimized tab), and `workspace_id`.
+The only reason value is `only_tab_in_workspace` — minimizing a workspace's
+last tab is refused rather than leaving the workspace with no visible tab.
+Herdr does not enforce which tabs may be minimized beyond that; a caller is
+expected not to minimize a tab it wants to keep visible.
+
+`pane.dormant.reappear` reattaches a minimized tab, keyed by `terminal_id` —
+once a tab is minimized its `pane_id` no longer resolves, so `terminal_id` is
+the only handle that survives:
+
+```json
+{"id":"req_reappear","method":"pane.dormant.reappear","params":{"terminal_id":"term_abc123","focus":false}}
+```
+
+`focus` defaults to `false` so a reappear does not steal attention by default.
+The response is `type: "pane_dormant_reappear"` with `changed`, optional
+`reason`, and the reattached `pane` — this is the only place a caller learns
+the pane's freshly assigned public `pane_id`, since minimizing frees its old
+number for reuse. The call is idempotent: reappearing an already-visible pane
+(a retried call, or one reattached through some other path) returns
+`changed: false` with `reason: "already_visible"` and the pane's current
+location, rather than erroring or moving it again. A `terminal_id` that was
+never minimized, was already explicitly closed while dormant, or belonged to a
+process that has since exited returns `code: "not_found"`.
+
+A minimized tab reappearing — whether through an explicit
+`pane.dormant.reappear` call or automatically (see below) — emits the same
+`pane.created` and `layout.updated` events a genuine new pane spawn would.
+Nothing in the event stream lets a subscriber tell a reappear apart from a
+fresh spawn, matching how `pane.move` already keeps a moved pane's terminal
+identity opaque to subscribers.
+
+Herdr also reappears a dormant pane automatically, with no caller involved,
+the instant that pane's live agent status transitions into `working` — the
+same signal a plain caller watches to learn work has resumed. A pane dormant
+while already `working` is unaffected (nothing "started"), and a transition
+into `idle`, `blocked`, or `unknown` does not trigger it (work finishing or
+staying blocked is not work starting). This auto-reappear is not configurable.
 
 The CLI wrapper for `notification.show` is:
 
@@ -912,9 +963,13 @@ Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
 `workspace_id`, requested `insert_index`, and updated ordered `tabs` list for
 that workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
-`pane.moved`, `pane.exited`, `pane.agent_detected`,
+`pane.moved`, `pane.exited`, `pane.dormant.exited`, `pane.agent_detected`,
 `pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.
 Terminal-title changes can emit `pane.updated`, but spinner-only raw-title changes do not emit it when `terminal_title_stripped` is unchanged.
+`pane.dormant.exited` reports a minimized pane's process exiting — it carries
+`terminal_id` instead of `pane_id`/`workspace_id`, since a dormant pane has
+neither; `pane.exited` never fires for a dormant pane, because it requires a
+live `pane_id` to report under.
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.

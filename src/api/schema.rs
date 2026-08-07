@@ -143,6 +143,10 @@ pub enum Method {
     PaneMove(PaneMoveParams),
     #[serde(rename = "pane.zoom")]
     PaneZoom(PaneZoomParams),
+    #[serde(rename = "pane.minimize")]
+    PaneMinimize(PaneMinimizeParams),
+    #[serde(rename = "pane.dormant.reappear")]
+    PaneDormantReappear(PaneDormantReappearParams),
     #[serde(rename = "pane.layout")]
     PaneLayout(PaneLayoutParams),
     #[serde(rename = "pane.process_info")]

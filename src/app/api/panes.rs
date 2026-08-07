@@ -2,11 +2,12 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCurrentParams,
-    PaneDeclareAgentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
-    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneDeclareAgentParams, PaneDirection, PaneDormantReappearParams, PaneDormantReappearReason,
+    PaneDormantReappearResult, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
+    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneLayoutPane, PaneLayoutParams,
+    PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMinimizeParams,
+    PaneMinimizeReason, PaneMinimizeResult, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
@@ -1129,6 +1130,138 @@ impl App {
                     focused_pane_id,
                     zoomed: outcome.zoomed,
                     layout,
+                },
+            },
+        )
+    }
+
+    /// Detaches the whole tab `params.pane_id` (or the focused pane, if omitted)
+    /// belongs to from its workspace's live tree — pane and tab together, as one unit
+    /// — without touching any of its panes' `TerminalRuntime`s. Mirrors
+    /// `handle_tab_close` exactly, except it stops before the kill calls
+    /// (`remove_unattached_terminal_ids`/`shutdown_detached_terminal_runtimes`) and
+    /// hands the removed `Tab` to the dormant registry instead.
+    pub(super) fn handle_pane_minimize(
+        &mut self,
+        id: String,
+        params: PaneMinimizeParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        let Some(tab_idx) = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id) else {
+            return pane_not_found(
+                id,
+                &self.public_pane_id(ws_idx, pane_id).unwrap_or_default(),
+            );
+        };
+        let workspace_id = self.public_workspace_id(ws_idx);
+        if self.state.workspaces[ws_idx].tabs.len() <= 1 {
+            return encode_success(
+                id,
+                ResponseResult::PaneMinimize {
+                    minimize: PaneMinimizeResult {
+                        changed: false,
+                        reason: Some(PaneMinimizeReason::OnlyTabInWorkspace),
+                        terminal_ids: Vec::new(),
+                        workspace_id,
+                    },
+                },
+            );
+        }
+
+        let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
+        let pane_ids: Vec<PaneId> = self.state.workspaces[ws_idx].tabs[tab_idx]
+            .panes
+            .keys()
+            .copied()
+            .collect();
+        let Some(tab) = self.state.workspaces[ws_idx].take_tab_for_dormancy(tab_idx) else {
+            return encode_error(id, "pane_minimize_failed", "tab could not be minimized");
+        };
+        self.state.remove_plugin_pane_records(pane_ids);
+        self.state
+            .dormant_tabs
+            .insert(tab, workspace_id.clone(), std::time::Instant::now());
+        self.schedule_session_save();
+
+        encode_success(
+            id,
+            ResponseResult::PaneMinimize {
+                minimize: PaneMinimizeResult {
+                    changed: true,
+                    reason: None,
+                    terminal_ids: terminal_ids.iter().map(|t| t.to_string()).collect(),
+                    workspace_id,
+                },
+            },
+        )
+    }
+
+    /// Reattaches a dormant pane's tab, keyed by `terminal_id` — the only handle that
+    /// survives minimize, since the pane's own `pane_id` stops resolving the moment its
+    /// tab leaves the live tree. Emits the same `pane.created` + `layout.updated` events
+    /// a genuine new pane spawn would, by design: nothing about the event stream lets a
+    /// subscriber tell a reappear apart from a fresh spawn.
+    pub(super) fn handle_pane_dormant_reappear(
+        &mut self,
+        id: String,
+        params: PaneDormantReappearParams,
+    ) -> String {
+        let terminal_id = crate::terminal::TerminalId::from_string(params.terminal_id.clone());
+
+        // Idempotent: already attached to a live pane (this call retried after a
+        // timeout, or the pane already reappeared through some other path). Report
+        // success with wherever it currently lives rather than erroring or re-moving it.
+        if let Some((ws_idx, pane_id)) = self.state.find_live_pane_by_terminal_id(&terminal_id) {
+            let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+                return encode_error(id, "pane_not_found", "pane not found");
+            };
+            return encode_success(
+                id,
+                ResponseResult::PaneDormantReappear {
+                    reappear: PaneDormantReappearResult {
+                        changed: false,
+                        reason: Some(PaneDormantReappearReason::AlreadyVisible),
+                        pane: Box::new(pane),
+                    },
+                },
+            );
+        }
+
+        let Some((dormant_id, pane_id)) = self.state.dormant_tabs.find_by_terminal_id(&terminal_id)
+        else {
+            // Covers both "never dormant" (stale caller bookkeeping) and "was dormant
+            // but its process already died" — the PaneDied-for-dormant-panes fix
+            // (`handle_dormant_pane_died`) already removes a dead pane's registry entry
+            // reactively, so by the time this runs there is no separate zombie state
+            // left to distinguish from "not found" here.
+            return encode_error(id, "not_found", "terminal not found");
+        };
+        let Some(reappeared) = self.state.reappear_dormant_tab(dormant_id, params.focus) else {
+            return encode_error(id, "not_found", "terminal not found");
+        };
+        self.schedule_session_save();
+        // `reappear_dormant_tab` reinserts the exact `Tab` value that was removed —
+        // unlike the original per-pane design, tab-level dormancy never rebuilds
+        // `PaneState` or reassigns `pane_id`, so the id `find_by_terminal_id` returned
+        // above is still the right key to look this pane up by.
+        let Some(pane) = self.pane_info(reappeared.ws_idx, pane_id) else {
+            return encode_error(id, "pane_not_found", "pane not found");
+        };
+        self.emit_event(EventEnvelope {
+            event: EventKind::PaneCreated,
+            data: EventData::PaneCreated { pane: pane.clone() },
+        });
+        self.emit_layout_updated_event(reappeared.ws_idx, reappeared.tab_idx);
+
+        encode_success(
+            id,
+            ResponseResult::PaneDormantReappear {
+                reappear: PaneDormantReappearResult {
+                    changed: true,
+                    reason: None,
+                    pane: Box::new(pane),
                 },
             },
         )
@@ -4308,5 +4441,332 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Dormant tab minimize / reappear
+    // -----------------------------------------------------------------
+
+    fn app_with_two_tab_workspace() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("main")];
+        app.state.workspaces[0].test_add_tab(Some("worker"));
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    /// Returns (app, worker pane id, worker terminal id, worker pane's current public id).
+    fn minimizable_worker_fixture() -> (App, PaneId, crate::terminal::TerminalId, String) {
+        let app = app_with_two_tab_workspace();
+        let worker_pane_id = app.state.workspaces[0].tabs[1].root_pane;
+        let worker_terminal_id = app.state.workspaces[0].tabs[1]
+            .terminal_id(worker_pane_id)
+            .unwrap()
+            .clone();
+        let public_pane_id = app.public_pane_id(0, worker_pane_id).unwrap();
+        (app, worker_pane_id, worker_terminal_id, public_pane_id)
+    }
+
+    #[test]
+    fn api_pane_minimize_detaches_tab_but_keeps_terminal_alive() {
+        let (mut app, _worker_pane_id, worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+
+        let response = app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneMinimize { minimize } = success.result else {
+            panic!("expected pane minimize response");
+        };
+        assert!(minimize.changed);
+        assert_eq!(minimize.reason, None);
+        assert_eq!(minimize.terminal_ids, vec![worker_terminal_id.to_string()]);
+
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            1,
+            "the minimized tab must leave the live tree"
+        );
+        assert_eq!(app.state.dormant_tabs.len(), 1);
+        assert!(
+            app.state.terminals.contains_key(&worker_terminal_id),
+            "minimizing must not kill the pane's terminal"
+        );
+    }
+
+    #[test]
+    fn api_pane_minimize_refuses_only_tab_in_workspace() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+
+        let response = app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneMinimize { minimize } = success.result else {
+            panic!("expected pane minimize response");
+        };
+        assert!(!minimize.changed);
+        assert_eq!(
+            minimize.reason,
+            Some(PaneMinimizeReason::OnlyTabInWorkspace)
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.dormant_tabs.len(), 0);
+    }
+
+    #[test]
+    fn api_pane_dormant_reappear_restores_same_pane_and_terminal_id() {
+        let (mut app, worker_pane_id, worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req1".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+
+        let response = app.handle_pane_dormant_reappear(
+            "req2".into(),
+            PaneDormantReappearParams {
+                terminal_id: worker_terminal_id.to_string(),
+                focus: false,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneDormantReappear { reappear } = success.result else {
+            panic!("expected pane dormant reappear response");
+        };
+        assert!(reappear.changed);
+        assert_eq!(reappear.reason, None);
+        assert_eq!(reappear.pane.terminal_id, worker_terminal_id.to_string());
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.dormant_tabs.len(), 0);
+        assert_eq!(
+            app.state.workspaces[0].tabs[1].root_pane, worker_pane_id,
+            "reappear must reuse the exact same PaneId, not allocate a new one"
+        );
+        assert_eq!(
+            reappear.pane.pane_id,
+            app.public_pane_id(0, worker_pane_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn api_pane_dormant_reappear_is_idempotent_when_already_visible() {
+        let (mut app, _worker_pane_id, worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req1".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+
+        let first = app.handle_pane_dormant_reappear(
+            "req2".into(),
+            PaneDormantReappearParams {
+                terminal_id: worker_terminal_id.to_string(),
+                focus: false,
+            },
+        );
+        let first_success: SuccessResponse = serde_json::from_str(&first).unwrap();
+        let ResponseResult::PaneDormantReappear {
+            reappear: first_reappear,
+        } = first_success.result
+        else {
+            panic!("expected pane dormant reappear response");
+        };
+        assert!(first_reappear.changed);
+
+        let second = app.handle_pane_dormant_reappear(
+            "req3".into(),
+            PaneDormantReappearParams {
+                terminal_id: worker_terminal_id.to_string(),
+                focus: false,
+            },
+        );
+        let second_success: SuccessResponse = serde_json::from_str(&second).unwrap();
+        let ResponseResult::PaneDormantReappear {
+            reappear: second_reappear,
+        } = second_success.result
+        else {
+            panic!("expected pane dormant reappear response");
+        };
+        assert!(!second_reappear.changed);
+        assert_eq!(
+            second_reappear.reason,
+            Some(PaneDormantReappearReason::AlreadyVisible)
+        );
+        assert_eq!(second_reappear.pane.pane_id, first_reappear.pane.pane_id);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+    }
+
+    #[test]
+    fn api_pane_dormant_reappear_errors_for_unknown_terminal_id() {
+        let (mut app, _public_pane_id) = app_with_test_workspace();
+
+        let response = app.handle_pane_dormant_reappear(
+            "req".into(),
+            PaneDormantReappearParams {
+                terminal_id: "term_does_not_exist".into(),
+                focus: false,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "not_found");
+    }
+
+    #[test]
+    fn dormant_pane_status_write_back_updates_terminal_state_while_hidden() {
+        let (mut app, worker_pane_id, worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+        assert_eq!(
+            app.state.terminals[&worker_terminal_id].state,
+            AgentState::Unknown
+        );
+
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id: worker_pane_id,
+                agent: Some(Agent::Claude),
+                state: AgentState::Blocked,
+                visible_blocker: true,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+
+        assert_eq!(
+            app.state.terminals[&worker_terminal_id].state,
+            AgentState::Blocked,
+            "a dormant pane's detected status must not freeze"
+        );
+    }
+
+    #[test]
+    fn dormant_pane_auto_reappears_when_state_transitions_to_working() {
+        let (mut app, worker_pane_id, _worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id: worker_pane_id,
+                agent: Some(Agent::Claude),
+                state: AgentState::Working,
+                visible_blocker: false,
+                visible_working: true,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+
+        assert_eq!(
+            app.state.dormant_tabs.len(),
+            0,
+            "bucket B must auto-reappear the instant the pane starts working"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.dormant_reappeared_pending.len(), 1);
+    }
+
+    #[test]
+    fn dormant_pane_does_not_auto_reappear_on_transition_to_blocked() {
+        let (mut app, worker_pane_id, _worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id: worker_pane_id,
+                agent: Some(Agent::Claude),
+                state: AgentState::Blocked,
+                visible_blocker: true,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+
+        assert_eq!(
+            app.state.dormant_tabs.len(),
+            1,
+            "bucket A stays dormant until an explicit pane.dormant.reappear call"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.dormant_reappeared_pending.len(), 0);
+    }
+
+    #[test]
+    fn dormant_pane_died_cleans_up_registry_and_reports_exit() {
+        let (mut app, worker_pane_id, worker_terminal_id, public_pane_id) =
+            minimizable_worker_fixture();
+        app.handle_pane_minimize(
+            "req".into(),
+            PaneMinimizeParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+        assert_eq!(app.state.dormant_tabs.len(), 1);
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: worker_pane_id,
+            exit: Some(crate::events::PaneExitStatus {
+                code: 1,
+                signal: None,
+            }),
+        });
+
+        assert_eq!(
+            app.state.dormant_tabs.len(),
+            0,
+            "PaneDied must clean up a dormant pane's registry entry, not leave a zombie"
+        );
+        assert!(!app.state.terminals.contains_key(&worker_terminal_id));
+
+        let events = app.event_hub.events_after(0);
+        assert!(
+            events.iter().any(|(_, envelope)| matches!(
+                &envelope.data,
+                crate::api::schema::EventData::PaneDormantExited { terminal_id, .. }
+                    if *terminal_id == worker_terminal_id.to_string()
+            )),
+            "a dormant pane dying must still be reported externally"
+        );
     }
 }

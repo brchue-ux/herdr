@@ -7,9 +7,10 @@ use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
 use super::panes::{
-    LayoutArrangement, LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo,
-    PaneLayoutSnapshot, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
-    PaneResizeResult, PaneSwapResult, PaneZoomResult,
+    LayoutArrangement, LayoutDescription, PaneDormantReappearResult, PaneEdgesResult,
+    PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot, PaneMinimizeResult, PaneMoveResult,
+    PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult, PaneSwapResult,
+    PaneZoomResult,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -137,6 +138,12 @@ pub enum ResponseResult {
     },
     PaneZoom {
         zoom: PaneZoomResult,
+    },
+    PaneMinimize {
+        minimize: PaneMinimizeResult,
+    },
+    PaneDormantReappear {
+        reappear: PaneDormantReappearResult,
     },
     PaneLayout {
         layout: PaneLayoutSnapshot,

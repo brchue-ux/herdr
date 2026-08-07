@@ -212,6 +212,23 @@ the user dragged is persisted as `sidebar_width` in `session.json` and overrides
 the `config.toml` default, and a panel loses one more column to its scrollbar as
 soon as the list outgrows the pane, so the PTY has to be as tall as theirs.
 
+Launching from inside a Herdr pane can also be unblocked without touching
+config: clear `HERDR_ENV` (`env -u HERDR_ENV ...`) alongside the socket
+overrides above, same effect as `[experimental] allow_nested = true` with no
+private config file needed. A **named** session (`--session <name>`) is a
+second, independent scope on top of `XDG_CONFIG_HOME` — every CLI command
+against it, including `herdr status`, needs the same `--session <name>`
+repeated, or it silently resolves the *default* session's socket under that
+same config dir instead of erroring. To exercise a brand-new socket method
+that has no CLI wrapper yet (no `herdr <group> <verb>` exists for it), talk to
+`$XDG_CONFIG_HOME/herdr-dev/sessions/<name>/herdr.sock` directly: it is
+newline-delimited JSON over a Unix socket, so a small Python script that
+`sendall`s one `{"id", "method", "params"}` line and reads one response line
+back is enough. `events.subscribe` over a second connection on the same
+socket, left open for the duration, is the only way to confirm two calls
+produced literally the same event shape (e.g. a reappeared pane's
+`pane.created` payload against a freshly spawned one's).
+
 For a mouse bug, run that private TUI inside a pane of a second private fleet
 and read it with `pane read <pane> --source visible --format text`. Herdr is
 the terminal emulator, so no external one is needed. Drive it by sending raw

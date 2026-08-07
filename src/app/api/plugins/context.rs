@@ -186,6 +186,10 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            // A dormant pane's death has no live workspace/pane to attach a plugin
+            // invocation context to — it is, by construction, not a member of any
+            // workspace's live tree.
+            EventData::PaneDormantExited { .. } => empty_plugin_context(correlation_id),
         }
     }
 

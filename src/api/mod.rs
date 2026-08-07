@@ -57,6 +57,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneSwap(_)
             | Method::PaneMove(_)
             | Method::PaneZoom(_)
+            | Method::PaneMinimize(_)
+            | Method::PaneDormantReappear(_)
             | Method::PaneFocusDirection(_)
             | Method::PaneResize(_)
             | Method::PaneFocus(_)

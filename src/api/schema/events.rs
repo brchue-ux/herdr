@@ -60,6 +60,8 @@ pub enum Subscription {
     PaneMoved {},
     #[serde(rename = "pane.exited")]
     PaneExited {},
+    #[serde(rename = "pane.dormant.exited")]
+    PaneDormantExited {},
     #[serde(rename = "pane.agent_detected")]
     PaneAgentDetected {},
     #[serde(rename = "pane.output_matched")]
@@ -215,6 +217,9 @@ pub enum EventKind {
     PaneMoved,
     PaneOutputChanged,
     PaneExited,
+    /// A dormant (minimized) pane's process exited while it had no live `pane_id` to
+    /// report `pane.exited` under. See [`EventData::PaneDormantExited`].
+    PaneDormantExited,
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
@@ -246,6 +251,7 @@ impl EventKind {
             EventKind::PaneMoved => "pane.moved",
             EventKind::PaneOutputChanged => "pane.output_changed",
             EventKind::PaneExited => "pane.exited",
+            EventKind::PaneDormantExited => "pane.dormant.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
@@ -278,6 +284,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneMoved,
     EventKind::PaneOutputChanged,
     EventKind::PaneExited,
+    EventKind::PaneDormantExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
@@ -530,6 +537,16 @@ pub enum EventData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<u32>,
         /// Signal name when the process was terminated by a signal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_signal: Option<String>,
+    },
+    /// A dormant (minimized) pane's process exited. Distinct from `PaneExited`, which
+    /// requires a live `pane_id` to report under — a dormant pane has none, so this
+    /// carries `terminal_id` instead, the one handle that survives minimize.
+    PaneDormantExited {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_signal: Option<String>,
     },

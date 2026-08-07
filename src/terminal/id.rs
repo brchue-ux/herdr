@@ -24,6 +24,13 @@ impl TerminalId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wraps an id string received over the API (e.g. `pane.dormant.reappear`'s
+    /// `terminal_id` param) back into a `TerminalId` for lookup. Does not validate
+    /// format — an id that was never allocated simply matches nothing.
+    pub(crate) fn from_string(id: String) -> Self {
+        Self(id)
+    }
 }
 
 impl fmt::Display for TerminalId {

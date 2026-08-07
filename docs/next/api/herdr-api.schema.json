@@ -638,6 +638,37 @@
               "type": "object"
             },
             {
+              "description": "A dormant (minimized) pane's process exited. Distinct from `PaneExited`, which\nrequires a live `pane_id` to report under — a dormant pane has none, so this\ncarries `terminal_id` instead, the one handle that survives minimize.",
+              "properties": {
+                "exit_code": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exit_signal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_dormant_exited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -743,35 +774,44 @@
           ]
         },
         "EventKind": {
-          "enum": [
-            "workspace_created",
-            "workspace_updated",
-            "workspace_metadata_updated",
-            "workspace_closed",
-            "workspace_renamed",
-            "workspace_moved",
-            "workspace_reordered",
-            "workspace_focused",
-            "worktree_created",
-            "worktree_opened",
-            "worktree_removed",
-            "tab_created",
-            "tab_closed",
-            "tab_renamed",
-            "tab_moved",
-            "tab_focused",
-            "pane_created",
-            "pane_closed",
-            "pane_updated",
-            "pane_focused",
-            "pane_moved",
-            "pane_output_changed",
-            "pane_exited",
-            "pane_agent_detected",
-            "pane_agent_status_changed",
-            "layout_updated"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "workspace_created",
+                "workspace_updated",
+                "workspace_metadata_updated",
+                "workspace_closed",
+                "workspace_renamed",
+                "workspace_moved",
+                "workspace_reordered",
+                "workspace_focused",
+                "worktree_created",
+                "worktree_opened",
+                "worktree_removed",
+                "tab_created",
+                "tab_closed",
+                "tab_renamed",
+                "tab_moved",
+                "tab_focused",
+                "pane_created",
+                "pane_closed",
+                "pane_updated",
+                "pane_focused",
+                "pane_moved",
+                "pane_output_changed",
+                "pane_exited",
+                "pane_agent_detected",
+                "pane_agent_status_changed",
+                "layout_updated"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "pane_dormant_exited",
+              "description": "A dormant (minimized) pane's process exited while it had no live `pane_id` to\nreport `pane.exited` under. See [`EventData::PaneDormantExited`].",
+              "type": "string"
+            }
+          ]
         },
         "PaneActivityInfo": {
           "description": "How much work a pane is doing right now, sampled and smoothed by the server\non its own loop.\n\nReported rather than pushed: this is a continuously varying analog value on\na fixed sample cadence, so a subscriber that wants it reads it, and it never\nbecomes an event stream that scales with how loud a pane is. It is also not\npersisted — a server that just started reports every pane at rest and\nre-derives the level from the next few samples.",
@@ -2607,6 +2647,23 @@
           ],
           "type": "string"
         },
+        "PaneDormantReappearParams": {
+          "description": "Reattaches a dormant (minimized) pane's tab, keyed by `terminal_id` — a dormant\npane's `pane_id` no longer resolves, so `terminal_id` is the only handle that\nsurvives minimize. Idempotent: calling this again for an already-visible pane is a\nno-op success, not an error.",
+          "properties": {
+            "focus": {
+              "default": false,
+              "description": "Focus the reappeared pane once it's back. Defaults to `false` so an automatic\nor answered-in-the-background reappear doesn't steal the user's attention.",
+              "type": "boolean"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
+        },
         "PaneEdgesParams": {
           "properties": {
             "pane_id": {
@@ -2742,6 +2799,19 @@
         "PaneListParams": {
           "properties": {
             "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "PaneMinimizeParams": {
+          "description": "Minimizes the whole tab a pane belongs to: the tab and every pane inside it detach\nfrom the workspace's live tree together, as one unit, but every pane's terminal (and\nits live agent-status detection) stays running untouched. Reattach with\n`pane.dormant.reappear`, keyed by whichever pane's `terminal_id` you want back.",
+          "properties": {
+            "pane_id": {
+              "description": "Pane whose tab should be minimized. Defaults to the focused pane.",
               "type": [
                 "string",
                 "null"
@@ -4109,6 +4179,18 @@
               "properties": {
                 "type": {
                   "const": "pane.exited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "pane.dormant.exited",
                   "type": "string"
                 }
               },
@@ -5532,6 +5614,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneZoomParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.minimize",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneMinimizeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.dormant.reappear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneDormantReappearParams"
             }
           },
           "required": [
@@ -7389,6 +7503,37 @@
               "type": "object"
             },
             {
+              "description": "A dormant (minimized) pane's process exited. Distinct from `PaneExited`, which\nrequires a live `pane_id` to report under — a dormant pane has none, so this\ncarries `terminal_id` instead, the one handle that survives minimize.",
+              "properties": {
+                "exit_code": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exit_signal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_dormant_exited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "agent": {
                   "type": [
@@ -7509,35 +7654,44 @@
           "type": "object"
         },
         "EventKind": {
-          "enum": [
-            "workspace_created",
-            "workspace_updated",
-            "workspace_metadata_updated",
-            "workspace_closed",
-            "workspace_renamed",
-            "workspace_moved",
-            "workspace_reordered",
-            "workspace_focused",
-            "worktree_created",
-            "worktree_opened",
-            "worktree_removed",
-            "tab_created",
-            "tab_closed",
-            "tab_renamed",
-            "tab_moved",
-            "tab_focused",
-            "pane_created",
-            "pane_closed",
-            "pane_updated",
-            "pane_focused",
-            "pane_moved",
-            "pane_output_changed",
-            "pane_exited",
-            "pane_agent_detected",
-            "pane_agent_status_changed",
-            "layout_updated"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "workspace_created",
+                "workspace_updated",
+                "workspace_metadata_updated",
+                "workspace_closed",
+                "workspace_renamed",
+                "workspace_moved",
+                "workspace_reordered",
+                "workspace_focused",
+                "worktree_created",
+                "worktree_opened",
+                "worktree_removed",
+                "tab_created",
+                "tab_closed",
+                "tab_renamed",
+                "tab_moved",
+                "tab_focused",
+                "pane_created",
+                "pane_closed",
+                "pane_updated",
+                "pane_focused",
+                "pane_moved",
+                "pane_output_changed",
+                "pane_exited",
+                "pane_agent_detected",
+                "pane_agent_status_changed",
+                "layout_updated"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "pane_dormant_exited",
+              "description": "A dormant (minimized) pane's process exited while it had no live `pane_id` to\nreport `pane.exited` under. See [`EventData::PaneDormantExited`].",
+              "type": "string"
+            }
+          ]
         },
         "InstalledPluginInfo": {
           "properties": {
@@ -7865,6 +8019,38 @@
             "down"
           ],
           "type": "string"
+        },
+        "PaneDormantReappearReason": {
+          "enum": [
+            "already_visible"
+          ],
+          "type": "string"
+        },
+        "PaneDormantReappearResult": {
+          "properties": {
+            "changed": {
+              "type": "boolean"
+            },
+            "pane": {
+              "$ref": "#/schemas/success_response/$defs/PaneInfo",
+              "description": "The pane's current state — including its freshly assigned `pane_id`, which is\nthe only place a caller learns it (no `terminal_id`-keyed pane lookup exists)."
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneDormantReappearReason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "changed",
+            "pane"
+          ],
+          "type": "object"
         },
         "PaneEdgesResult": {
           "properties": {
@@ -8210,6 +8396,48 @@
             "direction",
             "ratio",
             "rect"
+          ],
+          "type": "object"
+        },
+        "PaneMinimizeReason": {
+          "oneOf": [
+            {
+              "const": "only_tab_in_workspace",
+              "description": "The pane's tab is the only tab left in its workspace — minimizing it would\nleave the workspace with no visible tab at all, so the call is refused instead.",
+              "type": "string"
+            }
+          ]
+        },
+        "PaneMinimizeResult": {
+          "properties": {
+            "changed": {
+              "type": "boolean"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneMinimizeReason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "terminal_ids": {
+              "description": "Terminal ids of every pane that was in the minimized tab, in no particular\norder — the handle to pass to a later `pane.dormant.reappear` call.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "changed",
+            "terminal_ids",
+            "workspace_id"
           ],
           "type": "object"
         },
@@ -9718,6 +9946,38 @@
               "required": [
                 "type",
                 "zoom"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "minimize": {
+                  "$ref": "#/schemas/success_response/$defs/PaneMinimizeResult"
+                },
+                "type": {
+                  "const": "pane_minimize",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "minimize"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reappear": {
+                  "$ref": "#/schemas/success_response/$defs/PaneDormantReappearResult"
+                },
+                "type": {
+                  "const": "pane_dormant_reappear",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "reappear"
               ],
               "type": "object"
             },

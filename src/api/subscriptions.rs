@@ -200,6 +200,10 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::PaneExited,
                 last_sequence: 0,
             })),
+            Subscription::PaneDormantExited {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::PaneDormantExited,
+                last_sequence: 0,
+            })),
             Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneAgentDetected,
                 last_sequence: 0,

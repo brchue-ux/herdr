@@ -1606,6 +1606,24 @@ impl AppState {
             .map(|pane| pane.attached_terminal_id.clone())
     }
 
+    /// Finds a pane currently attached to `terminal_id` somewhere in the live tree.
+    /// Used by `pane.dormant.reappear`'s idempotency check — a terminal id that no
+    /// longer resolves in the dormant registry but does resolve here means the pane
+    /// already reappeared (through this same call retried, or a manual reappear
+    /// elsewhere), which is a no-op success, not an error.
+    pub(crate) fn find_live_pane_by_terminal_id(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> Option<(usize, PaneId)> {
+        self.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+            ws.tabs.iter().find_map(|tab| {
+                tab.panes.iter().find_map(|(pane_id, pane)| {
+                    (&pane.attached_terminal_id == terminal_id).then_some((ws_idx, *pane_id))
+                })
+            })
+        })
+    }
+
     pub(crate) fn remove_unattached_terminal_ids(
         &mut self,
         terminal_ids: impl IntoIterator<Item = crate::terminal::TerminalId>,
@@ -3029,10 +3047,19 @@ impl AppState {
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {
-        let ws_idx = self
+        let Some(ws_idx) = self
             .workspaces
             .iter()
-            .position(|ws| ws.pane_state(pane_id).is_some())?;
+            .position(|ws| ws.pane_state(pane_id).is_some())
+        else {
+            // Not in any live workspace's tree — it may be a pane inside a dormant
+            // (minimized) tab, which keeps being scanned for agent status by design
+            // but has no live tab to resolve through. Without this fallback the
+            // write-back silently no-ops and a dormant pane's status freezes at
+            // whatever it last was.
+            self.update_dormant_terminal_state(pane_id, update);
+            return None;
+        };
         let terminal_id = self.workspaces[ws_idx]
             .pane_state(pane_id)?
             .attached_terminal_id
@@ -3095,6 +3122,104 @@ impl AppState {
             agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
         };
         Some(update)
+    }
+
+    /// Mirrors the live-pane write-back path above, but for a pane inside a currently
+    /// dormant (minimized) tab. There is no live `PaneStateUpdate` to report — a
+    /// dormant pane has no visible `pane_id` any client could correlate a status event
+    /// against — but the raw `AgentState` write into `TerminalState` still has to run,
+    /// or a dormant terminal's status freezes and bucket B's auto-reappear rule below
+    /// never has fresh state to observe.
+    fn update_dormant_terminal_state<F>(&mut self, pane_id: PaneId, update: F)
+    where
+        F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
+    {
+        let Some(dormant_id) = self.dormant_tabs.contains_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal_id) = self
+            .dormant_tabs
+            .get(dormant_id)
+            .and_then(|entry| entry.tab.panes.get(&pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return;
+        };
+        let now = Instant::now();
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let Some(mutation) = update(terminal) else {
+            return;
+        };
+        terminal.reconcile_managed_agent_at(now, false);
+        let Some(change) = mutation.effective_state_change else {
+            return;
+        };
+        if change.previous_state == change.state {
+            return;
+        }
+        self.next_agent_state_change_seq += 1;
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+            terminal.last_agent_state_change_at = Some(now);
+        }
+        // Bucket B, per the dormant-reappear trigger design: "if the pane can proceed to
+        // a state where work starts again, it should always auto move back" — scoped to
+        // the transition edge, not the resulting state, so a tab dormant while already
+        // `Working` stays put (nothing "started") and a transition into `Done`/`Unknown`
+        // does not reappear it (work finishing isn't work starting). Bucket A (blocked on
+        // a decision) has no rule here at all — it stays dormant until an explicit
+        // `pane.dormant.reappear` call.
+        if change.state == AgentState::Working {
+            if let Some(reappeared) = self.reappear_dormant_tab(dormant_id, false) {
+                self.dormant_reappeared_pending.push(reappeared);
+            }
+        }
+    }
+
+    /// Reinserts a dormant tab into the workspace it was minimized from, or into
+    /// `self.active` if that workspace no longer exists, optionally focusing it.
+    ///
+    /// Pure state mutation only — event emission (`pane.created`/`layout.updated`) is
+    /// the caller's job, since `AppState` does not emit events itself. Used by both the
+    /// explicit `pane.dormant.reappear` API handler and bucket B's internal auto-reappear
+    /// above.
+    pub(crate) fn reappear_dormant_tab(
+        &mut self,
+        dormant_id: crate::app::dormant::DormantTabId,
+        focus: bool,
+    ) -> Option<crate::app::dormant::ReappearedTab> {
+        let origin_workspace_id = self
+            .dormant_tabs
+            .get(dormant_id)?
+            .origin_workspace_id
+            .clone();
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == origin_workspace_id)
+            .or(self.active)
+            .or_else(|| (!self.workspaces.is_empty()).then_some(0))?;
+        let entry = self.dormant_tabs.remove(dormant_id)?;
+        let pane_ids: Vec<PaneId> = entry.tab.panes.keys().copied().collect();
+        info!(
+            dormant_secs = entry.dormant_at.elapsed().as_secs_f64(),
+            panes = pane_ids.len(),
+            "reappearing dormant tab"
+        );
+        let tab_idx = self
+            .workspaces
+            .get_mut(ws_idx)?
+            .insert_dormant_tab(entry.tab);
+        if focus {
+            self.switch_workspace_tab(ws_idx, tab_idx);
+        }
+        Some(crate::app::dormant::ReappearedTab {
+            ws_idx,
+            tab_idx,
+            pane_ids,
+        })
     }
 
     pub(crate) fn next_managed_agent_deadline(&self) -> Option<Instant> {
@@ -3455,7 +3580,7 @@ impl AppState {
             .position(|ws| ws.find_tab_index_for_pane(pane_id).is_some());
 
         let Some(ws_idx) = ws_idx else {
-            warn!(pane = pane_id.raw(), "PaneDied for unknown pane");
+            self.handle_dormant_pane_died(pane_id);
             return;
         };
 
@@ -3521,6 +3646,34 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);
         }
+    }
+
+    /// `handle_pane_died`'s fallback for a pane inside a dormant (minimized) tab —
+    /// process-exit monitoring runs independent of tree membership, exactly like
+    /// detection, so a dormant pane's process can die with nothing in the live tree to
+    /// notice. Without this, `TerminalRuntimeRegistry` keeps a zombie entry forever and
+    /// nothing is ever told anything died. The caller (`src/app/api.rs`) is responsible
+    /// for peeking the dormant registry *before* this runs and emitting an external
+    /// `pane.dormant.exited`-style event afterward — this method is pure state cleanup.
+    fn handle_dormant_pane_died(&mut self, pane_id: PaneId) {
+        let Some(dormant_id) = self.dormant_tabs.contains_pane(pane_id) else {
+            warn!(pane = pane_id.raw(), "PaneDied for unknown pane");
+            return;
+        };
+        let Some(entry) = self.dormant_tabs.get_mut(dormant_id) else {
+            return;
+        };
+        let Some(pane_state) = entry.tab.panes.remove(&pane_id) else {
+            return;
+        };
+        let terminal_id = pane_state.attached_terminal_id;
+        // Best-effort geometry cleanup on the detached layout; harmless no-op if this
+        // was the tab's only pane (the whole entry is discarded right below anyway).
+        entry.tab.layout.close_pane(pane_id);
+        if entry.tab.panes.is_empty() {
+            self.dormant_tabs.remove(dormant_id);
+        }
+        self.remove_unattached_terminal_ids([terminal_id]);
     }
 }
 
