@@ -91,7 +91,15 @@ pub(super) const FILL_INNER_SIGMA: f32 = 0.09;
 /// The captain picked this over the softer alternative that still left 16%
 /// residual bleed, explicitly flagging "zero" bleed as a qualified claim
 /// measured only through the in-process render fixture, not yet a live
-/// terminal — verify that before treating it as settled.
+/// terminal.
+///
+/// Since confirmed: a real server on this build, driven through a real PTY
+/// client at the captain's 42-column sidebar and a 10×21 px cell, decoding
+/// the actual `\x1b_G` Kitty graphics APC blocks off the wire (not the
+/// in-process PNG fixture) and compositing them source-over in linear light
+/// the way a terminal does. Two adjacent same-hued idle cards at the real
+/// 17 px ink-to-ink gap: the gutter's four centre rows read exactly the
+/// panel background, `(30, 30, 46)`, with zero measured excess.
 pub(super) const BLOOM_PEAK: f32 = 0.38;
 /// Gaussian sigma of the bloom's near lobe, as a fraction of the tier's
 /// **nominal** height — not the height the card is drawn at. See
