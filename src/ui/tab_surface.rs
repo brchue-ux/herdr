@@ -28,7 +28,7 @@ impl ViewState {
 }
 
 pub(crate) fn compute_tab_surface(
-    app: &AppState,
+    app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
@@ -196,7 +196,7 @@ mod tests {
         let area = app.view.terminal_area;
         assert_eq!(area, Rect::new(26, 1, 80, 19));
         let surface = compute_tab_surface(
-            &app,
+            &mut app,
             &TerminalRuntimeRegistry::new(),
             area,
             false,

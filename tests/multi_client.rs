@@ -1082,6 +1082,12 @@ fn multi_client_smallest_leaving_resizes_up_for_remaining_clients() {
         "remaining client should receive resized-up frame"
     );
 
+    // Growing a pane's grid eases the runtime there over a short animation
+    // (see `PaneResizeReflow`) rather than resizing it in one step, so the
+    // very first post-detach frame can still report the pre-detach PTY size.
+    // Outlast the animation before sampling `stty size`.
+    thread::sleep(Duration::from_millis(400));
+
     let size_after_small_leaves = read_pane_tty_size(&api_socket, &pane_id, Duration::from_secs(5));
 
     assert!(
