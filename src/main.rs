@@ -90,6 +90,7 @@ mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
+mod particle_field;
 mod persist;
 mod platform;
 mod plugin_command;
