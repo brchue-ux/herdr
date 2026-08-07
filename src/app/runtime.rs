@@ -1353,6 +1353,7 @@ impl App {
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
             self.state.anim.next_deadline(now),
+            self.state.pane_resize_reflow.next_deadline(now),
             self.state.next_tree_view_commit_deadline(),
             self.next_state_age_tick,
             self.next_activity_sample,

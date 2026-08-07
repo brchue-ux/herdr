@@ -217,7 +217,7 @@ pub(super) fn resize_tab_panes(
 
 /// Compute pane layout info and optionally resize pane runtimes to match.
 pub(super) fn compute_pane_infos(
-    app: &AppState,
+    app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
@@ -242,20 +242,35 @@ pub(super) fn compute_pane_infos(
         let pane_inner = pane_inner_rect(area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
+        let mut resize_target: Option<(u16, u16)> = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            if resize_panes
-                && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
-            {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+            resize_target = Some((inner_rect.height, inner_rect.width));
+        }
+        let locked_terminal_id = ws.terminal_id(focused_id).cloned();
+        if let (true, Some((target_rows, target_cols)), Some(terminal_id)) =
+            (resize_panes, resize_target, locked_terminal_id)
+        {
+            if !app.direct_attach_resize_locks.contains(&terminal_id) {
+                let (eased_rows, eased_cols) = app.pane_resize_reflow.resolve(
+                    terminal_id,
+                    target_rows,
+                    target_cols,
+                    std::time::Instant::now(),
                 );
+                if let Some(rt) =
+                    app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id)
+                {
+                    rt.resize(
+                        eased_rows,
+                        eased_cols,
+                        cell_size.width_px,
+                        cell_size.height_px,
+                    );
+                }
+                inner_rect.height = eased_rows;
+                inner_rect.width = eased_cols;
             }
         }
         return vec![PaneInfo {
@@ -275,20 +290,35 @@ pub(super) fn compute_pane_infos(
 
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
+        let mut resize_target: Option<(u16, u16)> = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            if resize_panes
-                && ws.terminal_id(info.id).is_some_and(|terminal_id| {
-                    !app.direct_attach_resize_locks.contains(terminal_id)
-                })
-            {
-                rt.resize(
-                    inner_rect.height,
-                    inner_rect.width,
-                    cell_size.width_px,
-                    cell_size.height_px,
+            resize_target = Some((inner_rect.height, inner_rect.width));
+        }
+        let locked_terminal_id = ws.terminal_id(info.id).cloned();
+        if let (true, Some((target_rows, target_cols)), Some(terminal_id)) =
+            (resize_panes, resize_target, locked_terminal_id)
+        {
+            if !app.direct_attach_resize_locks.contains(&terminal_id) {
+                let (eased_rows, eased_cols) = app.pane_resize_reflow.resolve(
+                    terminal_id,
+                    target_rows,
+                    target_cols,
+                    std::time::Instant::now(),
                 );
+                if let Some(rt) =
+                    app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+                {
+                    rt.resize(
+                        eased_rows,
+                        eased_cols,
+                        cell_size.width_px,
+                        cell_size.height_px,
+                    );
+                }
+                inner_rect.height = eased_rows;
+                inner_rect.width = eased_cols;
             }
         }
 
@@ -1212,7 +1242,7 @@ mod tests {
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,
@@ -1241,7 +1271,7 @@ mod tests {
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,
@@ -1270,7 +1300,7 @@ mod tests {
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,
@@ -1299,7 +1329,7 @@ mod tests {
         let area = Rect::new(10, 3, 4, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,
@@ -1332,7 +1362,7 @@ mod tests {
         let area = Rect::new(10, 3, 40, 8);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,
@@ -1346,7 +1376,7 @@ mod tests {
 
         app.pane_scrollbars = false;
         let infos = compute_pane_infos(
-            &app,
+            &mut app,
             &terminal_runtimes,
             area,
             false,

@@ -1862,6 +1862,17 @@ pub struct AppState {
     /// attaches late is right to draw every element settled rather than replay
     /// arrivals it was not there for.
     pub(crate) anim: crate::anim::Animator,
+    /// Per-terminal resize-reflow easing: the row/column count a pane's
+    /// runtime is being handed *this frame* while the layout's own target for
+    /// it changes.
+    ///
+    /// Presentation state for the same reason [`Self::anim`] is — the layout
+    /// tree's ratios are the truth, this only paces how a runtime is told to
+    /// catch up to them — so it is deliberately absent from both
+    /// `persist::SessionSnapshot` and the live handoff manifest. A client that
+    /// attaches late is right to find every pane already settled at its
+    /// layout size.
+    pub(crate) pane_resize_reflow: crate::app::pane_resize_reflow::PaneResizeReflow,
     /// What state each drawn card was last seen in, so a change can be told
     /// from a state. Presentation state for the same reason [`Self::anim`] is.
     pub(crate) sidebar_card_washes: crate::app::card_wash::CardWashes,
@@ -2866,6 +2877,7 @@ impl AppState {
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
+            pane_resize_reflow: crate::app::pane_resize_reflow::PaneResizeReflow::default(),
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),
             sidebar_cmd_acks: crate::app::cmd_ack::CmdAcks::default(),
             pending_effects: crate::app::pending_effects::PendingEffects::default(),
