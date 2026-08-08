@@ -113,6 +113,21 @@ struct ClientState {
     /// time a frame is written, mirroring the server's own
     /// `insert_graphics_before_sync_end` splice point.
     pending_card_graphics: Vec<u8>,
+    /// This client's own rasterisation cache for `ServerMessage::TrayScene`.
+    /// Separate from `card_scene_cache` rather than shared with it: the
+    /// encoder deletes the images of every layer source absent from the pass
+    /// it is handed, so one cache across two separately-encoded surfaces would
+    /// have each surface delete the other.
+    tray_scene_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// The last `TrayScene` this client drew, so a scene that says exactly what
+    /// the one before it said is not rasterised twice — the client's own half
+    /// of the server's `signal_tray_graphics_key`.
+    previous_tray_scene: Option<crate::ui::TrayScene>,
+    /// Kitty graphics bytes from rasterised `TrayScene`s not yet spliced into
+    /// an outgoing frame. Appended rather than replaced, because these are the
+    /// encoder's *deltas* against `tray_scene_cache`: dropping an unflushed one
+    /// would leave the cache believing an upload happened that never went out.
+    pending_tray_graphics: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -716,6 +731,28 @@ fn wants_client_rasterized_cards() -> bool {
     cfg!(windows) && is_remote_client_process()
 }
 
+/// The same bargain as [`wants_client_rasterized_cards`], for the sidebar's
+/// signal tray: a Windows remote-bridge client draws the eight badges itself
+/// from a `ServerMessage::TrayScene` instead of being sent an RGBA image of
+/// them on every step of their animation.
+///
+/// Deliberately the *same* platform gate rather than a wider one — whether that
+/// gate should be broader at all is one question about both surfaces, not a
+/// different question about each. `HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY`
+/// overrides it for the same reason its card sibling has an override: there is
+/// no Windows hardware to exercise the real gate from a Unix dev box or CI.
+fn wants_client_rasterized_signal_tray() -> bool {
+    match std::env::var("HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY")
+        .ok()
+        .as_deref()
+    {
+        Some("1" | "true") => return true,
+        Some("0" | "false") => return false,
+        _ => {}
+    }
+    cfg!(windows) && is_remote_client_process()
+}
+
 /// Time to wait for the server's Welcome reply during the handshake.
 ///
 /// A local client talks to an already-connected server, so 5s is plenty. The
@@ -813,6 +850,7 @@ fn do_handshake(
         // `crate::kitty_graphics::host_terminal_report_from_env`.
         host_terminal: crate::kitty_graphics::host_terminal_report_from_env(),
         wants_client_rasterized_cards: wants_client_rasterized_cards(),
+        wants_client_rasterized_signal_tray: wants_client_rasterized_signal_tray(),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1376,6 +1414,9 @@ async fn run_client_loop(
         card_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
         previous_card_layers: Vec::new(),
         pending_card_graphics: Vec::new(),
+        tray_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+        previous_tray_scene: None,
+        pending_tray_graphics: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1669,11 +1710,12 @@ async fn run_client_loop(
                     // bytes in here rather than finding them already embedded
                     // — the same sync-end splice point the server uses for
                     // `frame.graphics` on a client that did not ask for this.
-                    let card_graphics = std::mem::take(&mut state.pending_card_graphics);
+                    let mut scene_graphics = std::mem::take(&mut state.pending_card_graphics);
+                    scene_graphics.append(&mut state.pending_tray_graphics);
                     let _ = write_encoded_frame_with_graphics(
                         &mut stdout,
                         &frame.bytes,
-                        &card_graphics,
+                        &scene_graphics,
                     );
                     let _ = stdout.flush();
                 }
@@ -1689,6 +1731,12 @@ async fn run_client_loop(
                     if state.kitty_graphics_enabled {
                         state.pending_card_graphics =
                             decode_and_rasterise_card_scene(&bytes, &mut state);
+                    }
+                }
+                ServerMessage::TrayScene { bytes } => {
+                    if state.kitty_graphics_enabled {
+                        let graphics = decode_and_rasterise_tray_scene(&bytes, &mut state);
+                        state.pending_tray_graphics.extend(graphics);
                     }
                 }
                 ServerMessage::ServerShutdown { reason } => {
@@ -2189,6 +2237,42 @@ fn decode_and_rasterise_card_scene(bytes: &[u8], state: &mut ClientState) -> Vec
         &mut state.card_scene_cache,
     );
     state.previous_card_layers = layers;
+    graphics
+}
+
+/// Decodes a `ServerMessage::TrayScene` payload and rasterises it into Kitty
+/// graphics bytes ready to splice into the next outgoing frame, updating
+/// `state`'s own rasterisation cache along the way.
+///
+/// Empty on a decode failure, on a scene with nothing to draw, or when the
+/// scene is the one already on screen — there is nothing new to splice either
+/// way.
+fn decode_and_rasterise_tray_scene(bytes: &[u8], state: &mut ClientState) -> Vec<u8> {
+    let scene = match crate::ui::decode_signal_tray_scene(bytes) {
+        Ok(scene) => scene,
+        Err(err) => {
+            debug!(%err, "failed to decode TrayScene from server");
+            return Vec::new();
+        }
+    };
+    if state.previous_tray_scene.as_ref() == Some(&scene) {
+        return Vec::new();
+    }
+    let Some((grid, image)) = crate::ui::rasterise_signal_tray_scene(
+        &scene,
+        state.cell_size.width_px,
+        state.cell_size.height_px,
+    ) else {
+        return Vec::new();
+    };
+    let layer = crate::ui::signal_tray_graphics_layer(image);
+    let graphics = crate::kitty_graphics::encode_tray_scene_graphics(
+        grid,
+        &layer,
+        state.cell_size,
+        &mut state.tray_scene_cache,
+    );
+    state.previous_tray_scene = Some(scene);
     graphics
 }
 

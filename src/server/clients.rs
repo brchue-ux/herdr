@@ -66,6 +66,10 @@ pub(crate) struct ClientConnection {
     /// server-embedded sidebar card pixels. Set once from the client's Hello
     /// and never changes for the lifetime of the connection.
     pub(crate) wants_client_rasterized_cards: bool,
+    /// Whether this client requested `ServerMessage::TrayScene` instead of
+    /// server-embedded signal-tray badge pixels. Set once from the client's
+    /// Hello and never changes for the lifetime of the connection.
+    pub(crate) wants_client_rasterized_signal_tray: bool,
     /// Stateful parser for app-client input split across transport reads.
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
@@ -159,6 +163,7 @@ impl ClientConnection {
             host_graphics_is_local: false,
             kitty_graphics_capability_confirmed: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
@@ -258,6 +263,17 @@ impl ClientConnection {
 
     pub(crate) fn is_full_app_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+    }
+
+    /// Which of Herdr's own drawn surfaces this client is sent as pixels.
+    ///
+    /// The inverse of what it asked to rasterise itself: a surface it draws
+    /// from a scene message is one this client's frames must not also carry.
+    pub(crate) fn embedded_surfaces(&self) -> crate::kitty_graphics::EmbeddedSurfaces {
+        crate::kitty_graphics::EmbeddedSurfaces {
+            cards: !self.wants_client_rasterized_cards,
+            signal_tray: !self.wants_client_rasterized_signal_tray,
+        }
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {

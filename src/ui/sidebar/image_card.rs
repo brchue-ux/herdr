@@ -6657,7 +6657,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut foreground,
-            true,
+            crate::kitty_graphics::EmbeddedSurfaces::ALL,
         );
         assert!(
             !bytes.is_empty() && !foreground.is_empty(),
@@ -6678,7 +6678,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut second,
-            true,
+            crate::kitty_graphics::EmbeddedSurfaces::ALL,
         );
         assert!(
             bytes.is_empty() && second.is_empty(),
@@ -6719,7 +6719,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut second,
-            true,
+            crate::kitty_graphics::EmbeddedSurfaces::ALL,
         );
         assert!(
             !bytes.is_empty() && !second.is_empty(),
@@ -7414,7 +7414,7 @@ mod motion_capture {
                 app.view.tab_surface(),
                 cell_size,
                 &mut fresh,
-                true,
+                crate::kitty_graphics::EmbeddedSurfaces::ALL,
             );
             std::fs::write(format!("{}/{name}.esc", self.dir), &standalone).expect("writes");
 
@@ -7424,7 +7424,7 @@ mod motion_capture {
                 app.view.tab_surface(),
                 cell_size,
                 &mut self.persistent,
-                true,
+                crate::kitty_graphics::EmbeddedSurfaces::ALL,
             );
             let _ = writeln!(
                 self.cost,

@@ -2027,6 +2027,15 @@ pub struct AppState {
     /// the cell size, folded into one number. Rasterising eight badges is not
     /// free, so it is redone when this moves and not once per frame.
     pub(crate) signal_tray_graphics_key: u64,
+    /// Whether the badges are being rasterised by whoever is watching rather
+    /// than here — every attached viewer asked for the tray as a
+    /// `ServerMessage::TrayScene` and draws it from that.
+    ///
+    /// Two things read it. The app loop skips rasterising artwork nobody would
+    /// receive, and [`crate::ui::sidebar::tray::render`] still leaves the
+    /// fallback marks off the grid, because badges are coming — just not from
+    /// here. Recomputed from the attached clients every pass, never persisted.
+    pub(crate) signal_tray_graphics_client_rasterized: bool,
     /// The sidebar's ambient particle-field wash, its loop frames included via
     /// [`GraphicsLayer::animation`]. `None` when disabled, not yet generated, or the sidebar
     /// column has no area.
@@ -3101,6 +3110,7 @@ impl AppState {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            signal_tray_graphics_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
             background_scene: None,

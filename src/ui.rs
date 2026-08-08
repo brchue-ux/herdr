@@ -106,8 +106,12 @@ pub(crate) use self::sidebar::sidebar_content_rect;
 /// it. Named `signal_tray_*` outside the sidebar module because "tray" alone
 /// says nothing about which surface it belongs to.
 pub(crate) use self::sidebar::tray::{
-    active as signal_tray_active, badge_at as signal_tray_badge_at, image as signal_tray_image,
-    menu_at as signal_tray_menu_at, motion_fingerprint as signal_tray_motion_fingerprint,
+    active as signal_tray_active, badge_at as signal_tray_badge_at,
+    build_scene as build_signal_tray_scene, decode_scene as decode_signal_tray_scene,
+    encode_scene as encode_signal_tray_scene, graphics_layer as signal_tray_graphics_layer,
+    image as signal_tray_image, menu_at as signal_tray_menu_at,
+    motion_fingerprint as signal_tray_motion_fingerprint,
+    rasterise_scene as rasterise_signal_tray_scene, TrayScene,
 };
 
 /// Where the tray's badge artwork is composited.

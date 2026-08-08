@@ -826,7 +826,11 @@ fn scale(rgb: [f32; 3], factor: f32) -> [f32; 3] {
 }
 
 /// What one badge is drawn in.
-#[derive(Debug, Clone, Copy)]
+///
+/// Serializable because a client that rasterises the tray itself is handed
+/// exactly this — two resolved colours — rather than the palette and host
+/// theme they were resolved from. See [`super::tray::TrayScene`].
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BadgePaint {
     /// The alert hue, taken from the palette rather than invented.
     pub attention: [f32; 3],

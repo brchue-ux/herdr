@@ -137,7 +137,7 @@ impl HeadlessServer {
                 return RetainedGraphicsOutcome::Fallback;
             }
 
-            let include_cards = !client.wants_client_rasterized_cards;
+            let embedded_surfaces = client.embedded_surfaces();
             let mut next_graphics_cache = client.graphics_cache.clone();
             let encode_started = crate::render_prof::timer();
             let bytes =
@@ -147,7 +147,7 @@ impl HeadlessServer {
                     self.app.state.view.tab_surface(),
                     cell_size,
                     &mut next_graphics_cache,
-                    include_cards,
+                    embedded_surfaces,
                 ));
             crate::render_prof::duration_since("retained_graphics.graphics_encode", encode_started);
             if bytes.len() > MAX_GRAPHICS_FRAME_SIZE {

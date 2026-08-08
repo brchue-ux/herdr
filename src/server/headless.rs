@@ -2871,6 +2871,7 @@ impl HeadlessServer {
                 direct_attach_requested,
                 host_terminal,
                 wants_client_rasterized_cards,
+                wants_client_rasterized_signal_tray,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2917,6 +2918,8 @@ impl HeadlessServer {
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.set_host_terminal(&host_terminal);
                     client.wants_client_rasterized_cards = wants_client_rasterized_cards;
+                    client.wants_client_rasterized_signal_tray =
+                        wants_client_rasterized_signal_tray;
                 }
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -3970,7 +3973,7 @@ impl HeadlessServer {
                 &self.app.terminal_runtimes,
                 self.app.state.view.tab_surface(),
                 *cell_size,
-                !client.wants_client_rasterized_cards,
+                client.embedded_surfaces(),
             )
         {
             retained_fallback!("visible_kitty_graphics");
@@ -4273,6 +4276,8 @@ impl HeadlessServer {
             let mut next_graphics_cache = client.graphics_cache.clone();
             let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
             let wants_client_rasterized_cards = client.wants_client_rasterized_cards;
+            let wants_client_rasterized_signal_tray = client.wants_client_rasterized_signal_tray;
+            let embedded_surfaces = client.embedded_surfaces();
             if is_app_client
                 && self.app.state.kitty_graphics_enabled
                 && self.app.state.kitty_graphics_capability_confirmed
@@ -4290,7 +4295,7 @@ impl HeadlessServer {
                         self.app.state.view.tab_surface(),
                         cell_size,
                         &mut next_graphics_cache,
-                        !wants_client_rasterized_cards,
+                        embedded_surfaces,
                     ));
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
             } else {
@@ -4331,6 +4336,37 @@ impl HeadlessServer {
                         },
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to encode card scene for client");
+                        }
+                    }
+                }
+            }
+
+            // And the tray's badges, the same way: the eight states and where
+            // each one is in its animation, instead of the RGBA image this
+            // client's frames no longer carry. Its own message rather than a
+            // field of the card scene — a client asks for the two separately,
+            // and they are regenerated on different keys.
+            if wants_client_rasterized_signal_tray
+                && is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && self.app.state.kitty_graphics_capability_confirmed
+                && cell_size.is_known()
+            {
+                if let Some(scene) = crate::ui::build_signal_tray_scene(&self.app.state) {
+                    match crate::ui::encode_signal_tray_scene(&scene) {
+                        Ok(bytes) => match Self::frame_server_message_with_max(
+                            &ServerMessage::TrayScene { bytes },
+                            MAX_GRAPHICS_FRAME_SIZE,
+                        ) {
+                            Ok(framed) => {
+                                let _ = writer.render.try_send(framed);
+                            }
+                            Err(err) => {
+                                warn!(client_id, err = %err, "failed to serialize tray scene for client");
+                            }
+                        },
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode tray scene for client");
                         }
                     }
                 }
@@ -4631,7 +4667,9 @@ impl HeadlessServer {
         // one is the only path a real Herdr takes. Without it the tray falls
         // back to its character marks on every server-backed session — which is
         // every session — because nothing ever rasterises the badges.
-        changed |= self.app.observe_signal_tray(now);
+        changed |= self
+            .app
+            .observe_signal_tray(now, self.every_app_viewer_rasterizes_signal_tray());
         changed |= self.app.observe_sidebar_particle_field();
         changed |= self.app.observe_background_scene();
         changed |= self.app.observe_background_effects(now, has_viewers);
@@ -4645,6 +4683,23 @@ impl HeadlessServer {
         self.clients
             .values()
             .any(ClientConnection::is_full_app_client)
+    }
+
+    /// True when there is at least one client rendering the app and *every*
+    /// one of them draws the signal tray itself from a `ServerMessage::TrayScene`.
+    ///
+    /// The artwork is one image on `AppState`, shared by every viewer, so it
+    /// can only be left undrawn when nobody is left who would be sent it. With
+    /// no app viewers at all this is false: a tray rasterised for nobody is
+    /// wasted either way, and the honest reading of "they all draw it
+    /// themselves" needs at least one of them to exist.
+    fn every_app_viewer_rasterizes_signal_tray(&self) -> bool {
+        let mut viewers = self
+            .clients
+            .values()
+            .filter(|client| client.is_full_app_client())
+            .peekable();
+        viewers.peek().is_some() && viewers.all(|client| client.wants_client_rasterized_signal_tray)
     }
 
     /// Initiates graceful shutdown.
@@ -5680,6 +5735,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5706,6 +5762,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -5738,6 +5795,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("rio".to_owned()),
                 term: None,
@@ -5777,6 +5835,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("some-unheard-of-terminal".to_owned()),
                 term: Some("xterm-256color".to_owned()),
@@ -5817,6 +5876,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5832,6 +5892,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -5877,6 +5938,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -5954,6 +6016,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -5976,6 +6039,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -6012,6 +6076,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6079,6 +6144,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6494,6 +6560,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6530,6 +6597,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6565,6 +6633,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6669,6 +6738,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -8922,6 +8992,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));

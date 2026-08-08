@@ -393,6 +393,15 @@ pub enum ClientMessage {
         /// card pixels in `Terminal`/`Graphics` frames.
         #[serde(default)]
         wants_client_rasterized_cards: bool,
+        /// Whether the client wants to rasterise the sidebar's signal tray
+        /// itself from a `ServerMessage::TrayScene` rather than receive
+        /// server-embedded badge pixels in `Terminal`/`Graphics` frames.
+        ///
+        /// Its own flag rather than a second meaning for the one above: the
+        /// two surfaces are drawn by different code and a client may well be
+        /// able to reproduce one and not the other.
+        #[serde(default)]
+        wants_client_rasterized_signal_tray: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -761,6 +770,19 @@ pub enum ServerMessage {
         /// Bincode-encoded `crate::ui::sidebar::image_card::CardScene`.
         bytes: Vec<u8>,
     },
+
+    /// Opaque, bincode-encoded signal-tray badge states for clients that
+    /// requested `wants_client_rasterized_signal_tray`. The client decodes
+    /// this with `crate::ui::sidebar::tray::TrayScene` and rasterises the
+    /// eight badges locally rather than receiving server-embedded tray pixels.
+    ///
+    /// Appended after `CardScene` for the same reason `CardScene` was appended
+    /// after `PrefixInputSource` — a variant added anywhere else shifts the
+    /// wire tag of everything declared below it.
+    TrayScene {
+        /// Bincode-encoded `crate::ui::sidebar::tray::TrayScene`.
+        bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1074,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1091,6 +1114,7 @@ mod tests {
                 launch_mode: ClientLaunchMode::App,
                 host_terminal: HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
+                wants_client_rasterized_signal_tray: false,
             }),
             0
         );
@@ -1624,6 +1648,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1700,6 +1725,7 @@ mod tests {
                     launch_mode: ClientLaunchMode::App,
                     host_terminal: HostTerminalReport::default(),
                     wants_client_rasterized_cards: false,
+                    wants_client_rasterized_signal_tray: false,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2138,6 +2164,7 @@ mod tests {
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2176,6 +2203,7 @@ mod tests {
                 launch_mode: ClientLaunchMode::App,
                 host_terminal: HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
+                wants_client_rasterized_signal_tray: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

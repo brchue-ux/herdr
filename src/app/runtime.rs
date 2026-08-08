@@ -420,7 +420,10 @@ impl App {
         changed |= self.advance_relation_signals(now, true);
         changed |= self.sample_pane_activity(now);
         changed |= self.observe_pane_unread(now);
-        changed |= self.observe_signal_tray(now);
+        // Its own terminal is its own viewer, so this Herdr rasterises its
+        // own badges — the delegated path is the server's, and only when every
+        // client attached to it draws them instead.
+        changed |= self.observe_signal_tray(now, false);
         changed |= self.observe_sidebar_particle_field();
         changed |= self.observe_background_scene();
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
@@ -981,20 +984,31 @@ impl App {
     ///    per-frame cost, so it is redone only when the states, the grid or the
     ///    cell size move.
     ///
+    /// `client_rasterized` says every viewer draws the badges itself from a
+    /// `ServerMessage::TrayScene`, in which case step three is the one thing
+    /// that does not happen here — see [`Self::refresh_signal_tray_graphics`].
+    ///
     /// Returns whether anything a frame would show has changed.
-    pub(crate) fn observe_signal_tray(&mut self, now: Instant) -> bool {
+    pub(crate) fn observe_signal_tray(&mut self, now: Instant, client_rasterized: bool) -> bool {
+        let delegation_changed =
+            self.state.signal_tray_graphics_client_rasterized != client_rasterized;
+        self.state.signal_tray_graphics_client_rasterized = client_rasterized;
         if !crate::ui::signal_tray_active(&self.state) {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
             return had;
         }
 
-        let mut changed = self.refresh_blocked_questions(now);
+        // A tray that just changed sides has to repaint whichever way it moved:
+        // the marks come off the grid when the client takes over, and back onto
+        // it when the last such client leaves.
+        let mut changed = delegation_changed;
+        changed |= self.refresh_blocked_questions(now);
         changed |= self
             .state
             .signal_tray
             .observe(crate::app::signal_tray::magnitudes(&self.state));
-        changed |= self.refresh_signal_tray_graphics();
+        changed |= self.refresh_signal_tray_graphics(client_rasterized);
         changed
     }
 
@@ -1042,7 +1056,12 @@ impl App {
     }
 
     /// Redraw the tray's badge artwork when what it was drawn for has moved.
-    fn refresh_signal_tray_graphics(&mut self) -> bool {
+    ///
+    /// `client_rasterized` means every viewer draws the badges itself from a
+    /// `ServerMessage::TrayScene`, so this stops at the key: rasterising eight
+    /// badges for nobody is the whole cost this exists to move off the server,
+    /// and the key is still what tells the loop a new scene is worth sending.
+    fn refresh_signal_tray_graphics(&mut self, client_rasterized: bool) -> bool {
         if !self.state.kitty_graphics_enabled || !self.state.host_cell_size.is_known() {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
@@ -1051,6 +1070,12 @@ impl App {
 
         let cell = self.state.host_cell_size;
         let key = self.signal_tray_graphics_key(cell);
+        if client_rasterized {
+            let had = self.state.signal_tray_graphics.take().is_some();
+            let moved = key != self.state.signal_tray_graphics_key;
+            self.state.signal_tray_graphics_key = key;
+            return had || moved;
+        }
         if key == self.state.signal_tray_graphics_key && self.state.signal_tray_graphics.is_some() {
             return false;
         }
@@ -1064,22 +1089,7 @@ impl App {
         };
 
         self.state.signal_tray_graphics_key = key;
-        self.state.signal_tray_graphics = Some(crate::app::state::GraphicsLayer::new(
-            crate::api::schema::PaneGraphicsFormat::Rgba,
-            image.width,
-            image.height,
-            image.pixels,
-            crate::api::schema::PaneGraphicsPlacementParams {
-                viewport_col: 0,
-                viewport_row: 0,
-                grid_cols: 0,
-                grid_rows: 0,
-                // Over the text. The badges *are* the tray; the fallback marks
-                // underneath them are what a host with no graphics gets, and on
-                // a host with graphics they are meant to be covered.
-                z: 0,
-            },
-        ));
+        self.state.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(image));
         true
     }
 
@@ -2618,19 +2628,69 @@ mod tests {
         app.state.workspaces[0].cached_git_ahead_behind = Some((3, 0));
         let now = Instant::now();
         app.advance_animations(now, true);
-        assert!(app.observe_signal_tray(now), "the tray drew nothing at all");
+        assert!(
+            app.observe_signal_tray(now, false),
+            "the tray drew nothing at all"
+        );
 
         let first = app.state.signal_tray_graphics_key;
         app.advance_animations(now + Duration::from_millis(400), true);
         assert!(
-            app.observe_signal_tray(now + Duration::from_millis(400)),
+            app.observe_signal_tray(now + Duration::from_millis(400), false),
             "the artwork did not follow the animation"
         );
         assert_ne!(first, app.state.signal_tray_graphics_key);
 
         // Asked again at the same instant, nothing has moved and nothing is
         // redrawn: the badge costs a raster per frame it moves, not per pass.
-        assert!(!app.refresh_signal_tray_graphics());
+        assert!(!app.refresh_signal_tray_graphics(false));
+    }
+
+    /// When every viewer draws the badges itself, the app loop stops drawing
+    /// them — but does not stop *watching* them. The key still has to follow
+    /// the animation, because it is what tells the loop a new scene is worth
+    /// sending, and a tray that stopped reporting change would ship one scene
+    /// and then hold still.
+    #[test]
+    fn a_delegated_tray_tracks_the_animation_without_rasterising_it() {
+        let mut app = tray_app();
+        app.state.workspaces[0].cached_git_ahead_behind = Some((3, 0));
+        let now = Instant::now();
+        app.advance_animations(now, true);
+
+        assert!(app.observe_signal_tray(now, true), "nothing was observed");
+        assert!(
+            app.state.signal_tray_graphics.is_none(),
+            "the server rasterised badge pixels no client was going to be sent"
+        );
+        assert!(
+            app.state.signal_tray_graphics_client_rasterized,
+            "the renderer was not told the badges are coming from elsewhere"
+        );
+        // And there is still a scene to send, saying the same thing the
+        // artwork would have said.
+        assert!(crate::ui::build_signal_tray_scene(&app.state).is_some());
+
+        let first = app.state.signal_tray_graphics_key;
+        app.advance_animations(now + Duration::from_millis(400), true);
+        assert!(
+            app.observe_signal_tray(now + Duration::from_millis(400), true),
+            "a moving badge did not register as a change worth a new scene"
+        );
+        assert_ne!(first, app.state.signal_tray_graphics_key);
+        assert!(app.state.signal_tray_graphics.is_none());
+
+        // The last such client leaving hands the tray back: the pixels return
+        // and the frame that carries them is asked for.
+        assert!(
+            app.observe_signal_tray(now + Duration::from_millis(400), false),
+            "handing the tray back did not repaint it"
+        );
+        assert!(
+            app.state.signal_tray_graphics.is_some(),
+            "the server never resumed drawing a tray nobody else was drawing"
+        );
+        assert!(!app.state.signal_tray_graphics_client_rasterized);
     }
 
     #[test]
