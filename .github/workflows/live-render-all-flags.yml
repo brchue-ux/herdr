@@ -1,0 +1,76 @@
+name: Live render (all flags on)
+
+# Tier A live check: a real headless herdr server driven over its socket API by a
+# real client attached through an explicitly sized PTY, with every runtime flag
+# this fork ships turned on. No X server and no terminal emulator involved — the
+# evidence is the bytes the client actually receives.
+#
+# This exists because the bugs that shipped in this area were all invisible to
+# the unit suite: they were found by decoding real emitted bytes.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/**
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+concurrency:
+  group: live-render-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install build tools and fonts
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          # fonts-dejavu matters: image_card::is_available requires a proportional
+          # face found on the machine at runtime, and herdr ships no font. Without
+          # one the pixel-card path stays off and every card flag is inert.
+          sudo apt-get install -y cmake ninja-build fonts-dejavu fonts-liberation
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: live-render
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Run live capture with every flag on
+        env:
+          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
+          HERDR_NS: herdr
+        run: |
+          chmod +x data/herdr-all-flags-live/run.sh
+          ./data/herdr-all-flags-live/run.sh
+
+      - name: Upload captures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-render-captures
+          path: data/herdr-all-flags-live/proof/
+          if-no-files-found: warn
