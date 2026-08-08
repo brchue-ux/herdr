@@ -66,19 +66,21 @@ jobs:
         with:
           key: live-render
 
-      # Debug, not release. Every settle in the capture is wall-clock, so a
-      # slower binary changes nothing about what is captured, and this compiles
-      # in roughly a third of the time. Note the namespace that comes with it:
-      # config::app_dir_name() returns herdr-dev under debug_assertions, so the
-      # config has to be written there or the run silently uses defaults and
-      # every flag below is inert.
+      # Release, deliberately. A debug build was tried to save ~3 min of compile
+      # and it was a false economy: debug card rasterisation and PNG encode are
+      # slow enough that almost nothing renders inside the capture's settles —
+      # run 2 produced 2,568 bytes against run 1's 5,696,056 from the same six
+      # captures, and still passed, because the only assertion was "no panic".
+      # The settles are wall-clock, so the binary's speed decides how much of
+      # the render lands inside them. Hence release, plus the volume guard in
+      # run.sh so an empty capture can never be green again.
       - name: Build
-        run: cargo build --locked
+        run: cargo build --release --locked
 
       - name: Run live capture with every flag on
         env:
-          HERDR_BIN: ${{ github.workspace }}/target/debug/herdr
-          HERDR_NS: herdr-dev
+          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
+          HERDR_NS: herdr
         run: |
           chmod +x data/herdr-all-flags-live/run.sh
           ./data/herdr-all-flags-live/run.sh

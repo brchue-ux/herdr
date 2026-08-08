@@ -128,6 +128,35 @@ if grep -qiE "panicked at|fatal|thread .* panicked" "$ROOT/server.log"; then
 fi
 echo "no panic in server log"
 
+# "No panic" is not evidence of a render. A capture that is empty because the
+# client never drew also never panics, which is exactly how run 2 went green on
+# 2,568 bytes against run 1's 5,696,056 from the same six captures. Assert the
+# capture is actually substantial, and that the pixel path in particular
+# reached the wire, or the whole job is a tick with nothing behind it.
+STEADY_BYTES=$(wc -c < "$OUT/steady.raw")
+APC_BLOCKS=$(python3 - "$OUT/steady.raw" <<'PY'
+import re, sys
+blob = open(sys.argv[1], "rb").read()
+print(len(re.findall(rb"\x1b_G", blob)))
+PY
+)
+echo "steady capture: ${STEADY_BYTES} bytes, ${APC_BLOCKS} kitty APC blocks"
+
+MIN_BYTES=${MIN_BYTES:-100000}
+MIN_APC=${MIN_APC:-10}
+if [ "$STEADY_BYTES" -lt "$MIN_BYTES" ]; then
+  echo "CAPTURE TOO SMALL: ${STEADY_BYTES} < ${MIN_BYTES} bytes — the client barely drew," >&2
+  echo "so nothing below this line proves anything. Check the binary is a release" >&2
+  echo "build and that the settles are long enough for it." >&2
+  exit 1
+fi
+if [ "$APC_BLOCKS" -lt "$MIN_APC" ]; then
+  echo "NO PIXEL PATH: only ${APC_BLOCKS} APC blocks (< ${MIN_APC})." >&2
+  echo "Either the PTY reported no pixel size, or no proportional font was found," >&2
+  echo "or kitty_graphics is off — every card flag is inert in that state." >&2
+  exit 1
+fi
+
 # The analysis goes LAST on purpose. A job's log is read from the end, and the
 # grids above are thousands of lines: printed before this, the summary is the
 # first thing truncation removes, which is exactly what happened on run 1.
