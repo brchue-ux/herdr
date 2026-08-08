@@ -32,6 +32,13 @@ FRAMES="${FRAMES:-8}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-0.6}"
 export LAB_TMP="$ROOT"
 
+# Resolved once, because the warm-up gate below and the tray assertion at the
+# bottom have to address the same pixels with the same floor. A gate that
+# measured a slightly different rectangle would open on something other than the
+# thing under test.
+TRAY_REGION="${TRAY_REGION:-0.0,0.0,0.18,0.06}"
+TRAY_MIN_PX="${TRAY_MIN_PX:-25}"
+
 lab_require Xvfb kitty import convert xdpyinfo compare git python3
 python3 -c 'import PIL' || { echo "python3 needs Pillow" >&2; exit 1; }
 
@@ -233,6 +240,34 @@ fi
 # draw them.
 sleep "${GRAPHICS_SETTLE:-6}"
 
+# ...and the tray starts moving later still. Everything above is a readiness
+# signal for *painting*: mean luma proves something reached the screen, and the
+# settle proves the pixel layers had time to land. Neither says anything about
+# whether the surface the first assertion is about has begun animating.
+#
+# It has not, necessarily. An idle tray is engraved marks that never travel; the
+# badges only start moving once the state behind them arrives, which here is a
+# git remote-status refresh (1.5 s cadence, off-thread) landing on a client that
+# is already up and drawing. So the tray's first animation frame can arrive
+# after capture has started — and the capture has a fixed budget of 7 frame
+# pairs, of which 5 must move.
+#
+# That is a measured failure, not a hypothesis. Run 31272863267 captured three
+# 0 px pairs and then moved on all four remaining ones: 4/7, red, on a build
+# whose tray was working perfectly. Eight runs against one stable base failed
+# once this way.
+#
+# So wait for the assertion's own subject, with the assertion's own instrument,
+# region and floor — and on timeout carry on and let the assertion speak, since
+# a tray that never moves at all is precisely the #97 defect and deserves the
+# per-pair numbers, not a gate's one-line complaint.
+echo "--- waiting for the tray to start animating ---"
+if ! lab_wait_for_motion "$DISP" "$ROOT/.tray" "$TRAY_REGION" "$TRAY_MIN_PX" \
+     "${TRAY_WARMUP_PAIRS:-3}" "${TRAY_WARMUP_POLLS:-30}" "$FRAME_INTERVAL"; then
+  echo "WARNING: the tray never warmed up; capturing anyway so the assertion" >&2
+  echo "below reports the freeze with its per-pair measurements." >&2
+fi
+
 echo "--- capturing ---"
 lab_shoot "$DISP" "$OUT/steady.png"
 lab_shoot_series "$DISP" "$OUT" frame "$FRAMES" "$FRAME_INTERVAL"
@@ -294,9 +329,9 @@ echo "=================== ASSERTIONS (BACKGROUND=$BG) ==================="
 # move 74-75 px per 0.6 s pair, and did so on 7 of 7 pairs. 25 is comfortably
 # above nothing and far below the real signal, so a freeze is unambiguous.
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
-  --region "${TRAY_REGION:-0.0,0.0,0.18,0.06}" \
+  --region "$TRAY_REGION" \
   --label "signal tray badges" \
-  --min-changed-px "${TRAY_MIN_PX:-25}" \
+  --min-changed-px "$TRAY_MIN_PX" \
   --min-active-pairs "${MIN_PAIRS:-5}"
 
 # The control: a real process is writing to a real pty in the lower pane. If this

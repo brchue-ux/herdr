@@ -65,6 +65,27 @@ An all-idle signal tray is engraved marks that never move, so the rig builds a
 throwaway git repo one commit ahead of *and* behind its upstream, which lights
 Push=Active and Sync=Attention. Without it a frozen tray would sail through.
 
+That same fact is why capture does not start when the terminal first paints.
+The badges go live only once the state behind them arrives — a git remote-status
+refresh, on a 1.5 s cadence and off-thread, landing on a client that is already
+up and drawing — so "something is on screen" is a readiness signal for painting
+and says nothing about whether the surface under test has begun animating. A
+capture started there can spend its first pairs on a genuinely static warm-up,
+out of a budget of seven of which five must move.
+
+Measured: over eight runs against one stable base, one failed 4/7 with three
+0 px pairs followed by four moving ones (run 31272863267) — a working tray,
+reported red. So `lab_wait_for_motion` waits for the assertion's own subject,
+using the assertion's own instrument, region and floor, and needs **three
+consecutive moving pairs** before capture begins. Three because a blip lasting
+one frame already yields two moving pairs, one arriving and one leaving.
+
+The gate cannot hide the defect it sits in front of. On timeout it warns and
+capture proceeds anyway, so a tray that never moves is still reported by the
+assertion with its per-pair numbers; and a tray that moves and *then* freezes —
+the #97 shape exactly — now has the whole seven-pair budget pointed at the
+period after warm-up rather than partly spent before it.
+
 ## The detectors prove they can fail, first
 
 `controls.sh` runs before the expensive job and needs no Rust build. It drives

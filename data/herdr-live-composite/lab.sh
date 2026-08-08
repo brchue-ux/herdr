@@ -16,6 +16,10 @@ LAB_W=${LAB_W:-1600}
 LAB_H=${LAB_H:-1000}
 LAB_FONT_SIZE=${LAB_FONT_SIZE:-12}
 
+# Where the measurement scripts live, so `lab_wait_for_motion` can call the same
+# one the assertions do rather than re-implementing the measurement.
+LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 lab_require() {
   local missing=0 tool
   for tool in "$@"; do
@@ -145,6 +149,60 @@ lab_wait_for_settle() {
     mv "${prefix}-b.png" "${prefix}-a.png"
   done
   echo "never settled on $disp" >&2
+  return 1
+}
+
+# lab_wait_for_motion <display> <scratch-prefix> <region> <min-px> [runs] [attempts] [interval]
+#
+# The exact inverse of `lab_wait_for_settle`: waits until a region has *started*
+# moving, for scenes that are supposed to animate and never settle.
+#
+# This is a readiness gate, not an assertion. An animated surface does not
+# necessarily begin animating at the moment the terminal first paints — the
+# signal tray only stops being engraved marks once the state behind its badges
+# has arrived, which on this rig is a git remote-status refresh landing after
+# the window is already up. A capture started on "something is on screen" can
+# therefore spend its first frames on a genuinely static warm-up, and a fixed
+# budget of frame pairs is spent on a period that was never under test. That is
+# a measured failure mode, not a hypothetical: run 31272863267 opened with three
+# 0 px pairs and then moved on all four remaining ones, and failed 4/7.
+#
+# `runs` consecutive moving pairs are required, so a transient — one card
+# settling, one row wiping in — does not open the gate on a tray that is still
+# frozen. Three, not two: a blip lasting a single frame already produces two
+# moving pairs, one as it appears and one as it goes, so two would admit exactly
+# the thing this is meant to exclude.
+#
+# The measurement is `assert_motion.py`, called with the region and floor the
+# caller will later assert on, because a gate that measured something slightly
+# different from the assertion would be worse than no gate at all.
+#
+# Returns non-zero on timeout rather than exiting: a surface that never moves is
+# exactly the #97 defect, and the assertion — not the gate — is what has to
+# report it, with its per-pair numbers attached.
+lab_wait_for_motion() {
+  local disp="$1" prefix="$2" region="$3" minpx="$4"
+  local want="${5:-3}" attempts="${6:-30}" interval="${7:-0.6}"
+  local n run=0
+  DISPLAY="$disp" import -window root "${prefix}-a.png" 2>/dev/null || return 1
+  for n in $(seq 1 "$attempts"); do
+    sleep "$interval"
+    DISPLAY="$disp" import -window root "${prefix}-b.png" 2>/dev/null || continue
+    if python3 "$LAB_DIR/assert_motion.py" "${prefix}-a.png" "${prefix}-b.png" \
+        --region "$region" --min-changed-px "$minpx" --min-active-pairs 1 \
+        --label "warm-up" >"${prefix}.log" 2>&1; then
+      run=$((run + 1))
+    else
+      run=0
+    fi
+    mv -f "${prefix}-b.png" "${prefix}-a.png"
+    if [ "$run" -ge "$want" ]; then
+      echo "region $region moved on $want consecutive pairs after ${n} polls" \
+           "($(awk "BEGIN{printf \"%.1f\", $n * $interval}")s of warm-up)"
+      return 0
+    fi
+  done
+  echo "region $region never moved on $want consecutive pairs within $attempts polls" >&2
   return 1
 }
 
