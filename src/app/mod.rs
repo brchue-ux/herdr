@@ -864,6 +864,7 @@ impl App {
                 crate::kitty_graphics::HostTerminalKind::default()
             },
             host_graphics_is_local: no_session && crate::kitty_graphics::host_graphics_is_local(),
+            every_app_viewer_draws_ambient_wash: true,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         };

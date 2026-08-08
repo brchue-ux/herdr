@@ -2125,6 +2125,26 @@ pub struct AppState {
     /// filesystem with its terminal. `false` — including "unknown" — is the
     /// safe default.
     pub(crate) host_graphics_is_local: bool,
+    /// Whether **every** attached app viewer runs on a terminal that draws an
+    /// opaque ambient wash where the scene's design puts it.
+    ///
+    /// [`Self::host_terminal_kind`] is the *foreground* client's terminal, and
+    /// it is overwritten every time another client is promoted — which happens
+    /// on any interaction, including the mouse crossing into that client's
+    /// window. The washes are not per-client: they are one image on this shared
+    /// state, generated once and placed for every viewer. So gating them on the
+    /// foreground terminal alone hands a wash built for a terminal that honours
+    /// the negative-`z` band to a viewer that does not, which composites the
+    /// same opaque image at the *top* of its stack and hides every pane behind
+    /// it. That is a Herdr bug on the second viewer's screen, not a fact about
+    /// its terminal.
+    ///
+    /// `true` when unknown, which is what keeps a monolithic Herdr and every
+    /// single-client session exactly as they were: this only ever *withdraws*
+    /// permission [`crate::kitty_graphics::HostTerminalKind::draws_ambient_wash`]
+    /// already granted, never grants what it refused. The split server sets it
+    /// from all of its app clients; see `every_app_viewer_draws_ambient_wash`.
+    pub(crate) every_app_viewer_draws_ambient_wash: bool,
     /// Whether the real outer terminal has confirmed it understands the Kitty
     /// Graphics Protocol, via `query_kitty_graphics_capability`. Painting must
     /// gate on this in addition to `kitty_graphics_enabled`: the config flag is
@@ -2375,7 +2395,22 @@ impl AppState {
     pub(crate) fn background_scene_active(&self) -> bool {
         self.kitty_graphics_enabled
             && self.persistent_background_enabled
-            && self.host_terminal_kind.draws_ambient_wash()
+            && self.ambient_wash_is_safe_on_every_viewer()
+    }
+
+    /// Whether an opaque ambient wash may be drawn for *this fleet of viewers*,
+    /// rather than only for the one whose terminal happens to be foreground.
+    ///
+    /// Both facts are required and they answer different questions.
+    /// [`crate::kitty_graphics::HostTerminalKind::draws_ambient_wash`] asks
+    /// whether the foreground terminal draws one where it was placed;
+    /// [`Self::every_app_viewer_draws_ambient_wash`] asks whether every *other*
+    /// attached viewer does too. The wash is one shared image placed for all of
+    /// them, so the answer has to hold for all of them — the first viewer that
+    /// composites it on top of its text is the one the whole feature was gated
+    /// to protect.
+    pub(crate) fn ambient_wash_is_safe_on_every_viewer(&self) -> bool {
+        self.host_terminal_kind.draws_ambient_wash() && self.every_app_viewer_draws_ambient_wash
     }
 
     /// True when the sidebar's ambient particle-field wash may be drawn.
@@ -2388,7 +2423,7 @@ impl AppState {
     pub(crate) fn sidebar_particle_field_active(&self) -> bool {
         self.kitty_graphics_enabled
             && self.sidebar_particle_field_enabled
-            && self.host_terminal_kind.draws_ambient_wash()
+            && self.ambient_wash_is_safe_on_every_viewer()
     }
 
     /// True when the fleet signal bar is drawn.
@@ -3165,6 +3200,7 @@ impl AppState {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
             host_graphics_is_local: false,
+            every_app_viewer_draws_ambient_wash: true,
             kitty_graphics_capability_confirmed: false,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
