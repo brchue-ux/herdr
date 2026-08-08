@@ -1,0 +1,132 @@
+name: Live render
+
+# Verify what a real terminal actually draws, rather than what a unit test
+# asserts about a buffer.
+#
+# Why this exists as a separate workflow: `ci.yml` runs `just ci`, which is
+# `cargo nextest run` with the default filter -- so every `#[ignore]`d test is
+# excluded, and `tests/frame_floor_lab.rs` says so in its own header ("never run
+# in CI"). The kitty/Xvfb harnesses under `data/` were never wired to CI at all.
+# The result was that a binary could go green and still be wrong on screen,
+# because nothing in the gating path had ever put pixels on a real terminal or
+# attached a real client to a real server.
+#
+# This runs on the same `claude/**` trigger as `dev-binary.yml`, so a branch that
+# produces a downloadable binary also gets its rendered output checked.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/**
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+concurrency:
+  group: live-render-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Does the terminal composite overlapping transparent placements the way the
+  # sidebar card path was measured against? Needs no Rust build, so it reports
+  # quickly and independently of the toolchain.
+  composite:
+    name: terminal compositing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install terminal graphics stack
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            kitty imagemagick xvfb x11-utils xauth fonts-dejavu-core
+          python3 -m pip install --quiet pillow
+          kitty --version
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :97 -screen 0 900x700x24 >/tmp/xvfb.log 2>&1 &
+          for _ in $(seq 1 20); do
+            DISPLAY=:97 xdpyinfo >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          DISPLAY=:97 xdpyinfo >/dev/null
+
+      # Both stacking orders: the card path relies on kitty honouring `z` in
+      # each direction, so a regression in one is not caught by the other.
+      - name: Capture real kitty compositing
+        working-directory: data/herdr-card-as-alpha-shape/blend-test
+        run: |
+          ./run.sh ab 0 1
+          ./run.sh ba 1 0
+
+      - name: Gate on the composited pixels
+        run: |
+          shots=data/herdr-card-as-alpha-shape/blend-test/shots
+          python3 scripts/live_render_gate.py "$shots/ab.png"
+          python3 scripts/live_render_gate.py --expect cyan-over-amber "$shots/ba.png"
+
+      - name: Upload captures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-render-captures
+          path: data/herdr-card-as-alpha-shape/blend-test/shots/*.png
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Spawn a real server, attach a real client over a PTY, and drive the actual
+  # render loop. These are the `#[ignore]`d live labs. Their assertions are
+  # deliberately shape-based rather than fixed millisecond figures (see the note
+  # at tests/frame_floor_lab.rs), so they hold on a shared runner; what this
+  # arm really buys is that the server/client/PTY path is exercised end to end
+  # before a binary ships.
+  live-terminal:
+    name: live server + client
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: true
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build test binaries
+        run: cargo build --locked --tests
+
+      # --test-threads=1 because each lab spawns its own server and measures
+      # wall-clock timing; running them concurrently makes both meaningless.
+      - name: Run live labs
+        run: cargo test --locked --test frame_floor_lab -- --ignored --test-threads=1 --nocapture
+
+      - name: Upload server logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-terminal-logs
+          path: /tmp/**/herdr-server.log
+          if-no-files-found: ignore
+          retention-days: 7
