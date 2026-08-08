@@ -14,16 +14,41 @@ A PTY opened with no window size at all reports about four columns, which
 wraps every pane and makes any layout evidence worthless while still looking
 like a real read.
 
+The parent also plays the terminal for one exchange. Since #82 the client sends
+a Kitty Graphics capability probe at startup and paints nothing until something
+answers it (`kitty_graphics_capability_confirmed`), so a bare PTY — which has no
+terminal on the other end — makes the whole pixel path inert. That is not a
+hypothetical: on the base this check was written against there was no probe, and
+on current master the same capture drops from 5,696,056 bytes to 60,993 with a
+single APC block, while still passing every assertion that is not a volume guard.
+
+The reply is written *when the probe is seen in the stream*, never on a timer.
+Blind or repeated writes into a freshly forked PTY race the child's cooked→raw
+transition and get silently swallowed — measured as working twice and then
+failing five times in a row with identical code. Waiting for the probe removes
+the race by construction: the client cannot have emitted it before entering raw
+mode.
+
+This stubs the handshake, it does not test it. What a real terminal does with
+the bytes that follow is `data/herdr-live-composite/`'s job.
+
 usage: capture.py <cols> <rows> <cell_w_px> <cell_h_px> <settle_ms> <out> -- <cmd...>
 """
 import fcntl
 import os
 import pty
+import re
 import selectors
 import struct
 import sys
 import termios
 import time
+
+# `\x1b_Gi=1,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\` — src/terminal_theme.rs.
+# Matched loosely on the key fields so a reordering of the control block does
+# not silently stop the reply and take the pixel path down with it.
+CAPABILITY_PROBE = re.compile(rb"\x1b_G[^;\x1b]*\ba=q\b[^;\x1b]*;")
+CAPABILITY_REPLY = b"\x1b_Gi=1;OK\x1b\\"
 
 
 def main() -> int:
@@ -53,6 +78,8 @@ def main() -> int:
     chunks = bytearray()
     sel = selectors.DefaultSelector()
     sel.register(fd, selectors.EVENT_READ)
+    answered = False
+    scanned = 0
     deadline = time.monotonic() + settle_ms / 1000.0
     while time.monotonic() < deadline:
         for _key, _mask in sel.select(timeout=0.05):
@@ -65,8 +92,23 @@ def main() -> int:
                 deadline = 0
                 break
             chunks.extend(data)
+            if not answered:
+                # Scan from a little behind the last position so a probe split
+                # across two reads is still seen.
+                window = chunks[max(0, scanned - len(CAPABILITY_REPLY) - 64) :]
+                if CAPABILITY_PROBE.search(bytes(window)):
+                    os.write(fd, CAPABILITY_REPLY)
+                    answered = True
+                    print("answered the kitty graphics capability probe", flush=True)
+                scanned = len(chunks)
 
     sel.close()
+    if not answered:
+        print(
+            "WARNING: never saw a kitty graphics capability probe; the client will "
+            "have painted no pixels at all",
+            file=sys.stderr,
+        )
     try:
         os.kill(pid, 15)
     except ProcessLookupError:
