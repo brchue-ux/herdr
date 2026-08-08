@@ -30,6 +30,15 @@ pub(super) enum ResolvedTokenKind {
         open: usize,
         review_requested: usize,
     },
+    /// The 5-hour (session) quota window, already formatted by
+    /// [`crate::quota::format_readout`]: `session 42%, resets in 2h`.
+    QuotaSession(String),
+    /// The 7-day (weekly) quota window, already formatted the same way:
+    /// `week 15%, resets in 2d`. A distinct variant from `QuotaSession`
+    /// rather than one `Quota(Window, String)` so the two can never be drawn
+    /// with the same styling by accident — see the readability requirement
+    /// this pair exists to satisfy.
+    QuotaWeekly(String),
     Custom(String),
 }
 
@@ -118,6 +127,11 @@ pub(super) struct SpaceTokenContext<'a> {
     pub terminal_title_stripped: Option<&'a str>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
+    /// The clock `quota_session`/`quota_weekly` reset countdowns are rendered
+    /// against — [`crate::app::state::AppState::wall_now`], threaded through
+    /// rather than read here so resolving a row stays a pure function of its
+    /// inputs.
+    pub wall_now: std::time::SystemTime,
 }
 
 pub(super) fn space_rows(
@@ -169,6 +183,28 @@ pub(super) fn space_rows(
                                 review_requested: counts.review_requested,
                             }),
                         SpaceSidebarToken::PullRequests => None,
+                        SpaceSidebarToken::QuotaSession => context
+                            .tokens
+                            .get(crate::quota::SESSION_TOKEN)
+                            .and_then(|raw| crate::quota::parse(raw))
+                            .map(|readout| {
+                                ResolvedTokenKind::QuotaSession(crate::quota::format_readout(
+                                    "session",
+                                    &readout,
+                                    context.wall_now,
+                                ))
+                            }),
+                        SpaceSidebarToken::QuotaWeekly => context
+                            .tokens
+                            .get(crate::quota::WEEKLY_TOKEN)
+                            .and_then(|raw| crate::quota::parse(raw))
+                            .map(|readout| {
+                                ResolvedTokenKind::QuotaWeekly(crate::quota::format_readout(
+                                    "week",
+                                    &readout,
+                                    context.wall_now,
+                                ))
+                            }),
                         SpaceSidebarToken::TerminalTitle => context
                             .terminal_title
                             .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
@@ -361,6 +397,7 @@ mod tests {
             terminal_title_stripped: None,
             tokens: &tokens,
             suppress_git_details: false,
+            wall_now: std::time::SystemTime::UNIX_EPOCH,
         };
 
         assert_eq!(
@@ -396,6 +433,7 @@ mod tests {
             terminal_title_stripped: None,
             tokens,
             suppress_git_details,
+            wall_now: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -705,6 +743,7 @@ mod tests {
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
             ),
             vec![vec![
@@ -742,6 +781,7 @@ mod tests {
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: false,
+                    wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
             ),
             vec![
@@ -785,6 +825,7 @@ mod tests {
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: false,
+                    wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
@@ -819,6 +860,7 @@ mod tests {
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
             ),
             vec![vec![
@@ -851,11 +893,104 @@ mod tests {
                     terminal_title_stripped: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
             ))]]
+        );
+    }
+
+    #[test]
+    fn quota_windows_resolve_from_their_own_tokens_and_read_as_two_distinct_facts() {
+        let tokens = std::collections::HashMap::from([
+            ("quota_5h".into(), "42@2026-08-08T02:00:00Z".into()),
+            ("quota_7d".into(), "15@2026-08-10T00:00:00Z".into()),
+        ]);
+        let config = SpacesSidebarConfig {
+            rows: vec![
+                vec![SpaceSidebarToken::QuotaSession],
+                vec![SpaceSidebarToken::QuotaWeekly],
+            ],
+            ..Default::default()
+        };
+        // 2026-08-08T00:00:00Z, cross-checked against
+        // `date -u -d 2026-08-08T00:00:00Z +%s`: 2h before the session window
+        // resets and exactly 2 days before the weekly one does.
+        let wall_now =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_786_147_200);
+
+        let rows = space_rows(
+            &config,
+            SpaceTokenContext {
+                workspace: "repo",
+                branch: None,
+                state_text: "idle",
+                state_age: None,
+                ahead_behind: None,
+                dirty: None,
+                pull_requests: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens: &tokens,
+                suppress_git_details: false,
+                wall_now,
+            },
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![ResolvedToken::unstyled(ResolvedTokenKind::QuotaSession(
+                    "session 42%, resets in 2h".into()
+                ))],
+                vec![ResolvedToken::unstyled(ResolvedTokenKind::QuotaWeekly(
+                    "week 15%, resets in 2d".into()
+                ))],
+            ],
+            "the two windows must carry different label words (session vs week) \
+             and different resolved-token variants, so no downstream renderer \
+             can draw them identically",
+        );
+    }
+
+    #[test]
+    fn a_quota_row_elides_when_its_own_token_is_absent() {
+        let tokens = std::collections::HashMap::from([(
+            "quota_5h".into(),
+            "42@2026-08-08T02:00:00Z".into(),
+        )]);
+        let config = SpacesSidebarConfig {
+            rows: vec![
+                vec![SpaceSidebarToken::QuotaSession],
+                vec![SpaceSidebarToken::QuotaWeekly],
+            ],
+            ..Default::default()
+        };
+
+        let rows = space_rows(
+            &config,
+            SpaceTokenContext {
+                workspace: "repo",
+                branch: None,
+                state_text: "idle",
+                state_age: None,
+                ahead_behind: None,
+                dirty: None,
+                pull_requests: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens: &tokens,
+                suppress_git_details: false,
+                wall_now: std::time::SystemTime::UNIX_EPOCH,
+            },
+        );
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "the weekly row has no token published, so it renders nothing"
         );
     }
 }

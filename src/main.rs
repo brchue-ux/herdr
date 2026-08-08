@@ -98,6 +98,7 @@ mod popup_size;
 mod product_announcements;
 mod protocol;
 mod pty;
+mod quota;
 mod raw_input;
 mod release_notes;
 mod remote;

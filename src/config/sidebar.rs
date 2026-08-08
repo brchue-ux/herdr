@@ -208,6 +208,12 @@ pub enum SpaceSidebarToken {
     GitDirty,
     /// Open pull requests on the forge repository this Space pushes to.
     PullRequests,
+    /// The 5-hour (session) quota window: percent used and reset countdown,
+    /// from the `quota_5h` metadata token. See [`crate::quota`].
+    QuotaSession,
+    /// The 7-day (weekly) quota window: percent used and reset countdown,
+    /// from the `quota_7d` metadata token. See [`crate::quota`].
+    QuotaWeekly,
     TerminalTitle,
     TerminalTitleStripped,
     Custom(String),
@@ -408,6 +414,8 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::GitStatus => "git_status".into(),
         SpaceSidebarToken::GitDirty => "git_dirty".into(),
         SpaceSidebarToken::PullRequests => "pull_requests".into(),
+        SpaceSidebarToken::QuotaSession => "quota_session".into(),
+        SpaceSidebarToken::QuotaWeekly => "quota_weekly".into(),
         SpaceSidebarToken::TerminalTitle => "terminal_title".into(),
         SpaceSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
@@ -500,6 +508,8 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("git_status", Self::GitStatus),
                 ("git_dirty", Self::GitDirty),
                 ("pull_requests", Self::PullRequests),
+                ("quota_session", Self::QuotaSession),
+                ("quota_weekly", Self::QuotaWeekly),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],
@@ -1710,6 +1720,31 @@ rows = [["workspace"], ["terminal_title", "terminal_title_stripped", "$terminal_
         };
 
         let encoded = toml::to_string(&config).expect("serialize spaces config");
+        let decoded: SpacesSidebarConfig = toml::from_str(&encoded).expect("round trip");
+
+        assert_eq!(decoded.rows, rows);
+    }
+
+    #[test]
+    fn quota_space_tokens_round_trip_through_serialization() {
+        let rows = vec![
+            vec![SpaceSidebarToken::QuotaSession],
+            vec![SpaceSidebarToken::Styled {
+                token: Box::new(SpaceSidebarToken::QuotaWeekly),
+                style: SidebarTokenStyle {
+                    bold: Some(true),
+                    ..Default::default()
+                },
+            }],
+        ];
+        let config = SpacesSidebarConfig {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&config).expect("serialize spaces config");
+        assert!(encoded.contains("quota_session"));
+        assert!(encoded.contains("quota_weekly"));
         let decoded: SpacesSidebarConfig = toml::from_str(&encoded).expect("round trip");
 
         assert_eq!(decoded.rows, rows);

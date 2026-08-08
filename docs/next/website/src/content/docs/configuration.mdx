@@ -343,6 +343,8 @@ Space rows accept these built-in tokens:
 - `git_status` — Git ahead and behind counts when nonzero.
 - `git_dirty` — uncommitted work in the checkout: `+` staged, `~` unstaged, `?` untracked.
 - `pull_requests` — open pull requests on the repository this checkout pushes to, as `pr3`.
+- `quota_session` — the published 5-hour quota window: `session 42%, resets in 2h`.
+- `quota_weekly` — the published 7-day quota window: `week 15%, resets in 2d`.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
 - `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
@@ -370,6 +372,18 @@ one. Herdr finds a token the way `gh` does, checking `HERDR_FORGE_TOKEN`,
 `GH_TOKEN`, and `GITHUB_TOKEN`, then `gh`'s own configuration; with no token it
 draws nothing and asks for none. When a fetch fails the previous count stays on
 the row, because "we could not ask" is not "there is nothing open".
+
+Herdr has no quota metering of its own. `quota_session` and `quota_weekly`
+read the `quota_5h`/`quota_7d` workspace metadata tokens a fleet publisher
+writes with `workspace.report_metadata`, each `<percentUsed>@<resetsAt>` —
+the raw reset timestamp, so the "resets in" countdown is always computed
+against the current render rather than a duration that started going stale
+the moment it was published. Either row elides on its own when its token is
+absent, the same as `git_dirty` and `pull_requests`. The two are deliberately
+two separate tokens rather than one, so a layout can put each on its own row:
+that, plus the different label word each one draws (`session` vs. `week`),
+is what keeps the 5-hour and 7-day windows reading as two different facts
+rather than two similar percentages side by side.
 
 `state_age` reports elapsed time and nothing else. It is not a stall warning:
 nothing about it changes colour or shape as the number grows, because Herdr has

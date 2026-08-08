@@ -794,6 +794,7 @@ impl App {
             toast_config: config.ui.toast.clone(),
             keybinds: config.keybinds(),
             state_age_now: Instant::now(),
+            wall_now: std::time::SystemTime::now(),
             relation_signals: relation_signal::RelationSignals::default(),
             pane_activity: pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),

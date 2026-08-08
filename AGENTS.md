@@ -231,6 +231,13 @@ socket, left open for the duration, is the only way to confirm two calls
 produced literally the same event shape (e.g. a reappeared pane's
 `pane.created` payload against a freshly spawned one's).
 
+Rendering config (`[ui.sidebar.*]` and friends) is read by whichever process
+runs `herdr server --session <name>`, not by a client attaching to it
+afterward — consistent with the server-owned-runtime direction above.
+`HERDR_CONFIG_PATH` has to be exported before that server starts; setting it
+only for the attaching client silently renders with the server's own
+(usually default) config instead.
+
 For a mouse bug, run that private TUI inside a pane of a second private fleet
 and read it with `pane read <pane> --source visible --format text`. Herdr is
 the terminal emulator, so no external one is needed. Drive it by sending raw

@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
@@ -1878,6 +1878,16 @@ pub struct AppState {
     /// position from `anim`. The runtime refreshes this every loop iteration;
     /// a test can set it and get a deterministic render.
     pub state_age_now: Instant,
+    /// The wall clock the sidebar's `quota_5h`/`quota_7d` reset countdowns are
+    /// rendered against — see [`crate::quota`].
+    ///
+    /// A wall-clock sibling to `state_age_now` and refreshed alongside it,
+    /// for the same reason: a reset timestamp is wall-clock (RFC3339 from the
+    /// publisher), not monotonic, so the countdown to it needs `SystemTime`
+    /// rather than `Instant`. Kept as a plain state field rather than read
+    /// with `SystemTime::now()` mid-render so render stays a pure function of
+    /// `&AppState` and a test can set it for a deterministic countdown.
+    pub wall_now: SystemTime,
     /// Fleet relation signals currently travelling a sidebar row.
     ///
     /// Deliberately absent from both `persist::SessionSnapshot` and the live
@@ -2975,6 +2985,7 @@ impl AppState {
             toast_config: ToastConfig::default(),
             keybinds: Keybinds::default(),
             state_age_now: Instant::now(),
+            wall_now: SystemTime::now(),
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             anim: crate::anim::Animator::default(),
