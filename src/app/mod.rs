@@ -25,6 +25,7 @@ mod input;
 pub(crate) mod lifecycle;
 pub(crate) mod pane_activity;
 pub(crate) mod pane_resize_reflow;
+pub(crate) mod pane_unread;
 pub(crate) mod pending_effects;
 mod popup;
 mod pull_requests;
@@ -797,6 +798,7 @@ impl App {
             wall_now: std::time::SystemTime::now(),
             relation_signals: relation_signal::RelationSignals::default(),
             pane_activity: pane_activity::PaneActivityMap::default(),
+            pane_unread: pane_unread::PaneUnreadTracker::default(),
             anim: crate::anim::Animator::default(),
             pane_resize_reflow: pane_resize_reflow::PaneResizeReflow::default(),
             sidebar_tree_row_memory: Vec::new(),

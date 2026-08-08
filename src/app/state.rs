@@ -1904,6 +1904,15 @@ pub struct AppState {
     /// the next few samples rather than resurrect a rate that has stopped
     /// being true.
     pub(crate) pane_activity: crate::app::pane_activity::PaneActivityMap,
+    /// Baseline `detection_content_seq` readings for the output-scoped unread
+    /// latch, and when it is next due to poll. See
+    /// `crate::app::pane_unread` and `AppState::observe_pane_unread`.
+    ///
+    /// Also absent from persistence, same reasoning as `pane_activity`: it is
+    /// a comparison baseline against a live counter, not a fact about the
+    /// session. `PaneState::seen` — the actual unread bit this baseline
+    /// drives — is what persists.
+    pub(crate) pane_unread: crate::app::pane_unread::PaneUnreadTracker,
     /// Every visual element's place in its own lifecycle, and the named
     /// behaviours they can play.
     ///
@@ -2553,6 +2562,65 @@ impl AppState {
             })
     }
 
+    /// Flip a backgrounded pane's `seen` bit to unread the moment new PTY
+    /// content arrives on it — agent-detected or not, and regardless of
+    /// `AgentState`. See `crate::app::pane_unread` for why this is a
+    /// leading-edge latch, not a debounce.
+    ///
+    /// `readings` is every live terminal's current `detection_content_seq`,
+    /// supplied by the caller the same way `pane_activity.observe` takes
+    /// `output_byte_counts` — this method never touches a `PaneRuntime`
+    /// itself, which is what keeps it testable with fake readings and no
+    /// PTYs. Self-throttled to `pane_unread`'s own ~300ms cadence, so calling
+    /// this on every loop pass costs nothing extra in between polls.
+    ///
+    /// A pane only latches unread while `pane_is_in_active_tab` is false for
+    /// it — the same visibility rule `apply_pane_state_change` used to gate
+    /// the old completion-scoped write, so a focused pane still never goes
+    /// unread out from under the user. Clearing `seen` is unchanged: still
+    /// `mark_active_tab_seen` on tab focus.
+    ///
+    /// Returns every `(ws_idx, pane_id)` that just flipped, so the caller can
+    /// publish the API events a silent state mutation wouldn't otherwise
+    /// produce (`PaneUpdated`, and `PaneAgentStatusChanged` when the fused
+    /// status actually changed) — see `App::observe_pane_unread`.
+    pub(crate) fn observe_pane_unread<'a>(
+        &mut self,
+        now: Instant,
+        readings: impl IntoIterator<Item = (&'a crate::terminal::TerminalId, u64)>,
+    ) -> Vec<(usize, crate::layout::PaneId)> {
+        if !self.pane_unread.is_due(now) {
+            return Vec::new();
+        }
+        self.pane_unread.mark_polled(now);
+
+        let mut content_changed = std::collections::HashMap::new();
+        for (terminal_id, seq) in readings {
+            let changed = self.pane_unread.observe(terminal_id, seq);
+            content_changed.insert(terminal_id.clone(), changed);
+        }
+
+        let mut flipped = Vec::new();
+        for ws_idx in 0..self.workspaces.len() {
+            let active_tab_idx =
+                (self.active == Some(ws_idx)).then_some(self.workspaces[ws_idx].active_tab);
+            for (tab_idx, tab) in self.workspaces[ws_idx].tabs.iter_mut().enumerate() {
+                let in_active_tab = active_tab_idx == Some(tab_idx);
+                for (pane_id, pane) in tab.panes.iter_mut() {
+                    let pane_content_changed = content_changed
+                        .get(&pane.attached_terminal_id)
+                        .copied()
+                        .unwrap_or(false);
+                    if pane_content_changed && pane.seen && !in_active_tab {
+                        pane.seen = false;
+                        flipped.push((ws_idx, *pane_id));
+                    }
+                }
+            }
+        }
+        flipped
+    }
+
     /// The same level, addressed by the terminal that produces the output.
     ///
     /// Prefer this where a terminal id is already in hand: the terminal is what
@@ -2988,6 +3056,7 @@ impl AppState {
             wall_now: SystemTime::now(),
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
+            pane_unread: crate::app::pane_unread::PaneUnreadTracker::default(),
             anim: crate::anim::Animator::default(),
             pane_resize_reflow: crate::app::pane_resize_reflow::PaneResizeReflow::default(),
             sidebar_card_washes: crate::app::card_wash::CardWashes::default(),

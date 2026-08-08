@@ -495,6 +495,7 @@ impl App {
                 .declared_agent()
                 .map(|agent| crate::detect::agent_label(agent).to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
+            unread: !pane.seen,
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),

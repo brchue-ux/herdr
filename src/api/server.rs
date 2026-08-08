@@ -883,6 +883,7 @@ mod tests {
             display_agent: None,
             declared_agent: None,
             agent_status,
+            unread: false,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,

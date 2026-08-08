@@ -537,6 +537,7 @@ fn restore_tab(
         // be gone by now, and the record is a statement about what happened at
         // creation, not a claim that the creator is still there.
         let saved_created_by = saved_pane.and_then(|pane| pane.created_by.clone());
+        let saved_seen = saved_pane.is_none_or(|pane| pane.seen);
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -605,7 +606,7 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            panes.insert(*id, PaneState::new(terminal_id));
+            panes.insert(*id, PaneState::restored(terminal_id, saved_seen));
             terminals.push(terminal);
             continue;
         }
@@ -708,7 +709,7 @@ fn restore_tab(
                         std::time::Instant::now(),
                     );
                 }
-                panes.insert(*id, PaneState::new(terminal_id.clone()));
+                panes.insert(*id, PaneState::restored(terminal_id.clone(), saved_seen));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }
@@ -1251,6 +1252,7 @@ mod tests {
                             metadata_tokens: Vec::new(),
                             declared_agent: None,
                             created_by: Some(origin.clone()),
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1324,6 +1326,7 @@ mod tests {
                             metadata_tokens: Vec::new(),
                             declared_agent: None,
                             created_by: None,
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1410,6 +1413,7 @@ mod tests {
                                 metadata_tokens: Vec::new(),
                                 declared_agent: None,
                                 created_by: None,
+                                seen: true,
                             },
                         ),
                         (
@@ -1424,6 +1428,7 @@ mod tests {
                                 metadata_tokens: Vec::new(),
                                 declared_agent: None,
                                 created_by: None,
+                                seen: true,
                             },
                         ),
                     ]),
@@ -1495,6 +1500,7 @@ mod tests {
                             metadata_tokens: Vec::new(),
                             declared_agent: Some("claude".into()),
                             created_by: None,
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1565,6 +1571,7 @@ mod tests {
                             metadata_tokens: Vec::new(),
                             declared_agent: Some("an-agent-this-build-never-heard-of".into()),
                             created_by: None,
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1619,6 +1626,7 @@ mod tests {
                     metadata_tokens: Vec::new(),
                     declared_agent: None,
                     created_by: None,
+                    seen: true,
                 },
             )
         };
@@ -1637,6 +1645,7 @@ mod tests {
             metadata_tokens: Vec::new(),
             declared_agent: None,
             created_by: None,
+            seen: true,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1794,6 +1803,7 @@ mod tests {
                             metadata_tokens: Vec::new(),
                             declared_agent: None,
                             created_by: None,
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1960,6 +1970,7 @@ mod tests {
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
                 created_by: None,
+                seen: true,
             },
         );
         let history = SessionHistorySnapshot {

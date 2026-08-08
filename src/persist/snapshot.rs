@@ -151,6 +151,15 @@ pub struct PaneSnapshot {
     /// too, so this rides that path as well.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<crate::api::schema::PaneOrigin>,
+    /// Whether the pane had been viewed since new output last arrived on it.
+    /// Defaults to `true` for snapshots taken before this field existed, so an
+    /// upgrade does not paint every restored pane unread.
+    #[serde(default = "default_true")]
+    pub seen: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +456,7 @@ fn capture_tab(
             .and_then(|terminal| terminal.declared_agent())
             .map(|agent| crate::detect::agent_label(agent).to_string());
         let created_by = terminal.and_then(|terminal| terminal.created_by.clone());
+        let seen = tab.panes.get(id).is_none_or(|pane| pane.seen);
         panes.insert(
             id.raw(),
             PaneSnapshot {
@@ -459,6 +469,7 @@ fn capture_tab(
                 metadata_tokens,
                 declared_agent,
                 created_by,
+                seen,
             },
         );
     }
@@ -792,6 +803,7 @@ mod tests {
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
                 created_by: None,
+                seen: true,
             },
         );
         panes.insert(
@@ -806,6 +818,7 @@ mod tests {
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
                 created_by: None,
+                seen: true,
             },
         );
 
@@ -1549,6 +1562,7 @@ mod tests {
                             }],
                             declared_agent: None,
                             created_by: None,
+                            seen: true,
                         },
                     )]),
                     zoomed: false,
@@ -1629,6 +1643,7 @@ mod tests {
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
                 created_by: None,
+                seen: true,
             },
         );
         panes.insert(
@@ -1645,6 +1660,7 @@ mod tests {
                 metadata_tokens: Vec::new(),
                 declared_agent: None,
                 created_by: None,
+                seen: true,
             },
         );
 
