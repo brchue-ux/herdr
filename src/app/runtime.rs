@@ -81,6 +81,7 @@ impl App {
             terminal_id: terminal_id.clone(),
         };
         self.release_input_target_headless(&target);
+        self.state.pane_unread.remove(&terminal_id);
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
             runtime.shutdown();
         }
@@ -418,6 +419,7 @@ impl App {
         }
         changed |= self.advance_relation_signals(now, true);
         changed |= self.sample_pane_activity(now);
+        changed |= self.observe_pane_unread(now);
         changed |= self.observe_signal_tray(now);
         changed |= self.observe_sidebar_particle_field();
         changed |= self.observe_background_scene();
@@ -510,6 +512,76 @@ impl App {
             .observe(now, self.terminal_runtimes.output_byte_counts());
         self.next_activity_sample = self.state.pane_activity.next_deadline(now);
         changed
+    }
+
+    /// Flip a backgrounded pane's `seen` bit to unread the moment new PTY
+    /// content arrives on it — agent-detected or not, and regardless of
+    /// `AgentState`. See `crate::app::pane_unread` for why this is a
+    /// leading-edge latch rather than a debounce.
+    ///
+    /// Self-throttled to the tracker's own ~300ms cadence internally, so
+    /// calling this on every loop pass (the same way `sample_pane_activity`
+    /// and `observe_signal_tray` are already called) costs nothing extra in
+    /// between polls. No dedicated wake deadline is armed for it: PTY output
+    /// on any pane already requests a render via `RenderSignal::request_pty`
+    /// regardless of that pane's visibility, which is what wakes this loop in
+    /// time to catch it.
+    ///
+    /// A thin wrapper: the actual baseline diffing and `seen` flip live on
+    /// `AppState`, testable with fake readings and no PTYs, the same split
+    /// `sample_pane_activity` uses for `PaneActivityMap`. This layer's job is
+    /// publishing the API events a silent state mutation wouldn't otherwise
+    /// produce — `AppState::observe_pane_unread` has no `event_hub` to push
+    /// through.
+    pub(crate) fn observe_pane_unread(&mut self, now: Instant) -> bool {
+        let flipped = self
+            .state
+            .observe_pane_unread(now, self.terminal_runtimes.detection_content_seq_counts());
+        for (ws_idx, pane_id) in &flipped {
+            self.publish_pane_unread_latch(*ws_idx, *pane_id);
+        }
+        !flipped.is_empty()
+    }
+
+    /// Publish for one pane that just latched unread: `PaneUpdated` always,
+    /// so `pane.get`/subscribers see the new `unread` bit, and
+    /// `PaneAgentStatusChanged` when the fused status actually moved. Only an
+    /// `Idle` pane's `agent_status` depends on `seen` at all (see
+    /// `pane_agent_status`) — a `Working`/`Blocked`/`Unknown` pane going
+    /// unread changes `PaneInfo.unread` but not `agent_status`, so this stays
+    /// silent on that event for those, matching the additive-only API design.
+    fn publish_pane_unread_latch(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        let Some(terminal_state) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .map(|terminal| terminal.state)
+        else {
+            return;
+        };
+        // `observe_pane_unread` only ever flips `seen` from true to false, so
+        // the "previous" fused status is always what `seen: true` would give.
+        let previous_status = super::api_helpers::pane_agent_status(terminal_state, true);
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_pane_updated(ws_idx, pane_id);
+        if previous_status != pane.agent_status {
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                    pane_id: pane.pane_id,
+                    workspace_id: pane.workspace_id,
+                    agent_status: pane.agent_status,
+                    agent: pane.agent,
+                    title: pane.title,
+                    display_agent: pane.display_agent,
+                    state_labels: pane.state_labels,
+                },
+            });
+        }
     }
 
     /// Publish the sidebar rows that exist right now and move every animated

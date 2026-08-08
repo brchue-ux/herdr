@@ -1,10 +1,16 @@
 pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (crate::detect::AgentState::Blocked, _) => 4,
-        (crate::detect::AgentState::Idle, false) => 3,
-        (crate::detect::AgentState::Working, _) => 2,
+        // Unread shares the Idle-unread tier rather than inventing a new one:
+        // output-scoped unread is agent-state-agnostic, so a `Working` or
+        // `Unknown` pane with unseen content is exactly as attention-worthy
+        // as an unseen `Idle` one.
+        (crate::detect::AgentState::Working, false)
+        | (crate::detect::AgentState::Idle, false)
+        | (crate::detect::AgentState::Unknown, false) => 3,
+        (crate::detect::AgentState::Working, true) => 2,
         (crate::detect::AgentState::Idle, true) => 1,
-        (crate::detect::AgentState::Unknown, _) => 0,
+        (crate::detect::AgentState::Unknown, true) => 0,
     }
 }
 

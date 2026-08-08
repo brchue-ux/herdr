@@ -923,10 +923,16 @@ fn tab_aggregate_state(
 fn state_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 5,
-        (AgentState::Working, _) => 4,
-        (AgentState::Idle, false) => 3,
+        (AgentState::Working, true) => 4,
+        // Unread shares the Idle-unread tier rather than inventing a new one:
+        // output-scoped unread is agent-state-agnostic, so a `Working` or
+        // `Unknown` pane with unseen content is exactly as attention-worthy
+        // as an unseen `Idle` one.
+        (AgentState::Working, false) | (AgentState::Idle, false) | (AgentState::Unknown, false) => {
+            3
+        }
         (AgentState::Idle, true) => 2,
-        (AgentState::Unknown, _) => 1,
+        (AgentState::Unknown, true) => 1,
     }
 }
 
@@ -3285,20 +3291,15 @@ impl AppState {
         pane_id: PaneId,
         change: &EffectiveStateChange,
     ) -> Option<bool> {
-        let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
-        let suppress_active_tab_notifications =
-            active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
-        let pane = self.workspaces[ws_idx]
+        // `seen` is no longer written here: it is output-scoped, driven purely
+        // by the content-seq latch in `observe_pane_unread` and cleared by
+        // `mark_active_tab_seen` on tab focus, not by `AgentState` transitions.
+        // This just reports the pane's current bit alongside the state change.
+        let seen = self.workspaces[ws_idx]
             .tabs
-            .iter_mut()
-            .find_map(|tab| tab.panes.get_mut(&pane_id))?;
-
-        if change.state != AgentState::Idle {
-            pane.seen = true;
-        } else if is_completion_transition(change) {
-            pane.seen = suppress_active_tab_notifications;
-        }
-        let seen = pane.seen;
+            .iter()
+            .find_map(|tab| tab.panes.get(&pane_id))?
+            .seen;
 
         if let Some(delivery) = self.record_or_deliver_agent_notification(ws_idx, pane_id, change) {
             self.apply_agent_notification_delivery(&delivery);
@@ -5297,14 +5298,22 @@ mod tests {
         );
     }
 
+    // The four tests below used to assert that an `AgentState` transition —
+    // specifically completing (`Working`/`Blocked` -> `Idle`) in the
+    // background — was what flipped `pane.seen` to unread. That mechanism is
+    // gone: `apply_pane_state_change` no longer touches `seen` at all, for
+    // any transition, in any tab. Output-scoped unread is driven purely by
+    // `AppState::observe_pane_unread`'s content-seq latch, exercised in the
+    // `pane_unread_latch` tests below. These now document the negative
+    // space that leaves behind: state transitions, including a completion in
+    // the active tab, are inert with respect to `seen`.
+
     #[test]
-    fn state_changed_idle_in_background_marks_unseen() {
+    fn state_transitions_never_touch_seen_directly() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
         state.active = Some(0);
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
-
-        // First set it to Working
         let bg_terminal_id = state.workspaces[1]
             .panes
             .get(&bg_pane_id)
@@ -5313,7 +5322,9 @@ mod tests {
             .clone();
         state.terminals.get_mut(&bg_terminal_id).unwrap().state = AgentState::Working;
 
-        // Now transition to Idle while in background
+        // A completion transition in the background still fires its toast —
+        // that stays completion-scoped and is unaffected by this change —
+        // but no longer touches `seen` on its own.
         state.handle_app_event(AppEvent::StateChanged {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
@@ -5325,7 +5336,10 @@ mod tests {
         });
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
-        assert!(!pane.seen);
+        assert!(
+            pane.seen,
+            "a state transition alone must never mark a pane unread"
+        );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
@@ -5333,7 +5347,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tab_completion_marks_pane_seen() {
+    fn active_tab_completion_no_longer_touches_seen() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
         state.outer_terminal_focus = Some(true);
@@ -5345,6 +5359,8 @@ mod tests {
             .attached_terminal_id
             .clone();
         state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+        // Forced false directly, standing in for whatever last latched this
+        // pane unread — a completion transition must not silently correct it.
         state.workspaces[0].panes.get_mut(&pane_id).unwrap().seen = false;
 
         state.handle_app_event(AppEvent::StateChanged {
@@ -5360,33 +5376,15 @@ mod tests {
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Idle);
         let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
-        assert!(pane.seen);
+        assert!(
+            !pane.seen,
+            "only mark_active_tab_seen clears seen now, not a state transition"
+        );
     }
 
     #[test]
-    fn initial_idle_in_background_stays_seen() {
+    fn unknown_to_idle_transition_in_background_does_not_touch_seen() {
         let mut state = app_with_workspaces(&["active", "background"]);
-        state.active = Some(0);
-        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
-
-        state.handle_app_event(AppEvent::StateChanged {
-            pane_id: bg_pane_id,
-            agent: Some(Agent::Pi),
-            state: AgentState::Idle,
-            visible_blocker: false,
-            visible_working: false,
-            process_exited: false,
-            observed_at: std::time::Instant::now(),
-        });
-
-        let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
-        assert!(pane.seen);
-    }
-
-    #[test]
-    fn idle_after_known_unknown_agent_in_background_marks_done() {
-        let mut state = app_with_workspaces(&["active", "background"]);
-        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
         state.active = Some(0);
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
@@ -5410,7 +5408,162 @@ mod tests {
         });
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
-        assert!(!pane.seen);
+        assert!(pane.seen);
+    }
+
+    // The latch itself: `AppState::observe_pane_unread` driven by fake
+    // `detection_content_seq` readings, no `PaneRuntime`/PTY involved. See
+    // `crate::app::pane_unread`.
+    mod pane_unread_latch {
+        use super::*;
+
+        #[test]
+        fn background_content_change_latches_unread_regardless_of_agent_state() {
+            let mut state = app_with_workspaces(&["active", "background"]);
+            state.active = Some(0);
+            let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[1]
+                .panes
+                .get(&bg_pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            // A plain pane with no agent at all — gap 1 in the design report:
+            // output-scoped unread must not require agent detection.
+            state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Unknown;
+
+            let now = std::time::Instant::now();
+            // First observation only seeds the baseline.
+            assert!(state
+                .observe_pane_unread(now, [(&terminal_id, 0)])
+                .is_empty());
+            assert!(state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+            let later = now + crate::app::pane_unread::POLL_INTERVAL;
+            assert_eq!(
+                state.observe_pane_unread(later, [(&terminal_id, 1)]),
+                vec![(1, bg_pane_id)]
+            );
+            assert!(!state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+        }
+
+        #[test]
+        fn working_pane_also_latches_unread() {
+            let mut state = app_with_workspaces(&["active", "background"]);
+            state.active = Some(0);
+            let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[1]
+                .panes
+                .get(&bg_pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+
+            let now = std::time::Instant::now();
+            state.observe_pane_unread(now, [(&terminal_id, 0)]);
+            let later = now + crate::app::pane_unread::POLL_INTERVAL;
+            state.observe_pane_unread(later, [(&terminal_id, 7)]);
+
+            assert!(
+                !state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen,
+                "unread must not depend on AgentState — a live Working pane latches too"
+            );
+        }
+
+        #[test]
+        fn active_tab_content_change_never_latches_unread() {
+            let mut state = app_with_workspaces(&["active"]);
+            state.active = Some(0);
+            let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[0]
+                .panes
+                .get(&pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+
+            let now = std::time::Instant::now();
+            state.observe_pane_unread(now, [(&terminal_id, 0)]);
+            let later = now + crate::app::pane_unread::POLL_INTERVAL;
+            let flipped = state.observe_pane_unread(later, [(&terminal_id, 1)]);
+
+            assert!(flipped.is_empty());
+            assert!(state.workspaces[0].panes.get(&pane_id).unwrap().seen);
+        }
+
+        #[test]
+        fn already_unread_pane_does_not_re_flag_on_further_content() {
+            let mut state = app_with_workspaces(&["active", "background"]);
+            state.active = Some(0);
+            let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[1]
+                .panes
+                .get(&bg_pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+
+            let mut now = std::time::Instant::now();
+            state.observe_pane_unread(now, [(&terminal_id, 0)]);
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            assert!(!state
+                .observe_pane_unread(now, [(&terminal_id, 1)])
+                .is_empty());
+
+            // A continuously streaming background pane keeps bumping the
+            // counter, but the side-effecting flip already happened.
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            assert!(state
+                .observe_pane_unread(now, [(&terminal_id, 2)])
+                .is_empty());
+            assert!(!state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+        }
+
+        #[test]
+        fn viewing_the_pane_again_does_not_immediately_re_latch_from_backlog() {
+            let mut state = app_with_workspaces(&["active", "background"]);
+            state.active = Some(0);
+            let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[1]
+                .panes
+                .get(&bg_pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+
+            let mut now = std::time::Instant::now();
+            state.observe_pane_unread(now, [(&terminal_id, 0)]);
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            state.observe_pane_unread(now, [(&terminal_id, 1)]);
+            assert!(!state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+            // The pane accumulates more backlog while still unread...
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            state.observe_pane_unread(now, [(&terminal_id, 50)]);
+
+            // ...then the user views it. Switching makes workspace 1 active,
+            // which clears `seen` via `mark_active_tab_seen`.
+            state.switch_workspace(1);
+            assert!(state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+            // The very next poll must not immediately re-latch it unread
+            // against the backlog that accumulated before the view — only
+            // genuinely new content after this point should.
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            let flipped = state.observe_pane_unread(now, [(&terminal_id, 50)]);
+            assert!(flipped.is_empty());
+            assert!(state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+
+            // The user leaves again, and only now does genuinely new content
+            // re-latch it.
+            state.switch_workspace(0);
+            now += crate::app::pane_unread::POLL_INTERVAL;
+            assert!(!state
+                .observe_pane_unread(now, [(&terminal_id, 51)])
+                .is_empty());
+            assert!(!state.workspaces[1].panes.get(&bg_pane_id).unwrap().seen);
+        }
     }
 
     #[test]
@@ -6433,9 +6586,13 @@ mod tests {
         assert_eq!(update.agent_label.as_deref(), Some("pi"));
         assert_eq!(update.known_agent, Some(Agent::Pi));
         assert!(update.agent_released);
+        // Not `Done`: `seen` is output-scoped now, so a process exit alone —
+        // like any other state transition — no longer marks the pane unread.
+        // It would still go unread through `AppState::observe_pane_unread` if
+        // new content actually arrived while backgrounded.
         assert_eq!(
             update.agent_release_status,
-            Some(crate::api::schema::AgentStatus::Done)
+            Some(crate::api::schema::AgentStatus::Idle)
         );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),

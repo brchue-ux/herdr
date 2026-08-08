@@ -883,6 +883,25 @@ fn agent_wait_returns_immediately_for_unseen_done_agent() {
     .status
     .success());
 
+    // Unread is output-scoped now: declaring the state alone never marks a
+    // pane unread, only genuinely new PTY content does. Send some real
+    // output to the backgrounded pane so the content-seq latch has something
+    // to catch, then poll until it does — the same ~300ms latch cadence
+    // `agent wait` below is meant to observe having already settled.
+    assert!(
+        run_cli(&socket_path, &["pane", "send-text", &first, "hello"])
+            .status
+            .success()
+    );
+    assert!(wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+        || {
+            let agent = run_cli_json(&socket_path, &["agent", "get", "worker"]);
+            agent["result"]["agent"]["agent_status"] == "done"
+        }
+    ));
+
     let waited = run_cli_json(&socket_path, &["agent", "wait", "worker", "--timeout", "1"]);
     assert_eq!(waited["result"]["agent"]["agent_status"], "done");
 

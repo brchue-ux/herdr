@@ -351,10 +351,16 @@ fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Working, _) => 2,
+        // Unread shares the Idle-unread tier rather than inventing a new one:
+        // output-scoped unread is agent-state-agnostic, so a `Working` or
+        // `Unknown` pane with unseen content is exactly as attention-worthy
+        // as an unseen `Idle` one.
+        (AgentState::Working, false) | (AgentState::Idle, false) | (AgentState::Unknown, false) => {
+            3
+        }
+        (AgentState::Working, true) => 2,
         (AgentState::Idle, true) => 1,
-        (AgentState::Unknown, _) => 0,
+        (AgentState::Unknown, true) => 0,
     }
 }
 

@@ -2871,6 +2871,16 @@ impl PaneRuntime {
         self.output_bytes.load(Ordering::Relaxed)
     }
 
+    /// Monotonic counter bumped for every PTY read this pane has seen,
+    /// agent-detected or not.
+    ///
+    /// The evidence the output-scoped unread latch polls: any change since the
+    /// last poll means new content has arrived, regardless of what state the
+    /// agent detector thinks the pane is in.
+    pub fn detection_content_seq(&self) -> u64 {
+        self.detection_content_seq.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn search_text_matches(
         &self,
         query: &str,

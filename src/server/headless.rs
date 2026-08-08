@@ -4556,6 +4556,10 @@ impl HeadlessServer {
         // Not gated on viewers: the activity level is a runtime fact the API
         // answers with, not decoration, so a detached server keeps it truthful.
         changed |= self.app.sample_pane_activity(now);
+        // Same reasoning: `PaneInfo.unread` is a runtime fact a detached
+        // server still has to answer truthfully, so the output-scoped unread
+        // latch runs here too, not only in `App::handle_scheduled_tasks`.
+        changed |= self.app.observe_pane_unread(now);
 
         if self
             .app

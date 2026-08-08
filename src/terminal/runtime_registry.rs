@@ -47,6 +47,15 @@ impl TerminalRuntimeRegistry {
             .map(|(id, runtime)| (id, runtime.output_bytes()))
     }
 
+    /// Every live terminal's `detection_content_seq` reading, for the
+    /// output-scoped unread latch. Same shape as `output_byte_counts`, one
+    /// relaxed atomic load per terminal.
+    pub(crate) fn detection_content_seq_counts(&self) -> impl Iterator<Item = (&TerminalId, u64)> {
+        self.runtimes
+            .iter()
+            .map(|(id, runtime)| (id, runtime.detection_content_seq()))
+    }
+
     #[cfg(unix)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&TerminalId, &TerminalRuntime)> {
         self.runtimes.iter()

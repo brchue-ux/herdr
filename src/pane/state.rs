@@ -5,8 +5,8 @@ use crate::terminal::TerminalId;
 /// Terminal identity, cwd, labels, and agent metadata live in TerminalState.
 pub struct PaneState {
     pub attached_terminal_id: TerminalId,
-    /// Whether the user has seen this pane since its last state change to Idle.
-    /// False = "Done" (agent finished while user was in another workspace).
+    /// Whether new output has arrived on this pane since it was last viewed.
+    /// False = unread: content arrived while the pane's tab was not active.
     pub seen: bool,
 }
 
@@ -15,6 +15,15 @@ impl PaneState {
         Self {
             attached_terminal_id,
             seen: true,
+        }
+    }
+
+    /// Restore a pane with a persisted `seen` value instead of the `true`
+    /// default `new` uses for a genuinely new pane.
+    pub fn restored(attached_terminal_id: TerminalId, seen: bool) -> Self {
+        Self {
+            attached_terminal_id,
+            seen,
         }
     }
 }

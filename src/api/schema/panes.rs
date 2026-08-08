@@ -508,6 +508,13 @@ pub struct PaneInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// Whether new output has arrived on this pane since it was last viewed.
+    ///
+    /// Independent of `agent_status`: unlike `AgentStatus::Done`, which only
+    /// exists for an idle agent, this can be `true` while the pane is
+    /// `Working` or `Blocked`, or has no agent at all — output-scoped unread
+    /// tracks any new PTY content, not agent completion.
+    pub unread: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

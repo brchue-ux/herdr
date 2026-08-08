@@ -293,6 +293,11 @@ impl TerminalRuntime {
         self.0.output_bytes()
     }
 
+    /// Monotonic counter bumped for every PTY read, agent-detected or not.
+    pub fn detection_content_seq(&self) -> u64 {
+        self.0.detection_content_seq()
+    }
+
     pub(crate) fn search_text_matches(
         &self,
         query: &str,
