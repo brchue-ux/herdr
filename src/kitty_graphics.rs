@@ -223,6 +223,35 @@ impl HostSurfaceId {
     }
 }
 
+/// Which of the surfaces Herdr draws itself this pass may embed as pixels.
+///
+/// A client can ask to be sent a surface as a semantic scene message and draw
+/// it locally instead — `ServerMessage::CardScene`, `ServerMessage::TrayScene`
+/// — and the pass that would otherwise have embedded the same pixels has to
+/// leave them out, or the client receives the surface twice.
+///
+/// One flag per such surface rather than one flag for "does its own drawing",
+/// because the two are asked for separately: a client may be able to reproduce
+/// the cards and not the badges, and each new surface that becomes negotiable
+/// adds a flag here rather than changing what an existing one means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmbeddedSurfaces {
+    /// `HostSurfaceId::SidebarCards` — the sidebar tree's rasterised cards.
+    pub(crate) cards: bool,
+    /// `HostSurfaceId::SignalTray` — the notification tray's badge artwork.
+    pub(crate) signal_tray: bool,
+}
+
+impl EmbeddedSurfaces {
+    /// Everything embedded: what a client that rasterises nothing itself gets,
+    /// which is every client before either scene message existed and still the
+    /// overwhelming majority of them.
+    pub(crate) const ALL: Self = Self {
+        cards: true,
+        signal_tray: true,
+    };
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum HostSourceKey {
     Terminal {
@@ -529,7 +558,7 @@ pub(crate) fn paint_local_pane_graphics(
             app.view.tab_surface(),
             cell_size,
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
     }
     if bytes.is_empty() {
@@ -552,7 +581,7 @@ pub(crate) fn encode_local_pane_graphics(
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     cache: &mut HostGraphicsCache,
-    include_cards: bool,
+    embedded: EmbeddedSurfaces,
 ) -> Vec<u8> {
     let mode_ok = app.mode == Mode::Terminal;
     let cell_ok = cell_size.is_known();
@@ -584,7 +613,7 @@ pub(crate) fn encode_local_pane_graphics(
         surface,
         cell_size,
         &cache.images,
-        include_cards,
+        embedded,
     );
     tracing::debug!(
         placements_collected = placements.len(),
@@ -649,12 +678,50 @@ pub(crate) fn encode_card_scene_graphics(
     bytes
 }
 
+/// Encodes a client-rasterised signal tray into Kitty graphics protocol bytes,
+/// exactly as the server would encode it under `HostSurfaceId::SignalTray`, for
+/// a client that decoded a `ServerMessage::TrayScene` and rasterised it locally
+/// with `crate::ui::rasterise_signal_tray_scene`.
+///
+/// `grid` is the scene's own cell rect — the same rect
+/// `crate::ui::signal_tray_graphics_rect` resolves server-side — and `cache` is
+/// this client's own, kept across calls and **separate from the card scene's**:
+/// `encode_graphics_update` deletes the images of every layer source missing
+/// from the pass it is given, so two surfaces encoded in separate calls against
+/// one cache would each delete the other.
+pub(crate) fn encode_tray_scene_graphics(
+    grid: Rect,
+    layer: &crate::app::state::GraphicsLayer,
+    cell_size: HostCellSize,
+    cache: &mut HostGraphicsCache,
+) -> Vec<u8> {
+    let placements = [layer_host_placement(
+        HostSurfaceId::SignalTray,
+        grid,
+        cell_size,
+        layer,
+        &cache.images,
+        true,
+    )];
+
+    let mut bytes = Vec::new();
+    encode_graphics_update(
+        &mut bytes,
+        &placements,
+        false,
+        &mut cache.images,
+        &mut cache.placements,
+        &mut cache.sources,
+    );
+    bytes
+}
+
 pub(crate) fn has_visible_pane_graphics(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
-    include_cards: bool,
+    embedded: EmbeddedSurfaces,
 ) -> bool {
     if app.mode != Mode::Terminal || !cell_size.is_known() {
         return false;
@@ -664,7 +731,7 @@ pub(crate) fn has_visible_pane_graphics(
     // are checked before — and independently of — the active workspace, exactly
     // as `collect_visible_placements` collects them.
     let empty_uploaded = HashMap::new();
-    for (surface_id, area, layer) in surface_layer_placement_targets(app, include_cards) {
+    for (surface_id, area, layer) in surface_layer_placement_targets(app, embedded) {
         let host_placement =
             layer_host_placement(surface_id, area, cell_size, layer, &empty_uploaded, false);
         if clipped_placement(&host_placement).is_some() {
@@ -984,14 +1051,14 @@ fn collect_visible_placements(
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
-    include_cards: bool,
+    embedded: EmbeddedSurfaces,
 ) -> Vec<HostPlacement> {
     let mut placements = Vec::new();
 
     // Chrome surfaces are laid out beside the tab surface, not inside it, so
     // they are collected before the active-workspace gate rather than through
     // the pane walk.
-    for (surface_id, area, layer) in surface_layer_placement_targets(app, include_cards) {
+    for (surface_id, area, layer) in surface_layer_placement_targets(app, embedded) {
         placements.push(layer_host_placement(
             surface_id,
             area,
@@ -1090,12 +1157,11 @@ fn collect_visible_placements(
 /// sidebar image erased the tray or the cards, and either of those redrawing
 /// erased the client's image.
 ///
-/// `include_cards` withholds the `SidebarCards` entries entirely — for a
-/// client that requested `ServerMessage::CardScene` and rasterises them
-/// itself, so the same pixels are never embedded twice.
+/// `embedded` withholds the entries for surfaces this client rasterises itself
+/// from a scene message, so the same pixels are never embedded twice.
 fn surface_layer_placement_targets(
     app: &AppState,
-    include_cards: bool,
+    embedded: EmbeddedSurfaces,
 ) -> impl Iterator<Item = (HostSurfaceId, Rect, &crate::app::state::GraphicsLayer)> {
     app.surface_graphics_layers
         .iter()
@@ -1104,13 +1170,18 @@ fn surface_layer_placement_targets(
                 (HostSurfaceId::Sidebar, app.view.sidebar_rect, layer)
             }
         })
-        .chain(app.signal_tray_graphics.as_ref().map(|layer| {
-            (
-                HostSurfaceId::SignalTray,
-                crate::ui::signal_tray_graphics_rect(app),
-                layer,
-            )
-        }))
+        .chain(
+            app.signal_tray_graphics
+                .as_ref()
+                .filter(|_| embedded.signal_tray)
+                .map(|layer| {
+                    (
+                        HostSurfaceId::SignalTray,
+                        crate::ui::signal_tray_graphics_rect(app),
+                        layer,
+                    )
+                }),
+        )
         .chain(app.sidebar_particle_field.as_ref().map(|layer| {
             (
                 HostSurfaceId::SidebarParticleField,
@@ -1147,11 +1218,11 @@ fn surface_layer_placement_targets(
         // `image_card::shape_covers_row` exists to prevent, arrived at from the
         // other side. A *sheet* cannot double anything: it is opaque over every
         // cell a row owns, so it simply covers the characters, which is what the
-        // default path did before shapes existed and still has to do. Only the
-        // cards are ever withheld; every other surface this client is entitled
-        // to keeps flowing either way.
+        // default path did before shapes existed and still has to do. The cards
+        // and the tray are the surfaces a client can ask to draw itself; every
+        // other surface this client is entitled to keeps flowing either way.
         .chain(
-            if include_cards
+            if embedded.cards
                 && (!app.sidebar_card_shapes || app.view.sidebar_card_layers_published)
             {
                 app.sidebar_card_layers.as_slice()
@@ -2017,6 +2088,129 @@ mod tests {
         }
     }
 
+    /// The client's own bytes are the server's own bytes.
+    ///
+    /// Moving a surface across the boundary is only safe if what reaches the
+    /// terminal is unchanged, and "the pixels match" is not that claim — the
+    /// image id, the placement id, the cell rect, the z and the format all have
+    /// to land identically too, or the badges arrive somewhere else or not at
+    /// all. So this compares the actual Kitty payload the two paths emit:
+    /// the server embedding its own raster, against a scene encoded, decoded,
+    /// rasterised and encoded again as a client does it.
+    #[test]
+    fn a_client_rasterised_tray_emits_the_bytes_the_server_would_have_embedded() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.kitty_graphics_enabled = true;
+        app.sidebar_signal_tray.enabled = true;
+        app.view.sidebar_rect = Rect::new(0, 0, 42, 34);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.workspaces[0].cached_git_ahead_behind = Some((3, 1));
+
+        let cell = test_cell_size();
+        let (_, artwork) =
+            crate::ui::signal_tray_image(&app, cell.width_px, cell.height_px).expect("artwork");
+        app.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(artwork));
+
+        // The server's side: the tray as this pass would embed it, with every
+        // other surface absent so what comes out is the tray and nothing else.
+        let mut server_cache = HostGraphicsCache::default();
+        let embedded = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            cell,
+            &mut server_cache,
+            EmbeddedSurfaces::ALL,
+        );
+        assert!(
+            !embedded.is_empty(),
+            "the server embedded no tray graphics to compare against"
+        );
+
+        // The client's side: the same tray as a scene, over the wire and back.
+        let scene = crate::ui::build_signal_tray_scene(&app).expect("scene");
+        let bytes = crate::ui::encode_signal_tray_scene(&scene).expect("encode");
+        let decoded = crate::ui::decode_signal_tray_scene(&bytes).expect("decode");
+        let (grid, image) =
+            crate::ui::rasterise_signal_tray_scene(&decoded, cell.width_px, cell.height_px)
+                .expect("the client rasterises the scene");
+        let mut client_cache = HostGraphicsCache::default();
+        let drawn = encode_tray_scene_graphics(
+            grid,
+            &crate::ui::signal_tray_graphics_layer(image),
+            cell,
+            &mut client_cache,
+        );
+
+        assert_eq!(
+            embedded, drawn,
+            "the client's tray reached the terminal differently from the server's"
+        );
+
+        // Asked again with nothing moved, the client sends nothing: its cache
+        // holds the same ground the server's does, so a still tray costs an
+        // upload once rather than once per frame.
+        assert!(encode_tray_scene_graphics(
+            grid,
+            &crate::ui::signal_tray_graphics_layer(
+                crate::ui::rasterise_signal_tray_scene(&decoded, cell.width_px, cell.height_px)
+                    .expect("raster")
+                    .1
+            ),
+            cell,
+            &mut client_cache,
+        )
+        .is_empty());
+    }
+
+    /// A surface a client rasterises itself is left out of that client's own
+    /// pass — otherwise it receives the same badges twice, once as the scene
+    /// it asked for and once as the pixels it asked not to be sent.
+    ///
+    /// Per surface, not per client: withholding the tray must not withhold the
+    /// cards, and a client entitled to neither still gets everything else.
+    #[test]
+    fn a_surface_the_client_rasterises_itself_is_withheld_from_its_own_pass() {
+        let mut app = app_with_sidebar(
+            Rect::new(0, 0, 26, 40),
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        app.sidebar_signal_tray.enabled = true;
+        app.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(
+            crate::ui::sidebar::tray_art::Rgba {
+                width: 8,
+                height: 8,
+                pixels: vec![0xff; 8 * 8 * 4],
+            },
+        ));
+
+        let surfaces = |embedded| {
+            surface_layer_placement_targets(&app, embedded)
+                .map(|(surface, _, _)| surface)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            surfaces(EmbeddedSurfaces::ALL).contains(&HostSurfaceId::SignalTray),
+            "a client that rasterises nothing itself must still be sent the tray"
+        );
+
+        let withheld = surfaces(EmbeddedSurfaces {
+            signal_tray: false,
+            ..EmbeddedSurfaces::ALL
+        });
+        assert!(
+            !withheld.contains(&HostSurfaceId::SignalTray),
+            "the tray's pixels were embedded for a client already drawing them"
+        );
+        assert!(
+            withheld.contains(&HostSurfaceId::Sidebar),
+            "withholding the tray took a client's own sidebar image with it"
+        );
+    }
+
     #[test]
     fn sidebar_layer_anchors_to_the_sidebar_rect_and_fills_it() {
         let app = app_with_sidebar(
@@ -2029,7 +2223,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
 
         assert_eq!(placements.len(), 1);
@@ -2065,7 +2259,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("visible sidebar layer");
 
@@ -2104,7 +2298,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("a card part-way in");
         assert_eq!((clipped.x, clipped.y), (18, 3));
@@ -2130,7 +2324,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert!(
             clipped_placement(&placements[0]).is_none(),
@@ -2152,7 +2346,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
 
         assert_eq!(placements.len(), 1, "the layer is still stored");
@@ -2165,7 +2359,7 @@ mod tests {
             &TerminalRuntimeRegistry::new(),
             empty_surface(),
             test_cell_size(),
-            true,
+            EmbeddedSurfaces::ALL,
         ));
     }
 
@@ -2191,7 +2385,7 @@ mod tests {
                 empty_surface(),
                 test_cell_size(),
                 &mut cache,
-                true,
+                EmbeddedSurfaces::ALL,
             );
             let emitted = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -2217,7 +2411,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -2229,7 +2423,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
 
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
@@ -2271,7 +2465,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("a=t"), "root frame uploaded");
@@ -2288,7 +2482,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert!(
             bytes.is_empty(),
@@ -2373,7 +2567,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert_eq!(placements.len(), 2);
 
@@ -2425,7 +2619,7 @@ mod tests {
             &TerminalRuntimeRegistry::new(),
             empty_surface(),
             test_cell_size(),
-            true,
+            EmbeddedSurfaces::ALL,
         ));
     }
 
@@ -2445,7 +2639,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -2459,7 +2653,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
-            true,
+            EmbeddedSurfaces::ALL,
         );
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
         assert!(cache.is_empty());

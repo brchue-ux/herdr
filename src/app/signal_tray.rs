@@ -62,7 +62,13 @@ const QUESTION_LINES: usize = 6;
 const MAX_ITEMS: usize = 32;
 
 /// How a badge is drawn right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// Serializable because it is what a `ServerMessage::TrayScene` carries — the
+/// badge's *state*, not its pixels — for a client that rasterises the tray
+/// itself. See [`crate::ui::sidebar::tray::TrayScene`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum BadgeState {
     /// The condition is not true. The mark is engraved into the tray rather
     /// than faded out: a faded badge looks broken, a carved one looks like a

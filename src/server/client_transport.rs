@@ -298,6 +298,10 @@ pub(crate) enum ServerEvent {
         /// `ServerMessage::CardScene` instead of receiving server-embedded
         /// card pixels.
         wants_client_rasterized_cards: bool,
+        /// Whether this client wants to rasterise the signal tray itself from
+        /// `ServerMessage::TrayScene` instead of receiving server-embedded
+        /// badge pixels.
+        wants_client_rasterized_signal_tray: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -524,6 +528,7 @@ pub(crate) fn handle_client_handshake(
         direct_attach_requested,
         host_terminal,
         wants_client_rasterized_cards,
+        wants_client_rasterized_signal_tray,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -536,6 +541,7 @@ pub(crate) fn handle_client_handshake(
             launch_mode,
             host_terminal,
             wants_client_rasterized_cards,
+            wants_client_rasterized_signal_tray,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -577,6 +583,7 @@ pub(crate) fn handle_client_handshake(
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 host_terminal,
                 wants_client_rasterized_cards,
+                wants_client_rasterized_signal_tray,
             )
         }
         _ => {
@@ -633,6 +640,7 @@ pub(crate) fn handle_client_handshake(
         direct_attach_requested,
         host_terminal,
         wants_client_rasterized_cards,
+        wants_client_rasterized_signal_tray,
         writer,
     });
 
@@ -1188,6 +1196,7 @@ new_tab = "ctrl+notakey"
                 launch_mode: ClientLaunchMode::App,
                 host_terminal: protocol::HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
+                wants_client_rasterized_signal_tray: false,
             },
         )
         .expect("write hello");
@@ -1222,6 +1231,7 @@ new_tab = "ctrl+notakey"
                 direct_attach_requested,
                 host_terminal: _,
                 wants_client_rasterized_cards: _,
+                wants_client_rasterized_signal_tray: _,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1267,6 +1277,7 @@ new_tab = "ctrl+notakey"
                 launch_mode: ClientLaunchMode::TerminalAttach,
                 host_terminal: protocol::HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
+                wants_client_rasterized_signal_tray: false,
             },
         )
         .expect("write hello");

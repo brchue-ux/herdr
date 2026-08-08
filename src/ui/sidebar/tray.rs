@@ -297,7 +297,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
         );
     }
 
-    if app.signal_tray_graphics.is_some() {
+    if artwork_covers_grid(app) {
         return;
     }
 
@@ -320,6 +320,108 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// Whether badges are going to be drawn over the grid, so [`render`] must
+/// leave the fallback marks off it.
+///
+/// Two ways that happens and they are equally binding: this Herdr rasterised
+/// the artwork into [`AppState::signal_tray_graphics`], or it handed a
+/// [`TrayScene`] to a client that rasterises it. The marks are the *no
+/// graphics* form, and a mark showing through a mostly-transparent badge is
+/// worse than either alone — so what matters is that badges are coming, not
+/// which machine drew them.
+fn artwork_covers_grid(app: &AppState) -> bool {
+    app.signal_tray_graphics.is_some() || app.signal_tray_graphics_client_rasterized
+}
+
+/// One badge, as the wire carries it: what it is saying and where it is in
+/// saying it. Ordered by [`FleetSignal::ALL`] inside a [`TrayScene`], which is
+/// the same order [`slot_rect`] lays the grid out in.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TrayBadge {
+    /// What the badge is drawn as.
+    state: BadgeState,
+    /// Where it is in its animation, as the engine's envelope — the value
+    /// [`motion`] resolves, already read off the server's clock.
+    motion: f32,
+}
+
+/// Everything a client needs to rasterise the tray's badge artwork itself, in
+/// place of server-embedded tray pixels. Sent as the opaque payload of
+/// `ServerMessage::TrayScene` to clients that set
+/// `ClientMessage::Hello::wants_client_rasterized_signal_tray`.
+///
+/// The field list is [`crate::app::runtime`]'s own `signal_tray_graphics_key`
+/// read forwards: that hash is exactly what the artwork depends on, so what it
+/// folds in is what has to cross the wire. The palette and host theme it hashes
+/// arrive here already resolved into [`BadgePaint`], because two colours are
+/// what the rasteriser actually reads.
+///
+/// # What is deliberately not here
+///
+/// Cell size. It is in the cache key server-side because the server rasterises
+/// against the *client's* reported cell, but the client already knows its own
+/// and is the authority on it — the same reason [`super::image_card::CardScene`]
+/// ships no cell or font metrics.
+///
+/// # Not a scope cut
+///
+/// Unlike `CardScene`, nothing is dropped on the way: a badge's whole motion is
+/// one `f32` envelope ([`motion`]'s own doc says why), so the client
+/// reconstructs the identical artwork rather than a reduced one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TrayScene {
+    /// The cell rect the badges are laid out in — [`grid_rect`]'s answer, which
+    /// is also where the placement lands.
+    grid: Rect,
+    /// The eight badges, in [`FleetSignal::ALL`] order. A fixed array rather
+    /// than a `Vec` so a decoded scene cannot carry seven badges or nine.
+    badges: [TrayBadge; FleetSignal::COUNT],
+    /// The two colours a badge is cut from.
+    paint: BadgePaint,
+}
+
+/// Snapshots what the tray would be rasterised from right now.
+///
+/// A **pure read**, like [`render`] — every value it takes is one the app loop
+/// has already settled — so building a scene for a client cannot make the
+/// artwork disagree with the frame it travels with.
+///
+/// `None` when there is nothing to draw, matching [`image`]'s own `None`.
+pub(crate) fn build_scene(app: &AppState) -> Option<TrayScene> {
+    let area = super::sidebar_content_rect(app.view.sidebar_rect);
+    let grid = grid_rect(tray_rect(app, area));
+    if grid.width == 0 || grid.height == 0 {
+        return None;
+    }
+    let reading = signal_tray::resolve(app);
+    Some(TrayScene {
+        grid,
+        badges: FleetSignal::ALL.map(|signal| {
+            let state = reading.badge(signal).state;
+            TrayBadge {
+                state,
+                motion: motion(app, signal, state),
+            }
+        }),
+        paint: BadgePaint {
+            attention: rgb_of(app.palette.peach, app),
+            surface: badge_surface(app),
+        },
+    })
+}
+
+/// Encodes a [`TrayScene`] as the opaque bincode payload carried by
+/// `ServerMessage::TrayScene { bytes }`.
+pub(crate) fn encode_scene(scene: &TrayScene) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(scene, bincode::config::standard())
+}
+
+/// Decodes a [`TrayScene`] from the opaque bincode payload carried by
+/// `ServerMessage::TrayScene { bytes }`.
+pub(crate) fn decode_scene(bytes: &[u8]) -> Result<TrayScene, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map(|(scene, _)| scene)
+}
+
 /// The tray's badge artwork, as one image covering [`grid_rect`].
 ///
 /// One image rather than eight, because the graphics surface holds one layer
@@ -330,8 +432,21 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
 /// `None` when there is nothing to draw. The caller is the app loop, never the
 /// renderer: rasterising is a mutation and `render` only draws.
 pub(crate) fn image(app: &AppState, cell_width: u32, cell_height: u32) -> Option<(Rect, Rgba)> {
-    let area = super::sidebar_content_rect(app.view.sidebar_rect);
-    let grid = grid_rect(tray_rect(app, area));
+    rasterise_scene(&build_scene(app)?, cell_width, cell_height)
+}
+
+/// Draws a [`TrayScene`] — this pass's own, server-side, or one that arrived
+/// over the wire — at this machine's cell size.
+///
+/// The one rasteriser. A client rasterising a scene it was sent runs exactly
+/// the code the server would have run, against its own cell, so the two cannot
+/// draw the tray differently.
+pub(crate) fn rasterise_scene(
+    scene: &TrayScene,
+    cell_width: u32,
+    cell_height: u32,
+) -> Option<(Rect, Rgba)> {
+    let grid = scene.grid;
     if grid.width == 0 || grid.height == 0 || cell_width == 0 || cell_height == 0 {
         return None;
     }
@@ -343,12 +458,6 @@ pub(crate) fn image(app: &AppState, cell_width: u32, cell_height: u32) -> Option
         height,
         pixels: vec![0; (width as usize) * (height as usize) * 4],
     };
-
-    let paint = BadgePaint {
-        attention: rgb_of(app.palette.peach, app),
-        surface: badge_surface(app),
-    };
-    let reading = signal_tray::resolve(app);
 
     for (index, signal) in FleetSignal::ALL.into_iter().enumerate() {
         let slot = slot_rect(grid, index);
@@ -363,14 +472,38 @@ pub(crate) fn image(app: &AppState, cell_width: u32, cell_height: u32) -> Option
         if size == 0 {
             continue;
         }
-        let state = reading.badge(signal).state;
-        let badge = tray_art::render_badge(signal, state, size, paint, motion(app, signal, state));
+        let badge = &scene.badges[index];
+        let art = tray_art::render_badge(signal, badge.state, size, scene.paint, badge.motion);
         let ox = u32::from(slot.x - grid.x) * cell_width + (slot_w.saturating_sub(size)) / 2;
         let oy = u32::from(slot.y - grid.y) * cell_height + (slot_h.saturating_sub(size)) / 2;
-        blit(&mut canvas, &badge, ox, oy);
+        blit(&mut canvas, &art, ox, oy);
     }
 
     Some((grid, canvas))
+}
+
+/// The artwork as the graphics layer that publishes it.
+///
+/// One construction for both sides of the boundary — the server embedding its
+/// own raster and a client compositing the one it drew from a `TrayScene` — so
+/// format, placement and z cannot drift apart between them.
+pub(crate) fn graphics_layer(image: Rgba) -> crate::app::state::GraphicsLayer {
+    crate::app::state::GraphicsLayer::new(
+        crate::api::schema::PaneGraphicsFormat::Rgba,
+        image.width,
+        image.height,
+        image.pixels,
+        crate::api::schema::PaneGraphicsPlacementParams {
+            viewport_col: 0,
+            viewport_row: 0,
+            grid_cols: 0,
+            grid_rows: 0,
+            // Over the text. The badges *are* the tray; the fallback marks
+            // underneath them are what a host with no graphics gets, and on
+            // a host with graphics they are meant to be covered.
+            z: 0,
+        },
+    )
 }
 
 /// Where one badge is in its animation right now, as the engine's envelope.
@@ -851,6 +984,123 @@ mod tests {
             marks_drawn(&app),
             0,
             "the fallback marks were drawn under artwork that cannot cover them"
+        );
+
+        // And artwork drawn by the client covers them exactly as artwork drawn
+        // here does. Which machine rasterised the badges is not a fact the
+        // fallback marks are entitled to have an opinion about.
+        app.signal_tray_graphics = None;
+        app.signal_tray_graphics_client_rasterized = true;
+        assert_eq!(
+            marks_drawn(&app),
+            0,
+            "the fallback marks were drawn under badges the client is about to composite"
+        );
+    }
+
+    /// A fleet with something to say on every row, so the scene under test is
+    /// not eight idle badges.
+    fn scene_app() -> AppState {
+        let mut app = app_with_tray(42, 34);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.workspaces[0].cached_git_ahead_behind = Some((3, 1));
+        app
+    }
+
+    /// A `TrayScene` built from a real fleet survives an encode/decode round
+    /// trip byte-for-byte — the contract `ServerMessage::TrayScene` rests on,
+    /// checked without a live terminal or a connected client on either end.
+    #[test]
+    fn tray_scene_round_trips_through_bincode() {
+        let app = scene_app();
+        let scene = build_scene(&app).expect("the tray has a grid to draw in");
+
+        let bytes = encode_scene(&scene).expect("encode TrayScene");
+        let decoded = decode_scene(&bytes).expect("decode TrayScene");
+
+        assert_eq!(scene, decoded);
+    }
+
+    /// Garbage bytes decode to an error rather than a panic — the client's
+    /// only defence against a version-skewed or corrupted `TrayScene` payload.
+    #[test]
+    fn tray_scene_decode_rejects_garbage_bytes() {
+        assert!(decode_scene(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
+    /// What crosses the wire is the *reading*, not the picture: a scene is a
+    /// few dozen bytes where the artwork it stands for is tens of kilobytes of
+    /// RGBA. This is the whole point of the message, so it is asserted rather
+    /// than assumed.
+    #[test]
+    fn a_scene_is_orders_of_magnitude_smaller_than_the_artwork_it_stands_for() {
+        let app = scene_app();
+        let scene = build_scene(&app).expect("the tray has a grid to draw in");
+        let bytes = encode_scene(&scene).expect("encode TrayScene");
+        let (_, image) = image(&app, 9, 18).expect("the tray rasterises");
+
+        assert!(
+            bytes.len() < 1024,
+            "a tray scene should be well under a kilobyte, was {}",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() * 100 < image.pixels.len(),
+            "a {}-byte scene against {} bytes of pixels is not the saving this exists for",
+            bytes.len(),
+            image.pixels.len()
+        );
+    }
+
+    /// The client draws what the server would have drawn — every pixel, not an
+    /// approximation of it. Unlike `CardScene` nothing is dropped on the way
+    /// over, so this is an equality and not a resemblance.
+    #[test]
+    fn a_scene_rasterised_from_the_wire_is_the_artwork_the_server_would_have_drawn() {
+        let app = scene_app();
+        let here = image(&app, 9, 18).expect("the tray rasterises");
+
+        let bytes = encode_scene(&build_scene(&app).expect("scene")).expect("encode");
+        let there = rasterise_scene(&decode_scene(&bytes).expect("decode"), 9, 18)
+            .expect("the scene rasterises");
+
+        assert_eq!(here.0, there.0, "the badges landed on a different grid");
+        assert_eq!(here.1.width, there.1.width);
+        assert_eq!(here.1.height, there.1.height);
+        assert_eq!(
+            here.1.pixels, there.1.pixels,
+            "the client drew different badges from the ones the server would have"
+        );
+    }
+
+    /// A badge mid-animation reaches the wire where it actually is. Shipping
+    /// the states without the envelope would look right in a screenshot and be
+    /// frozen in motion — the same failure the artwork's cache key exists to
+    /// prevent, arrived at from the other side.
+    #[test]
+    fn a_scene_carries_where_each_badge_is_in_its_animation() {
+        let mut app = scene_app();
+        app.sidebar_signal_tray.animate = true;
+        let now = std::time::Instant::now();
+        app.anim.advance(now);
+
+        let resting = build_scene(&app).expect("scene");
+        assert!(
+            resting.badges.iter().all(|badge| badge.motion == 0.0),
+            "a tray with no animation observed yet should be settled"
+        );
+
+        // Whatever the engine says about a badge is what the wire says about
+        // it; the scene never resolves motion of its own.
+        let mut moved = resting.clone();
+        moved.badges[0].motion = 0.5;
+        assert_ne!(resting, moved);
+        let bytes = encode_scene(&moved).expect("encode");
+        assert_eq!(
+            decode_scene(&bytes).expect("decode").badges[0].motion,
+            0.5,
+            "the badge's position in its animation did not survive the wire"
         );
     }
 }

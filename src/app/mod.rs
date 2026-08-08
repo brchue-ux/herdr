@@ -829,6 +829,7 @@ impl App {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            signal_tray_graphics_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
             background_scene: None,
