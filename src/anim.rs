@@ -437,6 +437,25 @@ struct Element {
     inputs: DriveInputs,
     /// Quantized position last published, for the per-frame diff.
     position: u32,
+    /// Which tick of its own [`Animator::frame_interval`] grid
+    /// [`Self::position`] was last republished on.
+    ///
+    /// [`Animator::advance`] runs on every loop pass, but an element only owes
+    /// a *new frame* on the cadence its behaviour declared. Without that gate
+    /// the published position moves whenever the 512-step quantization ticks,
+    /// which for a 4.2 s breath is every ~8 ms, so a single resting element
+    /// reports a change on nearly every pass and pins the render loop at its
+    /// floor forever.
+    ///
+    /// Counted off [`Animator::origin`] rather than each element's own last
+    /// frame so that every element sharing a tier lands on the *same* instants.
+    /// Per-element phasing would stagger them, and eight badges 50 ms apart but
+    /// offset from each other still wake the loop eight times per 50 ms — which
+    /// is most of the cost the gate exists to remove.
+    last_frame_tick: Option<u128>,
+    /// When this element was last stepped, so its phase integrates against its
+    /// own elapsed time rather than the loop's pacing.
+    last_framed_at: Option<Instant>,
 }
 
 /// The engine: every element's life, plus the behaviours they can play.
@@ -445,6 +464,12 @@ pub(crate) struct Animator {
     catalogue: Catalogue,
     elements: HashMap<ElementId, Element>,
     last_advanced_at: Option<Instant>,
+    /// The instant every element's frame grid is counted from.
+    ///
+    /// Shared so that elements on the same tier republish together — see
+    /// [`Element::last_frame_tick`]. Set on the first [`Self::advance`] and
+    /// never moved, so a tier's boundaries stay put for the engine's life.
+    origin: Option<Instant>,
     /// Floor under every behaviour's declared frame interval.
     ///
     /// A host that cannot afford a behaviour's natural cadence — a server
@@ -461,6 +486,7 @@ impl Default for Animator {
             catalogue: Catalogue::built_in(),
             elements: HashMap::new(),
             last_advanced_at: None,
+            origin: None,
             frame_floor: Duration::ZERO,
         }
     }
@@ -595,6 +621,8 @@ impl Animator {
                         progress: 0.0,
                         inputs,
                         position: 0,
+                        last_frame_tick: None,
+                        last_framed_at: None,
                     },
                 );
                 true
@@ -602,22 +630,73 @@ impl Animator {
         }
     }
 
-    /// Move every element to where it is due at `now`, and drop the ones that
-    /// have finished leaving.
+    /// Move every element that is due a frame to where it belongs at `now`, and
+    /// drop the ones that have finished leaving.
     ///
     /// Runs on every loop pass, not only while something is being drawn, so a
     /// dismount always completes and an element can never strand mid-exit.
     /// Returns whether any element's published position changed.
+    ///
+    /// # Why an element is stepped on its own cadence rather than every pass
+    ///
+    /// Each behaviour declares a [`Behaviour::frame_interval`] — how often it
+    /// actually wants redrawing — and [`Self::frame_floor`] raises that for a
+    /// host that cannot afford it. That declared tier is authoritative here:
+    /// an element is stepped only on its own interval, so everything derived
+    /// from it (the published position, and every value [`Self::frame`] hands
+    /// a caller) holds still between frames.
+    ///
+    /// Stepping on every pass instead is what made the whole loop free-run.
+    /// The idle phase never ends, so a resting element always has *some*
+    /// motion to report, and two separate consumers then took that as a redraw
+    /// being owed: the 512-step position quantization moved every ~8 ms for a
+    /// 4.2 s breath, and — because [`Self::frame`] handed out a continuously
+    /// integrated phase — so did every cache key computed from it, including
+    /// the signal tray's own artwork fingerprint. Both held `needs_render`
+    /// true, which pinned the render loop at `MIN_RENDER_INTERVAL` for as long
+    /// as anything was configured to animate, whatever tier it had asked for.
+    ///
+    /// The clock is not lost by skipping a pass: an element integrates against
+    /// the time since *its own* last frame, so its period is exact no matter
+    /// how the loop happens to be paced. The due check is against a shared grid
+    /// counted off [`Self::origin`] rather than per-element, so every element
+    /// on one tier lands on the same instants — eight badges 50 ms apart but
+    /// offset from each other would otherwise wake the loop eight times per
+    /// 50 ms, which is most of the cost this exists to remove.
     pub(crate) fn advance(&mut self, now: Instant) -> bool {
-        let elapsed = self
-            .last_advanced_at
-            .and_then(|last| now.checked_duration_since(last))
-            .unwrap_or_default();
         self.last_advanced_at = Some(now);
+        let since_origin = now.saturating_duration_since(*self.origin.get_or_insert(now));
+
+        // Split the borrow so each element can be asked what cadence it owes
+        // while the map itself is held mutably.
+        let Self {
+            catalogue,
+            elements,
+            frame_floor,
+            ..
+        } = self;
 
         let mut changed = false;
-        for element in self.elements.values_mut() {
+        for element in elements.values_mut() {
+            // Read before the bounded-phase walk below can move the phase: the
+            // interval owed is the one the element is currently playing.
+            let tick = frame_interval_of(catalogue, *frame_floor, element)
+                .map(|interval| since_origin.as_nanos() / interval.as_nanos().max(1));
+            // An element that has never been framed is due immediately, and so
+            // is one holding still — it has no cadence to be late against, and
+            // its single position still has to be published once.
+            let due = element.last_frame_tick.is_none() || tick != element.last_frame_tick;
+            if !due {
+                continue;
+            }
+
             let before = element.position;
+            let elapsed = element
+                .last_framed_at
+                .map(|last| now.saturating_duration_since(last))
+                .unwrap_or_default();
+            element.last_frame_tick = tick;
+            element.last_framed_at = Some(now);
 
             // Bounded phases end on their own deadline; the idle phase never
             // does.
@@ -655,7 +734,7 @@ impl Animator {
 
             if element.phase == Phase::Idle {
                 for (index, name) in element.lifecycle.idle.iter().enumerate() {
-                    let Some(behaviour) = self.catalogue.get(name) else {
+                    let Some(behaviour) = catalogue.get(name) else {
                         continue;
                     };
                     let Some(cycles) = element.cycles.get_mut(index) else {
@@ -781,26 +860,35 @@ impl Animator {
     /// The finest any of its declared behaviours asked for: an element drawn
     /// two ways at once has to satisfy the smoother of them.
     fn frame_interval(&self, element: &Element) -> Option<Duration> {
-        let interval = match element.lifecycle.stage(element.phase) {
-            Some(stage) => self
-                .catalogue
-                .get(&stage.behaviour)
-                .map(|behaviour| behaviour.frame_interval)
-                // A bounded phase still has to end even when its behaviour is
-                // missing, or an element with an unregistered mount name would
-                // sit in Mount forever.
-                .or(Some(crate::app::ANIMATION_INTERVAL)),
-            None if element.phase == Phase::Idle => element
-                .lifecycle
-                .idle
-                .iter()
-                .filter_map(|name| self.catalogue.get(name))
-                .map(|behaviour| behaviour.frame_interval)
-                .min(),
-            None => None,
-        };
-        interval.map(|interval| interval.max(self.frame_floor))
+        frame_interval_of(&self.catalogue, self.frame_floor, element)
     }
+}
+
+/// [`Animator::frame_interval`], as a free function so [`Animator::advance`]
+/// can ask it while holding the element map mutably.
+fn frame_interval_of(
+    catalogue: &Catalogue,
+    frame_floor: Duration,
+    element: &Element,
+) -> Option<Duration> {
+    let interval = match element.lifecycle.stage(element.phase) {
+        Some(stage) => catalogue
+            .get(&stage.behaviour)
+            .map(|behaviour| behaviour.frame_interval)
+            // A bounded phase still has to end even when its behaviour is
+            // missing, or an element with an unregistered mount name would
+            // sit in Mount forever.
+            .or(Some(crate::app::ANIMATION_INTERVAL)),
+        None if element.phase == Phase::Idle => element
+            .lifecycle
+            .idle
+            .iter()
+            .filter_map(|name| catalogue.get(name))
+            .map(|behaviour| behaviour.frame_interval)
+            .min(),
+        None => None,
+    };
+    interval.map(|interval| interval.max(frame_floor))
 }
 
 /// The phase a newly arrived element opens in.
@@ -1331,5 +1419,120 @@ mod tests {
             }
         }
         assert_eq!(painted, usize::from(extent.cols) * usize::from(extent.rows));
+    }
+
+    /// One resting element must not report a change on every pass.
+    ///
+    /// The regression this guards is the whole reason the render loop free-ran:
+    /// an idle phase never ends, so a resting element always has *some* motion
+    /// to report, and reporting it every pass held `needs_render` true forever
+    /// and pinned the loop at `MIN_RENDER_INTERVAL`. `badge-rest` is the exact
+    /// shape that did it — a 4.2 s breath on the 100 ms tier, which the 512-step
+    /// position quantization otherwise moved every ~8 ms.
+    #[test]
+    fn a_resting_element_reports_a_change_on_its_own_tier_not_every_pass() {
+        let start = Instant::now();
+        let mut anim = Animator::default();
+        let life = Lifecycle::still().with_idle(names::BADGE_REST);
+        anim.enter(
+            ElementId::Named("badge"),
+            &life,
+            DriveInputs::default(),
+            start,
+        );
+
+        // A second of loop passes at the render floor, which is how often the
+        // headless loop actually asks.
+        let mut changes = 0;
+        for step in 1..=125u32 {
+            if anim.advance(start + Duration::from_millis(u64::from(step) * 8)) {
+                changes += 1;
+            }
+        }
+
+        // `badge-rest` declares the 100 ms tier, so ten frames is what a second
+        // owes it. Anything near the 125 passes made is the bug back.
+        assert!(
+            (1..=12).contains(&changes),
+            "a resting badge should report about its own tier's worth of frames in a second, got {changes}"
+        );
+    }
+
+    /// What [`Animator::frame`] hands a caller has to hold still between frames
+    /// too, not just the published position.
+    ///
+    /// The signal tray rasterises its badge artwork whenever a fingerprint taken
+    /// from these values moves, so a continuously integrated phase made it
+    /// redraw — and re-upload — on every loop pass however coarse a tier its
+    /// behaviour had asked for.
+    #[test]
+    fn a_frame_read_between_tiers_is_the_same_frame() {
+        let start = Instant::now();
+        let mut anim = Animator::default();
+        let life = Lifecycle::still().with_idle(names::BADGE_REST);
+        let id = ElementId::Named("badge");
+        anim.enter(id.clone(), &life, DriveInputs::default(), start);
+        anim.advance(start);
+
+        let progress_at = |anim: &Animator| anim.frame(&id, None).expect("live").progress;
+        let first = progress_at(&anim);
+
+        // Two passes well inside the declared 100 ms tier.
+        anim.advance(start + Duration::from_millis(8));
+        assert_eq!(
+            progress_at(&anim),
+            first,
+            "a pass inside the tier moved the frame"
+        );
+        anim.advance(start + Duration::from_millis(16));
+        assert_eq!(
+            progress_at(&anim),
+            first,
+            "a pass inside the tier moved the frame"
+        );
+
+        // And one past it, which must.
+        anim.advance(start + Duration::from_millis(140));
+        assert_ne!(
+            progress_at(&anim),
+            first,
+            "the tier elapsed and the frame did not move"
+        );
+    }
+
+    /// The configured headless floor has to actually reach `advance`.
+    ///
+    /// `[advanced] headless_animation_interval_ms` only ever reached
+    /// [`Animator::next_deadline`], which was never the loop's minimum while
+    /// anything animated — so raising it changed nothing at all. It is the one
+    /// control a host too small for a behaviour's natural cadence has.
+    #[test]
+    fn the_frame_floor_coarsens_how_often_a_change_is_reported() {
+        let life = Lifecycle::still().with_idle(names::SHIMMER);
+        let count = |floor: Duration| {
+            let start = Instant::now();
+            let mut anim = Animator::default();
+            anim.set_frame_floor(floor);
+            anim.enter(
+                ElementId::Named("row"),
+                &life,
+                DriveInputs::default(),
+                start,
+            );
+            (1..=125u32)
+                .filter(|step| anim.advance(start + Duration::from_millis(u64::from(*step) * 8)))
+                .count()
+        };
+
+        let natural = count(Duration::ZERO);
+        let floored = count(Duration::from_millis(500));
+        assert!(
+            floored < natural,
+            "a 500 ms floor reported {floored} changes against the behaviour's own {natural}"
+        );
+        assert!(
+            floored <= 3,
+            "a 500 ms floor should owe about two frames a second, got {floored}"
+        );
     }
 }

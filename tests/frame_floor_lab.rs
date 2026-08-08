@@ -145,10 +145,9 @@ fn send_json_request(socket_path: &Path, request: &str) -> Value {
 ///
 /// Whether agents are reported is the single most important variable in this
 /// lab, and not for the reason the sidebar suggests. A fleet with reported
-/// agents puts the server into a continuous whole-app render loop, which wakes
-/// the animation engine ~58 times a second no matter what floor is configured —
-/// the floor governs only the deadline the engine schedules *for itself*, so it
-/// is observable only when nothing else is waking the loop.
+/// agents puts the server into a continuous whole-app render loop, so the
+/// frames counted here are that loop's rather than the animation's — the
+/// floor's own effect is only legible against a fleet that is otherwise quiet.
 fn seed_fleet(api_socket: &Path, spaces: usize, report_agents: bool) {
     for index in 0..spaces {
         let response = send_json_request(
@@ -301,19 +300,22 @@ fn with_floor(rows: &str, ms: u64) -> String {
     format!("{rows}\n[advanced]\nheadless_animation_interval_ms = {ms}\n")
 }
 
-/// What the configured floor does, and does not, govern on a live server.
+/// What the configured floor governs on a live server.
 ///
-/// The floor feeds exactly one thing: [`crate::anim::Engine::next_deadline`],
-/// which is one candidate among many in the headless loop's wait computation.
-/// `Engine::advance()` is never floored, so while any element is animating
-/// `handle_scheduled_tasks_headless` reports a change on *every* loop pass,
-/// which keeps `needs_render` true, which makes `last_render + 16 ms` the
-/// smallest deadline in the list. The animation deadline is therefore never
-/// the minimum and the floor is never reached.
+/// This lab previously recorded the opposite finding, and that finding was a
+/// bug rather than a property: `Engine::advance()` stepped every element on
+/// every loop pass, so a resting element always reported movement, which held
+/// `needs_render` true and made `last_render + MIN_RENDER_INTERVAL` the
+/// smallest deadline in the list forever. The floor fed only
+/// `Engine::next_deadline`, which never won, so floors of 16, 200 and 1000 ms
+/// were genuinely indistinguishable — at ~58 fps whatever tier was asked for.
 ///
-/// The arms below are the evidence: floors of 16, 200 and 1000 ms are
-/// indistinguishable, and the control shows the frames are genuinely the
-/// animation rather than background churn.
+/// `advance` now steps an element only on its own
+/// [`Behaviour::frame_interval`], raised by the floor, so the floor reaches
+/// the change signal itself and is the one real control over what a headless
+/// server spends on animation. The arms below are the evidence: a 1000 ms
+/// floor is now clearly slower than the default, and the control still shows
+/// the frames are the animation rather than background churn.
 #[test]
 #[ignore = "live lab: spawns a real server and measures wall-clock frame timing"]
 fn frame_floor_lab_idle_animation_clock() {
@@ -396,14 +398,20 @@ fn frame_floor_lab_idle_animation_clock() {
             (lo.min(fps), hi.max(fps))
         });
     println!(
-        "\n  >>> floors of 16 / 200 / 1000 ms span only {:.2}-{:.2} fps.\n  >>> The floor feeds the engine's own deadline, which the render deadline\n  >>> always beats while an element is animating. The 200 ms constant was\n  >>> inert on a live server, and lifting it changes nothing visible today.\n",
+        "\n  >>> floors of 16 / 200 / 1000 ms span {:.2}-{:.2} fps.\n  >>> The floor now raises each element's own frame interval, so it reaches\n  >>> the change signal rather than only a deadline that never wins. Raising\n  >>> it is what a host too small for a behaviour's natural cadence has.\n",
         spread.0, spread.1
     );
     assert!(
-        spread.1 - spread.0 < 5.0,
-        "expected the floors to be indistinguishable on a live server, saw {:.2}-{:.2} fps",
-        spread.0,
-        spread.1
+        ceiling_pulse.fps() * 2.0 < default_pulse.fps(),
+        "a 1000 ms floor must be clearly slower than the default, saw {:.2} against {:.2}",
+        ceiling_pulse.fps(),
+        default_pulse.fps()
+    );
+    assert!(
+        old_pulse.fps() < default_pulse.fps(),
+        "a 200 ms floor must be slower than the pulse's own 100 ms tier, saw {:.2} against {:.2}",
+        old_pulse.fps(),
+        default_pulse.fps()
     );
 }
 
