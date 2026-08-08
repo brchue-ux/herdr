@@ -529,6 +529,7 @@ pub(crate) fn paint_local_pane_graphics(
             app.view.tab_surface(),
             cell_size,
             &mut cache,
+            true,
         );
     }
     if bytes.is_empty() {
@@ -551,6 +552,7 @@ pub(crate) fn encode_local_pane_graphics(
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     cache: &mut HostGraphicsCache,
+    include_cards: bool,
 ) -> Vec<u8> {
     let mode_ok = app.mode == Mode::Terminal;
     let cell_ok = cell_size.is_known();
@@ -576,8 +578,14 @@ pub(crate) fn encode_local_pane_graphics(
     }
 
     let view_key = active_view_key(app);
-    let placements =
-        collect_visible_placements(app, terminal_runtimes, surface, cell_size, &cache.images);
+    let placements = collect_visible_placements(
+        app,
+        terminal_runtimes,
+        surface,
+        cell_size,
+        &cache.images,
+        include_cards,
+    );
     tracing::debug!(
         placements_collected = placements.len(),
         "collect_visible_placements result"
@@ -603,11 +611,50 @@ pub(crate) fn encode_local_pane_graphics(
     bytes
 }
 
+/// Encodes client-rasterised sidebar card layers into Kitty graphics protocol
+/// bytes, exactly as the server would encode them under `HostSurfaceId::SidebarCards`
+/// — image ids, dedup-by-signature, base64 framing — for a client that
+/// decoded a `ServerMessage::CardScene` and rasterised it locally with
+/// `image_card::rasterise_card_scene`. `cache` is that client's own, kept
+/// across calls the same way `HostGraphicsCache` is kept per server client.
+pub(crate) fn encode_card_scene_graphics(
+    layers: &[crate::ui::sidebar::image_card::SidebarCardLayer],
+    cell_size: HostCellSize,
+    cache: &mut HostGraphicsCache,
+) -> Vec<u8> {
+    let placements: Vec<HostPlacement> = layers
+        .iter()
+        .enumerate()
+        .map(|(slot, card)| {
+            layer_host_placement(
+                HostSurfaceId::SidebarCards(slot.try_into().unwrap_or(u16::MAX)),
+                card.clip,
+                cell_size,
+                &card.layer,
+                &cache.images,
+                true,
+            )
+        })
+        .collect();
+
+    let mut bytes = Vec::new();
+    encode_graphics_update(
+        &mut bytes,
+        &placements,
+        false,
+        &mut cache.images,
+        &mut cache.placements,
+        &mut cache.sources,
+    );
+    bytes
+}
+
 pub(crate) fn has_visible_pane_graphics(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
+    include_cards: bool,
 ) -> bool {
     if app.mode != Mode::Terminal || !cell_size.is_known() {
         return false;
@@ -617,7 +664,7 @@ pub(crate) fn has_visible_pane_graphics(
     // are checked before — and independently of — the active workspace, exactly
     // as `collect_visible_placements` collects them.
     let empty_uploaded = HashMap::new();
-    for (surface_id, area, layer) in surface_layer_placement_targets(app) {
+    for (surface_id, area, layer) in surface_layer_placement_targets(app, include_cards) {
         let host_placement =
             layer_host_placement(surface_id, area, cell_size, layer, &empty_uploaded, false);
         if clipped_placement(&host_placement).is_some() {
@@ -937,13 +984,14 @@ fn collect_visible_placements(
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
+    include_cards: bool,
 ) -> Vec<HostPlacement> {
     let mut placements = Vec::new();
 
     // Chrome surfaces are laid out beside the tab surface, not inside it, so
     // they are collected before the active-workspace gate rather than through
     // the pane walk.
-    for (surface_id, area, layer) in surface_layer_placement_targets(app) {
+    for (surface_id, area, layer) in surface_layer_placement_targets(app, include_cards) {
         placements.push(layer_host_placement(
             surface_id,
             area,
@@ -1041,8 +1089,13 @@ fn collect_visible_placements(
 /// [`HostSurfaceId`]s on purpose — sharing one would mean a client setting a
 /// sidebar image erased the tray or the cards, and either of those redrawing
 /// erased the client's image.
+///
+/// `include_cards` withholds the `SidebarCards` entries entirely — for a
+/// client that requested `ServerMessage::CardScene` and rasterises them
+/// itself, so the same pixels are never embedded twice.
 fn surface_layer_placement_targets(
     app: &AppState,
+    include_cards: bool,
 ) -> impl Iterator<Item = (HostSurfaceId, Rect, &crate::app::state::GraphicsLayer)> {
     app.surface_graphics_layers
         .iter()
@@ -1098,7 +1151,9 @@ fn surface_layer_placement_targets(
         // cards are ever withheld; every other surface this client is entitled
         // to keeps flowing either way.
         .chain(
-            if !app.sidebar_card_shapes || app.view.sidebar_card_layers_published {
+            if include_cards
+                && (!app.sidebar_card_shapes || app.view.sidebar_card_layers_published)
+            {
                 app.sidebar_card_layers.as_slice()
             } else {
                 &[]
@@ -1974,6 +2029,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
 
         assert_eq!(placements.len(), 1);
@@ -2009,6 +2065,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("visible sidebar layer");
 
@@ -2047,6 +2104,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("a card part-way in");
         assert_eq!((clipped.x, clipped.y), (18, 3));
@@ -2072,6 +2130,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
         assert!(
             clipped_placement(&placements[0]).is_none(),
@@ -2093,6 +2152,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
 
         assert_eq!(placements.len(), 1, "the layer is still stored");
@@ -2105,6 +2165,7 @@ mod tests {
             &TerminalRuntimeRegistry::new(),
             empty_surface(),
             test_cell_size(),
+            true,
         ));
     }
 
@@ -2130,6 +2191,7 @@ mod tests {
                 empty_surface(),
                 test_cell_size(),
                 &mut cache,
+                true,
             );
             let emitted = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -2155,6 +2217,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -2166,6 +2229,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
 
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
@@ -2207,6 +2271,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("a=t"), "root frame uploaded");
@@ -2223,6 +2288,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
         assert!(
             bytes.is_empty(),
@@ -2307,6 +2373,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &HashMap::new(),
+            true,
         );
         assert_eq!(placements.len(), 2);
 
@@ -2358,6 +2425,7 @@ mod tests {
             &TerminalRuntimeRegistry::new(),
             empty_surface(),
             test_cell_size(),
+            true,
         ));
     }
 
@@ -2377,6 +2445,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -2390,6 +2459,7 @@ mod tests {
             empty_surface(),
             test_cell_size(),
             &mut cache,
+            true,
         );
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
         assert!(cache.is_empty());

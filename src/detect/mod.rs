@@ -14,7 +14,7 @@ pub(crate) use command_marker::{command_markers, diff_new_markers};
 /// `Hash` because a state is part of an animated element's identity: a card's
 /// state wash is keyed on the change it carries, so the states either side of
 /// it are half of what names the element (`crate::anim::ElementId::CardWash`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AgentState {
     /// Agent finished, prompt visible, nothing happening.
     Idle,

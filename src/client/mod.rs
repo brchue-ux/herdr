@@ -61,6 +61,9 @@ struct ClientLoopConfig {
     mouse_capture_active: bool,
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    /// `[experimental] sidebar_card_font`, for `image_card::rasterise_card_scene`.
+    /// Unused unless `wants_client_rasterized_cards` was set in Hello.
+    card_font_override: Option<String>,
 }
 
 /// State tracking for the thin client.
@@ -91,6 +94,25 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// This client's own cell size, kept in step with `ClientLoopEvent::Resize`
+    /// for `image_card::rasterise_card_scene`. Unused unless
+    /// `wants_client_rasterized_cards` was set in Hello.
+    cell_size: crate::kitty_graphics::HostCellSize,
+    /// `[experimental] sidebar_card_font`, for `image_card::rasterise_card_scene`.
+    card_font_override: Option<String>,
+    /// This client's own rasterisation cache for `ServerMessage::CardScene`,
+    /// mirroring `ClientConnection::graphics_cache` server-side. `Default`
+    /// (empty) clients that never requested `CardScene` never touch it.
+    card_scene_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// This client's own last rasterised card layers, so a card whose content
+    /// did not change is carried forward without being redrawn — mirrors the
+    /// server-side embed path's `previous: &[SidebarCardLayer]`.
+    previous_card_layers: Vec<crate::ui::sidebar::image_card::SidebarCardLayer>,
+    /// Kitty graphics bytes from the most recently rasterised `CardScene`,
+    /// not yet spliced into an outgoing frame. Taken and cleared the next
+    /// time a frame is written, mirroring the server's own
+    /// `insert_graphics_before_sync_end` splice point.
+    pending_card_graphics: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -667,9 +689,31 @@ fn requested_render_encoding() -> RenderEncoding {
     }
 }
 
-#[cfg(unix)]
 fn is_remote_client_process() -> bool {
     std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
+}
+
+/// Windows remote-bridge clients rasterise sidebar cards themselves from
+/// `ServerMessage::CardScene` rather than receiving server-embedded card
+/// pixels, since the rest of the TUI already rides the unchanged
+/// `TerminalAnsi` encoding over that bridge. Native local Windows clients and
+/// all Unix clients keep the existing server-rasterized path.
+///
+/// `HERDR_CLIENT_RASTERIZED_CARDS` overrides the platform gate, the same way
+/// `HERDR_RENDER_ENCODING` already overrides the encoding negotiation — there
+/// is no Windows hardware to exercise the real gate from a Unix dev box or CI,
+/// so this is how a Unix client is driven through the same code path for
+/// testing.
+fn wants_client_rasterized_cards() -> bool {
+    match std::env::var("HERDR_CLIENT_RASTERIZED_CARDS")
+        .ok()
+        .as_deref()
+    {
+        Some("1" | "true") => return true,
+        Some("0" | "false") => return false,
+        _ => {}
+    }
+    cfg!(windows) && is_remote_client_process()
 }
 
 /// Time to wait for the server's Welcome reply during the handshake.
@@ -768,6 +812,7 @@ fn do_handshake(
         // — unlike the server's, which may not be co-located. See
         // `crate::kitty_graphics::host_terminal_report_from_env`.
         host_terminal: crate::kitty_graphics::host_terminal_report_from_env(),
+        wants_client_rasterized_cards: wants_client_rasterized_cards(),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1135,6 +1180,10 @@ fn run_client_with_mode(
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+    let card_font_override = {
+        let trimmed = loaded_config.config.experimental.sidebar_card_font.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    };
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1144,6 +1193,7 @@ fn run_client_with_mode(
         mouse_capture_active: mouse_capture,
         #[cfg(unix)]
         remote_image_paste_key,
+        card_font_override,
     };
 
     let socket_path = client_socket_path();
@@ -1318,6 +1368,14 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        cell_size: crate::kitty_graphics::HostCellSize {
+            width_px: initial_cell_width_px,
+            height_px: initial_cell_height_px,
+        },
+        card_font_override: config.card_font_override,
+        card_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+        previous_card_layers: Vec::new(),
+        pending_card_graphics: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1547,6 +1605,10 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
+                state.cell_size = crate::kitty_graphics::HostCellSize {
+                    width_px: cell_width_px,
+                    height_px: cell_height_px,
+                };
                 // Resizing invalidates the host-side blit baseline.
                 state.request_repaint();
                 // A window dragged onto a display with a different scale keeps
@@ -1601,7 +1663,18 @@ async fn run_client_loop(
                         record_received_kitty_graphics(&frame.bytes);
                     }
                     let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
+                    // A client that rasterises cards itself receives their
+                    // layout as `ServerMessage::CardScene` separately from
+                    // this frame's own bytes, so it splices its own Kitty
+                    // bytes in here rather than finding them already embedded
+                    // — the same sync-end splice point the server uses for
+                    // `frame.graphics` on a client that did not ask for this.
+                    let card_graphics = std::mem::take(&mut state.pending_card_graphics);
+                    let _ = write_encoded_frame_with_graphics(
+                        &mut stdout,
+                        &frame.bytes,
+                        &card_graphics,
+                    );
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
@@ -1610,6 +1683,12 @@ async fn run_client_loop(
                         let mut stdout = io::stdout();
                         let _ = stdout.write_all(&bytes);
                         let _ = stdout.flush();
+                    }
+                }
+                ServerMessage::CardScene { bytes } => {
+                    if state.kitty_graphics_enabled {
+                        state.pending_card_graphics =
+                            decode_and_rasterise_card_scene(&bytes, &mut state);
                     }
                 }
                 ServerMessage::ServerShutdown { reason } => {
@@ -2073,6 +2152,44 @@ fn record_received_kitty_graphics(bytes: &[u8]) {
     if let Ok(mut set) = set.lock() {
         set.extend(ids);
     }
+}
+
+/// Decodes a `ServerMessage::CardScene` payload and rasterises it into Kitty
+/// graphics bytes ready to splice into the next outgoing frame, updating
+/// `state`'s own rasterisation cache along the way.
+///
+/// Empty on a decode/rasterise failure or when the scene is unchanged from
+/// `state.previous_card_layers` — there is nothing new to splice either way.
+fn decode_and_rasterise_card_scene(bytes: &[u8], state: &mut ClientState) -> Vec<u8> {
+    let scene = match crate::ui::sidebar::image_card::decode_card_scene(bytes) {
+        Ok(scene) => scene,
+        Err(err) => {
+            debug!(%err, "failed to decode CardScene from server");
+            return Vec::new();
+        }
+    };
+    let layers = match crate::ui::sidebar::image_card::rasterise_card_scene(
+        &scene,
+        state.card_font_override.as_deref(),
+        state.cell_size,
+        crate::kitty_graphics::host_terminal_kind(),
+        crate::kitty_graphics::host_graphics_is_local(),
+        &state.previous_card_layers,
+    ) {
+        Ok(Some(layers)) => layers,
+        Ok(None) => return Vec::new(),
+        Err(()) => {
+            debug!("failed to rasterise CardScene");
+            return Vec::new();
+        }
+    };
+    let graphics = crate::kitty_graphics::encode_card_scene_graphics(
+        &layers,
+        state.cell_size,
+        &mut state.card_scene_cache,
+    );
+    state.previous_card_layers = layers;
+    graphics
 }
 
 fn clear_received_kitty_graphics(mut writer: impl io::Write) -> io::Result<()> {

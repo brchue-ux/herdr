@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -388,6 +388,11 @@ pub enum ClientMessage {
         /// server process's env. See `crate::kitty_graphics::HostTerminalKind`.
         #[serde(default)]
         host_terminal: HostTerminalReport,
+        /// Whether the client wants to rasterise sidebar cards itself from a
+        /// `ServerMessage::CardScene` rather than receive server-embedded
+        /// card pixels in `Terminal`/`Graphics` frames.
+        #[serde(default)]
+        wants_client_rasterized_cards: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -742,6 +747,20 @@ pub enum ServerMessage {
         /// Whether the ASCII input source should be active.
         active: bool,
     },
+
+    /// Opaque, bincode-encoded sidebar card layout+content for clients that
+    /// requested `wants_client_rasterized_cards`. The client decodes this
+    /// with `crate::ui::sidebar::image_card::CardScene` and rasterises it
+    /// locally rather than receiving server-embedded card pixels.
+    ///
+    /// Appended at the end rather than beside `Graphics` so it does not shift
+    /// the wire tag of every variant declared after it — see
+    /// `ClientMessage`'s own `client_message_wire_tags_preserve_protocol_15_order`
+    /// for why that stability matters.
+    CardScene {
+        /// Bincode-encoded `crate::ui::sidebar::image_card::CardScene`.
+        bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1051,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
+            wants_client_rasterized_cards: false,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1070,6 +1090,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 host_terminal: HostTerminalReport::default(),
+                wants_client_rasterized_cards: false,
             }),
             0
         );
@@ -1602,6 +1623,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
+            wants_client_rasterized_cards: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1677,6 +1699,7 @@ mod tests {
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
                     host_terminal: HostTerminalReport::default(),
+                    wants_client_rasterized_cards: false,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2114,6 +2137,7 @@ mod tests {
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
             host_terminal: HostTerminalReport::default(),
+            wants_client_rasterized_cards: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2151,6 +2175,7 @@ mod tests {
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
                 host_terminal: HostTerminalReport::default(),
+                wants_client_rasterized_cards: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

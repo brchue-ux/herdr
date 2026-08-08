@@ -13,7 +13,7 @@
 //! shape whose exact coverage is already known analytically.
 
 /// 8-bit sRGB, the space every sampled constant is quoted in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {

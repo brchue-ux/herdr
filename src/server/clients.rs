@@ -62,6 +62,10 @@ pub(crate) struct ClientConnection {
     /// Whether this client's real outer terminal confirmed Kitty Graphics
     /// Protocol support. Monotonic: once true, stays true for the connection.
     pub(crate) kitty_graphics_capability_confirmed: bool,
+    /// Whether this client requested `ServerMessage::CardScene` instead of
+    /// server-embedded sidebar card pixels. Set once from the client's Hello
+    /// and never changes for the lifetime of the connection.
+    pub(crate) wants_client_rasterized_cards: bool,
     /// Stateful parser for app-client input split across transport reads.
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
@@ -154,6 +158,7 @@ impl ClientConnection {
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
             host_graphics_is_local: false,
             kitty_graphics_capability_confirmed: false,
+            wants_client_rasterized_cards: false,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),

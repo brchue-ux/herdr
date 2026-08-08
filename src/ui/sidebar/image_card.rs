@@ -498,7 +498,7 @@ pub(crate) fn row_height_cells(app: &AppState, fold_width: u16) -> Option<u16> {
 /// being drawn with no relayout. Until then every card answers no and the slot
 /// is not reserved at all, which is what stops an empty box from standing on
 /// screen eating the width the title needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum CardMark {}
 
 /// A state change part-way across a card.
@@ -572,7 +572,7 @@ impl CardWashFrame {
 /// appearance — the same reason [`CardWashFrame`] copies its behaviour out of the
 /// catalogue. It carries all five and not just the card's own because a wash has
 /// two sides and they are two different stages.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct StageHues([f32; 5]);
 
 impl StageHues {
@@ -2028,19 +2028,40 @@ pub(crate) fn build_cards(
     CardsBuild { update, motion }
 }
 
-/// `Ok(Some)` is new artwork, `Ok(None)` is what is already held, `Err` is none
-/// at all.
+/// Which cards are placed where and what they say, independent of how the
+/// result is turned into pixels.
+///
+/// Shared by the server's own embed path (which adds a font/cell-size-aware
+/// [`Rasteriser`] and rasterises immediately) and [`build_card_scene`] (which
+/// ships this data to a client that rasterises for itself). Pulling it out is
+/// what keeps the two from ever disagreeing about where a card is or what it
+/// contains.
+struct CardPlacement {
+    placed: Vec<(Rect, CardContent)>,
+    offsets: Vec<(i32, i32)>,
+    field: Rect,
+    bounds: Rect,
+    bloom_floor: u16,
+    backdrop: Rgb,
+    font: &'static CardFont,
+    title_metrics: FontMetrics,
+    tidbit_metrics: FontMetrics,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+/// `Err` is none at all — see [`build_cards_inner`] and [`build_card_scene`]
+/// for what their callers do with that.
 ///
 /// `motion` is filled in with the offset each card was placed at, indexed like
 /// `cards`.
-fn build_cards_inner(
+fn compute_card_placement(
     app: &AppState,
     cards: &[crate::app::state::WorkspaceCardArea],
     sidebar_area: Rect,
     cell_size: HostCellSize,
-    previous: &[SidebarCardLayer],
     motion: &mut [(i32, i32)],
-) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
+) -> Result<CardPlacement, ()> {
     let fold_width = super::row_fold_width(app, super::workspace_list_rect(sidebar_area));
     if !is_available(app, fold_width) {
         return Err(());
@@ -2149,8 +2170,230 @@ fn build_cards_inner(
     // and the wave that is supposed to cross the tree would break at every card's
     // edge.
     let extents: Vec<Rect> = placed.iter().map(|(frame, _)| *frame).collect();
-    let field_rect =
-        dissolve_field_rect(&extents, (cell_w, cell_h), bounds, bloom_floor).ok_or(())?;
+    let field = dissolve_field_rect(&extents, (cell_w, cell_h), bounds, bloom_floor).ok_or(())?;
+
+    Ok(CardPlacement {
+        placed,
+        offsets,
+        field,
+        bounds,
+        bloom_floor,
+        backdrop,
+        font,
+        title_metrics,
+        tidbit_metrics,
+        cell_w,
+        cell_h,
+    })
+}
+
+/// `Ok(Some)` is new artwork, `Ok(None)` is what is already held, `Err` is none
+/// at all.
+///
+/// `motion` is filled in with the offset each card was placed at, indexed like
+/// `cards`.
+fn build_cards_inner(
+    app: &AppState,
+    cards: &[crate::app::state::WorkspaceCardArea],
+    sidebar_area: Rect,
+    cell_size: HostCellSize,
+    previous: &[SidebarCardLayer],
+    motion: &mut [(i32, i32)],
+) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
+    let placement = compute_card_placement(app, cards, sidebar_area, cell_size, motion)?;
+
+    let rasteriser = Rasteriser {
+        font: placement.font,
+        title_metrics: placement.title_metrics,
+        tidbit_metrics: placement.tidbit_metrics,
+        cell_size,
+        cell_w: placement.cell_w,
+        cell_h: placement.cell_h,
+        field: placement.field,
+        bounds: placement.bounds,
+        bloom_floor: placement.bloom_floor,
+        backdrop: placement.backdrop,
+        dissolve: sheet_dissolve(app, cell_size),
+        host_terminal_kind: app.host_terminal_kind,
+        host_graphics_is_local: app.host_graphics_is_local,
+    };
+
+    if app.sidebar_card_shapes {
+        return rasteriser.shapes(&placement.placed, &placement.offsets, previous);
+    }
+    rasteriser.sheet(&placement.placed, previous)
+}
+
+/// A wire-safe mirror of [`CardContent`], for `ServerMessage::CardScene`.
+///
+/// `wash` is left out on purpose — see [`CardScene`]'s own doc for why — so a
+/// client-reconstructed [`CardContent`] always carries `wash: None`, the same
+/// "no transition in progress" branch every card already renders correctly
+/// through.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CardContentWire {
+    title: String,
+    tidbit: Option<String>,
+    state_label: String,
+    state: AgentState,
+    stage: LifecycleStage,
+    severity: Severity,
+    hues: StageHues,
+    ground: Rgb,
+    split_channels: bool,
+    seen: bool,
+    depth: u8,
+    lifted: bool,
+    mark: Option<CardMark>,
+    breath: f32,
+}
+
+impl From<&CardContent> for CardContentWire {
+    fn from(content: &CardContent) -> Self {
+        Self {
+            title: content.title.clone(),
+            tidbit: content.tidbit.clone(),
+            state_label: content.state_label.clone(),
+            state: content.state,
+            stage: content.stage,
+            severity: content.severity,
+            hues: content.hues,
+            ground: content.ground,
+            split_channels: content.split_channels,
+            seen: content.seen,
+            depth: content.depth,
+            lifted: content.lifted,
+            mark: content.mark,
+            breath: content.breath,
+        }
+    }
+}
+
+impl From<CardContentWire> for CardContent {
+    fn from(wire: CardContentWire) -> Self {
+        Self {
+            title: wire.title,
+            tidbit: wire.tidbit,
+            state_label: wire.state_label,
+            state: wire.state,
+            stage: wire.stage,
+            severity: wire.severity,
+            hues: wire.hues,
+            ground: wire.ground,
+            split_channels: wire.split_channels,
+            seen: wire.seen,
+            depth: wire.depth,
+            lifted: wire.lifted,
+            mark: wire.mark,
+            breath: wire.breath,
+            wash: None,
+        }
+    }
+}
+
+/// Everything a client needs to rasterise the sidebar's cards itself, in
+/// place of server-embedded card pixels. Sent as the opaque payload of
+/// `ServerMessage::CardScene` to clients that set
+/// `ClientMessage::Hello::wants_client_rasterized_cards`.
+///
+/// # Scope cut: no wash, no dissolve
+///
+/// [`CardContent::wash`] and the sheet's dissolve transition both ultimately
+/// hold a [`crate::anim::behaviour::Behaviour`] carrying `&'static [char]`
+/// glyph tables copied from a named catalogue — not serializable as data. A
+/// client always reconstructs cards with `wash: None` and rasterises with
+/// `dissolve: None`, which is the same "nothing in transition" branch this
+/// module already renders correctly through, just without the wash-sweep and
+/// view-switch-dissolve effects. Restoring those needs the catalogue lookup
+/// key shipped alongside the resolved value, so the client can re-resolve the
+/// same `&'static Behaviour` locally; that is follow-up work, not this.
+///
+/// # What is deliberately not here
+///
+/// Cell/font metrics, `cell_size`, and `host_terminal_kind`/
+/// `host_graphics_is_local` are not shipped — the client already knows or
+/// computes those itself, from its own attaching terminal.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CardScene {
+    placed: Vec<(Rect, CardContentWire)>,
+    offsets: Vec<(i32, i32)>,
+    field: Rect,
+    bounds: Rect,
+    bloom_floor: u16,
+    backdrop: Rgb,
+}
+
+/// Builds the wire snapshot for a client that rasterises cards itself.
+/// `None` when cards are not available to draw at all — the `CardScene`
+/// equivalent of [`build_cards_inner`]'s `Err(())`.
+pub(crate) fn build_card_scene(
+    app: &AppState,
+    cards: &[crate::app::state::WorkspaceCardArea],
+    sidebar_area: Rect,
+    cell_size: HostCellSize,
+) -> Option<CardScene> {
+    let mut motion = vec![(0, 0); cards.len()];
+    let placement =
+        compute_card_placement(app, cards, sidebar_area, cell_size, &mut motion).ok()?;
+    Some(CardScene {
+        placed: placement
+            .placed
+            .into_iter()
+            .map(|(rect, content)| (rect, CardContentWire::from(&content)))
+            .collect(),
+        offsets: placement.offsets,
+        field: placement.field,
+        bounds: placement.bounds,
+        bloom_floor: placement.bloom_floor,
+        backdrop: placement.backdrop,
+    })
+}
+
+/// Encodes a [`CardScene`] as the opaque bincode payload carried by
+/// `ServerMessage::CardScene { bytes }`.
+pub(crate) fn encode_card_scene(scene: &CardScene) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(scene, bincode::config::standard())
+}
+
+/// Decodes a [`CardScene`] from the opaque bincode payload carried by
+/// `ServerMessage::CardScene { bytes }`.
+pub(crate) fn decode_card_scene(bytes: &[u8]) -> Result<CardScene, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map(|(scene, _)| scene)
+}
+
+/// Rasterises a [`CardScene`] shipped by the server into the same Kitty
+/// graphics layers [`Rasteriser::shapes`] would have produced server-side,
+/// using this client's own font, cell size, and host-terminal capability
+/// facts — `Rasteriser::shapes` itself is unchanged and reused as-is.
+///
+/// `font_override` is this client's own `[experimental] sidebar_card_font`
+/// config value, the same override `compute_card_placement` reads from
+/// `AppState` server-side. `previous` is this client's own last rasterised
+/// layers, so a card whose content did not change is carried forward without
+/// being redrawn, exactly as the server-side embed path already does.
+pub(crate) fn rasterise_card_scene(
+    scene: &CardScene,
+    font_override: Option<&str>,
+    cell_size: HostCellSize,
+    host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    host_graphics_is_local: bool,
+    previous: &[SidebarCardLayer],
+) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
+    let font = font::card_font(font_override).ok_or(())?;
+    let cell_w = f32::from(u16::try_from(cell_size.width_px).map_err(|_| ())?);
+    let cell_h = f32::from(u16::try_from(cell_size.height_px).map_err(|_| ())?);
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return Err(());
+    }
+    let title_metrics = font.metrics(TITLE_PX);
+    let tidbit_metrics = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
+
+    let placed: Vec<(Rect, CardContent)> = scene
+        .placed
+        .iter()
+        .cloned()
+        .map(|(rect, wire)| (rect, CardContent::from(wire)))
+        .collect();
 
     let rasteriser = Rasteriser {
         font,
@@ -2159,19 +2402,16 @@ fn build_cards_inner(
         cell_size,
         cell_w,
         cell_h,
-        field: field_rect,
-        bounds,
-        bloom_floor,
-        backdrop,
-        dissolve: sheet_dissolve(app, cell_size),
-        host_terminal_kind: app.host_terminal_kind,
-        host_graphics_is_local: app.host_graphics_is_local,
+        field: scene.field,
+        bounds: scene.bounds,
+        bloom_floor: scene.bloom_floor,
+        backdrop: scene.backdrop,
+        dissolve: None,
+        host_terminal_kind,
+        host_graphics_is_local,
     };
 
-    if app.sidebar_card_shapes {
-        return rasteriser.shapes(&placed, &offsets, previous);
-    }
-    rasteriser.sheet(&placed, previous)
+    rasteriser.shapes(&placed, &scene.offsets, previous)
 }
 
 /// How many cell rows the row at `index` occupies before the next one starts.
@@ -5073,6 +5313,36 @@ mod a_card_is_its_own_shape {
             .then(|| super::super::row_fold_width(app, app.view.sidebar_rect))
     }
 
+    /// A `CardScene` built from a real fleet survives an encode/decode round
+    /// trip byte-for-byte — the contract `ServerMessage::CardScene` rests on,
+    /// checked without a live terminal or a connected client on either end.
+    #[test]
+    fn card_scene_round_trips_through_bincode() {
+        let app = pixel_fleet_app();
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let Some(scene) = build_card_scene(&app, &cards, rect, app.host_cell_size) else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        assert!(
+            !scene.placed.is_empty(),
+            "fleet should place at least one card"
+        );
+
+        let bytes = encode_card_scene(&scene).expect("encode CardScene");
+        let decoded = decode_card_scene(&bytes).expect("decode CardScene");
+
+        assert_eq!(scene, decoded);
+    }
+
+    /// Garbage bytes decode to an error rather than a panic — the client's
+    /// only defence against a version-skewed or corrupted `CardScene` payload.
+    #[test]
+    fn card_scene_decode_rejects_garbage_bytes() {
+        assert!(decode_card_scene(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
     /// The cards a build published, or `None` when this machine has no
     /// proportional face and there is no pixel path to test.
     fn built(app: &AppState) -> Option<Vec<SidebarCardLayer>> {
@@ -6387,6 +6657,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut foreground,
+            true,
         );
         assert!(
             !bytes.is_empty() && !foreground.is_empty(),
@@ -6407,6 +6678,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut second,
+            true,
         );
         assert!(
             bytes.is_empty() && second.is_empty(),
@@ -6447,6 +6719,7 @@ mod a_card_is_its_own_shape {
             app.view.tab_surface(),
             cell_size,
             &mut second,
+            true,
         );
         assert!(
             !bytes.is_empty() && !second.is_empty(),
@@ -7141,6 +7414,7 @@ mod motion_capture {
                 app.view.tab_surface(),
                 cell_size,
                 &mut fresh,
+                true,
             );
             std::fs::write(format!("{}/{name}.esc", self.dir), &standalone).expect("writes");
 
@@ -7150,6 +7424,7 @@ mod motion_capture {
                 app.view.tab_surface(),
                 cell_size,
                 &mut self.persistent,
+                true,
             );
             let _ = writeln!(
                 self.cost,
