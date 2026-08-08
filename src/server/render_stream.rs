@@ -9,8 +9,67 @@ use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
 use crate::terminal::TerminalRuntimeRegistry;
 
+/// Identity of the surfaces a client draws itself, folded into one number.
+///
+/// Built fresh for each of a client's render passes — see
+/// [`ClientRenderState::set_delegated_scene_identity`]. Order matters and is
+/// the order the render loop delegates in; two passes that delegated
+/// byte-identical scenes produce the same number, and any change to any of them
+/// produces a different one. A pass that delegated nothing at all stays `0`,
+/// which is also where a fresh client starts, so a client that delegates
+/// nothing never sees this mechanism at all.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct DelegatedSceneIdentity(u64);
+
+impl DelegatedSceneIdentity {
+    /// Folds one delegated scene's encoded payload in.
+    ///
+    /// `tag` separates the surfaces, so a card scene and a tray scene that
+    /// happened to encode to the same bytes are still two different scenes.
+    pub(crate) fn note_scene(&mut self, tag: DelegatedSurface, bytes: &[u8]) {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.0.hash(&mut hasher);
+        (tag as u8).hash(&mut hasher);
+        bytes.hash(&mut hasher);
+        self.0 = hasher.finish();
+    }
+}
+
+/// A sidebar surface whose pixels a client can be asked to draw for itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DelegatedSurface {
+    Cards,
+    SignalTray,
+}
+
 /// Per-client render baseline for the negotiated render encoding.
-pub(crate) enum ClientRenderState {
+pub(crate) struct ClientRenderState {
+    baseline: EncodingBaseline,
+    /// The delegated-scene identity carried by the last frame actually sent to
+    /// this client.
+    sent_scenes: DelegatedSceneIdentity,
+    /// The delegated-scene identity of the pass currently being prepared.
+    ///
+    /// A client that draws a surface itself is deliberately *not* sent that
+    /// surface's pixels — but that also means a pass whose only change was
+    /// inside that surface produces a frame byte-identical to the previous one,
+    /// so the identical-frame skip below would drop the very frame the client's
+    /// freshly rasterised bytes ride out on (they are spliced into the next
+    /// frame, not written on receipt). Withholding the artwork removed the one
+    /// thing that made the frame worth sending, and the surface froze on screen.
+    ///
+    /// So a delegated scene's identity is part of this client's frame identity:
+    /// a tray-only or card-only change stops looking identical and a carrier
+    /// frame ships. It also keeps the client's `pending_*_graphics` from growing
+    /// without bound, because a carrier now arrives on every step rather than
+    /// whenever something unrelated happens to move.
+    pending_scenes: DelegatedSceneIdentity,
+}
+
+/// The half of a client's render baseline that the negotiated encoding owns.
+enum EncodingBaseline {
     /// Semantic clients compare full frame data and skip identical frames.
     Semantic { last_frame: Option<FrameData> },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -23,20 +82,24 @@ pub(crate) enum ClientRenderState {
 
 impl ClientRenderState {
     pub(crate) fn new(render_encoding: RenderEncoding) -> Self {
-        match render_encoding {
-            RenderEncoding::SemanticFrame => Self::Semantic { last_frame: None },
-            RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
-                blit_encoder: BlitEncoder::new(),
-                seq: 0,
-                repaint_pending: false,
+        Self {
+            baseline: match render_encoding {
+                RenderEncoding::SemanticFrame => EncodingBaseline::Semantic { last_frame: None },
+                RenderEncoding::TerminalAnsi => EncodingBaseline::TerminalAnsi {
+                    blit_encoder: BlitEncoder::new(),
+                    seq: 0,
+                    repaint_pending: false,
+                },
             },
+            sent_scenes: DelegatedSceneIdentity::default(),
+            pending_scenes: DelegatedSceneIdentity::default(),
         }
     }
 
     pub(crate) fn reset_baseline(&mut self) {
-        match self {
-            Self::Semantic { last_frame } => *last_frame = None,
-            Self::TerminalAnsi {
+        match &mut self.baseline {
+            EncodingBaseline::Semantic { last_frame } => *last_frame = None,
+            EncodingBaseline::TerminalAnsi {
                 blit_encoder,
                 repaint_pending,
                 ..
@@ -48,24 +111,40 @@ impl ClientRenderState {
     }
 
     pub(crate) fn request_repaint(&mut self) {
-        match self {
-            Self::Semantic { last_frame } => *last_frame = None,
-            Self::TerminalAnsi {
+        match &mut self.baseline {
+            EncodingBaseline::Semantic { last_frame } => *last_frame = None,
+            EncodingBaseline::TerminalAnsi {
                 repaint_pending, ..
             } => *repaint_pending = true,
         }
     }
 
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
+        if let EncodingBaseline::Semantic { last_frame } = &mut self.baseline {
             *last_frame = None;
         }
     }
 
+    /// Declares what this render pass handed to the client to draw itself,
+    /// before the pass's frame is prepared.
+    ///
+    /// Called once per pass by the render loop, from the identity it built while
+    /// sending this pass's scene messages, so a pass that sent no scenes resets
+    /// it to `0` rather than inheriting the last pass's.
+    pub(crate) fn set_delegated_scene_identity(&mut self, identity: DelegatedSceneIdentity) {
+        self.pending_scenes = identity;
+    }
+
+    /// Whether this pass delegated something the last sent frame did not carry.
+    fn delegated_scenes_moved(&self) -> bool {
+        self.pending_scenes != self.sent_scenes
+    }
+
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
-        match self {
-            Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(&frame) {
+        let delegated_scenes_moved = self.delegated_scenes_moved();
+        match &mut self.baseline {
+            EncodingBaseline::Semantic { last_frame } => {
+                if !delegated_scenes_moved && last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
                 }
@@ -74,12 +153,12 @@ impl ClientRenderState {
                     message: ServerMessage::Frame(frame),
                 })
             }
-            Self::TerminalAnsi {
+            EncodingBaseline::TerminalAnsi {
                 blit_encoder,
                 seq,
                 repaint_pending,
             } => {
-                if !*repaint_pending && blit_encoder.is_current(&frame) {
+                if !*repaint_pending && !delegated_scenes_moved && blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
@@ -112,22 +191,23 @@ impl ClientRenderState {
     }
 
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
-        match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
-            Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
+        match &self.baseline {
+            EncodingBaseline::Semantic { last_frame } => last_frame.as_ref(),
+            EncodingBaseline::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
 
     pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
-        match (self, prepared) {
+        self.sent_scenes = self.pending_scenes;
+        match (&mut self.baseline, prepared) {
             (
-                Self::Semantic { last_frame },
+                EncodingBaseline::Semantic { last_frame },
                 PreparedRender::Semantic {
                     message: ServerMessage::Frame(frame),
                 },
             ) => *last_frame = Some(frame),
             (
-                Self::TerminalAnsi {
+                EncodingBaseline::TerminalAnsi {
                     blit_encoder,
                     seq,
                     repaint_pending,
@@ -148,9 +228,9 @@ impl ClientRenderState {
 
     #[cfg(test)]
     pub(crate) fn terminal_seq(&self) -> Option<u64> {
-        match self {
-            Self::Semantic { .. } => None,
-            Self::TerminalAnsi { seq, .. } => Some(*seq),
+        match &self.baseline {
+            EncodingBaseline::Semantic { .. } => None,
+            EncodingBaseline::TerminalAnsi { seq, .. } => Some(*seq),
         }
     }
 }
