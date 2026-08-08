@@ -130,3 +130,49 @@ jobs:
           path: /tmp/**/herdr-server.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Run the binary with EVERY capability turned on at once and keep the bytes it
+  # actually emits. Every flag in tests/fixtures/all-flags.toml is off by
+  # default, so nothing else in CI -- unit suite included -- ever exercises this
+  # combination, and the surfaces behind those flags are the ones that have
+  # shipped bugs.
+  all-flags:
+    name: all-flags live capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: true
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # image_card::is_available needs a proportional face found at runtime and
+      # herdr ships none -- without this the pixel-card path stays off for a
+      # reason unrelated to the flags, and the capture silently loses its cards.
+      - name: Install a proportional font
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fonts-dejavu
+          fc-list | grep -ci dejavu || true
+
+      - name: Build herdr
+        run: cargo build --locked
+
+      - name: Capture with every flag on
+        run: |
+          python3 scripts/all_flags_capture.py \
+            target/debug/herdr "${RUNNER_TEMP}/afcap" --seconds 10

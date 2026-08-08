@@ -1,0 +1,77 @@
+# Every capability Herdr has been built with, turned on at once.
+#
+# This repo has no Cargo `[features]` and no `#[cfg(feature = ...)]` in `src/`,
+# so a stock binary already contains all of this -- there is no "all-flags
+# build", only an all-flags *config*. This file is that config, and it exists so
+# the live-render check measures a binary with every researched surface active
+# rather than the default-quiet one most tests see.
+#
+# Deliberately NOT set here, though both are also false by default:
+#
+#   ui.sidebar_start_collapsed        collapses the Spaces panel
+#   ui.hide_tab_bar_when_single_tab   hides the tab bar
+#
+# Those two are user preferences that *remove* surfaces from the screen. Turning
+# them on would hide the very things this config exists to put under
+# measurement, so they stay off. Everything else that ships off-by-default is on.
+#
+# Read by whichever process runs `herdr server`, not by a client attaching
+# afterward -- export HERDR_CONFIG_PATH before starting the server.
+
+[ui]
+# Additive: draws the detected agent name on each pane border.
+show_agent_labels_on_pane_borders = true
+
+[ui.sidebar.animation]
+# Rows arrive and leave with a behaviour rather than popping in fully drawn.
+row_enter = "dissolve"
+row_enter_ms = 260
+row_exit = "dissolve"
+row_exit_ms = 260
+# A row's arrival/departure also moves it: in from the panel's right edge, with
+# the rows below panning down to open its slot. Pixel cards only.
+row_motion = "slide"
+# Re-rooting the tree takes the panel apart cell by cell instead of swapping.
+view_switch_particles_per_cell = 4
+
+[ui.sidebar.notifications]
+# Fleet signal bar above the Spaces tree. Also arms the pull request refresh.
+enabled = true
+
+[ui.sidebar.signal_tray]
+# Notification tray at the foot of the Spaces panel: eight badges + popover.
+enabled = true
+
+[experimental]
+# Lab escape hatch, not a product surface: lets the check run a herdr inside a
+# herdr pane without a second private config.
+allow_nested = true
+
+# The gateway for every graphics surface below it -- with this off, the four
+# following keys are not read at all.
+kitty_graphics = true
+
+# Each card its own transparent shape rather than one opaque sheet over the
+# whole tree, so overlapping card glows are blended by the terminal.
+sidebar_card_shapes = true
+
+# Ambient particle wash behind the sidebar tree, played back by the terminal's
+# own Kitty animation-frame clock.
+sidebar_particle_field = true
+
+# Whole-terminal background scene: firstmate as sun, second mates as planets,
+# workers as moons.
+persistent_background = true
+
+# Hand pixels to the terminal as a local temp file (t=f) instead of base64 in
+# the escape stream, and pick a raw format the detected terminal is fast at.
+kitty_graphics_local_transport = true
+
+# Persist pane screen history to session-history.json.
+pane_history = true
+
+# Expose the focused pane's cursor anchor even when the pane requested ?25l.
+reveal_hidden_cursor_for_cjk_ime = true
+
+# Swap the host input source to ASCII while prefix mode is active.
+switch_ascii_input_source_in_prefix = true
