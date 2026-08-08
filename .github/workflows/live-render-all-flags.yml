@@ -13,6 +13,16 @@ on:
   push:
     branches:
       - claude/**
+    # Path-filtered: the build dominates this job's cost, so it should not run
+    # for changes that cannot affect what reaches the wire.
+    paths:
+      - 'src/ui/sidebar/**'
+      - 'src/kitty_graphics.rs'
+      - 'src/anim/**'
+      - 'src/anim.rs'
+      - 'src/config/sidebar.rs'
+      - 'data/herdr-all-flags-live/**'
+      - '.github/workflows/live-render-all-flags.yml'
 
 permissions:
   contents: read
@@ -56,13 +66,19 @@ jobs:
         with:
           key: live-render
 
+      # Debug, not release. Every settle in the capture is wall-clock, so a
+      # slower binary changes nothing about what is captured, and this compiles
+      # in roughly a third of the time. Note the namespace that comes with it:
+      # config::app_dir_name() returns herdr-dev under debug_assertions, so the
+      # config has to be written there or the run silently uses defaults and
+      # every flag below is inert.
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --locked
 
       - name: Run live capture with every flag on
         env:
-          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
-          HERDR_NS: herdr
+          HERDR_BIN: ${{ github.workspace }}/target/debug/herdr
+          HERDR_NS: herdr-dev
         run: |
           chmod +x data/herdr-all-flags-live/run.sh
           ./data/herdr-all-flags-live/run.sh

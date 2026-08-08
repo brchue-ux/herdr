@@ -82,6 +82,25 @@ def render(raw, cols, rows):
                 else:
                     i += 2
                     continue
+            elif i + 1 < n and raw[i + 1] == "_":
+                # APC, always ST-terminated (ESC \). Kitty graphics ride this:
+                # ESC _ G <controls> ; <payload> ESC \. Without this branch the
+                # generic two-byte skip below eats only "ESC _" and the whole
+                # control string plus its base64 payload lands in the grid as
+                # literal text, burying the actual rendered rows. Graphics are
+                # analysed separately by analyse.py; here they are structure to
+                # step over, not content.
+                j = i + 2
+                while j < n:
+                    if raw[j] == "\x1b" and j + 1 < n and raw[j + 1] == "\\":
+                        j += 2
+                        break
+                    if raw[j] == "\x07":
+                        j += 1
+                        break
+                    j += 1
+                i = j
+                continue
             elif i + 1 < n and raw[i + 1] == "]":
                 # OSC, terminated by BEL (consume it) or ST == ESC \ (already
                 # consumed by the inner break) -- the original single-cell

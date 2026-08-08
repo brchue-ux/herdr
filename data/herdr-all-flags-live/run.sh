@@ -113,9 +113,6 @@ cap cleared 2000
 echo "--- server log (last 40 lines) ---"
 tail -40 "$ROOT/server.log" || true
 
-echo "--- analysis ---"
-python3 "$HERE/analyse.py" "$OUT"/steady.raw "$OUT"/failing.raw "$OUT"/cleared.raw
-
 echo "--- decoded steady-state grid ---"
 cat "$OUT/steady.txt" || true
 
@@ -130,3 +127,11 @@ if grep -qiE "panicked at|fatal|thread .* panicked" "$ROOT/server.log"; then
   exit 1
 fi
 echo "no panic in server log"
+
+# The analysis goes LAST on purpose. A job's log is read from the end, and the
+# grids above are thousands of lines: printed before this, the summary is the
+# first thing truncation removes, which is exactly what happened on run 1.
+echo
+echo "=================== SUMMARY ==================="
+python3 "$HERE/analyse.py" "$OUT"/steady.raw "$OUT"/failing.raw "$OUT"/cleared.raw
+echo "==============================================="

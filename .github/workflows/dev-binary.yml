@@ -5,11 +5,11 @@ name: Dev binary
 # (same targets, same Zig/libghostty-vt settings) but publishes nothing: the
 # binaries are uploaded as workflow artifacts only.
 
+# Dispatch-only on purpose. This builds four targets, two of them on macOS
+# runners, so firing it on every push to a working branch costs far more than
+# it returns — ask for a binary when you actually want one.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - claude/**
 
 permissions:
   contents: read
