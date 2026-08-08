@@ -4713,6 +4713,11 @@ impl HeadlessServer {
         changed |= self
             .app
             .observe_signal_tray(now, self.every_app_viewer_rasterizes_signal_tray());
+        // Before either wash is asked whether it may exist: the answer depends
+        // on every attached viewer, not only on whichever one is foreground at
+        // this instant. See `AppState::every_app_viewer_draws_ambient_wash`.
+        self.app.state.every_app_viewer_draws_ambient_wash =
+            self.every_app_viewer_draws_ambient_wash();
         changed |= self.app.observe_sidebar_particle_field();
         changed |= self.app.observe_background_scene();
         changed |= self.app.observe_background_effects(now, has_viewers);
@@ -4736,6 +4741,30 @@ impl HeadlessServer {
     /// no app viewers at all this is false: a tray rasterised for nobody is
     /// wasted either way, and the honest reading of "they all draw it
     /// themselves" needs at least one of them to exist.
+    /// True when every client rendering the app runs on a terminal that draws
+    /// an opaque ambient wash where Herdr places it.
+    ///
+    /// The mirror of [`Self::every_app_viewer_rasterizes_signal_tray`], and it
+    /// exists for the same structural reason: the thing being decided is one
+    /// image on shared `AppState` that every viewer is placed a copy of, so a
+    /// per-client fact has to be folded across all of them before it can gate a
+    /// shared resource. `AppState::host_terminal_kind` is only the foreground
+    /// client's, and foreground changes on any interaction — including the
+    /// mouse merely crossing into another client's window — so a wash gated on
+    /// it alone appears and disappears as the user moves between windows, and
+    /// while it exists it is handed to viewers that hide their own panes behind
+    /// it.
+    ///
+    /// Vacuously true with no app viewers, unlike its sibling: this predicate
+    /// only ever withdraws permission, and with nobody attached there is no
+    /// viewer to protect and nothing to withdraw it for.
+    fn every_app_viewer_draws_ambient_wash(&self) -> bool {
+        self.clients
+            .values()
+            .filter(|client| client.is_full_app_client())
+            .all(|client| client.host_terminal_kind.draws_ambient_wash())
+    }
+
     fn every_app_viewer_rasterizes_signal_tray(&self) -> bool {
         let mut viewers = self
             .clients
@@ -8805,6 +8834,97 @@ next_tab = ""
 
         assert!(server.clients[&1].kitty_graphics_capability_confirmed);
         assert!(server.app.state.kitty_graphics_capability_confirmed);
+    }
+
+    /// A wash the foreground client's terminal draws must still be refused
+    /// while a viewer that does not draw it is attached.
+    ///
+    /// This is the multi-client half of the gate PR #96 added. That fix asked
+    /// `HostTerminalKind::draws_ambient_wash()` of `AppState::host_terminal_kind`
+    /// — the *foreground* client's terminal — but the wash is one image on
+    /// shared state that every attached viewer is placed a copy of. With a
+    /// kitty client and a Rio client both attached, the kitty client being
+    /// foreground generated an opaque full-surface wash and shipped it to the
+    /// Rio client too, which does not honour the negative-`z` band and
+    /// composited it over its own panes.
+    #[tokio::test]
+    async fn a_wash_is_refused_while_any_attached_viewer_would_composite_it_over_its_panes() {
+        let mut server = test_headless_server();
+        server.app.state.kitty_graphics_enabled = true;
+        server.app.state.persistent_background_enabled = true;
+        server.app.state.sidebar_particle_field_enabled = true;
+
+        let client = |id: u64, kind| {
+            let mut connection = ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                id,
+                RenderEncoding::TerminalAnsi,
+                None,
+            );
+            connection.host_terminal_kind = kind;
+            connection
+        };
+
+        // Only the kitty client: the wash is exactly what it was before.
+        server
+            .clients
+            .insert(1, client(1, crate::kitty_graphics::HostTerminalKind::Kitty));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.app.state.every_app_viewer_draws_ambient_wash =
+            server.every_app_viewer_draws_ambient_wash();
+        assert!(
+            server.app.state.background_scene_active(),
+            "a lone kitty viewer must still be drawn its wash"
+        );
+        assert!(server.app.state.sidebar_particle_field_active());
+
+        // A Rio client attaches. The foreground terminal has not changed, but
+        // what the fleet can be shown has.
+        server
+            .clients
+            .insert(2, client(2, crate::kitty_graphics::HostTerminalKind::Rio));
+        server.app.state.every_app_viewer_draws_ambient_wash =
+            server.every_app_viewer_draws_ambient_wash();
+        assert_eq!(
+            server.app.state.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Kitty,
+            "the foreground client is still the kitty one"
+        );
+        assert!(
+            !server.app.state.background_scene_active(),
+            "the background wash reached a viewer that draws it over its panes"
+        );
+        assert!(
+            !server.app.state.sidebar_particle_field_active(),
+            "the sidebar wash reached a viewer that draws it over its tree"
+        );
+
+        // And it stays refused whichever window the mouse is in: promotion is
+        // what used to flip this on and off as the user moved between them.
+        server.promote_client_to_foreground(2);
+        server.app.state.every_app_viewer_draws_ambient_wash =
+            server.every_app_viewer_draws_ambient_wash();
+        assert!(!server.app.state.background_scene_active());
+        server.promote_client_to_foreground(1);
+        server.app.state.every_app_viewer_draws_ambient_wash =
+            server.every_app_viewer_draws_ambient_wash();
+        assert!(
+            !server.app.state.background_scene_active(),
+            "moving focus back to the kitty client brought the wash back"
+        );
+
+        // The Rio client leaves: the remaining fleet can be shown a wash again.
+        server.clients.remove(&2);
+        server.app.state.every_app_viewer_draws_ambient_wash =
+            server.every_app_viewer_draws_ambient_wash();
+        assert!(
+            server.app.state.background_scene_active(),
+            "the wash must come back once the viewer it was withheld for has gone"
+        );
     }
 
     #[tokio::test]
