@@ -1,0 +1,71 @@
+# Config for the live compositing capture. `@PERSISTENT_BACKGROUND@` is the only
+# thing run.sh substitutes, so the two passes differ in exactly one key and the
+# comparison between them is a real counterfactual rather than two loosely
+# similar screenshots.
+#
+# `onboarding = false` matters: the setup modal covers the screen, and dismissing
+# it needs kitty remote control, a listening socket and a synthetic keypress.
+# Turning it off in the lab's own config removes all of that.
+onboarding = false
+
+[experimental]
+allow_nested = true
+kitty_graphics = true
+# Pixel cards. Off, the sidebar is characters and there is nothing composited to
+# look at.
+sidebar_card_shapes = true
+# Off, and that is the finding this rig produced on its first live run.
+#
+# On, at a 42-column sidebar on a 1600x1000 terminal, the per-frame graphics
+# payload measured **52 MB** — against herdr's own `MAX_GRAPHICS_FRAME_SIZE` of
+# 32 MiB. The server then drops the whole payload:
+#
+#   WARN herdr::server::headless: dropping oversized graphics payload for client
+#   frame client_id=2 graphics_bytes=52124609 max=33554432
+#
+# ...ten times a second, taking **every other pixel surface with it**. No cards,
+# no background scene, no pixel anything — while every character surface renders
+# normally, so the UI looks plausible and merely empty. The wash is generated
+# once per sidebar size and played back by the terminal's own animation clock, so
+# its cost is (sidebar area x RGBA x loop frames), which is why it alone accounts
+# for the overrun.
+#
+# The captain has this off (see #96), so off is also the faithful configuration.
+# `PARTICLE_FIELD=true` re-runs the rig against it; run.sh asserts the drop
+# never happens, so it fails loudly rather than drawing nothing.
+sidebar_particle_field = @PARTICLE_FIELD@
+# The whole-terminal scene. This is the key under test.
+persistent_background = @PERSISTENT_BACKGROUND@
+# #77: hand pixels over as a local file (`t=f`) instead of base64 in the stream,
+# and pick a raw pixel format for the detected terminal.
+#
+# On. The byte-level check next door only ever proves `t=f` reaches the wire —
+# its own body says so, "payload being a pid-scoped file path rather than
+# pixels" — so nothing before this rig could establish that a terminal reads
+# what that path points at. With the payload no longer being dropped whole, this
+# is the first check that exercises it end to end.
+#
+# `LOCAL_TRANSPORT=false` re-runs against inline base64 (`t=d`) if the two ever
+# need separating.
+kitty_graphics_local_transport = @LOCAL_TRANSPORT@
+
+[ui]
+sidebar_width = 42
+
+[ui.sidebar.animation]
+row_enter = "wipe"
+row_enter_ms = 400
+row_exit = "wipe"
+row_exit_ms = 400
+row_motion = "slide"
+view_switch = "dissolve"
+view_switch_ms = 400
+
+[ui.sidebar.cards]
+pulse = true
+wash = true
+wash_ms = 400
+stage_hue = true
+
+[ui.sidebar.notifications]
+enabled = true
