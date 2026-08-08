@@ -195,6 +195,13 @@ lab_wait_for_motion() {
     else
       run=0
     fi
+    # Every poll's measurement goes in the job log. A gate that only ever says
+    # "opened after N polls" cannot be told apart from one that opened on the
+    # wrong thing, which is exactly the question run 31274414469 raised.
+    printf '  poll %2d: %s (run %d/%d)\n' "$n" \
+      "$(sed -n 's/^  .*png: *\([0-9]*\) px .*(\(move\|STILL\)).*$/\1 px \2/p;
+                 s/^  .*png: *\([0-9]*\) px .*  \(move\|STILL\)$/\1 px \2/p' \
+           "${prefix}.log" | tail -1)" "$run" "$want"
     mv -f "${prefix}-b.png" "${prefix}-a.png"
     if [ "$run" -ge "$want" ]; then
       echo "region $region moved on $want consecutive pairs after ${n} polls" \

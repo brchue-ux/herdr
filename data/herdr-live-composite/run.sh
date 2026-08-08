@@ -28,8 +28,16 @@ NS="${HERDR_NS:-herdr-dev}"
 ROOT="${CAPTURE_ROOT:-/tmp/herdr-composite-$BG}"
 OUT="${COMPOSITE_OUT:-$HERE/proof/$BG}"
 DISP="${COMPOSITE_DISPLAY:-:97}"
-FRAMES="${FRAMES:-8}"
+# Twelve rather than eight. The tray's pulse opens on an amplitude envelope, so
+# the first pairs after capture starts can measure a real animation that is
+# still too small to clear any floor worth setting; `--tail-pairs` below takes
+# the verdict from the last seven, and these four are the headroom that leaves.
+FRAMES="${FRAMES:-12}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-0.6}"
+# How many trailing pairs the tray verdict is taken from. Seven keeps the
+# assertion exactly as strict as it was — 5 of 7 — on a window that is now
+# guaranteed to sit past the fade-in rather than straddling it.
+TRAY_JUDGED_PAIRS="${TRAY_JUDGED_PAIRS:-7}"
 export LAB_TMP="$ROOT"
 
 # Resolved once, because the warm-up gate below and the tray assertion at the
@@ -261,6 +269,16 @@ sleep "${GRAPHICS_SETTLE:-6}"
 # region and floor — and on timeout carry on and let the assertion speak, since
 # a tray that never moves at all is precisely the #97 defect and deserves the
 # per-pair numbers, not a gate's one-line complaint.
+#
+# This gate is half the answer, and the frames from run 31274414469 say which
+# half. What it can see is the badges *arriving* — engraved marks becoming lit
+# ones, a large one-time change. What it cannot see is that the pulse then opens
+# on an amplitude envelope: measured per badge across that run's eight frames,
+# the swing grows 0.4 -> 3.9 -> 5.7 -> 7.4 -> 7.5 luma, so the animation is
+# genuinely running for about two seconds while every pair still measures 0 px
+# against a per-channel floor of 24. No readiness signal fixes that, because
+# there is nothing to wait for that has not already happened — the fade-in is
+# the animation. `--tail-pairs` below is the other half.
 echo "--- waiting for the tray to start animating ---"
 if ! lab_wait_for_motion "$DISP" "$ROOT/.tray" "$TRAY_REGION" "$TRAY_MIN_PX" \
      "${TRAY_WARMUP_PAIRS:-3}" "${TRAY_WARMUP_POLLS:-30}" "$FRAME_INTERVAL"; then
@@ -332,7 +350,8 @@ python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
   --region "$TRAY_REGION" \
   --label "signal tray badges" \
   --min-changed-px "$TRAY_MIN_PX" \
-  --min-active-pairs "${MIN_PAIRS:-5}"
+  --min-active-pairs "${MIN_PAIRS:-5}" \
+  --tail-pairs "$TRAY_JUDGED_PAIRS"
 
 # The control: a real process is writing to a real pty in the lower pane. If this
 # is still, the client is not receiving frames at all and the verdict above says
