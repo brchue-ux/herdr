@@ -101,10 +101,15 @@ fi
 echo "server exited cleanly"
 
 if [ ! -f "$ROOT/.config/$NS/session.json" ]; then
-  echo "FAIL: the server exited but wrote no session.json, so a swap has nothing" >&2
-  echo "to restore. save_session_now() runs on clean loop exit; if that ran, the" >&2
-  echo "snapshot should be at $ROOT/.config/$NS/session.json" >&2
+  echo "FAIL: the server exited but no session.json is where this expects it." >&2
+  echo "Expected: $ROOT/.config/$NS/session.json" >&2
+  echo "--- anything named session.json anywhere under \$ROOT ---" >&2
+  find "$ROOT" -name 'session*.json' -print 2>/dev/null >&2 || true
+  echo "--- config dir ---" >&2
   ls -la "$ROOT/.config/$NS/" >&2 || true
+  echo "--- server log (tail) ---" >&2
+  tail -60 "$ROOT/.config/$NS/herdr-server.log" >&2 2>/dev/null \
+    || tail -60 "$ROOT/server.log" >&2 || true
   exit 1
 fi
 echo "session.json: $(wc -c < "$ROOT/.config/$NS/session.json") bytes"
