@@ -62,13 +62,25 @@ in sRGB, so software compositing of these bytes is not what the terminal would d
 2. The analysis summary printed *before* the grid dumps, so it was the first thing lost to log
    truncation. It now prints last, because a job log is read from the end.
 
-## Cost
+## Cost, and one saving that was not real
 
-The build dominates: ~4m17s of a 5m46s run 1. Hence the debug build, the path filter, and the
-warm Swatinem/Zig caches. The capture itself is ~45s, most of it fixed settles.
+The build dominates: ~4m17s of a 5m46s run 1. A debug build was tried to cut that and it was a
+false economy — debug card rasterisation and PNG encode are slow enough that almost nothing
+renders inside the capture's settles. Run 2 produced **2,568 bytes against run 1's 5,696,056**
+from the same six captures, finished in 2m09s, and **passed**, because the only assertion was
+"no panic" and an empty capture does not panic either.
+
+So the build stays release, and `run.sh` now asserts the capture is substantial (`MIN_BYTES`) and
+that the pixel path actually reached the wire (`MIN_APC`). A green tick on this job should mean
+something was drawn. The savings that are real and kept: the path filter, and warm Swatinem/Zig
+caches.
 
 ## Reproducing locally
 
+Release, for the reason above — a debug binary will trip the `MIN_BYTES` guard rather than produce
+a capture worth reading.
+
 ```bash
-HERDR_BIN=./target/debug/herdr HERDR_NS=herdr-dev ./data/herdr-all-flags-live/run.sh
+cargo build --release
+HERDR_BIN=./target/release/herdr HERDR_NS=herdr ./data/herdr-all-flags-live/run.sh
 ```
