@@ -147,49 +147,47 @@ moves with it). On a workstation that already has a live herdr fleet, use a
 named session and the fleet's own lab tooling rather than pointing this at the
 default session.
 
-## Open finding: with #77's local transport on, no pixel surface draws at all
+## What the first live runs found
 
-The first two real runs of this rig found something. On a real local kitty
-client at `2e2dd8fc`, with `[experimental] kitty_graphics_local_transport = true`
-(#77 — pixels handed over as a local file, `t=f`, plus a terminal-aware raw
-format), **every pixel surface was absent and every character surface was
-fine**:
+Three runs against a real kitty client at `2e2dd8fc`, and the rig earned its
+keep before it was even green.
 
-| surface | how it is drawn | result |
-|---|---|---|
-| sidebar cards | Kitty graphics, `z: 0` | **nothing** — max luma 42/255 over the row area |
-| whole-terminal background scene | Kitty graphics, `z: -2` | **nothing** — 0.000 coverage against the reference pass |
-| signal tray | characters | drew, in colour, animating at 74 px/pair |
-| pane text, borders, tree connectors | characters | fine |
+**Every pixel surface was missing and every character surface was fine.** No
+sidebar cards (max luminance 42/255 over the row area, 0 changed pixels across
+all 7 frame pairs), no whole-terminal background (0.000 coverage against the
+reference pass) — while pane text, borders, tree connectors and the signal tray
+all rendered and the tray animated at 74 px/pair. A UI that looks plausible and
+is merely empty.
 
-The byte-level check next door only ever proves `t=f` *reaches the wire* — its
-own body says so: "payload being a pid-scoped file path rather than pixels". So
-nothing before this rig could establish that a terminal reads what that path
-points at, and the flag also switches on a raw pixel format (`f=24`/`f=32`) whose
-`s=`/`v=` framing a terminal will reject silently under `q=2`.
+The cause is in the server's own log, once you keep it:
 
-The rig therefore runs with it **off** by default, and `LOCAL_TRANSPORT=true`
-re-runs it against the flag. That A/B is the thing that settles it, and this rig
-is the first thing able to run it.
+```
+WARN herdr::server::headless: dropping oversized graphics payload for client
+frame client_id=2 graphics_bytes=52124609 max=33554432
+```
 
-## Open finding: the sidebar row area is empty
+**52 MB per frame against a 32 MiB `MAX_GRAPHICS_FRAME_SIZE`, dropped ten times
+a second**, taking every pixel surface with it. 57 MB with the background scene
+on; the scene itself only adds ~4.8 MB, so the wash is the overrun. The cost of
+`sidebar_particle_field` is (sidebar area × RGBA × animation loop frames), and at
+a 42-column sidebar on a 1600×1000 terminal that is over the cap on its own.
 
-The first real run of this rig found something. On a real local kitty client at
-`2e2dd8fc`, with `sidebar_card_shapes` on, the sidebar drew **tree connectors and
-nothing else** — no labels, no cards, no row content. Measured over the row area:
-maximum luminance 42/255, 114 pixels above 20 out of 306,900, and **0 changed
-pixels across all 7 frame pairs**.
+Why nothing else caught it:
 
-On the same client, in the same frame, the signal tray drew all eight badges in
-colour and animated at 74 px per pair. Cards and the tray both publish at `z: 0`
-(`image_card.rs`, `tray.rs`), and the tray proves the graphics path reaches this
-terminal — so this is neither a stacking problem nor a capability problem.
+- `just check` never renders to a terminal.
+- The byte-level check drives a **90×32** PTY. Scale the sidebar down that far
+  and the payload fits, so the drop never happens there.
+- On screen it is not an error, it is an absence. The user sees a sidebar with
+  no cards and is given no reason.
 
-It is **reported, not asserted**, because a check that goes red for a reason
-nobody understands teaches people to ignore it. `run.sh` prints the row area's
-motion and dumps `agent list` / `workspace list --json` beside it so the next run
-carries the evidence to settle it. Promote it to an assertion once the cause is
-known.
+`run.sh` now **asserts** the drop never happens, so it fails loudly with the
+measured bytes instead of quietly measuring nothing. The rig runs with the wash
+off — which is also the captain's own configuration (#96) — and
+`PARTICLE_FIELD=true` re-runs against it.
+
+One thing this ruled out along the way: #77's local transport is **not**
+implicated. Payload size was identical with `t=f` on and off (52,124,609 vs
+52,124,643 bytes), because the drop happens before the transport is chosen.
 
 ## Known next tightening
 

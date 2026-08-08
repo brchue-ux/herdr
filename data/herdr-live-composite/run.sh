@@ -39,12 +39,16 @@ rm -rf "$ROOT" "$OUT"
 mkdir -p "$ROOT/.config/$NS" "$OUT"
 
 case "$BG" in on) BG_TOML=true ;; off) BG_TOML=false ;; esac
-LOCAL_TRANSPORT="${LOCAL_TRANSPORT:-false}"
-case "$LOCAL_TRANSPORT" in true|false) ;; *)
-  echo "LOCAL_TRANSPORT must be true or false, got: $LOCAL_TRANSPORT" >&2; exit 2 ;;
-esac
+LOCAL_TRANSPORT="${LOCAL_TRANSPORT:-true}"
+PARTICLE_FIELD="${PARTICLE_FIELD:-false}"
+for flag in "$LOCAL_TRANSPORT" "$PARTICLE_FIELD"; do
+  case "$flag" in true|false) ;; *)
+    echo "flags must be true or false, got: $flag" >&2; exit 2 ;;
+  esac
+done
 sed -e "s/@PERSISTENT_BACKGROUND@/$BG_TOML/" \
-    -e "s/@LOCAL_TRANSPORT@/$LOCAL_TRANSPORT/" "$HERE/config.toml.in" \
+    -e "s/@LOCAL_TRANSPORT@/$LOCAL_TRANSPORT/" \
+    -e "s/@PARTICLE_FIELD@/$PARTICLE_FIELD/" "$HERE/config.toml.in" \
   > "$ROOT/.config/$NS/config.toml"
 echo "--- config in use (BACKGROUND=$BG) ---"
 cat "$ROOT/.config/$NS/config.toml"
@@ -254,6 +258,27 @@ if grep -qiE "panicked at|thread .* panicked" "$ROOT/server.log"; then
   exit 1
 fi
 echo "no panic in server log"
+
+# A dropped graphics payload takes *every* pixel surface with it — cards,
+# background, everything — while character surfaces keep rendering, so the UI
+# looks plausible and merely empty. It is a WARN in a log nobody reads and
+# nothing at all on screen.
+#
+# This is the exact shape that made the first two runs of this rig
+# uninterpretable: 52 MB per frame against a 32 MiB `MAX_GRAPHICS_FRAME_SIZE`,
+# dropped ten times a second. It is asserted rather than reported because the
+# meaning is unambiguous: whatever else the frame proves, it is not proving
+# anything about pixels.
+DROPPED_LOG="$ROOT/.config/$NS/herdr-server.log"
+if [ -f "$DROPPED_LOG" ] && grep -q "dropping oversized graphics payload" "$DROPPED_LOG"; then
+  echo "GRAPHICS PAYLOAD DROPPED — no pixel surface can have drawn" >&2
+  grep -oE "graphics_bytes=[0-9]+ max=[0-9]+" "$DROPPED_LOG" | sort -u | tail -3 >&2
+  echo "The payload exceeds protocol::MAX_GRAPHICS_FRAME_SIZE. Reduce what this" >&2
+  echo "config asks for (the particle-field wash is the expensive one: sidebar" >&2
+  echo "area x RGBA x loop frames), or the window size, or raise the cap." >&2
+  exit 1
+fi
+echo "no graphics payload dropped"
 
 echo
 echo "=================== ASSERTIONS (BACKGROUND=$BG) ==================="

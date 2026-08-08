@@ -14,25 +14,39 @@ kitty_graphics = true
 # Pixel cards. Off, the sidebar is characters and there is nothing composited to
 # look at.
 sidebar_card_shapes = true
-# An opaque wash in the same negative-z band as the whole-terminal scene, with a
-# smaller blast radius. On in both passes: it is part of what the sidebar
-# animation assertion watches, and holding it constant keeps the background the
-# only variable between passes.
-sidebar_particle_field = true
+# Off, and that is the finding this rig produced on its first live run.
+#
+# On, at a 42-column sidebar on a 1600x1000 terminal, the per-frame graphics
+# payload measured **52 MB** — against herdr's own `MAX_GRAPHICS_FRAME_SIZE` of
+# 32 MiB. The server then drops the whole payload:
+#
+#   WARN herdr::server::headless: dropping oversized graphics payload for client
+#   frame client_id=2 graphics_bytes=52124609 max=33554432
+#
+# ...ten times a second, taking **every other pixel surface with it**. No cards,
+# no background scene, no pixel anything — while every character surface renders
+# normally, so the UI looks plausible and merely empty. The wash is generated
+# once per sidebar size and played back by the terminal's own animation clock, so
+# its cost is (sidebar area x RGBA x loop frames), which is why it alone accounts
+# for the overrun.
+#
+# The captain has this off (see #96), so off is also the faithful configuration.
+# `PARTICLE_FIELD=true` re-runs the rig against it; run.sh asserts the drop
+# never happens, so it fails loudly rather than drawing nothing.
+sidebar_particle_field = @PARTICLE_FIELD@
 # The whole-terminal scene. This is the key under test.
 persistent_background = @PERSISTENT_BACKGROUND@
 # #77: hand pixels over as a local file (`t=f`) instead of base64 in the stream,
 # and pick a raw pixel format for the detected terminal.
 #
-# Off here, and that is a finding rather than a preference. With it on, a real
-# kitty client drew *no pixel surface at all* — no cards, no background scene —
-# while every character surface rendered normally. The byte-level check next door
-# only ever proves `t=f` reaches the wire; its own body says so ("payload being a
-# pid-scoped file path rather than pixels"), so nothing has ever established that
-# a terminal reads what that path points at.
+# On. The byte-level check next door only ever proves `t=f` reaches the wire —
+# its own body says so, "payload being a pid-scoped file path rather than
+# pixels" — so nothing before this rig could establish that a terminal reads
+# what that path points at. With the payload no longer being dropped whole, this
+# is the first check that exercises it end to end.
 #
-# Set `LOCAL_TRANSPORT=true` to re-run the rig against it. That is the A/B that
-# settles it, and this rig is the first thing able to run it.
+# `LOCAL_TRANSPORT=false` re-runs against inline base64 (`t=d`) if the two ever
+# need separating.
 kitty_graphics_local_transport = @LOCAL_TRANSPORT@
 
 [ui]
