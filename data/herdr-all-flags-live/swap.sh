@@ -73,18 +73,38 @@ run_with "$OLD_BIN" pane report-agent w2:p2 --source swap --agent worker-1 --sta
 run_with "$OLD_BIN" pane report-metadata w2:p2 --source swap --token owner=2ndmate
 run_with "$OLD_BIN" pane report-metadata w2:p2 --source swap --token lifecycle=failed
 
-sleep 1
+# Let the fleet settle before snapshotting it; panes are real processes.
+sleep 3
 run_with "$OLD_BIN" api snapshot > "$ROOT/before.json"
 echo "--- before: $(wc -c < "$ROOT/before.json") bytes of snapshot ---"
 
+# Shut down gracefully and WAIT for the process to actually go. The snapshot is
+# written by save_session_now() on clean exit of the server loop — there is no
+# periodic write on this path — so a hard kill, or checking too early, means no
+# session.json and a swap with nothing to inherit.
+#
+# `herdr session stop` is not the tool here: it requires a session NAME, and an
+# earlier version called it bare with `|| true`, which swallowed the usage error
+# and made a signal-less "stop" look like it had worked. SIGTERM to the server
+# is what a person's own Ctrl-C does.
 echo "=== stopping on the old binary ==="
-run_with "$OLD_BIN" session stop >/dev/null 2>&1 || true
-sleep 2
-kill "$(cat "$ROOT/server.pid")" 2>/dev/null || true
-sleep 1
+SRV_PID="$(cat "$ROOT/server.pid")"
+kill -TERM "$SRV_PID" 2>/dev/null || true
+for _ in $(seq 1 60); do
+  if ! kill -0 "$SRV_PID" 2>/dev/null; then break; fi
+  sleep 0.5
+done
+if kill -0 "$SRV_PID" 2>/dev/null; then
+  echo "FAIL: server did not exit within 30s of SIGTERM" >&2
+  exit 1
+fi
+echo "server exited cleanly"
 
 if [ ! -f "$ROOT/.config/$NS/session.json" ]; then
-  echo "FAIL: no session.json was written, so there is nothing for a swap to restore" >&2
+  echo "FAIL: the server exited but wrote no session.json, so a swap has nothing" >&2
+  echo "to restore. save_session_now() runs on clean loop exit; if that ran, the" >&2
+  echo "snapshot should be at $ROOT/.config/$NS/session.json" >&2
+  ls -la "$ROOT/.config/$NS/" >&2 || true
   exit 1
 fi
 echo "session.json: $(wc -c < "$ROOT/.config/$NS/session.json") bytes"
