@@ -341,18 +341,59 @@ pub(crate) fn local_transport_enabled() -> bool {
 /// Which host terminal emulator this process's environment claims to be
 /// running under.
 ///
-/// Used only to pick a pixel format the terminal is known to be fast at —
-/// see `preferred_card_pixel_format`. A terminal herdr cannot positively
-/// identify is `Other` and gets no format upgrade: guessing costs real
-/// throughput here rather than nothing, because a terminal's *worst* raw
-/// format can be slower than PNG (Rio's `f=24` is 2.9x slower than its
-/// `f=32`, measured — see the PR description).
+/// Used to pick a pixel format the terminal is known to be fast at (see
+/// `preferred_card_pixel_format`) and to decide whether an *opaque ambient
+/// wash* may be drawn at all (see [`HostTerminalKind::draws_ambient_wash`]).
+/// A terminal herdr cannot positively identify is `Other` and gets neither:
+/// guessing costs real throughput on the first question and the whole
+/// readable UI on the second, so both refuse rather than assume.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostTerminalKind {
     Kitty,
     Rio,
     #[default]
     Other,
+}
+
+impl HostTerminalKind {
+    /// Whether an *opaque, full-surface* ambient wash may be handed to this
+    /// terminal at all.
+    ///
+    /// Two separate Kitty-graphics features have to be real for one of these
+    /// to look like what it was designed as, and neither is implied by the
+    /// terminal answering the `a=q` capability probe that sets
+    /// `AppState::kitty_graphics_enabled`:
+    ///
+    /// 1. **The negative-`z` band.** herdr places the whole-terminal scene at
+    ///    `z=-2` and the sidebar wash at `z=-1` — "above the cell background,
+    ///    below text", which is the entire compositing model the background
+    ///    was specified as ("a TRUE background layer, text floats over it",
+    ///    `data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`,
+    ///    firstmate home). A terminal that accepts the placement but ignores
+    ///    the band draws the same opaque image at the *top* of the stack and
+    ///    every glyph on screen disappears behind it. There is no protocol
+    ///    query for this, so it cannot be probed.
+    /// 2. **Animation frames (`a=f`/`a=a`).** Both washes are pre-uploaded
+    ///    loops played back on the terminal's own clock. Without them the
+    ///    root frame is all that is ever shown: a still photograph where the
+    ///    design asked for a continuous scene.
+    ///
+    /// Measured rather than assumed (`data/herdr-terminal-alternatives`,
+    /// firstmate home): Rio answers `EINVAL:unsupported action` to both `a=f`
+    /// and `a=a`, Ghostty ignores them silently, and WezTerm's parser has no
+    /// `a=a` arm at all — so of the terminals that have been probed only
+    /// kitty has (2), and (1) has only ever been confirmed on kitty.
+    ///
+    /// This is deliberately one predicate rather than two. A caller cannot
+    /// usefully have one without the other: a wash that cannot move is not
+    /// worth its wire cost, and a wash that can move but lands on top of the
+    /// text is worse than nothing.
+    pub(crate) fn draws_ambient_wash(self) -> bool {
+        match self {
+            Self::Kitty => true,
+            Self::Rio | Self::Other => false,
+        }
+    }
 }
 
 pub(crate) fn host_terminal_kind_for_env(
@@ -3566,6 +3607,24 @@ mod local_transport_tests {
         assert!(!host_graphics_locality_for_env(false, true, false));
         assert!(!host_graphics_locality_for_env(false, false, true));
         assert!(!host_graphics_locality_for_env(true, true, true));
+    }
+
+    // ---- draws_ambient_wash ------------------------------------------
+
+    /// Kitty-graphics *capability* and "draws an opaque wash where I put it"
+    /// are two different facts, and only the second one may gate an ambient
+    /// wash. Rio answers the capability probe and still rejects `a=f`/`a=a`
+    /// outright (measured, `data/herdr-terminal-alternatives`), which is why
+    /// answering the probe cannot stand in for this.
+    #[test]
+    fn only_a_measured_host_is_handed_an_opaque_ambient_wash() {
+        assert!(HostTerminalKind::Kitty.draws_ambient_wash());
+        assert!(!HostTerminalKind::Rio.draws_ambient_wash());
+        assert!(
+            !HostTerminalKind::Other.draws_ambient_wash(),
+            "an unidentified terminal must be refused, not guessed at: getting this \
+             wrong puts an opaque image over every glyph on screen"
+        );
     }
 
     // ---- preferred_local_pixel_format --------------------------------

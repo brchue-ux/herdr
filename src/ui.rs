@@ -587,7 +587,7 @@ pub fn render_with_runtime_registry(
 /// scene regardless, so its own fg is left untouched here. See
 /// `crate::app::background_legibility` for the smoothed/hysteresis-gated decision this reads.
 fn apply_background_legibility(app: &AppState, frame: &mut Frame) {
-    if !app.kitty_graphics_enabled || !app.persistent_background_enabled {
+    if !app.background_scene_active() {
         return;
     }
     let Some(grid) = app.background_legibility.as_ref() else {
@@ -1772,6 +1772,9 @@ switch_workspace = "ctrl+1..9"
         let mut app = crate::app::state::AppState::test_new();
         app.kitty_graphics_enabled = true;
         app.persistent_background_enabled = true;
+        // The legibility pass only runs where a scene actually exists, and a
+        // scene only exists on a host that draws an opaque wash below text.
+        app.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
         app.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 8,
             height_px: 16,

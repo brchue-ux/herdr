@@ -1372,13 +1372,13 @@
           "key": "experimental.sidebar_particle_field",
           "type": "boolean",
           "default": "false",
-          "description": "Draw an ambient particle-field wash behind the sidebar tree. Generated once per sidebar size and played back by the terminal's own Kitty animation-frame clock (a=f/a=a) rather than re-uploaded every tick, so steady-state wire cost is near zero once armed. Kitty-only for now: a terminal that does not honour a=f/a=a still shows the root frame, just static. Only read while kitty_graphics is on."
+          "description": "Draw an ambient particle-field wash behind the sidebar tree. Generated once per sidebar size and played back by the terminal's own Kitty animation-frame clock (a=f/a=a) rather than re-uploaded every tick, so steady-state wire cost is near zero once armed. Drawn only on a host terminal Herdr has positively identified as kitty: the wash is an opaque image placed under the text, and a terminal with partial Kitty-graphics support draws that same image over the sidebar tree instead, so an unrecognised terminal is refused rather than risked. Only read while kitty_graphics is on."
         },
         {
           "key": "experimental.persistent_background",
           "type": "boolean",
           "default": "false",
-          "description": "Draw a persistent whole-terminal background scene: firstmate as the sun, second mates as planets, workers as moons, mirroring the same owner tree the sidebar draws. Whole-terminal, not sidebar-confined. Generated as a looping animation the same way sidebar_particle_field is, so steady-state cost is near zero once armed; a bug/failure impact or a win comet regenerates only the small overlay layer, and only while at least one is live. Kitty-only for now. Only read while kitty_graphics is on."
+          "description": "Draw a persistent whole-terminal background scene: firstmate as the sun, second mates as planets, workers as moons, mirroring the same owner tree the sidebar draws. Whole-terminal, not sidebar-confined. Generated as a looping animation the same way sidebar_particle_field is, so steady-state cost is near zero once armed; a bug/failure impact or a win comet regenerates only the small overlay layer, and only while at least one is live. Drawn only on a host terminal Herdr has positively identified as kitty: the scene is a full-surface opaque image placed under the text, and a terminal with partial Kitty-graphics support draws that same image over every glyph on screen instead, so an unrecognised terminal is refused rather than risked. Only read while kitty_graphics is on."
         },
         {
           "key": "experimental.kitty_graphics_local_transport",
