@@ -42,18 +42,33 @@ independent reason. The workflow installs `fonts-dejavu`.
 - **No panic** with all eleven flags on simultaneously — the single most valuable signal, since this
   combination had never been exercised.
 
-## What this rig cannot confirm
+## The pixel format is decided by the SERVER's environment, not the client's
 
-**The terminal-aware pixel format did not engage.** Every transmit came through as `f=100` (PNG),
-which #77 documents as the fallback for a terminal herdr does not positively identify — the RGB24 /
-RGBA32 fast path never activated, despite `TERM=xterm-kitty`. Identification evidently needs more
-than `TERM`, so a synthetic PTY gets the *transport* half of that change and not the *format* half.
-Confirming the format half needs a real terminal emulator, i.e. the Xvfb + kitty rig in
+An early run saw `f=100` (PNG) on every transmit and concluded the format half of #77 could not be
+observed without a real terminal emulator. That was wrong, and the mistake is worth keeping written
+down because it is easy to repeat: `host_terminal_kind()` reads *this process's* environment, and
+its own doc comment says "for the split server, this is the server process's environment, which
+only agrees with the terminal's own when server and client are co-located." `TERM` was being set on
+the client's PTY while the encoding happens in the server.
+
+`SERVER_TERM` now sets it on the right process, and the job runs the capture twice because one pass
+can only confirm one branch:
+
+| `SERVER_TERM` | `HostTerminalKind` | expected on the wire |
+|---|---|---|
+| `rio` | `Rio` | `f=32` — RGBA32 applies to translucent cards, so the upgrade must appear |
+| `kitty` | `Kitty` | `f=100` — RGB24 is refused for a card because it is never opaque |
+
+Both are asserted. A real-world consequence falls out of this: a server that did not inherit the
+terminal's environment — started from a unit file, a cron job, a detached shell — silently keeps
+PNG while still getting the `t=f` transport benefit.
+
+## What this rig still cannot confirm
+
+How the terminal *composites* what it is sent — glow bleed between cards, `z` ordering — is out of
+reach here: kitty composites in linear light while `Canvas::blend` works in sRGB, so software
+compositing of these bytes is not what the terminal would draw. That needs the Xvfb + kitty rig in
 `data/herdr-card-as-alpha-shape/blend-test/`.
-
-Likewise, anything about how the terminal *composites* what it is sent — glow bleed between cards,
-`z` ordering — is out of reach here: kitty composites in linear light while `Canvas::blend` works
-in sRGB, so software compositing of these bytes is not what the terminal would draw.
 
 ## Two harness bugs found by run 1, neither a Herdr bug
 
@@ -74,6 +89,20 @@ So the build stays release, and `run.sh` now asserts the capture is substantial 
 that the pixel path actually reached the wire (`MIN_APC`). A green tick on this job should mean
 something was drawn. The savings that are real and kept: the path filter, and warm Swatinem/Zig
 caches.
+
+## Deliberately not here yet: the binary swap
+
+What this checks is that a binary *draws*. It does not check that a **swap** works — stop herdr,
+put a different binary in place, start it again, and expect the fleet to still be there. That risk
+lives in the on-disk session snapshot written by the old version, not in the render, and it is the
+thing a person actually does.
+
+A `swap.sh` for it exists on `claude/live-swap-wip` and is deliberately held back: it has not yet
+completed a run. It builds a fleet on the base branch's binary, stops it, restarts on the musl
+binary this job builds, and compares workspace labels, pane ids and published metadata tokens
+across the boundary. It currently fails looking for `session.json` after a clean shutdown, and
+whether that is a wrong path or a snapshot that is never written is unresolved — so it is not in
+front of real changes until it can tell those apart.
 
 ## Reproducing locally
 
