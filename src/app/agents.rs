@@ -357,6 +357,40 @@ impl App {
         }
     }
 
+    /// Each pane's place in the ownership tree, keyed by pane so
+    /// [`Self::agent_info`] can tag a pane without re-deriving the tree.
+    ///
+    /// [`crate::api::schema::PaneInfo::owner`] already resolves a pane's own
+    /// `owner` token or structural fallback in isolation, but answering
+    /// `first_mate` / `second_mate` / `worker` needs the depth of the whole
+    /// walk — how many owners deep that chain runs once Spaces are woven in —
+    /// which only the tree arrangement knows. This reuses exactly that
+    /// arrangement, the same one the sidebar and the persistent background
+    /// scene already draw, rather than adding a second grouping rule for this
+    /// API surface. Only panes the tree draws a row for on their own appear
+    /// here; a mate's own driving pane is absent for the same reason it draws
+    /// no row in the sidebar.
+    fn agent_relations(
+        &self,
+    ) -> std::collections::HashMap<crate::layout::PaneId, crate::app::agent_tree::AgentRelation>
+    {
+        let entries = crate::ui::sidebar::sidebar_agent_entries(&self.state);
+        crate::ui::sidebar::workspace_list_entries_whole_fleet(&self.state)
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::ui::sidebar::WorkspaceListEntry::Agent {
+                    entry_idx, depth, ..
+                } => entries.get(entry_idx).map(|entry| {
+                    (
+                        entry.pane_id,
+                        crate::app::agent_tree::AgentRelation::from_depth(depth),
+                    )
+                }),
+                crate::ui::sidebar::WorkspaceListEntry::Workspace { .. } => None,
+            })
+            .collect()
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
@@ -369,6 +403,11 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let relation = self
+            .agent_relations()
+            .get(&pane_id)
+            .map(|relation| relation.as_str().to_string());
+        let owner = pane.owner.clone();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -381,6 +420,8 @@ impl App {
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,
+            relation,
+            owner,
             agent_session: pane.agent_session,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
@@ -489,5 +530,69 @@ mod tests {
         ] {
             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
         }
+    }
+
+    /// `agent.list` tags a worker pane with the same owner-tree projection
+    /// the sidebar and background scene already draw, rather than the flat,
+    /// hierarchy-blind list it used to return. Mirrors the fleet shape
+    /// `crate::ui::sidebar`'s own tests use: mates are Spaces, chained by a
+    /// Space-level `owner` token, and a worker is a pane inside its mate's
+    /// Space naming that Space as its owner.
+    #[test]
+    fn collect_agent_infos_tags_a_worker_with_its_owner_tree_depth() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut second_mate = crate::workspace::Workspace::test_new("second-mate");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("first-mate"),
+            second_mate,
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+
+        let now = std::time::Instant::now();
+        // The second mate's Space names the first mate's Space as its owner.
+        app.state.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("first-mate".to_string()),
+            )]),
+            None,
+            now,
+        );
+
+        let worker_terminal = app.state.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let worker = app.state.terminals.get_mut(&worker_terminal).unwrap();
+        worker.set_agent_name("worker".to_string());
+        // ...and the worker's pane names the second mate's Space as its owner.
+        worker.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("second-mate".to_string()),
+            )]),
+            None,
+            now,
+        );
+
+        let infos = app.collect_agent_infos();
+        assert_eq!(infos.len(), 1, "only the worker pane counts as an agent");
+        let worker_info = &infos[0];
+        assert_eq!(worker_info.name.as_deref(), Some("worker"));
+        // Two hops down from a root Space: first-mate (0) -> second-mate (1)
+        // -> worker (2), so the worker is tagged a worker, not a second mate.
+        assert_eq!(worker_info.relation.as_deref(), Some("worker"));
+        assert_eq!(worker_info.owner.as_deref(), Some("second-mate"));
     }
 }

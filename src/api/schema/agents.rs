@@ -222,6 +222,20 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,
+    /// Where this pane sits in the ownership tree: `first_mate`,
+    /// `second_mate`, or `worker`. The same tag-and-group projection the
+    /// sidebar and the persistent background scene already draw from the
+    /// `owner` metadata token — see `crate::app::agent_tree::AgentRelation`.
+    /// `None` for a pane the tree draws no row for on its own, such as a
+    /// mate's own driving pane, whose place is carried by its Space instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    /// Who owns this pane: the same value as
+    /// `crate::api::schema::PaneInfo::owner`, which `pane.get`/`pane.list`
+    /// already expose. Repeated here so a caller does not have to cross-
+    /// reference `pane.get` just to see the fact behind `relation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,

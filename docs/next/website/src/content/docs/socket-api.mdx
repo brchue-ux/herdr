@@ -893,6 +893,8 @@ If no native session reference is stored, the field is omitted.
 
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
+`agent.list` and `agent.get` also expose `relation` (`first_mate`, `second_mate`, or `worker`) and `owner` — the resolved place a pane's `owner` metadata token gives it in the fleet's ownership tree, the same tag-and-group projection the sidebar and the persistent background scene already draw. Both are omitted for a pane the tree draws no row for on its own, such as a mate's own driving pane, whose place is carried by its Space instead.
+
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 
 ```json

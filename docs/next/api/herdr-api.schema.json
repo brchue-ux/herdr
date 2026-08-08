@@ -6727,8 +6727,22 @@
                 "null"
               ]
             },
+            "owner": {
+              "description": "Who owns this pane: the same value as\n`crate::api::schema::PaneInfo::owner`, which `pane.get`/`pane.list`\nalready expose. Repeated here so a caller does not have to cross-\nreference `pane.get` just to see the fact behind `relation`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
+            },
+            "relation": {
+              "description": "Where this pane sits in the ownership tree: `first_mate`,\n`second_mate`, or `worker`. The same tag-and-group projection the\nsidebar and the persistent background scene already draw from the\n`owner` metadata token — see `crate::app::agent_tree::AgentRelation`.\n`None` for a pane the tree draws no row for on its own, such as a\nmate's own driving pane, whose place is carried by its Space instead.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
