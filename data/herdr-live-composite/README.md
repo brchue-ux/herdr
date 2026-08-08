@@ -55,9 +55,11 @@ across a minimum number of consecutive frame pairs. A live pane running a real
 process is captured as a control: if that is still too, the client is not
 receiving frames at all and the tray verdict means nothing.
 
-Floors are calibrated against a real run rather than guessed. Eight breathing
-badges move **74-75 px** per 0.6 s pair on 7 of 7 pairs; the floor is 25. The
-live pane moves 1,560-1,880 px; its floor is 400.
+Floors are calibrated against a real run rather than guessed. The tray moves
+**145-237 px** per 0.6 s pair on 7 of 7 pairs; the floor is 25 — the same floor
+also clears the 74-75 px the tray produced when it was still drawing as
+characters, so it holds across both. The live pane moves 1,547-1,909 px; its
+floor is 400.
 
 An all-idle signal tray is engraved marks that never move, so the rig builds a
 throwaway git repo one commit ahead of *and* behind its upstream, which lights
@@ -149,17 +151,15 @@ default session.
 
 ## What the first live runs found
 
-Three runs against a real kitty client at `2e2dd8fc`, and the rig earned its
-keep before it was even green.
+The rig earned its keep before it was green.
 
-**Every pixel surface was missing and every character surface was fine.** No
-sidebar cards (max luminance 42/255 over the row area, 0 changed pixels across
-all 7 frame pairs), no whole-terminal background (0.000 coverage against the
-reference pass) — while pane text, borders, tree connectors and the signal tray
-all rendered and the tray animated at 74 px/pair. A UI that looks plausible and
-is merely empty.
+**No pixel surface drew at all**, while every character surface was fine: no
+sidebar cards (max luminance 42/255 over the row area), no whole-terminal
+background (0.000 coverage against the reference pass) — but pane text, borders,
+tree connectors and the signal tray all rendered, and the tray animated. A UI
+that looks plausible and is merely empty.
 
-The cause is in the server's own log, once you keep it:
+The cause was in the server's own log, once the rig kept it as an artifact:
 
 ```
 WARN herdr::server::headless: dropping oversized graphics payload for client
@@ -168,34 +168,56 @@ frame client_id=2 graphics_bytes=52124609 max=33554432
 
 **52 MB per frame against a 32 MiB `MAX_GRAPHICS_FRAME_SIZE`, dropped ten times
 a second**, taking every pixel surface with it. 57 MB with the background scene
-on; the scene itself only adds ~4.8 MB, so the wash is the overrun. The cost of
-`sidebar_particle_field` is (sidebar area × RGBA × animation loop frames), and at
-a 42-column sidebar on a 1600×1000 terminal that is over the cap on its own.
+on — the scene itself adds only ~4.8 MB, so the overrun is the wash.
+`sidebar_particle_field` costs (sidebar area x RGBA x animation loop frames),
+and at a 42-column sidebar on a 1600x1000 terminal that is over the cap on its
+own.
+
+With the wash off — which is also the captain's own configuration (#96) — the
+whole pixel path works. Same commit, same runner, one flag:
+
+| | wash on | wash off |
+|---|---|---|
+| graphics payload | 52 MB, **dropped** | under the cap, delivered |
+| sidebar cards | nothing | drawn: labels, stage chips, glow, tree |
+| background coverage | **0.000** | **0.995** |
+| text contrast over the scene | n/a — nothing to be over | **19.11:1**, mask agreement 0.992 |
 
 Why nothing else caught it:
 
 - `just check` never renders to a terminal.
-- The byte-level check drives a **90×32** PTY. Scale the sidebar down that far
-  and the payload fits, so the drop never happens there.
-- On screen it is not an error, it is an absence. The user sees a sidebar with
-  no cards and is given no reason.
+- The byte-level check drives a **90x32** PTY. Scale the sidebar down that far
+  and the payload fits, so the drop cannot happen there. That is the boundary of
+  what a small synthetic PTY can see, not a fault in that check.
+- On screen it is not an error, it is an *absence*. Turn the flag on, get a
+  sidebar with no cards, and nothing tells you why.
 
-`run.sh` now **asserts** the drop never happens, so it fails loudly with the
-measured bytes instead of quietly measuring nothing. The rig runs with the wash
-off — which is also the captain's own configuration (#96) — and
-`PARTICLE_FIELD=true` re-runs against it.
+`run.sh` now **asserts** the drop never happens, with the measured bytes in the
+failure, so it can never again be a warning in a log nobody reads.
+`PARTICLE_FIELD=true` re-runs against the wash.
 
-One thing this ruled out along the way: #77's local transport is **not**
-implicated. Payload size was identical with `t=f` on and off (52,124,609 vs
-52,124,643 bytes), because the drop happens before the transport is chosen.
+Ruled out along the way: **#77's local transport is not implicated.** Payload
+size was identical with `t=f` on and off (52,124,609 against 52,124,643 bytes),
+because the drop happens before a transport is chosen. It stays on, and with the
+payload no longer dropped whole this is the first check to exercise `t=f` end to
+end — the byte-level check can only ever confirm the path reaches the wire.
 
 ## Known next tightening
 
-Whole-frame motion is measured and printed but not asserted. In the
-`BACKGROUND=on` pass it includes the scene's own orbiting bodies, which is the
-#96 symptom-3 class (`a=f` refused ⇒ root frame only ⇒ frozen planets). It needs
-one real run's numbers before a floor can be set that is neither vacuous nor
-flaky — the same seed-then-enforce discipline `digest.py` uses next door.
+Two things are measured and printed but not asserted, pending a run's worth of
+numbers — the same seed-then-enforce discipline `digest.py` uses next door.
+
+**Whole-frame motion.** In the `BACKGROUND=on` pass it includes the scene's own
+orbiting bodies, which is the #96 symptom-3 class (`a=f` refused => root frame
+only => frozen planets).
+
+**The sidebar row area.** With the payload delivered, cards draw in full — and
+then hold still: 0 changed pixels across all 7 pairs in the reference pass, where
+#96 measured card pulse at 18,000-39,000 px per 210 ms pair in a comparable
+sidebar. The tray on the same client moves 145-237 px per pair. That gap is worth
+someone's attention; it is a printed number here rather than a red build, because
+a check that goes red for a reason nobody has diagnosed is one people learn to
+re-run past.
 
 ## Prior art
 
