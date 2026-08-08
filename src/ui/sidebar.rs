@@ -582,6 +582,38 @@ fn entry_card_row(
     }
 }
 
+/// What one drawn row's colour channels are saying: its lifecycle stage, and
+/// the open defect on it if there is one.
+///
+/// The renderer's door to [`crate::app::lifecycle::row_signal`], reading a row's
+/// tokens and detected state from wherever this particular entry keeps them —
+/// a Space from its own workspace, an agent row from the panel entry the tree
+/// was built with. The app loop reaches the same function from the other side
+/// when it decides which rows mount a marker at all.
+fn entry_row_signal(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entry: &WorkspaceListEntry,
+) -> Option<crate::app::lifecycle::RowSignal> {
+    match entry {
+        WorkspaceListEntry::Workspace { ws_idx, .. } => {
+            let workspace = app.workspaces.get(*ws_idx)?;
+            let (state, _seen) = workspace.aggregate_state(&app.terminals);
+            Some(crate::app::lifecycle::row_signal(
+                &workspace.metadata_tokens.values(),
+                state,
+            ))
+        }
+        WorkspaceListEntry::Agent { entry_idx, .. } => {
+            let entry = agents.get(*entry_idx)?;
+            Some(crate::app::lifecycle::row_signal(
+                &entry.tokens,
+                entry.state,
+            ))
+        }
+    }
+}
+
 /// Every trunk segment on screen right now: one per row with a gap still open
 /// beneath it, at each ancestor column that gap belongs to.
 ///
@@ -2384,6 +2416,7 @@ fn flexible_token_width(token: &ResolvedToken) -> usize {
         | ResolvedTokenKind::Branch(text)
         | ResolvedTokenKind::QuotaSession(text)
         | ResolvedTokenKind::QuotaWeekly(text)
+        | ResolvedTokenKind::Streak { text, .. }
         | ResolvedTokenKind::Custom(text) => display_width(text),
         _ => 0,
     }
@@ -2505,6 +2538,28 @@ fn shell_row_height(content_lines: usize, shell: RowShell) -> u16 {
         .max(1)
         .saturating_add(usize::from(shell.chrome_rows()))
         .min(u16::MAX as usize) as u16
+}
+
+/// The colour one flame band draws in.
+///
+/// Five distinct palette entries rather than one colour at five brightnesses,
+/// for the same reason the band word is in the text: this readout is drawn as a
+/// token span, which resolves against a palette and not against the colour
+/// underneath it, so a brightness ramp here would be measured against a ground
+/// it cannot see. The run is a temperature — a cold blue below zero, an ember
+/// that is barely there, then yellow, orange and red as the streak climbs — and
+/// red at the top is the reward this readout exists to give rather than the
+/// alarm the same colour means elsewhere in the panel, which is why the word
+/// `hot` is beside it.
+fn streak_band_color(band: crate::quality_streak::FlameBand, p: &Palette) -> ratatui::style::Color {
+    use crate::quality_streak::FlameBand;
+    match band {
+        FlameBand::Cold => p.blue,
+        FlameBand::Ember => p.subtext0,
+        FlameBand::Low => p.yellow,
+        FlameBand::Steady => p.peach,
+        FlameBand::Hot => p.red,
+    }
 }
 
 fn resolved_token_spans(
@@ -2790,6 +2845,22 @@ fn resolved_token_spans(
                     &mut spans,
                     truncate_end(text, budgets[index]),
                     Style::default().fg(p.mauve),
+                    token.style,
+                    anim,
+                );
+            }
+            // The flame heats up through the palette's own warm run rather
+            // than through the `anim::cell` intensity ramp the defect marker
+            // uses: a token span is resolved with a palette and no knowledge
+            // of the colour under it, and an intensity channel measured
+            // against the wrong ground is worse than a plain colour. The band
+            // *word* is in the text either way, which is what keeps the
+            // readout legible on a monochrome theme and in a text pane read.
+            ResolvedTokenKind::Streak { band, text } => {
+                push_token_span(
+                    &mut spans,
+                    truncate_end(text, budgets[index]),
+                    Style::default().fg(streak_band_color(*band, p)),
                     token.style,
                     anim,
                 );
@@ -3792,9 +3863,18 @@ fn trunk_rail_cell(trunk: Option<&TrunkRailPaint<'_>>, level: u8, base: Style) -
     (paint.glyph_over(SETTLED), paint.text_style(base, trunk.ink))
 }
 
-/// The failure spider: a persistent, red, pulsing marker that climbs a
-/// failing card's own trunk/branch to rest at its top-centre border, and
-/// stays there until the card clears.
+/// The failure spider: a persistent, pulsing marker that climbs a card with an
+/// open defect on it, up that card's own trunk/branch to rest at its
+/// top-centre border, and stays there until the defect clears.
+///
+/// Two channels meet on it and neither may move the other's number. Its **hue**
+/// is the row's [`crate::anim::cell::LifecycleStage`], so a marker rides a card
+/// that is still running without repainting that card's stage; its
+/// **intensity** is the severity the fleet published for the open defect
+/// (`sev`, at 25/50/75/100%), held constant as the stage's hue changes
+/// underneath it. Nothing at all is drawn when the fleet says `sev=-`: that is
+/// the fleet stating the defect is closed, which is a thing only it can know.
+/// See [`crate::quality_streak`].
 ///
 /// Deliberately not a `glyph_over` substitution — nothing settled already
 /// stands at the cell it rests on that has to keep meaning what it means —
@@ -3830,6 +3910,15 @@ fn render_failure_spiders(
         let Some(row) = entry_card_row(app, agents, entry) else {
             continue;
         };
+        // The same `row_signal` the app loop mounted this element from, so the
+        // hue drawn and the marker's very existence come from one reading
+        // rather than two that can disagree — see `App::failing_card_rows`.
+        let Some(signal) = entry_row_signal(app, agents, entry) else {
+            continue;
+        };
+        let Some(defect) = signal.defect else {
+            continue;
+        };
         let id = crate::anim::ElementId::failure_spider(row);
         let Some(elem_frame) = app.anim.frame(
             &id,
@@ -3854,23 +3943,29 @@ fn render_failure_spiders(
             continue;
         }
 
-        // `Severity::Serious`, not `Critical`: severity's light-reach ramp
-        // pushes an ink *toward the light bound* as it escalates (worse
-        // trouble reads as a brighter, more forward light, the same
-        // direction a card's own alert breath moves), so `Critical` on a dark
-        // panel washed the spider to a pale rose rather than reading as red —
-        // caught on the live render this PR's description captures, not by a
-        // unit test. `Serious` stays close enough to the panel to read as a
-        // real red.
+        // The two channels, and neither may reach into the other. The hue is
+        // the row's own lifecycle stage, so a marker on a card that is still
+        // running is drawn in the running hue rather than recolouring the
+        // card's stage to red behind its back. The intensity is the fleet's
+        // published defect severity, at 25/50/75/100% of the marker's full
+        // loudness — held across every stage, so moving from `Running` to
+        // `Failed` never reads as the defect having got worse.
+        //
+        // "Full" is `Severity::Serious`'s reach and not `Critical`'s, and that
+        // ceiling is measured rather than chosen: the ramp pushes an ink
+        // toward the light bound as it escalates, and at `Critical` a dark
+        // panel washed the spider to a pale rose instead of a real red —
+        // caught on a live render, not by a unit test. See
+        // `anim::cell::MARKER_FULL_REACH`.
         let ink = crate::anim::cell::InkPalette::resolve(
             Style::default(),
             backdrop_rgb(app),
             &app.palette,
             &app.host_terminal_theme,
         )
-        .with_signal(
-            crate::anim::cell::LifecycleStage::Failed.hue(&app.palette, &app.host_terminal_theme),
-            crate::anim::cell::Severity::Serious,
+        .with_marker(
+            signal.stage.hue(&app.palette, &app.host_terminal_theme),
+            defect.intensity(),
         );
         let paint = elem_frame.cell(
             crate::anim::cell::CellPos::new(0, 0),

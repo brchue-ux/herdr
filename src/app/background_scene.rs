@@ -35,12 +35,10 @@
 //!   `checks_pending` counts — already-live GitHub PR-check polling, independent of any
 //!   fleet-side publisher — firing on the edge where both counts return to zero after having been
 //!   positive.
-//! - **Quality-streak-milestone comet showers** read the documented (not-yet-published)
-//!   `streak`/`sev` workspace tokens `herdr-streak-meter` will publish
-//!   (`data/herdr-severity-and-weighting/report.md` section D, firstmate home). No fleet
-//!   publisher exists yet for this trigger; this module parses the token contract exactly as
-//!   specified so it lights up unmodified once that (separately tracked, currently captain-held)
-//!   task ships.
+//! - **Quality-streak-milestone comet showers** read the `streak`/`streak_hl` workspace tokens
+//!   the fleet's `fm-quality-event.sh` publishes, through [`crate::quality_streak`] — which owns
+//!   the token contract, the read-time decay and the band table for every surface that draws
+//!   them, so a shower fires on the same band the sidebar's own flame readout is showing.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -111,7 +109,7 @@ pub(crate) struct BackgroundEffectsState {
     asteroids: HashMap<PaneId, AsteroidLifecycle>,
     comets: Vec<ActiveComet>,
     seen_outcome: HashMap<String, String>,
-    seen_streak_band: HashMap<String, FlameBand>,
+    seen_streak_band: HashMap<String, crate::quality_streak::FlameBand>,
     seen_checks_clear: HashMap<String, bool>,
 }
 
@@ -133,41 +131,6 @@ impl BackgroundEffectsState {
         // which is exactly the double-fire this state exists to prevent.
         had_any
     }
-}
-
-/// The flame band a decayed streak score reads as, per
-/// `data/herdr-severity-and-weighting/report.md` section D's table (firstmate home). Only the
-/// ordering matters here — a milestone is *crossing into* a higher band, not the band itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum FlameBand {
-    Cold,
-    Ember,
-    Low,
-    Steady,
-    Hot,
-}
-
-impl FlameBand {
-    fn from_score(score: f64) -> Self {
-        if score < 0.0 {
-            Self::Cold
-        } else if score < 8.0 {
-            Self::Ember
-        } else if score < 20.0 {
-            Self::Low
-        } else if score < 38.0 {
-            Self::Steady
-        } else {
-            Self::Hot
-        }
-    }
-}
-
-/// Parse `streak=<score>@<unix_ts>` into just the score. The timestamp is not read: this module
-/// only cares about the band the score currently reads as, not when it was published.
-fn parse_streak_score(value: &str) -> Option<f64> {
-    let (score, _ts) = value.split_once('@').unwrap_or((value, ""));
-    score.trim().parse().ok()
 }
 
 /// Every node of the whole-fleet owner tree, in the exact shape `src/solar_system.rs` wants, plus
@@ -338,9 +301,25 @@ pub(crate) fn spawn_new_effects(
             state.seen_checks_clear.insert(ws_id.clone(), !all_clear);
         }
 
-        if let Some(streak) = workspace.metadata_tokens.get("streak") {
-            if let Some(score) = parse_streak_score(streak) {
-                let band = FlameBand::from_score(score);
+        // The band is read from the *decayed* score, through the one module that owns that
+        // arithmetic (`crate::quality_streak`) rather than a second copy of the table here: a
+        // milestone is a streak the fleet has right now, and a score read undecayed would fire a
+        // shower for heat that had already faded — including on the frame after a cold start,
+        // where nothing has ticked for however long Herdr was stopped.
+        if let Some(streak) = workspace
+            .metadata_tokens
+            .get(crate::quality_streak::STREAK_TOKEN)
+        {
+            if let Some(readout) = crate::quality_streak::parse(streak) {
+                let band = crate::quality_streak::FlameBand::of(crate::quality_streak::decayed(
+                    readout,
+                    crate::quality_streak::half_lives(
+                        workspace
+                            .metadata_tokens
+                            .get(crate::quality_streak::HALF_LIFE_TOKEN),
+                    ),
+                    app.wall_now,
+                ));
                 let previous = state.seen_streak_band.get(ws_id).copied();
                 if previous.is_some_and(|prev| band > prev) {
                     // A milestone is an accumulated streak, not one landed thing, so it reads as
@@ -523,18 +502,17 @@ fn push_crater(
 mod tests {
     use super::*;
 
+    /// The milestone rule this module holds is *crossing into a higher band*,
+    /// so all it needs from the shared vocabulary is that the bands order by
+    /// heat. The bands themselves, and the decay that places a score in one,
+    /// are `crate::quality_streak`'s to test.
     #[test]
     fn flame_band_orders_by_score() {
-        assert!(FlameBand::from_score(-5.0) < FlameBand::from_score(2.0));
-        assert!(FlameBand::from_score(2.0) < FlameBand::from_score(15.0));
-        assert!(FlameBand::from_score(15.0) < FlameBand::from_score(25.0));
-        assert!(FlameBand::from_score(25.0) < FlameBand::from_score(50.0));
-    }
-
-    #[test]
-    fn streak_token_parses_score_ahead_of_its_timestamp() {
-        assert_eq!(parse_streak_score("23.75@1733600000"), Some(23.75));
-        assert_eq!(parse_streak_score("not-a-number@123"), None);
+        use crate::quality_streak::FlameBand;
+        assert!(FlameBand::of(-5.0) < FlameBand::of(2.0));
+        assert!(FlameBand::of(2.0) < FlameBand::of(15.0));
+        assert!(FlameBand::of(15.0) < FlameBand::of(25.0));
+        assert!(FlameBand::of(25.0) < FlameBand::of(50.0));
     }
 
     #[test]

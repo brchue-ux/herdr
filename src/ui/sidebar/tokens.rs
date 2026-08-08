@@ -39,6 +39,16 @@ pub(super) enum ResolvedTokenKind {
     /// with the same styling by accident — see the readability requirement
     /// this pair exists to satisfy.
     QuotaWeekly(String),
+    /// This Space's quality streak, already decayed to now and banded:
+    /// `streak 23.8 steady`. See [`crate::quality_streak`].
+    ///
+    /// The band travels beside the text rather than being re-derived from it,
+    /// because it is what picks the colour the flame draws in and a renderer
+    /// re-parsing a word out of a formatted line is a second source of truth.
+    Streak {
+        band: crate::quality_streak::FlameBand,
+        text: String,
+    },
     Custom(String),
 }
 
@@ -204,6 +214,33 @@ pub(super) fn space_rows(
                                     &readout,
                                     context.wall_now,
                                 ))
+                            }),
+                        // Decayed here, on this render, from the instant the
+                        // publisher stamped into the token — never from a
+                        // counter Herdr keeps, which would have stood still
+                        // while Herdr was stopped and redrawn a stale score
+                        // at full heat. See [`crate::quality_streak`].
+                        SpaceSidebarToken::Streak => context
+                            .tokens
+                            .get(crate::quality_streak::STREAK_TOKEN)
+                            .and_then(|raw| crate::quality_streak::parse(raw))
+                            .map(|readout| {
+                                let half_lives = crate::quality_streak::half_lives(
+                                    context
+                                        .tokens
+                                        .get(crate::quality_streak::HALF_LIFE_TOKEN)
+                                        .map(String::as_str),
+                                );
+                                let value = crate::quality_streak::decayed(
+                                    readout,
+                                    half_lives,
+                                    context.wall_now,
+                                );
+                                let band = crate::quality_streak::FlameBand::of(value);
+                                ResolvedTokenKind::Streak {
+                                    band,
+                                    text: crate::quality_streak::format_readout(value, band),
+                                }
                             }),
                         SpaceSidebarToken::TerminalTitle => context
                             .terminal_title
@@ -899,6 +936,123 @@ mod tests {
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
             ))]]
+        );
+    }
+
+    /// 2026-08-08T00:00:00Z, cross-checked against
+    /// `date -u -d 2026-08-08T00:00:00Z +%s`.
+    const WALL_NOW_SECS: u64 = 1_786_147_200;
+
+    fn streak_rows(tokens: &std::collections::HashMap<String, String>) -> Vec<Vec<ResolvedToken>> {
+        let config = SpacesSidebarConfig {
+            rows: vec![vec![SpaceSidebarToken::Streak]],
+            ..Default::default()
+        };
+        space_rows(
+            &config,
+            SpaceTokenContext {
+                workspace: "repo",
+                branch: None,
+                state_text: "idle",
+                state_age: None,
+                ahead_behind: None,
+                dirty: None,
+                pull_requests: None,
+                terminal_title: None,
+                terminal_title_stripped: None,
+                tokens,
+                suppress_git_details: false,
+                wall_now: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(WALL_NOW_SECS),
+            },
+        )
+    }
+
+    fn streak_tokens(
+        published_days_ago: f64,
+        score: f64,
+    ) -> std::collections::HashMap<String, String> {
+        let published_at = WALL_NOW_SECS - (published_days_ago * 86_400.0) as u64;
+        std::collections::HashMap::from([
+            ("streak".into(), format!("{score:.2}@{published_at}")),
+            ("streak_hl".into(), "5/10".into()),
+        ])
+    }
+
+    /// The whole point of the token carrying its own instant: a score
+    /// published two days ago has to arrive two days colder on the first frame
+    /// after a cold start, with nothing having ticked in between.
+    #[test]
+    fn a_streak_is_decayed_at_read_time_so_a_cold_start_never_redraws_it_hot() {
+        assert_eq!(
+            streak_rows(&streak_tokens(0.0, 45.0)),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Streak {
+                band: crate::quality_streak::FlameBand::Hot,
+                text: "streak 45.0 hot".into(),
+            })]],
+            "read at the instant it was published, a score is itself"
+        );
+        assert_eq!(
+            streak_rows(&streak_tokens(2.0, 45.0)),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Streak {
+                band: crate::quality_streak::FlameBand::Steady,
+                text: "streak 34.1 steady".into(),
+            })]],
+            "two days of a five-day half-life took the same token out of `hot`"
+        );
+        assert_eq!(
+            streak_rows(&streak_tokens(20.0, 45.0)),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Streak {
+                band: crate::quality_streak::FlameBand::Ember,
+                text: "streak 2.8 ember".into(),
+            })]],
+            "and a fortnight of silence is an ember, not a fire"
+        );
+    }
+
+    /// Every band a row can be in, reached through the real token path.
+    #[test]
+    fn every_flame_band_is_reachable_from_a_published_token() {
+        let banded = |score: f64| match &streak_rows(&streak_tokens(0.0, score))[0][0].kind {
+            ResolvedTokenKind::Streak { band, text } => (*band, text.clone()),
+            other => panic!("expected a streak token, got {other:?}"),
+        };
+        use crate::quality_streak::FlameBand;
+        assert_eq!(banded(-4.0), (FlameBand::Cold, "streak -4.0 cold".into()));
+        assert_eq!(banded(4.0), (FlameBand::Ember, "streak 4.0 ember".into()));
+        assert_eq!(banded(12.0), (FlameBand::Low, "streak 12.0 low".into()));
+        assert_eq!(
+            banded(24.0),
+            (FlameBand::Steady, "streak 24.0 steady".into())
+        );
+        assert_eq!(banded(41.0), (FlameBand::Hot, "streak 41.0 hot".into()));
+    }
+
+    /// A Space nobody publishes a streak for draws no streak, and a malformed
+    /// one draws nothing rather than an undecayed number.
+    #[test]
+    fn a_row_with_no_usable_streak_token_draws_no_streak() {
+        assert!(streak_rows(&std::collections::HashMap::new()).is_empty());
+        assert!(streak_rows(&std::collections::HashMap::from([(
+            "streak".into(),
+            "23.75".into()
+        )]))
+        .is_empty());
+    }
+
+    /// The half-lives are a knob, not the fact: a publisher that omits them
+    /// still gets a correctly decayed readout.
+    #[test]
+    fn a_missing_half_life_token_falls_back_rather_than_blanking_the_readout() {
+        let mut tokens = streak_tokens(5.0, 40.0);
+        tokens.remove("streak_hl");
+        assert_eq!(
+            streak_rows(&tokens),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Streak {
+                band: crate::quality_streak::FlameBand::Steady,
+                text: "streak 20.0 steady".into(),
+            })]],
+            "five days with no published half-life is one default win half-life"
         );
     }
 

@@ -345,6 +345,7 @@ Space rows accept these built-in tokens:
 - `pull_requests` — open pull requests on the repository this checkout pushes to, as `pr3`.
 - `quota_session` — the published 5-hour quota window: `session 42%, resets in 2h`.
 - `quota_weekly` — the published 7-day quota window: `week 15%, resets in 2d`.
+- `streak` — the published quality streak, decayed to now: `streak 23.8 steady`.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
 - `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
@@ -384,6 +385,37 @@ two separate tokens rather than one, so a layout can put each on its own row:
 that, plus the different label word each one draws (`session` vs. `week`),
 is what keeps the 5-hour and 7-day windows reading as two different facts
 rather than two similar percentages side by side.
+
+Herdr scores nothing itself either. `streak` reads the `streak` workspace
+metadata token a fleet publisher writes, `<score>@<unix seconds>` — the score
+**and** the instant it was true. Herdr decays it on every render,
+`score × 2^(−days elapsed / half-life)`, and shows the result with the band it
+falls in: below zero `cold`, then `ember` (0–8), `low` (8–20), `steady` (20–38)
+and `hot` (38 and up), each in its own colour. The band word is drawn beside the
+number so the readout survives a monochrome theme and a plain-text pane read.
+
+Because the instant travels in the token, the decay is a pure function of it:
+nothing ticks in Herdr, nothing goes stale while Herdr is stopped, and a
+publisher only has to write the token when something actually happens. A Herdr
+started two days after the last event draws that streak two days colder on its
+first frame rather than at the heat it was published at.
+
+The half-lives come from the optional `streak_hl` token, `<win days>/<loss days>`
+(for example `5/10`), so a fleet can retune the decay without a Herdr release.
+Which of the two applies is decided by the sign of the published score: wins fade
+on the first, losses on the second. With no usable `streak_hl` the readout falls
+back to `5/10` rather than disappearing. A missing or malformed `streak` draws
+nothing at all — a score with no instant cannot be decayed, and drawing it
+undecayed would be exactly the falsely-hot reading the timestamp exists to
+prevent.
+
+A third token, `sev`, is not a row token: it carries the severity of the open
+defect a fleet owns on that Space (`S1`–`S4`, or `-` for none) and drives the
+marker that climbs a card in trouble — the marker's intensity steps through
+25/50/75/100% with the severity while its colour keeps saying which lifecycle
+stage the work is at, so a stage change never reads as the defect getting worse.
+Publishing `sev=-` says the defect is closed and takes the marker off the card
+entirely.
 
 `state_age` reports elapsed time and nothing else. It is not a stall warning:
 nothing about it changes colour or shape as the number grows, because Herdr has
