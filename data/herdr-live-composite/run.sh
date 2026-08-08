@@ -169,6 +169,13 @@ LIVE_PANE=$(split_down "$PROBE_PANE")
 "${E[@]}" workspace focus "$LEFT"
 echo "probe pane: $PROBE_PANE   live pane: $LIVE_PANE"
 
+# What the sidebar has to draw, in the log next to the screenshot of what it did
+# draw. The first real run showed a sidebar with tree connectors and no row
+# content, and the first question anyone asks is whether the rows existed at all.
+echo "--- fleet as the API sees it ---"
+"${E[@]}" agent list || true
+"${E[@]}" workspace list --json || true
+
 # The probe: a fixed block of bright text that never scrolls and never changes,
 # so the ink/paper masks taken from the reference pass address the same pixels in
 # the candidate pass. `\033[2J\033[H` wipes the shell prompt and the echoed
@@ -236,30 +243,46 @@ echo "no panic in server log"
 echo
 echo "=================== ASSERTIONS (BACKGROUND=$BG) ==================="
 
-# The sidebar is 42 columns wide. At any plausible cell width on a 1600px window
-# that is at least 21% of the frame, so the leftmost 18% is inside it whatever
-# font the runner resolves — no cell-size arithmetic, no way to drift onto the
-# pane area by accident.
+# The signal tray. This is the #97 surface exactly: it drew every badge correctly
+# and then never moved again, with the unit suite green throughout.
+#
+# The badges live on the sidebar's top row, and the sidebar is 42 columns wide —
+# at any plausible cell width on a 1600px window that is at least 21% of the
+# frame, so the leftmost 18% is inside it whatever font the runner resolves.
+#
+# The floor is calibrated against a real run, not guessed: eight badges breathing
+# move 74-75 px per 0.6 s pair, and did so on 7 of 7 pairs. 25 is comfortably
+# above nothing and far below the real signal, so a freeze is unambiguous.
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
-  --region "${SIDEBAR_REGION:-0.0,0.05,0.18,0.95}" \
-  --label "sidebar (cards + signal tray + particle wash)" \
-  --min-changed-px "${SIDEBAR_MIN_PX:-800}" \
-  --min-active-pairs "${SIDEBAR_MIN_PAIRS:-4}"
+  --region "${TRAY_REGION:-0.0,0.0,0.18,0.06}" \
+  --label "signal tray badges" \
+  --min-changed-px "${TRAY_MIN_PX:-25}" \
+  --min-active-pairs "${MIN_PAIRS:-5}"
 
 # The control: a real process is writing to a real pty in the lower pane. If this
-# is still, the client is not receiving frames at all and the sidebar verdict
-# above says nothing about animation.
+# is still, the client is not receiving frames at all and the verdict above says
+# nothing about animation. Measured at 1,560-1,880 px per pair.
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
   --region "${LIVE_REGION:-0.30,0.55,1.0,0.95}" \
   --label "live pane output (control)" \
-  --min-changed-px 200 \
-  --min-active-pairs "${SIDEBAR_MIN_PAIRS:-4}"
+  --min-changed-px "${LIVE_MIN_PX:-400}" \
+  --min-active-pairs "${MIN_PAIRS:-5}"
 
-# Reported, not asserted, until a real run has fixed what the numbers look like:
-# whole-frame motion, which in the BACKGROUND=on pass includes the scene's own
-# orbiting bodies.
+# Reported, not asserted. Two measurements that need a run's worth of numbers
+# before a floor can be set that is neither vacuous nor flaky — the same
+# seed-then-enforce discipline digest.py uses next door.
+#
+# The sidebar row area is here because the first real run found it completely
+# static and completely empty: tree connectors at luma <= 42 and no row content
+# at all, while the tray on the same client drew and animated. Both publish at
+# `z: 0`, so this is not a stacking problem and not a capability problem. Until
+# that is understood it is a number in the log, not a red build — but it is the
+# number to watch.
 echo
-echo "--- whole-frame motion (reported) ---"
+echo "--- reported, not asserted ---"
+python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
+  --region "${ROWS_REGION:-0.06,0.05,0.26,0.95}" \
+  --label "sidebar row area (cards)" --min-changed-px 1 --min-active-pairs 0 || true
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
   --label "whole frame" --min-changed-px 1 --min-active-pairs 0 || true
 

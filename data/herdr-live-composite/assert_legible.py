@@ -75,6 +75,15 @@ def main() -> int:
         "'coverage' that has nothing to do with the feature under test",
     )
     ap.add_argument(
+        "--coverage-level",
+        type=int,
+        default=16,
+        help="per-channel difference floor for the coverage guard. Lower than "
+        "the motion floor on purpose: a scene whose outer region is near-black "
+        "over a near-black theme backdrop still differs, just not by much, and "
+        "the guard only has to establish that something is there",
+    )
+    ap.add_argument(
         "--min-bg-coverage",
         type=float,
         default=0.15,
@@ -132,7 +141,9 @@ def main() -> int:
 
     # 1. Did the background actually draw?
     cov_region = lib.frac_box(ref.size, args.coverage_region)
-    changed = lib.clear_box(lib.changed_mask(ref, cand, level=16), box)
+    changed = lib.clear_box(
+        lib.changed_mask(ref, cand, level=args.coverage_level), box
+    )
     outside = changed.crop(cov_region)
     x0, y0, x1, y1 = box
     cx0, cy0, cx1, cy1 = cov_region

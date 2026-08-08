@@ -179,21 +179,36 @@ PY
 )
 echo "wire formats/transports: $FORMATS"
 
-case "$FORMATS" in
-  *"t:f"*) echo "local transport (t=f) confirmed on the wire" ;;
-  *) echo "EXPECTED t=f LOCAL TRANSPORT, got: $FORMATS" >&2; exit 1 ;;
-esac
+# Set membership, not substring. Both sets are sorted comma-joined lists, and
+# `*"t:f"*` only ever matched when `t=f` was the *sole* transport — which stopped
+# being true the moment the capture started working, because the capability
+# probe the client emits at startup is itself `t=d,f=24`. A real stream carries
+# `t:d,f`, and the substring test read that as "no local transport at all".
+FMT_SET=${FORMATS#f:}
+FMT_SET=${FMT_SET%% t:*}
+TRANSPORT_SET=${FORMATS##* t:}
+
+has_member() { # <needle> <comma-joined set>
+  case ",$2," in *",$1,"*) return 0 ;; esac
+  return 1
+}
+
+if has_member f "$TRANSPORT_SET"; then
+  echo "local transport (t=f) confirmed on the wire (transports: $TRANSPORT_SET)"
+else
+  echo "EXPECTED t=f LOCAL TRANSPORT, got transports: $TRANSPORT_SET" >&2
+  exit 1
+fi
 
 if [ "$SERVER_TERM" = "rio" ]; then
-  case "$FORMATS" in
-    *"f:"*32*) echo "terminal-aware format confirmed: Rio got RGBA32" ;;
-    *)
-      echo "FORMAT PICKING DID NOT ENGAGE: server believed it was Rio but no f=32" >&2
-      echo "reached the wire (got: $FORMATS). Either host_terminal_kind() did not" >&2
-      echo "see TERM_PROGRAM, or local transport/locality gating refused." >&2
-      exit 1
-      ;;
-  esac
+  if has_member 32 "$FMT_SET"; then
+    echo "terminal-aware format confirmed: Rio got RGBA32 (formats: $FMT_SET)"
+  else
+    echo "FORMAT PICKING DID NOT ENGAGE: server believed it was Rio but no f=32" >&2
+    echo "reached the wire (formats: $FMT_SET). Either host_terminal_kind() did not" >&2
+    echo "see TERM_PROGRAM, or local transport/locality gating refused." >&2
+    exit 1
+  fi
 fi
 
 # Golden comparison. The assertions above check that the right mechanisms fired;

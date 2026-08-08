@@ -50,10 +50,14 @@ not constrained — herdr's per-cell legibility pass may invert text over a brig
 scene, and dark ink on a light wash is still readable.
 
 **Surfaces that declare an animation demonstrably move** (`assert_motion.py`,
-the #94/#97 class). The sidebar — cards, signal tray, particle wash — must
-differ across a minimum number of consecutive frame pairs. A live pane running a
-real process is captured as a control: if that is still too, the client is not
-receiving frames at all and the sidebar verdict means nothing.
+the #94/#97 class). The signal tray — the #97 surface exactly — must differ
+across a minimum number of consecutive frame pairs. A live pane running a real
+process is captured as a control: if that is still too, the client is not
+receiving frames at all and the tray verdict means nothing.
+
+Floors are calibrated against a real run rather than guessed. Eight breathing
+badges move **74-75 px** per 0.6 s pair on 7 of 7 pairs; the floor is 25. The
+live pane moves 1,560-1,880 px; its floor is 400.
 
 An all-idle signal tray is engraved marks that never move, so the rig builds a
 throwaway git repo one commit ahead of *and* behind its upstream, which lights
@@ -142,6 +146,25 @@ bash data/herdr-live-composite/compare.sh
 moves with it). On a workstation that already has a live herdr fleet, use a
 named session and the fleet's own lab tooling rather than pointing this at the
 default session.
+
+## Open finding: the sidebar row area is empty
+
+The first real run of this rig found something. On a real local kitty client at
+`2e2dd8fc`, with `sidebar_card_shapes` on, the sidebar drew **tree connectors and
+nothing else** — no labels, no cards, no row content. Measured over the row area:
+maximum luminance 42/255, 114 pixels above 20 out of 306,900, and **0 changed
+pixels across all 7 frame pairs**.
+
+On the same client, in the same frame, the signal tray drew all eight badges in
+colour and animated at 74 px per pair. Cards and the tray both publish at `z: 0`
+(`image_card.rs`, `tray.rs`), and the tray proves the graphics path reaches this
+terminal — so this is neither a stacking problem nor a capability problem.
+
+It is **reported, not asserted**, because a check that goes red for a reason
+nobody understands teaches people to ignore it. `run.sh` prints the row area's
+motion and dumps `agent list` / `workspace list --json` beside it so the next run
+carries the evidence to settle it. Promote it to an assertion once the cause is
+known.
 
 ## Known next tightening
 

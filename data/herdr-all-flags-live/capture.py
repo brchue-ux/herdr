@@ -49,6 +49,9 @@ import time
 # not silently stop the reply and take the pixel path down with it.
 CAPABILITY_PROBE = re.compile(rb"\x1b_G[^;\x1b]*\ba=q\b[^;\x1b]*;")
 CAPABILITY_REPLY = b"\x1b_Gi=1;OK\x1b\\"
+# How far back to re-scan on each read, so a probe straddling two reads is still
+# matched whole. Comfortably more than the probe's own length.
+PROBE_OVERLAP = 128
 
 
 def main() -> int:
@@ -94,8 +97,8 @@ def main() -> int:
             chunks.extend(data)
             if not answered:
                 # Scan from a little behind the last position so a probe split
-                # across two reads is still seen.
-                window = chunks[max(0, scanned - len(CAPABILITY_REPLY) - 64) :]
+                # across two reads is still seen whole.
+                window = chunks[max(0, scanned - PROBE_OVERLAP) :]
                 if CAPABILITY_PROBE.search(bytes(window)):
                     os.write(fd, CAPABILITY_REPLY)
                     answered = True

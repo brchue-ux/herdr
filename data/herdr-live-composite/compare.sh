@@ -29,6 +29,7 @@ exec python3 "$HERE/assert_legible.py" "$OFF" "$ON" \
   --block-color "${PROBE_BLOCK_COLOR:-0,0,160}" \
   --search "${PROBE_SEARCH:-0.10,0.02,1.0,0.60}" \
   --coverage-region "${COVERAGE_REGION:-0.30,0.05,1.0,0.45}" \
+  --coverage-level "${COVERAGE_LEVEL:-6}" \
   --min-bg-coverage "${MIN_BG_COVERAGE:-0.05}" \
   --min-contrast "${MIN_CONTRAST:-3.0}" \
   --min-agreement "${MIN_AGREEMENT:-0.75}"
