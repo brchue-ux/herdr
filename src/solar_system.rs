@@ -888,6 +888,73 @@ pub(crate) fn effects_frame_png(
     encode_png(layout.width, layout.height, &rgba)
 }
 
+/// Average the composite (ambient + effects, alpha-over-composited) RGB colour under each
+/// terminal cell, for `src/app/background_legibility.rs`'s per-cell text-contrast sampling.
+///
+/// `ambient`/`effects` are exactly [`frame`]'s and [`effects_frame`]'s own packed RGBA8 output,
+/// sized `width`x`height`. Effects is composited over ambient using its own real alpha — exactly
+/// as a client displaying both layers would show them — so a comet crossing a cell changes that
+/// cell's sampled colour the same way it changes what's actually on screen. `cols`x`rows` is the
+/// terminal-cell grid `width`x`height` divides into (the background scene canvas is always built
+/// as an exact multiple of the host cell size, `App::observe_background_scene`).
+pub(crate) fn sample_cell_backgrounds(
+    ambient: &[u8],
+    effects: &[u8],
+    width: u32,
+    height: u32,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    cols: u32,
+    rows: u32,
+) -> Vec<(u8, u8, u8)> {
+    let cell_count = (cols as usize) * (rows as usize);
+    if cell_width_px == 0 || cell_height_px == 0 || cell_count == 0 {
+        return vec![SPACE_SURFACE; cell_count];
+    }
+
+    let mut sums = vec![[0u32; 3]; cell_count];
+    let mut counts = vec![0u32; cell_count];
+
+    for y in 0..height as usize {
+        let row = ((y as u32 / cell_height_px).min(rows - 1)) as usize;
+        for x in 0..width as usize {
+            let col = ((x as u32 / cell_width_px).min(cols - 1)) as usize;
+            let px_idx = (y * width as usize + x) * 4;
+
+            let effects_alpha = f32::from(effects[px_idx + 3]) / 255.0;
+            let composite = |channel: usize| {
+                let ambient_c = f32::from(ambient[px_idx + channel]);
+                let effects_c = f32::from(effects[px_idx + channel]);
+                effects_c * effects_alpha + ambient_c * (1.0 - effects_alpha)
+            };
+
+            let cell_idx = row * cols as usize + col;
+            let sum = &mut sums[cell_idx];
+            sum[0] += composite(0) as u32;
+            sum[1] += composite(1) as u32;
+            sum[2] += composite(2) as u32;
+            counts[cell_idx] += 1;
+        }
+    }
+
+    sums.into_iter()
+        .zip(counts)
+        .map(|(sum, count)| {
+            (
+                sum[0]
+                    .checked_div(count)
+                    .unwrap_or(u32::from(SPACE_SURFACE.0)) as u8,
+                sum[1]
+                    .checked_div(count)
+                    .unwrap_or(u32::from(SPACE_SURFACE.1)) as u8,
+                sum[2]
+                    .checked_div(count)
+                    .unwrap_or(u32::from(SPACE_SURFACE.2)) as u8,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,6 +1209,41 @@ mod tests {
             effects_frame(&layout, &SceneEffects::default(), 0.0).len(),
             10 * 10 * 4
         );
+    }
+
+    #[test]
+    fn sample_cell_backgrounds_reads_a_flat_ambient_colour_per_cell() {
+        let width = 8u32;
+        let height = 4u32;
+        let mut ambient = vec![0u8; (width * height * 4) as usize];
+        for px in ambient.chunks_mut(4) {
+            px.copy_from_slice(&[40, 60, 80, 255]);
+        }
+        let effects = vec![0u8; (width * height * 4) as usize]; // fully transparent: no overlay
+        let cols = 4;
+        let rows = 2;
+        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, cols, rows);
+        assert_eq!(samples.len(), (cols * rows) as usize);
+        for sample in samples {
+            assert_eq!(sample, (40, 60, 80));
+        }
+    }
+
+    #[test]
+    fn sample_cell_backgrounds_blends_a_fully_opaque_effect_over_the_ambient_layer() {
+        let width = 4u32;
+        let height = 4u32;
+        let ambient = [10u8, 10, 10, 255].repeat((width * height) as usize);
+        // One fully-opaque bright pixel in the top-left cell, transparent everywhere else.
+        let mut effects = vec![0u8; (width * height * 4) as usize];
+        effects[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, 2, 2);
+        // The top-left cell's 4 pixels average 3 dark ambient pixels and 1 bright effect pixel.
+        assert_eq!(samples[0], (71, 71, 71));
+        // Every other cell is untouched ambient.
+        assert_eq!(samples[1], (10, 10, 10));
+        assert_eq!(samples[2], (10, 10, 10));
+        assert_eq!(samples[3], (10, 10, 10));
     }
 
     /// A representative mid-size fleet: one sun, four planets, three moons each.

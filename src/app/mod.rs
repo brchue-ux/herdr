@@ -11,6 +11,7 @@ pub(crate) mod agent_view;
 mod agents;
 mod api;
 mod api_helpers;
+pub(crate) mod background_legibility;
 pub(crate) mod background_scene;
 pub(crate) mod card_wash;
 pub(crate) mod cmd_ack;
@@ -837,6 +838,7 @@ impl App {
             background_scene_generated_at: None,
             background_effects_layer: None,
             background_effects: crate::app::background_scene::BackgroundEffectsState::default(),
+            background_legibility: None,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),

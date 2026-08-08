@@ -569,6 +569,50 @@ pub fn render_with_runtime_registry(
         Mode::SignalTray => self::signal_tray_popup::render(app, frame),
         Mode::Terminal => {}
     }
+
+    apply_background_legibility(app, frame);
+}
+
+/// Adapt each cell's foreground colour for legibility against the persistent whole-terminal
+/// background scene (`src/solar_system.rs`), as the very last drawing step so every other
+/// renderer's own fg/bg decisions are already final.
+///
+/// Only a cell whose own background was left at [`Color::Reset`] lets the background scene show
+/// through underneath it (`src/app/runtime.rs`'s own doc on the scene's `z` ordering: "above the
+/// cell background, below text"); a cell with an opaque PTY-derived background paints over the
+/// scene regardless, so its own fg is left untouched here. See
+/// `crate::app::background_legibility` for the smoothed/hysteresis-gated decision this reads.
+fn apply_background_legibility(app: &AppState, frame: &mut Frame) {
+    if !app.kitty_graphics_enabled || !app.persistent_background_enabled {
+        return;
+    }
+    let Some(grid) = app.background_legibility.as_ref() else {
+        return;
+    };
+
+    let buffer = frame.buffer_mut();
+    let area = buffer.area;
+    for row in area.y..area.y + area.height {
+        for col in area.x..area.x + area.width {
+            let cell = &mut buffer[(col, row)];
+            if cell.bg != ratatui::style::Color::Reset {
+                continue;
+            }
+            let Some(fg_rgb) = self::color::resolve_color_rgb(cell.fg, &app.host_terminal_theme)
+            else {
+                continue;
+            };
+            let Some(legibility) = grid.cell(row, col) else {
+                continue;
+            };
+
+            let (fg, scrim) = legibility.render(fg_rgb);
+            cell.set_fg(ratatui::style::Color::Rgb(fg.0, fg.1, fg.2));
+            if let Some(scrim) = scrim {
+                cell.set_bg(ratatui::style::Color::Rgb(scrim.0, scrim.1, scrim.2));
+            }
+        }
+    }
 }
 
 fn render_navigation_chrome(
@@ -1709,5 +1753,100 @@ switch_workspace = "ctrl+1..9"
 
         assert_eq!(switch_tab_key, "prefix+1..9 / alt+1..9");
         assert_eq!(switch_workspace_key, "ctrl+1..9");
+    }
+
+    /// End-to-end exercise of the whole per-cell legibility pipeline — `solar_system::build_layout`
+    /// through `background_legibility::observe` through `apply_background_legibility`'s real
+    /// buffer walk — against the actual solar-system frame generator, not a stub. A cell over the
+    /// sun's bright, self-luminous disk must darken a light foreground to stay legible; a cell far
+    /// off in deep space, already legible, must not be touched. This cannot substitute for looking
+    /// at the real render live (see this task's own report for why that check did not run here),
+    /// but it does confirm the mechanism this task built is actually reachable and wired, using
+    /// the same `solar_system::frame`/`effects_frame` this task's sampler reads from in production.
+    #[test]
+    fn background_legibility_darkens_text_over_the_sun_and_leaves_deep_space_alone() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.kitty_graphics_enabled = true;
+        app.persistent_background_enabled = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+
+        // Large enough that the sun's rendered disk (radius is a fraction of `min(width, height)`)
+        // fills its whole centre cell brightly, rather than being diluted by mostly-dark
+        // surrounding pixels averaged into a tiny cell at a toy resolution.
+        let (cols, rows) = (40u32, 20u32);
+        let (width_px, height_px) = (cols * 8, rows * 16);
+        let nodes = [crate::solar_system::TreeNode {
+            parent: None,
+            kind: crate::solar_system::BodyKind::Sun,
+            hue: 41.0,
+            // `Severity::Critical` sits at `signal_light`'s brightest step (`SEVERITY_LIGHT_REACH`
+            // tops out at 0.92, near `SIGNAL_LIGHT_BOUNDS`'s own ceiling) — `Clear`'s far dimmer
+            // ink measured well under the WCAG black/white crossover luminance (~0.179) once
+            // averaged into an 8x16 cell, which produced no adjustment at all and made this test
+            // meaningless; this is the actual bright case the mechanism exists for.
+            severity: crate::anim::cell::Severity::Critical,
+        }];
+        let layout = crate::solar_system::build_layout(&nodes, width_px, height_px);
+
+        let bootstrapped = crate::app::background_legibility::observe(
+            &mut app.background_legibility,
+            &layout,
+            0.0,
+            &crate::solar_system::SceneEffects::default(),
+            8,
+            16,
+            std::time::Instant::now(),
+        );
+        assert!(
+            bootstrapped,
+            "the first observe call must bootstrap the grid"
+        );
+
+        // The sun sits at the canvas centre (`solar_system::position` for a parent-less body) —
+        // `(width_px/2, height_px/2)` divides exactly onto this cell grid for these dimensions.
+        let (sun_col, sun_row) = (cols as u16 / 2, rows as u16 / 2);
+        let (space_col, space_row) = (0u16, 0u16);
+
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let buf = frame.buffer_mut();
+                // A light PTY-style foreground on a transparent background — exactly the shape a
+                // live agent pane's own text renders as (see `apply_background_legibility`'s doc).
+                for row in 0..area.height {
+                    for col in 0..area.width {
+                        buf[(col, row)].set_fg(Color::Rgb(220, 220, 220));
+                        buf[(col, row)].set_bg(Color::Reset);
+                    }
+                }
+                apply_background_legibility(&app, frame);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let over_sun = crate::ui::color::resolve_color_rgb(
+            buf[(sun_col, sun_row)].fg,
+            &app.host_terminal_theme,
+        )
+        .expect("fg was rewritten to a concrete Rgb");
+        let over_space = crate::ui::color::resolve_color_rgb(
+            buf[(space_col, space_row)].fg,
+            &app.host_terminal_theme,
+        )
+        .expect("fg was rewritten to a concrete Rgb");
+
+        assert!(
+            crate::ui::color::relative_luminance(over_sun)
+                < crate::ui::color::relative_luminance(over_space),
+            "text over the sun {over_sun:?} must render darker than text over deep space {over_space:?}"
+        );
+        // Deep space is already dark, so a light foreground there already clears the contrast
+        // floor and `ensure_contrast_toward` must leave it alone rather than lightening it further.
+        assert_eq!(over_space, (220, 220, 220));
     }
 }

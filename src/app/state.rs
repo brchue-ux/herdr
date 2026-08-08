@@ -2065,6 +2065,11 @@ pub struct AppState {
     /// that stop a durable token from re-firing its comet on every tick it stays published. See
     /// [`crate::app::background_scene::BackgroundEffectsState`].
     pub(crate) background_effects: crate::app::background_scene::BackgroundEffectsState,
+    /// Per-cell adaptive text-foreground legibility decisions against the background scene above:
+    /// each visible cell's smoothed sampled colour and committed black/white correction target.
+    /// `None` whenever the background scene itself is absent (disabled, no viewers, no fleet to
+    /// draw). See `crate::app::background_legibility`.
+    pub(crate) background_legibility: Option<crate::app::background_legibility::LegibilityGrid>,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, GraphicsLayer>,
     /// The same layers, anchored to a named non-pane region of the client
@@ -3105,6 +3110,7 @@ impl AppState {
             background_scene_generated_at: None,
             background_effects_layer: None,
             background_effects: crate::app::background_scene::BackgroundEffectsState::default(),
+            background_legibility: None,
             pane_graphics_layers: std::collections::HashMap::new(),
             surface_graphics_layers: std::collections::HashMap::new(),
             sidebar_card_layers: Vec::new(),

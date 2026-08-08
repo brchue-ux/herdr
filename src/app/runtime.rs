@@ -1278,13 +1278,15 @@ impl App {
         if !self.state.kitty_graphics_enabled || !self.state.persistent_background_enabled {
             let forgot = self.state.background_effects.forget_all();
             let had = self.state.background_effects_layer.take().is_some();
-            return forgot || had;
+            let had_legibility = self.state.background_legibility.take().is_some();
+            return forgot || had || had_legibility;
         }
 
         if !has_viewers {
             let forgot = self.state.background_effects.forget_all();
             let had = self.state.background_effects_layer.take().is_some();
-            return forgot || had;
+            let had_legibility = self.state.background_legibility.take().is_some();
+            return forgot || had || had_legibility;
         }
 
         let Some(layout) = self.state.background_scene_layout.clone() else {
@@ -1308,13 +1310,29 @@ impl App {
         let live_after = effects_state.is_live();
         self.state.background_effects = effects_state;
 
-        if !live_after {
-            let had = self.state.background_effects_layer.take().is_some();
-            return live_before || had;
-        }
-
         let generated_at = self.state.background_scene_generated_at.unwrap_or(now);
         let phase = crate::app::background_scene::phase_at(generated_at, now);
+
+        // Resample per-cell text legibility every pass too — not gated on `live_after`, since an
+        // ambient body alone (the sun, an orbiting planet) can sit under static text with no
+        // transient effect ever spawning. `background_legibility::observe` gates its own heavier
+        // resampling work to a coarser cadence internally (see its own doc), so calling it here
+        // every tick is cheap on the passes it declines to do anything.
+        let legibility_changed = crate::app::background_legibility::observe(
+            &mut self.state.background_legibility,
+            &layout,
+            phase,
+            &effects,
+            self.state.host_cell_size.width_px,
+            self.state.host_cell_size.height_px,
+            now,
+        );
+
+        if !live_after {
+            let had = self.state.background_effects_layer.take().is_some();
+            return live_before || had || legibility_changed;
+        }
+
         let frame = crate::solar_system::effects_frame_png(&layout, &effects, phase);
         self.state.background_effects_layer = Some(crate::app::state::GraphicsLayer::new(
             crate::api::schema::PaneGraphicsFormat::Png,
