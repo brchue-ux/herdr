@@ -142,15 +142,21 @@ echo "--- building the fleet ---"
 
 # The probe: a fixed block of bright text that never scrolls and never changes,
 # so the ink/paper masks taken from the reference pass address the same pixels in
-# the candidate pass. `\e[2J\e[H` wipes the shell prompt and the echoed command
-# so the block is the only lit thing in the upper pane.
+# the candidate pass. `\033[2J\033[H` wipes the shell prompt and the echoed
+# command, leaving the block as the only lit thing in the upper pane.
+#
+# `pane run` types its argument into the pane's shell and presses Enter
+# (`Method::PaneSendInput`), joining argv with single spaces first — so the whole
+# command line has to arrive as ONE argument. Passing it as `-- bash -c '...'`
+# gets the `--` typed literally and the join flattens the quoting, which yields a
+# shell line that runs but draws nothing like the intended block.
 PROBE_LINE='HERDR LEGIBILITY PROBE 0123456789 abcdefghijklmnopqrstuvwxyz ##'
-"${E[@]}" pane run w3:p1 -- bash -c \
-  "printf '\\033[2J\\033[H'; for i in \$(seq 1 12); do printf '\\033[1;97m%s\\033[0m\\n' '$PROBE_LINE'; done; sleep 100000"
+PROBE_CMD="printf '\\033[2J\\033[H'; for i in \$(seq 1 12); do printf '\\033[1;97m%s\\033[0m\\n' '$PROBE_LINE'; done; sleep 100000"
+"${E[@]}" pane run w3:p1 "$PROBE_CMD"
 
 # Live pane text: a real process writing to a real pty, which is the control for
 # "is this client receiving anything at all".
-"${E[@]}" pane run w3:p2 -- bash -c \
+"${E[@]}" pane run w3:p2 \
   'n=0; while :; do n=$((n+1)); printf "live pane output line %s\n" "$n"; sleep 0.3; done'
 
 sleep 2
