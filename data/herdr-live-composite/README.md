@@ -147,6 +147,31 @@ moves with it). On a workstation that already has a live herdr fleet, use a
 named session and the fleet's own lab tooling rather than pointing this at the
 default session.
 
+## Open finding: with #77's local transport on, no pixel surface draws at all
+
+The first two real runs of this rig found something. On a real local kitty
+client at `2e2dd8fc`, with `[experimental] kitty_graphics_local_transport = true`
+(#77 — pixels handed over as a local file, `t=f`, plus a terminal-aware raw
+format), **every pixel surface was absent and every character surface was
+fine**:
+
+| surface | how it is drawn | result |
+|---|---|---|
+| sidebar cards | Kitty graphics, `z: 0` | **nothing** — max luma 42/255 over the row area |
+| whole-terminal background scene | Kitty graphics, `z: -2` | **nothing** — 0.000 coverage against the reference pass |
+| signal tray | characters | drew, in colour, animating at 74 px/pair |
+| pane text, borders, tree connectors | characters | fine |
+
+The byte-level check next door only ever proves `t=f` *reaches the wire* — its
+own body says so: "payload being a pid-scoped file path rather than pixels". So
+nothing before this rig could establish that a terminal reads what that path
+points at, and the flag also switches on a raw pixel format (`f=24`/`f=32`) whose
+`s=`/`v=` framing a terminal will reject silently under `q=2`.
+
+The rig therefore runs with it **off** by default, and `LOCAL_TRANSPORT=true`
+re-runs it against the flag. That A/B is the thing that settles it, and this rig
+is the first thing able to run it.
+
 ## Open finding: the sidebar row area is empty
 
 The first real run of this rig found something. On a real local kitty client at

@@ -39,7 +39,12 @@ rm -rf "$ROOT" "$OUT"
 mkdir -p "$ROOT/.config/$NS" "$OUT"
 
 case "$BG" in on) BG_TOML=true ;; off) BG_TOML=false ;; esac
-sed "s/@PERSISTENT_BACKGROUND@/$BG_TOML/" "$HERE/config.toml.in" \
+LOCAL_TRANSPORT="${LOCAL_TRANSPORT:-false}"
+case "$LOCAL_TRANSPORT" in true|false) ;; *)
+  echo "LOCAL_TRANSPORT must be true or false, got: $LOCAL_TRANSPORT" >&2; exit 2 ;;
+esac
+sed -e "s/@PERSISTENT_BACKGROUND@/$BG_TOML/" \
+    -e "s/@LOCAL_TRANSPORT@/$LOCAL_TRANSPORT/" "$HERE/config.toml.in" \
   > "$ROOT/.config/$NS/config.toml"
 echo "--- config in use (BACKGROUND=$BG) ---"
 cat "$ROOT/.config/$NS/config.toml"
@@ -228,6 +233,16 @@ echo "--- capturing ---"
 lab_shoot "$DISP" "$OUT/steady.png"
 lab_shoot_series "$DISP" "$OUT" frame "$FRAMES" "$FRAME_INTERVAL"
 
+# Keep the whole log next to the screenshots. The last forty lines are the
+# startup banner; anything that explains a blank pixel surface is above it.
+cp "$ROOT/server.log" "$OUT/server.log" 2>/dev/null || true
+cp "$ROOT/.config/$NS/herdr-server.log" "$OUT/herdr-server.log" 2>/dev/null || true
+cp "$ROOT/kitty.log" "$OUT/kitty.log" 2>/dev/null || true
+cp "$ROOT/.config/$NS/config.toml" "$OUT/config.toml" 2>/dev/null || true
+echo "--- anything the server said about graphics ---"
+grep -hiE "graphics|kitty|capability|cell size|EINVAL|refus|cannot|blank" \
+  "$ROOT/server.log" "$ROOT/.config/$NS/herdr-server.log" 2>/dev/null \
+  | grep -viE "render.prof" | tail -25 || true
 echo "--- server log (last 40 lines) ---"
 tail -40 "$ROOT/server.log" || true
 echo "--- render profile ---"

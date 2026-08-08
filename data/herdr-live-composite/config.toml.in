@@ -21,9 +21,19 @@ sidebar_card_shapes = true
 sidebar_particle_field = true
 # The whole-terminal scene. This is the key under test.
 persistent_background = @PERSISTENT_BACKGROUND@
-# Hand pixels over as a local file rather than base64 in the stream. Real kitty
-# on the same machine, so the transport is genuinely exercised.
-kitty_graphics_local_transport = true
+# #77: hand pixels over as a local file (`t=f`) instead of base64 in the stream,
+# and pick a raw pixel format for the detected terminal.
+#
+# Off here, and that is a finding rather than a preference. With it on, a real
+# kitty client drew *no pixel surface at all* — no cards, no background scene —
+# while every character surface rendered normally. The byte-level check next door
+# only ever proves `t=f` reaches the wire; its own body says so ("payload being a
+# pid-scoped file path rather than pixels"), so nothing has ever established that
+# a terminal reads what that path points at.
+#
+# Set `LOCAL_TRANSPORT=true` to re-run the rig against it. That is the A/B that
+# settles it, and this rig is the first thing able to run it.
+kitty_graphics_local_transport = @LOCAL_TRANSPORT@
 
 [ui]
 sidebar_width = 42
