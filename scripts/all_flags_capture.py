@@ -36,6 +36,10 @@ import termios
 import time
 
 SESSION = "afcap"
+# A single card's PNG runs to kilobytes, so anything under this is a handshake
+# and some text, not a rendered tree. Deliberately far above "nonzero": the
+# first version of this check passed on one capability probe.
+MIN_PIXEL_PAYLOAD = 4096
 # Big enough that the sidebar is not degenerate; the panel folds to bare lines
 # below card::MIN_FOLD_WIDTH and we want the card shell under test.
 COLS, ROWS = 200, 50
@@ -165,11 +169,49 @@ def main(argv):
             server.kill()
 
 
+def classify_apc(data):
+    """Split kitty APCs into capability probes and actual pixel traffic.
+
+    A probe is `a=q` -- herdr asks the terminal whether it speaks the protocol
+    and the answer decides nothing about whether artwork was drawn. Counting
+    all APCs together is how a capture containing ONLY the probe passes a
+    graphics check: the first run of this script did exactly that, reporting
+    one APC and calling it 'graphics on the wire'.
+    """
+    probes = transmits = places = 0
+    payload = 0
+    i = 0
+    while True:
+        i = data.find(b"\x1b_G", i)
+        if i < 0:
+            break
+        end = data.find(b"\x1b\\", i)
+        if end < 0:
+            end = len(data)
+        chunk = data[i:end]
+        header = chunk[3:chunk.find(b";")] if b";" in chunk else chunk[3:]
+        if b"a=q" in header:
+            probes += 1
+        else:
+            if b"a=t" in header or b"a=T" in header or b"a=f" in header:
+                transmits += 1
+            if b"a=p" in header or b"a=T" in header:
+                places += 1
+            payload += max(0, len(chunk) - len(header) - 4)
+        i = end + 2
+    return probes, transmits, places, payload
+
+
 def report(data, server):
     """Classify the capture. Empty and 'drew nothing' are different failures."""
     apc = data.count(b"\x1b_G")
-    print(f"\ncaptured bytes : {len(data)}")
-    print(f"kitty APC (\\e_G): {apc}")
+    probes, transmits, places, payload = classify_apc(data)
+    print(f"\ncaptured bytes  : {len(data)}")
+    print(f"kitty APC total : {apc}")
+    print(f"  capability probes (a=q) : {probes}")
+    print(f"  image transmits         : {transmits}")
+    print(f"  placements              : {places}")
+    print(f"  pixel payload bytes     : {payload}")
 
     # A crash shows up as a dead server, not as an empty capture.
     if server.poll() is not None and server.returncode not in (0, -15):
@@ -191,17 +233,23 @@ def report(data, server):
         )
         return 1
 
-    if apc == 0:
+    # The probe proves the handshake, never the artwork. With every graphics
+    # flag on and a fleet on screen, a real render is many transmits carrying
+    # real pixels -- so require transmits AND payload, not merely "an APC".
+    if transmits == 0 or payload < MIN_PIXEL_PAYLOAD:
         print(
-            "FAIL no kitty graphics escapes in the capture. Every graphics flag "
-            "is on, so this means the pixel path is inert -- most likely the "
-            "host cell size was unknown (PTY pixel fields) or no proportional "
-            "font was found on the machine.",
+            f"FAIL the pixel path is inert: {transmits} image transmit(s) and "
+            f"{payload} payload bytes, against {probes} capability probe(s). "
+            f"Every graphics flag is on, so an all-probe capture means the "
+            f"artwork never rendered. Usual causes, in order: the host cell "
+            f"size was unknown (the PTY must report ws_xpixel/ws_ypixel), no "
+            f"proportional font was found at runtime, the sidebar was narrower "
+            f"than card::MIN_FOLD_WIDTH, or the client never actually attached.",
             file=sys.stderr,
         )
         return 1
 
-    print("\nPASS all-flags binary rendered, with graphics on the wire")
+    print("\nPASS all-flags binary rendered, with real pixels on the wire")
     return 0
 
 
