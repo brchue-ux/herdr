@@ -697,11 +697,58 @@ impl Drop for TerminalGuard {
 // Handshake
 // ---------------------------------------------------------------------------
 
+/// The render encoding this client asks the server for.
+///
+/// `HERDR_RENDER_ENCODING` is the explicit answer whenever it is set. Otherwise
+/// a client that draws a sidebar surface itself asks for `TerminalAnsi`,
+/// because that is the only encoding whose arm of the event loop has a splice
+/// point for the Kitty bytes it rasterises — `ServerMessage::Terminal` takes
+/// `pending_card_graphics` and `pending_tray_graphics`, and
+/// `ServerMessage::Frame` never touches them. That is not a preference: on
+/// `SemanticFrame` a delegating client rasterises every scene and then throws
+/// every byte away, and the surface renders as a hole where its pixels should be.
+///
+/// This never fires for the real gate. Every Windows `--remote` client is
+/// launched with `HERDR_RENDER_ENCODING=terminal-ansi` already set
+/// (`crate::remote::bridge`), so the only clients it reaches are the ones that
+/// set `HERDR_CLIENT_RASTERIZED_CARDS` or `HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY`
+/// by hand — the dev-box and CI audience those overrides exist for, who
+/// otherwise get a blank surface from the very path they were trying to
+/// exercise. [`warn_if_encoding_cannot_carry_delegated_scenes`] covers what is
+/// left: an explicit `HERDR_RENDER_ENCODING` that names something else.
 fn requested_render_encoding() -> RenderEncoding {
     match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
         Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
-        _ => RenderEncoding::SemanticFrame,
+        Some(_) => RenderEncoding::SemanticFrame,
+        None if wants_client_rasterized_cards() || wants_client_rasterized_signal_tray() => {
+            RenderEncoding::TerminalAnsi
+        }
+        None => RenderEncoding::SemanticFrame,
     }
+}
+
+/// Says so out loud when this client will draw a surface it can never show.
+///
+/// The negotiated encoding is the server's answer, not this client's request,
+/// so it is the only place the mismatch is actually knowable — and a blank tray
+/// with no explanation is precisely what cost a live verification pass its first
+/// run. See [`requested_render_encoding`] for why `SemanticFrame` cannot carry
+/// them.
+fn warn_if_encoding_cannot_carry_delegated_scenes(
+    encoding: RenderEncoding,
+    wants_cards: bool,
+    wants_signal_tray: bool,
+) {
+    if encoding != RenderEncoding::SemanticFrame || !(wants_cards || wants_signal_tray) {
+        return;
+    }
+    warn!(
+        wants_cards,
+        wants_signal_tray,
+        "negotiated SemanticFrame encoding cannot carry client-rasterised sidebar \
+         surfaces: their scenes will be rasterised and dropped, and the surface \
+         will render blank. Set HERDR_RENDER_ENCODING=terminal-ansi."
+    );
 }
 
 fn is_remote_client_process() -> bool {
@@ -830,6 +877,9 @@ fn do_handshake(
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
+    let wants_cards = wants_client_rasterized_cards();
+    let wants_signal_tray = wants_client_rasterized_signal_tray();
+
     // Send Hello.
     let hello = ClientMessage::Hello {
         version: PROTOCOL_VERSION,
@@ -849,8 +899,8 @@ fn do_handshake(
         // — unlike the server's, which may not be co-located. See
         // `crate::kitty_graphics::host_terminal_report_from_env`.
         host_terminal: crate::kitty_graphics::host_terminal_report_from_env(),
-        wants_client_rasterized_cards: wants_client_rasterized_cards(),
-        wants_client_rasterized_signal_tray: wants_client_rasterized_signal_tray(),
+        wants_client_rasterized_cards: wants_cards,
+        wants_client_rasterized_signal_tray: wants_signal_tray,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -878,6 +928,11 @@ fn do_handshake(
                 return Err(ClientError::HandshakeRejected { version, error });
             }
             info!(version, ?encoding, "handshake succeeded");
+            warn_if_encoding_cannot_carry_delegated_scenes(
+                encoding,
+                wants_cards,
+                wants_signal_tray,
+            );
             Ok(encoding)
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(
@@ -3072,6 +3127,42 @@ mod tests {
             msg.contains("server shut down"),
             "should mention shutdown: {msg}"
         );
+    }
+
+    /// The dev-box overrides are the only way to exercise the client-rasterised
+    /// surfaces off Windows, and on their own they used to negotiate
+    /// `SemanticFrame` — whose arm of the event loop never touches
+    /// `pending_tray_graphics` — so the surface they turned on rendered as a
+    /// hole. Asking for the encoding the real bridge sets for itself is what
+    /// makes them exercise the real path instead of a broken one.
+    #[test]
+    fn a_client_rasterised_surface_asks_for_an_encoding_that_can_carry_it() {
+        let _guard = env_lock().lock().unwrap();
+        let _encoding = EnvVarsRemovedGuard::new(&[
+            "HERDR_RENDER_ENCODING",
+            "HERDR_CLIENT_RASTERIZED_CARDS",
+            "HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY",
+            crate::remote::REMOTE_KEYBINDINGS_ENV_VAR,
+        ]);
+        assert_eq!(requested_render_encoding(), RenderEncoding::SemanticFrame);
+
+        for override_var in [
+            "HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY",
+            "HERDR_CLIENT_RASTERIZED_CARDS",
+        ] {
+            let _delegated = EnvVarGuard::set(override_var, "1");
+            assert_eq!(
+                requested_render_encoding(),
+                RenderEncoding::TerminalAnsi,
+                "{override_var} left the client on an encoding that drops what it rasterises"
+            );
+
+            // An explicit request still wins — this implication fills a gap, it
+            // does not take the choice away.
+            let _explicit = EnvVarGuard::set("HERDR_RENDER_ENCODING", "semantic");
+            assert_eq!(requested_render_encoding(), RenderEncoding::SemanticFrame);
+            restore_env_var("HERDR_RENDER_ENCODING", None);
+        }
     }
 
     #[test]

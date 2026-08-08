@@ -4136,6 +4136,43 @@ impl HeadlessServer {
         }
     }
 
+    /// Hands one delegated surface's scene to a client, and folds it into the
+    /// identity of the frame that pass is about to prepare.
+    ///
+    /// The fold happens for every scene the pass delegates, before framing and
+    /// regardless of whether the framed message reaches the wire: the frame
+    /// prepared afterwards is the only carrier for the Kitty bytes the client
+    /// rasterises from this scene, so what the pass delegated is part of what
+    /// makes that frame worth sending at all. See
+    /// `ClientRenderState::pending_scenes`.
+    fn delegate_scene(
+        client_id: u64,
+        writer: &crate::server::client_transport::ClientWriter,
+        delegated: &mut crate::server::render_stream::DelegatedSceneIdentity,
+        surface: crate::server::render_stream::DelegatedSurface,
+        scene_bytes: Vec<u8>,
+        into_message: fn(Vec<u8>) -> ServerMessage,
+    ) {
+        delegated.note_scene(surface, &scene_bytes);
+        crate::render_prof::event("full_render.delegated_scene");
+        match Self::frame_server_message_with_max(
+            &into_message(scene_bytes),
+            MAX_GRAPHICS_FRAME_SIZE,
+        ) {
+            Ok(framed) => {
+                let _ = writer.render.try_send(framed);
+            }
+            Err(err) => {
+                warn!(
+                    client_id,
+                    ?surface,
+                    err = %err,
+                    "failed to serialize delegated scene for client"
+                );
+            }
+        }
+    }
+
     fn render_and_stream(&mut self) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
@@ -4307,6 +4344,15 @@ impl HeadlessServer {
                 continue;
             };
 
+            // What this pass hands the client to draw for itself. The frame
+            // below no longer carries those pixels, so it is also no longer
+            // different from the last one just because they moved — this is what
+            // puts that difference back into the frame's identity, so a carrier
+            // frame ships for the client's own bytes to ride out on. See
+            // `ClientRenderState::pending_scenes`.
+            let mut delegated_scenes =
+                crate::server::render_stream::DelegatedSceneIdentity::default();
+
             // A client that rasterises cards itself gets the same layout and
             // content build_cards_inner would have painted, as an opaque
             // CardScene, instead of the pixels this loop just withheld above.
@@ -4323,17 +4369,14 @@ impl HeadlessServer {
                     cell_size,
                 ) {
                     match crate::ui::sidebar::image_card::encode_card_scene(&scene) {
-                        Ok(bytes) => match Self::frame_server_message_with_max(
-                            &ServerMessage::CardScene { bytes },
-                            MAX_GRAPHICS_FRAME_SIZE,
-                        ) {
-                            Ok(framed) => {
-                                let _ = writer.render.try_send(framed);
-                            }
-                            Err(err) => {
-                                warn!(client_id, err = %err, "failed to serialize card scene for client");
-                            }
-                        },
+                        Ok(bytes) => Self::delegate_scene(
+                            client_id,
+                            &writer,
+                            &mut delegated_scenes,
+                            crate::server::render_stream::DelegatedSurface::Cards,
+                            bytes,
+                            |bytes| ServerMessage::CardScene { bytes },
+                        ),
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to encode card scene for client");
                         }
@@ -4354,23 +4397,23 @@ impl HeadlessServer {
             {
                 if let Some(scene) = crate::ui::build_signal_tray_scene(&self.app.state) {
                     match crate::ui::encode_signal_tray_scene(&scene) {
-                        Ok(bytes) => match Self::frame_server_message_with_max(
-                            &ServerMessage::TrayScene { bytes },
-                            MAX_GRAPHICS_FRAME_SIZE,
-                        ) {
-                            Ok(framed) => {
-                                let _ = writer.render.try_send(framed);
-                            }
-                            Err(err) => {
-                                warn!(client_id, err = %err, "failed to serialize tray scene for client");
-                            }
-                        },
+                        Ok(bytes) => Self::delegate_scene(
+                            client_id,
+                            &writer,
+                            &mut delegated_scenes,
+                            crate::server::render_stream::DelegatedSurface::SignalTray,
+                            bytes,
+                            |bytes| ServerMessage::TrayScene { bytes },
+                        ),
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to encode tray scene for client");
                         }
                     }
                 }
             }
+            client
+                .render_state
+                .set_delegated_scene_identity(delegated_scenes);
 
             let mut commit_graphics_cache = true;
             if frame.graphics.len() > MAX_GRAPHICS_FRAME_SIZE {
@@ -5535,8 +5578,26 @@ mod tests {
         std::sync::mpsc::Receiver<Vec<u8>>,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
+        test_client_writer_with_render_capacity(1)
+    }
+
+    /// A test client writer whose render channel holds more than the real
+    /// queue's single slot.
+    ///
+    /// The real queue is one deep on purpose, and a live writer thread empties
+    /// it between the two sends a delegating pass makes (its scene, then the
+    /// frame that carries what the client rasterises from it). A test has no
+    /// such thread, so a one-deep channel would drop the second send and hide
+    /// whatever the pass decided — which is the thing under test.
+    fn test_client_writer_with_render_capacity(
+        capacity: usize,
+    ) -> (
+        ClientWriter,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
         let (control_tx, control_rx) = std::sync::mpsc::channel();
-        let (render_tx, render_rx) = std::sync::mpsc::sync_channel(1);
+        let (render_tx, render_rx) = std::sync::mpsc::sync_channel(capacity);
         (
             ClientWriter::test_channel(control_tx, render_tx),
             control_rx,
@@ -9084,6 +9145,165 @@ next_tab = ""
                 .unwrap(),
             1
         );
+    }
+
+    /// What one render pass actually sent a client that draws a sidebar surface
+    /// itself: the scene it was handed, and how many frames it got to draw it on.
+    struct DelegatedPass {
+        scene: Option<Vec<u8>>,
+        carriers: usize,
+    }
+
+    /// Runs `passes` render passes with the animation clock moving, and records
+    /// what each one sent.
+    fn collect_delegated_passes(
+        server: &mut HeadlessServer,
+        client_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+        passes: usize,
+        step: Duration,
+    ) -> Vec<DelegatedPass> {
+        let start = Instant::now();
+        let mut recorded = Vec::with_capacity(passes);
+        for index in 0..passes {
+            server.handle_scheduled_tasks_headless(start + step * (index as u32), false);
+            server.render_and_stream();
+            let mut pass = DelegatedPass {
+                scene: None,
+                carriers: 0,
+            };
+            while let Ok(framed) = client_rx.try_recv() {
+                match read_server_message(framed) {
+                    ServerMessage::TrayScene { bytes } | ServerMessage::CardScene { bytes } => {
+                        pass.scene = Some(bytes);
+                    }
+                    ServerMessage::Terminal(_) | ServerMessage::Frame(_) => pass.carriers += 1,
+                    _ => {}
+                }
+            }
+            recorded.push(pass);
+        }
+        recorded
+    }
+
+    /// The cadence assertion the rasterisation tests could not make.
+    ///
+    /// A client that draws a surface itself is deliberately not sent that
+    /// surface's pixels — and the frame it *is* sent is the only carrier for the
+    /// Kitty bytes it rasterises from the scene, because they are spliced into
+    /// the next frame rather than written on receipt. Withholding the pixels
+    /// also removed the only thing that made that frame differ from the last
+    /// one, so `prepare_frame` skipped it as identical and the surface froze on
+    /// a real terminal: a live check of the tray measured 1696 scenes sent
+    /// against 5 frames that carried anything.
+    ///
+    /// So the question is not "were the badges drawn" but "did a frame ship for
+    /// them to ride out on, on every pass whose scene changed".
+    #[track_caller]
+    fn assert_changed_scenes_ship_carrier_frames(passes: &[DelegatedPass], surface: &str) {
+        let mut previous: Option<&Vec<u8>> = None;
+        let mut changed = 0usize;
+        let mut frozen = Vec::new();
+        for (index, pass) in passes.iter().enumerate() {
+            let Some(scene) = pass.scene.as_ref() else {
+                continue;
+            };
+            if previous == Some(scene) {
+                continue;
+            }
+            previous = Some(scene);
+            changed += 1;
+            if pass.carriers == 0 {
+                frozen.push(index);
+            }
+        }
+        // Without this the assertion below passes on a fixture that never
+        // animated, which is exactly the hole the live check fell into.
+        assert!(
+            changed >= 5,
+            "{surface}: only {changed} of {} passes changed the scene at all — \
+             nothing moved, so this proves nothing",
+            passes.len()
+        );
+        assert!(
+            frozen.is_empty(),
+            "{surface}: {} of {changed} changed scenes shipped no frame to carry \
+             the client's freshly rasterised bytes (passes {frozen:?}) — the \
+             surface is frozen on screen",
+            frozen.len()
+        );
+    }
+
+    /// A fleet whose sidebar surfaces are pixels, viewed by one client that
+    /// draws them itself over the `TerminalAnsi` encoding — the configuration
+    /// `run_client_process` gives every Windows `--remote` client.
+    fn delegating_client_server(
+        cards: bool,
+        signal_tray: bool,
+    ) -> (HeadlessServer, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("one");
+        // A second pane, so the card sheet has a tree to lay out rather than a
+        // single row.
+        workspace.test_split(ratatui::layout::Direction::Vertical);
+        // A Push badge that is lit rather than idle, so the tray has something
+        // that actually moves.
+        workspace.cached_git_ahead_behind = Some((3, 0));
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.sidebar_width = 42;
+        server.app.state.sidebar_card_shapes = cards;
+        server.app.state.sidebar_signal_tray.enabled = signal_tray;
+        server.app.state.sidebar_signal_tray.animate = signal_tray;
+        server.app.state.kitty_graphics_enabled = true;
+        server.app.state.kitty_graphics_capability_confirmed = true;
+        server.app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+
+        let (client_tx, _control_rx, client_rx) = test_client_writer_with_render_capacity(16);
+        let mut client = ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 9,
+                height_px: 18,
+            },
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::TerminalAnsi,
+            Some(client_tx),
+        );
+        client.kitty_graphics_capability_confirmed = true;
+        client.wants_client_rasterized_cards = cards;
+        client.wants_client_rasterized_signal_tray = signal_tray;
+        server.clients.insert(1, client);
+        server.foreground_client_id = Some(1);
+        (server, client_rx)
+    }
+
+    /// The regression: an animating tray delegated to the client has to reach
+    /// the client on every step, not on whatever unrelated accident happens to
+    /// force a frame.
+    #[test]
+    fn a_delegated_tray_ships_a_carrier_frame_on_every_step() {
+        let (mut server, client_rx) = delegating_client_server(false, true);
+        let passes =
+            collect_delegated_passes(&mut server, &client_rx, 24, Duration::from_millis(40));
+        assert_changed_scenes_ship_carrier_frames(&passes, "signal tray");
+    }
+
+    /// And the same for cards, which are withheld from the same `frame.graphics`
+    /// and spliced at the same point, so they were frozen the same way — the
+    /// live check could not prove it because it had no moving card to freeze.
+    #[test]
+    fn a_delegated_card_scene_ships_a_carrier_frame_on_every_step() {
+        let (mut server, client_rx) = delegating_client_server(true, false);
+        let passes =
+            collect_delegated_passes(&mut server, &client_rx, 24, Duration::from_millis(40));
+        assert_changed_scenes_ship_carrier_frames(&passes, "sidebar cards");
     }
 
     #[test]
