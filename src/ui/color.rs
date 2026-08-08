@@ -245,6 +245,44 @@ pub(crate) fn ensure_contrast(color: Rgb, background: Rgb, floor: f32) -> Rgb {
     }
 }
 
+/// Like [`ensure_contrast`], but the black/white correction direction is the caller's own
+/// `target` rather than re-derived from `background` on every call.
+///
+/// `ensure_contrast` picks `target` fresh each call from whichever of black/white has more
+/// headroom against `background` — correct for a fixed background, but wrong for a background
+/// that is resampled every frame (`src/app/background_legibility.rs`): a bright object sweeping
+/// past the crossover luminance flips `target` discontinuously on every call, producing a visible
+/// black/white pop. Callers with a per-frame-resampled background should smooth the sample and
+/// commit to a `target` with hysteresis/dwell first, then pass it here so the correction direction
+/// itself stays stable across frames — this function then only ever adjusts *how far* to move
+/// toward that already-decided `target`, never *which* direction.
+pub(crate) fn ensure_contrast_toward(color: Rgb, background: Rgb, target: Rgb, floor: f32) -> Rgb {
+    let current = contrast_ratio(color, background);
+    if current >= floor {
+        return color;
+    }
+    if contrast_ratio(target, background) <= current {
+        return color;
+    }
+
+    let (mut low, mut high) = (0.0f32, 1.0f32);
+    for _ in 0..12 {
+        let mid = (low + high) / 2.0;
+        if contrast_ratio(mix_rgb(color, target, mid), background) >= floor {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+
+    let lifted = mix_rgb(color, target, high);
+    if contrast_ratio(lifted, background) >= current {
+        lifted
+    } else {
+        color
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +382,35 @@ mod tests {
         // Just over the floor, not slammed to pure white.
         assert!(contrast_ratio(lifted, background) >= 3.0);
         assert!(contrast_ratio(lifted, background) < 4.0);
+    }
+
+    #[test]
+    fn ensure_contrast_toward_matches_ensure_contrast_when_targets_agree() {
+        // On a dark background `ensure_contrast` itself would pick WHITE — confirm the `_toward`
+        // variant given that same target produces the identical output.
+        let background = BLACK;
+        let color = (20, 20, 20);
+        assert_eq!(
+            ensure_contrast_toward(color, background, WHITE, 4.5),
+            ensure_contrast(color, background, 4.5)
+        );
+    }
+
+    #[test]
+    fn ensure_contrast_toward_holds_its_direction_even_when_the_other_has_more_headroom() {
+        // Against this light background `ensure_contrast` would pick BLACK (more headroom), but a
+        // caller mid-hysteresis-dwell has already committed to WHITE and must not be overridden.
+        let background = (220, 220, 220);
+        let color = (200, 200, 200);
+        let held = ensure_contrast_toward(color, background, WHITE, 4.5);
+        assert!(contrast_ratio(held, background) >= contrast_ratio(color, background));
+        // It moved toward white, not black.
+        assert!(relative_luminance(held) >= relative_luminance(color));
+    }
+
+    #[test]
+    fn ensure_contrast_toward_leaves_compliant_colours_alone() {
+        let color = (200, 200, 200);
+        assert_eq!(ensure_contrast_toward(color, BLACK, WHITE, 4.5), color);
     }
 }
