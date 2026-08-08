@@ -422,15 +422,59 @@ pub(crate) fn signal_ink(hue: f32, severity: Severity, surface: Rgb) -> Rgb {
 /// observable, and a test that asserts the channel is independent of the stage
 /// should be able to ask for it without going through a hue.
 pub(crate) fn signal_light(severity: Severity, surface: Rgb) -> f32 {
+    signal_light_at_reach(severity.light_reach(), surface)
+}
+
+/// How far off the surface the defect marker at full intensity stands.
+///
+/// [`Severity::Serious`]'s own reach, and it is a *measured* ceiling rather than
+/// a rounded-down maximum. The ramp pushes an ink toward the light bound as it
+/// escalates, and at [`Severity::Critical`]'s reach a live render washed the
+/// marker to a pale rose on a dark panel instead of reading as a real signal —
+/// see [`crate::ui::sidebar::render_failure_spiders`], which held this same
+/// value as a hard-coded severity before the fleet had a severity to give it.
+/// The intensity steps are fractions *of this*, so the loudest one lands exactly
+/// on the ink that was validated on screen.
+pub(crate) const MARKER_FULL_REACH: f32 = SEVERITY_LIGHT_REACH[2];
+
+/// The ink a defect marker draws at, at `intensity` of its full loudness.
+///
+/// The continuous sibling of [`signal_ink`], and it exists for a channel the
+/// four-step [`Severity`] ladder cannot spell: the fleet's own S1–S4 defect
+/// ladder places its steps at 25/50/75/100% of full intensity
+/// (see [`crate::quality_streak::DefectSeverity::intensity`]), which is a
+/// *proportion* of the reach rather than four hand-placed points on it.
+///
+/// The orthogonality rule is the same one [`signal_ink`] holds and is the reason
+/// this takes two arguments rather than one: `hue` comes from the row's
+/// [`LifecycleStage`] and `intensity` from its severity, and neither may reach
+/// into the other's number. A row that moves from `Running` to `Failed` changes
+/// hue and nothing else; a defect that is restated from S3 to S1 changes
+/// intensity and nothing else.
+pub(crate) fn marker_ink(hue: f32, intensity: f32, surface: Rgb) -> Rgb {
+    let reach = MARKER_FULL_REACH * intensity.clamp(0.0, 1.0);
+    crate::ui::color::from_hsl(
+        hue,
+        SIGNAL_SATURATION,
+        signal_light_at_reach(reach, surface),
+    )
+}
+
+/// The lightness an ink at `reach` is placed at over `surface`.
+///
+/// The one place the ramp's direction and headroom are decided, so
+/// [`signal_light`]'s four fixed steps and [`marker_ink`]'s continuous ones
+/// cannot drift apart.
+fn signal_light_at_reach(reach: f32, surface: Rgb) -> f32 {
     let (low, high) = SIGNAL_LIGHT_BOUNDS;
     let ground = crate::ui::color::to_hsl(surface).2;
     // Away from the panel, whichever way that is. The same rule
     // [`crate::ui::color::ensure_contrast`] picks its direction by, so a light
     // theme darkens where a dark theme lightens rather than both brightening.
     if ground >= 0.5 {
-        ground - (ground - low).max(0.0) * severity.light_reach()
+        ground - (ground - low).max(0.0) * reach
     } else {
-        ground + (high - ground).max(0.0) * severity.light_reach()
+        ground + (high - ground).max(0.0) * reach
     }
 }
 
@@ -500,6 +544,16 @@ impl InkPalette {
     /// severity asked for rather than invisible.
     pub(crate) fn with_signal(mut self, hue: f32, severity: Severity) -> Self {
         self.signal = signal_ink(hue, severity, self.surface);
+        self
+    }
+
+    /// Bind [`Ink::Signal`] to a stage's hue at a defect marker's intensity.
+    ///
+    /// [`with_signal`](Self::with_signal) for the one caller whose intensity is
+    /// a proportion rather than one of the four [`Severity`] steps — see
+    /// [`marker_ink`], which is the whole of the difference.
+    pub(crate) fn with_marker(mut self, hue: f32, intensity: f32) -> Self {
+        self.signal = marker_ink(hue, intensity, self.surface);
         self
     }
 
@@ -894,6 +948,96 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// **The defect marker's two channels do not touch each other either.**
+    ///
+    /// The [`crate::quality_streak`] intensity steps are a proportion of the
+    /// reach rather than one of `Severity`'s four points, so they get the same
+    /// contract asserted on their own path: the stage moves the hue and nothing
+    /// else, the severity moves the distance from the surface and nothing else.
+    #[test]
+    fn a_markers_hue_answers_only_to_its_stage_and_its_intensity_only_to_its_severity() {
+        use crate::quality_streak::DefectSeverity;
+        use crate::ui::color::to_hsl;
+
+        let palette = crate::app::state::Palette::catppuccin();
+        let host = crate::terminal_theme::TerminalTheme::default();
+        for surface in [(9, 17, 28), (239, 241, 245)] {
+            for severity in DefectSeverity::ALL {
+                // Every lifecycle hue at this one severity: the ink must land
+                // at one lightness, so a card moving red -> orange -> yellow ->
+                // green never reads as its defect having changed size.
+                let placed: Vec<f32> = LifecycleStage::ALL
+                    .into_iter()
+                    .map(|stage| {
+                        let hue = stage.hue(&palette, &host);
+                        let ink = marker_ink(hue, severity.intensity(), surface);
+                        let (h, s, l) = to_hsl(ink);
+                        let gap = {
+                            let raw = (h - hue).abs() % 360.0;
+                            raw.min(360.0 - raw)
+                        };
+                        assert!(
+                            gap < 1.5,
+                            "{severity:?} moved {stage:?}'s hue {hue} to {h}: the \
+                             intensity channel reached into the hue channel"
+                        );
+                        assert!(
+                            (s - SIGNAL_SATURATION).abs() < 0.02,
+                            "{stage:?} at {severity:?} is drawn at saturation {s:.3} \
+                             rather than the shared {SIGNAL_SATURATION:.3}"
+                        );
+                        l
+                    })
+                    .collect();
+                let first = placed[0];
+                for l in &placed {
+                    assert!(
+                        (l - first).abs() < 0.02,
+                        "{severity:?} is placed at {placed:?} across the stages: a \
+                         stage change is reading as a severity change"
+                    );
+                }
+            }
+
+            // And the four steps are four steps: distinct, quietest first.
+            let lights: Vec<f32> = DefectSeverity::ALL
+                .into_iter()
+                .map(|severity| {
+                    signal_light_at_reach(MARKER_FULL_REACH * severity.intensity(), surface)
+                })
+                .collect();
+            let ground = to_hsl(surface).2;
+            for pair in lights.windows(2) {
+                assert!(
+                    (pair[0] - pair[1]).abs() > 0.03,
+                    "two severities land on the same light: {lights:?}"
+                );
+                assert!(
+                    (pair[1] - ground).abs() > (pair[0] - ground).abs(),
+                    "a worse defect must stand further off the panel: {lights:?}"
+                );
+            }
+        }
+    }
+
+    /// The loudest defect marker is exactly the ink the marker shipped with.
+    ///
+    /// S1 is 100% of [`MARKER_FULL_REACH`], and that constant is
+    /// [`Severity::Serious`]'s reach — the value a live render settled on before
+    /// severity had a channel at all. Pinning it here is what makes "a fleet
+    /// that publishes nothing sees no change" checkable rather than asserted.
+    #[test]
+    fn the_loudest_step_lands_on_the_ink_the_marker_shipped_with() {
+        use crate::quality_streak::DefectSeverity;
+        let surface = (9, 17, 28);
+        for hue in [23.0, 115.0, 217.0, 343.0] {
+            assert_eq!(
+                marker_ink(hue, DefectSeverity::S1.intensity(), surface),
+                signal_ink(hue, Severity::Serious, surface),
+            );
         }
     }
 

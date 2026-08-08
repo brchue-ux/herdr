@@ -765,12 +765,16 @@ impl App {
             || spiders_changed
     }
 
-    /// Every card currently in [`crate::anim::cell::LifecycleStage::Failed`],
-    /// as the row identity the failure spider mounts under.
+    /// Every card that currently owns an open defect, as the row identity the
+    /// failure spider mounts under.
     ///
-    /// Reads the same published `lifecycle` token and detected state
-    /// [`crate::ui::sidebar::image_card::content_for`] resolves a row's stage
-    /// from, so a card reads as failing here exactly when it draws as failing.
+    /// Resolved through [`crate::app::lifecycle::row_signal`], the same one
+    /// function [`crate::ui::sidebar::render_failure_spiders`] draws from, so a
+    /// card is marked here exactly when it is drawn marked. A row is marked
+    /// when the fleet published a `sev` severity for it, or — with nothing
+    /// published — when detection reads it as failed; a published `sev=-` says
+    /// the defect is closed and unmounts the marker even on a failed row. See
+    /// [`crate::quality_streak::defect_mark`], which owns that rule.
     /// `live` is the tree's own agent rows, handed in rather than gathered
     /// again, because [`Self::observe_agent_rows`] already computes the same
     /// list when the tree is being drawn; the one extra computation this
@@ -782,31 +786,18 @@ impl App {
         &self,
         live: &[crate::ui::sidebar::AgentPanelEntry],
     ) -> Vec<crate::anim::CardRow> {
-        use crate::anim::cell::LifecycleStage;
-
         let mut rows = Vec::new();
         for workspace in &self.state.workspaces {
             let (state, _seen) = workspace.aggregate_state(&self.state.terminals);
-            let tokens = workspace.metadata_tokens.values();
-            let stage = crate::app::lifecycle::stage(
-                tokens
-                    .get(crate::app::lifecycle::STAGE_TOKEN)
-                    .map(String::as_str),
-                state,
-            );
-            if stage == LifecycleStage::Failed {
+            let signal =
+                crate::app::lifecycle::row_signal(&workspace.metadata_tokens.values(), state);
+            if signal.defect.is_some() {
                 rows.push(crate::anim::CardRow::Space(workspace.id.clone()));
             }
         }
         for entry in live {
-            let stage = crate::app::lifecycle::stage(
-                entry
-                    .tokens
-                    .get(crate::app::lifecycle::STAGE_TOKEN)
-                    .map(String::as_str),
-                entry.state,
-            );
-            if stage == LifecycleStage::Failed {
+            let signal = crate::app::lifecycle::row_signal(&entry.tokens, entry.state);
+            if signal.defect.is_some() {
                 rows.push(crate::anim::CardRow::Agent(entry.pane_id));
             }
         }
@@ -1906,6 +1897,88 @@ mod tests {
         assert!(
             app.state.anim.frame(&row, None).is_none(),
             "gone once the retreat finishes"
+        );
+    }
+
+    /// A published defect severity marks a card the fleet is still working on.
+    ///
+    /// The case the two channels exist for — *running, but in serious trouble*
+    /// — and the one detection can never reach on its own: a pane happily
+    /// producing output looks exactly like a pane happily producing output
+    /// whether or not somebody has an open bug against what it produced.
+    #[test]
+    fn a_published_defect_marks_a_card_that_is_not_failing() {
+        let (mut app, _pane_id) = test_app_with_pane();
+        let now = Instant::now();
+
+        assert!(!app.advance_animations(now, true));
+        let row = crate::anim::ElementId::failure_spider(crate::anim::CardRow::Space(
+            app.state.workspaces[0].id.clone(),
+        ));
+
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([
+                ("lifecycle".to_string(), Some("running".to_string())),
+                ("sev".to_string(), Some("S2".to_string())),
+            ]),
+            None,
+            now,
+        );
+        assert!(app.advance_animations(now, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("a running card with an open defect is marked")
+                .phase,
+            crate::anim::Phase::Mount,
+        );
+    }
+
+    /// `sev=-` is the fleet stating the defect is closed, and it unmounts the
+    /// marker even from a card detection still reads as failed.
+    ///
+    /// Publication is the ceiling: whether a bug is still open is a fact only
+    /// the fleet holds, and a failed last task with a closed defect is a real
+    /// state rather than a contradiction.
+    #[test]
+    fn a_closed_defect_retreats_the_marker_off_a_failed_card() {
+        let (mut app, _pane_id) = test_app_with_pane();
+        let now = Instant::now();
+
+        assert!(!app.advance_animations(now, true));
+        let row = crate::anim::ElementId::failure_spider(crate::anim::CardRow::Space(
+            app.state.workspaces[0].id.clone(),
+        ));
+
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "lifecycle".to_string(),
+                Some("failed".to_string()),
+            )]),
+            None,
+            now,
+        );
+        assert!(app.advance_animations(now, true));
+        assert!(
+            app.state.anim.frame(&row, None).is_some(),
+            "an unrated failure is still marked, the way it always was"
+        );
+
+        app.state.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([("sev".to_string(), Some("-".to_string()))]),
+            None,
+            now,
+        );
+        assert!(app.advance_animations(now, true));
+        assert_eq!(
+            app.state
+                .anim
+                .frame(&row, None)
+                .expect("still drawable mid-retreat")
+                .phase,
+            crate::anim::Phase::Dismount,
+            "a closed defect retreats the marker rather than leaving it resting",
         );
     }
 

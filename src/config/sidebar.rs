@@ -214,6 +214,9 @@ pub enum SpaceSidebarToken {
     /// The 7-day (weekly) quota window: percent used and reset countdown,
     /// from the `quota_7d` metadata token. See [`crate::quota`].
     QuotaWeekly,
+    /// This Space's quality streak, decayed to now and banded: from the
+    /// `streak`/`streak_hl` metadata tokens. See [`crate::quality_streak`].
+    Streak,
     TerminalTitle,
     TerminalTitleStripped,
     Custom(String),
@@ -416,6 +419,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::PullRequests => "pull_requests".into(),
         SpaceSidebarToken::QuotaSession => "quota_session".into(),
         SpaceSidebarToken::QuotaWeekly => "quota_weekly".into(),
+        SpaceSidebarToken::Streak => "streak".into(),
         SpaceSidebarToken::TerminalTitle => "terminal_title".into(),
         SpaceSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
@@ -510,6 +514,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("pull_requests", Self::PullRequests),
                 ("quota_session", Self::QuotaSession),
                 ("quota_weekly", Self::QuotaWeekly),
+                ("streak", Self::Streak),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],
@@ -1748,6 +1753,29 @@ rows = [["workspace"], ["terminal_title", "terminal_title_stripped", "$terminal_
         let decoded: SpacesSidebarConfig = toml::from_str(&encoded).expect("round trip");
 
         assert_eq!(decoded.rows, rows);
+    }
+
+    #[test]
+    fn the_streak_space_token_round_trips_through_serialization() {
+        let rows = vec![vec![SpaceSidebarToken::Streak]];
+        let config = SpacesSidebarConfig {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+
+        let encoded = toml::to_string(&config).expect("serialize spaces config");
+        assert!(encoded.contains("streak"));
+        let decoded: SpacesSidebarConfig = toml::from_str(&encoded).expect("round trip");
+
+        assert_eq!(decoded.rows, rows);
+        // `streak` is the built-in, not a custom token that happens to share
+        // the metadata key's name: `$streak` is still the raw-value escape.
+        let custom: SpacesSidebarConfig =
+            toml::from_str("rows = [[\"$streak\"]]").expect("custom token still parses");
+        assert_eq!(
+            custom.rows,
+            vec![vec![SpaceSidebarToken::Custom("streak".into())]]
+        );
     }
 
     #[test]

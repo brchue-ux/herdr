@@ -72,6 +72,42 @@ pub(crate) fn severity(published: Option<&str>) -> Severity {
     published.and_then(parse_severity).unwrap_or_default()
 }
 
+/// What one row's colour channels are currently saying: which stage it is at,
+/// and whether it owns an open defect.
+///
+/// The pair travels together because the two surfaces that draw the defect
+/// marker need both and must not disagree about either: the app loop decides
+/// *whether* a marker exists on this row, and the renderer draws it at that
+/// stage's hue — so a row that mounts a marker under one reading and paints it
+/// under another would put a marker on a card that is no longer marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSignal {
+    pub stage: LifecycleStage,
+    /// The open defect on this row, if there is one. See
+    /// [`crate::quality_streak::defect_mark`] for the resolution rule.
+    pub defect: Option<crate::quality_streak::DefectMark>,
+}
+
+/// Resolve one row's signal from its published tokens and what Herdr detected.
+///
+/// The single entry point for both, so "is this row marked" is answered once
+/// from one set of inputs rather than recomputed beside every call site.
+pub(crate) fn row_signal(
+    tokens: &std::collections::HashMap<String, String>,
+    detected: AgentState,
+) -> RowSignal {
+    let stage = stage(tokens.get(STAGE_TOKEN).map(String::as_str), detected);
+    RowSignal {
+        stage,
+        defect: crate::quality_streak::defect_mark(
+            tokens
+                .get(crate::quality_streak::DEFECT_TOKEN)
+                .map(String::as_str),
+            stage,
+        ),
+    }
+}
+
 fn parse_stage(value: &str) -> Option<LifecycleStage> {
     match normalize(value).as_str() {
         "queued" | "pending" | "waiting-to-start" => Some(LifecycleStage::Queued),
