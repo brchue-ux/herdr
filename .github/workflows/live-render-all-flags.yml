@@ -10,9 +10,12 @@ name: Live render (all flags on)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - claude/**
+  # On pull requests rather than on pushes to one branch prefix. A check that
+  # only fires for `claude/**` cannot see anyone else's change, and cannot be
+  # made a required status check either — GitHub can only require a check that
+  # runs on the pull request itself.
+  pull_request:
+    types: [opened, synchronize, reopened]
     # Path-filtered: the build dominates this job's cost, so it should not run
     # for changes that cannot affect what reaches the wire.
     paths:
