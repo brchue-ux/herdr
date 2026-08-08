@@ -250,6 +250,28 @@ drag, `\e[<0;C;Rm` release, `64`/`65` wheel up/down, `66`/`67` wheel
 left/right, with `C` and `R` 1-based in the nested TUI's own coordinates.
 crossterm parses them off stdin exactly as it would from a real terminal.
 
+### Live checks for anything that draws
+
+A PTY capture reads the bytes a client receives; it cannot see what a terminal
+does with them. Both halves have standing CI rigs, and both have READMEs that
+carry the technique — use them instead of building a fourth ad-hoc lab:
+
+- `data/herdr-all-flags-live/` — bytes on the wire, every runtime flag on, no
+  X server. Catches wrong format, wrong transport, and an empty capture.
+- `data/herdr-live-composite/` — real `kitty` under `Xvfb`, assertions on
+  screenshots. Catches wrong stacking order and frozen surfaces, which are
+  invisible to the byte-level check because the bytes are correct.
+
+Two traps that make a live capture measure nothing while still looking real.
+A terminal decodes and scales graphics off its parse thread, and Xvfb has no
+GPU: glyphs appear about a second after the window maps but an image placement
+lands about two seconds later still, so any readiness check tuned on text
+screenshots a frame with every pixel layer missing. Wait on the frame actually
+getting brighter, not on a sleep. And an all-idle signal tray is engraved marks
+that never move, so a motion measurement on a fresh fleet measures nothing —
+`data/herdr-live-composite/run.sh` builds a repo one commit ahead of *and*
+behind its upstream to light Push and Sync.
+
 ## Server state that has to survive a restart
 
 Two different boundaries carry server-owned state, and they are not
