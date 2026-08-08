@@ -130,12 +130,17 @@ def main(argv):
         set_winsize(slave, COLS, ROWS, COLS * CELL_W, ROWS * CELL_H)
         set_winsize(master, COLS, ROWS, COLS * CELL_W, ROWS * CELL_H)
 
+        # Keep the client's stderr and exit status. A client that dies on
+        # attach produces a small, perfectly reproducible capture that looks
+        # like a rendering problem -- the first two runs of this check were
+        # byte-identical at 3006, which a live animating sidebar never is.
+        client_err = open(os.path.join(workdir, "client.err"), "w+b")
         client = subprocess.Popen(
             [binary, "--session", SESSION],
             env=env,
             stdin=slave,
             stdout=slave,
-            stderr=subprocess.DEVNULL,
+            stderr=client_err,
             close_fds=True,
         )
         os.close(slave)
@@ -153,12 +158,28 @@ def main(argv):
             except OSError:
                 break
 
+        early_exit = client.poll()
         client.terminate()
         try:
             client.wait(timeout=10)
         except subprocess.TimeoutExpired:
             client.kill()
         os.close(master)
+
+        client_err.seek(0)
+        stderr_text = client_err.read().decode("utf-8", "replace").strip()
+        client_err.close()
+
+        if early_exit is not None:
+            print(
+                f"\nNOTE the client had already exited (status {early_exit}) "
+                f"before the capture window closed -- it did not stay attached.",
+                file=sys.stderr,
+            )
+        if stderr_text:
+            print("\n--- client stderr ---", file=sys.stderr)
+            print(stderr_text[-2000:], file=sys.stderr)
+            print("--- end client stderr ---", file=sys.stderr)
 
         return report(bytes(captured), server)
     finally:
