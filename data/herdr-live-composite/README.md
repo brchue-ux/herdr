@@ -71,8 +71,8 @@ five synthetic scenes through the same real kitty and checks the verdict of each
 | a block stepping across the screen | motion | **pass** |
 | the same block, drawn once | motion | **be caught** |
 
-Measured on this rig: `z=-2` gives contrast 6.26:1 and per-pixel agreement
-0.993; `z=0` gives 1.00:1 and 0.492. Those are far enough apart that no
+Measured on this rig: `z=-2` gives contrast 6.74:1 and per-pixel agreement
+0.995; `z=0` gives 1.05:1 and 0.538. Those are far enough apart that no
 judgement call is involved.
 
 This is not ceremony. The byte-level check's own history contains a run that
@@ -95,6 +95,15 @@ screen with no window manager, so the X root window and the kitty window are the
 same rectangle and every assertion can address regions as fractions of the
 frame. Hunting the window geometry at capture time fails silently — a fractional
 region measured against the wrong rectangle still returns a number.
+
+For the same reason the probe **paints its own cell background** (rgb 0,0,160,
+padded to a solid rectangle) and is located by that colour. Bounding a bright
+region instead would mean knowing where the sidebar ends in pixels, which is
+`sidebar_width × cell_width`, and the cell width depends on whichever font and
+DPI the runner resolves. Detection runs on the reference pass only: with the
+scene on, that backdrop is legitimately covered — the wash sits above the cell
+background and below text by design — and mistaking that for a detection failure
+would hide the very thing being measured.
 
 ## Files
 

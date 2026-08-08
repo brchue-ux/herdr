@@ -97,9 +97,9 @@ step() {
 
 cd "$HERE"
 step "legibility: image at z=-2 must be judged legible" \
-  python3 assert_legible.py "$OUT/ref.png" "$OUT/behind.png"
+  python3 assert_legible.py "$OUT/ref.png" "$OUT/behind.png" --block-color 0,0,160
 step "legibility: the same image at z=0 must be caught" \
-  python3 assert_legible.py "$OUT/ref.png" "$OUT/over.png" --expect-fail
+  python3 assert_legible.py "$OUT/ref.png" "$OUT/over.png" --block-color 0,0,160 --expect-fail
 step "motion: a moving block must be judged animating" \
   python3 assert_motion.py "$OUT"/moving-*.png --label "moving block"
 step "motion: a static block must be caught" \

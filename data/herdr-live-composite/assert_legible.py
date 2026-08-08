@@ -53,6 +53,15 @@ def main() -> int:
         help="fractional x0,y0,x1,y1 to hunt the probe text in (default: the "
         "upper pane area, right of the sidebar)",
     )
+    ap.add_argument(
+        "--block-color",
+        default=None,
+        help="R,G,B of the cell background the probe paints. Given, the block is "
+        "found by that colour in the reference and nothing has to be assumed "
+        "about where the sidebar ends — which depends on a cell size that "
+        "depends on the runner's font and DPI. Omitted, brightness is used",
+    )
+    ap.add_argument("--block-tolerance", type=int, default=20)
     ap.add_argument("--ink-luma", type=int, default=115, help="0..255 on the luma image")
     ap.add_argument("--paper-luma", type=int, default=50)
     ap.add_argument("--min-ink-px", type=int, default=3000)
@@ -90,7 +99,13 @@ def main() -> int:
 
     search = lib.frac_box(ref.size, args.search)
     try:
-        box = lib.find_text_block(ref, search, ink_luma=args.ink_luma)
+        if args.block_color:
+            rgb = tuple(int(v) for v in args.block_color.split(","))
+            if len(rgb) != 3:
+                raise ValueError(f"--block-color wants R,G,B, got {args.block_color!r}")
+            box = lib.find_block_by_color(ref, search, rgb, tol=args.block_tolerance)
+        else:
+            box = lib.find_text_block(ref, search, ink_luma=args.ink_luma)
     except ValueError as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 0 if args.expect_fail else 1

@@ -34,6 +34,11 @@ from PIL import Image
 
 KITTY_CHUNK_BYTES = 3072
 PROBE_LINE = "HERDR LEGIBILITY PROBE 0123456789 abcdefghijklm ##"
+# The probe paints its own cell background, so the block can be located by
+# colour rather than by guessing where anything is. Kept identical to the
+# live probe in run.sh so the self-test exercises the same detection path.
+PROBE_BG = "48;2;0;0;160"
+PROBE_WIDTH = 70
 PROBE_LINES = 12
 PROBE_ROW = 4
 PROBE_COL_FRAC = 0.36
@@ -100,7 +105,10 @@ def probe_text(cols: int) -> str:
     col = int(cols * PROBE_COL_FRAC)
     out = []
     for n in range(PROBE_LINES):
-        out.append(f"\x1b[{PROBE_ROW + n};{col + 1}H\x1b[1;97m{PROBE_LINE}\x1b[0m")
+        padded = PROBE_LINE.ljust(PROBE_WIDTH)
+        out.append(
+            f"\x1b[{PROBE_ROW + n};{col + 1}H\x1b[1;97;{PROBE_BG}m{padded}\x1b[0m"
+        )
     return "".join(out)
 
 

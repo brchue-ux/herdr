@@ -18,12 +18,17 @@ done
 echo "=================== TEXT OVER THE BACKGROUND ==================="
 # The probe block is in the upper pane, right of the 42-column sidebar.
 #
-# Coverage is measured over the pane area only. The sidebar animates in both
-# passes, so counting its churn as "the background drew" would let the check
-# pass with the feature switched off entirely.
+# Coverage is the vacuity guard, not the assertion: a feature that is silently
+# off passes a legibility test trivially, and a green tick would then mean
+# nothing. It is measured over the UPPER pane area, outside the probe block —
+# the sidebar animates in both passes and the lower pane is writing live text in
+# both, so either would supply "coverage" that has nothing to do with the
+# background. What is left is empty pane backdrop in the reference, so anything
+# that differs there is the scene.
 exec python3 "$HERE/assert_legible.py" "$OFF" "$ON" \
-  --search "${PROBE_SEARCH:-0.24,0.05,1.0,0.48}" \
-  --coverage-region "${COVERAGE_REGION:-0.30,0.05,1.0,0.95}" \
-  --min-bg-coverage "${MIN_BG_COVERAGE:-0.10}" \
+  --block-color "${PROBE_BLOCK_COLOR:-0,0,160}" \
+  --search "${PROBE_SEARCH:-0.10,0.02,1.0,0.60}" \
+  --coverage-region "${COVERAGE_REGION:-0.30,0.05,1.0,0.45}" \
+  --min-bg-coverage "${MIN_BG_COVERAGE:-0.05}" \
   --min-contrast "${MIN_CONTRAST:-3.0}" \
   --min-agreement "${MIN_AGREEMENT:-0.75}"

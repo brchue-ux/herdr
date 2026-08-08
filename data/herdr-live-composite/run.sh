@@ -116,29 +116,58 @@ else
 fi
 
 echo "--- building the fleet ---"
+# Ids are read back from the API rather than assumed. A fresh server's first
+# workspace is `w1`, not `w2` — assuming otherwise annotates a workspace that
+# does not exist, and the only reason that fails loudly here is that
+# `workspace_not_found` is an error; the same mistake made against a workspace
+# that *does* exist silently decorates the wrong row.
+ws_create() { # <label> <cwd> -> workspace id
+  "${E[@]}" workspace create --label "$1" --cwd "$2" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["result"]["workspace"]["workspace_id"], end="")'
+}
+
+split_down() { # <pane id> -> the new pane id
+  local parent="$1" new
+  new=$("${E[@]}" pane split "$parent" --direction down | python3 -c '
+import re, sys
+ids = sorted(set(re.findall(r"\"pane_id\":\"([^\"]+)\"", sys.stdin.read())))
+print(ids[-1] if ids else "", end="")')
+  if [ -z "$new" ] || [ "$new" = "$parent" ]; then
+    echo "pane split of $parent did not report a new pane id (got: '${new}')" >&2
+    return 1
+  fi
+  printf '%s' "$new"
+}
+
 # A first mate, two second mates under it, workers under those — the same tree
-# shape the byte-level check and the other tree proofs in data/ use, so the
-# scene has a real owner hierarchy to draw as sun / planets / moons.
-"${E[@]}" workspace create --label firstmate --cwd /tmp
-"${E[@]}" workspace create --label 2ndmate-left --cwd /tmp
-"${E[@]}" workspace create --label 2ndmate-right --cwd /tmp
-"${E[@]}" workspace create --label lit --cwd "$ROOT/lit"
-"${E[@]}" workspace report-metadata w3 --source proof --token owner=firstmate
-"${E[@]}" workspace report-metadata w4 --source proof --token owner=firstmate
-"${E[@]}" workspace report-metadata w5 --source proof --token owner=firstmate
-"${E[@]}" pane split w4:p1 --direction down
-"${E[@]}" pane report-agent w4:p1 --source proof --agent right-worker-1 --state working
-"${E[@]}" pane report-agent w4:p2 --source proof --agent right-worker-2 --state idle
-"${E[@]}" pane report-metadata w4:p1 --source proof --token owner=2ndmate-right
-"${E[@]}" pane report-metadata w4:p2 --source proof --token owner=2ndmate-right
+# shape the other tree proofs in data/ use, so the scene has a real owner
+# hierarchy to draw as sun / planets / moons.
+FM=$(ws_create firstmate /tmp)
+LEFT=$(ws_create 2ndmate-left /tmp)
+RIGHT=$(ws_create 2ndmate-right /tmp)
+LIT=$(ws_create lit "$ROOT/lit")
+echo "workspaces: firstmate=$FM left=$LEFT right=$RIGHT lit=$LIT"
+
+for ws in "$LEFT" "$RIGHT" "$LIT"; do
+  "${E[@]}" workspace report-metadata "$ws" --source proof --token owner=firstmate
+done
+
+RIGHT_P2=$(split_down "$RIGHT:p1")
+"${E[@]}" pane report-agent "$RIGHT:p1" --source proof --agent right-worker-1 --state working
+"${E[@]}" pane report-agent "$RIGHT_P2" --source proof --agent right-worker-2 --state idle
+"${E[@]}" pane report-metadata "$RIGHT:p1" --source proof --token owner=2ndmate-right
+"${E[@]}" pane report-metadata "$RIGHT_P2" --source proof --token owner=2ndmate-right
 
 # The workspace the client will be looking at: a static legibility probe on top,
 # live output underneath.
-"${E[@]}" pane split w3:p1 --direction down
-"${E[@]}" pane report-agent w3:p1 --source proof --agent probe --state working
-"${E[@]}" pane report-metadata w3:p1 --source proof --token owner=2ndmate-left
-"${E[@]}" pane report-metadata w3:p2 --source proof --token owner=2ndmate-left
-"${E[@]}" workspace focus w3
+PROBE_PANE="$LEFT:p1"
+LIVE_PANE=$(split_down "$PROBE_PANE")
+"${E[@]}" pane report-agent "$PROBE_PANE" --source proof --agent probe --state working
+"${E[@]}" pane report-metadata "$PROBE_PANE" --source proof --token owner=2ndmate-left
+"${E[@]}" pane report-metadata "$LIVE_PANE" --source proof --token owner=2ndmate-left
+"${E[@]}" workspace focus "$LEFT"
+echo "probe pane: $PROBE_PANE   live pane: $LIVE_PANE"
 
 # The probe: a fixed block of bright text that never scrolls and never changes,
 # so the ink/paper masks taken from the reference pass address the same pixels in
@@ -150,13 +179,18 @@ echo "--- building the fleet ---"
 # command line has to arrive as ONE argument. Passing it as `-- bash -c '...'`
 # gets the `--` typed literally and the join flattens the quoting, which yields a
 # shell line that runs but draws nothing like the intended block.
+#
+# It paints its own cell background (rgb 0,0,160, padded to a solid rectangle)
+# so the block can be located by colour instead of by assuming where the sidebar
+# ends in pixels — that boundary moves with the cell size, which moves with
+# whichever font and DPI the runner resolves.
 PROBE_LINE='HERDR LEGIBILITY PROBE 0123456789 abcdefghijklmnopqrstuvwxyz ##'
-PROBE_CMD="printf '\\033[2J\\033[H'; for i in \$(seq 1 12); do printf '\\033[1;97m%s\\033[0m\\n' '$PROBE_LINE'; done; sleep 100000"
-"${E[@]}" pane run w3:p1 "$PROBE_CMD"
+PROBE_CMD="printf '\\033[2J\\033[H'; for i in \$(seq 1 12); do printf '\\033[1;97;48;2;0;0;160m%-70s\\033[0m\\n' '$PROBE_LINE'; done; sleep 100000"
+"${E[@]}" pane run "$PROBE_PANE" "$PROBE_CMD"
 
 # Live pane text: a real process writing to a real pty, which is the control for
 # "is this client receiving anything at all".
-"${E[@]}" pane run w3:p2 \
+"${E[@]}" pane run "$LIVE_PANE" \
   'n=0; while :; do n=$((n+1)); printf "live pane output line %s\n" "$n"; sleep 0.3; done'
 
 sleep 2

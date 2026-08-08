@@ -133,37 +133,94 @@ def find_text_block(
     share: float = 0.15,
     inset: int = 2,
 ) -> tuple[int, int, int, int]:
-    """Locate the probe's text block inside `search`, in absolute pixels.
+    """Locate the probe block by brightness alone, inside `search`.
 
-    The block is found rather than assumed because the cell size is decided by
-    whichever font the runner resolves, so any hardcoded rectangle is a
-    measurement of the wrong pixels waiting to happen.
+    The fallback for a scene with no distinctive backdrop colour, and what the
+    synthetic controls used before they painted one. Prefer
+    [`find_block_by_color`] wherever the probe can choose its own background.
+    """
+    return _block_from_mask(
+        threshold(luma(ref.crop(search)), ink_luma),
+        search,
+        share,
+        inset,
+        "bright pixels",
+    )
 
-    Rows and columns count only when their bright-pixel coverage reaches
-    `share` of the busiest row/column. That threshold is what discards pane
-    borders and the tab strip: a one-pixel rule spans the whole search area but
-    contributes a single pixel to each row it crosses, while a line of text
-    contributes hundreds.
+
+def color_mask(img: Image.Image, rgb: tuple[int, int, int], tol: int) -> Image.Image:
+    """Binary "L" mask of pixels within `tol` of `rgb` on every channel."""
+    bands = img.split()
+    hit = None
+    for band, want in zip(bands, rgb):
+        near = band.point(lambda v, w=want: 255 if abs(v - w) <= tol else 0)
+        hit = near if hit is None else ImageChops.multiply(hit, near)
+    return hit
+
+
+def _block_from_mask(
+    mask: Image.Image,
+    search: tuple[int, int, int, int],
+    share: float,
+    inset: int,
+    what: str,
+) -> tuple[int, int, int, int]:
+    """Tightest rectangle over the rows and columns a mask actually fills.
+
+    Rows and columns count only when their coverage reaches `share` of the
+    busiest row/column. That threshold is what discards pane borders and the tab
+    strip: a one-pixel rule spans the whole search area but contributes a single
+    pixel to each row it crosses, while a line of the probe contributes hundreds.
     """
     x0, y0, _x1, _y1 = search
-    ink = threshold(luma(ref.crop(search)), ink_luma)
-    if mask_count(ink) == 0:
-        raise ValueError("no bright pixels in the search area — the probe never drew")
+    if mask_count(mask) == 0:
+        raise ValueError(f"no {what} in the search area — the probe never drew")
 
-    rows = _profile(ink, "y")
-    cols = _profile(ink, "x")
+    rows = _profile(mask, "y")
+    cols = _profile(mask, "x")
     row_floor = max(1.0, max(rows) * share)
     col_floor = max(1.0, max(cols) * share)
     keep_rows = [i for i, v in enumerate(rows) if v >= row_floor]
     keep_cols = [i for i, v in enumerate(cols) if v >= col_floor]
     if not keep_rows or not keep_cols:
-        raise ValueError("bright pixels present but no solid text rows/columns")
+        raise ValueError(f"{what} present but no solid rows/columns of it")
 
     return (
         x0 + keep_cols[0] + inset,
         y0 + keep_rows[0] + inset,
         x0 + keep_cols[-1] + 1 - inset,
         y0 + keep_rows[-1] + 1 - inset,
+    )
+
+
+def find_block_by_color(
+    ref: Image.Image,
+    search: tuple[int, int, int, int],
+    rgb: tuple[int, int, int],
+    tol: int = 20,
+    share: float = 0.15,
+    inset: int = 3,
+) -> tuple[int, int, int, int]:
+    """Locate the probe block by the exact cell background colour it paints.
+
+    Preferred over the brightness heuristic, because it needs to know nothing
+    about where anything is. The alternative is bounding a bright region and
+    hoping the sidebar is outside it — and the sidebar's own width in pixels
+    depends on the cell size, which depends on whichever font and DPI the runner
+    resolves. A search rectangle chosen against the wrong cell width does not
+    error; it silently measures the wrong pixels.
+
+    The colour is read from the *reference* pass only. With the scene on, the
+    wash sits above the cell background and below the text by design, so the
+    probe's own backdrop is legitimately gone in the candidate — which is the
+    thing being measured, not a detection failure.
+    """
+    return _block_from_mask(
+        color_mask(ref.crop(search), rgb, tol),
+        search,
+        share,
+        inset,
+        f"pixels near rgb{rgb}",
     )
 
 
