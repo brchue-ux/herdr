@@ -31,8 +31,30 @@ E=(env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH
 echo "--- config in use ---"
 cat "$ROOT/.config/$NS/config.toml"
 
-echo "--- starting server ---"
-"${E[@]}" server >"$ROOT/server.log" 2>&1 &
+# Which terminal the SERVER believes it is under, which is what decides the
+# pixel format — not the client's. host_terminal_kind() reads this process's
+# own environment, and its own doc comment says so: "for the split server, this
+# is the server process's environment, which only agrees with the terminal's own
+# when server and client are co-located." Setting TERM on the client's PTY and
+# expecting a format upgrade is testing the wrong process, which is exactly the
+# mistake that made an earlier run report f=100 everywhere and call it a
+# limitation of synthetic PTYs.
+#
+#   SERVER_TERM=kitty  -> HostTerminalKind::Kitty, prefers RGB24, but a card is
+#                         translucent by design so it correctly stays PNG
+#   SERVER_TERM=rio    -> HostTerminalKind::Rio, prefers RGBA32, which applies
+#                         to translucent cards, so f=32 must appear on the wire
+SERVER_TERM=${SERVER_TERM:-rio}
+case "$SERVER_TERM" in
+  kitty) SERVER_ENV=(TERM=xterm-kitty) ;;
+  rio)   SERVER_ENV=(TERM_PROGRAM=rio TERM=xterm-256color) ;;
+  other) SERVER_ENV=(TERM=xterm-256color) ;;
+  *) echo "unknown SERVER_TERM: $SERVER_TERM" >&2; exit 2 ;;
+esac
+echo "--- starting server as SERVER_TERM=$SERVER_TERM (${SERVER_ENV[*]}) ---"
+env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
+    HOME="$ROOT" XDG_CONFIG_HOME="$ROOT/.config" "${SERVER_ENV[@]}" \
+    "$BIN" server >"$ROOT/server.log" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 
@@ -123,6 +145,41 @@ if [ "$APC_BLOCKS" -lt "$MIN_APC" ]; then
   echo "Either the PTY reported no pixel size, or no proportional font was found," >&2
   echo "or kitty_graphics is off — every card flag is inert in that state." >&2
   exit 1
+fi
+
+# Assert the transport and the format independently. They are two halves of the
+# same change (#77) and only the transport half was ever confirmed before this.
+FORMATS=$(python3 - "$OUT/steady.raw" <<'PY'
+import re, sys
+blob = open(sys.argv[1], "rb").read()
+fmts = set()
+transports = set()
+for m in re.finditer(rb"\x1b_G([^;\x1b]*)", blob):
+    for pair in m.group(1).split(b","):
+        if pair.startswith(b"f="):
+            fmts.add(pair[2:].decode())
+        if pair.startswith(b"t="):
+            transports.add(pair[2:].decode())
+print("f:" + ",".join(sorted(fmts)) + " t:" + ",".join(sorted(transports)))
+PY
+)
+echo "wire formats/transports: $FORMATS"
+
+case "$FORMATS" in
+  *"t:f"*) echo "local transport (t=f) confirmed on the wire" ;;
+  *) echo "EXPECTED t=f LOCAL TRANSPORT, got: $FORMATS" >&2; exit 1 ;;
+esac
+
+if [ "$SERVER_TERM" = "rio" ]; then
+  case "$FORMATS" in
+    *"f:"*32*) echo "terminal-aware format confirmed: Rio got RGBA32" ;;
+    *)
+      echo "FORMAT PICKING DID NOT ENGAGE: server believed it was Rio but no f=32" >&2
+      echo "reached the wire (got: $FORMATS). Either host_terminal_kind() did not" >&2
+      echo "see TERM_PROGRAM, or local transport/locality gating refused." >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # The analysis goes LAST on purpose. A job's log is read from the end, and the

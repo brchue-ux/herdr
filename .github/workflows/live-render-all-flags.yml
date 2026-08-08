@@ -48,6 +48,10 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          # musl too: that is the target the released linux asset is built for,
+          # so it is the binary a person actually swaps to. Testing only the gnu
+          # build leaves the shipped artifact unexercised.
+          targets: x86_64-unknown-linux-musl
 
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -61,7 +65,7 @@ jobs:
           # fonts-dejavu matters: image_card::is_available requires a proportional
           # face found on the machine at runtime, and herdr ships no font. Without
           # one the pixel-card path stays off and every card flag is inert.
-          sudo apt-get install -y cmake ninja-build fonts-dejavu fonts-liberation
+          sudo apt-get install -y cmake ninja-build fonts-dejavu fonts-liberation musl-tools
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -79,13 +83,26 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Run live capture with every flag on
+      # Two passes over the same binary, differing only in which terminal the
+      # SERVER believes it is under, because that is what picks the pixel format.
+      # Rio must produce f=32 on translucent cards; kitty must correctly decline
+      # RGB24 for them and stay on PNG. One pass can only ever confirm one branch.
+      - name: Live capture — server believes Rio
         env:
           HERDR_BIN: ${{ github.workspace }}/target/release/herdr
           HERDR_NS: herdr
+          SERVER_TERM: rio
         run: |
           chmod +x data/herdr-all-flags-live/run.sh
           ./data/herdr-all-flags-live/run.sh
+
+      - name: Live capture — server believes kitty
+        env:
+          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
+          HERDR_NS: herdr
+          SERVER_TERM: kitty
+          CAPTURE_ROOT: /tmp/hallflags-kitty
+        run: ./data/herdr-all-flags-live/run.sh
 
       # The render capture proves this binary draws. It does not prove a *swap*
       # works, because it only ever runs one binary against a session that same
@@ -100,6 +117,14 @@ jobs:
             --target-dir /tmp/herdr-base-target
           /tmp/herdr-base-target/release/herdr --version
 
+      # The shipped linux asset is musl, so that is what a swap actually puts in
+      # place. Build this branch for musl and swap onto it from the base
+      # branch's gnu build — which also crosses a libc boundary, the harder case.
+      - name: Build this branch for musl (the shipped target)
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/herdr
+
       - name: Swap the binary under a live session
         env:
           HERDR_NS: herdr
@@ -107,7 +132,7 @@ jobs:
           chmod +x data/herdr-all-flags-live/swap.sh
           ./data/herdr-all-flags-live/swap.sh \
             /tmp/herdr-base-target/release/herdr \
-            "${{ github.workspace }}/target/release/herdr"
+            "${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/herdr"
 
       - name: Upload captures
         if: always()
