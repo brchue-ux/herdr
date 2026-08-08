@@ -2361,6 +2361,36 @@ impl AppState {
         lifecycle
     }
 
+    /// True when the persistent whole-terminal background scene may be drawn.
+    ///
+    /// Three facts, and the third is the one that was missing: the feature is
+    /// on, the host answered the Kitty-graphics capability probe, **and** the
+    /// host is a terminal that actually draws an opaque ambient wash where the
+    /// scene's design puts it — see
+    /// [`crate::kitty_graphics::HostTerminalKind::draws_ambient_wash`] for
+    /// what "actually" means and why it cannot be probed. Every producer and
+    /// consumer of the scene reads this one predicate rather than re-spelling
+    /// the conjunction, so none of them can drift out of agreement about
+    /// whether a scene exists this pass.
+    pub(crate) fn background_scene_active(&self) -> bool {
+        self.kitty_graphics_enabled
+            && self.persistent_background_enabled
+            && self.host_terminal_kind.draws_ambient_wash()
+    }
+
+    /// True when the sidebar's ambient particle-field wash may be drawn.
+    ///
+    /// The same three facts as [`Self::background_scene_active`], for the same
+    /// reason: this wash is opaque too (`particle_field::loop_frames`' own
+    /// `frame_alpha_is_opaque`) and sits in the same negative-`z` band, so a
+    /// host that draws it at the top of the stack covers the sidebar tree
+    /// exactly the way the whole-terminal scene covers everything.
+    pub(crate) fn sidebar_particle_field_active(&self) -> bool {
+        self.kitty_graphics_enabled
+            && self.sidebar_particle_field_enabled
+            && self.host_terminal_kind.draws_ambient_wash()
+    }
+
     /// True when the fleet signal bar is drawn.
     ///
     /// The bar lives on the reserved header row of the expanded panel, so a

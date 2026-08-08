@@ -1060,8 +1060,12 @@ pub struct ExperimentalConfig {
     /// Generated once per sidebar size and played back by the terminal's own Kitty
     /// animation-frame clock (`a=f`/`a=a`) rather than re-uploaded every tick, so steady-state
     /// wire cost is near zero once armed — see `src/kitty_graphics.rs` and
-    /// `src/ui/sidebar/particle_background.rs`. Kitty-only for now: a terminal that does not
-    /// honour `a=f`/`a=a` still shows the root frame, just static.
+    /// `src/ui/sidebar/particle_background.rs`.
+    ///
+    /// Drawn only on a host terminal herdr has positively identified as kitty. The wash is an
+    /// opaque image placed under the text, and a terminal with partial Kitty-graphics support
+    /// draws that same image over the sidebar tree instead — so an unrecognised terminal is
+    /// refused rather than risked. See `HostTerminalKind::draws_ambient_wash`.
     ///
     /// Only read while `kitty_graphics` is on.
     pub sidebar_particle_field: bool,
@@ -1073,7 +1077,13 @@ pub struct ExperimentalConfig {
     /// `src/app/background_scene.rs`. Generated as a looping animation the same way
     /// `sidebar_particle_field` is, so steady-state cost is near zero once armed; a bug/failure
     /// impact or a win comet regenerates only the small overlay layer, and only while at least
-    /// one is live. Kitty-only for now.
+    /// one is live.
+    ///
+    /// Drawn only on a host terminal herdr has positively identified as kitty. The scene is a
+    /// full-surface opaque image placed under the text, and a terminal with partial
+    /// Kitty-graphics support draws that same image over every glyph on screen instead — so an
+    /// unrecognised terminal is refused rather than risked. See
+    /// `HostTerminalKind::draws_ambient_wash`.
     ///
     /// Only read while `kitty_graphics` is on.
     pub persistent_background: bool,

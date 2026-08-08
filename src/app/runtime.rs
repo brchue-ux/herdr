@@ -1121,10 +1121,7 @@ impl App {
     /// resize), never once per tick. Once generated, uploading and arming playback is
     /// `kitty_graphics`'s job (`GraphicsLayer::animation`); this only owns producing the pixels.
     pub(crate) fn observe_sidebar_particle_field(&mut self) -> bool {
-        if !self.state.kitty_graphics_enabled
-            || !self.state.sidebar_particle_field_enabled
-            || !self.state.host_cell_size.is_known()
-        {
+        if !self.state.sidebar_particle_field_active() || !self.state.host_cell_size.is_known() {
             let had = self.state.sidebar_particle_field.take().is_some();
             self.state.sidebar_particle_field_key = 0;
             return had;
@@ -1193,7 +1190,7 @@ impl App {
     /// (`AppState::background_scene_layout`) is cached alongside the rendered loop rather than
     /// only the encoded bytes: the effects overlay needs real body positions to draw against.
     pub(crate) fn observe_background_scene(&mut self) -> bool {
-        if !self.state.kitty_graphics_enabled || !self.state.persistent_background_enabled {
+        if !self.state.background_scene_active() {
             return self.clear_background_scene();
         }
 
@@ -1276,7 +1273,7 @@ impl App {
     /// bounding-box-limited — see `src/solar_system.rs`'s own module doc), and left entirely
     /// absent whenever nothing is: fade-clean, state-derived persistence, not an accumulator.
     pub(crate) fn observe_background_effects(&mut self, now: Instant, has_viewers: bool) -> bool {
-        if !self.state.kitty_graphics_enabled || !self.state.persistent_background_enabled {
+        if !self.state.background_scene_active() {
             let forgot = self.state.background_effects.forget_all();
             let had = self.state.background_effects_layer.take().is_some();
             let had_legibility = self.state.background_legibility.take().is_some();
@@ -2446,12 +2443,108 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.kitty_graphics_enabled = true;
         app.state.sidebar_particle_field_enabled = true;
+        // An opaque ambient wash is only ever handed to a host that draws one
+        // where it was placed — see `HostTerminalKind::draws_ambient_wash`.
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
         app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 9,
             height_px: 18,
         };
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 24, 30);
         app
+    }
+
+    /// A fleet whose whole-terminal background scene has a screen to cover and
+    /// a host willing to draw it under the text.
+    fn background_scene_app() -> super::super::App {
+        let (mut app, _) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.kitty_graphics_enabled = true;
+        app.state.persistent_background_enabled = true;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 40, 30);
+        app.state.view.terminal_area = ratatui::layout::Rect::new(40, 0, 80, 30);
+        app
+    }
+
+    /// The scene is a full-surface, fully opaque image whose entire safety is
+    /// the host honouring `z=-2` — "above the cell background, below text". On
+    /// a host that draws it anyway at the top of the stack the same bytes
+    /// erase every glyph on screen, which is the failure this gate exists to
+    /// make unreachable rather than to apologise for afterwards.
+    #[test]
+    fn the_background_scene_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
+        for kind in [
+            crate::kitty_graphics::HostTerminalKind::Rio,
+            crate::kitty_graphics::HostTerminalKind::Other,
+        ] {
+            let mut app = background_scene_app();
+            app.state.host_terminal_kind = kind;
+            assert!(
+                !app.observe_background_scene(),
+                "{kind:?} was handed a scene it has not been measured to draw below text"
+            );
+            assert!(app.state.background_scene.is_none());
+            assert!(app.state.background_scene_layout.is_none());
+        }
+    }
+
+    /// The other half of the same gate: the terminal this was designed and
+    /// measured against still gets the scene, in the band it was specified in.
+    #[test]
+    fn the_background_scene_is_generated_below_text_on_a_host_that_draws_it() {
+        let mut app = background_scene_app();
+        assert!(app.observe_background_scene());
+        let layer = app
+            .state
+            .background_scene
+            .as_ref()
+            .expect("kitty gets the scene");
+        assert!(
+            layer.render.z < 0,
+            "the scene must be placed in the below-text band, not over the UI"
+        );
+        assert!(
+            layer
+                .animation
+                .as_ref()
+                .is_some_and(|a| !a.frames.is_empty()),
+            "the scene must carry its loop, not be a single frozen frame"
+        );
+    }
+
+    /// A client attaching from a different terminal replaces
+    /// `host_terminal_kind` (`sync_foreground_client_state`), so a scene
+    /// generated for one host has to be retired when the next one cannot draw
+    /// it — otherwise the already-uploaded image outlives the fact that made
+    /// it safe.
+    #[test]
+    fn a_generated_scene_is_retired_when_the_host_stops_being_one_that_draws_it() {
+        let mut app = background_scene_app();
+        assert!(app.observe_background_scene());
+        assert!(app.state.background_scene.is_some());
+
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Rio;
+        assert!(
+            app.observe_background_scene(),
+            "retiring the scene did not report a change to redraw"
+        );
+        assert!(app.state.background_scene.is_none());
+        assert_eq!(app.state.background_scene_key, 0);
+    }
+
+    /// The sidebar wash is opaque too, in the same band, so it answers to the
+    /// same fact about the host.
+    #[test]
+    fn the_sidebar_particle_field_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
+        let mut app = particle_field_app();
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Rio;
+        assert!(!app.observe_sidebar_particle_field());
+        assert!(app.state.sidebar_particle_field.is_none());
     }
 
     fn set_first_pane_state(app: &mut super::super::App, state: crate::detect::AgentState) {
