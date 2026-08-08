@@ -23,39 +23,7 @@ NS="${HERDR_NS:-herdr-dev}"
 rm -rf "$ROOT"
 mkdir -p "$ROOT/.config/$NS" "$OUT"
 
-cat > "$ROOT/.config/$NS/config.toml" <<'CONF'
-# Every runtime flag this fork ships, turned on.
-[experimental]
-allow_nested = true
-kitty_graphics = true
-sidebar_card_shapes = true
-sidebar_particle_field = true
-kitty_graphics_local_transport = true
-pane_history = true
-reveal_hidden_cursor_for_cjk_ime = true
-
-[ui]
-sidebar_width = 42
-
-[ui.sidebar.animation]
-row_enter = "wipe"
-row_enter_ms = 400
-row_exit = "wipe"
-row_exit_ms = 400
-row_motion = "slide"
-view_switch = "dissolve"
-view_switch_ms = 400
-view_switch_particles_per_cell = 2
-
-[ui.sidebar.cards]
-pulse = true
-wash = true
-wash_ms = 400
-stage_hue = true
-
-[ui.sidebar.notifications]
-enabled = true
-CONF
+cp "$HERE/config.toml" "$ROOT/.config/$NS/config.toml"
 
 E=(env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH
    HOME="$ROOT" XDG_CONFIG_HOME="$ROOT/.config" "$BIN")

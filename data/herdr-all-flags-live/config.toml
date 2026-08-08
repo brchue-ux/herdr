@@ -1,0 +1,36 @@
+# Every runtime flag this fork ships, turned on at once.
+#
+# There is no all-flags *build*: this repo has no Cargo [features] and no
+# cfg gates on any of these, so a stock binary already contains all of it and
+# turning them on is purely this file. Shared by run.sh (render capture) and
+# swap.sh (binary swap) so both mean the same thing by "all on".
+[experimental]
+allow_nested = true
+kitty_graphics = true
+sidebar_card_shapes = true
+sidebar_particle_field = true
+kitty_graphics_local_transport = true
+pane_history = true
+reveal_hidden_cursor_for_cjk_ime = true
+
+[ui]
+sidebar_width = 42
+
+[ui.sidebar.animation]
+row_enter = "wipe"
+row_enter_ms = 400
+row_exit = "wipe"
+row_exit_ms = 400
+row_motion = "slide"
+view_switch = "dissolve"
+view_switch_ms = 400
+view_switch_particles_per_cell = 2
+
+[ui.sidebar.cards]
+pulse = true
+wash = true
+wash_ms = 400
+stage_hue = true
+
+[ui.sidebar.notifications]
+enabled = true
