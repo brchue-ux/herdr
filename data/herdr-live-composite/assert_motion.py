@@ -12,6 +12,14 @@ byte-level check too when the bytes that never arrive are the evidence.
 Passing needs *sustained* motion, not one twitch: a minimum number of
 consecutive frame pairs must each clear a pixel floor. One large blip — a modal
 closing, a scroll — cannot carry a frozen animation over the line.
+
+`--tail-pairs` exists because an animation can *fade in* rather than switch on.
+The tray's badges pulse on an amplitude envelope that opens from nothing, so its
+first seconds are genuinely below any pixel floor worth setting — measured at a
+per-badge swing of 0.4 luma against the 7.5 it settles at. Judging those pairs
+asks the surface to be at full amplitude the instant it is looked at. They are
+still measured and still printed; they are just not what the verdict is taken
+from.
 """
 
 from __future__ import annotations
@@ -46,6 +54,15 @@ def main() -> int:
         help="how many pairs must move for the surface to count as animating",
     )
     ap.add_argument(
+        "--tail-pairs",
+        type=int,
+        default=0,
+        help="judge only the last N pairs (0: all of them). Every pair is still "
+        "measured and printed; this decides which ones the verdict is taken "
+        "from. For a surface whose animation fades in rather than switching on, "
+        "the opening pairs measure the fade, not the animation.",
+    )
+    ap.add_argument(
         "--expect-fail",
         action="store_true",
         help="invert the exit code; used by the detector self-test so a known-static "
@@ -67,22 +84,29 @@ def main() -> int:
     crops = [f.crop(box) for f in frames]
     area = (box[2] - box[0]) * (box[3] - box[1])
 
+    total = len(crops) - 1
+    judged_from = max(0, total - args.tail_pairs) if args.tail_pairs > 0 else 0
+
     print(f"{args.label}: {lib.describe_box(box)}  ({area} px)")
     active = 0
-    for i in range(len(crops) - 1):
+    for i in range(total):
         changed = lib.mask_count(lib.changed_mask(crops[i], crops[i + 1], args.level))
         moving = changed >= args.min_changed_px
-        active += 1 if moving else 0
+        counted = i >= judged_from
+        if moving and counted:
+            active += 1
         print(
             f"  {os.path.basename(args.frames[i])} -> "
             f"{os.path.basename(args.frames[i + 1])}: {changed:>8} px "
             f"({changed / area:.4f} of region)  {'move' if moving else 'STILL'}"
+            f"{'' if counted else '  (warm-up, not judged)'}"
         )
 
-    print(f"  moving pairs: {active}/{len(crops) - 1} (need {args.min_active_pairs})")
+    judged = total - judged_from
+    print(f"  moving pairs: {active}/{judged} (need {args.min_active_pairs})")
     if active < args.min_active_pairs:
         print(
-            f"FAIL: {args.label} moved in only {active} of {len(crops) - 1} pairs — "
+            f"FAIL: {args.label} moved in only {active} of {judged} judged pairs — "
             "a surface that declares an animation is not animating",
             file=sys.stderr,
         )

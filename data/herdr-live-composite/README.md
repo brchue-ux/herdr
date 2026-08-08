@@ -65,6 +65,45 @@ An all-idle signal tray is engraved marks that never move, so the rig builds a
 throwaway git repo one commit ahead of *and* behind its upstream, which lights
 Push=Active and Sync=Attention. Without it a frozen tray would sail through.
 
+That same fact is why capture does not start when the terminal first paints.
+The badges go live only once the state behind them arrives — a git remote-status
+refresh, on a 1.5 s cadence and off-thread, landing on a client that is already
+up and drawing — so "something is on screen" is a readiness signal for painting
+and says nothing about whether the surface under test has begun animating. A
+capture started there can spend its first pairs on a genuinely static warm-up,
+out of a budget of seven of which five must move.
+
+Measured: over eight runs against one stable base, one failed 4/7 with three
+0 px pairs followed by four moving ones (run 31272863267) — a working tray,
+reported red. So `lab_wait_for_motion` waits for the assertion's own subject,
+using the assertion's own instrument, region and floor, and needs **three
+consecutive moving pairs** before capture begins. Three because a blip lasting
+one frame already yields two moving pairs, one arriving and one leaving.
+
+That gate is half of it, and run 31274414469 — a failure *with* the gate in
+place, same 4/7 shape — showed which half. What a readiness gate can see is the
+badges arriving: engraved marks becoming lit ones, one large change. What it
+cannot see is that the pulse then opens on an amplitude envelope. Measured per
+badge across that run's frames, the swing grows
+
+    0.4  ->  3.9  ->  5.7  ->  7.4  ->  7.5   luma
+
+so for about two seconds the animation is genuinely running and every pair still
+measures **0 px** against a per-channel floor of 24. There is nothing left to
+wait for — the fade-in *is* the animation — so no readiness signal can fix it.
+
+Hence the other half: capture runs to **12 frames** and `--tail-pairs 7` takes
+the verdict from the last seven, printing the earlier ones marked
+`(warm-up, not judged)`. The assertion stays exactly as strict as it was, 5 of
+7, on a window now guaranteed to sit past the fade rather than straddling it.
+
+Neither half can hide the defect it sits in front of. The gate warns on timeout
+and captures anyway, so a tray that never moves is still reported by the
+assertion with its numbers. And the tail window is where a freeze is *most*
+visible: a tray that animates and then stops — the #97 shape exactly — freezes
+inside the judged pairs, which is checked against real frames rather than
+asserted.
+
 ## The detectors prove they can fail, first
 
 `controls.sh` runs before the expensive job and needs no Rust build. It drives

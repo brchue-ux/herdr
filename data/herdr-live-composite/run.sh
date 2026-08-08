@@ -28,9 +28,24 @@ NS="${HERDR_NS:-herdr-dev}"
 ROOT="${CAPTURE_ROOT:-/tmp/herdr-composite-$BG}"
 OUT="${COMPOSITE_OUT:-$HERE/proof/$BG}"
 DISP="${COMPOSITE_DISPLAY:-:97}"
-FRAMES="${FRAMES:-8}"
+# Twelve rather than eight. The tray's pulse opens on an amplitude envelope, so
+# the first pairs after capture starts can measure a real animation that is
+# still too small to clear any floor worth setting; `--tail-pairs` below takes
+# the verdict from the last seven, and these four are the headroom that leaves.
+FRAMES="${FRAMES:-12}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-0.6}"
+# How many trailing pairs the tray verdict is taken from. Seven keeps the
+# assertion exactly as strict as it was — 5 of 7 — on a window that is now
+# guaranteed to sit past the fade-in rather than straddling it.
+TRAY_JUDGED_PAIRS="${TRAY_JUDGED_PAIRS:-7}"
 export LAB_TMP="$ROOT"
+
+# Resolved once, because the warm-up gate below and the tray assertion at the
+# bottom have to address the same pixels with the same floor. A gate that
+# measured a slightly different rectangle would open on something other than the
+# thing under test.
+TRAY_REGION="${TRAY_REGION:-0.0,0.0,0.18,0.06}"
+TRAY_MIN_PX="${TRAY_MIN_PX:-25}"
 
 lab_require Xvfb kitty import convert xdpyinfo compare git python3
 python3 -c 'import PIL' || { echo "python3 needs Pillow" >&2; exit 1; }
@@ -233,6 +248,44 @@ fi
 # draw them.
 sleep "${GRAPHICS_SETTLE:-6}"
 
+# ...and the tray starts moving later still. Everything above is a readiness
+# signal for *painting*: mean luma proves something reached the screen, and the
+# settle proves the pixel layers had time to land. Neither says anything about
+# whether the surface the first assertion is about has begun animating.
+#
+# It has not, necessarily. An idle tray is engraved marks that never travel; the
+# badges only start moving once the state behind them arrives, which here is a
+# git remote-status refresh (1.5 s cadence, off-thread) landing on a client that
+# is already up and drawing. So the tray's first animation frame can arrive
+# after capture has started — and the capture has a fixed budget of 7 frame
+# pairs, of which 5 must move.
+#
+# That is a measured failure, not a hypothesis. Run 31272863267 captured three
+# 0 px pairs and then moved on all four remaining ones: 4/7, red, on a build
+# whose tray was working perfectly. Eight runs against one stable base failed
+# once this way.
+#
+# So wait for the assertion's own subject, with the assertion's own instrument,
+# region and floor — and on timeout carry on and let the assertion speak, since
+# a tray that never moves at all is precisely the #97 defect and deserves the
+# per-pair numbers, not a gate's one-line complaint.
+#
+# This gate is half the answer, and the frames from run 31274414469 say which
+# half. What it can see is the badges *arriving* — engraved marks becoming lit
+# ones, a large one-time change. What it cannot see is that the pulse then opens
+# on an amplitude envelope: measured per badge across that run's eight frames,
+# the swing grows 0.4 -> 3.9 -> 5.7 -> 7.4 -> 7.5 luma, so the animation is
+# genuinely running for about two seconds while every pair still measures 0 px
+# against a per-channel floor of 24. No readiness signal fixes that, because
+# there is nothing to wait for that has not already happened — the fade-in is
+# the animation. `--tail-pairs` below is the other half.
+echo "--- waiting for the tray to start animating ---"
+if ! lab_wait_for_motion "$DISP" "$ROOT/.tray" "$TRAY_REGION" "$TRAY_MIN_PX" \
+     "${TRAY_WARMUP_PAIRS:-3}" "${TRAY_WARMUP_POLLS:-30}" "$FRAME_INTERVAL"; then
+  echo "WARNING: the tray never warmed up; capturing anyway so the assertion" >&2
+  echo "below reports the freeze with its per-pair measurements." >&2
+fi
+
 echo "--- capturing ---"
 lab_shoot "$DISP" "$OUT/steady.png"
 lab_shoot_series "$DISP" "$OUT" frame "$FRAMES" "$FRAME_INTERVAL"
@@ -294,10 +347,11 @@ echo "=================== ASSERTIONS (BACKGROUND=$BG) ==================="
 # move 74-75 px per 0.6 s pair, and did so on 7 of 7 pairs. 25 is comfortably
 # above nothing and far below the real signal, so a freeze is unambiguous.
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
-  --region "${TRAY_REGION:-0.0,0.0,0.18,0.06}" \
+  --region "$TRAY_REGION" \
   --label "signal tray badges" \
-  --min-changed-px "${TRAY_MIN_PX:-25}" \
-  --min-active-pairs "${MIN_PAIRS:-5}"
+  --min-changed-px "$TRAY_MIN_PX" \
+  --min-active-pairs "${MIN_PAIRS:-5}" \
+  --tail-pairs "$TRAY_JUDGED_PAIRS"
 
 # The control: a real process is writing to a real pty in the lower pane. If this
 # is still, the client is not receiving frames at all and the verdict above says
