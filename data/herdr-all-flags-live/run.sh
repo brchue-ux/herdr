@@ -58,10 +58,24 @@ env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH \
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
 
-for _ in $(seq 1 60); do
+# Wait on a real API call, and fail if it never answers. This loop used to
+# probe `api status` and merely `break` on success — so when the probe never
+# succeeded it silently fell through and the script carried on, which is how a
+# broken readiness check survived several green runs. A capture taken before
+# the server is up is exactly the empty capture the guards below exist to catch,
+# so it is better to fail here with the server log than to proceed and blame
+# the render.
+READY=0
+for _ in $(seq 1 80); do
   sleep 0.25
-  if "${E[@]}" api status >/dev/null 2>&1; then break; fi
+  if "${E[@]}" api snapshot >/dev/null 2>&1; then READY=1; break; fi
 done
+if [ "$READY" != "1" ]; then
+  echo "server never answered api snapshot; not capturing" >&2
+  tail -40 "$ROOT/server.log" >&2 || true
+  exit 1
+fi
+echo "server ready"
 
 echo "--- building the fleet ---"
 # A first mate, two second mates under it, workers under those: the shape every

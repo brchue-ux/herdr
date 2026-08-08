@@ -29,16 +29,33 @@ run_with() {
       HOME="$ROOT" XDG_CONFIG_HOME="$ROOT/.config" "$bin" "$@"
 }
 
+cleanup() {
+  if [ -f "$ROOT/server.pid" ]; then
+    kill "$(cat "$ROOT/server.pid")" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# Readiness is "the api socket answers a real call", not `api status`. An
+# earlier version probed with `api status` and it never returned 0 even with a
+# healthy server printing its banner and socket paths — run.sh had the same
+# probe, but its loop falls through instead of failing, so it proceeded anyway
+# and the broken probe stayed invisible until this script treated it as fatal.
+# `api snapshot` is used because the swap itself compares snapshots: if it
+# cannot answer, there is nothing to compare and waiting longer is pointless.
 start_server() {
   local bin="$1"
   run_with "$bin" server >>"$ROOT/server.log" 2>&1 &
   echo $! > "$ROOT/server.pid"
   for _ in $(seq 1 80); do
     sleep 0.25
-    if run_with "$bin" api status >/dev/null 2>&1; then return 0; fi
+    if run_with "$bin" api snapshot >/dev/null 2>&1; then return 0; fi
   done
-  echo "server built from $bin never became ready" >&2
+  echo "server built from $bin never answered api snapshot" >&2
+  echo "--- server log ---" >&2
   tail -40 "$ROOT/server.log" >&2 || true
+  echo "--- socket dir ---" >&2
+  ls -la "$ROOT/.config/$NS/" >&2 || true
   return 1
 }
 
