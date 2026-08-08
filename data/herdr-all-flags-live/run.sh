@@ -182,6 +182,20 @@ if [ "$SERVER_TERM" = "rio" ]; then
   esac
 fi
 
+# Golden comparison. The assertions above check that the right mechanisms fired;
+# this checks that the tree still looks the same. Baselines are per SERVER_TERM,
+# because the format branch legitimately differs between them.
+BASELINE="$HERE/baseline/steady-$SERVER_TERM.digest"
+mkdir -p "$HERE/baseline"
+if [ "${BASELINE_WRITE:-0}" = "1" ]; then
+  python3 "$HERE/digest.py" write "$OUT/steady.raw" "$OUT/steady.txt" "$BASELINE"
+  cp "$BASELINE" "$OUT/steady-$SERVER_TERM.digest"
+else
+  python3 "$HERE/digest.py" write "$OUT/steady.raw" "$OUT/steady.txt" \
+    "$OUT/steady-$SERVER_TERM.digest" >/dev/null
+  python3 "$HERE/digest.py" check "$OUT/steady.raw" "$OUT/steady.txt" "$BASELINE"
+fi
+
 # The analysis goes LAST on purpose. A job's log is read from the end, and the
 # grids above are thousands of lines: printed before this, the summary is the
 # first thing truncation removes, which is exactly what happened on run 1.
