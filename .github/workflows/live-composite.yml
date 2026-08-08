@@ -1,0 +1,234 @@
+name: Live compositing (real kitty under Xvfb)
+
+# Tier B live check: a real headless herdr server, a real `kitty` client on a
+# real X server, and assertions made on screenshots of what the terminal
+# actually put on screen.
+#
+# This is the gap the byte-level check names and cannot close. From
+# `.github/workflows/live-render-all-flags.yml`:
+#
+#     What it does not cover:
+#       How the terminal composites what it is sent — glow bleed, z ordering.
+#
+# Every regression that shipped in this area was invisible to `cargo test` and
+# `just check`, and each was found by hand-building a one-off Xvfb + kitty lab:
+#
+#   #94  animation timing/flicker  — found by measuring render rate on real Kitty
+#   #96  background z-order        — found by replaying a real byte stream through
+#                                    real kitty; the UI vanished when the z band
+#                                    was ignored. Exactly what a byte-level check
+#                                    cannot see, because the bytes were correct.
+#   #97  tray animation freeze     — found by measuring frame motion over time
+#
+# Two jobs, in order:
+#
+#   detectors  — no Rust build. Proves the two assertions can FAIL, on this
+#                runner, on this kitty, this minute: a synthetic wash at z=-2
+#                must pass legibility and the same wash at z=0 must be caught; a
+#                moving block must pass motion and a static one must be caught.
+#   composite  — the real thing, gated on the above. Two passes over one build,
+#                differing in exactly one config key.
+#
+# The self-test is not ceremony. The byte-level check's own history has a run
+# that went green on a 2,568-byte capture because the only assertion was "no
+# panic" — a check that has never been shown to fail is a tick with nothing
+# behind it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Path-filtered for the same reason the byte-level check is: the release
+    # build dominates the cost, and a change that cannot reach a pixel should
+    # not pay for it.
+    paths:
+      - 'src/ui.rs'
+      - 'src/ui/**'
+      - 'src/anim.rs'
+      - 'src/anim/**'
+      - 'src/kitty_graphics.rs'
+      - 'src/solar_system.rs'
+      - 'src/app/background_scene.rs'
+      - 'src/app/background_legibility.rs'
+      - 'src/app/signal_tray.rs'
+      - 'src/client/**'
+      - 'src/server/render_stream.rs'
+      - 'src/server/headless.rs'
+      - 'src/server/headless/**'
+      - 'src/config/sidebar.rs'
+      - 'src/config/model.rs'
+      - 'data/herdr-live-composite/**'
+      - '.github/workflows/live-composite.yml'
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  # Xvfb has no GPU. Saying so explicitly beats depending on the runner's GL
+  # stack falling back to llvmpipe on its own.
+  LIBGL_ALWAYS_SOFTWARE: '1'
+  # Pinned rather than apt's, because the terminal is the instrument here: a
+  # distro bump that changes how graphics are composited would look like a herdr
+  # regression. This is also the build every measurement in
+  # data/herdr-card-as-alpha-shape/blend-test/ was taken on.
+  KITTY_VERSION: 0.45.0
+  KITTY_SHA256: e6b70867a9a35181796775c79ebfbd82e00cf18c38b2bbdad73ff48d362380da
+
+concurrency:
+  group: live-composite-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detectors:
+    name: detectors can fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Cache kitty
+        id: kitty-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/kitty.app
+          key: kitty-${{ env.KITTY_VERSION }}-x86_64
+
+      - name: Install X server, ImageMagick, Pillow and kitty's runtime deps
+        run: |
+          sudo apt-get update
+          # fonts-dejavu is not optional: kitty needs a monospace face, and
+          # image_card::is_available needs a proportional one found at runtime —
+          # herdr ships neither, and without them the pixel path is silently off.
+          #
+          # Distro `kitty` is installed for its *dependency closure* only — the
+          # upstream binary bundle ships its own Python and extensions but links
+          # against the host's X and GL libraries, and a bare runner has neither
+          # (it fails at `dlopen kitty.glfw-x11.so: libxcb-xkb.so.1`). The pinned
+          # bundle goes ahead of it on PATH, and the version is printed before
+          # use so which binary ran is never in doubt.
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11-utils imagemagick python3-pil fonts-dejavu \
+            kitty libxcb-xkb1 libxkbcommon-x11-0 libgl1-mesa-dri libglx-mesa0
+
+      - name: Install kitty ${{ env.KITTY_VERSION }}
+        if: steps.kitty-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/kitty.txz \
+            "https://github.com/kovidgoyal/kitty/releases/download/v${KITTY_VERSION}/kitty-${KITTY_VERSION}-x86_64.txz"
+          echo "${KITTY_SHA256}  /tmp/kitty.txz" | sha256sum -c -
+          mkdir -p "$HOME/kitty.app"
+          tar -xJf /tmp/kitty.txz -C "$HOME/kitty.app"
+
+      - name: Put kitty on PATH
+        run: |
+          echo "$HOME/kitty.app/bin" >> "$GITHUB_PATH"
+
+      - name: Prove the detectors discriminate
+        run: |
+          command -v kitty
+          kitty --version
+          bash data/herdr-live-composite/controls.sh
+
+      - name: Upload control shots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: composite-detector-controls
+          path: /tmp/herdr-composite-controls/*.png
+          if-no-files-found: warn
+
+  composite:
+    name: live compositing
+    needs: detectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Cache kitty
+        id: kitty-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/kitty.app
+          key: kitty-${{ env.KITTY_VERSION }}-x86_64
+
+      - name: Install build tools, X server, ImageMagick and fonts
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          # See the detectors job for why distro kitty is here: dependency
+          # closure for the pinned upstream bundle, which goes first on PATH.
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build xvfb x11-utils imagemagick python3-pil \
+            fonts-dejavu fonts-liberation \
+            kitty libxcb-xkb1 libxkbcommon-x11-0 libgl1-mesa-dri libglx-mesa0
+
+      - name: Install kitty ${{ env.KITTY_VERSION }}
+        if: steps.kitty-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/kitty.txz \
+            "https://github.com/kovidgoyal/kitty/releases/download/v${KITTY_VERSION}/kitty-${KITTY_VERSION}-x86_64.txz"
+          echo "${KITTY_SHA256}  /tmp/kitty.txz" | sha256sum -c -
+          mkdir -p "$HOME/kitty.app"
+          tar -xJf /tmp/kitty.txz -C "$HOME/kitty.app"
+
+      - name: Put kitty on PATH
+        run: |
+          echo "$HOME/kitty.app/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: live-composite
+
+      # Release, for the same reason the byte-level check is: the captures are
+      # wall-clock settles, so a debug build's card rasterisation and PNG encode
+      # decide how much of the render lands inside them. A debug build there
+      # produced 2,568 bytes against 5,696,056 from the same captures.
+      - name: Build
+        run: cargo build --release --locked
+
+      # Pass 1. Everything on except the whole-terminal scene: this is the
+      # reference the legibility masks come from.
+      - name: Live pass — background off
+        env:
+          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
+          HERDR_NS: herdr
+          BACKGROUND: off
+          COMPOSITE_DISPLAY: ':97'
+        run: bash data/herdr-live-composite/run.sh
+
+      # Pass 2. The same fleet, the same geometry, one config key different.
+      - name: Live pass — background on
+        env:
+          HERDR_BIN: ${{ github.workspace }}/target/release/herdr
+          HERDR_NS: herdr
+          BACKGROUND: on
+          COMPOSITE_DISPLAY: ':98'
+        run: bash data/herdr-live-composite/run.sh
+
+      - name: Assert text survives the background
+        run: bash data/herdr-live-composite/compare.sh
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: live-composite-screenshots
+          path: data/herdr-live-composite/proof/
+          if-no-files-found: warn

@@ -1,0 +1,47 @@
+# Config for the live compositing capture. `@PERSISTENT_BACKGROUND@` is the only
+# thing run.sh substitutes, so the two passes differ in exactly one key and the
+# comparison between them is a real counterfactual rather than two loosely
+# similar screenshots.
+#
+# `onboarding = false` matters: the setup modal covers the screen, and dismissing
+# it needs kitty remote control, a listening socket and a synthetic keypress.
+# Turning it off in the lab's own config removes all of that.
+onboarding = false
+
+[experimental]
+allow_nested = true
+kitty_graphics = true
+# Pixel cards. Off, the sidebar is characters and there is nothing composited to
+# look at.
+sidebar_card_shapes = true
+# An opaque wash in the same negative-z band as the whole-terminal scene, with a
+# smaller blast radius. On in both passes: it is part of what the sidebar
+# animation assertion watches, and holding it constant keeps the background the
+# only variable between passes.
+sidebar_particle_field = true
+# The whole-terminal scene. This is the key under test.
+persistent_background = @PERSISTENT_BACKGROUND@
+# Hand pixels over as a local file rather than base64 in the stream. Real kitty
+# on the same machine, so the transport is genuinely exercised.
+kitty_graphics_local_transport = true
+
+[ui]
+sidebar_width = 42
+
+[ui.sidebar.animation]
+row_enter = "wipe"
+row_enter_ms = 400
+row_exit = "wipe"
+row_exit_ms = 400
+row_motion = "slide"
+view_switch = "dissolve"
+view_switch_ms = 400
+
+[ui.sidebar.cards]
+pulse = true
+wash = true
+wash_ms = 400
+stage_hue = true
+
+[ui.sidebar.notifications]
+enabled = true
