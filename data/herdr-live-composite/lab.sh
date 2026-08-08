@@ -159,11 +159,19 @@ lab_shoot_series() {
   echo "captured $count frames into $dir/$prefix-*.png"
 }
 
+# Every branch is guarded and the function always succeeds. Callers install this
+# as an EXIT trap under `set -e`, where a bare `[ -n "$x" ] && kill` that finds
+# nothing to kill aborts the rest of the handler — so the X server survives the
+# script that started it, and in run.sh the server would never be asked to stop.
 lab_stop() {
-  [ -n "${LAB_KITTY_PID:-}" ] && kill "$LAB_KITTY_PID" 2>/dev/null
-  [ -n "${LAB_XVFB_PID:-}" ] && kill "$LAB_XVFB_PID" 2>/dev/null
-  wait "${LAB_KITTY_PID:-}" 2>/dev/null
-  wait "${LAB_XVFB_PID:-}" 2>/dev/null
+  if [ -n "${LAB_KITTY_PID:-}" ]; then
+    kill "$LAB_KITTY_PID" 2>/dev/null || true
+    wait "$LAB_KITTY_PID" 2>/dev/null || true
+  fi
+  if [ -n "${LAB_XVFB_PID:-}" ]; then
+    kill "$LAB_XVFB_PID" 2>/dev/null || true
+    wait "$LAB_XVFB_PID" 2>/dev/null || true
+  fi
   LAB_KITTY_PID=""
   LAB_XVFB_PID=""
   return 0

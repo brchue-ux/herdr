@@ -65,6 +65,9 @@ permissions:
 
 env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
+  # Xvfb has no GPU. Saying so explicitly beats depending on the runner's GL
+  # stack falling back to llvmpipe on its own.
+  LIBGL_ALWAYS_SOFTWARE: '1'
   # Pinned rather than apt's, because the terminal is the instrument here: a
   # distro bump that changes how graphics are composited would look like a herdr
   # regression. This is also the build every measurement in
@@ -93,14 +96,22 @@ jobs:
           path: ~/kitty.app
           key: kitty-${{ env.KITTY_VERSION }}-x86_64
 
-      - name: Install X server, ImageMagick and Pillow
+      - name: Install X server, ImageMagick, Pillow and kitty's runtime deps
         run: |
           sudo apt-get update
           # fonts-dejavu is not optional: kitty needs a monospace face, and
           # image_card::is_available needs a proportional one found at runtime —
           # herdr ships neither, and without them the pixel path is silently off.
+          #
+          # Distro `kitty` is installed for its *dependency closure* only — the
+          # upstream binary bundle ships its own Python and extensions but links
+          # against the host's X and GL libraries, and a bare runner has neither
+          # (it fails at `dlopen kitty.glfw-x11.so: libxcb-xkb.so.1`). The pinned
+          # bundle goes ahead of it on PATH, and the version is printed before
+          # use so which binary ran is never in doubt.
           sudo apt-get install -y --no-install-recommends \
-            xvfb x11-utils imagemagick python3-pil fonts-dejavu
+            xvfb x11-utils imagemagick python3-pil fonts-dejavu \
+            kitty libxcb-xkb1 libxkbcommon-x11-0 libgl1-mesa-dri libglx-mesa0
 
       - name: Install kitty ${{ env.KITTY_VERSION }}
         if: steps.kitty-cache.outputs.cache-hit != 'true'
@@ -117,6 +128,7 @@ jobs:
 
       - name: Prove the detectors discriminate
         run: |
+          command -v kitty
           kitty --version
           bash data/herdr-live-composite/controls.sh
 
@@ -159,9 +171,12 @@ jobs:
         run: |
           sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
           sudo apt-get update
+          # See the detectors job for why distro kitty is here: dependency
+          # closure for the pinned upstream bundle, which goes first on PATH.
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build xvfb x11-utils imagemagick python3-pil \
-            fonts-dejavu fonts-liberation
+            fonts-dejavu fonts-liberation \
+            kitty libxcb-xkb1 libxkbcommon-x11-0 libgl1-mesa-dri libglx-mesa0
 
       - name: Install kitty ${{ env.KITTY_VERSION }}
         if: steps.kitty-cache.outputs.cache-hit != 'true'
