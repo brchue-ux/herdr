@@ -22,6 +22,7 @@ use crate::protocol::{
     ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
     MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
+use crate::server::render_stream::DelegatedSurface;
 
 /// Minimum accepted attached client size.
 ///
@@ -178,6 +179,31 @@ impl ClientRenderWriter {
             ClientRenderTarget::Channel(sender) => sender.try_send(data),
         }
     }
+
+    /// Queues a scene for a surface this client draws itself.
+    ///
+    /// Its own slot rather than the render slot: a delegating client is sent a
+    /// card scene, a tray scene *and* a frame every render pass, and the render
+    /// slot holds one message. Sharing it meant whichever of the three reached
+    /// it second and third was dropped — measured at a third of all tray scenes
+    /// against a real client on an idle fleet — while the pass that produced
+    /// them recorded them as carried.
+    ///
+    /// Latest-wins per surface, like the render slot, and for the same reason:
+    /// the client rasterises a scene against its own cache, so a newer scene
+    /// supersedes an undrained older one and the delta it produces is still
+    /// correct. What is not survivable is dropping the *newest*.
+    pub(crate) fn try_send_scene(
+        &self,
+        surface: DelegatedSurface,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => queue.try_send_scene(surface, data),
+            #[cfg(test)]
+            ClientRenderTarget::Channel(sender) => sender.try_send(data),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -189,9 +215,23 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    /// Latest undrained scene per delegated surface. Separate slots so the two
+    /// scenes and the frame a single render pass produces cannot evict each
+    /// other — see [`ClientRenderWriter::try_send_scene`].
+    cards: Option<Vec<u8>>,
+    tray: Option<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
+}
+
+impl ClientWriterQueueState {
+    fn scene_slot(&mut self, surface: DelegatedSurface) -> &mut Option<Vec<u8>> {
+        match surface {
+            DelegatedSurface::Cards => &mut self.cards,
+            DelegatedSurface::SignalTray => &mut self.tray,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -245,11 +285,42 @@ impl ClientWriterQueue {
         Ok(())
     }
 
+    /// Replaces this surface's undrained scene, if any, with a newer one.
+    ///
+    /// Unlike the render slot this never reports `Full`: a scene the client has
+    /// not been sent yet is superseded by the one that replaces it, and the
+    /// caller's only correct response to `Full` would have been to send this
+    /// same newer scene anyway.
+    fn try_send_scene(
+        &self,
+        surface: DelegatedSurface,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive {
+            return Err(TrySendError::Disconnected(data));
+        }
+        *state.scene_slot(surface) = Some(data);
+        self.ready.notify_one();
+        Ok(())
+    }
+
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
+            }
+            // Scenes before the frame: the client splices what it rasterised
+            // from them into the next frame it receives, so a scene that
+            // arrives after its carrier waits a whole pass to be drawn.
+            if let Some(data) = state.cards.take() {
+                self.ready.notify_one();
+                return Some(ClientWriteItem::Render(data));
+            }
+            if let Some(data) = state.tray.take() {
+                self.ready.notify_one();
+                return Some(ClientWriteItem::Render(data));
             }
             if let Some(data) = state.render.take() {
                 self.ready.notify_one();
@@ -967,6 +1038,101 @@ mod tests {
         assert!(matches!(
             writer.render.try_send(second),
             Err(TrySendError::Full(_))
+        ));
+    }
+
+    /// One render pass of a delegating client produces a card scene, a tray
+    /// scene and a frame. All three have to survive it.
+    ///
+    /// They shared the render slot, which holds one message, so the second and
+    /// third were dropped whenever the writer had not drained between them —
+    /// measured against a real client as a third of every tray scene the server
+    /// built, on an idle fleet over a loopback bridge.
+    #[test]
+    fn a_pass_of_two_scenes_and_a_frame_all_reach_the_writer() {
+        let (writer, queue) = test_queue_writer();
+        let cards = frame_server_message(&ServerMessage::CardScene { bytes: vec![1] });
+        let tray = frame_server_message(&ServerMessage::TrayScene { bytes: vec![2] });
+        let frame = frame_server_message(&ServerMessage::WindowTitle {
+            title: Some("frame".into()),
+        });
+
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::Cards, cards.clone())
+            .expect("card scene queued");
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::SignalTray, tray.clone())
+            .expect("tray scene queued");
+        writer.render.try_send(frame.clone()).expect("frame queued");
+
+        // Scenes first: the client splices what it rasterised from them into
+        // the next frame it receives, so a scene behind its carrier is a scene
+        // that waits a whole pass to be drawn.
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(cards)));
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(tray)));
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(frame)));
+    }
+
+    /// A surface's undrained scene is replaced by its own newer one, and by
+    /// nothing else.
+    #[test]
+    fn a_newer_scene_supersedes_its_own_surface_only() {
+        let (writer, queue) = test_queue_writer();
+        let stale = frame_server_message(&ServerMessage::CardScene { bytes: vec![1] });
+        let fresh = frame_server_message(&ServerMessage::CardScene { bytes: vec![2] });
+        let tray = frame_server_message(&ServerMessage::TrayScene { bytes: vec![3] });
+
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::Cards, stale)
+            .expect("stale card scene queued");
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::SignalTray, tray.clone())
+            .expect("tray scene queued");
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::Cards, fresh.clone())
+            .expect("fresh card scene queued");
+
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(fresh)));
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(tray)));
+    }
+
+    /// Control still outranks everything, including scenes.
+    #[test]
+    fn control_is_drained_before_a_delegated_scene() {
+        let (writer, queue) = test_queue_writer();
+        let scene = frame_server_message(&ServerMessage::CardScene { bytes: vec![1] });
+        let control = frame_server_message(&ServerMessage::ReloadSoundConfig);
+
+        writer
+            .render
+            .try_send_scene(DelegatedSurface::Cards, scene.clone())
+            .expect("scene queued");
+        writer
+            .control
+            .send(control.clone())
+            .expect("control queued");
+
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(control)));
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Render(scene)));
+    }
+
+    /// A scene queued for a client whose writer has gone reports it, rather
+    /// than being swallowed — the render pass folds a scene into its frame's
+    /// identity only when the scene was actually queued.
+    #[test]
+    fn a_scene_for_a_dead_writer_is_reported() {
+        let (writer, queue) = test_queue_writer();
+        queue.close_writer();
+        assert!(matches!(
+            writer
+                .render
+                .try_send_scene(DelegatedSurface::Cards, vec![1, 2, 3]),
+            Err(TrySendError::Disconnected(_))
         ));
     }
 

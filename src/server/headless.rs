@@ -4139,12 +4139,18 @@ impl HeadlessServer {
     /// Hands one delegated surface's scene to a client, and folds it into the
     /// identity of the frame that pass is about to prepare.
     ///
-    /// The fold happens for every scene the pass delegates, before framing and
-    /// regardless of whether the framed message reaches the wire: the frame
-    /// prepared afterwards is the only carrier for the Kitty bytes the client
-    /// rasterises from this scene, so what the pass delegated is part of what
-    /// makes that frame worth sending at all. See
+    /// The fold is what makes the frame prepared afterwards worth sending at
+    /// all — it is the only carrier for the Kitty bytes the client rasterises
+    /// from this scene, so a pass whose only change was inside a delegated
+    /// surface would otherwise look identical and be skipped. See
     /// `ClientRenderState::pending_scenes`.
+    ///
+    /// It happens only when the scene actually reached this client's queue.
+    /// Folding it unconditionally meant a scene that never made it still
+    /// marked itself delivered once the carrier committed, so the next pass —
+    /// whose scene is unchanged and therefore rasterises to nothing — could not
+    /// put it back, and the surface stayed as it was until something else
+    /// moved it.
     fn delegate_scene(
         client_id: u64,
         writer: &crate::server::client_transport::ClientWriter,
@@ -4153,16 +4159,30 @@ impl HeadlessServer {
         scene_bytes: Vec<u8>,
         into_message: fn(Vec<u8>) -> ServerMessage,
     ) {
-        delegated.note_scene(surface, &scene_bytes);
         crate::render_prof::event("full_render.delegated_scene");
+        let mut delivered = *delegated;
+        delivered.note_scene(surface, &scene_bytes);
         match Self::frame_server_message_with_max(
             &into_message(scene_bytes),
             MAX_GRAPHICS_FRAME_SIZE,
         ) {
-            Ok(framed) => {
-                let _ = writer.render.try_send(framed);
-            }
+            Ok(framed) => match writer.render.try_send_scene(surface, framed) {
+                Ok(()) => {
+                    *delegated = delivered;
+                }
+                Err(err) => {
+                    crate::render_prof::event("full_render.delegated_scene_dropped");
+                    debug!(
+                        client_id,
+                        ?surface,
+                        disconnected =
+                            matches!(err, std::sync::mpsc::TrySendError::Disconnected(_)),
+                        "delegated scene not queued for client"
+                    );
+                }
+            },
             Err(err) => {
+                crate::render_prof::event("full_render.delegated_scene_dropped");
                 warn!(
                     client_id,
                     ?surface,

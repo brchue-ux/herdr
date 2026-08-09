@@ -282,6 +282,29 @@ that never move, so a motion measurement on a fresh fleet measures nothing —
 `data/herdr-live-composite/run.sh` builds a repo one commit ahead of *and*
 behind its upstream to light Push and Sync.
 
+### Exercising the `--remote` client path without a second machine
+
+Neither standing rig covers the remote bridge, and it is a genuinely different
+render path: `client::wants_client_rasterized_cards` /
+`wants_client_rasterized_signal_tray` are `cfg!(windows) && is_remote_client_process()`,
+so a Windows `--remote` client is sent `CardScene`/`TrayScene` **tokens** and
+rasterises the sidebar itself instead of receiving pixels. Several whole
+classes of bug reach only that population.
+
+`herdr --remote <host>` is only three things (`remote::bridge`): a local socket,
+`ssh <host> "herdr --session S remote-client-bridge"` relaying its stdio, and a
+plain `herdr client` pointed at that socket. So the path runs locally without
+ssh: relay a unix socket to `remote-client-bridge`'s stdio yourself, and launch
+the client with `HERDR_CLIENT_SOCKET_PATH`, `HERDR_RENDER_ENCODING=terminal-ansi`,
+`HERDR_REMOTE_KEYBINDINGS`, and the two `HERDR_CLIENT_RASTERIZED_*` overrides
+that exist precisely because the real gate needs Windows hardware. Put the relay
+on the wire and it also becomes the instrument: framing is
+`[u32 LE length][bincode payload]` and payload byte 0 is the `ServerMessage`
+variant index, so a few lines of decoding give an exact record of what reached
+the client, to compare against what the server's `render_prof` counters say it
+sent. That comparison is what found a third of every `TrayScene` being dropped;
+neither side alone showed it.
+
 ## Server state that has to survive a restart
 
 Two different boundaries carry server-owned state, and they are not
