@@ -2515,6 +2515,39 @@ impl AppState {
         lifecycle
     }
 
+    /// Whether Herdr's own pixel surfaces reach a screen at all on this host.
+    ///
+    /// The two *state* facts every delivery gate already requires before a
+    /// single graphics byte is encoded — `src/server/headless.rs` for the split
+    /// server's per-client passes and its two scene messages, `src/app/mod.rs`
+    /// for a monolithic Herdr. The third term those gates carry is the cell
+    /// size, which is deliberately not folded in here: each render pass is
+    /// handed its own client's cell, and `Self::host_cell_size` is only the
+    /// foreground one, so the cell stays where the pass that owns it can answer
+    /// for it.
+    ///
+    /// # Why every fallback predicate has to read this too
+    ///
+    /// A surface with a character form — the tray's marks
+    /// ([`crate::ui::sidebar::tray`]), the tree's character cards
+    /// ([`crate::ui::sidebar::image_card`]) — decides whether to draw it by
+    /// asking whether pixels are covering the same cells. When that question is
+    /// spelled out separately from the one that actually gates delivery the two
+    /// drift, and the state where they disagree renders as a **hole**: the text
+    /// suppressed in favour of pixels, and the pixels withheld.
+    ///
+    /// [`Self::kitty_graphics_capability_confirmed`] is exactly where they had
+    /// drifted. It is the user's opt-in *and* the host's answer, and only the
+    /// opt-in had reached the producers — so on every terminal that does not
+    /// speak the Kitty Graphics Protocol, which never answers the probe and so
+    /// sits in this state permanently, the artwork was rasterised, the marks and
+    /// the character cards stood down for it, and no client was ever sent it.
+    /// Both halves read this one predicate now, so neither can move without the
+    /// other.
+    pub(crate) fn host_paints_pixel_surfaces(&self) -> bool {
+        self.kitty_graphics_enabled && self.kitty_graphics_capability_confirmed
+    }
+
     /// True when the persistent whole-terminal background scene may be drawn.
     ///
     /// Three facts, and the third is the one that was missing: the feature is

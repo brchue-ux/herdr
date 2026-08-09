@@ -1079,7 +1079,11 @@ impl App {
         // cell differs would be shown a crop of a raster built for someone
         // else's grid. See `AppState::shared_raster_cell_size`.
         let cell = self.state.shared_raster_cell_size();
-        if !self.state.kitty_graphics_enabled || !cell.is_known() {
+        // `host_paints_pixel_surfaces` and not `kitty_graphics_enabled` alone:
+        // this artwork is what `tray::artwork_covers_grid` stands the fallback
+        // marks down for, so building it on a host the delivery gate will not
+        // send it to draws the tray as a hole. See the predicate's own doc.
+        if !self.state.host_paints_pixel_surfaces() || !cell.is_known() {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
             self.state.signal_tray_published.forget();
@@ -2467,12 +2471,105 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.sidebar_signal_tray.enabled = true;
         app.state.kitty_graphics_enabled = true;
+        // The other half of `AppState::host_paints_pixel_surfaces`: without the
+        // host's answer to the capability probe this is a tray that draws its
+        // character marks, and none of the artwork below it is built.
+        app.state.kitty_graphics_capability_confirmed = true;
         app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 9,
             height_px: 18,
         };
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 30, 40);
         app
+    }
+
+    /// A host that never answered the capability probe draws the marks, not a
+    /// hole.
+    ///
+    /// The gap PR #101's own body named and left: "the character fallbacks are
+    /// gated on different predicates than the pixels ... so when the two
+    /// disagree a surface renders as a **hole** rather than degrading to text."
+    /// This is that disagreement, and it is not an edge case — it is the
+    /// permanent state of every terminal that does not speak the Kitty Graphics
+    /// Protocol, because such a terminal never answers
+    /// `query_kitty_graphics_capability` and so never confirms.
+    ///
+    /// Before the fix: `refresh_signal_tray_graphics` asked only
+    /// `kitty_graphics_enabled`, rasterised the badges, and
+    /// `tray::artwork_covers_grid` saw artwork and stood the eight marks down —
+    /// while both delivery gates (`server::headless`'s per-client pass and
+    /// `App::run`'s own paint) required `kitty_graphics_capability_confirmed`
+    /// too and encoded nothing at all. Eight empty slots under a live header.
+    ///
+    /// Asserted end to end rather than on the predicate, because the predicate
+    /// agreeing with itself is exactly what the bug looked like: the app loop
+    /// runs, then the real renderer draws, then the delivery conjunction is
+    /// evaluated as the two gates spell it.
+    #[test]
+    fn a_host_that_never_confirmed_graphics_draws_the_marks_and_not_a_hole() {
+        use crate::app::fleet_signals::FleetSignal;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = tray_app();
+        app.state.kitty_graphics_capability_confirmed = false;
+        assert!(
+            app.state.kitty_graphics_enabled && app.state.host_cell_size.is_known(),
+            "the opt-in and the cell are what make this the interesting state"
+        );
+
+        app.observe_signal_tray(std::time::Instant::now(), false);
+
+        let area = app.state.view.sidebar_rect;
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("backend");
+        terminal
+            .draw(|frame| {
+                crate::ui::sidebar::tray::render(
+                    &app.state,
+                    frame,
+                    crate::ui::sidebar::sidebar_content_rect(area),
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let marks = FleetSignal::ALL
+            .into_iter()
+            .filter(|signal| {
+                (0..area.height)
+                    .any(|y| (0..area.width).any(|x| buffer[(x, y)].symbol() == signal.mark()))
+            })
+            .count();
+
+        // The delivery conjunction, spelled as `server::headless` and
+        // `App::run` spell it. Both now read the same predicate the fallback
+        // does, so this is the fact the marks were suppressed for.
+        let pixels_delivered =
+            app.state.host_paints_pixel_surfaces() && app.state.host_cell_size.is_known();
+        assert!(
+            !pixels_delivered,
+            "no client can be sent graphics without a confirmed capability, so \
+             this fixture is not the divergent state"
+        );
+        assert!(
+            app.state.signal_tray_graphics.is_none(),
+            "artwork was rasterised for a host no delivery gate will send it to"
+        );
+        assert_eq!(
+            marks,
+            FleetSignal::COUNT,
+            "the tray drew {marks} of {} marks with no pixels coming: a blank \
+             hole where the fallback belongs",
+            FleetSignal::COUNT
+        );
+
+        // And the moment the probe is answered the tray changes sides, so this
+        // is a fallback and not a feature switch.
+        app.state.kitty_graphics_capability_confirmed = true;
+        app.observe_signal_tray(std::time::Instant::now(), false);
+        assert!(
+            app.state.signal_tray_graphics.is_some(),
+            "a host that confirmed the capability was left on the marks"
+        );
     }
 
     /// A fleet whose cards are drawn as pixels, so the card animations have
@@ -2482,6 +2579,7 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.sidebar_card_shapes = true;
         app.state.kitty_graphics_enabled = true;
+        app.state.kitty_graphics_capability_confirmed = true;
         app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 9,
             height_px: 18,

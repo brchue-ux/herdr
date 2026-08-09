@@ -4335,10 +4335,7 @@ impl HeadlessServer {
             let wants_client_rasterized_cards = client.wants_client_rasterized_cards;
             let wants_client_rasterized_signal_tray = client.wants_client_rasterized_signal_tray;
             let embedded_surfaces = client.embedded_surfaces();
-            if is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && self.app.state.kitty_graphics_capability_confirmed
-                && cell_size.is_known()
+            if is_app_client && self.app.state.host_paints_pixel_surfaces() && cell_size.is_known()
             {
                 if graphics_surface_reset_pending {
                     frame.graphics = next_graphics_cache.clear_bytes();
@@ -4378,8 +4375,7 @@ impl HeadlessServer {
             // CardScene, instead of the pixels this loop just withheld above.
             if wants_client_rasterized_cards
                 && is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && self.app.state.kitty_graphics_capability_confirmed
+                && self.app.state.host_paints_pixel_surfaces()
                 && cell_size.is_known()
             {
                 if let Some(scene) = crate::ui::sidebar::image_card::build_card_scene(
@@ -4411,8 +4407,7 @@ impl HeadlessServer {
             // and they are regenerated on different keys.
             if wants_client_rasterized_signal_tray
                 && is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && self.app.state.kitty_graphics_capability_confirmed
+                && self.app.state.host_paints_pixel_surfaces()
                 && cell_size.is_known()
             {
                 if let Some(scene) = crate::ui::build_signal_tray_scene(&self.app.state) {
@@ -7315,6 +7310,10 @@ next_tab = ""
         server.app.state.active = Some(0);
         server.app.state.sidebar_signal_tray.enabled = true;
         server.app.state.kitty_graphics_enabled = true;
+        // A host that answered the capability probe, which is the other half of
+        // `AppState::host_paints_pixel_surfaces`. Without it the tray draws its
+        // character marks and there is no artwork to assert on.
+        server.app.state.kitty_graphics_capability_confirmed = true;
         server.app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 9,
             height_px: 18,
@@ -10728,6 +10727,7 @@ next_tab = ""
 
         let (mut server, _client_rx, _pane_id) = retained_test_server(b"card");
         server.app.state.kitty_graphics_enabled = true;
+        server.app.state.kitty_graphics_capability_confirmed = true;
 
         let mut laid_out_against = Vec::new();
         for cols in [100u16, 160, 220, 300] {
@@ -10794,6 +10794,7 @@ next_tab = ""
     async fn retained_pty_update_allows_kitty_enabled_empty_graphics_cache() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         server.app.state.kitty_graphics_enabled = true;
+        server.app.state.kitty_graphics_capability_confirmed = true;
         server
             .clients
             .get_mut(&1)
@@ -10828,6 +10829,7 @@ next_tab = ""
     async fn retained_pty_update_declines_when_graphics_cache_has_content() {
         let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
         server.app.state.kitty_graphics_enabled = true;
+        server.app.state.kitty_graphics_capability_confirmed = true;
         let client = server.clients.get_mut(&1).unwrap();
         client.set_cell_size(crate::kitty_graphics::HostCellSize {
             width_px: 10,
@@ -10870,6 +10872,7 @@ next_tab = ""
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
         server.app.state.kitty_graphics_enabled = true;
+        server.app.state.kitty_graphics_capability_confirmed = true;
 
         let cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 10,

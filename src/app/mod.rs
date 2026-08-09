@@ -1375,7 +1375,7 @@ impl App {
                         frame,
                     );
                 })?;
-                if kitty_graphics_enabled && self.state.kitty_graphics_capability_confirmed {
+                if self.state.host_paints_pixel_surfaces() {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
                         &self.terminal_runtimes,
