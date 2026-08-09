@@ -45,6 +45,7 @@
 mod canvas;
 mod font;
 mod measured;
+mod summary;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -82,7 +83,49 @@ use crate::ui::sidebar::AgentPanelEntry;
 /// one number on every rank, and a card's size says *what it is* in one
 /// dimension rather than in two that disagreed about which of depth and rank
 /// they were reading.
-const BASE_HEIGHT_PX: f32 = 68.0;
+///
+/// # The 20% trim of 2026-08-09, and where it was taken from
+///
+/// This was 68.0. The captain, looking at the shipped tree:
+///
+/// > *"the cards a still a bit too big, need to be trimmed like 20% all
+/// > respectively. i dont think I want the card sizes changing, that ruins
+/// > symmetry and truncates titles. herdr will just need to be better about
+/// > what it chooses to display as current working summary."*
+///
+/// 68 × 0.8 = 54.4, and it is one number rather than a per-rank cut precisely
+/// because of the second sentence: the ladder is still width and only width
+/// (`super::rank_right_inset` is untouched), so every card shrinks by the same
+/// fifth and the rank steps between them are exactly the ones that were there
+/// before.
+///
+/// **The trim comes out of the card's air, not out of its type.** The type is
+/// fixed by legibility ([`TITLE_PX`]) and the block it sets is the same 45.1 px
+/// on every face this runs on — `ab_glyph` normalises a face's line height to
+/// the scale it is asked for, so two 14 px lines at [`TITLE_LEADING`] plus a
+/// tidbit at [`TIDBIT_GAP`] is a constant, not a per-face measurement. So:
+///
+/// ```text
+///                 nominal   content block   air per side   min pad
+///   before          68.0        45.11           11.45         3.0
+///   after           54.4        45.11            4.65         3.0
+/// ```
+///
+/// That is the whole reason the trim is a single constant and composes with
+/// [`content_floor_px`] instead of fighting it: the floor is 51.11 px, the
+/// trimmed nominal is 54.4 px, so the floor stays a *floor* — it does not
+/// engage, the card is not pushed back up, and [`MIN_VERTICAL_PAD_PX`] is still
+/// not reached. Trim any further and the floor starts clamping, at which point
+/// the number here stops meaning anything; `the_trim_is_air_and_not_the_floor`
+/// holds that boundary.
+///
+/// Nothing about the title's capacity moved, which is the answer to *"truncates
+/// titles"*: a title's room is lines × column width, the line count is
+/// unchanged at [`TITLE_LINES`], and the column is measured in from a nominal
+/// that just got smaller — [`measured::PAD`] and [`measured::PAD_RIGHT`] are
+/// fractions of it — so every card came out of this trim about 6 px *wider* in
+/// the text. See `the_trim_did_not_cost_the_title_a_single_pixel`.
+const BASE_HEIGHT_PX: f32 = 54.4;
 
 /// The title's type size, on every card.
 ///
@@ -1652,22 +1695,86 @@ struct RailChevron {
     group: GroupChevron,
 }
 
-/// Whether `title` sets whole — every word, no line overrunning — in `avail`,
+/// Whether `text` sets whole — every word, no line overrunning — in `avail`,
 /// which is `(the first line, every line after it)`.
-fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
+///
+/// Exactly as published: this asks nothing of [`summary`], because it is the
+/// predicate [`fit_title`] uses to test one rung of the ladder at a time.
+fn sets_whole(font: &CardFont, text: &str, avail: (f32, f32)) -> bool {
     if avail.0 <= 1.0 || avail.1 <= 1.0 {
         return false;
     }
-    let lines = wrap_ragged(font, title, TITLE_PX, avail, TITLE_LINES);
+    let lines = wrap_ragged(font, text, TITLE_PX, avail, TITLE_LINES);
     let words = lines
         .iter()
         .map(|line| line.split_whitespace().count())
         .sum::<usize>();
-    words == title.split_whitespace().count()
+    words == text.split_whitespace().count()
         && lines.iter().enumerate().all(|(index, line)| {
             let width = if index == 0 { avail.0 } else { avail.1 };
             font.width(line, TITLE_PX) <= width + 0.5
         })
+}
+
+/// The lines a card sets its summary in, and what that cost.
+struct FittedTitle {
+    lines: Vec<String>,
+    /// Which rung of [`summary::candidates`] set whole, or `None` when none
+    /// did and the lines below are a greedy wrap of the lossless rung.
+    ///
+    /// Ordered, and compared rather than merely tested: rung 0 is the
+    /// publisher's own words untouched and every rung after it has given
+    /// something up, so "which rung" is how much of the summary this width
+    /// cost. [`text_column`] reads exactly that to decide whether the state
+    /// chip is affordable.
+    rung: Option<usize>,
+}
+
+impl FittedTitle {
+    /// A total order over "how well did this fit", worst last, so two widths
+    /// can be compared with `<`. Not fitting at all is worse than any rung.
+    fn cost(&self) -> usize {
+        self.rung.unwrap_or(usize::MAX)
+    }
+}
+
+/// Set `title` in `avail`, condensing only as far as it has to.
+///
+/// Walks [`summary::candidates`] and stops at the first rendering that sets
+/// whole, so a title that already fits is drawn exactly as the fleet published
+/// it and costs one wrap. When nothing on the ladder fits, the lines are a
+/// greedy wrap of [`summary::lossless_rung`] — the cheapest rendering that gave
+/// up no content — which is the old behaviour applied to a better string rather
+/// than to the raw one.
+///
+/// This is the whole of the captain's *"herdr will just need to be better about
+/// what it chooses to display"*: the card no longer answers "too long" by
+/// silently dropping whatever fell off the end of a greedy wrap. It answers it
+/// by picking a shorter *rendering of the same summary* that still reads as a
+/// finished phrase, and only falls back to the drop when even the shortest one
+/// will not fit.
+fn fit_title(font: &CardFont, title: &str, avail: (f32, f32)) -> FittedTitle {
+    let ladder = summary::candidates(title);
+    if avail.0 > 1.0 && avail.1 > 1.0 {
+        for (rung, candidate) in ladder.rungs().enumerate() {
+            if sets_whole(font, candidate, avail) {
+                return FittedTitle {
+                    lines: wrap_ragged(font, candidate, TITLE_PX, avail, TITLE_LINES),
+                    rung: Some(rung),
+                };
+            }
+        }
+    }
+    FittedTitle {
+        lines: wrap_ragged(font, ladder.lossless(), TITLE_PX, avail, TITLE_LINES),
+        rung: None,
+    }
+}
+
+/// Whether `title` reaches the card entire, at any rung of the ladder.
+#[cfg(test)]
+fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
+    fit_title(font, title, avail).rung.is_some()
 }
 
 /// The chip yields to the title, never the other way round.
@@ -1675,9 +1782,9 @@ fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
 /// The card's one absolute is that a title is never shortened and never shrunk.
 /// The chip is the widest thing competing with it — about a quarter of a narrow
 /// card — so on a card that cannot hold both, the chip is what goes. It is
-/// dropped only when dropping it actually makes the title whole: on a card too
-/// narrow for the title either way there is nothing to buy, and the state is
-/// worth more than one extra word.
+/// dropped only when dropping it actually buys something: on a card too narrow
+/// for the title either way there is nothing to buy, and the state is worth
+/// more than one extra word.
 ///
 /// The control rail does **not** yield, and that is the one asymmetry here. The
 /// chip is a *restatement* — the card's own colour already carries its state,
@@ -1687,6 +1794,17 @@ fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
 /// rather than terse. The rail is also the narrower of the two by a wide margin
 /// — a badge and a chevron together run about half a state chip — so on a card
 /// where the chip stays, it costs the title nothing.
+///
+/// # Why this compares rungs and no longer compares a boolean
+///
+/// It used to ask "does the title set whole with the chip, and whole without
+/// it", which was the only question available when the alternative to whole was
+/// a silent drop. [`fit_title`] made the answer graded: a width the chip costs
+/// is now a width the summary is condensed *further* at, and both sides of that
+/// trade can be "whole". So the trade is stated where it actually happens —
+/// the chip stands down exactly when standing down lets the card say more of
+/// what the fleet published, and the old rule is the special case of this one
+/// where the two rungs are `Some(0)` and `None`.
 fn text_column(
     font: &CardFont,
     geometry: &CardGeometry,
@@ -1716,8 +1834,8 @@ fn text_column(
     let with_chip = (chip_right.min(rail_right) - left, chip_right - left);
     let without_chip = (rail_right - left, right - left);
     let room_for_chip = chip_height < height - 2.0 && with_chip.0 > 0.0;
-    let chip_costs_a_word =
-        !title_sets_whole(font, title, with_chip) && title_sets_whole(font, title, without_chip);
+    let chip_costs_a_word = room_for_chip
+        && fit_title(font, title, without_chip).cost() < fit_title(font, title, with_chip).cost();
 
     TextColumn {
         left,
@@ -1948,7 +2066,10 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let title_metrics = font.metrics(TITLE_PX);
     let tidbit_px = TITLE_PX * measured::TIDBIT_SIZE_MUL;
     let tidbit_metrics = font.metrics(tidbit_px);
-    let lines = wrap_ragged(font, &content.title, TITLE_PX, widths, TITLE_LINES);
+    // The same fit `text_column` just decided the chip against, so the card
+    // cannot be laid out for one rendering of the summary and painted with
+    // another.
+    let lines = fit_title(font, &content.title, widths).lines;
     let leading = title_metrics.line_height * TITLE_LEADING;
 
     let title_block = leading * (lines.len().max(1) as f32 - 1.0) + title_metrics.line_height;
@@ -2184,17 +2305,40 @@ fn tidbit_parts(
 /// The title: the work this agent says it is doing.
 ///
 /// `doing` is display-only metadata the fleet publishes and Herdr only ever
-/// stores, so this reads it and never writes or shortens it. With no `doing`
+/// stores, so the *token* is still never rewritten — this is a display choice
+/// made on the way to the card and nothing here writes back. With no `doing`
 /// published the card falls back to the same name the character row shows,
 /// which is what keeps a plain shell pane from drawing an empty card.
+///
+/// [`summary::condense`] is applied here rather than in the renderer because
+/// what it removes does not depend on how wide the card is — so this is the one
+/// place it can run and have the clean string be what gets hashed, cached,
+/// carried forward on an unchanged signature and sent to a remote client that
+/// rasterises the card itself. Condensing at draw time instead would make two
+/// clients disagree about the card's text while agreeing about its signature.
 fn title_text(entry: &AgentPanelEntry) -> String {
-    entry
+    let published = entry
         .tokens
         .get("doing")
         .cloned()
         .or_else(|| entry.agent_label.clone())
         .or_else(|| entry.pane_label.clone())
-        .unwrap_or_else(|| entry.primary_label.clone())
+        .unwrap_or_else(|| entry.primary_label.clone());
+    display_summary(published)
+}
+
+/// One published summary, as the card will say it.
+///
+/// Falls back to the publisher's own string whenever condensing would leave
+/// nothing: a card with no words on it is indistinguishable from a broken one,
+/// and a `doing` of `"..."` is still better than a blank.
+fn display_summary(published: String) -> String {
+    let condensed = summary::condense(&published);
+    if condensed.is_empty() {
+        published
+    } else {
+        condensed
+    }
 }
 
 /// The catalogue behaviour a card in this state breathes with.
@@ -2356,7 +2500,7 @@ fn content_for(
             );
             let breath = breath(app, &row, state, severity);
             Some(CardContent {
-                title: tokens.get("doing").cloned().unwrap_or(label),
+                title: display_summary(tokens.get("doing").cloned().unwrap_or(label)),
                 tidbit: tidbit_parts(tokens.get("project"), tokens.get("context"), age),
                 state_label: crate::ui::status::state_label(state, seen).to_string(),
                 state,
@@ -4714,11 +4858,13 @@ mod tests {
     #[test]
     fn the_card_sheet_stops_at_the_notification_tray() {
         let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        // Tall enough that the fleet's ten uniform-height rows still reach the
-        // tray exactly: since height stopped stepping down by rank, every row
-        // below the top tier is now as tall as the top tier's, so the fixture
-        // needs more room than it did when depth 1 and 2 rows were shorter.
-        let area = Rect::new(0, 0, 100, 52);
+        // Sized so the tray lands *inside* the reach of the last card's bloom,
+        // which is the only arrangement in which the clamp is under test at
+        // all — a tree that stops short of the tray would pass this whatever
+        // the clamp did. The height is a fixture detail and the assertions
+        // below no longer depend on it: they compare the clamped sheet against
+        // the unclamped one, and refuse to pass if the clamp never engaged.
+        let area = Rect::new(0, 0, 100, 42);
 
         let sheet_for = |tray_on: bool| {
             let mut app = pixel_fleet_app();
@@ -4753,7 +4899,7 @@ mod tests {
             ))
         };
 
-        let Some((sheet, tray, last_card)) = sheet_for(true) else {
+        let Some((sheet, tray, _last_card)) = sheet_for(true) else {
             return;
         };
         assert!(tray.height > 0, "the fixture drew no tray");
@@ -4776,14 +4922,26 @@ mod tests {
         );
         // And the clamp costs the tray-on sheet only the bloom it cannot have:
         // it still reaches every row up to the tray's edge.
+        //
+        // Stated against the *unclamped* sheet rather than against a fixture
+        // height that happens to line up. The old form asserted the tree ended
+        // exactly on the tray, which was true of one panel height and one card
+        // height and stopped being true the moment either moved — it broke on
+        // the 2026-08-06 uniform-height change and again on the 20% trim,
+        // both times as a fixture arithmetic failure that said nothing about
+        // the clamp. What matters is that the clamp takes the floor down to the
+        // tray and not one row further, whatever the sheet wanted.
+        let wanted = sheet_off.y + sheet_off.height;
+        assert!(
+            wanted > tray.y,
+            "the tree wants only {wanted} rows and the tray starts at {}, so the clamp \
+             never engaged and this test is asserting nothing",
+            tray.y
+        );
         assert_eq!(
             sheet.y + sheet.height,
             tray.y,
             "the sheet stopped short of the tray rather than at it"
-        );
-        assert_eq!(
-            last_card, tray.y,
-            "the fixture's tree did not reach the tray"
         );
     }
 
@@ -4880,6 +5038,204 @@ mod tests {
         assert!(
             height > BASE_HEIGHT_PX,
             "a tall face did not push the card past the base"
+        );
+    }
+
+    /// The height the card was drawn at before the captain's 2026-08-09 trim.
+    ///
+    /// Kept as a number so the two tests below can state the trim as a ratio
+    /// against what it actually replaced, rather than restating 54.4 and
+    /// proving only that a constant equals itself.
+    const PRE_TRIM_HEIGHT_PX: f32 = 68.0;
+
+    /// The card really is a fifth shorter, on every face and at every rank.
+    ///
+    /// A fifth of the *card*, not of some faces' cards and none of the others':
+    /// `card_height_px` is `max(base, content)`, so a trim that dropped under
+    /// the content floor would be silently undone on exactly the faces whose
+    /// type runs large and the constant would stop describing the screen.
+    #[test]
+    fn the_trim_is_air_and_not_the_floor() {
+        let faces = font::all_available_faces();
+        assert!(
+            !faces.is_empty() || font::card_font(None).is_none(),
+            "a machine with a card face must expose it to this test"
+        );
+        for (face, font) in faces {
+            let title = font.metrics(TITLE_PX);
+            let tidbit = font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL);
+            let floor = content_floor_px(title, tidbit);
+            assert!(
+                floor < BASE_HEIGHT_PX,
+                "the content floor ({floor:.2}px) has caught up with the trimmed base \
+                 ({BASE_HEIGHT_PX}px) in {face}: the card is no longer the size this \
+                 constant says it is"
+            );
+            let drawn = card_height_px(title, tidbit);
+            assert_eq!(
+                drawn, BASE_HEIGHT_PX,
+                "the trim did not reach the drawn card in {face}"
+            );
+            let ratio = drawn / PRE_TRIM_HEIGHT_PX;
+            assert!(
+                (0.78..=0.82).contains(&ratio),
+                "the card is at {:.1}% of what it was in {face}, not the fifth off the \
+                 captain asked for",
+                ratio * 100.0
+            );
+            // And what the fifth came out of is the air, which is still air:
+            // the block of type is untouched and the minimum is not reached.
+            let air = (drawn - content_block_px(title, tidbit)) / 2.0;
+            assert!(
+                air > MIN_VERTICAL_PAD_PX,
+                "the trim ate into the minimum padding in {face}: {air:.2}px a side"
+            );
+        }
+    }
+
+    /// The trim is uniform, so the rank ladder it sits inside is untouched.
+    ///
+    /// Height carries no rank — that was the 2026-08-06 decision — so "every
+    /// tier proportionally smaller" means every card takes the same fifth and
+    /// the width steps between ranks come out the far side identical. This
+    /// measures the second half of that: `rank_right_inset` is what a rank is
+    /// worth on screen, and the trim must not have moved it.
+    #[test]
+    fn the_trim_left_the_rank_ladder_exactly_where_it_was() {
+        use crate::app::agent_tree::AgentRelation;
+        for fold in [MIN_FOLD_WIDTH, 34, 40, 48, 64] {
+            let insets: Vec<u16> = [
+                AgentRelation::FirstMate,
+                AgentRelation::SecondMate,
+                AgentRelation::Worker,
+            ]
+            .into_iter()
+            .map(|rank| super::super::rank_right_inset(rank, fold))
+            .collect();
+            assert_eq!(
+                insets[0], 0,
+                "the top rank stopped being the full-width one at fold {fold}"
+            );
+            assert!(
+                insets[1] <= insets[2],
+                "the rank ladder is not monotonic at fold {fold}: {insets:?}"
+            );
+        }
+    }
+
+    /// The trim cost the title nothing — it paid it.
+    ///
+    /// This is the captain's *"truncates titles"* stated as an assertion. A
+    /// title's room is lines × column width; the line count did not move, and
+    /// the column is measured in from the nominal height by [`measured::PAD`]
+    /// and [`measured::PAD_RIGHT`], so a shorter card is a *wider* text column.
+    /// `CardGeometry::new` floors the nominal at the cell height, so passing
+    /// the old 68 px as a cell height reconstructs the pre-trim chrome exactly
+    /// and the two can be measured against each other.
+    #[test]
+    fn the_trim_did_not_cost_the_title_a_single_pixel() {
+        let before = CardGeometry::new(PRE_TRIM_HEIGHT_PX, false);
+        let after = CardGeometry::new(21.0, false);
+        assert!(
+            after.text_inset() < before.text_inset(),
+            "the trimmed card starts its ink no further left"
+        );
+        let gained =
+            (before.text_inset() - after.text_inset()) + (before.pad_right - after.pad_right);
+        assert!(
+            gained > 4.0,
+            "the trim gave the title only {gained:.2}px back; it was supposed to be \
+             about six"
+        );
+        // And that is real width in the column the title is actually set in,
+        // chip and all, at the captain's panel.
+        for (face, font) in font::all_available_faces() {
+            for depth in 0..3u8 {
+                for title in REAL_FLEET_TITLES {
+                    let now =
+                        real_text_column(&font, 42, 9.0, depth, title, widest_rail()).available();
+                    let then = pre_trim_text_column(&font, 42, 9.0, depth, title).available();
+                    assert!(
+                        now >= then,
+                        "the trimmed card gives the title {now:.1}px where the old one \
+                         gave {then:.1}px, in {face} at depth {depth}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`real_text_column`] as it would have measured before the trim.
+    fn pre_trim_text_column(
+        font: &CardFont,
+        sidebar_width: u16,
+        cell_w: f32,
+        depth: u8,
+        title: &str,
+    ) -> TextColumn {
+        let prefix = if depth == 0 {
+            1
+        } else {
+            3 * u16::from(depth) + 1
+        };
+        let frame_cells = sidebar_width.saturating_sub(1).saturating_sub(prefix);
+        // The cell-height floor in `nominal_height_px` is what makes the old
+        // nominal reachable without a second copy of `CardGeometry`.
+        let geometry = CardGeometry::new(PRE_TRIM_HEIGHT_PX, false);
+        text_column(
+            font,
+            &geometry,
+            f32::from(frame_cells) * cell_w,
+            PRE_TRIM_HEIGHT_PX,
+            WIDEST_STATE_LABEL,
+            title,
+            widest_rail(),
+        )
+    }
+
+    /// A row is fewer cells tall than it was, which is the trim the captain can
+    /// actually see.
+    ///
+    /// The pixel height is the design; the *footprint* is `ceil(height / cell)`
+    /// floored at the character card's chrome, and that is what closes the gap
+    /// between two agents in the tree. Swept over the cell heights a real
+    /// terminal reports rather than asserted at one, because the ceiling means
+    /// the trim lands as a whole row at some of them and as a wider gutter at
+    /// the rest — and both are correct, but only the first is what the captain
+    /// asked to see.
+    #[test]
+    fn a_row_is_shorter_in_cells_at_the_cell_heights_a_terminal_reports() {
+        let mut shrank = 0;
+        for cell_h in 14..=28u16 {
+            let cells = |height: f32| {
+                ((height / f32::from(cell_h)).ceil() as u16)
+                    .max(super::super::card::CHROME_ROWS + 1)
+            };
+            let before = cells(PRE_TRIM_HEIGHT_PX);
+            let after = cells(BASE_HEIGHT_PX);
+            assert!(
+                after <= before,
+                "a {cell_h}px cell makes the trimmed card *taller*: {after} rows against \
+                 {before}"
+            );
+            shrank += usize::from(after < before);
+        }
+        assert!(
+            shrank >= 6,
+            "the trim only bought a row back at {shrank} of the fifteen cell heights \
+             swept; it is not reaching the layout"
+        );
+        // The captain's own terminal, which is the one this was asked for.
+        let his = 21.0f32;
+        assert_eq!(
+            (BASE_HEIGHT_PX / his).ceil() as u16,
+            3,
+            "the trimmed card no longer fits three of his cells"
+        );
+        assert_eq!(
+            (PRE_TRIM_HEIGHT_PX / his).ceil() as u16,
+            4,
+            "the fixture cell height no longer reproduces the four-row card"
         );
     }
 
@@ -5188,6 +5544,269 @@ mod tests {
         }
     }
 
+    /// Summaries at the three lengths a fleet actually publishes.
+    ///
+    /// [`REAL_FLEET_TITLES`] are all one length — they were read off a snapshot
+    /// on one evening — and every one of them already fits. So they test the
+    /// wrap and test nothing at all about the *choosing*, which only happens
+    /// when a summary does not fit. These are the other two ends: a label, and
+    /// the sort of sentence an agent writes when it is describing a whole
+    /// investigation rather than naming a task.
+    const SUMMARY_LENGTHS: &[&str] = &[
+        // Short — a label. Must reach the card exactly as published.
+        "Building connector",
+        "Just arrived",
+        "Fixing the flake",
+        // Medium — the common case, and the length the card was measured at.
+        "Adding main branch guard to sync commit hooks",
+        "Currently working on the sidebar card trim and the summary logic",
+        "Fixing src/ui/sidebar/image_card.rs so the trim composes with the floor",
+        // Long — where the choosing has to do the work.
+        "Investigating why the sidebar card rasteriser drops oversized graphics \
+         payloads on a 42-column sidebar at 1600x1000 and whether the cap is the \
+         right one",
+        "Trimmed every card by a fifth and rewrote the summary fitter. Now verifying \
+         both against a real kitty under Xvfb before opening the pull request.",
+        "Working on: validating the FM_HOME anchor fix (which turned out to be two \
+         separate bugs) and shipping the pull request before the handoff window \
+         closes",
+    ];
+
+    /// Every summary, at every length, on every face, at every width the card is
+    /// drawn at — and not one line of it is ever clipped.
+    ///
+    /// The whole point of the fitter is that this holds for text far longer than
+    /// the card, which is the case `every_real_fleet_title_is_set_whole_…` does
+    /// not reach because every string in it fits. Here the assertion is not that
+    /// nothing is given up — a 150-character summary in a 230 px column has to
+    /// give something up — but that whatever survives is *drawn*, whole, inside
+    /// its column.
+    #[test]
+    fn no_summary_at_any_length_overruns_the_column_it_is_set_in() {
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                for published in SUMMARY_LENGTHS {
+                    let title = display_summary((*published).to_string());
+                    // The widest rail, because a card carrying both controls is
+                    // the narrowest first line a summary is ever set in.
+                    let column = real_text_column(
+                        &font,
+                        sidebar_width,
+                        cell_w,
+                        depth,
+                        &title,
+                        widest_rail(),
+                    );
+                    let widths = column.title_widths();
+                    let fitted = fit_title(&font, &title, widths);
+                    assert!(
+                        fitted.lines.len() <= TITLE_LINES,
+                        "{:?} was set in {} lines in {face}",
+                        fitted.lines,
+                        fitted.lines.len()
+                    );
+                    for (index, line) in fitted.lines.iter().enumerate() {
+                        let avail = if index == 0 { widths.0 } else { widths.1 };
+                        if font.width(line, TITLE_PX) <= avail + 0.5 {
+                            continue;
+                        }
+                        assert!(
+                            !line.contains(' '),
+                            "{line:?} overruns its {avail:.1}px column with a break \
+                             available, in {face} at sidebar {sidebar_width}, cell \
+                             {cell_w}, depth {depth}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The card omits the publisher's words; it never writes its own.
+    ///
+    /// This is the guardrail on the whole idea of Herdr choosing. Every word
+    /// drawn has to be a word the fleet published, so the card can be trusted as
+    /// a report rather than read as a paraphrase — and the order has to survive
+    /// too, or a condensed summary could say something the agent did not.
+    #[test]
+    fn the_fitter_only_ever_omits_the_publishers_own_words() {
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                for published in SUMMARY_LENGTHS {
+                    let title = display_summary((*published).to_string());
+                    let column = real_text_column(
+                        &font,
+                        sidebar_width,
+                        cell_w,
+                        depth,
+                        &title,
+                        widest_rail(),
+                    );
+                    let drawn = fit_title(&font, &title, column.title_widths())
+                        .lines
+                        .join(" ");
+                    let mut source = published.split_whitespace();
+                    for word in drawn.split_whitespace() {
+                        assert!(
+                            source.any(|from| from.contains(word) || word.contains(from)),
+                            "{drawn:?} is not the publisher's own words in order, from \
+                             {published:?} in {face} at sidebar {sidebar_width}, cell \
+                             {cell_w}, depth {depth}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A summary that fits is drawn exactly as it was published.
+    ///
+    /// The ladder is a response to not fitting, never a house style. A card with
+    /// room for its title has to show that title and nothing else — otherwise
+    /// the choosing is editing the fleet's copy for its own sake, which is not
+    /// what was asked for.
+    #[test]
+    fn the_ladder_does_not_engage_on_a_summary_that_already_fits() {
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                if cell_w < GUARANTEED_CELL_WIDTH_PX {
+                    continue;
+                }
+                for published in ["Building connector", "Just arrived", "Fixing the flake"] {
+                    let column = real_text_column(
+                        &font,
+                        sidebar_width,
+                        cell_w,
+                        depth,
+                        published,
+                        widest_rail(),
+                    );
+                    let fitted = fit_title(&font, published, column.title_widths());
+                    assert_eq!(
+                        fitted.rung,
+                        Some(0),
+                        "{published:?} was condensed at rung {:?} despite fitting, in \
+                         {face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}",
+                        fitted.rung
+                    );
+                    assert_eq!(fitted.lines.join(" "), published);
+                }
+            }
+        }
+    }
+
+    /// The words a summary is allowed to end on.
+    ///
+    /// A card that stops on "and", "the" or "with" has visibly been cut; a card
+    /// that stops on a noun has been *edited*. This is the difference the
+    /// captain is pointing at, and it is checkable.
+    const DANGLING_TAILS: &[&str] = &[
+        "and", "or", "the", "a", "an", "with", "for", "to", "of", "in", "on", "at", "from", "that",
+        "which", "then", "but", "while", "before", "after", "because", "into", "by",
+    ];
+
+    /// A summary the card had to shorten still reads as a finished phrase.
+    ///
+    /// This is the regression the fitter exists for. The old path answered "too
+    /// long" with a greedy wrap that stopped wherever the second line ran out —
+    /// which, on the longest real fleet title, is the word *"and"*. The fitter
+    /// answers it by choosing a shorter rendering that ends where the publisher
+    /// put a boundary, so what is on screen is a phrase rather than a stump.
+    ///
+    /// Asserted only where the ladder actually fired: a card wide enough to set
+    /// the whole thing has nothing to prove, and one so narrow that even the
+    /// shortest rung overflows has fallen back to the wrap on purpose.
+    #[test]
+    fn a_shortened_summary_still_ends_where_a_phrase_ends() {
+        let mut exercised = 0;
+        for (face, font) in font::all_available_faces() {
+            for (sidebar_width, cell_w, depth) in card_widths() {
+                if cell_w < GUARANTEED_CELL_WIDTH_PX {
+                    continue;
+                }
+                for published in SUMMARY_LENGTHS {
+                    let title = display_summary((*published).to_string());
+                    let column = real_text_column(
+                        &font,
+                        sidebar_width,
+                        cell_w,
+                        depth,
+                        &title,
+                        widest_rail(),
+                    );
+                    let fitted = fit_title(&font, &title, column.title_widths());
+                    let Some(rung) = fitted.rung else {
+                        continue; // Fell back to the wrap; nothing was chosen.
+                    };
+                    if rung == 0 {
+                        continue; // Set whole as published.
+                    }
+                    exercised += 1;
+                    let drawn = fitted.lines.join(" ");
+                    let last = drawn
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or_default()
+                        .trim_end_matches([',', ';', ':'])
+                        .to_lowercase();
+                    assert!(
+                        !DANGLING_TAILS.contains(&last.as_str()),
+                        "the card was shortened to {drawn:?}, which ends on {last:?} — a \
+                         sentence sliced, not a phrase chosen. {face} at sidebar \
+                         {sidebar_width}, cell {cell_w}, depth {depth}"
+                    );
+                }
+            }
+        }
+        assert!(
+            exercised > 0,
+            "no width in the sweep made the card choose, so the choosing is untested"
+        );
+    }
+
+    /// The longest title the fleet has actually published now reaches the card
+    /// at the one width where it used not to.
+    ///
+    /// `ACCEPTED_NARROW_FLOOR_TRUNCATION` is the combination the captain waved
+    /// through on 2026-08-06 — the raw wrap drops words there in the widest
+    /// face. The trim widened the column and the fitter can shorten, so between
+    /// them that hole is closed; this pins it shut so a later change to either
+    /// has to reopen it deliberately.
+    ///
+    /// # Stated for a card with no control rail, and why that is the honest
+    /// scope
+    ///
+    /// A rail takes width off the first line and, unlike the chip, does not
+    /// yield — that is deliberate, and `text_column` says why. So on the very
+    /// narrowest card *also* carrying a badge and a chevron, a title with
+    /// nothing in it to condense can still overrun: "Establish home_budget_app
+    /// secondmate operations" is one clause, one sentence, no path and no
+    /// aside, so its ladder has exactly one rung and the fitter has nothing to
+    /// offer. Claiming the hole is closed there would be claiming the fitter
+    /// can shorten text that has no shorter rendering. The rail-free card is
+    /// the one the 2026-08-06 exception was about, and it is closed.
+    #[test]
+    fn the_accepted_narrow_floor_truncation_is_no_longer_a_truncation() {
+        let (sidebar_width, cell_w, depth) = ACCEPTED_NARROW_FLOOR_TRUNCATION;
+        for (face, font) in font::all_available_faces() {
+            for title in REAL_FLEET_TITLES {
+                let column = real_text_column(
+                    &font,
+                    sidebar_width,
+                    cell_w,
+                    depth,
+                    title,
+                    ControlRail::default(),
+                );
+                let fitted = fit_title(&font, title, column.title_widths());
+                assert!(
+                    fitted.rung.is_some(),
+                    "{title:?} still falls off the card in {face} at the narrow floor"
+                );
+            }
+        }
+    }
+
     /// And a rail *wider* than the chip is what the first line clears — and
     /// only the first line, exactly as the character row reserves its two
     /// controls on its first content row and no other.
@@ -5262,19 +5881,24 @@ mod tests {
                          {title:?}"
                     );
 
+                    // How far down the ladder each side of the trade forces the
+                    // summary. Lower is more of what the fleet published.
+                    let cost_with = fit_title(&font, title, with_chip).cost();
+                    let cost_without = fit_title(&font, title, without_chip).cost();
+
                     if column.chip_fits {
-                        // A chip is only kept when keeping it costs no words.
+                        // A chip is only kept when keeping it costs the summary
+                        // nothing — not merely when the summary survives it.
                         assert!(
-                            title_sets_whole(&font, title, with_chip)
-                                || !title_sets_whole(&font, title, without_chip),
-                            "the chip was kept at the title's expense in {where_}"
+                            cost_with <= cost_without,
+                            "the chip was kept at the title's expense in {where_}: rung \
+                             {cost_with} with it against {cost_without} without"
                         );
                     } else {
                         ever_yielded = true;
                         // And is only given up when giving it up buys the title
                         // — otherwise the card simply had no room for one.
-                        let bought_the_title = title_sets_whole(&font, title, without_chip)
-                            && !title_sets_whole(&font, title, with_chip);
+                        let bought_the_title = cost_without < cost_with;
                         let never_had_room = with_chip.0 <= 0.0
                             || column.chip_height
                                 >= card_height_px(
@@ -5684,15 +6308,43 @@ mod tests {
         );
     }
 
-    /// The title is the fleet's own words. Herdr picks which token to read and
-    /// never edits the value.
+    /// The title is the fleet's own words, and the token behind it is never
+    /// written back.
+    ///
+    /// The captain's 2026-08-09 change is that Herdr may now *choose* — see
+    /// [`summary`] — so "verbatim" is no longer the whole rule and this states
+    /// the part that survived it: a summary with nothing redundant in it comes
+    /// through untouched, and the fallback chain down to the pane's own name is
+    /// unchanged. What the choosing removes is pinned in `summary`'s own tests,
+    /// against strings that have something to remove.
     #[test]
-    fn the_title_is_the_published_doing_string_verbatim() {
+    fn a_published_doing_string_with_nothing_redundant_in_it_is_untouched() {
         let mut entry = AgentPanelEntry::test_new("worker");
         assert_eq!(title_text(&entry), "worker");
         let doing = "Investigateing killed Okta corpus and Herdr work sessions";
         entry.tokens.insert("doing".to_string(), doing.to_string());
         assert_eq!(title_text(&entry), doing);
+        // And the token itself is still the publisher's, not Herdr's copy of it.
+        assert_eq!(entry.tokens.get("doing").map(String::as_str), Some(doing));
+    }
+
+    /// A summary the fleet padded reaches the card without the padding.
+    #[test]
+    fn a_padded_doing_string_is_chosen_down_before_it_is_ever_measured() {
+        let mut entry = AgentPanelEntry::test_new("worker");
+        entry.tokens.insert(
+            "doing".to_string(),
+            "Currently working on `the card trim`.".to_string(),
+        );
+        assert_eq!(title_text(&entry), "the card trim");
+    }
+
+    /// Condensing must never blank a card. A `doing` that is nothing but
+    /// punctuation still puts the publisher's own string on screen.
+    #[test]
+    fn a_summary_that_condenses_to_nothing_falls_back_to_what_was_published() {
+        assert_eq!(display_summary("...".to_string()), "...");
+        assert_eq!(display_summary("   ".to_string()), "   ");
     }
 }
 
