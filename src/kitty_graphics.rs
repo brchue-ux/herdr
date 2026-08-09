@@ -1262,9 +1262,19 @@ fn surface_layer_placement_targets(
         // default path did before shapes existed and still has to do. The cards
         // and the tray are the surfaces a client can ask to draw itself; every
         // other surface this client is entitled to keeps flowing either way.
+        //
+        // A pass is always entitled to the cards it built itself. What the
+        // sheet path adds — handing the foreground client's sheet to a pass
+        // that built nothing — is only sound while every viewer measures its
+        // cell the same, because the sheet is a count of pixels taken against
+        // the cell of whoever built it. When they disagree, that pass falls
+        // back to its character cards, which are drawn in cells and so are
+        // right at every cell size. See
+        // `AppState::every_app_viewer_shares_host_cell_size`.
         .chain(
             if embedded.cards
-                && (!app.sidebar_card_shapes || app.view.sidebar_card_layers_published)
+                && (app.view.sidebar_card_layers_published
+                    || (!app.sidebar_card_shapes && app.every_app_viewer_shares_host_cell_size))
             {
                 app.sidebar_card_layers.as_slice()
             } else {

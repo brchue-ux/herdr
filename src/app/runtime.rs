@@ -1062,13 +1062,17 @@ impl App {
     /// badges for nobody is the whole cost this exists to move off the server,
     /// and the key is still what tells the loop a new scene is worth sending.
     fn refresh_signal_tray_graphics(&mut self, client_rasterized: bool) -> bool {
-        if !self.state.kitty_graphics_enabled || !self.state.host_cell_size.is_known() {
+        // The fleet's cell, not the foreground client's: this artwork is one
+        // image every attached viewer is placed a copy of, so a viewer whose
+        // cell differs would be shown a crop of a raster built for someone
+        // else's grid. See `AppState::shared_raster_cell_size`.
+        let cell = self.state.shared_raster_cell_size();
+        if !self.state.kitty_graphics_enabled || !cell.is_known() {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
             return had;
         }
 
-        let cell = self.state.host_cell_size;
         let key = self.signal_tray_graphics_key(cell);
         if client_rasterized {
             let had = self.state.signal_tray_graphics.take().is_some();
@@ -1121,13 +1125,15 @@ impl App {
     /// resize), never once per tick. Once generated, uploading and arming playback is
     /// `kitty_graphics`'s job (`GraphicsLayer::animation`); this only owns producing the pixels.
     pub(crate) fn observe_sidebar_particle_field(&mut self) -> bool {
-        if !self.state.sidebar_particle_field_active() || !self.state.host_cell_size.is_known() {
+        // Shared with every viewer, so sized by the fleet's cell rather than
+        // the foreground client's — see `AppState::shared_raster_cell_size`.
+        let cell = self.state.shared_raster_cell_size();
+        if !self.state.sidebar_particle_field_active() || !cell.is_known() {
             let had = self.state.sidebar_particle_field.take().is_some();
             self.state.sidebar_particle_field_key = 0;
             return had;
         }
 
-        let cell = self.state.host_cell_size;
         let key = self.sidebar_particle_field_key(cell);
         if key == self.state.sidebar_particle_field_key
             && self.state.sidebar_particle_field.is_some()
@@ -1195,7 +1201,9 @@ impl App {
         }
 
         let area = self.state.screen_rect();
-        let cell = self.state.host_cell_size;
+        // Shared with every viewer, so sized by the fleet's cell rather than
+        // the foreground client's — see `AppState::shared_raster_cell_size`.
+        let cell = self.state.shared_raster_cell_size();
         if area.width == 0 || area.height == 0 || !cell.is_known() {
             return self.clear_background_scene();
         }
@@ -1316,13 +1324,18 @@ impl App {
         // transient effect ever spawning. `background_legibility::observe` gates its own heavier
         // resampling work to a coarser cadence internally (see its own doc), so calling it here
         // every tick is cheap on the passes it declines to do anything.
+        //
+        // Sampled against the same cell the scene under it was rasterised at,
+        // not the foreground client's, or the samples would be read out of a
+        // grid the layout was never built for.
+        let cell = self.state.shared_raster_cell_size();
         let legibility_changed = crate::app::background_legibility::observe(
             &mut self.state.background_legibility,
             &layout,
             phase,
             &effects,
-            self.state.host_cell_size.width_px,
-            self.state.host_cell_size.height_px,
+            cell.width_px,
+            cell.height_px,
             now,
         );
 

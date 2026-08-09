@@ -2145,6 +2145,35 @@ pub struct AppState {
     /// already granted, never grants what it refused. The split server sets it
     /// from all of its app clients; see `every_app_viewer_draws_ambient_wash`.
     pub(crate) every_app_viewer_draws_ambient_wash: bool,
+    /// Whether **every** attached app viewer measures its terminal cell the
+    /// same as [`Self::host_cell_size`] does.
+    ///
+    /// The sibling of [`Self::every_app_viewer_draws_ambient_wash`], and the
+    /// twin bug that one names: `host_cell_size` is the *foreground* client's
+    /// cell, reassigned every time another client is promoted, but the tray's
+    /// badge artwork and the two washes are one image on this shared state that
+    /// every attached viewer is placed a copy of. A raster is a count of
+    /// pixels, and the only thing that turns a rect of cells into pixels is a
+    /// cell size — so artwork built against the foreground client's cell is
+    /// built for the foreground client's grid, and a viewer whose cell differs
+    /// is placed pixels that were never measured for its screen.
+    ///
+    /// It does not degrade gently. `kitty_graphics::clipped_placement` sizes
+    /// the placement from the *receiving* client's cell and then crops the
+    /// image to it, so a viewer with a smaller cell than the one the artwork
+    /// was built for is shown the top-left corner of it, stretched over the
+    /// whole surface. Measured on two real clients: an 8x16 viewer attached
+    /// beside a 16x32 foreground was transmitted the tray as 656x256px — 82x16
+    /// of its own cells for a surface 41x8 cells wide — and told to place it
+    /// with a 328x128 crop, which is exactly one quarter of the artwork.
+    ///
+    /// `true` when unknown, which is what keeps a monolithic Herdr and every
+    /// single-client session exactly as they were: a fleet that agrees on its
+    /// cell is a fleet the foreground's cell already speaks for, so this only
+    /// ever *withdraws* artwork that could not have been right for everyone.
+    /// The split server sets it from all of its app clients; see
+    /// `every_app_viewer_shares_host_cell_size`.
+    pub(crate) every_app_viewer_shares_host_cell_size: bool,
     /// Whether the real outer terminal has confirmed it understands the Kitty
     /// Graphics Protocol, via `query_kitty_graphics_capability`. Painting must
     /// gate on this in addition to `kitty_graphics_enabled`: the config flag is
@@ -2411,6 +2440,35 @@ impl AppState {
     /// to protect.
     pub(crate) fn ambient_wash_is_safe_on_every_viewer(&self) -> bool {
         self.host_terminal_kind.draws_ambient_wash() && self.every_app_viewer_draws_ambient_wash
+    }
+
+    /// The cell that shared pixel artwork may be rasterised against, which is
+    /// [`Self::host_cell_size`] only while it speaks for the whole fleet.
+    ///
+    /// The sizing counterpart of [`Self::ambient_wash_is_safe_on_every_viewer`]
+    /// and the same fold, differing only in what a per-client fact does to the
+    /// shared resource. The wash's fold gates a boolean, so refusing is simply
+    /// `false`; a cell size *is* the resource's dimensions, so refusing has to
+    /// be a cell no raster can be built from. That is what
+    /// [`crate::kitty_graphics::HostCellSize::default`] already means
+    /// everywhere downstream: `is_known()` is false for it, and every producer
+    /// of shared artwork already drops its layer rather than guessing when the
+    /// cell is unknown. So a fleet that disagrees about its cell falls back to
+    /// exactly the surface a host with no measurable cell gets — the tray's
+    /// character marks, no washes — which is drawn correctly at every cell size
+    /// because it is drawn in cells.
+    ///
+    /// Deliberately *not* consulted by the per-client render passes. Each pass
+    /// already builds its own cards against its own client's cell (see
+    /// `ViewState::sidebar_card_layers_published`), and that is right at any
+    /// cell size; only artwork built once and handed to everyone has to answer
+    /// this question.
+    pub(crate) fn shared_raster_cell_size(&self) -> crate::kitty_graphics::HostCellSize {
+        if self.every_app_viewer_shares_host_cell_size {
+            self.host_cell_size
+        } else {
+            crate::kitty_graphics::HostCellSize::default()
+        }
     }
 
     /// True when the sidebar's ambient particle-field wash may be drawn.
@@ -3201,6 +3259,7 @@ impl AppState {
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
             host_graphics_is_local: false,
             every_app_viewer_draws_ambient_wash: true,
+            every_app_viewer_shares_host_cell_size: true,
             kitty_graphics_capability_confirmed: false,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
