@@ -2202,6 +2202,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         }];
     }
 

@@ -341,6 +341,21 @@ assumed one never did, which is how `tray_art::rrect_contains` sat on an
 f32-inverted `clamp` range (a pill's two corner-centre bounds) without anyone
 hitting the panic.
 
+What a cell-size disagreement cannot do is move a placement *within* itself. The
+image is rasterised at `cells x believed_cell` and placed with `c=`/`r=`, so the
+terminal scales it onto `cells x real_cell` — a uniform scale per axis, which
+leaves every relative position inside the image exactly where it was. A tree rail
+that does not line up with the card border it continues is therefore never a cell
+mismatch, however plausible that reads; the mismatch makes the card *soft*, not
+misplaced. Rule out geometry that is wrong in cells first.
+
+The tree's own geometry is that geometry, and it is a function of the cell in one
+place: `image_card::row_height_cells` is `ceil(card px / cell px)`, which is three
+cells at a 19–27 px cell and **four** at 14–18 px. Anything anchored on a row
+index rather than on the card's own middle is right at one of those and wrong at
+the other — see `WorkspaceCardArea::connector_y`. Check both when changing what a
+row draws beside its card.
+
 To reproduce a cell-size defect on the real thing, put the client on a PTY whose
 winsize pixel fields are a lie and run that inside a real terminal: the derived
 cell is then whatever you chose while the terminal underneath is genuinely

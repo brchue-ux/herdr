@@ -598,6 +598,25 @@ impl Behaviour {
                 if shaped <= 0.0 {
                     return 0.0;
                 }
+                if extent.is_a_single_cell() {
+                    // A front sweeps *through* a field, and one cell is not a
+                    // field: there is no distance for the edge to cross, so the
+                    // only honest reveal is the clock's own.
+                    //
+                    // Left to the arithmetic it is far worse than uninteresting.
+                    // The cell's field value is a constant — for `dissolve` a
+                    // hash of position `(0, 0)`, which is the same constant for
+                    // every one-cell element in the tree — and a front crosses a
+                    // constant in `softness` of its run. So the whole reveal
+                    // landed inside the first quarter of the phase — measured on
+                    // a real client, 0.70 s of a 1.50 s mount, which is ~80 ms of
+                    // the 320 ms `row_enter` a Herdr is configured with by
+                    // default — and the element stood settled for the rest:
+                    // *"trunk/branch segments show zero animation"*, which is
+                    // what the captain saw. Every trunk segment did it at the
+                    // same moment, too, because they all hash the same cell.
+                    return shaped;
+                }
                 let softness = softness.max(1e-3);
                 let edge = shaped * (1.0 + softness);
                 ((edge - field) / softness).clamp(0.0, 1.0)
@@ -1584,6 +1603,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A one-cell reveal takes the whole run it was given.**
+    ///
+    /// The tree's ancestor rails are one-cell elements
+    /// (`ui::sidebar::TrunkRailPaint`), and this is the defect that made them
+    /// read as *"trunk/branch segments show zero animation"*: a `Front` sweeps
+    /// through a field, and one cell is not a field. Its field value is a
+    /// constant, a front crosses a constant in `softness` of its run, and
+    /// `dissolve`'s softness is 0.2 — so an ancestor rail finished arriving
+    /// inside the first quarter of its phase, about 80 ms of the default 320 ms
+    /// `row_enter`, and stood settled for the rest. Every segment in the tree
+    /// did it at the same moment, because they all hash cell `(0, 0)`.
+    ///
+    /// Checked at the quarter points across every bounded reveal, because what
+    /// was wrong was not the endpoints — those were always right — but that the
+    /// middle of the run had nothing in it.
+    #[test]
+    fn a_one_cell_reveal_uses_its_whole_run_rather_than_flashing_through_it() {
+        let one = CellExtent::new(1, 1);
+        for name in [
+            names::FADE,
+            names::TYPEWRITER,
+            names::WIPE,
+            names::DROP_IN,
+            names::DISSOLVE,
+            names::COLLAPSE,
+        ] {
+            let behaviour = get(name);
+            let at = |progress: f32| {
+                behaviour
+                    .cell(
+                        CellPos::new(0, 0),
+                        one,
+                        progress,
+                        DriveInputs::default(),
+                        PALETTE,
+                    )
+                    .coverage
+            };
+            let (quarter, half, three_quarters) = (at(0.25), at(0.5), at(0.75));
+            assert!(
+                quarter < half && half < three_quarters,
+                "{name} on one cell is not still moving across its own run: \
+                 {quarter} -> {half} -> {three_quarters}"
+            );
+            // The specific shape of the old defect: arrived long before the run
+            // was over, so the rest of the configured duration showed nothing.
+            assert!(
+                quarter < 0.99,
+                "{name} on one cell has already finished a quarter of the way in"
+            );
+            assert_eq!(at(0.0), 0.0, "{name} covers a cell before it has started");
+            assert_eq!(at(1.0), 1.0, "{name} leaves a cell behind at full progress");
+        }
+    }
+
+    /// The same behaviours across a real extent are untouched: a dissolve over
+    /// twelve cells still scatters, which is the whole point of the field this
+    /// one-cell case cannot use.
+    #[test]
+    fn a_multi_cell_dissolve_still_reaches_its_cells_at_different_times() {
+        let extent = CellExtent::row(12);
+        let behaviour = get(names::DISSOLVE);
+        let mid: Vec<f32> = (0..extent.cols)
+            .map(|col| {
+                behaviour
+                    .cell(
+                        CellPos::col(col),
+                        extent,
+                        0.5,
+                        DriveInputs::default(),
+                        PALETTE,
+                    )
+                    .coverage
+            })
+            .collect();
+        let covered = mid.iter().filter(|c| **c >= 0.999).count();
+        assert!(
+            covered > 0 && covered < mid.len(),
+            "half way through, a dissolve must have reached some cells and not others: {mid:?}"
+        );
     }
 
     #[test]

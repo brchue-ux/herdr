@@ -312,6 +312,31 @@ fn bloom_reach_px(cell_height: f32) -> f32 {
 /// is exactly the error being removed here.
 const RAIL_INK_COLUMN_FRACTION: f32 = 0.5;
 
+/// How far a card's ink sits from the middle of its own cells, so that it is
+/// centred on the row the tree's branch line meets it on.
+///
+/// The vertical twin of [`RAIL_INK_COLUMN_FRACTION`], and the same argument:
+/// the characters are the layout authority because a glyph goes where the font
+/// puts it, so the drawn card is the side that gives. A branch line lands on a
+/// whole row — [`crate::app::state::WorkspaceCardArea::connector_y`] — and the
+/// card is what moves onto it.
+///
+/// Zero whenever the row is an odd number of cells, which is every row at a
+/// 19–27 px cell: the middle row's own centre already *is* the frame's centre.
+/// At a 14–18 px cell a card needs four cells and there is no middle row, so
+/// the frame's centre falls on the boundary between rows 1 and 2 and the card
+/// moves up half a cell onto row 1's centre — *up*, because the row above the
+/// tree's first card is the panel's header row and the row below its last may
+/// be the signal tray, whose badges are placements on this same plane.
+fn connector_row_offset_px(frame_height: u16, cell_h: f32) -> f32 {
+    if frame_height == 0 {
+        return 0.0;
+    }
+    let connector_row = f32::from((frame_height - 1) / 2);
+    let frame_middle = f32::from(frame_height) / 2.0;
+    (connector_row + 0.5 - frame_middle) * cell_h
+}
+
 /// One finished image and the cells it covers — one card's shape, or the whole
 /// tree's sheet.
 ///
@@ -3163,10 +3188,17 @@ fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f3
 fn card_image_rect(frame: Rect, cell: (f32, f32), bounds: Rect, bloom_floor: u16) -> Option<Rect> {
     let (cell_w, cell_h) = cell;
     let reach = bloom_reach_px(cell_h);
+    // The vertical margin also has to carry however far the card was moved off
+    // the middle of its own cells to sit on its branch line
+    // ([`connector_row_offset_px`]). Without it the image is exactly the reach
+    // wide and the card is drawn half a cell up it, so the top of the glow — and
+    // on a tight face the top stroke — is cropped by the image's own edge rather
+    // than by the panel.
+    let shifted = reach + connector_row_offset_px(frame.height, cell_h).abs();
     clamp_bloomed(
         frame,
         (reach / cell_w).ceil() as u16,
-        (reach / cell_h).ceil() as u16,
+        (shifted / cell_h).ceil() as u16,
         bounds,
         bloom_floor,
     )
@@ -3812,13 +3844,18 @@ impl Rasteriser<'_> {
     /// One card's rounded rect, in the coordinates of an image covering `rect`.
     fn place<'c>(&self, frame: Rect, content: &'c CardContent, rect: Rect) -> PlacedCard<'c> {
         let geometry = CardGeometry::new(self.cell_h, content.mark.is_some());
-        // The card is drawn at the one height every card is drawn at, centred in
-        // the cells the row was given. The leftover is the gutter — this is where
-        // the measured 0.19 h sibling gap comes back after the row height was
-        // rounded up to a whole number of cells.
+        // The card is drawn at the one height every card is drawn at, centred on
+        // the row its branch line meets it on. That is the middle of the cells
+        // the row was given whenever there is a middle row to be the middle of,
+        // and half a cell above it when there is not — see
+        // [`connector_row_offset_px`]. The leftover is the gutter, and it is the
+        // same leftover either way because every row in the tree is offset by
+        // the same amount: this is where the measured 0.19 h sibling gap comes
+        // back after the row height was rounded up to a whole number of cells.
         let cell_top = f32::from(frame.y.saturating_sub(rect.y)) * self.cell_h;
         let cell_height = f32::from(frame.height) * self.cell_h;
         let wanted = card_height_px(self.title_metrics, self.tidbit_metrics).min(cell_height);
+        let connector_offset = connector_row_offset_px(frame.height, self.cell_h);
         // The left border stands where the tree's rails have their ink, not
         // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
         let left =
@@ -3826,7 +3863,7 @@ impl Rasteriser<'_> {
         PlacedCard {
             rect: RoundRect {
                 x: left,
-                y: cell_top + (cell_height - wanted) / 2.0,
+                y: cell_top + (cell_height - wanted) / 2.0 + connector_offset,
                 // The right edge does not move: nothing in the tree is drawn
                 // against it, so pulling the left one in is what aligns the card
                 // rather than sliding the whole box off the columns the layout
@@ -7537,6 +7574,95 @@ mod a_card_is_its_own_shape {
             checked += 1;
         }
         assert!(checked > 1, "no card was actually measured");
+    }
+
+    /// **A card's ink is centred on the row its branch line meets it on.**
+    ///
+    /// The vertical half of the same finding, reported live on a real Rio at the
+    /// captain's 42 columns: *"branch lines are not centered on the card's
+    /// vertical span."* The line lands on
+    /// [`crate::app::state::WorkspaceCardArea::connector_y`] and the card was
+    /// centred in its own cells, and those are the same row only while the row
+    /// is an odd number of cells. At a 15 px cell a card needs four, and every
+    /// branch in the tree ran into its card 7 px above the middle at once.
+    ///
+    /// Driven at cell heights on both sides of that boundary and measured in the
+    /// published pixels, for the reason the horizontal test gives: what was
+    /// wrong was where the ink landed.
+    #[test]
+    fn a_cards_ink_is_centred_on_the_row_its_branch_line_meets_it_on() {
+        for cell_height in [21u32, 18, 15] {
+            let mut app = shape_fleet_app();
+            app.host_cell_size.height_px = cell_height;
+            let rect = sidebar_rect();
+            let cards = super::super::compute_workspace_card_areas(&app, rect);
+            let Some(layers) = built(&app) else {
+                return; // No face on this machine.
+            };
+            let framed: Vec<&crate::app::state::WorkspaceCardArea> = cards
+                .iter()
+                .filter(|card| {
+                    card.card_frame
+                        .is_some_and(|frame| frame.width > 0 && frame.height > 0)
+                })
+                .collect();
+            assert_eq!(layers.len(), framed.len());
+            let cell_h = cell_height as f32;
+
+            let mut checked = 0;
+            for (layer, card) in layers.iter().zip(&framed) {
+                let frame = card.card_frame.expect("filtered to framed rows");
+                assert!(
+                    card.drawn_card,
+                    "this fixture must be on the drawn-card path or the row it \
+                     measures is a box of characters"
+                );
+                let (width_px, height_px, rgba) = decode(layer);
+                // The card's own left border column, away from the rounded
+                // corners: the topmost and bottommost opaque pixel of that
+                // column are the card's own top and bottom strokes.
+                let column = ((f32::from(frame.x.saturating_sub(layer.rect.x))
+                    + RAIL_INK_COLUMN_FRACTION)
+                    * f32::from(u16::try_from(app.host_cell_size.width_px).expect("a cell")))
+                    as u32;
+                let alpha =
+                    |y: u32| rgba[((y * width_px + column.min(width_px - 1)) * 4 + 3) as usize];
+                let Some(top) = (0..height_px).find(|y| alpha(*y) > 200) else {
+                    continue;
+                };
+                let Some(bottom) = (0..height_px).rev().find(|y| alpha(*y) > 200) else {
+                    continue;
+                };
+                let ink_centre = f32::from(layer.rect.y) * cell_h + (top + bottom) as f32 / 2.0;
+                let line_centre = (f32::from(card.connector_y()) + 0.5) * cell_h;
+                assert!(
+                    (ink_centre - line_centre).abs() <= 1.5,
+                    "at a {cell_height} px cell a {}-cell card put its middle at \
+                     {ink_centre} px, not on the {line_centre} px middle of the row \
+                     its branch line lands on",
+                    frame.height,
+                );
+                checked += 1;
+            }
+            assert!(checked > 1, "no card was actually measured");
+        }
+    }
+
+    /// The offset is zero wherever there is a middle row to be the middle of,
+    /// and exactly half a cell — upwards — wherever there is not.
+    ///
+    /// Pinned separately from the pixels because it is the whole of the rule and
+    /// a fixture can only ever reach the row heights its own face produces.
+    #[test]
+    fn a_card_only_gives_ground_when_its_row_has_no_middle_cell() {
+        for (rows, expected) in [(1u16, 0.0), (2, -10.0), (3, 0.0), (4, -10.0), (5, 0.0)] {
+            assert_eq!(
+                connector_row_offset_px(rows, 20.0),
+                expected,
+                "a {rows}-cell row"
+            );
+        }
+        assert_eq!(connector_row_offset_px(0, 20.0), 0.0, "a row with no cells");
     }
 
     /// The right edge did not move with it. Nothing in the tree is drawn against
