@@ -190,7 +190,15 @@ pub(super) const PLATE_GAP: f32 = 0.21;
 /// column in the whole tree — 291 px against 315 px at depth 2. Capping it is a
 /// named deviation from the measurement, taken in
 /// `data/herdr-card-iteration-2/` and kept here.
-pub(super) const PLATE_MAX_PX: f32 = 44.0;
+///
+/// Cut from 44.0 with the card, on the same 20% as `BASE_HEIGHT_PX`: this is an
+/// absolute pixel ceiling on a slot whose measured size is a fraction of the
+/// nominal height, so leaving it where it was would have quietly stopped it
+/// being a cap at all — 0.70 × 54.4 is 38.1 px, already under the old 44 — and
+/// the deviation this constant exists to record would have evaporated rather
+/// than been withdrawn. `the_plate_is_capped_so_the_card_is_not_the_narrowest_column`
+/// is the const assertion that catches that.
+pub(super) const PLATE_MAX_PX: f32 = 35.2;
 
 /// Ink: `#CEDCE9`, L 86%.
 pub(super) const INK: Rgb = Rgb(206, 220, 233);
