@@ -614,6 +614,73 @@ fn entry_row_signal(
     }
 }
 
+/// Which of a card's three breaths this Space row is on right now.
+///
+/// The publish-time half of [`image_card::breath_behaviour`]: the app loop needs
+/// the same answer the renderer will reach, one pass earlier, so the engine can
+/// step the row on that breath's tier instead of the fastest of the three the
+/// row declares. Read from the same two facts the card reads — the row's
+/// aggregate state and its severity token.
+fn space_row_breath(app: &AppState, workspace: &crate::workspace::Workspace) -> &'static str {
+    let (state, _) = workspace.aggregate_state(&app.terminals);
+    let severity = crate::app::lifecycle::severity(
+        workspace
+            .metadata_tokens
+            .values()
+            .get(crate::app::lifecycle::SEVERITY_TOKEN)
+            .map(String::as_str),
+    );
+    image_card::breath_behaviour(state, severity)
+}
+
+/// Which of a card's three breaths this Agent row is on right now.
+///
+/// See [`space_row_breath`]; the same two facts, read off the panel entry.
+fn agent_row_breath(entry: &AgentPanelEntry) -> &'static str {
+    let severity = crate::app::lifecycle::severity(
+        entry
+            .tokens
+            .get(crate::app::lifecycle::SEVERITY_TOKEN)
+            .map(String::as_str),
+    );
+    image_card::breath_behaviour(entry.state, severity)
+}
+
+/// Every Space row the app loop publishes to [`crate::anim::Animator`], with the
+/// breath each one is playing.
+pub(crate) fn sidebar_space_row_members(app: &AppState) -> Vec<crate::anim::Member> {
+    app.workspaces
+        .iter()
+        .map(|workspace| crate::anim::Member {
+            id: crate::anim::ElementId::workspace_row(&workspace.id),
+            inputs: crate::anim::behaviour::DriveInputs {
+                activity: app.workspace_activity_level(workspace),
+            },
+            playing: Some(space_row_breath(app, workspace)),
+        })
+        .collect()
+}
+
+/// Every Agent row the app loop publishes, with the breath each one is playing.
+///
+/// Takes the live entries the caller already gathered rather than gathering its
+/// own, for the reason `observe_card_washes` gives: two readings of the tree in
+/// one pass can disagree about which rows exist.
+pub(crate) fn sidebar_agent_row_members(
+    app: &AppState,
+    live: &[AgentPanelEntry],
+) -> Vec<crate::anim::Member> {
+    live.iter()
+        .map(|entry| crate::anim::Member {
+            id: crate::anim::ElementId::agent_row(entry.pane_id),
+            inputs: crate::anim::behaviour::DriveInputs {
+                activity: app.pane_activity_level(entry.ws_idx, entry.pane_id),
+            },
+            playing: Some(agent_row_breath(entry)),
+        })
+        .collect()
+}
+
 /// Every trunk segment on screen right now: one per row with a gap still open
 /// beneath it, at each ancestor column that gap belongs to.
 ///

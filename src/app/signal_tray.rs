@@ -110,11 +110,18 @@ impl BadgeState {
     /// the state changes, because [`crate::anim::Lifecycle`] is read only when
     /// an element is *new* — a lifecycle that carried one name would freeze a
     /// badge on whatever state it happened to mount in.
+    ///
+    /// Declared as *alternates* rather than plain idle behaviours because a
+    /// badge is in exactly one state: all three are declared so the badge can
+    /// change state without remounting, but only one is ever on screen, and the
+    /// engine has to be told that or it steps every resting badge on
+    /// `badge-charge`'s tier. [`TrayReading::animation_membership`] names the
+    /// one each badge is actually playing.
     pub(crate) fn lifecycle() -> crate::anim::Lifecycle {
         crate::anim::Lifecycle::still()
-            .with_idle(Self::Idle.behaviour())
-            .with_idle(Self::Active.behaviour())
-            .with_idle(Self::Attention.behaviour())
+            .with_alternate(Self::Idle.behaviour())
+            .with_alternate(Self::Active.behaviour())
+            .with_alternate(Self::Attention.behaviour())
     }
 }
 
@@ -394,16 +401,17 @@ impl TrayReading {
     /// behaviour it plays. What is left for a live drive to say is how hard the
     /// fleet as a whole is working, which is the tray's existing tint concept
     /// applied to tempo.
-    pub(crate) fn animation_membership(
-        &self,
-    ) -> impl Iterator<Item = (crate::anim::ElementId, crate::anim::behaviour::DriveInputs)> + '_
-    {
+    ///
+    /// Each badge also carries *which* of [`BadgeState::lifecycle`]'s alternates
+    /// it is playing, which is the same answer [`BadgeState::behaviour`] gives
+    /// the renderer. Without it the engine has to assume any of the three could
+    /// be on screen and steps a resting badge on the charged tier.
+    pub(crate) fn animation_membership(&self) -> impl Iterator<Item = crate::anim::Member> + '_ {
         let activity = self.activity();
-        self.badges.iter().map(move |badge| {
-            (
-                badge.signal.badge_element_id(),
-                crate::anim::behaviour::DriveInputs { activity },
-            )
+        self.badges.iter().map(move |badge| crate::anim::Member {
+            id: badge.signal.badge_element_id(),
+            inputs: crate::anim::behaviour::DriveInputs { activity },
+            playing: Some(badge.state.behaviour()),
         })
     }
 }
@@ -908,11 +916,49 @@ mod tests {
         let reading = resolve(&app);
         assert!(reading.any_live(), "the fixture lit nothing");
 
-        let published: Vec<_> = reading.animation_membership().map(|(id, _)| id).collect();
+        let published: Vec<_> = reading
+            .animation_membership()
+            .map(|member| member.id)
+            .collect();
         assert_eq!(published.len(), FleetSignal::COUNT);
         for signal in FleetSignal::ALL {
             assert!(published.contains(&signal.badge_element_id()), "{signal:?}");
         }
+    }
+
+    /// And each one is published with the behaviour it is actually playing.
+    ///
+    /// [`BadgeState::lifecycle`] declares all three states as alternates, so the
+    /// engine steps a badge on the tier of whichever one is named here. Publish
+    /// nothing and it has to assume any of the three could be on screen, which
+    /// puts every resting badge on `badge-charge`'s 50 ms tier — twice what
+    /// `badge-rest` asks for, on the tray's own common case of eight badges
+    /// doing nothing. Publish the *wrong* one and the engine paces a badge to a
+    /// behaviour the renderer is not drawing, which is the same defect with a
+    /// visible edge, so this pins the answer against
+    /// [`BadgeState::behaviour`] — the one the renderer asks
+    /// `Animator::frame` for.
+    #[test]
+    fn every_published_badge_names_the_behaviour_it_is_playing() {
+        let mut app = app_with_workspace();
+        app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
+        let reading = resolve(&app);
+        assert!(reading.any_live(), "the fixture lit nothing");
+
+        let mut rested = 0;
+        for (badge, member) in reading.badges().zip(reading.animation_membership()) {
+            assert_eq!(
+                member.playing,
+                Some(badge.state.behaviour()),
+                "{:?} is published on a behaviour it is not drawn with",
+                badge.signal
+            );
+            rested += u32::from(!badge.state.is_live());
+        }
+        assert!(
+            rested > 0,
+            "the fixture lit every badge, so the resting case went untested"
+        );
     }
 
     /// The safety property the whole tray is built around. `sync` is the only
