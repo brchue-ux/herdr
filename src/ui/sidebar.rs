@@ -1904,6 +1904,12 @@ pub(crate) fn compute_workspace_list_areas(
 
     let scroll = app.workspace_scroll;
     let fold_width = row_fold_width(app, ws_area);
+    // Whether a drawn card is what sets every row's height, resolved once for
+    // the whole pass rather than per row: it is the same answer for all of them
+    // (card height is uniform across every rank) and answering it costs a font
+    // lookup. `list_entry_height` asks the same question again per row, which is
+    // where the height itself comes from; this is only the fact that it did.
+    let drawn_card = image_card::row_height_cells(app, fold_width).is_some();
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
@@ -1948,6 +1954,7 @@ pub(crate) fn compute_workspace_list_areas(
             agent,
             card_frame: card_frame_for(rect, entry, fold_width),
             motion_cells: (0, 0),
+            drawn_card,
         });
         row_y = row_y
             .saturating_add(row_height)
@@ -3136,6 +3143,13 @@ fn render_agent_row(
     }
 
     let last_content_row = rows.len().saturating_sub(1);
+    // Which of the card's content rows the branch line lands on, counted from
+    // the first. Zero for a character card and for every drawn card whose row
+    // has a middle cell to be the middle of; one further down when the card
+    // needed five cells. Resolved once, because the loop below and
+    // `render_card_border_rails` above both draw into the same prefix columns
+    // and a disagreement between them is two branch lines on one card.
+    let connector_row = card.connector_y().saturating_sub(card.content_y());
     for (row_index, resolved) in rows.iter().enumerate() {
         let row_y = card.content_y() + row_index as u16;
         if row_index as u16 >= content_rows || row_y >= list_bottom {
@@ -3153,7 +3167,9 @@ fn render_agent_row(
         // The branch line only exists on the card's first content row, so
         // that is the only row a signal can travel and the only row it
         // damages.
-        let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
+        let row_signal_phase = (row_index as u16 == connector_row)
+            .then_some(signal_phase)
+            .flatten();
         let row_charge = ConnectorCharge::new(app, connector_style, row_signal_phase, row_severity);
         // Only the first content row carries the badge, so only it gives up the
         // width; only the last carries the pill.
@@ -3173,9 +3189,10 @@ fn render_agent_row(
         let (mut spans, token_budget) = match &card_shell {
             Some(shell) => {
                 // A content row draws its own prefix over the rail laid down
-                // before it, so this is where the connector actually lands. Row
-                // zero is the card's name, and the connector points at the name.
-                let (mut spans, _) = if row_index == 0 {
+                // before it, so this is where the connector actually lands —
+                // on `connector_row`, which is the card's name row unless the
+                // drawn card's own middle falls further down.
+                let (mut spans, _) = if row_index as u16 == connector_row {
                     agent_row_prefix(
                         entry.depth(),
                         entry.is_last_child(),
@@ -3191,7 +3208,11 @@ fn render_agent_row(
                         entry.depth(),
                         entry.is_last_child(),
                         entry.ancestors_continue(),
-                        CardRailSegment::BelowConnector,
+                        if (row_index as u16) < connector_row {
+                            CardRailSegment::AboveConnector
+                        } else {
+                            CardRailSegment::BelowConnector
+                        },
                         p,
                         trunk.as_ref(),
                     )
@@ -3200,7 +3221,7 @@ fn render_agent_row(
                 // border can be laid over the first of them once the row has
                 // had its say — except on the connector row of a nested card,
                 // where that column is where the branch meets the border.
-                if row_index == 0 && entry.depth() > 0 {
+                if row_index as u16 == connector_row && entry.depth() > 0 {
                     spans.push(connector_joint_span(p));
                 } else {
                     spans.push(Span::raw(" "));
@@ -3374,11 +3395,14 @@ fn render_card_border_rails(
     if width == 0 || shell_frame.height == 0 || motion.0 != 0 {
         return;
     }
-    // The connector points at the card's *name*, which is its first content
-    // row, not at the corner of its box. A rail calibrated for one-line rows put
-    // it on the top border, where it reads as an arrow at a rectangle rather
-    // than as a line to a thing with a name.
-    let connector_y = card.content_y();
+    // Where the branch line meets this card. On a character card that is its
+    // *name* — its first content row, not the corner of its box, because a rail
+    // calibrated for one-line rows put it on the top border where it reads as an
+    // arrow at a rectangle rather than as a line to a thing with a name. On a
+    // drawn card it is the row the shape's own middle falls in, which is a
+    // different row as soon as the card needs more than three cells. See
+    // [`crate::app::state::WorkspaceCardArea::connector_y`].
+    let connector_y = card.connector_y();
     // Every row from the card's top edge to the foot of the gap under it, so
     // the line is a line. Drawing only the first and last rows of a card left a
     // dash per card with the tree's own spacing showing through the breaks.
@@ -4196,6 +4220,7 @@ mod failure_spider_geometry {
             agent: None,
             card_frame: Some(frame),
             motion_cells: (0, 0),
+            drawn_card: true,
         }
     }
 
@@ -4870,6 +4895,9 @@ fn render_workspace_list(
         }
 
         let last_content_row = rows.len().saturating_sub(1);
+        // See the same line in `render_agent_row`: the row the branch lands on,
+        // which the rails drawn above this loop also use.
+        let connector_row = card.connector_y().saturating_sub(content_y);
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= content_rows || content_y + row_index as u16 >= list_bottom {
                 break;
@@ -4885,9 +4913,12 @@ fn render_workspace_list(
             else {
                 continue;
             };
-            // The branch line only exists on a child card's first row, so that
-            // is the only row a signal can travel and the only row it damages.
-            let row_signal_phase = (row_index == 0).then_some(signal_phase).flatten();
+            // The branch line exists on exactly one row of a child card, so
+            // that is the only row a signal can travel and the only row it
+            // damages.
+            let row_signal_phase = (row_index as u16 == connector_row)
+                .then_some(signal_phase)
+                .flatten();
             let mut spans = Vec::new();
             // Resolved once per row rather than per cell: the charge's colour
             // and its behaviour are the same for every cell of the route, and
@@ -4896,12 +4927,14 @@ fn render_workspace_list(
             let row_charge =
                 ConnectorCharge::new(app, connector_style, row_signal_phase, row_severity);
             let token_budget = match &card_shell {
-                // The connector is on the card's *name* row — its first content
-                // row — because that is the thing the tree is pointing at. Every
-                // other row of the card carries the plain rail, and the frame
-                // holds the content in from the column beside it.
+                // The connector is on `connector_row` — the card's *name* row
+                // under the character shell, because that is the thing the tree
+                // is pointing at, and the row a drawn card's own middle falls in
+                // when the two differ. Every other row of the card carries the
+                // plain rail, and the frame holds the content in from the column
+                // beside it.
                 Some(shell) => {
-                    let (mut prefix, _) = if row_index == 0 {
+                    let (mut prefix, _) = if row_index as u16 == connector_row {
                         agent_row_prefix(
                             own_depth,
                             own_is_last,
@@ -4917,7 +4950,11 @@ fn render_workspace_list(
                             own_depth,
                             own_is_last,
                             own_ancestors,
-                            CardRailSegment::BelowConnector,
+                            if (row_index as u16) < connector_row {
+                                CardRailSegment::AboveConnector
+                            } else {
+                                CardRailSegment::BelowConnector
+                            },
                             p,
                             trunk.as_ref(),
                         )
@@ -4928,7 +4965,7 @@ fn render_workspace_list(
                     // row has had its say — except on the connector row of a
                     // nested card, where that column is where the branch meets
                     // the border.
-                    if row_index == 0 && own_depth > 0 {
+                    if row_index as u16 == connector_row && own_depth > 0 {
                         spans.push(connector_joint_span(p));
                     } else {
                         spans.push(Span::raw(" "));
@@ -6004,6 +6041,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
     }
@@ -6420,6 +6458,7 @@ mod tests {
             agent: None,
             card_frame: Some(frame),
             motion_cells: (0, 0),
+            drawn_card: true,
         };
         let chevron = workspace_group_chevron_rect(&card);
         assert_eq!(
@@ -8006,6 +8045,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             worktree_child: false,
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(15, 6)).expect("test terminal");
@@ -10469,5 +10509,159 @@ mod ownership_is_drawn_as_written {
             assert_eq!(frame.x, 1);
             assert_eq!(frame.width, fold - 1);
         }
+    }
+}
+
+/// Where the tree's branch line meets a card it points at.
+///
+/// The captain, live on a real Rio at his own 42 columns: *"branch lines are not
+/// centered on the card pane's vertical portion."* The line lands on a whole
+/// character row and the drawn card is a shape of a fixed pixel height, and the
+/// two agreed only while a row happened to be an odd number of cells — three at
+/// a 21 px cell, four at 15–18 px, where the line ran into every card in the
+/// tree half a cell above its middle at once.
+#[cfg(test)]
+mod a_branch_line_meets_its_card_in_the_middle {
+    use super::*;
+    use crate::app::state::{AppState, WorkspaceCardArea};
+    use crate::workspace::Workspace;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn area(frame_height: u16, drawn_card: bool) -> WorkspaceCardArea {
+        WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 4, 40, frame_height),
+            worktree_child: false,
+            entry_idx: 0,
+            agent: None,
+            card_frame: Some(Rect::new(4, 4, 30, frame_height)),
+            motion_cells: (0, 0),
+            drawn_card,
+        }
+    }
+
+    /// A drawn card's line lands on the row its own middle falls in, whatever
+    /// its cell height made the row.
+    #[test]
+    fn a_drawn_cards_line_lands_on_the_row_its_middle_falls_in() {
+        for (rows, expected) in [(1u16, 4u16), (2, 4), (3, 5), (4, 5), (5, 6)] {
+            assert_eq!(
+                area(rows, true).connector_y(),
+                expected,
+                "a {rows}-cell drawn card"
+            );
+        }
+    }
+
+    /// A character card's line still points at its *name*. Its rows are its own
+    /// content — the captain's three token rows make a five-row box — and a line
+    /// to the middle of that box would be pointing at whatever token happened to
+    /// be third.
+    #[test]
+    fn a_character_cards_line_still_points_at_its_name() {
+        for rows in [3u16, 4, 5, 6] {
+            let card = area(rows, false);
+            assert_eq!(card.connector_y(), card.content_y(), "a {rows}-cell box");
+            assert_eq!(card.connector_y(), 5);
+        }
+    }
+
+    /// A row with no card shell at all answers with its own first row, which is
+    /// what every caller of `content_y` already relied on.
+    #[test]
+    fn a_bare_row_answers_with_its_own_first_row() {
+        let mut card = area(3, true);
+        card.card_frame = None;
+        assert_eq!(card.connector_y(), card.rect.y);
+    }
+
+    /// The renderer draws it there.
+    ///
+    /// The link the two geometry tests cannot make on their own: `connector_y`
+    /// being right is worth nothing if `render_card_border_rails` goes on
+    /// drawing the `└──` on `content_y`. Driven through the real
+    /// [`render_sidebar`] at an 11 px cell, where a card needs five cells and
+    /// the middle row is two down rather than one — a four-cell row cannot say
+    /// anything here, because there the two rows agree and it is the card that
+    /// moves onto the line instead.
+    #[test]
+    fn the_renderer_draws_the_branch_on_that_row_and_not_on_the_name_row() {
+        let mut app = AppState::test_new();
+        let mut mate = Workspace::test_new("2ndmate-a");
+        let worker = mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+        let terminal_id = app.workspaces[1].tabs[0].panes[&worker]
+            .attached_terminal_id
+            .clone();
+        let carrier = app
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("a test terminal");
+        carrier.set_agent_name("worker".to_string());
+        carrier.state = AgentState::Idle;
+        carrier.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("2ndmate-a".to_string()))]),
+            None,
+            now,
+        );
+        app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
+        app.sidebar_card_shapes = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 11,
+        };
+
+        let area = Rect::new(0, 0, 42, 24);
+        app.sidebar_width = area.width;
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let Some(card) = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_some())
+            .copied()
+        else {
+            panic!("the worker row is missing from the tree");
+        };
+        if !card.drawn_card {
+            return; // No proportional face on this machine; nothing draws a card.
+        }
+        let frame = card.card_frame.expect("a card at 42 columns");
+        assert!(
+            frame.height >= 5 && frame.height % 2 == 1,
+            "an 11 px cell must give an odd row of five cells or more, not {}",
+            frame.height
+        );
+        assert_ne!(
+            card.connector_y(),
+            card.content_y(),
+            "this fixture has to be one where the two rows disagree"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|f| render_sidebar(&app, &TerminalRuntimeRegistry::new(), f, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let branch_rows: Vec<u16> = (card.rect.y..card.rect.y + card.rect.height)
+            .filter(|y| (0..frame.x).any(|x| matches!(buffer[(x, *y)].symbol(), "├" | "└")))
+            .collect();
+        assert_eq!(
+            branch_rows,
+            vec![card.connector_y()],
+            "the worker's branch is not on the row its card's middle falls in"
+        );
     }
 }

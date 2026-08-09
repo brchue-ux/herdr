@@ -960,6 +960,15 @@ pub struct WorkspaceCardArea {
     /// one place the offset is resolved — see
     /// [`crate::ui::sidebar::motion::cell_offsets`].
     pub motion_cells: (i32, i32),
+    /// True when this row is as tall as it is because a *drawn* card set its
+    /// height ([`crate::ui::sidebar::image_card::row_height_cells`]) rather
+    /// than because its text lines did.
+    ///
+    /// The one thing that separates a card which is a picture from a card which
+    /// is a box of characters, kept here because the layout already had to
+    /// decide it and the renderer must not decide it a second time. Read by
+    /// [`Self::connector_y`].
+    pub drawn_card: bool,
 }
 
 impl WorkspaceCardArea {
@@ -968,6 +977,42 @@ impl WorkspaceCardArea {
         self.card_frame
             .map(|frame| frame.y.saturating_add(1))
             .unwrap_or(self.rect.y)
+    }
+
+    /// The row of this card the tree's branch line meets it on.
+    ///
+    /// # Why this is not [`Self::content_y`]
+    ///
+    /// A *character* card is a box whose rows are its own content, and the line
+    /// points at its name — the first content row — because a line to the top
+    /// border reads as an arrow at a rectangle rather than as a line to a thing
+    /// with a name. That is unchanged, and it is what this returns for one.
+    ///
+    /// A *drawn* card is not a box of rows. It is one shape of a fixed pixel
+    /// height, centred in however many cells
+    /// [`crate::ui::sidebar::image_card::row_height_cells`] gave the row, and
+    /// what the eye lines the branch up against is that shape's own middle. The
+    /// two coincide only when the row is exactly three cells — which is what it
+    /// is at a 21 px cell, and is not at 14–18 px, where the card needs four.
+    /// There `frame.y + 1` sits half a cell above the card's centre in every
+    /// row of the tree at once: *"branch lines are not centered on the card's
+    /// vertical span"*.
+    ///
+    /// So a drawn card's line lands on the row its centre falls in. For an odd
+    /// number of cells that row's own centre *is* the card's centre and nothing
+    /// else has to move; for an even number the two are half a cell apart, and
+    /// the card gives that half cell back — see
+    /// [`crate::ui::sidebar::image_card::connector_row_offset_px`], the vertical
+    /// twin of the half-column
+    /// [`crate::ui::sidebar::image_card::RAIL_INK_COLUMN_FRACTION`] already
+    /// moves a card by.
+    pub fn connector_y(&self) -> u16 {
+        match self.card_frame {
+            Some(frame) if self.drawn_card && frame.height > 0 => {
+                frame.y.saturating_add(frame.height.saturating_sub(1) / 2)
+            }
+            _ => self.content_y(),
+        }
     }
 
     /// One past the rightmost column a control drawn over this row may occupy.
@@ -4344,6 +4389,7 @@ mod tests {
             }),
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         }];
 
         assert!(
@@ -4378,6 +4424,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         }];
         assert!(
             !state.relation_signal_damage(),
@@ -4399,6 +4446,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            drawn_card: true,
         }];
         assert!(!state.relation_signal_damage());
 
