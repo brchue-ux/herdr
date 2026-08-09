@@ -10,6 +10,7 @@ use base64::Engine;
 use ratatui::layout::Rect;
 
 use crate::app::state::AppState;
+#[cfg(test)]
 use crate::app::Mode;
 use crate::ghostty::{
     KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
@@ -690,7 +691,8 @@ pub(crate) fn encode_local_pane_graphics(
     cache: &mut HostGraphicsCache,
     embedded: EmbeddedSurfaces,
 ) -> Vec<u8> {
-    let mode_ok = app.mode == Mode::Terminal;
+    let occlusion = crate::ui::overlay_occlusion(app);
+    let mode_ok = occlusion != crate::ui::OverlayOcclusion::Screen;
     let cell_ok = cell_size.is_known();
     tracing::debug!(
         mode_ok,
@@ -704,7 +706,7 @@ pub(crate) fn encode_local_pane_graphics(
     if !mode_ok || !cell_ok {
         tracing::debug!(
             reason = if !mode_ok {
-                "not terminal mode"
+                "overlay covers the whole surface"
             } else {
                 "cell size unknown"
             },
@@ -721,6 +723,7 @@ pub(crate) fn encode_local_pane_graphics(
         cell_size,
         &cache.images,
         embedded,
+        occlusion,
     );
     tracing::debug!(
         placements_collected = placements.len(),
@@ -830,9 +833,19 @@ pub(crate) fn has_visible_pane_graphics(
     cell_size: HostCellSize,
     embedded: EmbeddedSurfaces,
 ) -> bool {
-    if app.mode != Mode::Terminal || !cell_size.is_known() {
+    let occlusion = crate::ui::overlay_occlusion(app);
+    if occlusion == crate::ui::OverlayOcclusion::Screen || !cell_size.is_known() {
         return false;
     }
+    // The same rule `collect_visible_placements` filters on, so this answers for
+    // the placements that pass would actually make rather than for the ones the
+    // overlay is about to withhold.
+    let visible = |host_placement: &HostPlacement| -> bool {
+        match clipped_placement(host_placement) {
+            Some((clipped, _)) => !occlusion.hides(clipped_cells(&clipped)),
+            None => false,
+        }
+    };
 
     // Surface layers anchor to viewport chrome rather than to a pane, so they
     // are checked before — and independently of — the active workspace, exactly
@@ -841,7 +854,7 @@ pub(crate) fn has_visible_pane_graphics(
     for (surface_id, area, layer) in surface_layer_placement_targets(app, embedded) {
         let host_placement =
             layer_host_placement(surface_id, area, cell_size, layer, &empty_uploaded, false);
-        if clipped_placement(&host_placement).is_some() {
+        if visible(&host_placement) {
             return true;
         }
     }
@@ -868,7 +881,7 @@ pub(crate) fn has_visible_pane_graphics(
                 &empty_uploaded,
                 false,
             );
-            clipped_placement(&host_placement).is_some()
+            visible(&host_placement)
         }) {
             return true;
         }
@@ -892,7 +905,7 @@ pub(crate) fn has_visible_pane_graphics(
                     scrollback_offset,
                     animation: None,
                 };
-                if clipped_placement(&host_placement).is_some() {
+                if visible(&host_placement) {
                     return true;
                 }
             }
@@ -1171,6 +1184,17 @@ fn active_view_key(app: &AppState) -> Option<HostViewKey> {
     })
 }
 
+/// The cell box a clipped placement will occupy, as a [`Rect`], so it can be
+/// measured against what this pass's overlay is painting over.
+fn clipped_cells(clipped: &ClippedPlacement) -> Rect {
+    Rect::new(
+        clipped.x,
+        clipped.y,
+        clipped.cols.try_into().unwrap_or(u16::MAX),
+        clipped.rows.try_into().unwrap_or(u16::MAX),
+    )
+}
+
 fn collect_visible_placements(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1178,21 +1202,35 @@ fn collect_visible_placements(
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
     embedded: EmbeddedSurfaces,
+    occlusion: crate::ui::OverlayOcclusion,
 ) -> Vec<HostPlacement> {
     let mut placements = Vec::new();
+
+    // Whether an image would land on the cells this pass's overlay owns. Images
+    // composite above text, so one that would is not placed at all — see
+    // `crate::ui::OverlayOcclusion`. Measured on the *clipped* placement, which
+    // is the cell box the terminal is actually handed, rather than on the
+    // surface's own rect.
+    let hidden_by_overlay = |placement: &HostPlacement| -> bool {
+        if occlusion == crate::ui::OverlayOcclusion::None {
+            return false;
+        }
+        let Some((clipped, _)) = clipped_placement(placement) else {
+            return false;
+        };
+        occlusion.hides(clipped_cells(&clipped))
+    };
 
     // Chrome surfaces are laid out beside the tab surface, not inside it, so
     // they are collected before the active-workspace gate rather than through
     // the pane walk.
     for (surface_id, area, layer) in surface_layer_placement_targets(app, embedded) {
-        placements.push(layer_host_placement(
-            surface_id,
-            area,
-            cell_size,
-            layer,
-            uploaded_images,
-            true,
-        ));
+        let placement =
+            layer_host_placement(surface_id, area, cell_size, layer, uploaded_images, true);
+        if hidden_by_overlay(&placement) {
+            continue;
+        }
+        placements.push(placement);
     }
 
     let ws_idx = match app.active {
@@ -1220,14 +1258,17 @@ fn collect_visible_placements(
     );
     for info in surface.pane_infos {
         if let Some(layer) = app.pane_graphics_layers.get(&info.id) {
-            placements.push(layer_host_placement(
+            let placement = layer_host_placement(
                 HostSurfaceId::Pane(info.id),
                 info.inner_rect,
                 cell_size,
                 layer,
                 uploaded_images,
                 true,
-            ));
+            );
+            if !hidden_by_overlay(&placement) {
+                placements.push(placement);
+            }
         }
 
         let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
@@ -1247,7 +1288,7 @@ fn collect_visible_placements(
                 .scroll_metrics()
                 .map(|m| m.offset_from_bottom as u32)
                 .unwrap_or(0);
-            placements.push(HostPlacement {
+            let host_placement = HostPlacement {
                 surface: HostSurfaceId::Pane(info.id),
                 area: info.inner_rect,
                 cell_size,
@@ -1258,7 +1299,11 @@ fn collect_visible_placements(
                 placement,
                 scrollback_offset,
                 animation: None,
-            });
+            };
+            if hidden_by_overlay(&host_placement) {
+                continue;
+            }
+            placements.push(host_placement);
         }
     }
 
@@ -2532,6 +2577,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
 
         assert_eq!(placements.len(), 1);
@@ -2546,6 +2592,110 @@ mod tests {
         let (clipped, _) = clipped_placement(placement).expect("visible sidebar layer");
         assert_eq!((clipped.x, clipped.y), (0, 0));
         assert_eq!((clipped.cols, clipped.rows), (26, 20));
+    }
+
+    /// A bounded overlay takes off the terminal exactly the surfaces it lands
+    /// on, and leaves the rest drawn.
+    ///
+    /// The defect this pins: a Kitty image composites above the cell text, so
+    /// no image may be placed under an open overlay — but the rule was written
+    /// as `mode != Terminal`, and every graphics surface added since inherited
+    /// it. A five-row menu in the sidebar footer, or the one-row prefix bar
+    /// under the panes, took every card and every badge on the panel with it.
+    #[test]
+    fn a_bounded_overlay_withholds_only_the_surfaces_it_lands_on() {
+        let sidebar = Rect::new(0, 0, 26, 20);
+        let placed = |app: &AppState| -> Vec<HostSurfaceId> {
+            collect_visible_placements(
+                app,
+                &TerminalRuntimeRegistry::new(),
+                empty_surface(),
+                test_cell_size(),
+                &HashMap::new(),
+                EmbeddedSurfaces::ALL,
+                crate::ui::overlay_occlusion(app),
+            )
+            .into_iter()
+            .map(|placement| placement.surface)
+            .collect()
+        };
+
+        let app = app_with_sidebar(
+            sidebar,
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        assert_eq!(
+            placed(&app),
+            vec![HostSurfaceId::Sidebar],
+            "the surface is not drawn even with nothing overlaid"
+        );
+
+        // A menu that misses it entirely: the surface stays on the terminal.
+        let mut missed = app_with_sidebar(
+            sidebar,
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        missed.view.terminal_area = Rect::new(26, 0, 74, 40);
+        missed.mode = Mode::ContextMenu;
+        missed.context_menu = Some(crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            x: 60,
+            y: 30,
+            list: crate::app::state::MenuListState::new(0),
+        });
+        assert!(
+            matches!(
+                crate::ui::overlay_occlusion(&missed),
+                crate::ui::OverlayOcclusion::Panel(_)
+            ),
+            "a context menu must be bounded by its own box, not by the screen"
+        );
+        assert_eq!(
+            placed(&missed),
+            vec![HostSurfaceId::Sidebar],
+            "a menu nowhere near the surface still took it off the terminal"
+        );
+
+        // A menu opened on top of it: that one surface stands down.
+        let mut covered = app_with_sidebar(
+            sidebar,
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        covered.view.terminal_area = Rect::new(26, 0, 74, 40);
+        covered.mode = Mode::ContextMenu;
+        covered.context_menu = Some(crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            x: 2,
+            y: 2,
+            list: crate::app::state::MenuListState::new(0),
+        });
+        assert!(
+            placed(&covered).is_empty(),
+            "an overlay drawn over the surface must not have an image placed above it"
+        );
+
+        // And a mode whose painted extent cannot be named keeps the old answer.
+        let mut unbounded = app_with_sidebar(
+            sidebar,
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        unbounded.mode = Mode::Settings;
+        assert_eq!(
+            crate::ui::overlay_occlusion(&unbounded),
+            crate::ui::OverlayOcclusion::Screen
+        );
+        assert!(
+            encode_local_pane_graphics(
+                &unbounded,
+                &TerminalRuntimeRegistry::new(),
+                empty_surface(),
+                test_cell_size(),
+                &mut HostGraphicsCache::default(),
+                EmbeddedSurfaces::ALL,
+            )
+            .is_empty(),
+            "an unbounded overlay must still withhold every surface"
+        );
     }
 
     #[test]
@@ -2568,6 +2718,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("visible sidebar layer");
 
@@ -2607,6 +2758,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("a card part-way in");
         assert_eq!((clipped.x, clipped.y), (18, 3));
@@ -2633,6 +2785,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
         assert!(
             clipped_placement(&placements[0]).is_none(),
@@ -2655,6 +2808,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
 
         assert_eq!(placements.len(), 1, "the layer is still stored");
@@ -2870,6 +3024,7 @@ mod tests {
             test_cell_size(),
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
         );
         assert_eq!(placements.len(), 2);
 
