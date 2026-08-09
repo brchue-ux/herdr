@@ -123,6 +123,15 @@ struct ClientState {
     /// the one before it said is not rasterised twice — the client's own half
     /// of the server's `signal_tray_graphics_key`.
     previous_tray_scene: Option<crate::ui::TrayScene>,
+    /// The badge artwork this client last actually handed its terminal.
+    ///
+    /// `previous_tray_scene` above stops an *identical* scene being drawn
+    /// twice; this stops a scene that is different only in ways nobody can see
+    /// from costing the terminal a whole new image. On an idle fleet that is
+    /// almost every scene, and this is the client's own half of the server's
+    /// `AppState::signal_tray_published` — see
+    /// [`crate::app::state::PublishedSurfaceRaster`].
+    published_tray_raster: crate::app::state::PublishedSurfaceRaster,
     /// Kitty graphics bytes from rasterised `TrayScene`s not yet spliced into
     /// an outgoing frame. Appended rather than replaced, because these are the
     /// encoder's *deltas* against `tray_scene_cache`: dropping an unflushed one
@@ -1497,6 +1506,7 @@ async fn run_client_loop(
         pending_card_graphics: Vec::new(),
         tray_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
         previous_tray_scene: None,
+        published_tray_raster: crate::app::state::PublishedSurfaceRaster::default(),
         pending_tray_graphics: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
@@ -2334,9 +2344,16 @@ fn decode_and_rasterise_card_scene(bytes: &[u8], state: &mut ClientState) -> Vec
 /// graphics bytes ready to splice into the next outgoing frame, updating
 /// `state`'s own rasterisation cache along the way.
 ///
-/// Empty on a decode failure, on a scene with nothing to draw, or when the
-/// scene is the one already on screen — there is nothing new to splice either
-/// way.
+/// Empty on a decode failure, on a scene with nothing to draw, when the scene
+/// is the one already on screen, or when the artwork it draws to is within
+/// [`crate::app::state::SURFACE_DRIFT_LEVELS`] of the artwork this terminal is
+/// already showing — there is nothing new to splice in any of those cases.
+///
+/// That last one is the whole idle cost of a delegating client. The scenes
+/// arrive on the badge frame tier and every one of them is a *different* scene
+/// — a resting badge's breath is a continuous envelope — so `previous_tray_scene`
+/// alone stops none of them, and each one used to buy the terminal a fresh
+/// 328x128 image for a change of a fraction of an 8-bit level.
 fn decode_and_rasterise_tray_scene(bytes: &[u8], state: &mut ClientState) -> Vec<u8> {
     let scene = match crate::ui::decode_signal_tray_scene(bytes) {
         Ok(scene) => scene,
@@ -2355,15 +2372,31 @@ fn decode_and_rasterise_tray_scene(bytes: &[u8], state: &mut ClientState) -> Vec
     ) else {
         return Vec::new();
     };
-    let layer = crate::ui::signal_tray_graphics_layer(image);
-    let graphics = crate::kitty_graphics::encode_tray_scene_graphics(
+    // Recorded either way: this scene has been drawn, and drawing it again
+    // would produce the same pixels the gate just refused.
+    state.previous_tray_scene = Some(scene);
+    if !state
+        .published_tray_raster
+        .accept(image.width, image.height, &image.pixels)
+    {
+        return Vec::new();
+    }
+    let Some(layer) = crate::ui::signal_tray_graphics_layer(
+        image,
+        crate::kitty_graphics::host_terminal_kind(),
+        crate::kitty_graphics::host_graphics_is_local(),
+    ) else {
+        // Nothing went out, so nothing on screen matches what was just
+        // recorded as published.
+        state.published_tray_raster.forget();
+        return Vec::new();
+    };
+    crate::kitty_graphics::encode_tray_scene_graphics(
         grid,
         &layer,
         state.cell_size,
         &mut state.tray_scene_cache,
-    );
-    state.previous_tray_scene = Some(scene);
-    graphics
+    )
 }
 
 fn clear_received_kitty_graphics(mut writer: impl io::Write) -> io::Result<()> {
