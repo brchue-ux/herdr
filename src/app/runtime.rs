@@ -672,23 +672,15 @@ impl App {
         // them: it is a singleton driven by enter/leave, in its own family for
         // exactly that reason.
         type Members = Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)>;
+        // Families whose publisher also knows which of the lifecycle's
+        // alternates each element is playing — see `crate::anim::Member`.
+        type SelectedMembers = Vec<crate::anim::Member>;
 
         let lifecycle = self.state.sidebar_row_lifecycle();
-        let spaces: Members = if tree {
-            self.state
-                .workspaces
-                .iter()
-                .map(|workspace| {
-                    (
-                        crate::anim::ElementId::workspace_row(&workspace.id),
-                        crate::anim::behaviour::DriveInputs {
-                            activity: self.state.workspace_activity_level(workspace),
-                        },
-                    )
-                })
-                .collect()
+        let spaces: SelectedMembers = if tree {
+            crate::ui::sidebar_space_row_members(&self.state)
         } else {
-            Members::new()
+            SelectedMembers::new()
         };
         let spaces_changed =
             self.state
@@ -736,12 +728,12 @@ impl App {
         // is either all eight or none, and a badge going quiet changes which
         // behaviour it plays rather than whether it exists.
         let badge_lifecycle = crate::app::signal_tray::BadgeState::lifecycle();
-        let badge_members: Members = if badges {
+        let badge_members: SelectedMembers = if badges {
             crate::app::signal_tray::resolve(&self.state)
                 .animation_membership()
                 .collect()
         } else {
-            Members::new()
+            SelectedMembers::new()
         };
         let badges_changed = self.state.anim.observe(
             now,
@@ -850,17 +842,7 @@ impl App {
             Vec::new()
         };
         let washes_changed = self.observe_card_washes(now, &live, washes);
-        let rows: Vec<_> = live
-            .iter()
-            .map(|entry| {
-                (
-                    crate::anim::ElementId::agent_row(entry.pane_id),
-                    crate::anim::behaviour::DriveInputs {
-                        activity: self.state.pane_activity_level(entry.ws_idx, entry.pane_id),
-                    },
-                )
-            })
-            .collect();
+        let rows = crate::ui::sidebar_agent_row_members(&self.state, &live);
         let changed = self
             .state
             .anim

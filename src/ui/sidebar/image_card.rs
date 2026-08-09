@@ -1759,7 +1759,12 @@ fn title_text(entry: &AgentPanelEntry) -> String {
 /// explicit that state has to survive a reader who cannot separate the hues, so
 /// severity says it twice — in how far the card stands off the panel, and in how
 /// fast it breathes.
-fn breath_behaviour(state: AgentState, severity: Severity) -> &'static str {
+///
+/// `pub(crate)` because it is not only a render-time question: the app loop
+/// publishes it as [`crate::anim::Member::playing`] so the engine steps a card
+/// on the tier of the breath it is on rather than the fastest of the three its
+/// row declares. Both callers must agree, which is why there is one function.
+pub(crate) fn breath_behaviour(state: AgentState, severity: Severity) -> &'static str {
     if severity.escalates() {
         return crate::anim::behaviour::names::CARD_ALERT;
     }
@@ -7769,46 +7774,30 @@ mod cards_breathe_and_wash {
     /// The fleet with card motion configured on and its rows published, so the
     /// engine really is running the breaths.
     ///
-    /// The lifecycle is built from [`crate::config::SidebarCardsConfig`]'s own
-    /// answer rather than from `AppState::sidebar_row_lifecycle`, which
-    /// additionally requires this machine to have a proportional face —
-    /// something a container running the suite routinely does not. The
-    /// behaviours declared are the same ones either way, and the read path
-    /// under test is the same read path.
+    /// The lifecycle is [`AppState::sidebar_row_lifecycle_given_cards`] with the
+    /// card gate handed in rather than `AppState::sidebar_row_lifecycle`, whose
+    /// gate additionally requires this machine to have a proportional face —
+    /// something a container running the suite routinely does not. That is the
+    /// only term substituted: the lists a row is given, and the membership it is
+    /// published with, are the ones the app loop builds.
     fn breathing_fleet() -> (AppState, Instant) {
         let mut app = pixel_fleet_app();
         app.sidebar_card_shapes = true;
         let now = Instant::now();
-        let mut lifecycle = crate::anim::Lifecycle::still();
-        for behaviour in app.sidebar_cards.pulse_behaviours() {
-            lifecycle = lifecycle.with_idle(*behaviour);
-        }
+        let lifecycle = app.sidebar_row_lifecycle_given_cards(true);
         publish_rows(&mut app, &lifecycle, now);
         (app, now)
     }
 
+    /// The app loop's own publish, as [`crate::app::runtime`] makes it — the
+    /// real member builders, so each row carries the breath it is playing and is
+    /// stepped on that breath's tier rather than the fastest of the three.
     fn publish_rows(app: &mut AppState, lifecycle: &crate::anim::Lifecycle, now: Instant) {
-        let agents: Vec<_> = super::super::sidebar_agent_live_entries(app)
-            .iter()
-            .map(|entry| {
-                (
-                    crate::anim::ElementId::agent_row(entry.pane_id),
-                    crate::anim::behaviour::DriveInputs::default(),
-                )
-            })
-            .collect();
+        let live = super::super::sidebar_agent_live_entries(app);
+        let agents = super::super::sidebar_agent_row_members(app, &live);
         app.anim
             .observe(now, crate::anim::Family::AgentRow, lifecycle, agents);
-        let spaces: Vec<_> = app
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    crate::anim::ElementId::workspace_row(&workspace.id),
-                    crate::anim::behaviour::DriveInputs::default(),
-                )
-            })
-            .collect();
+        let spaces = super::super::sidebar_space_row_members(app);
         app.anim
             .observe(now, crate::anim::Family::WorkspaceRow, lifecycle, spaces);
     }
@@ -7974,6 +7963,56 @@ mod cards_breathe_and_wash {
             differed,
             "the two card states breathed in lockstep, so rhythm is carrying \
              nothing and the state ladder is colour alone"
+        );
+    }
+
+    /// A fleet in one state, published the way the app loop publishes it, and
+    /// the frames its rows report over a second of passes at the render floor.
+    fn frames_reported_in_a_second(state: AgentState) -> u32 {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        for terminal in app.terminals.values_mut() {
+            terminal.state = state;
+        }
+        let now = Instant::now();
+        let lifecycle = app.sidebar_row_lifecycle_given_cards(true);
+        publish_rows(&mut app, &lifecycle, now);
+        (1..=125u32)
+            .filter(|step| {
+                app.anim
+                    .advance(now + Duration::from_millis(u64::from(*step) * 8))
+            })
+            .count() as u32
+    }
+
+    /// **A quiet fleet's cards are stepped on the tier `card-rest` declares, not
+    /// on `card-live`'s.**
+    ///
+    /// Every row declares all three breaths, because a card that named only the
+    /// one its state wants today would freeze when the state moved. Reading the
+    /// tier as `min()` across that declaration stepped every resting card at
+    /// 50 ms — twice what it asks for, and `card-rest` says why it asks for
+    /// 100: "a five-second breath has nothing at 50 ms that it does not have at
+    /// 100, and a resting card is the tree's common case". Each of those extra
+    /// steps is a re-raster of the card, a fresh `CardScene` on the wire, and on
+    /// a delegating client a re-raster and a Kitty upload again at the far end.
+    ///
+    /// A quiet fleet is the case that matters: every card in it is a resting
+    /// one. A working fleet is measured too, because halving the idle cost by
+    /// slowing down the state that asked to be smooth would be no fix at all.
+    #[test]
+    fn a_quiet_fleets_cards_are_stepped_on_the_resting_tier() {
+        let resting = frames_reported_in_a_second(AgentState::Idle);
+        assert!(
+            (1..=12).contains(&resting),
+            "a resting fleet's cards should report about `card-rest`'s tier in a \
+             second; {resting} is `card-live`'s"
+        );
+
+        let working = frames_reported_in_a_second(AgentState::Working);
+        assert!(
+            (15..=25).contains(&working),
+            "a working fleet's cards must keep the smooth tier they breathe on, got {working}"
         );
     }
 

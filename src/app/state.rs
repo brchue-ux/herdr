@@ -2470,28 +2470,49 @@ impl AppState {
     /// each keeps its own period and its own live rate — while still sharing
     /// one arrival.
     pub(crate) fn sidebar_row_lifecycle(&self) -> crate::anim::Lifecycle {
+        self.sidebar_row_lifecycle_given_cards(self.sidebar_card_animation_active())
+    }
+
+    /// [`Self::sidebar_row_lifecycle`] with the card gate handed in.
+    ///
+    /// Split for the same reason [`Self::rows_move_given_face`] is: one term of
+    /// `sidebar_card_animation_active` is whether this machine has a font a card
+    /// can be set in, which a minimal container does not, so a test that asked
+    /// the live gate would assert nothing there. What has to be pinned is the
+    /// *shape* the row is given once cards are animating — layers and alternates
+    /// in the right lists — and that is what this exposes.
+    pub(crate) fn sidebar_row_lifecycle_given_cards(
+        &self,
+        cards_animate: bool,
+    ) -> crate::anim::Lifecycle {
         let moves = self.sidebar_rows_move();
         let mut lifecycle = crate::anim::Lifecycle::still();
         lifecycle.mount = self.sidebar_animation.row_enter_stage(moves);
         lifecycle.dismount = self.sidebar_animation.row_exit_stage(moves);
+        // Token emphases are layers: a row whose state icon shimmers while its
+        // branch name pulses is drawing both at once, so both count towards the
+        // tier it is stepped on.
         for behaviour in self
             .sidebar_agents
             .animated_behaviours()
             .into_iter()
             .chain(self.sidebar_spaces.animated_behaviours())
-            // The card's own breath rides the row's element rather than one of
-            // its own: a card *is* the row, so there is no second membership to
-            // reconcile and no way for the two to disagree about when a card
-            // exists. Both breaths are declared whichever one the card's state
-            // wants today, for the reason `Lifecycle::idle` gives.
-            .chain(
-                self.sidebar_card_animation_active()
-                    .then(|| self.sidebar_cards.pulse_behaviours().iter().copied())
-                    .into_iter()
-                    .flatten(),
-            )
         {
             lifecycle = lifecycle.with_idle(behaviour);
+        }
+        // The card's own breath rides the row's element rather than one of
+        // its own: a card *is* the row, so there is no second membership to
+        // reconcile and no way for the two to disagree about when a card
+        // exists. All three breaths are declared whichever one the card's state
+        // wants today, for the reason `Lifecycle::idle` gives — but as
+        // *alternates*, because a card is in one state and draws one of them.
+        // `crate::ui::sidebar_agent_row_members` names the one it is on, and
+        // without that the engine steps every resting card on `card-live`'s
+        // tier.
+        if cards_animate {
+            for behaviour in self.sidebar_cards.pulse_behaviours() {
+                lifecycle = lifecycle.with_alternate(*behaviour);
+            }
         }
         lifecycle
     }
@@ -3924,6 +3945,59 @@ mod tests {
              which is what leaves a closed pane's row drawn for row_exit_ms"
         );
         assert_eq!(lifecycle.mount.is_some(), moves);
+    }
+
+    /// A row's three card breaths are alternatives; its token emphases are not.
+    ///
+    /// The engine steps an element on the finest tier among the behaviours it is
+    /// actually drawing, and it can only tell the two apart because this
+    /// function sorts them. Filed in the wrong list, the three breaths are read
+    /// as three layers all on screen at once, and every resting card is stepped
+    /// on `card-live`'s 50 ms tier rather than the 100 ms one `card-rest`
+    /// declares and defends — twice the raster, and on a delegating client twice
+    /// the upload and re-raster, for a breath nobody can see the difference in.
+    #[test]
+    fn a_cards_three_breaths_are_alternatives_and_a_rows_tokens_are_layers() {
+        use crate::anim::behaviour::names;
+
+        let mut app = AppState::test_new();
+        // One emphasised token, so there is a layer to tell apart from the
+        // alternates rather than an empty list that would agree with anything.
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Styled {
+            token: Box::new(crate::config::AgentSidebarToken::Agent),
+            style: crate::config::SidebarTokenStyle {
+                emphasis: Some(crate::config::SidebarTokenEmphasis::Pulse),
+                ..Default::default()
+            },
+        }]];
+
+        let lifecycle = app.sidebar_row_lifecycle_given_cards(true);
+
+        for breath in app.sidebar_cards.pulse_behaviours() {
+            assert!(
+                lifecycle.idle.iter().any(|name| name == breath),
+                "{breath} has to stay declared, or a card cannot change state without remounting"
+            );
+            assert!(
+                lifecycle.alternates.iter().any(|name| name == breath),
+                "{breath} is one of three states a card is in, not a layer drawn over the others"
+            );
+        }
+        assert!(
+            lifecycle.idle.iter().any(|name| name == names::PULSE),
+            "the emphasised token's behaviour was dropped"
+        );
+        assert!(
+            !lifecycle.alternates.iter().any(|name| name == names::PULSE),
+            "a token emphasis is drawn alongside whatever else the row draws, \
+             so filing it as an alternate would stop it setting the row's tier"
+        );
+
+        // And with cards off, the alternates go with them.
+        assert!(app
+            .sidebar_row_lifecycle_given_cards(false)
+            .alternates
+            .is_empty());
     }
 
     mod contrast_floor {

@@ -318,6 +318,12 @@ impl Stage {
 /// forced to run at each other's tempo. Declaring them up front is also what
 /// lets [`Animator::advance`] accumulate for a behaviour that is only named
 /// later, at draw time.
+///
+/// Some of those declared behaviours are *alternatives* rather than layers,
+/// though — a tray badge declares rest, charge and alert, and plays exactly one
+/// of them — and [`Self::alternates`] is how a publisher says so. Without it the
+/// engine cannot tell "drawn two ways at once" from "one of these three", and
+/// has to assume the first: see [`frame_interval_of`] for what that costs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Lifecycle {
     pub(crate) mount: Option<Stage>,
@@ -326,6 +332,15 @@ pub(crate) struct Lifecycle {
     /// element has no phase for it, and freezing one mid-effect would look far
     /// more broken than leaving it settled.
     pub(crate) idle: Vec<String>,
+    /// The subset of [`Self::idle`] whose members exclude each other: at most
+    /// one of them is being drawn at any moment, and the publisher names which
+    /// through [`Member::playing`].
+    ///
+    /// Every one of them still has to be *declared*, and every one still
+    /// accumulates its own phase, for the reason [`Self::idle`] gives — this
+    /// says only that they are not drawn together, which is a fact about cost
+    /// rather than about what an element may be asked for.
+    pub(crate) alternates: Vec<String>,
     pub(crate) dismount: Option<Stage>,
 }
 
@@ -341,6 +356,19 @@ impl Lifecycle {
             self.idle.push(behaviour);
         }
         self
+    }
+
+    /// Declare a steady behaviour that *excludes* the other alternates — one of
+    /// a set of which exactly one is drawn at a time.
+    ///
+    /// Declares it as an idle behaviour too, so nothing about what the element
+    /// may be asked to draw changes; see [`Self::alternates`].
+    pub(crate) fn with_alternate(mut self, behaviour: impl Into<String>) -> Self {
+        let behaviour = behaviour.into();
+        if !self.alternates.contains(&behaviour) {
+            self.alternates.push(behaviour.clone());
+        }
+        self.with_idle(behaviour)
     }
 
     pub(crate) fn with_mount(mut self, stage: Stage) -> Self {
@@ -414,9 +442,42 @@ impl ElementFrame<'_> {
     }
 }
 
+/// One element as a publisher sees it this pass.
+///
+/// A struct rather than the `(id, inputs)` pair it grew out of so that a
+/// publisher which knows something extra about *this* element — today, which of
+/// its lifecycle's alternates it is playing — can say so without every other
+/// publisher having to. `From<(ElementId, DriveInputs)>` is what keeps the ones
+/// that have nothing extra to say writing exactly what they wrote before.
+#[derive(Debug, Clone)]
+pub(crate) struct Member {
+    pub(crate) id: ElementId,
+    pub(crate) inputs: DriveInputs,
+    /// Which of [`Lifecycle::alternates`] this element is drawn with right now.
+    ///
+    /// `None` means the publisher is not tracking it, and the engine falls back
+    /// to assuming every alternate could be the one on screen. That is the
+    /// conservative direction — it costs frames rather than freezing an element
+    /// that turns out to be playing something nobody named.
+    pub(crate) playing: Option<&'static str>,
+}
+
+impl From<(ElementId, DriveInputs)> for Member {
+    fn from((id, inputs): (ElementId, DriveInputs)) -> Self {
+        Self {
+            id,
+            inputs,
+            playing: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Element {
     lifecycle: Lifecycle,
+    /// Which of [`Lifecycle::alternates`] its publisher last said it is drawn
+    /// with. See [`Member::playing`].
+    playing: Option<String>,
     phase: Phase,
     /// When the current phase began.
     entered_at: Instant,
@@ -456,6 +517,31 @@ struct Element {
     /// When this element was last stepped, so its phase integrates against its
     /// own elapsed time rather than the loop's pacing.
     last_framed_at: Option<Instant>,
+}
+
+impl Element {
+    /// Whether `name` is a behaviour this element is actually drawn with now.
+    ///
+    /// True for anything its lifecycle declares as a plain idle behaviour: those
+    /// are layers, and they are all on screen at once. An *alternate* is on
+    /// screen only when it is the one its publisher named.
+    ///
+    /// A selection this lifecycle does not declare selects *nothing*, and is
+    /// answered as if none had been made. Excluding every alternate on the
+    /// strength of a name that resolves to none of them would leave an element
+    /// whose only behaviours are alternates with no tier at all — which
+    /// [`Animator::is_animating`] reads as holding still, and a badge that is
+    /// visibly breathing would stop.
+    fn draws_idle(&self, name: &str) -> bool {
+        let alternates = &self.lifecycle.alternates;
+        if !alternates.iter().any(|alt| alt == name) {
+            return true;
+        }
+        match self.playing.as_deref() {
+            Some(playing) if alternates.iter().any(|alt| alt == playing) => playing == name,
+            _ => true,
+        }
+    }
 }
 
 /// The engine: every element's life, plus the behaviours they can play.
@@ -535,7 +621,7 @@ impl Animator {
         inputs: DriveInputs,
         now: Instant,
     ) {
-        self.admit(id, lifecycle, inputs, now);
+        self.admit(Member::from((id, inputs)), lifecycle, now);
     }
 
     /// Ask an element to leave.
@@ -561,7 +647,7 @@ impl Animator {
     /// [`adopt_lifecycle`] for why a lifecycle pinned at creation left live
     /// elements permanently unable to play a behaviour switched on after them.
     /// Returns whether anything a renderer draws changed.
-    pub(crate) fn observe<I>(
+    pub(crate) fn observe<I, M>(
         &mut self,
         now: Instant,
         family: Family,
@@ -569,14 +655,20 @@ impl Animator {
         live: I,
     ) -> bool
     where
-        I: IntoIterator<Item = (ElementId, DriveInputs)>,
+        I: IntoIterator<Item = M>,
+        M: Into<Member>,
     {
         let mut seen: Vec<ElementId> = Vec::new();
         let mut changed = false;
-        for (id, inputs) in live {
-            debug_assert_eq!(id.family(), family, "observe was handed a foreign family");
-            seen.push(id.clone());
-            changed |= self.admit(id, lifecycle, inputs, now);
+        for member in live {
+            let member = member.into();
+            debug_assert_eq!(
+                member.id.family(),
+                family,
+                "observe was handed a foreign family"
+            );
+            seen.push(member.id.clone());
+            changed |= self.admit(member, lifecycle, now);
         }
         for (id, element) in &mut self.elements {
             if id.family() == family && !seen.contains(id) {
@@ -588,16 +680,22 @@ impl Animator {
 
     /// Returns whether this call changed the element's phase, which is a change
     /// a renderer can see even when the position has not moved yet.
-    fn admit(
-        &mut self,
-        id: ElementId,
-        lifecycle: &Lifecycle,
-        inputs: DriveInputs,
-        now: Instant,
-    ) -> bool {
+    fn admit(&mut self, member: Member, lifecycle: &Lifecycle, now: Instant) -> bool {
+        let Member {
+            id,
+            inputs,
+            playing,
+        } = member;
         match self.elements.get_mut(&id) {
             Some(element) => {
                 element.inputs = inputs;
+                // The publisher is authoritative every pass, the same way
+                // `inputs` is: which alternate is on screen is a fact about now,
+                // not about the moment the element arrived. Not a change a
+                // renderer can see on its own, so it does not report one — what
+                // it changes is the tier the element is stepped on, and
+                // `advance` reads it there.
+                element.playing = playing.map(str::to_owned);
                 // Before the re-arrival check below, so a row coming back does
                 // so into the life its publisher declares this pass rather than
                 // into the one it happened to be born with.
@@ -625,6 +723,7 @@ impl Animator {
                         phase: opening_phase(lifecycle),
                         cycles: vec![0.0; lifecycle.idle.len()],
                         lifecycle: lifecycle.clone(),
+                        playing: playing.map(str::to_owned),
                         entered_at: now,
                         progress: 0.0,
                         inputs,
@@ -887,10 +986,25 @@ fn frame_interval_of(
             // missing, or an element with an unregistered mount name would
             // sit in Mount forever.
             .or(Some(crate::app::ANIMATION_INTERVAL)),
+        // The finest tier among the behaviours actually on screen — not among
+        // every behaviour the element declares it *could* be asked for.
+        //
+        // The two are the same thing for layers, which are all drawn at once,
+        // and they are not for alternates. A tray badge declares rest, charge
+        // and alert; a sidebar card declares its rest, live and alert breaths.
+        // Exactly one of each set is ever on screen, and resting is the common
+        // case for both — a quiet fleet is eight resting badges and a card per
+        // row. Reading `min()` across the whole declaration stepped every one of
+        // them on `badge-charge`/`card-live`'s 50 ms tier, at double the rate
+        // the behaviour they were actually playing asks for and its own doc
+        // defends ("a four-second breath has nothing a 50 ms step would show
+        // that a 100 ms step does not"). Every one of those extra steps is a
+        // raster, and on a delegating client an upload and a re-raster too.
         None if element.phase == Phase::Idle => element
             .lifecycle
             .idle
             .iter()
+            .filter(|name| element.draws_idle(name))
             .filter_map(|name| catalogue.get(name))
             .map(|behaviour| behaviour.frame_interval)
             .min(),
@@ -1162,7 +1276,7 @@ mod tests {
         // A pass that publishes no agent rows at all must not touch the Space
         // rows, and vice versa: two second mates' groups shrinking is exactly
         // this, one family at a time.
-        anim.observe(now, Family::AgentRow, &life, Vec::new());
+        anim.observe(now, Family::AgentRow, &life, quiet(&[]));
         assert!(anim.frame(&pane, None).is_none());
         assert!(anim.frame(&row("space"), None).is_some());
     }
@@ -1638,7 +1752,36 @@ mod tests {
         assert_eq!(painted, usize::from(extent.cols) * usize::from(extent.rows));
     }
 
-    /// One resting element must not report a change on every pass.
+    /// Frames one element reports over a second of loop passes at the render
+    /// floor, which is how often the headless loop actually asks.
+    ///
+    /// Published through [`Animator::observe`] rather than mounted by hand, so
+    /// what is measured is the same call the app loop makes — including the
+    /// `playing` selection, which is the whole point of these two tests.
+    fn frames_reported_in_a_second(life: &Lifecycle, playing: Option<&'static str>) -> u32 {
+        let start = Instant::now();
+        let mut anim = Animator::default();
+        anim.observe(
+            start,
+            Family::Named,
+            life,
+            [Member {
+                id: ElementId::Named("probe"),
+                inputs: DriveInputs::default(),
+                playing,
+            }],
+        );
+        let mut changes = 0;
+        for step in 1..=125u32 {
+            if anim.advance(start + Duration::from_millis(u64::from(step) * 8)) {
+                changes += 1;
+            }
+        }
+        changes
+    }
+
+    /// One resting element must not report a change on every pass, and must not
+    /// report one on some *other* declared behaviour's tier either.
     ///
     /// The regression this guards is the whole reason the render loop free-ran:
     /// an idle phase never ends, so a resting element always has *some* motion
@@ -1646,32 +1789,92 @@ mod tests {
     /// and pinned the loop at `MIN_RENDER_INTERVAL`. `badge-rest` is the exact
     /// shape that did it — a 4.2 s breath on the 100 ms tier, which the 512-step
     /// position quantization otherwise moved every ~8 ms.
+    ///
+    /// # Why this drives the real lifecycle and not a one-behaviour stand-in
+    ///
+    /// It used to build `Lifecycle::still().with_idle(BADGE_REST)`, which
+    /// production never constructs: a badge declares all three of its states up
+    /// front so it can escalate without remounting. That one-behaviour shape
+    /// passed at ten frames a second while the *shipped*
+    /// [`crate::app::signal_tray::BadgeState::lifecycle`] three files away
+    /// measured twenty, because the tier was read as `min()` across every
+    /// declared behaviour and `badge-charge` declares 50 ms. A guard that
+    /// asserts on a shape nobody publishes cannot see that, so this one asks the
+    /// production lifecycle for both of the answers that matter: a badge at rest
+    /// costs its own slow tier, and one that is actually charging still gets the
+    /// fast one.
     #[test]
     fn a_resting_element_reports_a_change_on_its_own_tier_not_every_pass() {
-        let start = Instant::now();
-        let mut anim = Animator::default();
-        let life = Lifecycle::still().with_idle(names::BADGE_REST);
-        anim.enter(
-            ElementId::Named("badge"),
-            &life,
-            DriveInputs::default(),
-            start,
-        );
+        use crate::app::signal_tray::BadgeState;
 
-        // A second of loop passes at the render floor, which is how often the
-        // headless loop actually asks.
-        let mut changes = 0;
-        for step in 1..=125u32 {
-            if anim.advance(start + Duration::from_millis(u64::from(step) * 8)) {
-                changes += 1;
-            }
-        }
+        let life = BadgeState::lifecycle();
 
         // `badge-rest` declares the 100 ms tier, so ten frames is what a second
-        // owes it. Anything near the 125 passes made is the bug back.
+        // owes it. Anything near the 125 passes made is the original bug back;
+        // twenty is the `min()` bug, stepping a resting badge on `badge-charge`.
+        let resting = frames_reported_in_a_second(&life, Some(BadgeState::Idle.behaviour()));
         assert!(
-            (1..=12).contains(&changes),
-            "a resting badge should report about its own tier's worth of frames in a second, got {changes}"
+            (1..=12).contains(&resting),
+            "a resting badge should report about its own tier's worth of frames in a second, got {resting}"
+        );
+
+        // And the fix must not have bought that by slowing down the state that
+        // asked to be smooth: a charging badge is on the 50 ms tier and stays
+        // there.
+        let charging = frames_reported_in_a_second(&life, Some(BadgeState::Active.behaviour()));
+        assert!(
+            (15..=25).contains(&charging),
+            "a charging badge should still report its own faster tier, got {charging}"
+        );
+    }
+
+    /// Alternates are the exception, not the rule: layers all draw at once, so
+    /// an element carrying two of them still owes the finer.
+    ///
+    /// The narrow reading of the fix above — "an idle element steps on one
+    /// behaviour" — would break the case `Lifecycle::idle` exists for, a row
+    /// whose state icon shimmers while its branch name pulses. Both are on
+    /// screen, so both count.
+    #[test]
+    fn a_layered_element_still_owes_the_finest_of_the_layers_it_draws() {
+        let layered = Lifecycle::still()
+            .with_idle(names::BADGE_REST)
+            .with_idle(names::SHIMMER);
+        let alone = Lifecycle::still().with_idle(names::SHIMMER);
+
+        let both = frames_reported_in_a_second(&layered, None);
+        let shimmer_only = frames_reported_in_a_second(&alone, None);
+        assert_eq!(
+            both, shimmer_only,
+            "a layer on the finer tier must set the pace for the element it is drawn on"
+        );
+        assert!(
+            both > 12,
+            "the layered element collapsed onto the slow tier, got {both}"
+        );
+    }
+
+    /// A selection nobody declared must not stop an element animating.
+    ///
+    /// The narrowing is a filter, so the failure mode of a bad `playing` is not
+    /// a wrong tier but *no* tier: an element whose behaviours are all
+    /// alternates would filter every one of them out, report no interval, and be
+    /// read by `is_animating` as holding still. A resting badge would simply
+    /// stop breathing, and nothing would say why.
+    #[test]
+    fn a_selection_the_lifecycle_does_not_declare_leaves_the_element_animating() {
+        use crate::app::signal_tray::BadgeState;
+
+        let life = BadgeState::lifecycle();
+        let stray = frames_reported_in_a_second(&life, Some(names::SHIMMER));
+        assert!(
+            stray > 0,
+            "a `playing` naming nothing the lifecycle declares froze the element"
+        );
+        assert_eq!(
+            stray,
+            frames_reported_in_a_second(&life, None),
+            "a selection that resolves to no alternate should read as no selection"
         );
     }
 
