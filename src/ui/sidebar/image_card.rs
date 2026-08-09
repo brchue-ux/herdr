@@ -51,7 +51,7 @@ use std::hash::{Hash, Hasher};
 
 use ratatui::layout::Rect;
 
-use canvas::{coverage, Canvas, Rgb, RoundRect};
+use canvas::{coverage, Canvas, Rgb, RoundRect, Triangle};
 use font::{CardFont, FontMetrics};
 
 use crate::anim::cell::{LifecycleStage, Severity};
@@ -660,6 +660,8 @@ struct CardContent {
     lifted: bool,
     /// The project mark, once there are any. See [`CardMark`].
     mark: Option<CardMark>,
+    /// The controls hung on the card's right margin. See [`ControlRail`].
+    controls: ControlRail,
     /// This frame of the card's breath, quantized to [`CARD_BREATH_STEPS`].
     /// `0.0` is the card at its own settled light, which is what a host with no
     /// card animation draws, and `1.0` is a full breath — but a snapping
@@ -690,6 +692,11 @@ impl CardContent {
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
         self.mark.is_some().hash(hasher);
+        // Every part of it: a worker reporting back, a summary being read, and a
+        // group being folded all change the card's pixels and nothing else about
+        // it, so a card carried forward on a signature blind to this would keep
+        // a stale count or a chevron pointing the wrong way.
+        self.controls.hash(hasher);
         // Both quantized before they reach here, so a card whose light has not
         // moved by a step anyone could see hashes the same and is carried
         // forward without being redrawn. This is the whole of what keeps a tree
@@ -1153,16 +1160,31 @@ impl CardGeometry {
 /// fills the lines it has with whole words and stops. A single word wider than
 /// the column is drawn and clipped at the column edge by the caller, which is
 /// the one case where there is nothing to break on.
-fn wrap(font: &CardFont, text: &str, px: f32, avail: f32, max_lines: usize) -> Vec<String> {
+///
+/// `avail` is `(the first line, every line after it)`, and the two really do
+/// differ. The card's first title line is the one the control rail stands over
+/// — see [`ControlRail`] — and the character row this is a skin over reserves
+/// those same two controls on its first content row and no other. So the rail
+/// costs one line its width rather than costing the title block its width,
+/// which on the narrowest panel Herdr draws cards on is the difference between
+/// a title that sets whole and one that loses its last word.
+fn wrap_ragged(
+    font: &CardFont,
+    text: &str,
+    px: f32,
+    avail: (f32, f32),
+    max_lines: usize,
+) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
+    let width_of = |index: usize| if index == 0 { avail.0 } else { avail.1 };
     for word in text.split_whitespace() {
         let candidate = if current.is_empty() {
             word.to_string()
         } else {
             format!("{current} {word}")
         };
-        if font.width(&candidate, px) <= avail || current.is_empty() {
+        if font.width(&candidate, px) <= width_of(lines.len()) || current.is_empty() {
             current = candidate;
             continue;
         }
@@ -1386,6 +1408,54 @@ impl BloomField {
 /// to look when a real title will not fit.
 const CHIP_SIDE_PAD: f32 = 0.55;
 
+/// The summary mark's side, as a multiple of the control rail's type size.
+///
+/// One em. The mark stands in for a character the row would otherwise have set,
+/// so it is drawn at the size that character would have had — which is also
+/// what keeps it from competing with the count beside it.
+const SUMMARY_MARK_MUL: f32 = 1.0;
+
+/// The summary mark's corner radius, as a fraction of its own side.
+///
+/// Small, and deliberately not the card's own 0.13 h: `▤` is a *square*, and
+/// the card's radius applied to a ten-pixel box rounds it into a dot.
+const SUMMARY_MARK_RADIUS: f32 = 0.16;
+
+/// Rules drawn inside the summary mark. `▤` is U+25A4, SQUARE WITH HORIZONTAL
+/// FILL, and this is the fill: two rules, three bands, at the smallest size the
+/// card can still resolve them at.
+const SUMMARY_MARK_RULES: [f32; 2] = [1.0 / 3.0, 2.0 / 3.0];
+
+/// Gap between the summary mark and its count, as a multiple of the rail's type
+/// size.
+const SUMMARY_COUNT_GAP_MUL: f32 = 0.26;
+
+/// The chevron's box, as a multiple of the rail's type size.
+///
+/// Smaller than the mark, because `▸` is a small triangle in every face that
+/// carries it at all — drawn at a full em it would read as a second badge
+/// rather than as the disclosure control it is.
+const CHEVRON_MUL: f32 = 0.66;
+
+/// How far the chevron's nose reaches across its own box.
+///
+/// Under 1.0 so the box is the same square whichever way the chevron points:
+/// the reserved width must not change when a group is opened or closed, or the
+/// title beside it would reflow on a click that changed nothing about it.
+const CHEVRON_NOSE: f32 = 0.86;
+
+/// Gap between the summary badge and the chevron, as a multiple of the rail's
+/// type size.
+///
+/// The character row keeps a whole cell between them so neither can ever be
+/// clicked for the other. The rail is drawn rather than laid out in cells, so
+/// this is that separation expressed in the card's own units.
+const CONTROL_GAP_MUL: f32 = 0.45;
+
+/// The least air between the control rail and the state chip under it, as a
+/// multiple of the card's own pad.
+const RAIL_CHIP_GAP: f32 = 0.45;
+
 /// Gap between the chip and the text column, as a multiple of the card's pad.
 const CHIP_GAP_MUL: f32 = 0.5;
 
@@ -1406,39 +1476,198 @@ struct TextColumn {
     chip_height: f32,
     chip_fits: bool,
     chip_gap: f32,
+    /// What the control rail takes off the same margin, or `0.0` for a card
+    /// carrying neither control. See [`ControlRail`].
+    rail_width: f32,
 }
 
 impl TextColumn {
-    /// Where the text has to stop once the chip has been placed.
+    /// Where the text has to stop, once the chip has taken its share.
+    ///
+    /// The chip is centred in the card's height, so it stands over every line
+    /// the card sets — the second title line and the tidbit as much as the
+    /// first. This is their column.
     fn text_right(&self) -> f32 {
+        if !self.chip_fits {
+            return self.right;
+        }
         self.right - self.chip_width - self.chip_gap
     }
 
-    /// The width the title and the tidbit are set in.
+    /// Where the *first* title line has to stop.
+    ///
+    /// The control rail sits in the band above the chip, which is the band the
+    /// first title line occupies and no other — so it is the one line that has
+    /// to clear it, exactly as the character row reserves its badge and its
+    /// chevron on its first content row and no other.
+    fn first_line_right(&self) -> f32 {
+        self.text_right()
+            .min(self.right - reserved_margin(self.rail_width, self.chip_gap))
+    }
+
+    /// The width the second title line and the tidbit are set in.
     fn available(&self) -> f32 {
-        let right = if self.chip_fits {
-            self.text_right()
-        } else {
-            self.right
-        };
-        (right - self.left).max(0.0)
+        (self.text_right() - self.left).max(0.0)
+    }
+
+    /// The width the first title line is set in.
+    fn first_line_available(&self) -> f32 {
+        (self.first_line_right() - self.left).max(0.0)
+    }
+
+    /// Both, in the order [`wrap_ragged`] wants them.
+    fn title_widths(&self) -> (f32, f32) {
+        (self.first_line_available(), self.available())
     }
 }
 
-/// Whether `title` sets whole — every word, no line overrunning — in `avail`.
-fn title_sets_whole(font: &CardFont, title: &str, avail: f32) -> bool {
-    if avail <= 1.0 {
+/// Workers under this card's row that have reported back.
+///
+/// The pixel twin of the character row's `▤N` badge — see
+/// [`super::worker_summary_badge_rect`], which is the cell it is clickable at
+/// whether or not anything was drawn there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SummaryBadge {
+    /// How many reported. Printed through [`super::worker_summary_count_label`],
+    /// so a card and a bare row cannot disagree about what ten of them says.
+    count: usize,
+    /// At least one of those summaries has not been looked at. The character
+    /// row says this in the palette's accent against `overlay0`; the card says
+    /// it the way it says every other "still worth a look", by holding the ink
+    /// at full instead of dropping it to caption weight.
+    fresh: bool,
+}
+
+/// Which way a worktree group's chevron points, and therefore whether the rows
+/// under this card are hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum GroupChevron {
+    /// `▸` — the group's children are folded away under this row.
+    Collapsed,
+    /// `▾` — they are shown beneath it.
+    Expanded,
+}
+
+/// The two controls a card hangs on its right margin, above its state chip.
+///
+/// # Why the card has to draw these at all
+///
+/// Both are drawn by the character row when nothing covers it, at the cells
+/// [`super::worker_summary_badge_rect`] and
+/// [`super::workspace_group_chevron_rect`] name. Those cells stay *clickable*
+/// under a pixel card — the hit tests are cell geometry and know nothing about
+/// pixels, which is the whole integration this module is built on — so a card
+/// that did not draw them left two live controls with nothing on screen to say
+/// they were there. That was raised on the first cards pass and again on the
+/// shapes pass, and deferred both times on the grounds that the settled design
+/// did not specify them. It specifies them now.
+///
+/// # Why they are laid out and not overlaid
+///
+/// Because the title's column has to know about them. Painting the rail over a
+/// finished card would put it on top of a title that had already been set
+/// through to the card's own right pad — the exact overlap being fixed here,
+/// moved one layer inward. So the rail is measured in [`text_column`] beside
+/// the chip, and the title stops clear of whichever of the two is wider.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct ControlRail {
+    summary: Option<SummaryBadge>,
+    group: Option<GroupChevron>,
+}
+
+impl ControlRail {
+    fn is_empty(&self) -> bool {
+        self.summary.is_none() && self.group.is_none()
+    }
+
+    /// Where every part of the rail goes, in pixels from the rail's own top
+    /// left corner.
+    ///
+    /// One function rather than a width here and a placement there: the
+    /// reservation the title is set against and the pixels the marks land on
+    /// have to be the same arithmetic, for the same reason [`TextColumn`]
+    /// exists at all.
+    fn layout(&self, font: &CardFont, px: f32) -> RailLayout {
+        let mark_side = px * SUMMARY_MARK_MUL;
+        let chevron_side = px * CHEVRON_MUL;
+        let mut x = 0.0;
+        let summary = self.summary.map(|badge| {
+            let count = super::worker_summary_count_label(badge.count);
+            let count_x = mark_side + px * SUMMARY_COUNT_GAP_MUL;
+            x = count_x + font.width(&count, px);
+            RailSummary {
+                mark_side,
+                count_x,
+                count,
+                fresh: badge.fresh,
+            }
+        });
+        let chevron = self.group.map(|group| {
+            if summary.is_some() {
+                x += px * CONTROL_GAP_MUL;
+            }
+            let at = x;
+            x += chevron_side;
+            RailChevron {
+                x: at,
+                side: chevron_side,
+                group,
+            }
+        });
+        RailLayout {
+            width: x,
+            height: font
+                .metrics(px)
+                .line_height
+                .max(mark_side)
+                .max(chevron_side),
+            summary,
+            chevron,
+        }
+    }
+}
+
+/// The resolved pixel placement of one card's control rail.
+struct RailLayout {
+    /// `0.0` for a rail with nothing on it, which is what a card with no
+    /// finished workers and no worktree children has.
+    width: f32,
+    height: f32,
+    summary: Option<RailSummary>,
+    chevron: Option<RailChevron>,
+}
+
+struct RailSummary {
+    mark_side: f32,
+    count_x: f32,
+    count: String,
+    fresh: bool,
+}
+
+struct RailChevron {
+    x: f32,
+    side: f32,
+    group: GroupChevron,
+}
+
+/// Whether `title` sets whole — every word, no line overrunning — in `avail`,
+/// which is `(the first line, every line after it)`.
+fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
+    if avail.0 <= 1.0 || avail.1 <= 1.0 {
         return false;
     }
-    let lines = wrap(font, title, TITLE_PX, avail, TITLE_LINES);
+    let lines = wrap_ragged(font, title, TITLE_PX, avail, TITLE_LINES);
     let words = lines
         .iter()
         .map(|line| line.split_whitespace().count())
         .sum::<usize>();
     words == title.split_whitespace().count()
-        && lines
-            .iter()
-            .all(|line| font.width(line, TITLE_PX) <= avail + 0.5)
+        && lines.iter().enumerate().all(|(index, line)| {
+            let width = if index == 0 { avail.0 } else { avail.1 };
+            font.width(line, TITLE_PX) <= width + 0.5
+        })
 }
 
 /// The chip yields to the title, never the other way round.
@@ -1449,6 +1678,15 @@ fn title_sets_whole(font: &CardFont, title: &str, avail: f32) -> bool {
 /// dropped only when dropping it actually makes the title whole: on a card too
 /// narrow for the title either way there is nothing to buy, and the state is
 /// worth more than one extra word.
+///
+/// The control rail does **not** yield, and that is the one asymmetry here. The
+/// chip is a *restatement* — the card's own colour already carries its state,
+/// so a dropped chip costs a word that was said twice. A chevron is the only
+/// thing on screen saying rows are hidden under this one, and a summary badge
+/// the only thing saying workers finished; drop either and the card is wrong
+/// rather than terse. The rail is also the narrower of the two by a wide margin
+/// — a badge and a chevron together run about half a state chip — so on a card
+/// where the chip stays, it costs the title nothing.
 fn text_column(
     font: &CardFont,
     geometry: &CardGeometry,
@@ -1456,6 +1694,7 @@ fn text_column(
     height: f32,
     state_label: &str,
     title: &str,
+    rail: ControlRail,
 ) -> TextColumn {
     let chip_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
     let chip_metrics = font.metrics(chip_px);
@@ -1465,10 +1704,18 @@ fn text_column(
     let left = geometry.text_inset();
     let right = width - geometry.pad_right;
     let chip_gap = geometry.pad * CHIP_GAP_MUL;
+    // The rail is set at the chip's own type size, so the card carries two
+    // sizes of type and not three.
+    let rail_width = rail.layout(font, chip_px).width;
+    let rail_right = right - reserved_margin(rail_width, chip_gap);
 
-    let with_chip = right - chip_width - chip_gap - left;
-    let without_chip = right - left;
-    let room_for_chip = chip_height < height - 2.0 && with_chip > 0.0;
+    // Both measured as the ragged pair the title is really set in: the rail
+    // takes the first line either way, and only the chip's own share is what
+    // dropping it gives back.
+    let chip_right = right - chip_width - chip_gap;
+    let with_chip = (chip_right.min(rail_right) - left, chip_right - left);
+    let without_chip = (rail_right - left, right - left);
+    let room_for_chip = chip_height < height - 2.0 && with_chip.0 > 0.0;
     let chip_costs_a_word =
         !title_sets_whole(font, title, with_chip) && title_sets_whole(font, title, without_chip);
 
@@ -1480,7 +1727,17 @@ fn text_column(
         chip_height,
         chip_fits: room_for_chip && !chip_costs_a_word,
         chip_gap,
+        rail_width,
     }
+}
+
+/// What a margin `width` wide really costs the text: nothing at all when there
+/// is nothing in it, and its own gap once there is.
+fn reserved_margin(width: f32, gap: f32) -> f32 {
+    if width <= 0.0 {
+        return 0.0;
+    }
+    width + gap
 }
 
 /// Draw one card's body, plate, chip and text over whatever is already there.
@@ -1604,20 +1861,21 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         height,
         &content.state_label,
         &content.title,
+        content.controls,
     );
-    let mut text_right = ox + column.right;
+    let text_right = ox + column.text_right();
     let chip_px = column.chip_px;
     let chip_metrics = font.metrics(chip_px);
     let label = content.state_label.to_uppercase();
     let chip_w = column.chip_width;
     let chip_h = column.chip_height;
+    let chip_y = oy + (height - chip_h) / 2.0;
     let text_left = ox + column.left;
     if column.chip_fits {
         let ink = chip_ink(content);
         let fill = measured::FILL_MID.mix(ink, 0.16);
         let edge = fill.mix(ink, 0.50);
-        let chip_x = text_right - chip_w;
-        let chip_y = oy + (height - chip_h) / 2.0;
+        let chip_x = ox + column.right - chip_w;
         let chip_rect = RoundRect {
             x: chip_x,
             y: chip_y,
@@ -1654,19 +1912,43 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             chip_x,
             chip_x + chip_w,
         );
-        text_right = ox + column.text_right();
+    }
+
+    // ---- the control rail ------------------------------------------------
+    // Right-aligned to the same margin the chip is, in the band above it. The
+    // character row puts these two on its *first* content row and its status
+    // pill on its last, so this is that row's own vertical order kept: controls
+    // at the top, state through the middle.
+    if !content.controls.is_empty() {
+        let rail = content.controls.layout(font, chip_px);
+        // Anchored under the card's top pad rather than centred in whatever band
+        // the chip leaves it, so the rail does not move when a chip is dropped
+        // for a long title or when a state's label changes width. It only gives
+        // way on a card too short to hold both, and then only as far as its own
+        // stroke.
+        let ceiling = chip_y - geometry.pad * RAIL_CHIP_GAP - rail.height;
+        let rail_y = (oy + geometry.pad).min(ceiling).max(oy + geometry.stroke);
+        draw_control_rail(
+            sheet,
+            font,
+            &rail,
+            chip_ink(content),
+            chip_px,
+            geometry,
+            (ox + column.right - rail.width, rail_y),
+        );
     }
 
     // ---- title and tidbit ------------------------------------------------
-    // The same number the fit tests measure, not a second one derived here.
-    let avail = column.available();
-    if avail <= 1.0 {
+    // The same numbers the fit tests measure, not a second pair derived here.
+    let widths = column.title_widths();
+    if widths.0 <= 1.0 || widths.1 <= 1.0 {
         return;
     }
     let title_metrics = font.metrics(TITLE_PX);
     let tidbit_px = TITLE_PX * measured::TIDBIT_SIZE_MUL;
     let tidbit_metrics = font.metrics(tidbit_px);
-    let lines = wrap(font, &content.title, TITLE_PX, avail, TITLE_LINES);
+    let lines = wrap_ragged(font, &content.title, TITLE_PX, widths, TITLE_LINES);
     let leading = title_metrics.line_height * TITLE_LEADING;
 
     let title_block = leading * (lines.len().max(1) as f32 - 1.0) + title_metrics.line_height;
@@ -1678,10 +1960,19 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let block_top = oy + (height - title_block - tidbit_block) / 2.0;
 
     let ink = measured::INK.restate(1.0, (0.55 + 0.45 * lum).min(1.0));
+    let first_line_right = ox + column.first_line_right();
     for (index, line) in lines.iter().enumerate() {
         let baseline = block_top + leading * index as f32 + title_metrics.ascent;
+        // The first line is clipped short of the rail, every line after it only
+        // short of the chip. A word too wide to break is cut at its own line's
+        // edge, which for line one is the edge the rail stands on.
+        let right = if index == 0 {
+            first_line_right
+        } else {
+            text_right
+        };
         draw_text(
-            sheet, font, line, TITLE_PX, text_left, baseline, ink, text_left, text_right,
+            sheet, font, line, TITLE_PX, text_left, baseline, ink, text_left, right,
         );
     }
 
@@ -1694,6 +1985,133 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         draw_text(
             sheet, font, tidbit, tidbit_px, text_left, baseline, tidbit_ink, text_left, text_right,
         );
+    }
+}
+
+/// Draw a card's control rail with its top left corner at `at`.
+///
+/// `ink` is the card's chip ink — the stage hue at the chip's own rung. Both
+/// controls take it for the same reason the chip does: they are the card's
+/// affordances, and an affordance drawn in a hue the card is not at would be a
+/// second thing on it saying what state its work is in.
+fn draw_control_rail(
+    sheet: &mut Canvas,
+    font: &CardFont,
+    rail: &RailLayout,
+    ink: Rgb,
+    px: f32,
+    geometry: &CardGeometry,
+    at: (f32, f32),
+) {
+    let (x, y) = at;
+    if let Some(summary) = &rail.summary {
+        // Seen summaries drop to the tidbit's own caption weight rather than to
+        // a grey: the card carries no neutral ink, and a badge that changed hue
+        // when it was read would be the card saying its state had changed.
+        let badge_ink = if summary.fresh {
+            ink
+        } else {
+            measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX)
+        };
+        draw_summary_mark(
+            sheet,
+            RoundRect {
+                x,
+                y: y + (rail.height - summary.mark_side) / 2.0,
+                w: summary.mark_side,
+                h: summary.mark_side,
+                r: summary.mark_side * SUMMARY_MARK_RADIUS,
+            },
+            badge_ink,
+            (geometry.stroke * 0.5).max(0.9),
+        );
+        let metrics = font.metrics(px);
+        let baseline = y + (rail.height - metrics.line_height) / 2.0 + metrics.ascent;
+        draw_text(
+            sheet,
+            font,
+            &summary.count,
+            px,
+            x + summary.count_x,
+            baseline,
+            badge_ink,
+            x + summary.count_x,
+            x + rail.width,
+        );
+    }
+    if let Some(chevron) = &rail.chevron {
+        draw_chevron(
+            sheet,
+            (x + chevron.x, y + (rail.height - chevron.side) / 2.0),
+            chevron.side,
+            chevron.group,
+            ink,
+        );
+    }
+}
+
+/// `▤`, drawn rather than set: a hairline square with two rules across it.
+///
+/// The glyph is U+25A4 and no face the card can be set in is guaranteed to
+/// carry it — see [`canvas::Triangle`] for the same problem and the same
+/// answer. Hairline and rules are one width, and it is the card's own stroke
+/// halved: the mark is a tenth of the card's height, so the chrome around it
+/// wants to be lighter than the chrome around the card.
+fn draw_summary_mark(sheet: &mut Canvas, mark: RoundRect, ink: Rgb, hairline: f32) {
+    let half = hairline / 2.0;
+    let rules: [f32; 2] = SUMMARY_MARK_RULES.map(|at| mark.y + mark.h * at);
+    for y in mark.y.floor().max(0.0) as u32..((mark.y + mark.h).ceil() as u32) {
+        let py = y as f32 + 0.5;
+        // The rules stop inside the frame rather than crossing it, so the mark
+        // reads as a filled square and not as a grid.
+        let rule = rules
+            .into_iter()
+            .map(|at| coverage((py - at).abs() - half))
+            .fold(0.0, f32::max);
+        for x in mark.x.floor().max(0.0) as u32..((mark.x + mark.w).ceil() as u32) {
+            let px = x as f32 + 0.5;
+            let d = mark.distance(px, py);
+            let frame = coverage(d.abs() - half);
+            // `d + half` is the distance to the frame's *inner* edge, so this is
+            // 1 well inside the square and ramps away exactly where the frame's
+            // own ink starts.
+            let inside = coverage(d + half);
+            let alpha = frame.max(rule * inside);
+            if alpha > 0.0 {
+                sheet.blend(x, y, ink, alpha);
+            }
+        }
+    }
+}
+
+/// `▸` or `▾`, inscribed in a square box of `side` at `at`.
+///
+/// Both points are drawn from the same box so the rail's reserved width does not
+/// change when a group is opened or closed — see [`CHEVRON_NOSE`].
+fn draw_chevron(sheet: &mut Canvas, at: (f32, f32), side: f32, group: GroupChevron, ink: Rgb) {
+    let (x, y) = at;
+    let nose = side * CHEVRON_NOSE;
+    let slack = (side - nose) / 2.0;
+    let triangle = match group {
+        GroupChevron::Collapsed => Triangle {
+            a: (x + slack, y),
+            b: (x + slack, y + side),
+            c: (x + slack + nose, y + side / 2.0),
+        },
+        GroupChevron::Expanded => Triangle {
+            a: (x, y + slack),
+            b: (x + side, y + slack),
+            c: (x + side / 2.0, y + slack + nose),
+        },
+    };
+    let (x0, y0, x1, y1) = triangle.bounds();
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let alpha = coverage(triangle.distance(px as f32 + 0.5, py as f32 + 0.5));
+            if alpha > 0.0 {
+                sheet.blend(px, py, ink, alpha);
+            }
+        }
     }
 }
 
@@ -1951,6 +2369,10 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.active == Some(*ws_idx),
                 mark: None,
+                // Filled in by `compute_card_placement`, which is the pass that
+                // has the row's cells and can therefore ask whether a control is
+                // clickable there at all. See `control_rail`.
+                controls: ControlRail::default(),
                 breath,
                 wash: wash(app, crate::anim::CardRow::Space(workspace.id.clone())),
             })
@@ -1989,11 +2411,61 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
                 mark: None,
+                controls: ControlRail::default(),
                 breath,
                 wash: wash(app, crate::anim::CardRow::Agent(detail.pane_id)),
             })
         }
     }
+}
+
+/// The controls this row's card has to carry, resolved from the same functions
+/// the character row and the click targets read.
+///
+/// # Why this is asked here and not in [`content_for`]
+///
+/// Because it needs the row's *cells*. Both controls are drawn over a row rather
+/// than laid out in it, and both are gated on the row being wide enough to hold
+/// them — [`super::worker_summary_badge_rect`] returns an empty rect on a row
+/// that is not, and that empty rect is also the row's click target. A card that
+/// drew a badge the row had already declined would be a mark nothing could
+/// click, which is the same defect as the one being fixed here with the sign
+/// flipped. So the gate is the rect, taken from the one function that decides
+/// it, and drawn == clickable holds by construction.
+fn control_rail(
+    app: &AppState,
+    entry: &super::WorkspaceListEntry,
+    agents: &[AgentPanelEntry],
+    card: &crate::app::state::WorkspaceCardArea,
+) -> ControlRail {
+    let summary = super::worker_summary_badge_for_entry(app, entry, agents)
+        .filter(|(_, count)| super::worker_summary_badge_rect(card, *count).width > 0)
+        .map(|(owner, count)| SummaryBadge {
+            count,
+            fresh: crate::app::worker_summary::summaries_for_owner(agents, &owner)
+                .iter()
+                .any(|summary| summary.is_unseen_finish()),
+        });
+    // Spaces only, and only the one that heads its group — a worktree child
+    // carries no chevron of its own, and an agent pane is not a worktree space
+    // at all. The same two conditions `render_workspace_list` draws under.
+    let group = match entry {
+        super::WorkspaceListEntry::Workspace {
+            ws_idx,
+            worktree_child: false,
+            ..
+        } => super::workspace_parent_group_state(app, *ws_idx),
+        _ => None,
+    }
+    .filter(|_| super::workspace_group_chevron_rect(card).width > 0)
+    .map(|(_, collapsed)| {
+        if collapsed {
+            GroupChevron::Collapsed
+        } else {
+            GroupChevron::Expanded
+        }
+    });
+    ControlRail { summary, group }
 }
 
 /// What one pass over the tree's cards concluded.
@@ -2172,9 +2644,10 @@ fn compute_card_placement(
         let Some(entry) = entries.get(card.entry_idx) else {
             continue;
         };
-        let Some(content) = content_for(app, entry, &agents) else {
+        let Some(mut content) = content_for(app, entry, &agents) else {
             continue;
         };
+        content.controls = control_rail(app, entry, &agents, card);
         if moving {
             lives.push(super::motion::RowLife {
                 // The distance to the next row's own top, so the span a row
@@ -2323,6 +2796,7 @@ pub(crate) struct CardContentWire {
     depth: u8,
     lifted: bool,
     mark: Option<CardMark>,
+    controls: ControlRail,
     breath: f32,
 }
 
@@ -2342,6 +2816,7 @@ impl From<&CardContent> for CardContentWire {
             depth: content.depth,
             lifted: content.lifted,
             mark: content.mark,
+            controls: content.controls,
             breath: content.breath,
         }
     }
@@ -2363,6 +2838,7 @@ impl From<CardContentWire> for CardContent {
             depth: wire.depth,
             lifted: wire.lifted,
             mark: wire.mark,
+            controls: wire.controls,
             breath: wire.breath,
             wash: None,
         }
@@ -4417,7 +4893,7 @@ mod tests {
         };
         let title = "Refactor work cards with improved chip icons and typography";
         for avail in [40.0, 90.0, 160.0, 300.0, 1000.0] {
-            let lines = wrap(font, title, TITLE_PX, avail, TITLE_LINES);
+            let lines = wrap_ragged(font, title, TITLE_PX, (avail, avail), TITLE_LINES);
             assert!(lines.len() <= TITLE_LINES);
             for line in &lines {
                 assert!(!line.contains('…'), "{line} was elided");
@@ -4455,6 +4931,22 @@ mod tests {
     /// the title the least room.
     const WIDEST_STATE_LABEL: &str = "BLOCKED";
 
+    /// The heaviest control rail a card can carry: a two-glyph count and a
+    /// chevron.
+    ///
+    /// The fit ladder measures against this and not against an empty rail, so
+    /// the "titles are never truncated" guarantee is asserted on the cards that
+    /// have the *least* room rather than on the ones that have the most.
+    fn widest_rail() -> ControlRail {
+        ControlRail {
+            summary: Some(SummaryBadge {
+                count: 10,
+                fresh: true,
+            }),
+            group: Some(GroupChevron::Collapsed),
+        }
+    }
+
     /// The column a card at `depth` gives its title, on a `sidebar_width`
     /// panel whose cells are `cell_w` wide. The same arithmetic `card_frame_for`
     /// and `build_sheet_inner` do, so a test measuring this is measuring the
@@ -4465,6 +4957,7 @@ mod tests {
         cell_w: f32,
         depth: u8,
         title: &str,
+        rail: ControlRail,
     ) -> TextColumn {
         // The card starts after the tree's own prefix, exactly as
         // `card_frame_for` places it, on the scrollbar-narrow width
@@ -4487,6 +4980,7 @@ mod tests {
             height,
             WIDEST_STATE_LABEL,
             title,
+            rail,
         )
     }
 
@@ -4521,17 +5015,30 @@ mod tests {
         for (face, font) in font::all_available_faces() {
             for (sidebar_width, cell_w, depth) in card_widths() {
                 for title in REAL_FLEET_TITLES {
-                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
-                    for line in wrap(&font, title, TITLE_PX, column.available(), TITLE_LINES) {
-                        if font.width(&line, TITLE_PX) <= column.available() + 0.5 {
-                            continue;
+                    // Both rails: a card carrying controls sets its first line
+                    // in a narrower column than its second, and that line is
+                    // clipped at its own edge — so it is the one most able to
+                    // overrun.
+                    for rail in [ControlRail::default(), widest_rail()] {
+                        let column =
+                            real_text_column(&font, sidebar_width, cell_w, depth, title, rail);
+                        let widths = column.title_widths();
+                        for (index, line) in
+                            wrap_ragged(&font, title, TITLE_PX, widths, TITLE_LINES)
+                                .into_iter()
+                                .enumerate()
+                        {
+                            let avail = if index == 0 { widths.0 } else { widths.1 };
+                            if font.width(&line, TITLE_PX) <= avail + 0.5 {
+                                continue;
+                            }
+                            assert!(
+                                !line.contains(' '),
+                                "{line:?} overruns its {avail:.1}px column with a break \
+                                 available, in {face} at sidebar {sidebar_width}, cell \
+                                 {cell_w}, depth {depth}, rail {rail:?}"
+                            );
                         }
-                        assert!(
-                            !line.contains(' '),
-                            "{line:?} overruns its {:.1}px column with a break available, in \
-                             {face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}",
-                            column.available()
-                        );
                     }
                 }
             }
@@ -4573,6 +5080,28 @@ mod tests {
     /// chrome proportions globally to buy it back.
     const ACCEPTED_NARROW_FLOOR_TRUNCATION: (u16, f32, u8) = (34, GUARANTEED_CELL_WIDTH_PX, 2);
 
+    /// # The second accepted exception: a card carrying both controls
+    ///
+    /// A card with a worker-summary badge *and* a group chevron reserves them
+    /// on its first title line — the same line, and only the line, the character
+    /// row reserves them on. That width has to come from somewhere, and on the
+    /// 34-column panel there is nothing spare: the longest fixture titles lose
+    /// their last word there in every face.
+    ///
+    /// Taken deliberately, on the captain's own precedent for this exact panel
+    /// width — accept the narrow floor rather than shrink chrome globally to buy
+    /// it back — and on the direction of the trade. A missing word of a title
+    /// the fleet chose is a card that reads short; a missing chevron is a card
+    /// that does not say rows are folded under it while the cell that unfolds
+    /// them stays clickable, which is the defect the rail exists to fix. The
+    /// guarantee is unchanged and still asserted for every card that carries no
+    /// controls, which is most of them.
+    ///
+    /// 38 columns and wider is clean in every face, with or without the rail —
+    /// `the_captains_own_geometry_carries_every_real_title_with_its_chip` pins
+    /// that at the geometry he actually runs.
+    const RAILED_TITLES_TRUNCATE_BELOW: u16 = 38;
+
     #[test]
     fn every_real_fleet_title_is_set_whole_in_every_face_at_every_width() {
         let faces = font::all_available_faces();
@@ -4588,26 +5117,118 @@ mod tests {
                 if (sidebar_width, cell_w, depth) == ACCEPTED_NARROW_FLOOR_TRUNCATION {
                     continue;
                 }
-                for title in REAL_FLEET_TITLES {
-                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
-                    let lines = wrap(&font, title, TITLE_PX, column.available(), TITLE_LINES);
+                for (title, rail) in REAL_FLEET_TITLES.iter().flat_map(|title| {
+                    [ControlRail::default(), widest_rail()]
+                        .into_iter()
+                        .map(move |rail| (*title, rail))
+                }) {
+                    if !rail.is_empty() && sidebar_width < RAILED_TITLES_TRUNCATE_BELOW {
+                        continue;
+                    }
+                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title, rail);
+                    let widths = column.title_widths();
+                    let lines = wrap_ragged(&font, title, TITLE_PX, widths, TITLE_LINES);
                     let set = lines.join(" ");
                     assert_eq!(
                         set.split_whitespace().collect::<Vec<_>>(),
                         title.split_whitespace().collect::<Vec<_>>(),
                         "dropped words in {face} at sidebar {sidebar_width}, cell {cell_w}, \
-                         depth {depth}: {set:?} from {title:?}"
+                         depth {depth}, rail {rail:?}: {set:?} from {title:?}"
                     );
-                    for line in &lines {
+                    for (index, line) in lines.iter().enumerate() {
+                        let avail = if index == 0 { widths.0 } else { widths.1 };
                         assert!(
-                            font.width(line, TITLE_PX) <= column.available() + 0.5,
+                            font.width(line, TITLE_PX) <= avail + 0.5,
                             "{line:?} would be clipped in {face} at sidebar {sidebar_width}, \
-                             cell {cell_w}, depth {depth}"
+                             cell {cell_w}, depth {depth}, rail {rail:?}"
                         );
                     }
                 }
             }
         }
+    }
+
+    /// A rail narrower than the chip costs the title nothing at all.
+    ///
+    /// The two share the card's right margin — one centred, one in the band
+    /// above it — so on every card where the state's own label is the wider of
+    /// the two, adding both controls does not move a single word. That is the
+    /// common card, and it is why the rail is affordable.
+    #[test]
+    fn a_rail_the_chip_already_covers_costs_the_title_nothing() {
+        for (face, font) in font::all_available_faces() {
+            for title in REAL_FLEET_TITLES {
+                let bare = real_text_column(
+                    &font,
+                    FLEET_SIDEBAR_COLUMNS,
+                    FLEET_CELL_WIDTH_PX,
+                    0,
+                    title,
+                    ControlRail::default(),
+                );
+                let railed = real_text_column(
+                    &font,
+                    FLEET_SIDEBAR_COLUMNS,
+                    FLEET_CELL_WIDTH_PX,
+                    0,
+                    title,
+                    widest_rail(),
+                );
+                assert!(
+                    railed.rail_width < railed.chip_width,
+                    "the rail is wider than a {WIDEST_STATE_LABEL} chip in {face}, which is \
+                     not the card this test is about"
+                );
+                assert_eq!(
+                    (bare.available(), bare.first_line_available()),
+                    (railed.available(), railed.first_line_available()),
+                    "the rail took width the chip had already reserved, in {face}"
+                );
+            }
+        }
+    }
+
+    /// And a rail *wider* than the chip is what the first line clears — and
+    /// only the first line, exactly as the character row reserves its two
+    /// controls on its first content row and no other.
+    #[test]
+    fn a_rail_wider_than_the_chip_is_taken_off_the_first_line_only() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let height = card_height_px(
+            font.metrics(TITLE_PX),
+            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+        );
+        let column = |rail| {
+            text_column(
+                font,
+                &geometry,
+                420.0,
+                height,
+                // The shortest label there is, so the chip is narrow enough for
+                // the rail to be the wider of the two.
+                "IDLE",
+                REAL_FLEET_TITLES[0],
+                rail,
+            )
+        };
+        let bare = column(ControlRail::default());
+        let railed = column(widest_rail());
+        assert!(
+            railed.rail_width > railed.chip_width,
+            "this fixture is meant to have a rail wider than its chip"
+        );
+        assert!(
+            railed.first_line_available() < bare.first_line_available(),
+            "the wider rail was not taken off the first line"
+        );
+        assert_eq!(
+            railed.available(),
+            bare.available(),
+            "the rail narrowed a line it does not stand over"
+        );
     }
 
     /// And that guarantee is bought by the chip, not by the title.
@@ -4622,9 +5243,20 @@ mod tests {
         for (face, font) in font::all_available_faces() {
             for (sidebar_width, cell_w, depth) in card_widths() {
                 for title in REAL_FLEET_TITLES {
-                    let column = real_text_column(&font, sidebar_width, cell_w, depth, title);
-                    let with_chip = column.text_right() - column.left;
-                    let without_chip = column.right - column.left;
+                    let column =
+                        real_text_column(&font, sidebar_width, cell_w, depth, title, widest_rail());
+                    // The ragged pair each way, so this measures the title the
+                    // card really sets: the rail takes the first line whether
+                    // the chip stays or goes, and only the chip's own share
+                    // moves between the two.
+                    let rail_right =
+                        column.right - reserved_margin(column.rail_width, column.chip_gap);
+                    let chip_right = column.right - column.chip_width - column.chip_gap;
+                    let with_chip = (
+                        chip_right.min(rail_right) - column.left,
+                        chip_right - column.left,
+                    );
+                    let without_chip = (rail_right - column.left, column.right - column.left);
                     let where_ = format!(
                         "{face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}, \
                          {title:?}"
@@ -4643,7 +5275,7 @@ mod tests {
                         // — otherwise the card simply had no room for one.
                         let bought_the_title = title_sets_whole(&font, title, without_chip)
                             && !title_sets_whole(&font, title, with_chip);
-                        let never_had_room = with_chip <= 0.0
+                        let never_had_room = with_chip.0 <= 0.0
                             || column.chip_height
                                 >= card_height_px(
                                     font.metrics(TITLE_PX),
@@ -4687,6 +5319,7 @@ mod tests {
             height,
             WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
+            ControlRail::default(),
         );
         let without = text_column(
             font,
@@ -4695,6 +5328,7 @@ mod tests {
             height,
             WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
+            ControlRail::default(),
         );
         assert!(
             without.available() > with_plate.available(),
@@ -4727,6 +5361,7 @@ mod tests {
                         FLEET_CELL_WIDTH_PX,
                         depth,
                         title,
+                        widest_rail(),
                     );
                     assert!(
                         column.chip_fits,
@@ -4734,7 +5369,7 @@ mod tests {
                     );
                     // And it is not bought with a word.
                     assert!(
-                        title_sets_whole(&font, title, column.available()),
+                        title_sets_whole(&font, title, column.title_widths()),
                         "{title:?} is not whole in {face} at the fleet's own geometry, \
                          depth {depth}"
                     );
@@ -4750,7 +5385,10 @@ mod tests {
         let Some(font) = font::card_font(None) else {
             return;
         };
-        assert_eq!(wrap(font, "Ship PR", TITLE_PX, 400.0, TITLE_LINES).len(), 1);
+        assert_eq!(
+            wrap_ragged(font, "Ship PR", TITLE_PX, (400.0, 400.0), TITLE_LINES).len(),
+            1
+        );
     }
 
     /// With the split switched off the card is exactly what it was: the
@@ -5415,6 +6053,7 @@ mod the_sheet_carries_the_view_transition {
 mod a_card_is_its_own_shape {
     use super::tests::{pixel_fleet_app, sidebar_rect, three_rank_pixel_app};
     use super::*;
+    use crate::workspace::Workspace;
 
     /// The same fleet, drawing shapes instead of one sheet.
     fn shape_fleet_app() -> AppState {
@@ -5502,6 +6141,417 @@ mod a_card_is_its_own_shape {
         let info = reader.next_frame(&mut buf).expect("a PNG with no frame");
         buf.truncate(info.buffer_size());
         (info.width, info.height, buf)
+    }
+
+    /// A fleet where the two controls are actually on: a second mate that owns
+    /// a worker who reported back, and that also heads a worktree group with a
+    /// linked child under it.
+    ///
+    /// Both conditions on one tree rather than two fixtures, because the
+    /// interesting card is the one carrying *both* — that is the card the
+    /// character row reserves two controls on, and the one whose rail is
+    /// widest.
+    fn railed_fleet_app(summary: bool, collapsed: bool) -> AppState {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+
+        let mut mate = Workspace::test_new("2ndmate-explore");
+        mate.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr"),
+            is_linked_worktree: false,
+        });
+        let worker_pane = mate.test_split(ratatui::layout::Direction::Vertical);
+
+        let mut child = Workspace::test_new("2ndmate-explore-issue");
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            checkout_path: std::path::PathBuf::from("/repo/herdr-issue"),
+            is_linked_worktree: true,
+        });
+
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate, child];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        let worker_terminal = app.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app
+            .terminals
+            .get_mut(&worker_terminal)
+            .expect("the worker has a terminal");
+        terminal.set_agent_name("worker".to_string());
+        terminal.state = AgentState::Idle;
+        let mut tokens = std::collections::HashMap::from([(
+            "owner".to_string(),
+            Some("2ndmate-explore".to_string()),
+        )]);
+        if summary {
+            tokens.insert("summary".to_string(), Some("rebased and green".to_string()));
+        }
+        terminal.metadata_tokens.patch(tokens, None, now);
+        // Unseen either way, so the *only* difference a published summary makes
+        // to this tree is the mate's badge: `is_unseen_finish` is idle and
+        // unseen, and a test pane is born seen, so flipping it alongside the
+        // token would change the worker's own card too.
+        if let Some(pane) = app.workspaces[1].tabs[0].panes.get_mut(&worker_pane) {
+            pane.seen = false;
+        }
+
+        if collapsed {
+            app.collapsed_space_keys.insert("repo-key".to_string());
+        }
+        app.view.sidebar_rect = sidebar_rect();
+        app.view.workspace_card_areas =
+            super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        app
+    }
+
+    /// The rail each card is given, beside the row it belongs to.
+    fn rails(app: &AppState) -> Vec<(String, ControlRail)> {
+        let entries = super::super::workspace_list_entries(app);
+        let agents = super::super::sidebar_agent_entries(app);
+        super::super::compute_workspace_card_areas(app, sidebar_rect())
+            .into_iter()
+            .filter_map(|card| {
+                let entry = entries.get(card.entry_idx)?;
+                let name = match entry {
+                    super::super::WorkspaceListEntry::Workspace { ws_idx, .. } => app
+                        .workspaces
+                        .get(*ws_idx)?
+                        .display_name_from_terminals(&app.terminals),
+                    super::super::WorkspaceListEntry::Agent { entry_idx, .. } => {
+                        agents.get(*entry_idx)?.agent_name.clone()?
+                    }
+                };
+                Some((name, control_rail(app, entry, &agents, &card)))
+            })
+            .collect()
+    }
+
+    /// Both controls reach the card, on exactly the rows the character tree
+    /// would have drawn them on.
+    ///
+    /// The badge follows *ownership* — the mate whose workers reported — and
+    /// the chevron follows the worktree group's head. They land on the same row
+    /// here, which is the case worth pinning: two controls on one card is what
+    /// the rail was sized for.
+    #[test]
+    fn a_mate_that_owns_a_finished_worker_and_heads_a_group_carries_both_controls() {
+        let rails = rails(&railed_fleet_app(true, false));
+        let mate = rails
+            .iter()
+            .find(|(name, _)| name.contains("2ndmate-explore") && !name.contains("issue"))
+            .map(|(_, rail)| *rail)
+            .expect("the mate has a card");
+        assert_eq!(
+            mate.summary,
+            Some(SummaryBadge {
+                count: 1,
+                fresh: true
+            }),
+            "the mate's card lost the badge its row draws"
+        );
+        assert_eq!(
+            mate.group,
+            Some(GroupChevron::Expanded),
+            "the mate's card lost the chevron its row draws"
+        );
+    }
+
+    /// And neither appears on a row the character tree would not have drawn it
+    /// on: the worktree *child* carries no chevron of its own, and no row that
+    /// owns nothing carries a badge.
+    #[test]
+    fn no_card_grows_a_control_the_character_row_would_not_have_drawn() {
+        for (name, rail) in rails(&railed_fleet_app(true, false)) {
+            if name.contains("issue") {
+                assert_eq!(
+                    rail.group, None,
+                    "{name} is a worktree child and drew a chevron of its own"
+                );
+            }
+            if name == "firstmate" || name == "worker" {
+                assert_eq!(rail, ControlRail::default(), "{name} grew a control");
+            }
+        }
+    }
+
+    /// A folded group points its chevron the other way, and that is a different
+    /// card — so the artwork is rebuilt rather than carried forward.
+    ///
+    /// The signature is the whole of what decides that. A rail hashed out of it
+    /// would leave a collapsed group showing the chevron it had before the
+    /// click, which is worse than not drawing one at all.
+    #[test]
+    fn folding_a_group_turns_the_chevron_and_redraws_the_card() {
+        let expanded = railed_fleet_app(true, false);
+        let collapsed = railed_fleet_app(true, true);
+        assert_eq!(
+            rails(&expanded)
+                .iter()
+                .filter_map(|(_, rail)| rail.group)
+                .collect::<Vec<_>>(),
+            vec![GroupChevron::Expanded]
+        );
+        assert_eq!(
+            rails(&collapsed)
+                .iter()
+                .filter_map(|(_, rail)| rail.group)
+                .collect::<Vec<_>>(),
+            vec![GroupChevron::Collapsed]
+        );
+
+        let (Some(before), Some(after)) = (built(&expanded), built(&collapsed)) else {
+            return; // No face on this machine.
+        };
+        assert!(
+            before
+                .iter()
+                .map(|layer| layer.content_signature)
+                .collect::<Vec<_>>()
+                != after
+                    .iter()
+                    .map(|layer| layer.content_signature)
+                    .collect::<Vec<_>>(),
+            "turning the chevron changed no card's signature, so the old artwork \
+             would be carried forward"
+        );
+    }
+
+    /// The rail is ink on the card, not a reservation nobody filled.
+    ///
+    /// The card with the controls draws pixels in the band above its chip that
+    /// the same card without them leaves to the card's own fill. This is the
+    /// whole defect being fixed, asserted on the bytes a real pass publishes
+    /// rather than on the layout that precedes them.
+    #[test]
+    fn the_controls_put_ink_on_the_card_where_the_bare_row_would_have_drawn_them() {
+        let with = railed_fleet_app(true, false);
+        let without = railed_fleet_app(false, false);
+        let (Some(with_layers), Some(without_layers)) = (built(&with), built(&without)) else {
+            return; // No face on this machine.
+        };
+        // Same tree either way — one worker's summary is the only difference —
+        // so the cards line up and the mate's is the one that differs.
+        assert_eq!(with_layers.len(), without_layers.len());
+        let differing = with_layers
+            .iter()
+            .zip(&without_layers)
+            .filter(|(a, b)| decode(a).2 != decode(b).2)
+            .count();
+        assert_eq!(
+            differing, 1,
+            "a published summary changed {differing} cards, not just the mate's"
+        );
+    }
+
+    /// The rail's ink lands inside the cells its click targets name.
+    ///
+    /// This is the property that makes the rail *correct* rather than merely
+    /// present: `worker_summary_badge_rect` and `workspace_group_chevron_rect`
+    /// are still the only things a click resolves against, so a mark drawn
+    /// outside them would be a control pointing at a cell it does not occupy —
+    /// the same defect as one drawn nowhere, wearing a costume.
+    #[test]
+    fn the_rail_is_drawn_inside_the_cells_its_controls_are_clicked_at() {
+        let app = railed_fleet_app(true, false);
+        let Some(font) = font::card_font(app.sidebar_card_font.as_deref()) else {
+            return; // No face on this machine.
+        };
+        let cell_w = f32::from(u16::try_from(app.host_cell_size.width_px).expect("a sane cell"));
+        let cell_h = f32::from(u16::try_from(app.host_cell_size.height_px).expect("a sane cell"));
+        let entries = super::super::workspace_list_entries(&app);
+        let agents = super::super::sidebar_agent_entries(&app);
+
+        let mut checked = 0;
+        for card in super::super::compute_workspace_card_areas(&app, sidebar_rect()) {
+            let Some(frame) = card.card_frame else {
+                continue;
+            };
+            let Some(entry) = entries.get(card.entry_idx) else {
+                continue;
+            };
+            let rail = control_rail(&app, entry, &agents, &card);
+            if rail.is_empty() {
+                continue;
+            }
+            let Some(content) = content_for(&app, entry, &agents) else {
+                continue;
+            };
+            let geometry = CardGeometry::new(cell_h, content.mark.is_some());
+            let column = text_column(
+                font,
+                &geometry,
+                (f32::from(frame.width) - RAIL_INK_COLUMN_FRACTION) * cell_w,
+                card_height_px(
+                    font.metrics(TITLE_PX),
+                    font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+                ),
+                &content.state_label,
+                &content.title,
+                rail,
+            );
+            let layout = rail.layout(font, column.chip_px);
+
+            // The card's own left edge stands half a column inside its first
+            // cell, so the rail's pixels are measured back to that same origin.
+            let card_left_px = (f32::from(frame.x) + RAIL_INK_COLUMN_FRACTION) * cell_w;
+            let rail_left = card_left_px + column.right - layout.width;
+            let rail_right = card_left_px + column.right;
+
+            // Right to left, the way the character row lays them out: the
+            // chevron in the last control cell, the badge immediately left of
+            // it.
+            let chevron_cell = super::super::workspace_group_chevron_rect(&card);
+            if let Some(chevron) = &layout.chevron {
+                let left = card_left_px + column.right - layout.width + chevron.x;
+                let right = left + chevron.side;
+                let cell_left = f32::from(chevron_cell.x) * cell_w;
+                let cell_right = cell_left + f32::from(chevron_cell.width) * cell_w;
+                assert!(
+                    left >= cell_left - 1.0 && right <= cell_right + 1.0,
+                    "the chevron is drawn at {left:.1}..{right:.1} px but clicked at cell \
+                     {chevron_cell:?} = {cell_left:.1}..{cell_right:.1} px"
+                );
+                checked += 1;
+            }
+            if let Some(badge) = rail.summary {
+                let badge_cells = super::super::worker_summary_badge_rect(&card, badge.count);
+                assert!(
+                    badge_cells.width > 0,
+                    "a badge was drawn with no click target"
+                );
+                let cell_left = f32::from(badge_cells.x) * cell_w;
+                assert!(
+                    rail_left >= cell_left - 1.0,
+                    "the rail starts at {rail_left:.1} px, left of the badge's own cells at \
+                     {cell_left:.1} px"
+                );
+                checked += 1;
+            }
+            // And neither reaches the card's right border.
+            assert!(
+                rail_right
+                    <= card_left_px + (f32::from(frame.width) - RAIL_INK_COLUMN_FRACTION) * cell_w,
+                "the rail overran the card's right edge"
+            );
+        }
+        assert!(checked >= 2, "no rail was actually measured");
+    }
+
+    /// The two chevron directions are two different pictures.
+    ///
+    /// Drawn rather than set — the faces a card can use carry neither `▸` nor
+    /// `▾` — so nothing but this says the triangle really turns.
+    #[test]
+    fn the_chevron_points_the_way_its_group_is_folded() {
+        let ink = Rgb(255, 255, 255);
+        let painted = |group| {
+            let mut sheet = Canvas::new(16, 16);
+            draw_chevron(&mut sheet, (2.0, 2.0), 10.0, group, ink);
+            sheet.rgba8().to_vec()
+        };
+        let collapsed = painted(GroupChevron::Collapsed);
+        let expanded = painted(GroupChevron::Expanded);
+        assert_ne!(collapsed, expanded, "the chevron drew the same both ways");
+
+        let lit = |px: &[u8], x: u32, y: u32| px[((y * 16 + x) * 4 + 3) as usize] > 128;
+        // A right-pointing triangle has its nose on the middle row and nothing
+        // at the far corner of it; a down-pointing one is the same claim turned
+        // a quarter turn.
+        assert!(lit(&collapsed, 8, 7) && !lit(&collapsed, 10, 3));
+        assert!(lit(&expanded, 7, 8) && !lit(&expanded, 3, 10));
+    }
+
+    /// An unread summary is stated and a read one is caption weight, and both
+    /// are the card's own hue rather than a colour from outside it.
+    #[test]
+    fn a_fresh_summary_badge_is_louder_than_one_already_read() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        let ink = Rgb(120, 220, 220);
+        let painted = |fresh| {
+            let rail = ControlRail {
+                summary: Some(SummaryBadge { count: 3, fresh }),
+                group: None,
+            };
+            let layout = rail.layout(font, 10.0);
+            let mut sheet = Canvas::new(64, 24);
+            draw_control_rail(
+                &mut sheet,
+                font,
+                &layout,
+                ink,
+                10.0,
+                &CardGeometry::new(21.0, false),
+                (4.0, 4.0),
+            );
+            sheet.rgba8().to_vec()
+        };
+        let fresh = painted(true);
+        let seen = painted(false);
+        assert_ne!(
+            fresh, seen,
+            "a read summary looks the same as an unread one"
+        );
+
+        // Brightest pixel each way: the fresh badge is drawn at the card's ink,
+        // the seen one mixed toward the card's own fill.
+        let peak = |px: &[u8]| {
+            (0..px.len() / 4)
+                .filter(|i| px[i * 4 + 3] > 200)
+                .map(|i| u32::from(px[i * 4]) + u32::from(px[i * 4 + 1]) + u32::from(px[i * 4 + 2]))
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            peak(&fresh) > peak(&seen),
+            "the read badge is not quieter than the unread one"
+        );
+    }
+
+    /// Both paths clamp a large crew the same way, because they share the one
+    /// function that decides it.
+    #[test]
+    fn the_card_and_the_bare_row_agree_on_what_a_large_crew_says() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        for count in [1usize, 9, 10, 400] {
+            let rail = ControlRail {
+                summary: Some(SummaryBadge {
+                    count,
+                    fresh: false,
+                }),
+                group: None,
+            };
+            let drawn = rail
+                .layout(font, 10.0)
+                .summary
+                .expect("a rail with a badge lays one out")
+                .count;
+            assert_eq!(
+                super::super::worker_summary_badge_label(count),
+                format!("{}{drawn}", super::super::WORKER_SUMMARY_BADGE_GLYPH),
+                "the card and the row printed different counts for {count}"
+            );
+        }
     }
 
     /// Every card in a real tree — first mate, second mates, and their
