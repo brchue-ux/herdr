@@ -300,6 +300,15 @@ that never move, so a motion measurement on a fresh fleet measures nothing —
 `data/herdr-live-composite/run.sh` builds a repo one commit ahead of *and*
 behind its upstream to light Push and Sync.
 
+`assert_motion.py`'s default `--level 24` is calibrated for the signal tray and
+is far too coarse for a card breath. A card breathing perfectly normally moves
+tens of thousands of pixels per 0.6 s pair by fewer than 24 levels each, so the
+rig's own `sidebar row area (cards)` line reports **0 px on most pairs for a
+healthy build**. Never read that number as a freeze without re-measuring at a
+threshold of 1: a genuinely frozen card region is 0 changed pixels with a max
+per-channel delta of 0, and a working one is tens of thousands with a max in the
+teens. The two are indistinguishable at the default floor.
+
 ### The host terminal's cell is a measurement, and one source of it lies
 
 Every pixel surface is rasterised at `cells x cell_size` and then placed in

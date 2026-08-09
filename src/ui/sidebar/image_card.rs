@@ -7977,6 +7977,66 @@ mod cards_breathe_and_wash {
         );
     }
 
+    /// **A card switched on after its row is on screen actually breathes.**
+    ///
+    /// The row is the element and the breath rides it, so the breath is only
+    /// declared on that element once `sidebar_card_animation_active` holds —
+    /// and every one of that predicate's terms can turn true *after* the row
+    /// exists. Turning `card breathing` on from the settings screen is the
+    /// shortest way there on a stock config: the wash keeps the card gate open
+    /// throughout, so no row is ever retired and recreated, and this is the
+    /// whole of what a reader does.
+    ///
+    /// The failure this pins is silent on every channel except the picture. The
+    /// engine still runs, the row still resolves, the tree still lays out, and
+    /// the card is still rasterised, encoded and pushed to the client on every
+    /// pass — it is simply the same card every time, so what a reader sees is a
+    /// panel of cards holding perfectly still with the effect switched on.
+    ///
+    /// Published through [`AppState::sidebar_row_lifecycle`] rather than
+    /// [`breathing_fleet`]'s hand-built one, because the lifecycle going stale
+    /// against what that method now answers *is* the bug.
+    #[test]
+    fn a_card_breathes_when_the_pulse_is_switched_on_after_its_row_is_drawn() {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        let now = Instant::now();
+
+        // A session whose cards start settled. The wash is still on, so the
+        // card gate is open and the rows below are never forgotten.
+        app.sidebar_cards.pulse = false;
+        if !app.sidebar_card_animation_active() {
+            // No proportional face on this machine, so there are no pixel cards
+            // for a breath to happen to.
+            return;
+        }
+        let lifecycle = app.sidebar_row_lifecycle();
+        publish_rows(&mut app, &lifecycle, now);
+
+        // The captain turns `card breathing` on.
+        app.sidebar_cards.pulse = true;
+
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        // Well past any arrival, so what is measured is the steady breath.
+        for step in 0..=125u64 {
+            let at = now + Duration::from_secs(3) + Duration::from_millis(step * 40);
+            let lifecycle = app.sidebar_row_lifecycle();
+            publish_rows(&mut app, &lifecycle, at);
+            for card in contents(&app) {
+                lo = lo.min(card.breath);
+                hi = hi.max(card.breath);
+            }
+        }
+        assert!(hi >= lo, "the fixture drew no cards at all");
+        assert!(
+            hi - lo > 0.1,
+            "every card held perfectly still with the pulse switched on: the \
+             breath swung {:.4} over five seconds",
+            hi - lo
+        );
+    }
+
     /// With the pulse switched off a card is drawn at exactly its settled
     /// light, which is what a host with no card animation already gets.
     #[test]
