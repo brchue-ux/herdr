@@ -2542,7 +2542,7 @@ struct Rasteriser<'a> {
     backdrop: Rgb,
     dissolve: Option<DissolveFrame<'a>>,
     /// The foreground client's detected host terminal, from `AppState`. See
-    /// `crate::kitty_graphics::preferred_card_pixel_format`.
+    /// `crate::kitty_graphics::preferred_sidebar_pixel_format`.
     host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
     host_graphics_is_local: bool,
 }
@@ -2941,8 +2941,8 @@ impl Rasteriser<'_> {
         // bytes back every attached client's placement of this image, so a
         // single "is the host terminal local and known-fast" answer — the
         // foreground client's, detected at attach — is what all of them get.
-        // See `preferred_card_pixel_format`.
-        let format = crate::kitty_graphics::preferred_card_pixel_format(
+        // See `preferred_sidebar_pixel_format`.
+        let format = crate::kitty_graphics::preferred_sidebar_pixel_format(
             canvas_is_fully_opaque(canvas),
             self.host_terminal_kind,
             self.host_graphics_is_local,
@@ -3436,7 +3436,7 @@ fn sheet_dissolve(app: &AppState, cell_size: HostCellSize) -> Option<DissolveFra
     })
 }
 
-/// Whether every pixel is fully opaque — the gate `preferred_card_pixel_format`
+/// Whether every pixel is fully opaque — the gate `preferred_sidebar_pixel_format`
 /// needs before it will hand a canvas to an alpha-losing raw format. Herdr's
 /// cards are translucent by design (gutters, glow falloff, rounded corners),
 /// so this is expected to come back `false` for most real card sheets; a
@@ -3447,44 +3447,12 @@ fn canvas_is_fully_opaque(sheet: &Canvas) -> bool {
 }
 
 /// Encodes a finished canvas in whichever format the host terminal is fast
-/// at (`preferred_card_pixel_format`), falling back to PNG for anything else.
+/// at (`preferred_sidebar_pixel_format`), falling back to PNG for anything else.
 fn encode_canvas(
     sheet: &Canvas,
     format: crate::api::schema::PaneGraphicsFormat,
 ) -> Option<Vec<u8>> {
-    match format {
-        crate::api::schema::PaneGraphicsFormat::Png => encode_png(sheet),
-        crate::api::schema::PaneGraphicsFormat::Rgba => Some(sheet.rgba8().to_vec()),
-        crate::api::schema::PaneGraphicsFormat::Rgb => Some(rgba_to_rgb(sheet.rgba8())),
-    }
-}
-
-/// Drops the alpha byte from each pixel. The canvas is always fully opaque
-/// where a card draws and transparent elsewhere; RGB has no way to carry
-/// that transparency, so this format is only ever selected for a terminal
-/// (`f=24` kitty) that composites the sheet the same way the RGBA path does
-/// — see `preferred_local_pixel_format`.
-fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
-    for pixel in rgba.chunks_exact(4) {
-        out.extend_from_slice(&pixel[..3]);
-    }
-    out
-}
-
-fn encode_png(sheet: &Canvas) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut encoder = png::Encoder::new(&mut out, sheet.width(), sheet.height());
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    // Fast rather than default: this runs on the render thread when a card's
-    // content changes, and the content is flat fills and text, which is where
-    // the cheap filters already get most of the ratio.
-    encoder.set_compression(png::Compression::Fast);
-    let mut writer = encoder.write_header().ok()?;
-    writer.write_image_data(sheet.rgba8()).ok()?;
-    drop(writer);
-    Some(out)
+    crate::kitty_graphics::encode_layer_pixels(format, sheet.width(), sheet.height(), sheet.rgba8())
 }
 
 #[cfg(test)]
@@ -3533,12 +3501,6 @@ mod pixel_format_tests {
     }
 
     #[test]
-    fn rgba_to_rgb_drops_every_fourth_byte() {
-        let rgba = vec![1, 2, 3, 255, 4, 5, 6, 128];
-        assert_eq!(rgba_to_rgb(&rgba), vec![1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
     fn encode_canvas_rgba_is_the_canvas_bytes_verbatim() {
         let canvas = opaque_canvas(2, 2);
         let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgba)
@@ -3551,7 +3513,12 @@ mod pixel_format_tests {
         let canvas = opaque_canvas(2, 2);
         let encoded = encode_canvas(&canvas, crate::api::schema::PaneGraphicsFormat::Rgb)
             .expect("rgb encode");
-        assert_eq!(encoded, rgba_to_rgb(canvas.rgba8()));
+        let expected: Vec<u8> = canvas
+            .rgba8()
+            .chunks_exact(4)
+            .flat_map(|pixel| pixel[..3].to_vec())
+            .collect();
+        assert_eq!(encoded, expected);
         assert_eq!(encoded.len(), canvas.rgba8().len() / 4 * 3);
     }
 

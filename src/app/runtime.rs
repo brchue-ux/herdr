@@ -996,7 +996,13 @@ impl App {
         if !crate::ui::signal_tray_active(&self.state) {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
+            self.state.signal_tray_published.forget();
             return had;
+        }
+        if delegation_changed {
+            // Whichever way it moved, this process is no longer the one whose
+            // raster the terminal is showing.
+            self.state.signal_tray_published.forget();
         }
 
         // A tray that just changed sides has to repaint whichever way it moved:
@@ -1061,6 +1067,12 @@ impl App {
     /// `ServerMessage::TrayScene`, so this stops at the key: rasterising eight
     /// badges for nobody is the whole cost this exists to move off the server,
     /// and the key is still what tells the loop a new scene is worth sending.
+    ///
+    /// The key moving is what makes a *raster* worth taking; whether that
+    /// raster is worth an *upload* is a second question, and
+    /// `AppState::signal_tray_published` is what answers it. A resting tray
+    /// moves the key on every badge frame for a change of a fraction of one
+    /// 8-bit level — see [`crate::app::state::PublishedSurfaceRaster`].
     fn refresh_signal_tray_graphics(&mut self, client_rasterized: bool) -> bool {
         // The fleet's cell, not the foreground client's: this artwork is one
         // image every attached viewer is placed a copy of, so a viewer whose
@@ -1070,6 +1082,7 @@ impl App {
         if !self.state.kitty_graphics_enabled || !cell.is_known() {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
+            self.state.signal_tray_published.forget();
             return had;
         }
 
@@ -1078,6 +1091,9 @@ impl App {
             let had = self.state.signal_tray_graphics.take().is_some();
             let moved = key != self.state.signal_tray_graphics_key;
             self.state.signal_tray_graphics_key = key;
+            if had {
+                self.state.signal_tray_published.forget();
+            }
             return had || moved;
         }
         if key == self.state.signal_tray_graphics_key && self.state.signal_tray_graphics.is_some() {
@@ -1089,12 +1105,35 @@ impl App {
         else {
             let had = self.state.signal_tray_graphics.take().is_some();
             self.state.signal_tray_graphics_key = 0;
+            self.state.signal_tray_published.forget();
             return had;
         };
 
         self.state.signal_tray_graphics_key = key;
-        self.state.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(image));
-        true
+        // Drawn, and within a couple of levels of the artwork already on
+        // screen: the terminal keeps what it has rather than being handed the
+        // whole surface again.
+        if !self
+            .state
+            .signal_tray_published
+            .accept(image.width, image.height, &image.pixels)
+            && self.state.signal_tray_graphics.is_some()
+        {
+            return false;
+        }
+        let layer = crate::ui::signal_tray_graphics_layer(
+            image,
+            self.state.host_terminal_kind,
+            self.state.host_graphics_is_local,
+        );
+        let had = self.state.signal_tray_graphics.is_some();
+        if layer.is_none() {
+            // Nothing was published, so nothing is on screen to compare the
+            // next raster against.
+            self.state.signal_tray_published.forget();
+        }
+        self.state.signal_tray_graphics = layer;
+        had || self.state.signal_tray_graphics.is_some()
     }
 
     /// Everything the artwork depends on, folded into one number.
@@ -2750,6 +2789,88 @@ mod tests {
         // Asked again at the same instant, nothing has moved and nothing is
         // redrawn: the badge costs a raster per frame it moves, not per pass.
         assert!(!app.refresh_signal_tray_graphics(false));
+    }
+
+    /// A resting tray costs the terminal one upload, not one per badge frame.
+    ///
+    /// The key follows the animation — that is what
+    /// `a_moving_badge_makes_the_app_loop_redraw_the_artwork` pins, and it is
+    /// right — so the artwork is *rasterised* on every badge frame. Whether
+    /// each of those is worth a whole-surface upload is the second question,
+    /// and at rest the answer is almost always no: the breath moves the pixels
+    /// by a fraction of one 8-bit level.
+    ///
+    /// Measured on a real client before this existed: 20 uploads a second at
+    /// 328x128, 3.28 MiB/s, on a fleet with nothing happening.
+    #[test]
+    fn a_resting_tray_publishes_once_and_then_holds() {
+        const FRAMES: u64 = 40;
+        let mut app = tray_app();
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        assert!(
+            app.observe_signal_tray(now, false),
+            "the tray drew nothing at all"
+        );
+        let published = app
+            .state
+            .signal_tray_graphics
+            .clone()
+            .expect("a resting tray still has artwork");
+
+        let mut on_screen = published.data_fingerprint;
+        let mut republished = 0;
+        for step in 1..=FRAMES {
+            let at = now + Duration::from_millis(step * 50);
+            app.advance_animations(at, true);
+            app.observe_signal_tray(at, false);
+            let current = app
+                .state
+                .signal_tray_graphics
+                .as_ref()
+                .expect("the tray lost its artwork while resting")
+                .data_fingerprint;
+            if current != on_screen {
+                republished += 1;
+                on_screen = current;
+            }
+        }
+        assert!(
+            republished * 3 < FRAMES,
+            "a resting tray handed the terminal {republished} of {FRAMES} frames"
+        );
+    }
+
+    /// And a badge that actually lights is published at once, not on the
+    /// tolerance's clock.
+    #[test]
+    fn a_badge_lighting_up_reaches_the_terminal_immediately() {
+        let mut app = tray_app();
+        let now = Instant::now();
+        app.advance_animations(now, true);
+        app.observe_signal_tray(now, false);
+        let resting = app
+            .state
+            .signal_tray_graphics
+            .clone()
+            .expect("a resting tray still has artwork");
+
+        app.state.workspaces[0].cached_git_ahead_behind = Some((3, 0));
+        let at = now + Duration::from_millis(50);
+        app.advance_animations(at, true);
+        assert!(
+            app.observe_signal_tray(at, false),
+            "a badge lit and the tray reported nothing"
+        );
+        assert_ne!(
+            app.state
+                .signal_tray_graphics
+                .as_ref()
+                .expect("artwork")
+                .data_fingerprint,
+            resting.data_fingerprint,
+            "a badge lit and the terminal was left showing the resting artwork"
+        );
     }
 
     /// When every viewer draws the badges itself, the app loop stops drawing

@@ -487,12 +487,40 @@ pub(crate) fn rasterise_scene(
 /// One construction for both sides of the boundary — the server embedding its
 /// own raster and a client compositing the one it drew from a `TrayScene` — so
 /// format, placement and z cannot drift apart between them.
-pub(crate) fn graphics_layer(image: Rgba) -> crate::app::state::GraphicsLayer {
-    crate::app::state::GraphicsLayer::new(
-        crate::api::schema::PaneGraphicsFormat::Rgba,
+///
+/// The format is [`crate::kitty_graphics::preferred_sidebar_pixel_format`]'s,
+/// the same decision the tree's cards go through, rather than the unconditional
+/// raw RGBA this used to hardcode. The badges are a handful of small marks on a
+/// transparent ground, so PNG carries them at a tenth of the bytes; four bytes
+/// a pixel plus base64 is only ever right when the pixels never touch the
+/// escape stream. [`rasterise_scene`] opens on a fully transparent canvas and
+/// the badges never tile it, so the artwork is never opaque and the `f=24` case
+/// can be answered without scanning for it.
+///
+/// `None` when the pixels cannot be encoded, which is exactly the card path's
+/// own answer to the same failure: no layer, and the character marks the
+/// badges are drawn over stand on their own.
+pub(crate) fn graphics_layer(
+    image: Rgba,
+    host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    host_graphics_is_local: bool,
+) -> Option<crate::app::state::GraphicsLayer> {
+    let format = crate::kitty_graphics::preferred_sidebar_pixel_format(
+        false,
+        host_terminal_kind,
+        host_graphics_is_local,
+    );
+    let data = crate::kitty_graphics::encode_layer_pixels(
+        format,
         image.width,
         image.height,
-        image.pixels,
+        &image.pixels,
+    )?;
+    Some(crate::app::state::GraphicsLayer::new(
+        format,
+        image.width,
+        image.height,
+        data,
         crate::api::schema::PaneGraphicsPlacementParams {
             viewport_col: 0,
             viewport_row: 0,
@@ -503,7 +531,7 @@ pub(crate) fn graphics_layer(image: Rgba) -> crate::app::state::GraphicsLayer {
             // a host with graphics they are meant to be covered.
             z: 0,
         },
-    )
+    ))
 }
 
 /// Where one badge is in its animation right now, as the engine's envelope.
@@ -1101,6 +1129,148 @@ mod tests {
             decode_scene(&bytes).expect("decode").badges[0].motion,
             0.5,
             "the badge's position in its animation did not survive the wire"
+        );
+    }
+
+    /// The tray takes the format the transport policy names, and that format
+    /// is not raw pixels on a link that carries them.
+    ///
+    /// The tray used to hardcode `PaneGraphicsFormat::Rgba` — four bytes a
+    /// pixel plus a third again for base64, 224 KiB per upload at a 42-column
+    /// panel, on a link that for the captain's own fleet is an SSH hop. The
+    /// tree's cards have always routed through
+    /// `preferred_sidebar_pixel_format`; this is the tray joining them, stated
+    /// against the policy itself so the two cannot drift apart.
+    #[test]
+    fn the_tray_takes_the_format_the_transport_policy_names() {
+        let app = animated_tray(std::time::Duration::from_millis(200));
+        for (kind, is_local) in [
+            (crate::kitty_graphics::HostTerminalKind::Rio, false),
+            (crate::kitty_graphics::HostTerminalKind::Rio, true),
+            (crate::kitty_graphics::HostTerminalKind::Kitty, true),
+            (crate::kitty_graphics::HostTerminalKind::Other, true),
+        ] {
+            let (_, artwork) = image(&app, 8, 16).expect("an enabled tray has an image");
+            let layer =
+                graphics_layer(artwork, kind, is_local).expect("the tray encodes its artwork");
+            assert_eq!(
+                layer.format,
+                crate::kitty_graphics::preferred_sidebar_pixel_format(false, kind, is_local),
+                "the tray chose its own format for {kind:?} (local={is_local})"
+            );
+        }
+    }
+
+    /// And the format that policy names by default is worth taking: the badges
+    /// are a handful of small marks on a transparent ground.
+    #[test]
+    fn the_badges_carry_an_order_of_magnitude_smaller_as_png() {
+        let app = animated_tray(std::time::Duration::from_millis(200));
+        let (_, artwork) = image(&app, 8, 16).expect("an enabled tray has an image");
+        let raw = artwork.pixels.len();
+        let png = crate::kitty_graphics::encode_layer_pixels(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            artwork.width,
+            artwork.height,
+            &artwork.pixels,
+        )
+        .expect("png encode");
+        assert!(
+            png.len() * 4 < raw,
+            "PNG carried the badges in {} bytes against {raw} raw",
+            png.len()
+        );
+    }
+
+    /// A tray whose badges are published to the engine on `now`, so a caller
+    /// stepping the animator from that same instant is stepping the clock the
+    /// elements were mounted against.
+    ///
+    /// Deliberately not [`animated_tray`], which takes its own `Instant::now()`
+    /// internally: two clocks means the first advances land before the
+    /// animator's own origin and are clamped away, and the badge simply does
+    /// not move for the first stretch of the measurement.
+    fn tray_published_at(now: std::time::Instant, lit: bool) -> AppState {
+        let mut app = app_with_tray(42, 40);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        if lit {
+            // `push` goes live on a branch with commits that have not left.
+            app.workspaces[0].cached_git_ahead_behind = Some((2, 0));
+        }
+        let live: Vec<_> = signal_tray::resolve(&app).animation_membership().collect();
+        app.anim.observe(
+            now,
+            crate::anim::Family::TrayBadge,
+            &BadgeState::lifecycle(),
+            live,
+        );
+        app
+    }
+
+    /// How many of a span of badge frames are worth handing the terminal.
+    fn published_over(app: &mut AppState, start: std::time::Instant, frames: u32) -> (u32, u32) {
+        let mut published = crate::app::state::PublishedSurfaceRaster::default();
+        let (mut drawn, mut sent) = (0, 0);
+        for step in 0..frames {
+            app.anim
+                .advance(start + std::time::Duration::from_millis(50) * step);
+            let Some((_, artwork)) = image(app, 8, 16) else {
+                continue;
+            };
+            drawn += 1;
+            if published.accept(artwork.width, artwork.height, &artwork.pixels) {
+                sent += 1;
+            }
+        }
+        (drawn, sent)
+    }
+
+    /// Eight resting badges cost the terminal almost nothing, and one lit badge
+    /// costs it almost everything.
+    ///
+    /// This is the whole claim of [`crate::app::state::PublishedSurfaceRaster`]
+    /// stated as a test rather than as a comment, and it is one test rather
+    /// than two because the two numbers only mean something against each
+    /// other. A rule that merely slowed the tray down would move both.
+    ///
+    /// Rest's motion is a carve breathing by a fraction of one 8-bit level per
+    /// frame; a lit badge's mark travels and brightens. The first is not worth
+    /// a 328x128 upload twenty times a second and the second is worth every
+    /// frame it asks for, and the same rule says so.
+    #[test]
+    fn a_resting_tray_stops_re_uploading_and_a_lit_one_does_not() {
+        const FRAMES: u32 = 200;
+        let now = std::time::Instant::now();
+
+        let mut resting = tray_published_at(now, false);
+        assert!(
+            FleetSignal::ALL
+                .into_iter()
+                .all(
+                    |signal| signal_tray::resolve(&resting).badge(signal).state == BadgeState::Idle
+                ),
+            "the resting fixture lit a badge"
+        );
+        let (rest_drawn, rest_sent) = published_over(&mut resting, now, FRAMES);
+
+        let mut lit = tray_published_at(now, true);
+        assert_eq!(
+            signal_tray::resolve(&lit).badge(FleetSignal::Push).state,
+            BadgeState::Active,
+            "the lit fixture lit no badge"
+        );
+        let (lit_drawn, lit_sent) = published_over(&mut lit, now, FRAMES);
+
+        assert!(
+            rest_sent * 3 < rest_drawn,
+            "a resting tray published {rest_sent} of {rest_drawn} rasters; \
+             nothing was saved on the fleet's common case"
+        );
+        assert!(
+            lit_sent * 10 > lit_drawn * 8,
+            "a lit badge published only {lit_sent} of {lit_drawn} rasters; \
+             this is a throttle, not a bound on what the screen may drift"
         );
     }
 }

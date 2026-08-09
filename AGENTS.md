@@ -272,6 +272,24 @@ every pixel surface with it and putting nothing on screen to say so;
 terminal. A small PTY never reaches the cap, which is why only a real terminal
 at a real size sees this.
 
+Neither rig covers the `--remote` bridge's sidebar, which is a different
+drawing path: a delegating client is sent `CardScene`/`TrayScene` tokens and
+rasterises the pixels itself, so a tap of the *server* socket sees no graphics
+at all. `HERDR_CLIENT_RASTERIZED_CARDS=1` and
+`HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY=1` put a Unix client on that path
+(`client::wants_client_rasterized_cards`), and the only place its escapes exist
+is between the client and its terminal — run the client under `script -f` in a
+real terminal to record them.
+
+A terminal's image store is not a resource herdr can see, and `a=d` does not
+give it back. Measured on Rio 0.5.19: minting a fresh image id per raster grows
+it ~10 MiB/s and never shrinks, until it caps and evicts whatever has sat there
+longest untouched — the sidebar's cards, while herdr's cache still believes
+they are uploaded. A pixel surface that goes blank a couple of minutes in and
+never returns is that, not a dropped upload; count distinct image ids, not
+bytes. herdr's own surfaces keep one id each and are replaced in place — see
+`kitty_graphics::layer_host_image_id`.
+
 Two more traps that make a live capture measure nothing while still looking real.
 A terminal decodes and scales graphics off its parse thread, and Xvfb has no
 GPU: glyphs appear about a second after the window maps but an image placement

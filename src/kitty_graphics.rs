@@ -342,7 +342,7 @@ pub(crate) fn local_transport_enabled() -> bool {
 /// running under.
 ///
 /// Used to pick a pixel format the terminal is known to be fast at (see
-/// `preferred_card_pixel_format`) and to decide whether an *opaque ambient
+/// `preferred_sidebar_pixel_format`) and to decide whether an *opaque ambient
 /// wash* may be drawn at all (see [`HostTerminalKind::draws_ambient_wash`]).
 /// A terminal herdr cannot positively identify is `Other` and gets neither:
 /// guessing costs real throughput on the first question and the whole
@@ -484,11 +484,20 @@ fn preferred_local_pixel_format(kind: HostTerminalKind) -> Option<KittyImageForm
     }
 }
 
-/// The pixel format herdr's own sidebar cards should be rasterised in.
+/// The pixel format herdr's own sidebar artwork — the tree's cards and the
+/// signal tray's badges alike — should be rasterised in.
 ///
 /// PNG (what herdr has always sent) unless local transport is enabled,
 /// locality is positively established, and the terminal is one herdr has a
 /// known-fast raw format for.
+///
+/// This is a policy about *transport*, not about a particular surface, which is
+/// why it is not named for one. Raw pixels are only ever right when the pixels
+/// are not going over the escape stream at all (`t=f`, a local file the
+/// terminal reads itself); base64 raw RGBA in `t=d` is four bytes a pixel plus
+/// a third again for the encoding, on a link that may be an SSH hop. The tray
+/// used to bypass this and hardcode RGBA, which cost it 10x its PNG size on
+/// every one of its uploads.
 ///
 /// `is_opaque` gates the RGB case specifically: `f=24` has no alpha channel,
 /// and herdr's cards are genuinely translucent — rounded corners, glow
@@ -504,15 +513,59 @@ fn preferred_local_pixel_format(kind: HostTerminalKind) -> Option<KittyImageForm
 /// `host_terminal_report_from_env` and `ClientConnection::host_terminal_kind`)
 /// — never from this process's own environment, which for the split server is
 /// not necessarily the attached terminal's.
-pub(crate) fn preferred_card_pixel_format(
+pub(crate) fn preferred_sidebar_pixel_format(
     is_opaque: bool,
     kind: HostTerminalKind,
     is_local: bool,
 ) -> crate::api::schema::PaneGraphicsFormat {
-    preferred_card_pixel_format_for(local_transport_enabled(), is_local, kind, is_opaque)
+    preferred_sidebar_pixel_format_for(local_transport_enabled(), is_local, kind, is_opaque)
 }
 
-fn preferred_card_pixel_format_for(
+/// Encodes an RGBA8 canvas in `format`.
+///
+/// The one encoder for every surface herdr rasterises itself, so the format
+/// [`preferred_sidebar_pixel_format`] picked and the bytes that go out under
+/// `f=` cannot drift apart between two producers.
+pub(crate) fn encode_layer_pixels(
+    format: crate::api::schema::PaneGraphicsFormat,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Option<Vec<u8>> {
+    match format {
+        crate::api::schema::PaneGraphicsFormat::Png => encode_layer_png(width, height, rgba),
+        crate::api::schema::PaneGraphicsFormat::Rgba => Some(rgba.to_vec()),
+        crate::api::schema::PaneGraphicsFormat::Rgb => Some(rgba_to_rgb(rgba)),
+    }
+}
+
+/// Drops the alpha byte from each pixel. Only ever selected for a canvas that
+/// carries no real transparency and a terminal (`f=24` kitty) that composites
+/// it the same way the RGBA path does — see [`preferred_local_pixel_format`].
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    out
+}
+
+fn encode_layer_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // Fast rather than default: this runs on the render thread when a surface's
+    // content changes, and the content is flat fills, marks and text, which is
+    // where the cheap filters already get most of the ratio.
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(out)
+}
+
+fn preferred_sidebar_pixel_format_for(
     local_transport_enabled: bool,
     is_local: bool,
     kind: HostTerminalKind,
@@ -556,11 +609,24 @@ fn local_graphics_path(host_id: u32) -> std::path::PathBuf {
 /// rename only ever sees a complete write. Nothing here waits for the
 /// terminal to finish reading; the rename is what makes that safe to skip.
 ///
-/// `host_id` is derived from the image's own content signature
-/// (`host_image_id`), so two callers staging the same `host_id` are always
-/// staging identical bytes — safe to overwrite redundantly, which matters
-/// when more than one attached client shares this process's local-transport
+/// A terminal-sourced `host_id` is derived from the image's own content
+/// signature (`host_image_id`), so two callers staging one of those are always
+/// staging identical bytes — safe to overwrite redundantly, which matters when
+/// more than one attached client shares this process's local-transport
 /// directory.
+///
+/// A herdr-owned layer's id is its *surface's* (`layer_host_image_id`), so
+/// successive frames of an animating surface do share a path and do overwrite
+/// each other. The rename is still atomic, so nothing is ever read half-written;
+/// what can happen is a terminal opening the path after a newer frame landed and
+/// showing that frame one step early. It self-corrects on the next upload, which
+/// points at the same path holding the same bytes. The one visible case is a
+/// resize landing between the escape and the read — the escape declares the old
+/// `s`/`v` for a file that now holds a different geometry — and that too is
+/// corrected by the pass that follows. Both are confined to
+/// `[experimental] kitty_graphics_local_transport`, which is off by default; the
+/// `t=d` path this falls back to carries its pixels inline and cannot race at
+/// all.
 fn write_local_graphics_file(host_id: u32, data: &[u8]) -> Option<std::path::PathBuf> {
     let dir = local_graphics_dir();
     std::fs::create_dir_all(dir).ok()?;
@@ -887,7 +953,7 @@ fn encode_graphics_update(
         let Some((clipped, format_code)) = clipped else {
             continue;
         };
-        let host_id = host_image_id(placement.surface, &placement.placement);
+        let host_id = placement_host_image_id(placement);
         let host_placement_id = host_placement_id(placement.source_key, &placement.placement);
         let image_signature = image_signature(placement, format_code);
         let placement_signature =
@@ -901,23 +967,33 @@ fn encode_graphics_update(
         // that reason; arming it here, before the image has a placement, left the terminal
         // stuck showing the root frame forever in live testing.
         let mut needs_animation_arm = false;
+        // A herdr-owned surface keeps one image id and has its pixels replaced
+        // under it (`a=t` with an existing `i=`). The alternative — hand the id
+        // back with `a=d` and take a fresh one — is what walks a terminal's
+        // image store up until it evicts the sidebar's cards out from under a
+        // cache that believes they are still there. See `layer_host_image_id`.
+        let replaces_in_place = matches!(placement.source_key, HostSourceKey::Layer { .. });
+        let mut replaced_in_place = false;
         match host_images.get(&host_id).copied() {
             Some(existing) if existing == image_signature => {}
             Some(_) => {
-                encode_delete_image(bytes, host_id);
-                host_placements.retain(|(image_id, placement_id), _| {
-                    if *image_id == host_id {
-                        current_placements.remove(&(*image_id, *placement_id));
-                        false
-                    } else {
-                        true
-                    }
-                });
+                if !replaces_in_place {
+                    encode_delete_image(bytes, host_id);
+                    host_placements.retain(|(image_id, placement_id), _| {
+                        if *image_id == host_id {
+                            current_placements.remove(&(*image_id, *placement_id));
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
                 if !encode_upload_image(bytes, placement, format_code, host_id) {
                     continue;
                 }
                 host_images.insert(host_id, image_signature);
                 needs_animation_arm = placement.animation.is_some();
+                replaced_in_place = replaces_in_place;
             }
             None => {
                 if !encode_upload_image(bytes, placement, format_code, host_id) {
@@ -941,8 +1017,17 @@ fn encode_graphics_update(
         // A different view can repaint the same cells with text or overlays and
         // leave the host-side Kitty placement state out of sync with this cache.
         // Re-emit the placement even when its geometry signature is unchanged.
+        //
+        // And re-emit it after a replace-in-place, because the old path got one
+        // for free: deleting the image took its placements with it, so the new
+        // upload always arrived with a fresh `a=p` behind it. Kitty's spec has a
+        // replaced image keep its placements and Rio was measured doing exactly
+        // that, but a terminal that dropped them would leave the surface blank
+        // and there is no way to ask — and one placement escape is a rounding
+        // error against the upload it follows.
         match host_placements.get_mut(&placement_key) {
-            Some(existing) if !view_changed && *existing == placement_signature => {}
+            Some(existing)
+                if !view_changed && !replaced_in_place && *existing == placement_signature => {}
             Some(existing) => {
                 encode_display_placement(
                     bytes,
@@ -1320,7 +1405,7 @@ fn layer_host_placement(
         data_len: layer.data.len(),
         data_fingerprint: layer.data_fingerprint,
     };
-    let host_id = layer_host_image_id(surface, signature);
+    let host_id = layer_host_image_id(surface);
     let already_uploaded = uploaded_images.get(&host_id).copied() == Some(signature);
     let data = if !include_data || already_uploaded {
         Vec::new()
@@ -1412,11 +1497,54 @@ fn host_image_id_for_signature(surface: HostSurfaceId, signature: ImageSignature
     HOST_IMAGE_ID_BASE + ((hasher.finish() as u32) % 900_000)
 }
 
-fn layer_host_image_id(surface: HostSurfaceId, signature: ImageSignature) -> u32 {
+/// The host image id a herdr-owned layer surface keeps for as long as it is on
+/// screen.
+///
+/// **The surface's identity, and nothing else.** Terminal-emitted images are
+/// content-addressed — see [`host_image_id_for_signature`] — because the same
+/// picture genuinely recurs there and two panes showing it should share one
+/// upload. A layer surface is the opposite case: it has exactly one source, so
+/// [`release_superseded_source_image`] deletes its previous image the moment
+/// its content moves, and a content-addressed id therefore never once dedupes
+/// anything. What it does instead is mint a *new* id for every raster.
+///
+/// That is not free on the terminal side, and it is not free in a way herdr
+/// cannot see. Measured against a real Rio 0.5.19 under Xvfb, same image, same
+/// rate, same bytes, only the id differing:
+///
+/// | | resident growth |
+/// |---|---|
+/// | fresh id per upload, previous one deleted | **10.7 MiB/s, unbounded** |
+/// | one id, re-transmitted in place | **0.14 MiB/s — flat** |
+///
+/// An `a=d` for an image id does not give the storage back. So a surface that
+/// re-rasterises — the tray's badges, a breathing card — walks the terminal's
+/// image store up until it hits its cap and starts evicting, and what it
+/// evicts is whatever has been sitting there longest and untouched: the
+/// sidebar's cards, uploaded once and then correct forever. herdr's own cache
+/// believes they are still there, so it never sends them again. That is the
+/// card blackout, and this is why it only ever happened to the client that
+/// rasterises its own sidebar — a server-rasterised client's cards are caught
+/// in the same churn and so keep being re-uploaded.
+///
+/// Replacing in place is the protocol's own idiom (`a=t` with an `i=` that
+/// already exists) and was confirmed on Rio to update what is on screen.
+fn layer_host_image_id(surface: HostSurfaceId) -> u32 {
     let mut hasher = DefaultHasher::new();
     surface.hash_identity(&mut hasher);
-    signature.hash(&mut hasher);
     PANE_GRAPHICS_IMAGE_ID_BIT | ((hasher.finish() as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
+}
+
+/// The host image id this placement's pixels live under.
+///
+/// Two families, and the split is [`HostSourceKey`]'s: what a pane's own
+/// program drew is content-addressed, and what herdr drew belongs to the
+/// surface that drew it. See [`layer_host_image_id`].
+fn placement_host_image_id(placement: &HostPlacement) -> u32 {
+    match placement.source_key {
+        HostSourceKey::Layer { surface } => layer_host_image_id(surface),
+        HostSourceKey::Terminal { .. } => host_image_id(placement.surface, &placement.placement),
+    }
 }
 
 fn host_placement_id(source_key: HostSourceKey, placement: &KittyImagePlacement) -> u32 {
@@ -2032,7 +2160,7 @@ mod tests {
         let placement = test_placement(0, 0);
         let signature = image_signature(&placement, kitty_format_code(placement.placement.format));
         let terminal_id = host_image_id_for_signature(placement.surface, signature);
-        let pane_graphics_id = layer_host_image_id(placement.surface, signature);
+        let pane_graphics_id = layer_host_image_id(placement.surface);
 
         assert_eq!(terminal_id & PANE_GRAPHICS_IMAGE_ID_BIT, 0);
         assert_ne!(pane_graphics_id & PANE_GRAPHICS_IMAGE_ID_BIT, 0);
@@ -2162,7 +2290,11 @@ mod tests {
         let cell = test_cell_size();
         let (_, artwork) =
             crate::ui::signal_tray_image(&app, cell.width_px, cell.height_px).expect("artwork");
-        app.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(artwork));
+        app.signal_tray_graphics = crate::ui::signal_tray_graphics_layer(
+            artwork,
+            app.host_terminal_kind,
+            app.host_graphics_is_local,
+        );
 
         // The server's side: the tray as this pass would embed it, with every
         // other surface absent so what comes out is the tray and nothing else.
@@ -2190,7 +2322,12 @@ mod tests {
         let mut client_cache = HostGraphicsCache::default();
         let drawn = encode_tray_scene_graphics(
             grid,
-            &crate::ui::signal_tray_graphics_layer(image),
+            &crate::ui::signal_tray_graphics_layer(
+                image,
+                app.host_terminal_kind,
+                app.host_graphics_is_local,
+            )
+            .expect("the client encodes the tray it drew"),
             cell,
             &mut client_cache,
         );
@@ -2208,8 +2345,11 @@ mod tests {
             &crate::ui::signal_tray_graphics_layer(
                 crate::ui::rasterise_signal_tray_scene(&decoded, cell.width_px, cell.height_px)
                     .expect("raster")
-                    .1
-            ),
+                    .1,
+                app.host_terminal_kind,
+                app.host_graphics_is_local,
+            )
+            .expect("the client encodes the tray it drew"),
             cell,
             &mut client_cache,
         )
@@ -2229,13 +2369,15 @@ mod tests {
             crate::api::schema::PaneGraphicsPlacementParams::default(),
         );
         app.sidebar_signal_tray.enabled = true;
-        app.signal_tray_graphics = Some(crate::ui::signal_tray_graphics_layer(
+        app.signal_tray_graphics = crate::ui::signal_tray_graphics_layer(
             crate::ui::sidebar::tray_art::Rgba {
                 width: 8,
                 height: 8,
                 pixels: vec![0xff; 8 * 8 * 4],
             },
-        ));
+            app.host_terminal_kind,
+            app.host_graphics_is_local,
+        );
 
         let surfaces = |embedded| {
             surface_layer_placement_targets(&app, embedded)
@@ -2543,18 +2685,11 @@ mod tests {
 
     #[test]
     fn sidebar_and_pane_layers_never_share_a_host_id() {
-        let signature = ImageSignature {
-            image_width: 4,
-            image_height: 4,
-            format_code: 32,
-            data_len: 64,
-            data_fingerprint: 11,
-        };
         let pane = HostSurfaceId::Pane(PaneId::from_raw(1));
 
         assert_ne!(
-            layer_host_image_id(pane, signature),
-            layer_host_image_id(HostSurfaceId::Sidebar, signature)
+            layer_host_image_id(pane),
+            layer_host_image_id(HostSurfaceId::Sidebar)
         );
         assert_ne!(
             host_placement_id(
@@ -2732,9 +2867,16 @@ mod tests {
             host_image_id_for_signature(HostSurfaceId::Pane(pane_id), signature),
             HOST_IMAGE_ID_BASE + ((legacy as u32) % 900_000)
         );
+
+        // The layer path's id is the surface's own and carries no signature —
+        // see `layer_host_image_id` — so what is pinned here is that it is
+        // still derived from the raw pane id and still lands in its own range.
+        let mut surface_only = DefaultHasher::new();
+        pane_id.raw().hash(&mut surface_only);
+        let surface_only = surface_only.finish();
         assert_eq!(
-            layer_host_image_id(HostSurfaceId::Pane(pane_id), signature),
-            PANE_GRAPHICS_IMAGE_ID_BIT | ((legacy as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
+            layer_host_image_id(HostSurfaceId::Pane(pane_id)),
+            PANE_GRAPHICS_IMAGE_ID_BIT | ((surface_only as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
         );
     }
 
@@ -3459,8 +3601,114 @@ mod tests {
         assert_eq!(sources.len(), 1);
     }
 
+    /// A layer surface that keeps re-rasterising keeps one host image id.
+    ///
+    /// The regression this guards is the card blackout: every raster used to
+    /// mint a new content-hashed id and hand the previous one back with `a=d`,
+    /// and a real Rio grows 10.7 MiB/s under that and never shrinks — until it
+    /// hits its cap and evicts the sidebar's cards out from under a cache that
+    /// believes they are still uploaded. Counting `a=d,d=I` is the whole test:
+    /// a surface whose content moves must cost the terminal no image
+    /// allocations at all after its first.
     #[test]
-    fn removed_pane_layer_preserves_image_shared_with_terminal_source() {
+    fn a_re_rasterising_layer_never_hands_its_image_id_back() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+
+        let first_id = placement_host_image_id(&pane_layer_placement(0, 0));
+        let mut deletes = 0;
+        let mut uploads = 0;
+        for step in 0..8u64 {
+            let mut placement = pane_layer_placement(0, 0);
+            placement.placement.data_fingerprint = 100 + step;
+            let id = placement_host_image_id(&placement);
+            assert_eq!(
+                id, first_id,
+                "the surface's image id moved when only its pixels did"
+            );
+
+            let mut bytes = Vec::new();
+            encode_graphics_update(
+                &mut bytes,
+                &[placement],
+                false,
+                &mut images,
+                &mut placements,
+                &mut sources,
+            );
+            let update = String::from_utf8_lossy(&bytes);
+            deletes += update.matches("a=d,d=I").count();
+            uploads += update.matches("a=t,").count();
+        }
+
+        assert_eq!(
+            deletes, 0,
+            "the layer handed its image id back {deletes} times"
+        );
+        assert_eq!(uploads, 8, "a changed layer did not re-transmit its pixels");
+        assert_eq!(
+            images.len(),
+            1,
+            "one surface accumulated {} images",
+            images.len()
+        );
+    }
+
+    /// And the pixels genuinely land: a replace-in-place is followed by the
+    /// placement that displays it, which the delete-first path used to get for
+    /// free.
+    #[test]
+    fn a_replaced_layer_image_is_placed_again() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+        encode_graphics_update(
+            &mut bytes,
+            &[pane_layer_placement(0, 0)],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+
+        let mut changed = pane_layer_placement(0, 0);
+        changed.placement.data_fingerprint = 43;
+        bytes.clear();
+        encode_graphics_update(
+            &mut bytes,
+            &[changed],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        let update = String::from_utf8_lossy(&bytes);
+        assert!(
+            update.contains("a=t,"),
+            "the replacement was not transmitted"
+        );
+        assert!(
+            update.contains("a=p,"),
+            "the replacement was never placed: {update}"
+        );
+    }
+
+    /// A herdr-owned layer and a pane's own image never share a host image, so
+    /// removing the layer cannot take the pane's picture with it.
+    ///
+    /// This used to be a *coincidence to survive*: both families were
+    /// content-addressed, identical content meant one shared id, and
+    /// `release_superseded_source_image` had to count references to avoid
+    /// deleting an image the other source still needed. Since
+    /// `layer_host_image_id` keys a layer on its surface rather than on its
+    /// pixels, the two families cannot collide at all — the hazard is gone by
+    /// construction rather than guarded against, and the price is one extra
+    /// upload in the case where a pane's program happened to draw exactly what
+    /// herdr was compositing over it.
+    #[test]
+    fn a_removed_layer_leaves_a_pane_image_of_identical_content_alone() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
         let mut sources = HashMap::new();
@@ -3473,7 +3721,12 @@ mod tests {
             &mut placements,
             &mut sources,
         );
-        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images.len(),
+            2,
+            "the two families shared a host image after the id split"
+        );
+        let terminal_host_id = placement_host_image_id(&test_placement(4, 0));
 
         bytes.clear();
         encode_graphics_update(
@@ -3486,7 +3739,11 @@ mod tests {
         );
 
         let update = String::from_utf8_lossy(&bytes);
-        assert!(!update.contains("a=d,d=I"));
+        assert!(
+            !update.contains(&format!("a=d,d=I,i={terminal_host_id}")),
+            "the pane's own image was deleted when the layer over it went away"
+        );
+        assert!(images.contains_key(&terminal_host_id));
         assert_eq!(images.len(), 1);
         assert_eq!(placements.len(), 1);
         assert_eq!(sources.len(), 1);
@@ -3652,12 +3909,12 @@ mod local_transport_tests {
         assert_eq!(preferred_local_pixel_format(HostTerminalKind::Other), None);
     }
 
-    // ---- preferred_card_pixel_format_for ------------------------------
+    // ---- preferred_sidebar_pixel_format_for ------------------------------
 
     #[test]
     fn card_format_stays_png_when_local_transport_disabled() {
         assert_eq!(
-            preferred_card_pixel_format_for(false, true, HostTerminalKind::Rio, true),
+            preferred_sidebar_pixel_format_for(false, true, HostTerminalKind::Rio, true),
             crate::api::schema::PaneGraphicsFormat::Png
         );
     }
@@ -3665,7 +3922,7 @@ mod local_transport_tests {
     #[test]
     fn card_format_stays_png_when_locality_not_established() {
         assert_eq!(
-            preferred_card_pixel_format_for(true, false, HostTerminalKind::Rio, true),
+            preferred_sidebar_pixel_format_for(true, false, HostTerminalKind::Rio, true),
             crate::api::schema::PaneGraphicsFormat::Png
         );
     }
@@ -3673,11 +3930,11 @@ mod local_transport_tests {
     #[test]
     fn card_format_upgrades_rio_to_rgba_regardless_of_opacity() {
         assert_eq!(
-            preferred_card_pixel_format_for(true, true, HostTerminalKind::Rio, false),
+            preferred_sidebar_pixel_format_for(true, true, HostTerminalKind::Rio, false),
             crate::api::schema::PaneGraphicsFormat::Rgba
         );
         assert_eq!(
-            preferred_card_pixel_format_for(true, true, HostTerminalKind::Rio, true),
+            preferred_sidebar_pixel_format_for(true, true, HostTerminalKind::Rio, true),
             crate::api::schema::PaneGraphicsFormat::Rgba
         );
     }
@@ -3685,11 +3942,11 @@ mod local_transport_tests {
     #[test]
     fn card_format_upgrades_kitty_to_rgb_only_when_opaque() {
         assert_eq!(
-            preferred_card_pixel_format_for(true, true, HostTerminalKind::Kitty, true),
+            preferred_sidebar_pixel_format_for(true, true, HostTerminalKind::Kitty, true),
             crate::api::schema::PaneGraphicsFormat::Rgb
         );
         assert_eq!(
-            preferred_card_pixel_format_for(true, true, HostTerminalKind::Kitty, false),
+            preferred_sidebar_pixel_format_for(true, true, HostTerminalKind::Kitty, false),
             crate::api::schema::PaneGraphicsFormat::Png,
             "a translucent card handed to f=24 would clip every soft edge to opaque"
         );
@@ -3698,7 +3955,7 @@ mod local_transport_tests {
     #[test]
     fn card_format_is_the_documented_safe_default_for_an_unknown_terminal() {
         assert_eq!(
-            preferred_card_pixel_format_for(true, true, HostTerminalKind::Other, true),
+            preferred_sidebar_pixel_format_for(true, true, HostTerminalKind::Other, true),
             crate::api::schema::PaneGraphicsFormat::Png
         );
     }

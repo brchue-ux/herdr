@@ -77,6 +77,103 @@ fn graphics_data_fingerprint(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// How far the artwork a host terminal is showing may sit from the artwork
+/// herdr would draw for it right now, per 8-bit channel.
+///
+/// This is a *fidelity* contract, not a frame budget: whatever is on screen is
+/// always within this many levels of the truth, and the moment it is not, it is
+/// re-sent. Two levels is well under a single step of the dithering a terminal
+/// does when it composites, so nothing a viewer can see is ever held back.
+///
+/// It is expressed in the unit the terminal actually shows — channel levels —
+/// rather than in frames per second, because the cost it governs is not the
+/// raster (cheap) but the *upload*: a whole surface, base64'd onto the escape
+/// stream, on a link that may be an SSH hop. See [`PublishedSurfaceRaster`].
+pub(crate) const SURFACE_DRIFT_LEVELS: u8 = 2;
+
+/// The raster a graphics surface last handed the host terminal, and the rule
+/// for whether a fresh one is worth sending.
+///
+/// # Why a surface needs one
+///
+/// Every producer of a [`GraphicsLayer`] answers one question — *has the
+/// artwork changed?* — and `data_fingerprint` answers it exactly: one byte
+/// different is a different image and a whole re-upload. That is the right rule
+/// for content: a badge lighting up, a card changing state, a panel resizing.
+///
+/// It is the wrong rule for *ambient motion*, and the tray is where that shows.
+/// Eight resting badges breathe on a 4.2 s loop whose entire visible range is
+/// 25 levels of 255, sampled on the badge frame tier — so consecutive frames
+/// differ by a **maximum of 3 levels and a mean of 0.02**, and each of them
+/// costs the terminal a fresh 328x128 image. Measured on an idle fleet with
+/// nothing happening: 20 uploads a second, 3.28 MiB/s, forever.
+///
+/// The frame tiers that produce those rasters
+/// ([`crate::anim::behaviour`]'s `frame_interval`,
+/// `crate::ui::sidebar::image_card`'s breath ladder) are set against *raster*
+/// cost, which is small and local. Nothing was set against upload cost, which
+/// is neither. This is that missing half: a raster is published when it would
+/// look different, and otherwise the artwork already on screen stands.
+///
+/// # Why the anchor is the published raster and not the previous one
+///
+/// Comparing against the previous *frame* would let an arbitrarily slow ramp
+/// creep arbitrarily far while every individual step stayed under the
+/// threshold. Comparing against what was actually published makes the drift
+/// *bounded*: the screen is never more than [`SURFACE_DRIFT_LEVELS`] from the
+/// truth, so a slow ramp still arrives — in steps a viewer can see rather than
+/// in steps only a memcmp can.
+///
+/// # What it does not do
+///
+/// It is not a throttle, and the difference is measurable. Under it an idle
+/// tray goes from 20 uploads a second to 5.4; one badge lit and snapping keeps
+/// 19.5 of its 20, because a mark that travels and brightens moves far more
+/// than two levels. Bytes are spent in proportion to visible change.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PublishedSurfaceRaster {
+    /// Width, height and RGBA8 pixels of the last raster actually sent.
+    published: Option<(u32, u32, Vec<u8>)>,
+}
+
+impl PublishedSurfaceRaster {
+    /// Whether `pixels` is far enough from what the terminal is showing to be
+    /// worth an upload, recording it as published when it is.
+    ///
+    /// Geometry always publishes: a surface that changed size is a different
+    /// image whatever its pixels say, and there is nothing to compare it to.
+    pub(crate) fn accept(&mut self, width: u32, height: u32, pixels: &[u8]) -> bool {
+        let worth_sending = match &self.published {
+            Some((published_width, published_height, published))
+                if *published_width == width
+                    && *published_height == height
+                    && published.len() == pixels.len() =>
+            {
+                published
+                    .iter()
+                    .zip(pixels)
+                    .any(|(was, now)| was.abs_diff(*now) > SURFACE_DRIFT_LEVELS)
+            }
+            _ => true,
+        };
+        if worth_sending {
+            self.published = Some((width, height, pixels.to_vec()));
+        }
+        worth_sending
+    }
+
+    /// Forgets what was published, so the next raster is sent whatever it looks
+    /// like.
+    ///
+    /// For every path that takes the surface off the terminal — the tray being
+    /// switched off, delegation changing sides, graphics being disabled. The
+    /// terminal is no longer showing what this remembers, so remembering it
+    /// would hold back the raster that puts the surface back.
+    pub(crate) fn forget(&mut self) {
+        self.published = None;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PopupPaneState {
     pub pane_id: PaneId,
@@ -2027,6 +2124,14 @@ pub struct AppState {
     /// the cell size, folded into one number. Rasterising eight badges is not
     /// free, so it is redone when this moves and not once per frame.
     pub(crate) signal_tray_graphics_key: u64,
+    /// The badge artwork this session last actually handed a host terminal.
+    ///
+    /// The key above says the artwork *may* have moved; this says whether the
+    /// move is one a viewer could see. A resting tray's breath moves the key on
+    /// every badge frame and the pixels by a fraction of one level, and without
+    /// this every one of those is a whole-surface re-upload — see
+    /// [`PublishedSurfaceRaster`].
+    pub(crate) signal_tray_published: PublishedSurfaceRaster,
     /// Whether the badges are being rasterised by whoever is watching rather
     /// than here — every attached viewer asked for the tray as a
     /// `ServerMessage::TrayScene` and draws it from that.
@@ -2119,7 +2224,7 @@ pub struct AppState {
     /// Foreground client's host terminal kind, from its own attach-time
     /// host-capability probe. `Other` (no format upgrade) until a client with
     /// a positively identified terminal is foreground. See
-    /// `crate::kitty_graphics::preferred_card_pixel_format`.
+    /// `crate::kitty_graphics::preferred_sidebar_pixel_format`.
     pub(crate) host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
     /// Whether the foreground client positively established that it shares a
     /// filesystem with its terminal. `false` — including "unknown" — is the
@@ -3233,6 +3338,7 @@ impl AppState {
             signal_tray: crate::app::signal_tray::SignalTrayState::default(),
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
+            signal_tray_published: PublishedSurfaceRaster::default(),
             signal_tray_graphics_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
@@ -3603,6 +3709,112 @@ impl AppState {
         {
             ws.insert_test_runtime(pane_id, runtime);
         }
+    }
+}
+
+#[cfg(test)]
+mod published_surface_raster_tests {
+    use super::*;
+
+    fn flat(width: u32, height: u32, level: u8) -> Vec<u8> {
+        vec![level; (width as usize) * (height as usize) * 4]
+    }
+
+    #[test]
+    fn the_first_raster_is_always_published() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 10)));
+    }
+
+    #[test]
+    fn a_raster_identical_to_the_one_on_screen_is_refused() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 10)));
+        assert!(!published.accept(2, 2, &flat(2, 2, 10)));
+    }
+
+    /// The rule is about what a viewer can see, so the boundary is stated
+    /// rather than inferred: at the tolerance the screen still stands, one
+    /// level past it the surface is re-sent.
+    #[test]
+    fn the_tolerance_is_the_boundary_between_standing_and_re_sending() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 100)));
+        assert!(
+            !published.accept(2, 2, &flat(2, 2, 100 + SURFACE_DRIFT_LEVELS)),
+            "a change exactly at the tolerance was sent"
+        );
+        assert!(
+            published.accept(2, 2, &flat(2, 2, 100 + SURFACE_DRIFT_LEVELS + 1)),
+            "a change past the tolerance was held back"
+        );
+    }
+
+    /// One pixel is enough. A small bright thing appearing — a marker, a chip,
+    /// a badge lighting — moves few pixels a long way, and a rule that averaged
+    /// over the surface would swallow it.
+    #[test]
+    fn a_single_pixel_moving_far_enough_publishes_the_whole_surface() {
+        let mut published = PublishedSurfaceRaster::default();
+        let ground = flat(8, 8, 10);
+        assert!(published.accept(8, 8, &ground));
+        let mut spot = ground.clone();
+        spot[4 * 4] = 255;
+        assert!(published.accept(8, 8, &spot));
+    }
+
+    /// The anchor is what the terminal is *showing*, not the last raster
+    /// offered, so a ramp of individually invisible steps still arrives.
+    ///
+    /// This is the whole difference between a fidelity bound and a throttle: a
+    /// breath that drifts a level at a time is published every few frames
+    /// instead of every frame, and the screen is never further from the truth
+    /// than the tolerance allows.
+    #[test]
+    fn a_slow_ramp_still_arrives_because_the_drift_is_bounded() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 0)));
+        let mut sent = 0;
+        for level in 1..=40u8 {
+            if published.accept(2, 2, &flat(2, 2, level)) {
+                sent += 1;
+            }
+        }
+        assert!(
+            sent >= 40 / usize::from(SURFACE_DRIFT_LEVELS + 1),
+            "a 40-level ramp published only {sent} times; the drift is not bounded"
+        );
+        assert!(
+            sent < 40,
+            "every step of the ramp was published; nothing was saved"
+        );
+        // And what it finished on is what is actually on screen.
+        assert!(
+            !published.accept(2, 2, &flat(2, 2, 40)),
+            "the ramp's last published raster was not the one it ended at"
+        );
+    }
+
+    /// A surface that changed size is a different image whatever its pixels
+    /// say, and there is nothing to compare it against.
+    #[test]
+    fn a_resize_always_publishes() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 10)));
+        assert!(published.accept(3, 2, &flat(3, 2, 10)));
+        assert!(published.accept(3, 3, &flat(3, 3, 10)));
+    }
+
+    /// Forgetting is what every path that takes the surface off the terminal
+    /// owes: the terminal is no longer showing this, so it must not be held
+    /// against the raster that puts it back.
+    #[test]
+    fn forgetting_republishes_identical_artwork() {
+        let mut published = PublishedSurfaceRaster::default();
+        assert!(published.accept(2, 2, &flat(2, 2, 10)));
+        assert!(!published.accept(2, 2, &flat(2, 2, 10)));
+        published.forget();
+        assert!(published.accept(2, 2, &flat(2, 2, 10)));
     }
 }
 
