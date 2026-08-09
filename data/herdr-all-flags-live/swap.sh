@@ -26,6 +26,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where the inline python blocks find swap_snapshot.py. Exported rather than
+# passed, because each block is a heredoc with its own argv.
+export SWAP_HELPERS="$HERE"
 OLD_BIN="${1:?usage: swap.sh <old-binary> <new-binary>}"
 NEW_BIN="${2:?usage: swap.sh <old-binary> <new-binary>}"
 ROOT="${SWAP_ROOT:-/tmp/hswap}"
@@ -153,11 +156,32 @@ snapshot_to() {
 compare_snapshots() {
   local before="$1" after="$2" phase="$3"
   python3 - "$before" "$after" "$phase" <<'PY'
-import json, sys
+import json, os, sys
 
-before = json.load(open(sys.argv[1]))
-after = json.load(open(sys.argv[2]))
+sys.path.insert(0, os.environ["SWAP_HELPERS"])
+from swap_snapshot import looks_like_snapshot, snapshot_of
+
 phase = sys.argv[3]
+before = snapshot_of(json.load(open(sys.argv[1])))
+after = snapshot_of(json.load(open(sys.argv[2])))
+
+# Fail at the read rather than downstream. An unwrap that returned the wrong
+# level yields a dict with none of these keys, and every comparison below then
+# comes back equal-and-empty — which is exactly how the previous version of this
+# script reported `swap OK` while every token had been dropped.
+for name, doc in (("before", before), ("after", after)):
+    if not looks_like_snapshot(doc):
+        print(
+            f"{phase}: the {name} snapshot does not have the shape of a "
+            f"SessionSnapshot (top-level keys: {sorted(doc)[:12] if isinstance(doc, dict) else type(doc).__name__}).",
+            file=sys.stderr,
+        )
+        print(
+            "`herdr api snapshot` prints the whole socket response and the snapshot "
+            "sits at .result.snapshot — see swap_snapshot.py.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
 
 def labels(doc):
@@ -262,7 +286,9 @@ run_with "$OLD_BIN" workspace create --label 2ndmate --cwd /tmp
 # the script empty ids and fail later somewhere unrelated.
 MATE_INFO=$(run_with "$OLD_BIN" api snapshot | python3 -c '
 import json, sys
-doc = json.load(sys.stdin)
+sys.path.insert(0, __import__("os").environ["SWAP_HELPERS"])
+from swap_snapshot import snapshot_of
+doc = snapshot_of(json.load(sys.stdin))
 ws = next((w for w in doc.get("workspaces", []) if w.get("label") == "2ndmate"), None)
 if ws is None:
     raise SystemExit("no workspace labelled 2ndmate in the snapshot")
@@ -280,8 +306,10 @@ run_with "$OLD_BIN" workspace report-metadata "$MATE_WS" --source swap --token o
 run_with "$OLD_BIN" pane split "$MATE_PANE" --direction down
 WORKER_PANE=$(run_with "$OLD_BIN" api snapshot | python3 -c '
 import json, sys
+sys.path.insert(0, __import__("os").environ["SWAP_HELPERS"])
+from swap_snapshot import snapshot_of
 wid = sys.argv[1] if len(sys.argv) > 1 else None
-doc = json.load(sys.stdin)
+doc = snapshot_of(json.load(sys.stdin))
 ids = sorted(p["pane_id"] for p in doc.get("panes", []) if p.get("workspace_id") == wid)
 if len(ids) < 2:
     raise SystemExit(f"expected a second pane in {wid}, got {ids}")
