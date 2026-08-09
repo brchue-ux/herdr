@@ -11,8 +11,16 @@ and colours breathe continuously by design. So the digest deliberately keeps
 only what a layout change would move and a repaint would not:
 
   * placement geometry — the (cols, rows, width_px, height_px) of every card
-    placement, as a sorted multiset. This is the tree's layout: a card's rank is
-    carried by its width, its tier by its height. #67 lives here.
+    placement, as a sorted set of the *distinct* geometries. This is the tree's
+    layout: a card's rank is carried by its width, its tier by its height. #67
+    lives here.
+
+    Distinct, not a multiset, and that was measured rather than chosen. A card is
+    re-placed on every frame it changes on, so the number of repeats is a count of
+    frames the capture happened to contain, not a fact about the tree: two
+    captures of one unchanged fleet came back with 93 and 106 placements of the
+    same six geometries. Keeping the repeats made the digest unreproducible
+    against itself, which no committed baseline could survive.
   * the decoded character grid, with trailing blanks stripped, cropped to the
     sidebar's own columns (`DIGEST_GRID_COLS`). Under the pixel path most card
     cells are covered by images, so this mostly pins the connectors, the rails
@@ -65,10 +73,10 @@ def digest(capture_path: str, grid_path: str) -> str:
                 (keys.get("c", ""), keys.get("r", ""), keys.get("w", ""), keys.get("h", ""))
             )
 
-    lines = ["# placement geometry (cols,rows,width_px,height_px), sorted multiset"]
-    for p in sorted(placements):
+    lines = ["# placement geometry (cols,rows,width_px,height_px), distinct, sorted"]
+    for p in sorted(set(placements)):
         lines.append("placement " + ",".join(p))
-    lines.append(f"placement_count {len(placements)}")
+    lines.append(f"distinct_placements {len(set(placements))}")
     lines.append("# wire capability")
     lines.append("formats " + ",".join(sorted(formats)))
     lines.append("transports " + ",".join(sorted(transports)))
