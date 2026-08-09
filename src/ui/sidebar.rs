@@ -7706,8 +7706,11 @@ rows = [[{ token = "$hype", fg = "#abcdef", bold = true, dim = false }, "workspa
 
     #[test]
     fn pulse_emphasis_ramps_the_token_color_toward_the_panel_background() {
-        // The pulse loops over 1600ms, so its trough is half of that in.
-        const HALF_CYCLE_MS: u64 = 800;
+        // The pulse loops over `DEFAULT_PERIOD`, so its trough is half of that
+        // in. Stated as a literal because that is what the assertions below are
+        // about — a pulse whose period moved is a pulse whose trough moved with
+        // it, and the two have to be read off the same number.
+        const HALF_CYCLE_MS: u64 = 1_120;
         let pulse = r##"{ token = "$dot", fg = "#a6e3a1", emphasis = "pulse" }"##;
         let (peak, app) = render_styled_space_token(pulse, 0);
         let (trough, _) = render_styled_space_token(pulse, HALF_CYCLE_MS);

@@ -500,9 +500,9 @@ A whole sidebar row can animate as it appears and as it leaves:
 ```toml
 [ui.sidebar.animation]
 row_enter = "wipe"
-row_enter_ms = 320
+row_enter_ms = 448
 row_exit = "wipe"
-row_exit_ms = 220
+row_exit_ms = 308
 ```
 
 `row_enter` takes any of the behaviour names above and defaults to `none`, which is how rows have always appeared: fully drawn on their first frame. `row_enter_ms` is clamped to 60–1500 ms. A row's arrival always wins over its tokens' own `emphasis`, so a token cannot start shimmering while the row under it is still arriving.
@@ -534,7 +534,7 @@ With `kitty_graphics` or `sidebar_card_shapes` off, or with no proportional font
 
 ### How smooth the movement is
 
-Motion is quantised to **whole cell rows**, and it resolves at the panel's own 50 ms animation step. On a 9×18 px cell a row of vertical travel is about 72 px taken in four 18 px steps, so the movement reads as stepped rather than as a glide. `row_enter_ms` is effectively a frame count — 320 ms is about six frames — but past roughly 500 ms it is the cell grid, not the frame rate, that limits how many distinct positions a card can occupy.
+Motion is quantised to **whole cell rows**, and it resolves at the panel's own 50 ms animation step. On a 9×18 px cell a row of vertical travel is about 72 px taken in four 18 px steps, so the movement reads as stepped rather than as a glide. `row_enter_ms` is effectively a frame count — the default 448 ms is about nine frames — but past roughly 500 ms it is the cell grid, not the frame rate, that limits how many distinct positions a card can occupy.
 
 Making it smooth needs two things this release does not have: sub-cell pixel placement, and a finer frame tier than the 50 ms step. Both are needed together — extra frames alone land on the same handful of cell rows. And once a card can sit at a fraction of a cell, the tree's branch lines cannot follow it, because a character occupies a whole cell row and there is no half-row position for `├─` or `│`. Smooth movement therefore also requires the trunk and branches to be drawn as pixel artwork rather than as characters. That is a known, measured boundary and the next piece of work, not an oversight — the measurements are in `data/herdr-row-slide-reflow/subcell-test/RESULT.md`.
 
@@ -547,7 +547,7 @@ Eight fixed slots on the row above the Spaces tree, saying what the fleet is wai
 enabled = true
 emphasis = "pulse"
 enter = "fade"
-enter_ms = 220
+enter_ms = 308
 ```
 
 The eight, in the order they always draw:
@@ -668,13 +668,13 @@ Nothing slides. The view being left dematerializes where it is, the layout chang
 ```toml
 [ui.sidebar.animation]
 view_switch = "dissolve"
-view_switch_ms = 640
+view_switch_ms = 896
 view_switch_particles_per_cell = 0
 ```
 
 `view_switch` takes the same behaviour names as `row_enter`, and like `row_exit` the way out is that name played backwards — the view comes apart the way it formed. Unlike `row_enter` it is on by default, because re-rooting with no transition is a hard cut from one set of rows to another; `view_switch = "none"` restores that hard cut. `view_switch_ms` is how long *each half* takes, clamped to 60–1500 ms.
 
-The transition redraws every 50 ms, so `view_switch_ms` is really a frame count rather than a continuous dial: 640 ms is about thirteen frames each way, and anything under about 250 ms is four frames or fewer — one intermediate state on the way in, one on the way out, and a lot of hard edge.
+The transition redraws every 50 ms, so `view_switch_ms` is really a frame count rather than a continuous dial: the default 896 ms is about eighteen frames each way, and anything under about 250 ms is four frames or fewer — one intermediate state on the way in, one on the way out, and a lot of hard edge.
 
 ### Dissolving the pixel cards
 

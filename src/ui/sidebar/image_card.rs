@@ -1453,10 +1453,12 @@ const CHIP_SIDE_PAD: f32 = 0.55;
 
 /// The summary mark's side, as a multiple of the control rail's type size.
 ///
-/// One em. The mark stands in for a character the row would otherwise have set,
-/// so it is drawn at the size that character would have had — which is also
-/// what keeps it from competing with the count beside it.
-const SUMMARY_MARK_MUL: f32 = 1.0;
+/// Four fifths of an em. The mark stands in for a character the row would
+/// otherwise have set, so an em is where it started; it is drawn a fifth under
+/// that because at a full em it sat level with the count beside it and read as
+/// a second piece of type rather than as a mark. The count itself is unchanged,
+/// so the pair now has a size difference as well as a shape one.
+const SUMMARY_MARK_MUL: f32 = 0.80;
 
 /// The summary mark's corner radius, as a fraction of its own side.
 ///
@@ -1477,8 +1479,10 @@ const SUMMARY_COUNT_GAP_MUL: f32 = 0.26;
 ///
 /// Smaller than the mark, because `▸` is a small triangle in every face that
 /// carries it at all — drawn at a full em it would read as a second badge
-/// rather than as the disclosure control it is.
-const CHEVRON_MUL: f32 = 0.66;
+/// rather than as the disclosure control it is. Taken a further fifth down with
+/// the summary mark, so the two controls keep the proportion they were drawn at
+/// against each other.
+const CHEVRON_MUL: f32 = 0.53;
 
 /// How far the chevron's nose reaches across its own box.
 ///
@@ -7252,18 +7256,28 @@ mod a_card_is_its_own_shape {
             "a read summary looks the same as an unread one"
         );
 
-        // Brightest pixel each way: the fresh badge is drawn at the card's ink,
-        // the seen one mixed toward the card's own fill.
+        // Brightest well-covered pixel each way: the fresh badge is drawn at the
+        // card's ink, the seen one mixed toward the card's own fill.
+        //
+        // The coverage bar is half rather than near-opaque. The mark is drawn a
+        // fifth under the em it used to fill, and at the rail's real ~10 px type
+        // that is an eight-pixel box whose strokes and rules are now thin enough
+        // that antialiasing keeps every one of them off full opacity. That is a
+        // softer mark, which is the change; it is not a missing one, and this
+        // test is about the two badges' relative weight, not about either one's
+        // absolute coverage.
         let peak = |px: &[u8]| {
             (0..px.len() / 4)
-                .filter(|i| px[i * 4 + 3] > 200)
+                .filter(|i| px[i * 4 + 3] > 128)
                 .map(|i| u32::from(px[i * 4]) + u32::from(px[i * 4 + 1]) + u32::from(px[i * 4 + 2]))
                 .max()
                 .unwrap_or(0)
         };
         assert!(
             peak(&fresh) > peak(&seen),
-            "the read badge is not quieter than the unread one"
+            "the read badge is not quieter than the unread one: {} against {}",
+            peak(&fresh),
+            peak(&seen)
         );
     }
 

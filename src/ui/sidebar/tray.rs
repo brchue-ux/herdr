@@ -57,6 +57,16 @@ const MIN_TREE_ROWS: u16 = 6;
 /// The fewest columns one slot can be drawn in.
 const MIN_SLOT_COLS: u16 = 3;
 
+/// How much of its slot a badge is actually drawn at.
+///
+/// A fifth off the size the slot would allow. The slot geometry is unchanged —
+/// the tray still reserves the same cells, so the hit tests and the tier search
+/// are untouched — and the badge is simply drawn smaller inside it and stays
+/// centred by the offsets below. The badge art is described over a normalised
+/// box (`tray_art`'s `Pen`), so this shrinks the mark, its border and its
+/// halo together rather than cropping any of them.
+const BADGE_SCALE: f32 = 0.80;
+
 /// Which form the tray draws in.
 ///
 /// Ordered tallest first, which is also the order [`Tier::tallest_fitting`]
@@ -477,8 +487,10 @@ pub(crate) fn rasterise_scene(
         let slot_w = u32::from(slot.width) * cell_width;
         let slot_h = u32::from(slot.height) * cell_height;
         // Square, and inset so two badges never touch: the gap is what lets the
-        // eye count eight things rather than read one strip.
-        let size = slot_w.min(slot_h).saturating_sub(2);
+        // eye count eight things rather than read one strip. `BADGE_SCALE` then
+        // takes the badge off the slot it is centred in — see its own note.
+        let fitted = slot_w.min(slot_h).saturating_sub(2);
+        let size = ((fitted as f32) * BADGE_SCALE).round() as u32;
         if size == 0 {
             continue;
         }
