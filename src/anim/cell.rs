@@ -96,6 +96,15 @@ impl CellExtent {
     pub(crate) fn is_empty(self) -> bool {
         self.cols == 0 || self.rows == 0
     }
+
+    /// One cell, so there is no geometry for an effect to travel through.
+    ///
+    /// The distinction a reveal has to make: a behaviour whose whole idea is a
+    /// leading edge crossing the element has nothing to cross here, and has to
+    /// fall back on its own clock. See [`super::behaviour::Shape::Front`].
+    pub(crate) fn is_a_single_cell(self) -> bool {
+        self.cols <= 1 && self.rows <= 1
+    }
 }
 
 /// Attribute changes an animation makes to a cell.
