@@ -4710,6 +4710,13 @@ impl HeadlessServer {
         // one is the only path a real Herdr takes. Without it the tray falls
         // back to its character marks on every server-backed session — which is
         // every session — because nothing ever rasterises the badges.
+        // Before any shared artwork is rasterised: the cell it may be built
+        // against depends on every attached viewer, not only on whichever one
+        // is foreground at this instant. Ahead of `observe_signal_tray`
+        // deliberately — the tray's badges are the first surface this decides.
+        // See `AppState::every_app_viewer_shares_host_cell_size`.
+        self.app.state.every_app_viewer_shares_host_cell_size =
+            self.every_app_viewer_shares_host_cell_size();
         changed |= self
             .app
             .observe_signal_tray(now, self.every_app_viewer_rasterizes_signal_tray());
@@ -4733,14 +4740,6 @@ impl HeadlessServer {
             .any(ClientConnection::is_full_app_client)
     }
 
-    /// True when there is at least one client rendering the app and *every*
-    /// one of them draws the signal tray itself from a `ServerMessage::TrayScene`.
-    ///
-    /// The artwork is one image on `AppState`, shared by every viewer, so it
-    /// can only be left undrawn when nobody is left who would be sent it. With
-    /// no app viewers at all this is false: a tray rasterised for nobody is
-    /// wasted either way, and the honest reading of "they all draw it
-    /// themselves" needs at least one of them to exist.
     /// True when every client rendering the app runs on a terminal that draws
     /// an opaque ambient wash where Herdr places it.
     ///
@@ -4765,6 +4764,48 @@ impl HeadlessServer {
             .all(|client| client.host_terminal_kind.draws_ambient_wash())
     }
 
+    /// True when every client rendering the app measures its terminal cell the
+    /// same, so one raster can be right for all of them.
+    ///
+    /// The sizing sibling of [`Self::every_app_viewer_draws_ambient_wash`], and
+    /// the twin bug PR #101 named but did not fix. `AppState::host_cell_size`
+    /// is only the foreground client's, and the tray's badge artwork and both
+    /// washes are single images on shared state that every viewer is placed a
+    /// copy of — so the moment two viewers measure their cells differently,
+    /// whichever one is not foreground is handed pixels counted out against
+    /// somebody else's grid and shown a crop of them.
+    ///
+    /// Compares the cells as the connections already hold them, which is after
+    /// `ClientConnection::set_cell_size` has run each through
+    /// `HostCellSize::plausible_or_unknown`. That matters: a Windows client
+    /// over the remote bridge reports an arithmetic `3x7` that is replaced by
+    /// the fallback on the way in, so it agrees with a real `8x16` viewer and
+    /// this correctly stays true for that pair rather than withdrawing artwork
+    /// neither of them had a problem with.
+    ///
+    /// Vacuously true with no app viewers, exactly like its sibling and for the
+    /// same reason: this predicate only ever withdraws artwork, and with nobody
+    /// attached there is no viewer to withdraw it for.
+    fn every_app_viewer_shares_host_cell_size(&self) -> bool {
+        let mut cells = self
+            .clients
+            .values()
+            .filter(|client| client.is_full_app_client())
+            .map(ClientConnection::cell_size);
+        let Some(first) = cells.next() else {
+            return true;
+        };
+        cells.all(|cell| cell == first)
+    }
+
+    /// True when there is at least one client rendering the app and *every*
+    /// one of them draws the signal tray itself from a `ServerMessage::TrayScene`.
+    ///
+    /// The artwork is one image on `AppState`, shared by every viewer, so it
+    /// can only be left undrawn when nobody is left who would be sent it. With
+    /// no app viewers at all this is false: a tray rasterised for nobody is
+    /// wasted either way, and the honest reading of "they all draw it
+    /// themselves" needs at least one of them to exist.
     fn every_app_viewer_rasterizes_signal_tray(&self) -> bool {
         let mut viewers = self
             .clients
@@ -8924,6 +8965,194 @@ next_tab = ""
         assert!(
             server.app.state.background_scene_active(),
             "the wash must come back once the viewer it was withheld for has gone"
+        );
+    }
+
+    /// Shared artwork must not be rasterised against one client's cell while a
+    /// viewer that measures its cell differently is attached.
+    ///
+    /// The twin of the gate above, and the bug PR #101's own body named and
+    /// left: the tray's badges and both washes are single images on shared
+    /// `AppState` that every attached viewer is placed a copy of, but they were
+    /// sized from `AppState::host_cell_size` — the *foreground* client's cell.
+    ///
+    /// Measured on two real clients before this was fixed: an 8x16 viewer
+    /// attached beside a 16x32 foreground was transmitted the tray as a
+    /// 656x256px image — 82x16 of its own cells, for a surface 41x8 cells wide
+    /// — and told to place it with a 328x128 crop, so it drew one quarter of
+    /// the artwork stretched over the whole tray.
+    #[tokio::test]
+    async fn shared_artwork_is_not_sized_from_one_cell_while_a_viewer_measures_a_different_one() {
+        let mut server = test_headless_server();
+        server.app.state.kitty_graphics_enabled = true;
+
+        let client = |id: u64, width_px: u32, height_px: u32| {
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize {
+                    width_px,
+                    height_px,
+                },
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                id,
+                RenderEncoding::TerminalAnsi,
+                None,
+            )
+        };
+
+        // One viewer: its cell is the fleet's cell, exactly as before.
+        server.clients.insert(1, client(1, 8, 16));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert_eq!(
+            server.app.state.shared_raster_cell_size(),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 8,
+                height_px: 16
+            },
+            "a lone viewer's own cell must still size its artwork"
+        );
+
+        // A second viewer attaches on a different cell. The foreground cell has
+        // not changed, but no single raster can now be right for both of them.
+        server.clients.insert(2, client(2, 16, 32));
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert_eq!(
+            server.app.state.host_cell_size,
+            crate::kitty_graphics::HostCellSize {
+                width_px: 8,
+                height_px: 16
+            },
+            "the foreground client's cell is still what it was"
+        );
+        assert!(
+            !server.app.state.shared_raster_cell_size().is_known(),
+            "shared artwork was sized from the foreground cell and shipped to a \
+             viewer that measures a different one"
+        );
+
+        // And it stays withheld whichever window the mouse is in: promotion is
+        // what used to swap which client's grid everyone else was drawn for.
+        server.promote_client_to_foreground(2);
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert!(!server.app.state.shared_raster_cell_size().is_known());
+        server.promote_client_to_foreground(1);
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert!(
+            !server.app.state.shared_raster_cell_size().is_known(),
+            "promoting the other client back merely swapped whose grid was wrong"
+        );
+
+        // A third viewer that agrees with the foreground changes nothing: the
+        // fold is unanimity, not a majority.
+        server.clients.insert(3, client(3, 8, 16));
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert!(!server.app.state.shared_raster_cell_size().is_known());
+
+        // The odd viewer leaves: the fleet agrees again and artwork resumes.
+        server.clients.remove(&2);
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert_eq!(
+            server.app.state.shared_raster_cell_size(),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 8,
+                height_px: 16
+            },
+            "artwork must resume once the viewer it was withheld for has gone"
+        );
+    }
+
+    /// A cell that arrives implausible is normalised on the way in, so the
+    /// clients that report one still count as agreeing.
+    ///
+    /// This is the captain's own fleet: a Windows client over the `--remote`
+    /// bridge reports an arithmetic `3x7` that `HostCellSize::plausible_or_unknown`
+    /// replaces with the `8x16` fallback, and a local viewer reports a real
+    /// `8x16`. Folding the *reported* cells would have withdrawn the tray from
+    /// a pair that never had a sizing problem, so the fold has to read the
+    /// cells as the connections hold them.
+    #[tokio::test]
+    async fn viewers_agree_when_an_implausible_reported_cell_normalises_to_the_fallback() {
+        let mut server = test_headless_server();
+        server.app.state.kitty_graphics_enabled = true;
+
+        let client = |id: u64, width_px: u32, height_px: u32| {
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize {
+                    width_px,
+                    height_px,
+                },
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                id,
+                RenderEncoding::TerminalAnsi,
+                None,
+            )
+        };
+
+        // 3x7 is not a cell any font draws in; it is a stale pty pixel width
+        // divided by a wide column count. It becomes HostCellSize::FALLBACK.
+        server.clients.insert(2, client(2, 3, 7));
+        server.clients.insert(4, client(4, 8, 16));
+        server.foreground_client_id = Some(4);
+        server.sync_foreground_client_state();
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert!(
+            server.every_app_viewer_shares_host_cell_size(),
+            "an implausible reported cell is normalised before the fold sees it"
+        );
+        assert_eq!(
+            server.app.state.shared_raster_cell_size(),
+            crate::kitty_graphics::HostCellSize {
+                width_px: 8,
+                height_px: 16
+            }
+        );
+    }
+
+    /// A client whose own config has Kitty graphics off reports `0x0`, and an
+    /// unknown cell is not a disagreement about a known one — but it is also
+    /// not something a raster can be built against, so artwork still stops.
+    #[tokio::test]
+    async fn an_unknown_cell_beside_a_known_one_still_withholds_shared_artwork() {
+        let mut server = test_headless_server();
+        server.app.state.kitty_graphics_enabled = true;
+
+        let client = |id: u64, width_px: u32, height_px: u32| {
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize {
+                    width_px,
+                    height_px,
+                },
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                id,
+                RenderEncoding::TerminalAnsi,
+                None,
+            )
+        };
+
+        server.clients.insert(1, client(1, 8, 16));
+        server.clients.insert(2, client(2, 0, 0));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.app.state.every_app_viewer_shares_host_cell_size =
+            server.every_app_viewer_shares_host_cell_size();
+        assert!(
+            !server.app.state.shared_raster_cell_size().is_known(),
+            "a viewer with no measurable cell cannot be sent pixels counted \
+             out against another viewer's"
         );
     }
 
