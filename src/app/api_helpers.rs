@@ -429,6 +429,43 @@ pub(super) fn normalize_metadata_ttl(
     Ok(Some(std::time::Duration::from_millis(ttl_ms)))
 }
 
+/// The least of the value budget a word-boundary cut is allowed to keep.
+///
+/// A cut that lands on the last space is only an improvement while there *is*
+/// a late space to land on. A path, a hash or a URL over the cap has none, and
+/// backing off to the one space near the front would throw away most of a
+/// value to gain a tidy edge. Below this share the hard cut is the honest one.
+const METADATA_TOKEN_WORD_CUT_FLOOR: usize = MAX_METADATA_TOKEN_VALUE_LEN * 3 / 4;
+
+/// `value` clamped to [`MAX_METADATA_TOKEN_VALUE_LEN`], ending on a whole word.
+///
+/// # Why the cut moved off the character boundary
+///
+/// This was `.take(MAX_METADATA_TOKEN_VALUE_LEN)`, and the first thing anyone
+/// sees of it is a sidebar card reading *"…turned out to be two separa"*. The
+/// cap itself is not the problem — a display-only token has to be bounded — but
+/// *where* it cut was: a value sliced mid-word looks like a rendering bug in
+/// whatever is drawing it, and the card's own fitter cannot undo it, because by
+/// the time the card sees the token the rest of the word is gone.
+///
+/// The captain's rule for the card is that Herdr should be better about what it
+/// chooses to display; this is the earliest point at which it chooses anything,
+/// so it is the first place that rule applies. Every consumer gets the benefit
+/// — the tray, the badges and the API all read the same stored token.
+///
+/// Nothing is added: the result is always a prefix of the input.
+fn clamp_metadata_token_value(value: &str) -> String {
+    let mut clamped: String = value.chars().take(MAX_METADATA_TOKEN_VALUE_LEN).collect();
+    if clamped.chars().count() < value.chars().count() {
+        if let Some(space) = clamped.rfind(char::is_whitespace) {
+            if clamped[..space].chars().count() >= METADATA_TOKEN_WORD_CUT_FLOOR {
+                clamped.truncate(space);
+            }
+        }
+    }
+    clamped
+}
+
 pub(super) fn normalize_metadata_tokens(
     tokens: std::collections::HashMap<String, Option<String>>,
 ) -> Result<std::collections::HashMap<String, Option<String>>, String> {
@@ -453,12 +490,12 @@ pub(super) fn normalize_metadata_tokens(
                 return Err(format!("invalid metadata token key: {key}"));
             }
             let value = value.and_then(|value| {
-                let normalized = value
+                let cleaned = value
                     .trim()
                     .chars()
                     .filter(|ch| !ch.is_control())
-                    .take(MAX_METADATA_TOKEN_VALUE_LEN)
                     .collect::<String>();
+                let normalized = clamp_metadata_token_value(&cleaned);
                 (!normalized.trim().is_empty()).then(|| normalized.trim().to_string())
             });
             Ok((key, value))
@@ -500,5 +537,68 @@ mod metadata_token_tests {
             .map(|index| (format!("key{index}"), Some("value".into())))
             .collect();
         assert!(normalize_metadata_tokens(too_many).is_err());
+    }
+
+    /// An over-long value is still bounded, and no longer cut mid-word.
+    ///
+    /// The character cut is what put *"two separa"* on a sidebar card: the card
+    /// draws the token it was given, so a value sliced between two letters is a
+    /// defect no renderer downstream can repair.
+    #[test]
+    fn an_over_long_token_is_cut_between_words_and_not_inside_one() {
+        let published = "validating the FM_HOME anchor fix which turned out to be two \
+                         separate bugs and shipping the pull request";
+        let tokens = normalize_metadata_tokens(std::collections::HashMap::from([(
+            "doing".to_string(),
+            Some(published.to_string()),
+        )]))
+        .expect("a long value is clamped, not rejected");
+        let stored = tokens["doing"].as_deref().expect("the value survived");
+
+        assert!(stored.chars().count() <= MAX_METADATA_TOKEN_VALUE_LEN);
+        assert!(
+            published.starts_with(stored),
+            "{stored:?} is not a prefix of what was published"
+        );
+        assert!(
+            published[stored.len()..].starts_with(char::is_whitespace),
+            "{stored:?} ends part-way through a word"
+        );
+    }
+
+    /// A value with no late word boundary keeps the hard cut.
+    ///
+    /// A path or a hash over the cap has one space at best, near the front, and
+    /// backing off to it would throw away most of the value for a tidy edge.
+    #[test]
+    fn a_value_with_nowhere_to_break_is_still_cut_at_the_cap() {
+        for published in [
+            "a".repeat(MAX_METADATA_TOKEN_VALUE_LEN + 20),
+            format!("see {}", "x".repeat(MAX_METADATA_TOKEN_VALUE_LEN + 20)),
+        ] {
+            let tokens = normalize_metadata_tokens(std::collections::HashMap::from([(
+                "doing".to_string(),
+                Some(published.clone()),
+            )]))
+            .expect("a long value is clamped, not rejected");
+            let stored = tokens["doing"].as_deref().expect("the value survived");
+            assert_eq!(
+                stored.chars().count(),
+                MAX_METADATA_TOKEN_VALUE_LEN,
+                "{stored:?} gave up characters it had nowhere better to cut"
+            );
+        }
+    }
+
+    /// A value inside the cap is not touched at all.
+    #[test]
+    fn a_value_inside_the_cap_keeps_its_last_word() {
+        let published = "Validating FM_HOME anchor fix and ship PR";
+        let tokens = normalize_metadata_tokens(std::collections::HashMap::from([(
+            "doing".to_string(),
+            Some(published.to_string()),
+        )]))
+        .expect("a short value is kept");
+        assert_eq!(tokens["doing"].as_deref(), Some(published));
     }
 }
