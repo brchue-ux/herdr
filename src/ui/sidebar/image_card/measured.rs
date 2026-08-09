@@ -93,13 +93,47 @@ pub(super) const FILL_INNER_SIGMA: f32 = 0.09;
 /// measured only through the in-process render fixture, not yet a live
 /// terminal.
 ///
-/// Since confirmed: a real server on this build, driven through a real PTY
+/// Since confirmed twice, and the second one is the one the captain asked for.
+///
+/// First off the wire: a real server on this build, driven through a real PTY
 /// client at the captain's 42-column sidebar and a 10×21 px cell, decoding
 /// the actual `\x1b_G` Kitty graphics APC blocks off the wire (not the
 /// in-process PNG fixture) and compositing them source-over in linear light
 /// the way a terminal does. Two adjacent same-hued idle cards at the real
 /// 17 px ink-to-ink gap: the gutter's four centre rows read exactly the
 /// panel background, `(30, 30, 46)`, with zero measured excess.
+///
+/// Then on real pixels, which is what "zero" had never been checked against:
+/// a real kitty under Xvfb attached to a lab server on this build, at the same
+/// 42 columns and the same 10 × 21 px cell the server logs for that client —
+/// so the terminal decoded, scaled and composited the graphics itself. Nine
+/// same-hued idle cards, 48 gutters over six frames of the breath, measured
+/// off screenshots: every gutter row is **byte-identical to bare panel**, a
+/// Chebyshev excess of 0 on every channel. Not "0.0% by a ratio" — no pixel
+/// between two cards differs from the panel at all.
+///
+/// The same rig run against the glow this replaced (`BLOOM_SIGMA` 0.07 h, two
+/// lobes, peak 0.19) reads a Chebyshev excess of 21 in the same gutters, which
+/// is what makes the zero a measurement rather than a rig that cannot see
+/// bleed.
+///
+/// One caveat belongs with the number, because it decides whether it holds on
+/// a given host. The gutter is not a constant: `row_height_cells` rounds a
+/// card's wanted height *up* to whole cells and `place` centres the card in
+/// them, so the gap between two cards is the rounding leftover,
+/// `(-card_height_px).rem_euclid(cell_height)`. That is a property of the
+/// host's cell, not of this table, and it does not vary smoothly — at a 21 px
+/// cell it is 16 px and this field is past its reach there (Chebyshev 0), at
+/// 20 px it is 12 px (Chebyshev 3), and at 18 px the grid leaves only 4 px.
+/// In that last case the gutter's midpoint sits inside one sigma, and a hot
+/// narrow core is the wrong shape for it: measured on the same rig, wire-C
+/// reads *brighter* there than the dim wide glow it replaced, 49 against 40.
+///
+/// That is not a reason to widen this field again — it would give up the
+/// 21-to-0 win at the captain's own cell to improve a case that is already
+/// bad. Closing it means moving the gap itself, which is the `row_gap` lever
+/// the captain refused in `glow-narrower-field` to keep card density. His
+/// call, not a retune of this table.
 pub(super) const BLOOM_PEAK: f32 = 0.38;
 /// Gaussian sigma of the bloom's near lobe, as a fraction of the tier's
 /// **nominal** height — not the height the card is drawn at. See
