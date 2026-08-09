@@ -555,7 +555,11 @@ impl Animator {
     /// it already had. Only this family is reconciled, so subsystems sharing
     /// one engine cannot retire each other's elements.
     ///
-    /// `lifecycle` is used for elements this call brings into existence.
+    /// `lifecycle` is the life every published element has *right now*, not
+    /// only the one an arrival is born with: an element already tracked adopts
+    /// it too, keeping the clock of every behaviour it still declares. See
+    /// [`adopt_lifecycle`] for why a lifecycle pinned at creation left live
+    /// elements permanently unable to play a behaviour switched on after them.
     /// Returns whether anything a renderer draws changed.
     pub(crate) fn observe<I>(
         &mut self,
@@ -594,6 +598,10 @@ impl Animator {
         match self.elements.get_mut(&id) {
             Some(element) => {
                 element.inputs = inputs;
+                // Before the re-arrival check below, so a row coming back does
+                // so into the life its publisher declares this pass rather than
+                // into the one it happened to be born with.
+                let relifed = adopt_lifecycle(element, lifecycle, now);
                 // An element that reappears while it was leaving arrives again
                 // rather than resuming: it really did go away, and animating it
                 // back from where the exit had reached would be animating
@@ -605,7 +613,7 @@ impl Animator {
                     element.cycles.fill(0.0);
                     return true;
                 }
-                false
+                relifed
             }
             None => {
                 if self.elements.len() >= MAX_ELEMENTS {
@@ -898,6 +906,76 @@ fn opening_phase(lifecycle: &Lifecycle) -> Phase {
     } else {
         Phase::Idle
     }
+}
+
+/// Bring a tracked element onto the life its publisher declares now.
+///
+/// # Why a lifecycle cannot be pinned at creation
+///
+/// What an element is allowed to play is not a fact about the moment it
+/// appeared — it is read from config and from what the host turned out to be
+/// able to draw, and both of those move under a live element. A sidebar row is
+/// the case that exposed it: the card breath is only declared once
+/// `AppState::sidebar_card_animation_active` holds, which needs the Kitty
+/// capability probe answered, the client's cell size reported, and the
+/// `card breathing` setting on. Every one of those can arrive *after* the row
+/// does. With the lifecycle frozen at creation, the row kept a life with no
+/// `card-*` behaviour in it, so [`Lifecycle::idle_slot`] could not resolve the
+/// name the card renderer asked for, [`Animator::frame`] answered with no
+/// behaviour and zero progress, and the card was drawn at its settled light
+/// forever — artwork rasterised, encoded and delivered on every pass, and
+/// identical every time. Nothing downstream could tell that from a card that
+/// was simply configured still.
+///
+/// # What is carried across and what is not
+///
+/// A behaviour the element still declares keeps its accumulated phase, matched
+/// **by name** rather than by slot: gaining or losing one must not restart the
+/// ones either side of it, and it must not silently hand one behaviour's clock
+/// to another whose period and rate drive are different. A newly declared
+/// behaviour starts at the top of its own loop, which is where an effect being
+/// switched on belongs.
+///
+/// A *bounded* phase the new lifecycle no longer declares is ended here rather
+/// than left to [`Animator::advance`]: that walk needs the stage to read its
+/// duration from, so it breaks out when the stage is gone and would strand the
+/// element in an arrival that can never finish.
+///
+/// Returns whether anything about the element's life actually moved, so a pass
+/// that re-publishes an unchanged lifecycle — which is every pass — reports no
+/// change and cannot pin the render loop.
+fn adopt_lifecycle(element: &mut Element, lifecycle: &Lifecycle, now: Instant) -> bool {
+    if element.lifecycle == *lifecycle {
+        return false;
+    }
+    element.cycles = lifecycle
+        .idle
+        .iter()
+        .map(|name| {
+            element
+                .lifecycle
+                .idle
+                .iter()
+                .position(|declared| declared == name)
+                .and_then(|slot| element.cycles.get(slot).copied())
+                .unwrap_or(0.0)
+        })
+        .collect();
+    element.lifecycle = lifecycle.clone();
+    if element.phase.is_bounded() && element.lifecycle.stage(element.phase).is_none() {
+        element.phase = match element.phase {
+            Phase::Mount => Phase::Idle,
+            _ => Phase::Retired,
+        };
+        element.entered_at = now;
+        element.progress = 0.0;
+    }
+    // The element may have just moved onto a finer or coarser tier, and its
+    // recorded tick is counted on the old one. Clearing it makes the element
+    // due on the next pass, which is what starts a behaviour switched on now
+    // rather than at the end of whatever interval it used to owe.
+    element.last_frame_tick = None;
+    true
 }
 
 /// Returns whether this actually started a departure, so a caller can tell a
@@ -1288,6 +1366,145 @@ mod tests {
         );
         // And with no playable idle behaviour the loop goes back to sleep.
         assert_eq!(anim.next_deadline(now + Duration::from_millis(300)), None);
+    }
+
+    /// **A behaviour switched on after a row is on screen plays on that row.**
+    ///
+    /// What a sidebar row is allowed to animate is not settled at the moment it
+    /// appears: the card breath is only declared once the Kitty capability
+    /// probe has answered, the client has reported its cell size and the
+    /// `card breathing` setting is on, and each of those can land after the row
+    /// does. A lifecycle pinned at creation left the row unable to resolve the
+    /// name the card renderer asks for, so [`Animator::frame`] answered with no
+    /// behaviour and zero progress and the card was drawn at exactly its
+    /// settled light for the rest of the session — with its artwork still
+    /// rasterised, encoded and delivered on every pass, and identical every
+    /// time.
+    #[test]
+    fn a_behaviour_declared_after_an_element_exists_still_plays_on_it() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        let before = Lifecycle::still().with_idle(names::PULSE);
+        let after = before.clone().with_idle(names::SHIMMER);
+
+        anim.observe(now, Family::WorkspaceRow, &before, quiet(&["a"]));
+        assert!(
+            anim.frame(&row("a"), Some(names::SHIMMER))
+                .expect("live")
+                .behaviour
+                .is_none(),
+            "the fixture already declared the behaviour, so it proves nothing"
+        );
+
+        anim.observe(
+            now + Duration::from_millis(50),
+            Family::WorkspaceRow,
+            &after,
+            quiet(&["a"]),
+        );
+        let mut seen = Vec::new();
+        for step in 1..=40 {
+            anim.observe(
+                now + Duration::from_millis(50 + step * 50),
+                Family::WorkspaceRow,
+                &after,
+                quiet(&["a"]),
+            );
+            let frame = anim.frame(&row("a"), Some(names::SHIMMER)).expect("live");
+            assert!(
+                frame.behaviour.is_some(),
+                "the element never adopted the behaviour its publisher declared"
+            );
+            seen.push(frame.progress);
+        }
+        let hi = seen.iter().cloned().fold(f32::MIN, f32::max);
+        let lo = seen.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            hi - lo > 0.1,
+            "the behaviour resolved but never moved: it swung {:.4} over two seconds",
+            hi - lo
+        );
+    }
+
+    /// Adopting a life must not restart the behaviours it kept.
+    ///
+    /// Matched by name and not by slot: a row that gains one behaviour would
+    /// otherwise hand every later behaviour's accumulated phase to its
+    /// neighbour, which is a visible jump in an effect nobody touched.
+    #[test]
+    fn adopting_a_life_keeps_the_clock_of_every_behaviour_it_still_declares() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        let before = Lifecycle::still().with_idle(names::SHIMMER);
+        // The new behaviour is declared *ahead* of the one already running, so
+        // a slot-indexed carry would be caught rather than accidentally right.
+        let after = Lifecycle::still()
+            .with_idle(names::PULSE)
+            .with_idle(names::SHIMMER);
+
+        anim.observe(now, Family::WorkspaceRow, &before, quiet(&["a"]));
+        let at = now + Duration::from_millis(600);
+        anim.observe(at, Family::WorkspaceRow, &before, quiet(&["a"]));
+        let carried = anim
+            .frame(&row("a"), Some(names::SHIMMER))
+            .expect("live")
+            .progress;
+        assert!(
+            carried > 0.0,
+            "the fixture never ran the surviving behaviour"
+        );
+
+        anim.observe(at, Family::WorkspaceRow, &after, quiet(&["a"]));
+        assert_eq!(
+            anim.frame(&row("a"), Some(names::SHIMMER))
+                .expect("live")
+                .progress,
+            carried,
+            "an untouched behaviour was restarted by a sibling arriving"
+        );
+        let pulse = anim.frame(&row("a"), Some(names::PULSE)).expect("live");
+        assert!(
+            pulse.behaviour.is_some(),
+            "the newly declared behaviour never reached the element"
+        );
+        assert_eq!(
+            pulse.progress, 0.0,
+            "a behaviour switched on now must start at the top of its own loop"
+        );
+    }
+
+    /// An arrival that stops being configured while a row is inside it releases
+    /// that row instead of stranding it.
+    ///
+    /// [`Animator::advance`]'s bounded walk reads the stage to get its
+    /// duration, so a phase whose stage the new life no longer declares can
+    /// never end there — the row would hold its first arrival frame forever.
+    #[test]
+    fn an_arrival_that_stops_being_configured_cannot_strand_a_live_element() {
+        let now = Instant::now();
+        let mut anim = Animator::default();
+        let arriving = Lifecycle::still()
+            .with_mount(Stage::new(names::WIPE, Duration::from_secs(5)))
+            .with_idle(names::PULSE);
+
+        anim.observe(now, Family::WorkspaceRow, &arriving, quiet(&["a"]));
+        assert_eq!(
+            anim.frame(&row("a"), None).expect("live").phase,
+            Phase::Mount
+        );
+
+        let settled = Lifecycle::still().with_idle(names::PULSE);
+        anim.observe(
+            now + Duration::from_millis(100),
+            Family::WorkspaceRow,
+            &settled,
+            quiet(&["a"]),
+        );
+        assert_eq!(
+            anim.frame(&row("a"), None).expect("live").phase,
+            Phase::Idle,
+            "the row was left inside an arrival its life no longer has"
+        );
     }
 
     #[test]
