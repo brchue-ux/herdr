@@ -52,8 +52,16 @@ run_with() {
 }
 
 SRV_PID=""
+# Two ways out, because after a live handoff there is no pid to hold: the process
+# this script started has been replaced by one it never forked. Asking the socket
+# to stop is the only handle on that one, and without it the check leaves a live
+# server behind — the first real run did exactly that, and the runner reaped a
+# stray `herdr-swap-target` on its way out.
 cleanup() {
-  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null || true
+  if [ -n "$SRV_PID" ]; then
+    kill "$SRV_PID" 2>/dev/null || true
+  fi
+  run_with "$NEW_BIN" server stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
