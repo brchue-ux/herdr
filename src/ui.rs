@@ -283,7 +283,12 @@ fn update_sidebar_card_layers(
     sidebar_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> bool {
-    if !app.kitty_graphics_enabled {
+    // The host's answer to the capability probe as well as the user's opt-in:
+    // a pass that publishes layers is a pass whose character cards stand down
+    // (`image_card::shape_covers_row`), so publishing them where no client will
+    // be sent them draws the tree as bare connectors. See
+    // `AppState::host_paints_pixel_surfaces`.
+    if !app.host_paints_pixel_surfaces() {
         app.sidebar_card_layers.clear();
         return false;
     }

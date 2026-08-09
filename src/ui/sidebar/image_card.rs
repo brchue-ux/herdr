@@ -344,8 +344,13 @@ pub(crate) struct UndissolvedSheet(std::sync::Arc<Canvas>);
 /// Every caller reads this one function rather than re-deriving the conditions,
 /// because the layout and the renderer disagreeing about which path is live
 /// would put a pixel card over a row sized for characters.
+///
+/// The first term is [`AppState::host_paints_pixel_surfaces`] and not the config
+/// flag alone, for the same reason one level up: this predicate is half of
+/// [`shape_covers_row`], so a term it is missing that the delivery gate has is a
+/// term on which the character cards stand down for pixels nobody is sent.
 pub(crate) fn is_available(app: &AppState, fold_width: u16) -> bool {
-    app.kitty_graphics_enabled
+    app.host_paints_pixel_surfaces()
         && app.host_cell_size.is_known()
         && fold_width >= MIN_FOLD_WIDTH
         && card_face_available(app.sidebar_card_font.as_deref())
@@ -3745,6 +3750,11 @@ mod tests {
     pub(super) fn pixel_fleet_app() -> AppState {
         let mut app = fleet_app();
         app.kitty_graphics_enabled = true;
+        // The host answered the capability probe, which is the other half of
+        // `AppState::host_paints_pixel_surfaces` and so the other half of
+        // `is_available`. Without it this fixture is a host that draws
+        // character cards, and every pixel assertion below it passes vacuously.
+        app.kitty_graphics_capability_confirmed = true;
         app.host_cell_size = HostCellSize {
             width_px: 10,
             height_px: 21,
@@ -3793,6 +3803,7 @@ mod tests {
         );
 
         app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
         app.host_cell_size = HostCellSize {
             width_px: 10,
             height_px: 21,
@@ -3852,6 +3863,7 @@ mod tests {
         let character_cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
 
         app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
         app.host_cell_size = HostCellSize {
             width_px: 10,
             height_px: 21,
@@ -6651,6 +6663,72 @@ mod a_card_is_its_own_shape {
             bytes.is_empty() && second.is_empty(),
             "a client that drew its character cards was sent the shapes too, \
              which doubles every border, chip and title a few pixels off"
+        );
+    }
+
+    /// A host that never answered the capability probe keeps its character
+    /// cards.
+    ///
+    /// The tree's half of the gap PR #101 named: `shape_covers_row` and the
+    /// delivery gate were spelled from different conditions, and
+    /// `kitty_graphics_capability_confirmed` was in one and not the other. On
+    /// every terminal without Kitty Graphics Protocol support — which never
+    /// answers the probe, so this is a permanent state and not a startup race —
+    /// `update_sidebar_card_layers` published shapes, the character cards stood
+    /// down for them, and `server::headless` encoded no graphics at all. The
+    /// tree drew as bare connectors: exactly the failure
+    /// `a_client_that_is_sent_no_images_keeps_its_character_cards` guards on the
+    /// per-client axis, arrived at on the per-host one.
+    #[test]
+    fn a_host_that_never_confirmed_graphics_keeps_its_character_cards() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        // The control: a confirmed host draws shapes and suppresses characters,
+        // so the assertions below are about the capability and not about this
+        // machine having no face.
+        let mut confirmed = shape_fleet_app();
+        let Some(fold) = shape_pass(&mut confirmed, &runtimes) else {
+            return; // No face on this machine.
+        };
+        assert!(shape_covers_row(&confirmed, fold));
+
+        let mut app = shape_fleet_app();
+        app.kitty_graphics_capability_confirmed = false;
+        assert!(
+            app.kitty_graphics_enabled && app.host_cell_size.is_known(),
+            "the opt-in and the cell are what make this the interesting state"
+        );
+        assert!(
+            shape_pass(&mut app, &runtimes).is_none(),
+            "shapes were published for a host no delivery gate will send them to"
+        );
+
+        let fold = super::super::row_fold_width(&app, app.view.sidebar_rect);
+        assert!(
+            !is_available(&app, fold),
+            "the pixel path claimed to be live on a host that never confirmed it"
+        );
+        assert!(
+            !shape_covers_row(&app, fold),
+            "the character cards were suppressed on a host that is sent no \
+             images, which draws the tree as bare connectors"
+        );
+
+        // And the encode side agrees, which is what makes this one fact rather
+        // than two that happen to match: nothing is withheld from a pass that
+        // never published.
+        let mut cache = crate::kitty_graphics::HostGraphicsCache::default();
+        let bytes = crate::kitty_graphics::encode_local_pane_graphics(
+            &app,
+            &runtimes,
+            app.view.tab_surface(),
+            app.host_cell_size,
+            &mut cache,
+            crate::kitty_graphics::EmbeddedSurfaces::ALL,
+        );
+        assert!(
+            bytes.is_empty() && cache.is_empty(),
+            "a host that drew its character cards had card graphics encoded for it"
         );
     }
 
