@@ -283,6 +283,40 @@ fn desktop_tab_bar_and_terminal_area(
 /// character renderer draws the tree's connectors at the cells the placement
 /// actually used rather than deriving a second answer — see
 /// `crate::app::state::WorkspaceCardArea::motion_cells`.
+/// Whether this pass's overlay reaches any row the tree would draw a pixel card
+/// over.
+///
+/// The test is against each row's own card frame rather than against the
+/// sidebar column, because the two menus that open *inside* the panel — the
+/// global launcher and a Space's context menu — normally sit well below the
+/// last card, and falling back to character cards for them would flip the whole
+/// tree's art on every click that changed nothing about it. A frame is grown by
+/// one cell on each side so a card's bloom, which reaches past its own box, is
+/// counted too.
+fn overlay_hides_sidebar_cards(
+    app: &AppState,
+    cards: &[crate::app::state::WorkspaceCardArea],
+) -> bool {
+    let occlusion = overlay_occlusion(app);
+    match occlusion {
+        OverlayOcclusion::None => false,
+        OverlayOcclusion::Screen => true,
+        OverlayOcclusion::Panel(_) => {
+            cards
+                .iter()
+                .filter_map(|card| card.card_frame)
+                .any(|frame| {
+                    occlusion.hides(Rect::new(
+                        frame.x.saturating_sub(1),
+                        frame.y.saturating_sub(1),
+                        frame.width.saturating_add(2),
+                        frame.height.saturating_add(2),
+                    ))
+                })
+        }
+    }
+}
+
 fn update_sidebar_card_layers(
     app: &mut AppState,
     cards: &mut [crate::app::state::WorkspaceCardArea],
@@ -305,6 +339,18 @@ fn update_sidebar_card_layers(
         // exactly as they are rather than clearing artwork this pass has no way
         // to redraw, which would make every background frame cost the
         // foreground one a re-encode and a re-upload.
+        return false;
+    }
+    // An overlay reaching into the tree takes the cards it covers off the host
+    // terminal (`OverlayOcclusion`), and a card that is not placed must not
+    // stand its character card down — that is the whole of the "rows vanish on
+    // a menu click" defect. Answering `false` puts the characters back for
+    // exactly the passes whose artwork the overlay is going to withhold.
+    //
+    // The layers are left alone rather than cleared, for the reason the cell
+    // check above leaves them alone: this pass cannot redraw them, and dropping
+    // them would make closing the menu cost a full re-raster of the tree.
+    if overlay_hides_sidebar_cards(app, cards) {
         return false;
     }
     let build = sidebar::image_card::build_cards(
@@ -747,6 +793,123 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
         && b.x < a.x.saturating_add(a.width)
         && a.y < b.y.saturating_add(b.height)
         && b.y < a.y.saturating_add(a.height)
+}
+
+/// What the current mode's overlay is painting over, and therefore where a
+/// Kitty graphics surface may not be placed this pass.
+///
+/// # Why a surface has to stand down for an overlay at all
+///
+/// A Kitty image at `z = 0` composites *above* the cell text, so an image left
+/// on screen under an open menu draws over the menu rather than under it. That
+/// is why [`crate::kitty_graphics::encode_local_pane_graphics`] has withheld
+/// graphics outside [`Mode::Terminal`] since the first commit that drew pane
+/// images.
+///
+/// # Why it is a rect and not a bool
+///
+/// That gate was written when a pane image was the only graphics surface there
+/// was. The sidebar's pixel cards, the notification tray's badges and the
+/// background scenes joined the same placement list later and inherited a rule
+/// that was never about them — so opening a five-row menu in the sidebar
+/// footer, or merely pressing the prefix key for a one-row bar under the panes,
+/// deleted every card and every badge on the panel. The card and tray
+/// *characters* stand down for artwork that is coming
+/// ([`sidebar::image_card::shape_covers_row`], `sidebar::tray`'s
+/// `artwork_covers_grid`), so what the user saw was not a fallback but bare
+/// tree rails: rows dropping out of the sidebar on a click that destroyed
+/// nothing.
+///
+/// Naming the overlay's own box instead answers the question the gate was
+/// really asking — *would this image be drawn over the overlay?* — for exactly
+/// the cells the overlay owns, and leaves every other surface where it is.
+///
+/// # Keeping this in step with [`render`]
+///
+/// One arm per mode, matched exhaustively and with no wildcard, against the
+/// same dispatch `render` uses. A mode whose overlay this cannot bound answers
+/// [`OverlayOcclusion::Screen`], which is exactly the old behaviour — so the
+/// safe answer is also the default, and a new mode that is added to `render`
+/// without being classified here fails to compile rather than silently
+/// blanking the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayOcclusion {
+    /// Nothing is overlaid: every surface is placed.
+    None,
+    /// A bounded panel. Only a surface reaching into it stands down.
+    Panel(Rect),
+    /// An overlay whose painted extent this cannot name, so nothing is placed.
+    Screen,
+}
+
+impl OverlayOcclusion {
+    /// Whether a surface drawn over `area` would land on this pass's overlay.
+    pub(crate) fn hides(self, area: Rect) -> bool {
+        match self {
+            Self::None => false,
+            Self::Screen => true,
+            Self::Panel(panel) => rects_overlap(panel, area),
+        }
+    }
+}
+
+/// The one-row bar `render` draws for the prefix/copy/resize/navigate modes,
+/// read off the same two rects that decide it there.
+fn mode_bar_rect(app: &AppState) -> Rect {
+    let area = if app.view.layout == ViewLayout::Desktop
+        && app.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
+        && app.view.tab_bar_rect.height > 0
+    {
+        app.view.tab_bar_rect
+    } else {
+        app.view.terminal_area
+    };
+    if area.height == 0 {
+        return Rect::default();
+    }
+    Rect::new(area.x, area.y + area.height - 1, area.width, 1)
+}
+
+/// See [`OverlayOcclusion`].
+pub(crate) fn overlay_occlusion(app: &AppState) -> OverlayOcclusion {
+    match app.mode {
+        Mode::Terminal => OverlayOcclusion::None,
+        // The bottom bars: one row of `mode_bar_area`, nowhere near the panel.
+        Mode::Prefix | Mode::Copy | Mode::Resize => OverlayOcclusion::Panel(mode_bar_rect(app)),
+        // Mobile navigate is the whole panel; desktop navigate is the bar.
+        Mode::Navigate if app.view.layout == ViewLayout::Mobile => OverlayOcclusion::Screen,
+        Mode::Navigate => OverlayOcclusion::Panel(mode_bar_rect(app)),
+        Mode::ContextMenu => app
+            .context_menu_rect()
+            .map_or(OverlayOcclusion::Screen, OverlayOcclusion::Panel),
+        Mode::GlobalMenu => OverlayOcclusion::Panel(app.global_menu_rect()),
+        // The popover is anchored *above* the tray on purpose — its own doc:
+        // "never over it: the badges have to stay visible" — which the blanket
+        // gate made untrue the moment a badge was clicked.
+        Mode::SignalTray => self::signal_tray_popup::view(app)
+            .map_or(OverlayOcclusion::Screen, |view| {
+                OverlayOcclusion::Panel(view.outer)
+            }),
+        Mode::WorkerSummaries => {
+            self::worker_summary::worker_summaries_popup_rect(app.screen_rect())
+                .map_or(OverlayOcclusion::Screen, OverlayOcclusion::Panel)
+        }
+        // Everything else keeps the blanket answer: a full-screen overlay, a
+        // dimmed backdrop, or a dialog drawing more than one box.
+        Mode::ConfirmClose
+        | Mode::ConfirmRemoveWorktree
+        | Mode::RenameWorkspace
+        | Mode::RenameTab
+        | Mode::RenamePane
+        | Mode::NewLinkedWorktree
+        | Mode::OpenExistingWorktree
+        | Mode::Settings
+        | Mode::Onboarding
+        | Mode::ReleaseNotes
+        | Mode::ProductAnnouncement
+        | Mode::KeybindHelp
+        | Mode::Navigator => OverlayOcclusion::Screen,
+    }
 }
 
 fn dim_background(frame: &mut Frame, area: Rect) {

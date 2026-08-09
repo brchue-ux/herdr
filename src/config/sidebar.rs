@@ -857,7 +857,7 @@ pub struct SidebarConfig {
 }
 
 /// How long a state wash takes to cross a card, in milliseconds.
-const DEFAULT_CARD_WASH_MS: u64 = 520;
+const DEFAULT_CARD_WASH_MS: u64 = 728;
 
 /// Bounds on a configured wash. Below the floor a sweep cannot resolve as a
 /// sweep at any frame tier; above the ceiling a card spends longer announcing a
@@ -949,7 +949,7 @@ impl SidebarCardsConfig {
 
 /// How long a signal's arrival runs. Short: an alert lighting up is news, and
 /// news that takes half a second to become readable is late news.
-const DEFAULT_SIGNAL_ENTER_MS: u64 = 220;
+const DEFAULT_SIGNAL_ENTER_MS: u64 = 308;
 
 /// The always-present bar of fleet signals above the tree.
 ///
@@ -1074,7 +1074,7 @@ impl Default for SidebarSignalTrayConfig {
 ///
 /// Short enough that a row is readable almost immediately, long enough that the
 /// arrival is a movement rather than a flicker.
-const DEFAULT_ROW_ENTER_MS: u64 = 320;
+const DEFAULT_ROW_ENTER_MS: u64 = 448;
 /// Bounds on a configured arrival. A publisher of config cannot make a row
 /// unreadable for a second and a half, and cannot ask for a duration too short
 /// to resolve a single frame.
@@ -1085,7 +1085,7 @@ const MAX_ROW_ENTER_MS: u64 = 1_500;
 ///
 /// Shorter than the arrival on purpose: an arrival is introducing something the
 /// eye has to find, a departure is releasing something it has already read.
-const DEFAULT_ROW_EXIT_MS: u64 = 220;
+const DEFAULT_ROW_EXIT_MS: u64 = 308;
 
 /// How long each half of a tree view switch takes by default.
 ///
@@ -1102,9 +1102,12 @@ const DEFAULT_ROW_EXIT_MS: u64 = 220;
 /// is one intermediate state on the way in, one on the way out, and a lot of
 /// hard edge. At 640 ms a half is twelve or thirteen frames, which is where a
 /// dissolve stops reading as a flicker and starts reading as a thing coming
-/// apart — and it is still under two thirds of a second each way, so drilling
-/// into a mate is still a navigation rather than a wait.
-const DEFAULT_VIEW_SWITCH_MS: u64 = 640;
+/// apart — and it is still under a second each way, so drilling into a mate is
+/// still a navigation rather than a wait.
+///
+/// The 640 ms that reasoning arrived at was then taken to 896 ms with every
+/// other cycle in the panel, when the whole of it was slowed by two fifths.
+const DEFAULT_VIEW_SWITCH_MS: u64 = 896;
 const MIN_VIEW_SWITCH_MS: u64 = 60;
 const MAX_VIEW_SWITCH_MS: u64 = 1_500;
 

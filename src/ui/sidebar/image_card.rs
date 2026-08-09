@@ -1453,10 +1453,12 @@ const CHIP_SIDE_PAD: f32 = 0.55;
 
 /// The summary mark's side, as a multiple of the control rail's type size.
 ///
-/// One em. The mark stands in for a character the row would otherwise have set,
-/// so it is drawn at the size that character would have had — which is also
-/// what keeps it from competing with the count beside it.
-const SUMMARY_MARK_MUL: f32 = 1.0;
+/// Four fifths of an em. The mark stands in for a character the row would
+/// otherwise have set, so an em is where it started; it is drawn a fifth under
+/// that because at a full em it sat level with the count beside it and read as
+/// a second piece of type rather than as a mark. The count itself is unchanged,
+/// so the pair now has a size difference as well as a shape one.
+const SUMMARY_MARK_MUL: f32 = 0.80;
 
 /// The summary mark's corner radius, as a fraction of its own side.
 ///
@@ -1477,8 +1479,10 @@ const SUMMARY_COUNT_GAP_MUL: f32 = 0.26;
 ///
 /// Smaller than the mark, because `▸` is a small triangle in every face that
 /// carries it at all — drawn at a full em it would read as a second badge
-/// rather than as the disclosure control it is.
-const CHEVRON_MUL: f32 = 0.66;
+/// rather than as the disclosure control it is. Taken a further fifth down with
+/// the summary mark, so the two controls keep the proportion they were drawn at
+/// against each other.
+const CHEVRON_MUL: f32 = 0.53;
 
 /// How far the chevron's nose reaches across its own box.
 ///
@@ -6736,6 +6740,95 @@ mod a_card_is_its_own_shape {
             .then(|| super::super::row_fold_width(app, app.view.sidebar_rect))
     }
 
+    /// A menu opened on the tree puts the character cards back; one opened
+    /// clear of it leaves the pixel cards exactly where they are.
+    ///
+    /// This is the "rows vanish on a menu click" defect, from the publication
+    /// side. A Kitty image composites above the cell text, so an open overlay
+    /// takes the artwork under it off the terminal — and the character cards
+    /// stood down for artwork that pass was no longer going to place
+    /// ([`shape_covers_row`]), leaving bare tree rails where every row had been.
+    ///
+    /// One test rather than two because either half alone is satisfied by a
+    /// wrong rule: standing down for *every* overlay is safe but flips the whole
+    /// tree's art on a menu that changed nothing about it, and standing down for
+    /// none of them is the defect.
+    #[test]
+    fn an_overlay_on_the_tree_stands_the_pixel_cards_down_and_one_clear_of_it_does_not() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut app = shape_fleet_app();
+        // Stated rather than inherited: `AppState::test_new` starts in
+        // `Mode::Navigate`, and this test is about what a mode's overlay does.
+        app.mode = crate::app::Mode::Terminal;
+        if shape_pass(&mut app, &runtimes).is_none() {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        }
+        assert!(
+            app.view.sidebar_card_layers_published,
+            "the resting pass published no cards, so this tests nothing"
+        );
+        let published_layers = app.sidebar_card_layers.len();
+        let tree_bottom = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .filter_map(|card| card.card_frame)
+            .map(|frame| frame.y + frame.height)
+            .max()
+            .expect("the tree drew no card frames");
+
+        let open_menu_at = |app: &mut AppState, y: u16| {
+            app.mode = crate::app::Mode::ContextMenu;
+            app.context_menu = Some(crate::app::state::ContextMenuState {
+                kind: crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+                x: 1,
+                y,
+                list: crate::app::state::MenuListState::new(0),
+            });
+        };
+
+        // Below the last card: the tree is untouched and keeps its artwork.
+        open_menu_at(&mut app, tree_bottom + 2);
+        shape_pass(&mut app, &runtimes);
+        assert!(
+            app.view.sidebar_card_layers_published,
+            "a menu clear of the tree flipped it back to character cards"
+        );
+
+        // On the first card: the artwork will not be placed, so the characters
+        // have to be there instead.
+        open_menu_at(&mut app, 1);
+        shape_pass(&mut app, &runtimes);
+        assert!(
+            !app.view.sidebar_card_layers_published,
+            "a menu drawn over the tree left the character cards stood down, \
+             so those rows render as bare rails"
+        );
+        assert!(
+            !shape_covers_row(
+                &app,
+                super::super::row_fold_width(&app, app.view.sidebar_rect)
+            ),
+            "the row still believes a shape is covering it"
+        );
+        assert_eq!(
+            app.sidebar_card_layers.len(),
+            published_layers,
+            "the artwork was dropped rather than merely withheld, so closing \
+             the menu costs the whole tree a re-raster"
+        );
+
+        // And closing it puts the pixel cards straight back.
+        app.mode = crate::app::Mode::Terminal;
+        app.context_menu = None;
+        shape_pass(&mut app, &runtimes);
+        assert!(
+            app.view.sidebar_card_layers_published,
+            "the tree did not come back when the menu closed"
+        );
+    }
+
     /// A `CardScene` built from a real fleet survives an encode/decode round
     /// trip byte-for-byte — the contract `ServerMessage::CardScene` rests on,
     /// checked without a live terminal or a connected client on either end.
@@ -7163,18 +7256,28 @@ mod a_card_is_its_own_shape {
             "a read summary looks the same as an unread one"
         );
 
-        // Brightest pixel each way: the fresh badge is drawn at the card's ink,
-        // the seen one mixed toward the card's own fill.
+        // Brightest well-covered pixel each way: the fresh badge is drawn at the
+        // card's ink, the seen one mixed toward the card's own fill.
+        //
+        // The coverage bar is half rather than near-opaque. The mark is drawn a
+        // fifth under the em it used to fill, and at the rail's real ~10 px type
+        // that is an eight-pixel box whose strokes and rules are now thin enough
+        // that antialiasing keeps every one of them off full opacity. That is a
+        // softer mark, which is the change; it is not a missing one, and this
+        // test is about the two badges' relative weight, not about either one's
+        // absolute coverage.
         let peak = |px: &[u8]| {
             (0..px.len() / 4)
-                .filter(|i| px[i * 4 + 3] > 200)
+                .filter(|i| px[i * 4 + 3] > 128)
                 .map(|i| u32::from(px[i * 4]) + u32::from(px[i * 4 + 1]) + u32::from(px[i * 4 + 2]))
                 .max()
                 .unwrap_or(0)
         };
         assert!(
             peak(&fresh) > peak(&seen),
-            "the read badge is not quieter than the unread one"
+            "the read badge is not quieter than the unread one: {} against {}",
+            peak(&fresh),
+            peak(&seen)
         );
     }
 

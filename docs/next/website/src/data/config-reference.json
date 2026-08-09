@@ -818,7 +818,7 @@
         {
           "key": "ui.sidebar.animation.row_enter_ms",
           "type": "integer",
-          "default": "320",
+          "default": "448",
           "description": "How long a configured row arrival takes, in milliseconds. Clamped to 60-1500."
         },
         {
@@ -844,7 +844,7 @@
         {
           "key": "ui.sidebar.animation.row_exit_ms",
           "type": "integer",
-          "default": "220",
+          "default": "308",
           "description": "How long a configured row departure takes, in milliseconds. Clamped to 60-1500."
         },
         {
@@ -880,7 +880,7 @@
         {
           "key": "ui.sidebar.animation.view_switch_ms",
           "type": "integer",
-          "default": "640",
+          "default": "896",
           "description": "How long each half of a tree view switch takes, in milliseconds. The view being left dematerializes for this long, the new root is adopted at the instant nothing is on screen, and the view being arrived at materializes for the same again. The transition redraws every 50 ms, so this is really a frame count: 640 ms is about thirteen frames each way. Clamped to 60-1500."
         },
         {
@@ -938,7 +938,7 @@
         {
           "key": "ui.sidebar.notifications.enter_ms",
           "type": "integer",
-          "default": "220",
+          "default": "308",
           "description": "How long a signal slot's arrival takes, in milliseconds. Clamped to 60-1500."
         },
         {
@@ -974,7 +974,7 @@
         {
           "key": "ui.sidebar.cards.wash_ms",
           "type": "integer",
-          "default": "520",
+          "default": "728",
           "description": "How long a state wash takes to cross a card, in milliseconds. Clamped to 120-2000."
         },
         {
