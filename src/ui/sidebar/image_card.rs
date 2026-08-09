@@ -135,10 +135,11 @@ pub(crate) const MIN_FOLD_WIDTH: u16 = super::card::MIN_FOLD_WIDTH;
 
 /// The smallest amount [`lay_bloom`] will paint.
 ///
-/// Below this a bloom pixel cannot move an 8-bit channel: the peak amount is
-/// [`measured::BLOOM_PEAK`] = 0.19 and it carries about +33 levels over the
-/// canvas, so 0.002 is roughly a third of one level. It is also the number
-/// [`BLOOM_REACH_SIGMAS`] is derived from — see there.
+/// Below this a bloom pixel cannot move an 8-bit channel: an amount of 1.0 is
+/// the stroke's own excess over the canvas, about 173 levels, so the peak
+/// amount [`measured::BLOOM_PEAK`] = 0.38 carries about +66 levels and 0.002 is
+/// roughly a third of one level. It is also the number [`BLOOM_REACH_SIGMAS`]
+/// is derived from — see there.
 const BLOOM_PAINT_FLOOR: f32 = 0.002;
 
 /// A card's bloom is carried this many sigmas past its stroke, and truncated
@@ -184,14 +185,24 @@ const BLOOM_PAINT_FLOOR: f32 = 0.002;
 /// which truncating can remove nothing that would have been drawn. Both the
 /// floor and [`measured::BLOOM_PEAK`] are absolute, so that distance is a
 /// property of the profile's *shape* alone: the same number of sigmas on every
-/// tier, at every cell size, on every card. For the two-lobe field this draws it
-/// is **3.64 σ**; 3.7 rounds up so the cut sits under the floor rather than on
-/// it.
+/// tier, at every cell size, on every card.
+///
+/// Being a count of sigmas is what let the field be narrowed without touching
+/// this: [`measured::BLOOM_SIGMA`] went 0.19 h → 0.07 h → 0.030 h and the reach
+/// followed it in pixels each time, so the cut has never had to be refitted to
+/// a narrower rim. The *distance* did move when the field's shape changed —
+/// **3.64 σ** for the two-lobe field 3.7 was first read off, **3.24 σ** for the
+/// single hot-core lobe drawn since ([`measured::BLOOM_FAR_WEIGHT`] `= 0.0`, and
+/// a higher peak buys fewer sigmas than a second lobe's tail did). 3.7 covers
+/// both, so the cut still sits under the floor rather than on it, and
+/// `the_bloom_reach_is_derived_from_the_paint_floor` recomputes that distance
+/// from whatever shape the constants currently describe rather than trusting
+/// this paragraph to have been updated with them.
 ///
 /// The consequence is that the truncation is no longer visible by construction
 /// rather than by measurement — the profile has already stopped painting before
-/// the reach cuts it — and `card_glow_falls_to_nothing_before_it_is_cut` holds
-/// it there if any of the shape constants move.
+/// the reach cuts it — and `a_card_glow_falls_to_nothing_before_it_is_cut` holds
+/// it there on real rendered pixels.
 const BLOOM_REACH_SIGMAS: f32 = 3.7;
 
 /// The narrowest a bloom's near lobe is ever drawn, in pixels.
@@ -5767,6 +5778,67 @@ mod a_card_is_its_own_shape {
             checked += 1;
         }
         assert!(checked > 0, "no gutter was measured");
+    }
+
+    /// The reach is still derived from the paint floor, whatever shape the
+    /// field currently has.
+    ///
+    /// [`a_card_glow_falls_to_nothing_before_it_is_cut`] asserts the visible
+    /// consequence of that derivation on rendered pixels; this asserts the
+    /// derivation itself, in the field's own units. Two reasons it is worth
+    /// having both:
+    ///
+    /// - The rendered check can only speak for the cards a fixture happens to
+    ///   build, and skips entirely on a machine with no font face. This one is
+    ///   arithmetic on the constants, so it holds on every card, at every cell
+    ///   size, on every host, and runs everywhere.
+    /// - The distance is a property of the profile's *shape*, and the shape has
+    ///   changed under this constant before: the field went two-lobe at 0.19
+    ///   peak to a single hot core at 0.38, which moved the derived distance
+    ///   from 3.64 σ to 3.24 σ while [`BLOOM_REACH_SIGMAS`] stayed 3.7. That was
+    ///   the safe direction. Nothing but this test would have caught the other
+    ///   one, and the prose that recorded the old figure went stale in exactly
+    ///   the way a comment does.
+    #[test]
+    fn the_bloom_reach_is_derived_from_the_paint_floor() {
+        // The profile `lay_bloom` samples, restated in sigmas: `d / near_sigma`,
+        // which is what makes the answer independent of the cell size. Taken at
+        // the card's strongest bloom, because the per-column multiplier only
+        // ever dips it — `presence` peaks at 1.0 and `BREATH_BLOOM_DIP`
+        // subtracts from there.
+        let amount = |sigmas: f32| {
+            let near = (-(sigmas * sigmas) / 2.0).exp();
+            let far = (-(sigmas * sigmas)
+                / (2.0 * measured::BLOOM_FAR_SIGMA_MUL * measured::BLOOM_FAR_SIGMA_MUL))
+                .exp();
+            measured::BLOOM_PEAK
+                * (measured::BLOOM_NEAR_WEIGHT * near + measured::BLOOM_FAR_WEIGHT * far)
+        };
+
+        // Where the field falls under what `lay_bloom` will paint at all.
+        let mut derived = f32::NAN;
+        let mut sigmas = 0.0_f32;
+        while sigmas <= 64.0 {
+            if amount(sigmas) <= BLOOM_PAINT_FLOOR {
+                derived = sigmas;
+                break;
+            }
+            sigmas += 0.001;
+        }
+        assert!(
+            derived.is_finite(),
+            "the bloom profile never falls under BLOOM_PAINT_FLOOR, so no reach can \
+             truncate it invisibly — the peak or the weights are wrong",
+        );
+        assert!(
+            derived <= BLOOM_REACH_SIGMAS,
+            "the bloom is still worth {:.5} at BLOOM_REACH_SIGMAS = {}, above the \
+             {BLOOM_PAINT_FLOOR} lay_bloom will paint, so the truncation is a hard edge \
+             in open panel. The field's shape changed and the reach did not: it has to \
+             be at least {derived:.2} σ now",
+            amount(BLOOM_REACH_SIGMAS),
+            BLOOM_REACH_SIGMAS,
+        );
     }
 
     /// A card's glow fades out before it is truncated, rather than stopping dead.
