@@ -1,4 +1,4 @@
-//! A straight-alpha RGBA canvas and the two shapes the card is made of.
+//! A straight-alpha RGBA canvas and the shapes the card is made of.
 //!
 //! The card is a rounded rectangle drawn four times over — as a bloom outside
 //! it, a fill inside it, a stroke on its boundary, and an inner glow just
@@ -11,6 +11,11 @@
 //! Antialiasing is coverage from that distance rather than supersampling. The
 //! prototype supersampled 3–4×, which costs 9–16 times the fill rate for a
 //! shape whose exact coverage is already known analytically.
+//!
+//! [`Triangle`] is the second shape, and it is here for the same reason the
+//! first one is: the card's group chevron is a mark it has to *draw* rather
+//! than set, so it needs a boundary [`coverage`] can read exactly as it reads
+//! the rounded rect's.
 
 /// 8-bit sRGB, the space every sampled constant is quoted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -214,10 +219,122 @@ impl RoundRect {
     }
 }
 
+/// A triangle in pixel space, and the distance to its boundary.
+///
+/// Here because the card's group chevron cannot be a glyph. `▸` and `▾` are
+/// U+25B8 and U+25BE, and the faces a card is set in are whatever proportional
+/// sans the machine happens to have — Ubuntu Sans, Arial and Segoe UI carry
+/// neither, and a face that does not carry a codepoint draws `.notdef`. So the
+/// card draws the shape, out of the same signed distance every other mark on it
+/// is drawn from.
+///
+/// The distance is the largest of the three edge half-planes. That is exact
+/// everywhere inside the triangle, and outside it under-reads near a vertex —
+/// which blunts a corner by a fraction of a pixel on a mark six pixels wide, and
+/// is the reason this is eleven lines rather than a proper polygon field.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Triangle {
+    pub a: (f32, f32),
+    pub b: (f32, f32),
+    pub c: (f32, f32),
+}
+
+impl Triangle {
+    /// Signed distance from `(px, py)` to the boundary: negative inside,
+    /// positive outside, in the same units and the same sense as
+    /// [`RoundRect::distance`], so [`coverage`] reads both the same way.
+    ///
+    /// Winding-agnostic on purpose. A chevron pointing right and one pointing
+    /// down are the same three points with two of them swapped, and a test that
+    /// assumed one winding would draw the other one's complement — every pixel
+    /// of the card *except* the chevron.
+    pub(super) fn distance(&self, px: f32, py: f32) -> f32 {
+        let inward = -cross(self.a, self.b, self.c).signum();
+        [(self.a, self.b), (self.b, self.c), (self.c, self.a)]
+            .into_iter()
+            .map(|(from, to)| {
+                let len = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+                if len <= f32::EPSILON {
+                    return f32::INFINITY;
+                }
+                cross(from, to, (px, py)) / len * inward
+            })
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// The pixel rows and columns this triangle can possibly touch.
+    pub(super) fn bounds(&self) -> (u32, u32, u32, u32) {
+        let xs = [self.a.0, self.b.0, self.c.0];
+        let ys = [self.a.1, self.b.1, self.c.1];
+        let lo = |v: [f32; 3]| v.into_iter().fold(f32::INFINITY, f32::min);
+        let hi = |v: [f32; 3]| v.into_iter().fold(f32::NEG_INFINITY, f32::max);
+        (
+            lo(xs).floor().max(0.0) as u32,
+            lo(ys).floor().max(0.0) as u32,
+            hi(xs).ceil().max(0.0) as u32,
+            hi(ys).ceil().max(0.0) as u32,
+        )
+    }
+}
+
+/// Twice the signed area of the triangle `o → p → q`, positive counterclockwise
+/// in a y-down space.
+fn cross(o: (f32, f32), p: (f32, f32), q: (f32, f32)) -> f32 {
+    (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
+}
+
 /// Coverage of a pixel whose centre is `d` from the boundary, inside positive.
 ///
 /// The half-pixel ramp is the analytic answer for an edge crossing a pixel and
 /// is what replaces the prototype's supersampling.
 pub(super) fn coverage(d: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn right_chevron() -> Triangle {
+        Triangle {
+            a: (0.0, 0.0),
+            b: (0.0, 8.0),
+            c: (7.0, 4.0),
+        }
+    }
+
+    /// Inside is negative, outside is positive, whichever way the three points
+    /// were wound.
+    #[test]
+    fn a_triangle_is_negative_inside_at_either_winding() {
+        let forward = right_chevron();
+        let reversed = Triangle {
+            a: forward.c,
+            b: forward.b,
+            c: forward.a,
+        };
+        for triangle in [forward, reversed] {
+            assert!(triangle.distance(1.5, 4.0) < 0.0, "the middle is inside");
+            assert!(triangle.distance(-2.0, 4.0) > 0.0, "left of the base");
+            assert!(triangle.distance(9.0, 4.0) > 0.0, "past the nose");
+            assert!(triangle.distance(3.0, -2.0) > 0.0, "above the top edge");
+        }
+    }
+
+    /// The boundary is where the distance crosses zero, so a pixel centred on an
+    /// edge is drawn at half coverage rather than at none or at all of it.
+    #[test]
+    fn a_triangle_antialiases_its_edges() {
+        let triangle = right_chevron();
+        assert!((coverage(triangle.distance(0.0, 4.0)) - 0.5).abs() < 0.01);
+        assert_eq!(coverage(triangle.distance(2.0, 4.0)), 1.0);
+        assert_eq!(coverage(triangle.distance(-3.0, 4.0)), 0.0);
+    }
+
+    /// The bounds hold every pixel the shape can put ink in.
+    #[test]
+    fn a_triangle_bounds_its_own_ink() {
+        let (x0, y0, x1, y1) = right_chevron().bounds();
+        assert_eq!((x0, y0, x1, y1), (0, 0, 7, 8));
+    }
 }

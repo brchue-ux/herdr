@@ -1994,16 +1994,30 @@ pub(crate) fn compute_workspace_card_areas(
 /// The glyph marking "these workers reported back".
 const WORKER_SUMMARY_BADGE_GLYPH: &str = "▤";
 
-/// What the badge prints for `count` finished workers.
+/// What the badge prints for `count` finished workers, without the mark in
+/// front of it.
 ///
 /// Two digits is the widest it ever gets, so the badge cannot eat an
 /// unbounded slice of a 26-wide sidebar however large a mate's crew grows.
-pub(crate) fn worker_summary_badge_label(count: usize) -> String {
+///
+/// Split out because the pixel card *draws* the mark instead of setting it —
+/// [`WORKER_SUMMARY_BADGE_GLYPH`] is U+25A4 and the proportional faces a card
+/// can be set in are not guaranteed to carry it — and a card that clamped the
+/// count for itself would be a second opinion about what ten workers says.
+pub(crate) fn worker_summary_count_label(count: usize) -> String {
     if count > 9 {
-        format!("{WORKER_SUMMARY_BADGE_GLYPH}9+")
+        "9+".to_string()
     } else {
-        format!("{WORKER_SUMMARY_BADGE_GLYPH}{count}")
+        count.to_string()
     }
+}
+
+/// What the badge prints for `count` finished workers.
+pub(crate) fn worker_summary_badge_label(count: usize) -> String {
+    format!(
+        "{WORKER_SUMMARY_BADGE_GLYPH}{}",
+        worker_summary_count_label(count)
+    )
 }
 
 /// The clickable summary badge on a second mate's row.
@@ -2055,26 +2069,17 @@ fn worker_summary_badge_width(count: usize, width: u16) -> u16 {
     badge
 }
 
-/// The tree handle this card's row answers to, the name a worker's `owner`
-/// token would have to spell to nest under it.
+/// The tree handle a row answers to, the name a worker's `owner` token would
+/// have to spell to nest under it.
 ///
 /// Spaces and agent panes name themselves differently — a Space by its label, a
 /// pane by `agent rename` — so this is the one place that difference is
 /// resolved, and both kinds of row become eligible for a badge by the same
 /// rule.
-fn card_tree_name(
-    app: &AppState,
-    entries: &[WorkspaceListEntry],
-    agents: &[AgentPanelEntry],
-    card: &crate::app::state::WorkspaceCardArea,
-) -> Option<String> {
-    entry_tree_name(app, agents, entries.get(card.entry_idx)?)
-}
-
-/// The same handle, resolved from the entry alone.
 ///
-/// The layout has entries but no cards yet, and it has to know whether a row
-/// earns a badge before it can decide how wide that row's content is.
+/// Resolved from the entry rather than from the card: the layout has entries
+/// but no cards yet, and it has to know whether a row earns a badge before it
+/// can decide how wide that row's content is.
 fn entry_tree_name(
     app: &AppState,
     agents: &[AgentPanelEntry],
@@ -2100,7 +2105,21 @@ pub(crate) fn worker_summary_badge(
     agents: &[AgentPanelEntry],
     card: &crate::app::state::WorkspaceCardArea,
 ) -> Option<(String, usize)> {
-    let name = card_tree_name(app, entries, agents, card)?;
+    let entry = entries.get(card.entry_idx)?;
+    worker_summary_badge_for_entry(app, entry, agents)
+}
+
+/// The same answer, resolved from the entry alone.
+///
+/// The pixel card's placement pass walks entries and cards together and already
+/// holds the entry, so it asks here rather than looking the same entry up again
+/// through `card.entry_idx`. One rule, reached two ways.
+pub(crate) fn worker_summary_badge_for_entry(
+    app: &AppState,
+    entry: &WorkspaceListEntry,
+    agents: &[AgentPanelEntry],
+) -> Option<(String, usize)> {
+    let name = entry_tree_name(app, agents, entry)?;
     let count = crate::app::worker_summary::summary_count_for_owner(agents, &name);
     (count > 0).then_some((name, count))
 }
@@ -3249,6 +3268,10 @@ fn render_agent_row(
     }
 
     if let Some((owner, count)) = &summary_badge {
+        // Not suppressed under a shape any more — *relocated*. The pixel card
+        // draws its own badge on its own right rail, in its own type, at the
+        // cell this one's click target still names. See
+        // `image_card::ControlRail`.
         if !covered {
             render_worker_summary_badge(app, frame, card, agents, owner, *count, list_bottom);
         }
@@ -5017,10 +5040,11 @@ fn render_workspace_list(
         }
 
         if let Some((_, collapsed)) = parent_group {
-            // Suppressed with the badge beside it, and for the same reason: both
-            // anchor inside the card's frame, so under a shape they would show
-            // through artwork that carries no room for them. The opaque sheet
-            // covered neither, and this keeps the two in step.
+            // Skipped with the badge beside it, and for the same reason: the
+            // card carries both now. They anchor inside the card's frame, so a
+            // shape drawn over this row would have covered them — so the card
+            // draws them itself, on its own right rail, and this is the bare
+            // row's copy rather than the only one. See `image_card::ControlRail`.
             if !covered {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
