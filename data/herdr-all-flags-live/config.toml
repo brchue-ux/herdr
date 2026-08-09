@@ -4,14 +4,29 @@
 # cfg gates on any of these, so a stock binary already contains all of it and
 # turning them on is purely this file. Shared by run.sh (render capture) and
 # swap.sh (binary swap) so both mean the same thing by "all on".
+#
+# This file's whole claim is completeness, so it is checked against the struct
+# rather than trusted: `experimental_config_covers_every_flag` in run.sh diffs
+# these keys against `ExperimentalConfig`'s own boolean fields and fails when
+# one is missing. `persistent_background` was absent for the first four runs of
+# this rig — the whole-terminal background scene, a shipped flag, sat outside a
+# check whose name says every flag is on.
 [experimental]
 allow_nested = true
 kitty_graphics = true
 sidebar_card_shapes = true
 sidebar_particle_field = true
+# Whole-terminal, not sidebar-confined, and the one flag here that legitimately
+# does nothing in one of the two passes: an opaque ambient wash is refused on a
+# terminal not measured to draw the below-text band, so this reaches the wire
+# under SERVER_TERM=kitty and is correctly withheld under rio. Both are worth
+# capturing — the refusal is the #96 fix, and a placement appearing under rio
+# would be that regression.
+persistent_background = true
 kitty_graphics_local_transport = true
 pane_history = true
 reveal_hidden_cursor_for_cjk_ime = true
+switch_ascii_input_source_in_prefix = true
 
 [ui]
 sidebar_width = 42

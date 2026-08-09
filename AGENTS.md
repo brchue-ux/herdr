@@ -281,6 +281,21 @@ at all. `HERDR_CLIENT_RASTERIZED_CARDS=1` and
 is between the client and its terminal — run the client under `script -f` in a
 real terminal to record them.
 
+A shell harness driving a real server has two traps that make it report the
+opposite of what happened, and both have cost a parked check already
+(`data/herdr-all-flags-live/swap.sh`). **`$!` after backgrounding a shell
+*function* is the subshell's pid, not the program's** — bash does not
+exec-optimise a function body away — so signalling it tears down the wrapper and
+leaves the server running, reparented and unsignalled, while the wait loop sees
+that pid vanish and reports a clean exit. Use `( exec env … ) &`, and assert the
+server is gone by **the API no longer answering** rather than by a pid
+disappearing; those are different claims and only the first is about the server.
+Second, `session.snapshot` is four *flat* top-level arrays — `workspaces`,
+`tabs`, `panes`, `agents`, with `tokens` an object on workspaces and panes alike
+— so a walk expecting `workspaces[].tabs[].panes[]` yields nothing and every
+assertion downstream of it compares two empty collections and passes. Any
+comparison over API output should assert its own subject is non-empty first.
+
 A terminal's image store is not a resource herdr can see, and `a=d` does not
 give it back. Measured on Rio 0.5.19: minting a fresh image id per raster grows
 it ~10 MiB/s and never shrinks, until it caps and evicts whatever has sat there

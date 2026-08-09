@@ -13,21 +13,35 @@ only what a layout change would move and a repaint would not:
   * placement geometry — the (cols, rows, width_px, height_px) of every card
     placement, as a sorted multiset. This is the tree's layout: a card's rank is
     carried by its width, its tier by its height. #67 lives here.
-  * the decoded character grid, with trailing blanks stripped. Under the pixel
-    path most card cells are covered by images, so this mostly pins the
-    connectors, the rails and any character-shell rows.
+  * the decoded character grid, with trailing blanks stripped, cropped to the
+    sidebar's own columns (`DIGEST_GRID_COLS`). Under the pixel path most card
+    cells are covered by images, so this mostly pins the connectors, the rails
+    and any character-shell rows.
   * which formats and transports appeared, as sets.
 
 Image ids, payload bytes, z-order and per-frame animation controls are all
 excluded on purpose: they move for reasons that are not regressions.
 
-  digest.py write <capture> <grid> <out>     — write a digest
-  digest.py check <capture> <grid> <baseline> — compare, exit 1 on drift
+The crop matters for the same reason. The panes to the right of the divider run
+real shells, and a default prompt prints the machine's hostname — freshly
+generated per run on a hosted runner. Keeping those columns makes every digest
+unique, so no committed baseline could ever match and the whole golden check
+would read as permanent drift.
+
+  digest.py write <capture> <grid> <out>      — write a digest
+  digest.py check <capture> <grid> <baseline> — compare; exit 1 on drift,
+                                               exit 3 when there is no baseline
 """
+import os
 import re
 import sys
 
 APC = re.compile(rb"\x1b_G([^;\x1b]*)")
+
+#: Exit code for "there is nothing to compare against". Distinct from drift (1)
+#: and from usage (2) so a caller can decide whether a missing baseline is
+#: tolerable; this used to be exit 0, which made every run pass vacuously.
+NO_BASELINE = 3
 
 
 def digest(capture_path: str, grid_path: str) -> str:
@@ -58,10 +72,14 @@ def digest(capture_path: str, grid_path: str) -> str:
     lines.append("# wire capability")
     lines.append("formats " + ",".join(sorted(formats)))
     lines.append("transports " + ",".join(sorted(transports)))
-    lines.append("# decoded grid")
+    grid_cols = os.environ.get("DIGEST_GRID_COLS", "")
+    crop = int(grid_cols) if grid_cols.isdigit() and int(grid_cols) > 0 else None
+    lines.append(f"# decoded grid (first {crop} columns)" if crop else "# decoded grid")
     try:
         with open(grid_path, encoding="utf-8", errors="replace") as fh:
             for row in fh.read().splitlines():
+                if crop is not None:
+                    row = row[:crop]
                 lines.append("row " + row.rstrip())
     except FileNotFoundError:
         lines.append("row <no decoded grid>")
@@ -94,7 +112,7 @@ def main() -> int:
         print("--- digest begins ---")
         print(got, end="")
         print("--- digest ends ---")
-        return 0
+        return NO_BASELINE
 
     if got == want:
         print(f"digest matches baseline {target}")

@@ -31,6 +31,47 @@ E=(env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH
 echo "--- config in use ---"
 cat "$ROOT/.config/$NS/config.toml"
 
+# This rig's name is a claim about completeness, so check it against the struct
+# instead of trusting the file. `persistent_background` was missing for this
+# check's first four runs: a shipped flag, drawing a whole-terminal surface,
+# outside a job called "all flags on". Nothing could have noticed, because the
+# only thing that knew the full list was the Rust source.
+#
+# Booleans only. `sidebar_card_font` is a path whose empty value already means
+# "search the system", and the two `cjk_ime_*` keys are a list and an enum with
+# no all-on value; a flag is what this is about.
+echo "--- checking the flag list against ExperimentalConfig ---"
+python3 - "$HERE/config.toml" "$HERE/../../src/config/model.rs" <<'PY'
+import re, sys
+
+cfg_path, model_path = sys.argv[1], sys.argv[2]
+model = open(model_path, encoding="utf-8").read()
+m = re.search(r"pub struct ExperimentalConfig \{(.*?)\n\}", model, re.S)
+if not m:
+    raise SystemExit("could not find ExperimentalConfig in " + model_path)
+declared = set(re.findall(r"\n    pub (\w+): bool,", m.group(1)))
+
+cfg = open(cfg_path, encoding="utf-8").read()
+section = cfg.split("[experimental]", 1)
+if len(section) != 2:
+    raise SystemExit("config.toml has no [experimental] section")
+body = re.split(r"\n\[", section[1], 1)[0]
+present = set(re.findall(r"(?m)^(\w+)\s*=", body))
+
+missing = sorted(declared - present)
+unknown = sorted(present - declared)
+print(f"ExperimentalConfig booleans: {len(declared)}; set here: {len(present & declared)}")
+if missing:
+    print("FLAGS MISSING FROM THE ALL-FLAGS CONFIG: " + ", ".join(missing), file=sys.stderr)
+    print("Add them to data/herdr-all-flags-live/config.toml, or this job's name lies.", file=sys.stderr)
+    raise SystemExit(1)
+if unknown:
+    print("KEYS HERE THAT ARE NOT BOOLEAN FLAGS ON ExperimentalConfig: " + ", ".join(unknown), file=sys.stderr)
+    print("A renamed or removed flag is silently inert; fix the config file.", file=sys.stderr)
+    raise SystemExit(1)
+print("every boolean experimental flag is turned on")
+PY
+
 # Which terminal the SERVER believes it is under, which is what decides the
 # pixel format — not the client's. host_terminal_kind() reads this process's
 # own environment, and its own doc comment says so: "for the split server, this
@@ -114,6 +155,14 @@ echo "--- capture: failure cleared (spider retreat) ---"
 "${E[@]}" pane report-metadata w2:p1 --source proof --clear-token lifecycle
 cap cleared 2000
 
+# Capture the cleared state a second time, changing nothing between the two.
+# This is the precondition a golden baseline needs and nobody had checked: a
+# digest that does not reproduce against itself inside one run can never be
+# committed, and a baseline seeded from it would fail every run afterwards for
+# reasons that are not regressions. Cheap to ask, and it answers the question
+# before a drift failure has to be triaged as a possible flake.
+cap cleared-again 2000
+
 echo "--- server log (last 40 lines) ---"
 tail -40 "$ROOT/server.log" || true
 
@@ -131,6 +180,23 @@ if grep -qiE "panicked at|fatal|thread .* panicked" "$ROOT/server.log"; then
   exit 1
 fi
 echo "no panic in server log"
+
+# A per-frame graphics payload over protocol::MAX_GRAPHICS_FRAME_SIZE is dropped
+# *whole*, taking every pixel surface on that pass with it and putting nothing on
+# screen to say so — it reads exactly like the capability handshake failing. The
+# only evidence is this log line. The guards below would catch it on the steady
+# capture, but not on a later one, and this configuration is now the largest it
+# has ever been: `persistent_background` puts a whole-terminal image beside the
+# sidebar's particle wash and its cards.
+if grep -qi "dropping oversized graphics payload" "$ROOT/server.log"; then
+  echo "OVERSIZED GRAPHICS PAYLOAD DROPPED — a pass rendered no pixels at all" >&2
+  grep -i -B2 -A2 "dropping oversized graphics payload" "$ROOT/server.log" >&2
+  echo "Every pixel surface is missing from that frame. Raise nothing to hide it:" >&2
+  echo "either the surface must encode smaller (PNG, not raw RGBA) or the geometry" >&2
+  echo "here is past what one frame can carry." >&2
+  exit 1
+fi
+echo "no oversized graphics payload dropped"
 
 # "No panic" is not evidence of a render. A capture that is empty because the
 # client never drew also never panics, which is exactly how run 2 went green on
@@ -211,6 +277,39 @@ if [ "$SERVER_TERM" = "rio" ]; then
   fi
 fi
 
+# The digest keeps only the sidebar's own columns of the decoded grid, and that
+# bound is not tidiness — it is what makes a baseline possible at all. The panes
+# to the right of the divider run real shells, and a default prompt carries the
+# machine's hostname, which on a hosted runner is freshly generated per run
+# (`fv-az1425-773`, `iad20-fj918-…`). A digest containing one can never match a
+# committed baseline, so the golden half of this rig would have failed every run
+# for a reason that is not a regression. Placement geometry is still taken from
+# the whole capture; it is only the character grid that is cropped.
+SIDEBAR_COLS=$(awk -F'= *' '/^sidebar_width/ {print $2; exit}' "$HERE/config.toml")
+SIDEBAR_COLS=${SIDEBAR_COLS:-42}
+export DIGEST_GRID_COLS="$SIDEBAR_COLS"
+echo "--- digest: grid cropped to the sidebar's $SIDEBAR_COLS columns ---"
+
+# Reproducibility before comparison. Two captures of one unchanged state must
+# digest identically, or a baseline seeded from either is worthless. Checking it
+# here means a future drift failure is a real difference rather than a coin toss,
+# and it is the assertion that would have to fail before anyone spent a run
+# triaging a phantom.
+python3 "$HERE/digest.py" write "$OUT/cleared.raw" "$OUT/cleared.txt" \
+  "$OUT/cleared-a.digest" >/dev/null
+python3 "$HERE/digest.py" write "$OUT/cleared-again.raw" "$OUT/cleared-again.txt" \
+  "$OUT/cleared-b.digest" >/dev/null
+if diff -u "$OUT/cleared-a.digest" "$OUT/cleared-b.digest" > "$OUT/reproducibility.diff"; then
+  echo "digest reproduces across two captures of the same state"
+else
+  echo "DIGEST DOES NOT REPRODUCE against itself within one run." >&2
+  echo "Two captures of an unchanged fleet digested differently, so no baseline" >&2
+  echo "committed from this rig could ever match. Something volatile is still in" >&2
+  echo "the digest — widen the crop or exclude the field, do not seed a baseline." >&2
+  head -60 "$OUT/reproducibility.diff" >&2
+  exit 1
+fi
+
 # Golden comparison. The assertions above check that the right mechanisms fired;
 # this checks that the tree still looks the same. Baselines are per SERVER_TERM,
 # because the format branch legitimately differs between them.
@@ -222,7 +321,30 @@ if [ "${BASELINE_WRITE:-0}" = "1" ]; then
 else
   python3 "$HERE/digest.py" write "$OUT/steady.raw" "$OUT/steady.txt" \
     "$OUT/steady-$SERVER_TERM.digest" >/dev/null
+  # digest.py exits 3, not 1, when there is no baseline to compare against. That
+  # case used to exit 0 with a printed hint, and no baseline was ever committed,
+  # so the golden half of this rig passed vacuously on every run it has had. It
+  # is still not fatal by default — a fork with no baselines committed should not
+  # be red — but BASELINE_REQUIRED=1 makes it fatal, and CI sets that once the
+  # digests are in the tree.
+  set +e
   python3 "$HERE/digest.py" check "$OUT/steady.raw" "$OUT/steady.txt" "$BASELINE"
+  DIGEST_STATUS=$?
+  set -e
+  case "$DIGEST_STATUS" in
+    0) ;;
+    3)
+      if [ "${BASELINE_REQUIRED:-0}" = "1" ]; then
+        echo "NO BASELINE COMMITTED for SERVER_TERM=$SERVER_TERM, and this run" >&2
+        echo "requires one. Take the digest printed above and commit it to" >&2
+        echo "data/herdr-all-flags-live/baseline/." >&2
+        exit 1
+      fi
+      echo "!!! DRIFT CHECK INERT: no baseline for SERVER_TERM=$SERVER_TERM."
+      echo "!!! Everything above still held, but nothing checked what is drawn."
+      ;;
+    *) exit "$DIGEST_STATUS" ;;
+  esac
 fi
 
 # The analysis goes LAST on purpose. A job's log is read from the end, and the

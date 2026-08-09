@@ -24,6 +24,18 @@ on:
       - 'src/anim/**'
       - 'src/anim.rs'
       - 'src/config/sidebar.rs'
+      # The flag list this job claims to have turned on is checked against
+      # ExperimentalConfig, which lives here. Without this line a new flag could
+      # be added without the check that notices it ever running — which is how
+      # `persistent_background` stayed outside an "all flags on" job.
+      - 'src/config/model.rs'
+      # Turned on by config.toml now, so a change to either can move the wire.
+      - 'src/solar_system.rs'
+      - 'src/app/background_scene.rs'
+      # The swap check reads state written by the server's own shutdown and
+      # handoff paths.
+      - 'src/persist/**'
+      - 'src/server/handoff.rs'
       - 'data/herdr-all-flags-live/**'
       - '.github/workflows/live-render-all-flags.yml'
 
@@ -107,12 +119,31 @@ jobs:
 
       # The released linux asset is musl, and nothing else on the push path
       # builds it, so a musl-only break would otherwise not surface until a
-      # release. This proves the shipped target compiles; running the capture
-      # against it is follow-up work, tracked with the swap check.
+      # release. This proves the shipped target compiles; the swap check below
+      # then runs it, which is the follow-up this comment used to defer.
       - name: Build this branch for musl (the shipped target)
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/release/herdr
+
+      # The captures above run one binary against a session that same binary
+      # created, so they cannot see a swap. This does: the gnu build creates a
+      # fleet, and the *shipped* musl artifact inherits it — first through
+      # session.json across a full stop and start, then through a live handoff
+      # (`herdr server swap --exe`) under a fleet that never stops.
+      #
+      # Cheap here because the build is already paid for; the swap itself is
+      # ~25s. No client and no PTY: this phase is about state surviving, not
+      # about what is drawn.
+      - name: Binary swap — cold restart, then live handoff
+        env:
+          HERDR_NS: herdr
+          SWAP_ROOT: ${{ github.workspace }}/data/herdr-all-flags-live/proof/swap
+        run: |
+          chmod +x data/herdr-all-flags-live/swap.sh
+          ./data/herdr-all-flags-live/swap.sh \
+            target/release/herdr \
+            target/x86_64-unknown-linux-musl/release/herdr
 
       - name: Upload captures
         if: always()
