@@ -751,6 +751,35 @@ fn warn_if_encoding_cannot_carry_delegated_scenes(
     );
 }
 
+/// The cell this client rasterises delegated scenes against.
+///
+/// Through the same gate the server puts the very same reported numbers through
+/// on the way in (`ClientConnection::set_cell_size` →
+/// `HostCellSize::plausible_or_unknown`), because a delegating client is the
+/// one place the two copies have to agree: `build_card_scene` counts the
+/// layout out server-side against the server's copy, and `rasterise_card_scene`
+/// turns it into pixels here against this one. Everything sized in pixels comes
+/// out of this — a card's frame, its type, and the half-cell the tree's rails
+/// are offset by to sit where a box-drawing glyph's stem sits
+/// (`RAIL_INK_COLUMN_FRACTION`).
+///
+/// A Windows client over the remote bridge reports an arithmetic `3x7` that
+/// fails `is_plausible` and becomes the `8x16` fallback server-side. Kept raw
+/// here, the same scene was laid out on a 8x16 grid and drawn on a 3x7 one:
+/// under half the width per column, and rails offset 1.5px into a column the
+/// layout put them 4px into.
+///
+/// Unknown stays unknown, exactly as it does server-side: a client with Kitty
+/// graphics off reports `0x0` and that absence means "no graphics", not "a
+/// wrong measurement".
+fn rasterisation_cell_size(width_px: u32, height_px: u32) -> crate::kitty_graphics::HostCellSize {
+    crate::kitty_graphics::HostCellSize {
+        width_px,
+        height_px,
+    }
+    .plausible_or_unknown()
+}
+
 fn is_remote_client_process() -> bool {
     std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
 }
@@ -1461,10 +1490,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
-        cell_size: crate::kitty_graphics::HostCellSize {
-            width_px: initial_cell_width_px,
-            height_px: initial_cell_height_px,
-        },
+        cell_size: rasterisation_cell_size(initial_cell_width_px, initial_cell_height_px),
         card_font_override: config.card_font_override,
         card_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
         previous_card_layers: Vec::new(),
@@ -1701,10 +1727,7 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
-                state.cell_size = crate::kitty_graphics::HostCellSize {
-                    width_px: cell_width_px,
-                    height_px: cell_height_px,
-                };
+                state.cell_size = rasterisation_cell_size(cell_width_px, cell_height_px);
                 // Resizing invalidates the host-side blit baseline.
                 state.request_repaint();
                 // A window dragged onto a display with a different scale keeps
@@ -1784,8 +1807,20 @@ async fn run_client_loop(
                 }
                 ServerMessage::CardScene { bytes } => {
                     if state.kitty_graphics_enabled {
-                        state.pending_card_graphics =
-                            decode_and_rasterise_card_scene(&bytes, &mut state);
+                        let graphics = decode_and_rasterise_card_scene(&bytes, &mut state);
+                        // Appended, not assigned. What comes back is a *delta*
+                        // against this client's own graphics cache — deletes for
+                        // the image ids it just superseded, uploads and
+                        // placements for the ones replacing them — and the cache
+                        // has already moved on by the time it lands here.
+                        // Assigning dropped whichever delta no frame had carried
+                        // yet, and since the very next scene is usually unchanged
+                        // and rasterises to nothing, it dropped it in favour of
+                        // an empty vector: the terminal kept the deletes it had
+                        // been sent and never received the artwork that replaced
+                        // them, so the cards went out and stayed out. Concatenating
+                        // in arrival order is what the cache's own state assumes.
+                        state.pending_card_graphics.extend(graphics);
                     }
                 }
                 ServerMessage::TrayScene { bytes } => {
@@ -2576,6 +2611,48 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+
+    /// The cell a delegating client draws with is the one the server laid the
+    /// scene out against, not the raw report.
+    ///
+    /// The Windows remote bridge's `3x7` is the case that matters: the server
+    /// replaces it with the fallback on the way in, so a client that kept it
+    /// raw drew every card, and the tree's rails, on a grid less than half the
+    /// width the layout counted.
+    #[test]
+    fn an_implausible_reported_cell_is_rasterised_against_the_fallback() {
+        use crate::kitty_graphics::HostCellSize;
+        assert_eq!(rasterisation_cell_size(3, 7), HostCellSize::FALLBACK);
+        assert_eq!(
+            rasterisation_cell_size(3, 7),
+            HostCellSize {
+                width_px: 3,
+                height_px: 7
+            }
+            .plausible_or_unknown(),
+            "the client has to use the server's own gate, not a second opinion"
+        );
+    }
+
+    /// A believable cell is left exactly as reported.
+    #[test]
+    fn a_plausible_reported_cell_is_rasterised_as_reported() {
+        use crate::kitty_graphics::HostCellSize;
+        assert_eq!(
+            rasterisation_cell_size(8, 15),
+            HostCellSize {
+                width_px: 8,
+                height_px: 15
+            }
+        );
+    }
+
+    /// Graphics off reports `0x0`, and that absence must survive the gate: it
+    /// means "send no graphics", not "a measurement I do not believe".
+    #[test]
+    fn a_client_with_graphics_off_stays_unknown() {
+        assert!(!rasterisation_cell_size(0, 0).is_known());
+    }
 
     /// Graphics off means the server is told nothing about pixels at all.
     #[test]
