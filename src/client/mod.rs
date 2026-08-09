@@ -2507,20 +2507,36 @@ fn ioctl_cell_size() -> Option<(u32, u32)> {
 /// 1. **The terminal's own answer** to `CSI 16 t` (`reported`). Exact, because
 ///    it is the number the terminal lays its own glyphs out on rather than a
 ///    number derived from anything.
-/// 2. **The terminal size ioctl** (`ioctl`). An estimate: `ws_xpixel / columns`
-///    truncates, and the window pixels it divides include whatever padding the
-///    terminal draws around the grid. Good enough on every real terminal
-///    measured, and free, so it stays the common path.
+/// 2. **The terminal size ioctl** (`ioctl`). An estimate, and a *derived* one:
+///    `ws_xpixel / columns` truncates, the window pixels it divides include
+///    whatever padding the terminal draws around the grid, and on a pty that
+///    did not measure the terminal at all the pixel fields are somebody else's
+///    number entirely.
 /// 3. **[`DEFAULT_CELL_WIDTH_PX`]/[`DEFAULT_CELL_HEIGHT_PX`]**, which knows
 ///    nothing at all.
 ///
-/// The ordering that matters is *implausible before absent*. An estimate that
-/// arrives nonzero but cannot be a cell — a terminal behind ConPTY or a remote
-/// bridge reports an arithmetic `3x7` on a real 11x21 px cell — used to outrank
-/// the terminal's own answer purely by being present, and dropped the client
-/// onto the 8x16 guess. Nothing downstream says so: the artwork is drawn for
-/// the guessed cell, placed by cell *count*, and the terminal stretches it to
-/// fit. That is the whole of the "sidebar cards are soft, not crisp" report.
+/// They are consulted in that order, which is the order they are listed in:
+/// ask the terminal, and fall back to arithmetic about the terminal only when
+/// the terminal did not answer.
+///
+/// # The bug this ordering exists to fix
+///
+/// The estimate used to outrank the terminal's own answer whenever it was
+/// merely *plausible*, and [`host_cell_size_query_required`] did not even send
+/// the query in that case — so on a pty whose pixel fields are wrong the
+/// terminal was never asked, and a wrong-but-believable cell won unopposed.
+///
+/// An SSH pty carrying a stale `ws_xpixel` is exactly that pty, and it is the
+/// captain's route. Plausibility cannot catch it: `is_plausible` refuses a cell
+/// no font could have, not a cell some *other* window had. A stale 1272x784 on
+/// a 159x49 grid divides to 8x16 — a perfectly ordinary cell, and wrong, on a
+/// terminal whose real cell is 10x21. Nothing downstream says so: the artwork
+/// is drawn for the believed cell, placed by cell *count*, and the terminal
+/// resamples it to fit. That is the whole of the "text is very blurry" report,
+/// and it is why the earlier fix in this area — which only widened *which*
+/// derived cells are refused — did not reach it.
+///
+/// See `a_stale_but_plausible_ioctl_loses_to_the_terminals_own_answer`.
 fn best_known_cell_size(ioctl: Option<(u32, u32)>, reported: Option<(u32, u32)>) -> (u32, u32) {
     let plausible = |pair: Option<(u32, u32)>| {
         pair.filter(|(width_px, height_px)| {
@@ -2531,8 +2547,8 @@ fn best_known_cell_size(ioctl: Option<(u32, u32)>, reported: Option<(u32, u32)>)
             .is_plausible()
         })
     };
-    plausible(ioctl)
-        .or(plausible(reported))
+    plausible(reported)
+        .or(plausible(ioctl))
         .unwrap_or((DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX))
 }
 
@@ -2651,28 +2667,24 @@ fn query_host_cell_size() {
     let _ = write_host_cell_size_query(io::stdout());
 }
 
-/// Only pane graphics need pixel dimensions, and only when the ioctl cannot
-/// supply a believable cell.
+/// Only pane graphics need pixel dimensions — but whenever they do, the
+/// terminal is asked, however believable the ioctl looks.
 ///
-/// "Believable" and not merely "present": the ioctl answering with something
-/// that cannot be a cell is the case this query exists for. A terminal behind
-/// ConPTY answers nothing at all, and one behind a remote bridge answers an
-/// arithmetic `3x7` — both leave [`best_known_cell_size`] on the
-/// [`DEFAULT_CELL_WIDTH_PX`] guess unless the terminal is asked directly, and
-/// gating on `is_none()` asked in only one of the two cases.
+/// This used to be gated on the ioctl being *implausible*, which quietly made
+/// the gate decide the answer: a pty reporting a wrong-but-ordinary cell was
+/// never contradicted, because the only thing that could contradict it was
+/// never sent. A stale SSH `ws_xpixel` is precisely that pty, and it is the one
+/// the "text is very blurry" report came from — see [`best_known_cell_size`]
+/// for why plausibility cannot stand in for correctness here.
+///
+/// The cost of asking unconditionally is one escape sequence at startup and one
+/// per resize, on a path that is already sending a Kitty capability query
+/// beside it. A terminal that does not implement `CSI 16 t` simply does not
+/// answer, `reported` stays `None`, and the ioctl is used exactly as before —
+/// the reply-framing this depends on has always run on the implausible branch,
+/// so it is the same machinery, not a new one.
 fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
-    kitty_graphics_enabled && !ioctl_cell_size_is_plausible()
-}
-
-/// Whether the ioctl reading is a cell a terminal could actually draw in.
-fn ioctl_cell_size_is_plausible() -> bool {
-    ioctl_cell_size().is_some_and(|(width_px, height_px)| {
-        crate::kitty_graphics::HostCellSize {
-            width_px,
-            height_px,
-        }
-        .is_plausible()
-    })
+    kitty_graphics_enabled
 }
 
 fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
@@ -3075,14 +3087,50 @@ mod tests {
         assert_eq!(output, b"\x1b[16t");
     }
 
+    /// The ioctl is used when it is all there is, and only then.
     #[test]
-    fn best_known_cell_size_prefers_a_plausible_ioctl_reading() {
-        // The common path, and the cheap one: no query, no reply to wait for.
+    fn best_known_cell_size_uses_a_plausible_ioctl_when_the_terminal_did_not_answer() {
         assert_eq!(best_known_cell_size(Some((11, 21)), None), (11, 21));
+        // An unanswered query and an implausible answer are the same absence.
         assert_eq!(
-            best_known_cell_size(Some((11, 21)), Some((9, 18))),
+            best_known_cell_size(Some((11, 21)), Some((16, 16))),
             (11, 21)
         );
+    }
+
+    /// The regression this ordering exists for: a pty whose pixel fields are
+    /// stale reports a cell that is entirely believable and entirely wrong, and
+    /// the terminal's own answer has to win anyway.
+    ///
+    /// Measured live on Rio, `--remote`, at the captain's 42-column sidebar: a
+    /// pty carrying `1272x784` on a 159x49 grid divides to a clean `8x16` while
+    /// the terminal's real cell is `10x20`. Believing the division rasterised
+    /// the tree 328x96 and asked the terminal to draw it across 41x6 cells —
+    /// 410x120 real pixels — so every glyph arrived through a 1.25x resample.
+    /// `is_plausible` says yes to `8x16` and always will: it refuses a cell no
+    /// font could have, not a cell another window had.
+    #[test]
+    fn a_stale_but_plausible_ioctl_loses_to_the_terminals_own_answer() {
+        use crate::kitty_graphics::HostCellSize;
+        let stale = (8, 16);
+        assert!(
+            HostCellSize {
+                width_px: stale.0,
+                height_px: stale.1,
+            }
+            .is_plausible(),
+            "the premise: the stale reading is not one plausibility can refuse"
+        );
+        assert_eq!(best_known_cell_size(Some(stale), Some((10, 20))), (10, 20));
+    }
+
+    /// And the answer is only available because it is always asked for. Gating
+    /// the query on the ioctl being implausible let the suspect reading decide
+    /// whether anything was allowed to contradict it.
+    #[test]
+    fn the_terminal_is_asked_for_its_cell_whenever_graphics_are_on() {
+        assert!(host_cell_size_query_required(true));
+        assert!(!host_cell_size_query_required(false));
     }
 
     #[test]
