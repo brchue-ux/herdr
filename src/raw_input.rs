@@ -172,6 +172,12 @@ impl RawInputFramer {
         self.byte_framer.host_color_query_sent();
     }
 
+    /// Windows only: the Unix client drives the byte framer directly.
+    #[cfg(any(windows, test))]
+    pub(crate) fn host_cell_size_query_sent(&mut self) {
+        self.byte_framer.host_cell_size_query_sent();
+    }
+
     pub(crate) fn enable_host_color_scheme_change_tracking(&mut self) {
         self.byte_framer.enable_host_color_scheme_change_tracking();
     }
@@ -226,7 +232,6 @@ pub(crate) struct RawInputByteFramer {
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
-#[cfg(any(unix, test))]
 const HOST_CELL_SIZE_QUERY_REPLIES: u16 = 1;
 const MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES: usize = 32;
 
@@ -257,8 +262,7 @@ impl RawInputByteFramer {
     }
 
     /// Same hold window as `host_color_query_sent`, for the XTWINOPS cell size
-    /// reply. Only the Unix client sends this query.
-    #[cfg(any(unix, test))]
+    /// reply.
     pub(crate) fn host_cell_size_query_sent(&mut self) {
         self.host_cell_size_replies_awaited = HOST_CELL_SIZE_QUERY_REPLIES;
         self.held_pending_host_reply_esc = false;
@@ -2788,6 +2792,33 @@ mod tests {
                 height_px: 21,
             }
         ));
+    }
+
+    /// The event-level framer holds the same window as the byte-level one.
+    ///
+    /// This is the framer the *Windows* client runs, and the reply arrives
+    /// there as a run of character key events that can be split anywhere. It
+    /// had no way to be told a query was outstanding at all until the client
+    /// started asking on that platform.
+    #[test]
+    fn the_event_framer_stitches_a_split_host_cell_size_reply_too() {
+        let mut framer = RawInputFramer::for_host_input();
+        framer.host_cell_size_query_sent();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        let events = framer.push(b"[6;21;11t");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [RawInputEvent::HostCellSizeReport {
+                    width_px: 11,
+                    height_px: 21,
+                }]
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]
