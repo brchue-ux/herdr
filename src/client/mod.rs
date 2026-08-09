@@ -991,6 +991,11 @@ enum ClientLoopEvent {
     /// Structured input events from platforms without Unix-style stdin bytes.
     #[cfg(windows)]
     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
+    /// The host terminal's answer to `CSI 16 t`, on platforms whose stdin path
+    /// hands the loop semantic events rather than raw bytes. The Unix arm reads
+    /// the same reply straight out of the byte stream it is already parsing.
+    #[cfg(windows)]
+    HostCellSizeReported { width_px: u32, height_px: u32 },
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received.
@@ -1714,6 +1719,16 @@ async fn run_client_loop(
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
+            }
+            #[cfg(windows)]
+            ClientLoopEvent::HostCellSizeReported {
+                width_px,
+                height_px,
+            } => {
+                // Recorded, never forwarded — the same bargain the Unix arm
+                // strikes above: the server learns the cell through the resize
+                // path, so there is exactly one way for it to learn it.
+                store_reported_cell_size(&reported_cell_size, width_px, height_px);
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -2461,6 +2476,13 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Cell size assumed when neither the terminal size ioctl nor the host
 /// terminal reports pixel dimensions.
+///
+/// A guess, and the only one of the three sources in [`best_known_cell_size`]
+/// that is. Everything the sidebar draws is rasterised at this many pixels per
+/// cell and then placed with `c=`/`r=` cell counts, so a terminal whose cell is
+/// not this **rescales** what it receives: the artwork lands in the right cells
+/// and is soft, which is the one failure that looks like a font problem rather
+/// than like a herdr bug.
 const DEFAULT_CELL_WIDTH_PX: u32 = 8;
 const DEFAULT_CELL_HEIGHT_PX: u32 = 16;
 
@@ -2476,12 +2498,44 @@ fn ioctl_cell_size() -> Option<(u32, u32)> {
     ))
 }
 
-/// Cell size used when the ioctl reports no pixels.
-fn cell_size_fallback(reported: u64) -> (u32, u32) {
-    unpack_cell_size(reported).unwrap_or((DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX))
+/// The cell this client will rasterise and place graphics against, chosen from
+/// the sources in the order they deserve to be believed.
+///
+/// Three things can claim to know the host terminal's cell, and they are not
+/// equally good:
+///
+/// 1. **The terminal's own answer** to `CSI 16 t` (`reported`). Exact, because
+///    it is the number the terminal lays its own glyphs out on rather than a
+///    number derived from anything.
+/// 2. **The terminal size ioctl** (`ioctl`). An estimate: `ws_xpixel / columns`
+///    truncates, and the window pixels it divides include whatever padding the
+///    terminal draws around the grid. Good enough on every real terminal
+///    measured, and free, so it stays the common path.
+/// 3. **[`DEFAULT_CELL_WIDTH_PX`]/[`DEFAULT_CELL_HEIGHT_PX`]**, which knows
+///    nothing at all.
+///
+/// The ordering that matters is *implausible before absent*. An estimate that
+/// arrives nonzero but cannot be a cell — a terminal behind ConPTY or a remote
+/// bridge reports an arithmetic `3x7` on a real 11x21 px cell — used to outrank
+/// the terminal's own answer purely by being present, and dropped the client
+/// onto the 8x16 guess. Nothing downstream says so: the artwork is drawn for
+/// the guessed cell, placed by cell *count*, and the terminal stretches it to
+/// fit. That is the whole of the "sidebar cards are soft, not crisp" report.
+fn best_known_cell_size(ioctl: Option<(u32, u32)>, reported: Option<(u32, u32)>) -> (u32, u32) {
+    let plausible = |pair: Option<(u32, u32)>| {
+        pair.filter(|(width_px, height_px)| {
+            crate::kitty_graphics::HostCellSize {
+                width_px: *width_px,
+                height_px: *height_px,
+            }
+            .is_plausible()
+        })
+    };
+    plausible(ioctl)
+        .or(plausible(reported))
+        .unwrap_or((DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX))
 }
 
-#[cfg(any(unix, test))]
 fn pack_cell_size(width_px: u32, height_px: u32) -> u64 {
     (u64::from(width_px) << 32) | u64::from(height_px)
 }
@@ -2500,8 +2554,10 @@ fn current_terminal_geometry(
     if !kitty_graphics_enabled {
         return (cols, rows, 0, 0);
     }
-    let (cell_width_px, cell_height_px) = ioctl_cell_size()
-        .unwrap_or_else(|| cell_size_fallback(reported_cell_size.load(Ordering::Acquire)));
+    let (cell_width_px, cell_height_px) = best_known_cell_size(
+        ioctl_cell_size(),
+        unpack_cell_size(reported_cell_size.load(Ordering::Acquire)),
+    );
     (cols, rows, cell_width_px, cell_height_px)
 }
 
@@ -2595,14 +2651,28 @@ fn query_host_cell_size() {
     let _ = write_host_cell_size_query(io::stdout());
 }
 
-fn should_query_host_cell_size() -> bool {
-    !cfg!(windows)
+/// Only pane graphics need pixel dimensions, and only when the ioctl cannot
+/// supply a believable cell.
+///
+/// "Believable" and not merely "present": the ioctl answering with something
+/// that cannot be a cell is the case this query exists for. A terminal behind
+/// ConPTY answers nothing at all, and one behind a remote bridge answers an
+/// arithmetic `3x7` — both leave [`best_known_cell_size`] on the
+/// [`DEFAULT_CELL_WIDTH_PX`] guess unless the terminal is asked directly, and
+/// gating on `is_none()` asked in only one of the two cases.
+fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
+    kitty_graphics_enabled && !ioctl_cell_size_is_plausible()
 }
 
-/// Only pane graphics need pixel dimensions, and only when the ioctl cannot
-/// provide them.
-fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
-    kitty_graphics_enabled && should_query_host_cell_size() && ioctl_cell_size().is_none()
+/// Whether the ioctl reading is a cell a terminal could actually draw in.
+fn ioctl_cell_size_is_plausible() -> bool {
+    ioctl_cell_size().is_some_and(|(width_px, height_px)| {
+        crate::kitty_graphics::HostCellSize {
+            width_px,
+            height_px,
+        }
+        .is_plausible()
+    })
 }
 
 fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
@@ -2610,7 +2680,6 @@ fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.flush()
 }
 
-#[cfg(any(unix, test))]
 fn store_reported_cell_size(reported_cell_size: &AtomicU64, width_px: u32, height_px: u32) {
     let packed = pack_cell_size(width_px, height_px);
     if reported_cell_size.swap(packed, Ordering::AcqRel) != packed {
@@ -3007,16 +3076,40 @@ mod tests {
     }
 
     #[test]
-    fn host_cell_size_query_is_disabled_on_windows() {
-        assert_eq!(should_query_host_cell_size(), !cfg!(windows));
+    fn best_known_cell_size_prefers_a_plausible_ioctl_reading() {
+        // The common path, and the cheap one: no query, no reply to wait for.
+        assert_eq!(best_known_cell_size(Some((11, 21)), None), (11, 21));
+        assert_eq!(
+            best_known_cell_size(Some((11, 21)), Some((9, 18))),
+            (11, 21)
+        );
     }
 
     #[test]
-    fn cell_size_fallback_prefers_reported_size_over_default() {
-        assert_eq!(cell_size_fallback(0), (8, 16));
-        assert_eq!(cell_size_fallback(pack_cell_size(10, 21)), (10, 21));
-        assert_eq!(cell_size_fallback(pack_cell_size(10, 0)), (8, 16));
-        assert_eq!(cell_size_fallback(pack_cell_size(0, 21)), (8, 16));
+    fn best_known_cell_size_prefers_the_terminals_own_answer_to_an_implausible_ioctl() {
+        // The bug this ranking exists for. `3x7` is the arithmetic reading a
+        // client behind ConPTY or a remote bridge gets; believing it — or
+        // falling from it straight to the 8x16 guess — rasterises the sidebar
+        // for a cell the terminal does not have, and the terminal rescales
+        // what it is sent.
+        assert_eq!(best_known_cell_size(Some((3, 7)), Some((11, 21))), (11, 21));
+        assert_eq!(best_known_cell_size(None, Some((11, 21))), (11, 21));
+    }
+
+    #[test]
+    fn best_known_cell_size_falls_back_only_when_nothing_believable_was_measured() {
+        assert_eq!(best_known_cell_size(None, None), (8, 16));
+        assert_eq!(best_known_cell_size(Some((3, 7)), None), (8, 16));
+        // A square "cell" is a report, not a measurement.
+        assert_eq!(best_known_cell_size(None, Some((16, 16))), (8, 16));
+    }
+
+    #[test]
+    fn unpack_cell_size_rejects_a_half_reported_cell() {
+        assert_eq!(unpack_cell_size(0), None);
+        assert_eq!(unpack_cell_size(pack_cell_size(10, 21)), Some((10, 21)));
+        assert_eq!(unpack_cell_size(pack_cell_size(10, 0)), None);
+        assert_eq!(unpack_cell_size(pack_cell_size(0, 21)), None);
     }
 
     #[test]

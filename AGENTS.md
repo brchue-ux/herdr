@@ -300,6 +300,42 @@ that never move, so a motion measurement on a fresh fleet measures nothing —
 `data/herdr-live-composite/run.sh` builds a repo one commit ahead of *and*
 behind its upstream to light Push and Sync.
 
+### The host terminal's cell is a measurement, and one source of it lies
+
+Every pixel surface is rasterised at `cells x cell_size` and then placed in
+*cells* (`c=`/`r=` in `kitty_graphics::encode_display_placement`), so the
+terminal scales the image onto the cell box it was given. It is 1:1 only while
+the two agree, nothing in the protocol carries the disagreement, and the failure
+is not a misplaced image but a correctly placed soft one — which reads as a font
+or terminal problem rather than a herdr bug. `kitty_graphics::tests::
+every_sidebar_placement_carries_one_image_pixel_per_terminal_pixel` is the
+invariant.
+
+`client::best_known_cell_size` ranks the three sources. The ioctl reading
+(`ws_xpixel / columns`) is an estimate and can arrive **nonzero and impossible**:
+a client behind ConPTY or the `--remote` bridge reports an arithmetic `3x7`.
+`HostCellSize::is_plausible` is the gate, and the rule is *implausible before
+absent* — an unbelievable reading must not outrank the terminal's own `CSI 16 t`
+answer, and must not suppress the query that would get one. Rio answers `CSI 16
+t` exactly at every font size measured.
+
+Two consequences worth knowing before changing anything here. The client's cell
+reaches the server through `ClientMessage::Resize`, so one client-side ranking
+fixes the delegated *and* the server-rasterised path. And the assumed `8x16` was
+load-bearing by accident: badge sizes derived from a real cell reach shapes the
+assumed one never did, which is how `tray_art::rrect_contains` sat on an
+f32-inverted `clamp` range (a pill's two corner-centre bounds) without anyone
+hitting the panic.
+
+To reproduce a cell-size defect on the real thing, put the client on a PTY whose
+winsize pixel fields are a lie and run that inside a real terminal: the derived
+cell is then whatever you chose while the terminal underneath is genuinely
+itself, and its escape replies still pass through. Real Rio runs headless under
+`Xvfb` from its GitHub release `.deb`, and reports a real 11x21 px cell at font
+size 18. Read the emitted `a=p` controls back and divide `w`/`h` by `c`/`r`;
+that number is the cell the client believed, and it either is or is not the one
+the terminal answers with.
+
 ### Exercising the `--remote` client path without a second machine
 
 Neither standing rig covers the remote bridge, and it is a genuinely different

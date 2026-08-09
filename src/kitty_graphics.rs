@@ -2356,6 +2356,121 @@ mod tests {
         .is_empty());
     }
 
+    /// Every sidebar surface reaches the terminal at exactly one image pixel
+    /// per terminal pixel.
+    ///
+    /// The Kitty placement is written in *cells* (`c=`/`r=`) and the image in
+    /// *pixels*, so the terminal scales one onto the other. It is 1:1 only
+    /// while the image is `cells x cell_size` — nothing in the protocol says so
+    /// and nothing reports it when it stops being true. A client that gets the
+    /// cell wrong therefore does not misplace the artwork, which would be
+    /// obvious; it hands over the right rectangle at the wrong resolution and
+    /// the terminal resamples, which reads as "the cards look soft" and as
+    /// nothing else at all.
+    ///
+    /// So this walks the bytes both surfaces actually emit and divides:
+    /// source pixels per placed cell must be the cell the client was told it
+    /// has, on both axes, for every placement.
+    #[test]
+    fn every_sidebar_placement_carries_one_image_pixel_per_terminal_pixel() {
+        // Deliberately not the 8x16 default: that is the value a broken client
+        // lands on by accident, so a test written against it passes either way.
+        let cell = HostCellSize {
+            width_px: 11,
+            height_px: 21,
+        };
+
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.kitty_graphics_enabled = true;
+        app.sidebar_signal_tray.enabled = true;
+        app.view.sidebar_rect = Rect::new(0, 0, 42, 34);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+
+        let scene = crate::ui::build_signal_tray_scene(&app).expect("scene");
+        let (grid, image) =
+            crate::ui::rasterise_signal_tray_scene(&scene, cell.width_px, cell.height_px)
+                .expect("the client rasterises the tray");
+        // The raster itself, before anything places it.
+        assert_eq!(image.width, u32::from(grid.width) * cell.width_px);
+        assert_eq!(image.height, u32::from(grid.height) * cell.height_px);
+
+        let layer = crate::ui::signal_tray_graphics_layer(
+            image,
+            app.host_terminal_kind,
+            app.host_graphics_is_local,
+        )
+        .expect("the client encodes the tray it drew");
+        let bytes =
+            encode_tray_scene_graphics(grid, &layer, cell, &mut HostGraphicsCache::default());
+
+        let placements = placement_controls(&bytes);
+        assert!(
+            !placements.is_empty(),
+            "no placement was emitted to measure"
+        );
+        for control in placements {
+            let cols: u32 = control["c"].parse().expect("c");
+            let rows: u32 = control["r"].parse().expect("r");
+            // `w`/`h` are omitted when the whole image is used, which is the
+            // uncropped case; then the source is the image itself.
+            let source_width: u32 = control
+                .get("w")
+                .map_or(layer.image_width, |v| v.parse().expect("w"));
+            let source_height: u32 = control
+                .get("h")
+                .map_or(layer.image_height, |v| v.parse().expect("h"));
+            assert_eq!(
+                source_width,
+                cols * cell.width_px,
+                "placement asks the terminal to scale {source_width}px across {cols} cells \
+                 of {}px",
+                cell.width_px
+            );
+            assert_eq!(
+                source_height,
+                rows * cell.height_px,
+                "placement asks the terminal to scale {source_height}px down {rows} cells \
+                 of {}px",
+                cell.height_px
+            );
+        }
+    }
+
+    /// The `a=p` control blocks in an emitted Kitty stream, as key/value maps.
+    fn placement_controls(bytes: &[u8]) -> Vec<HashMap<String, String>> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        while let Some(start) = find_subslice(rest, b"\x1b_G") {
+            let body = &rest[start + 3..];
+            let Some(end) = find_subslice(body, b"\x1b\\") else {
+                break;
+            };
+            let control = String::from_utf8_lossy(&body[..end])
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let map: HashMap<String, String> = control
+                .split(',')
+                .filter_map(|part| part.split_once('='))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            if map.get("a").map(String::as_str) == Some("p") {
+                out.push(map);
+            }
+            rest = &body[end + 2..];
+        }
+        out
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     /// A surface a client rasterises itself is left out of that client's own
     /// pass — otherwise it receives the same badges twice, once as the scene
     /// it asked for and once as the pixels it asked not to be sent.

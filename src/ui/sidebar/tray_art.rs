@@ -470,8 +470,20 @@ fn rrect_contains(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32) 
     if px < x0 || px > x1 || py < y0 || py > y1 {
         return false;
     }
-    let cx = px.clamp(x0 + r, x1 - r);
-    let cy = py.clamp(y0 + r, y1 - r);
+    // The band of corner centres on each axis. It collapses to a single point
+    // when the radius is exactly half the extent — a pill — and [`Pen::rrect`]
+    // clamps the radius to exactly that, so the collapse is a shape the
+    // catalogue actually draws rather than a pathological input.
+    //
+    // The upper bound is held at or above the lower one because the two are
+    // computed by different arithmetic (`x0 + r` against `x1 - r`) and f32
+    // rounding can order them backwards at the collapse: a badge drawn at a
+    // real 11x21 px cell lands on 45.08 against 45.079998, and `f32::clamp`
+    // panics on an inverted range instead of returning the point. A cell that
+    // is 8x16 because nothing measured the terminal never reaches it, so this
+    // only became reachable once clients started using the cell they have.
+    let cx = px.clamp(x0 + r, (x1 - r).max(x0 + r));
+    let cy = py.clamp(y0 + r, (y1 - r).max(y0 + r));
     (px - cx).hypot(py - cy) <= r
 }
 
@@ -1619,5 +1631,57 @@ mod tests {
         let cold = settled(FleetSignal::Sync, BadgeState::Active, 48);
         let warm = settled(FleetSignal::Sync, BadgeState::Active, 48);
         assert_eq!(cold, warm);
+    }
+
+    /// A pill — a rounded rect whose radius is exactly half its extent — is a
+    /// shape the catalogue draws, not a pathological input.
+    ///
+    /// `Pen::rrect` clamps the radius to half the shorter side, so the two
+    /// corner-centre bounds meet; computed as `x0 + r` and `x1 - r` they can
+    /// meet a rounding error apart and in the wrong order. That used to reach
+    /// `f32::clamp` as an inverted range and abort the process. It is only
+    /// reachable at some badge sizes, and the badge size follows the host
+    /// terminal's cell — so a client pinned to an assumed 8x16 never found it
+    /// and one using the cell it actually has does.
+    #[test]
+    fn a_pill_shaped_badge_mark_does_not_panic_at_any_size() {
+        for size in 8u32..=96 {
+            for signal in FleetSignal::ALL {
+                for state in [BadgeState::Idle, BadgeState::Active, BadgeState::Attention] {
+                    let _ = render_badge(signal, state, size, paint(), 0.5);
+                }
+            }
+        }
+    }
+
+    /// The degenerate band itself, straight at the predicate.
+    ///
+    /// A pill's two corner-centre bounds are the same point, reached by
+    /// different arithmetic. The scan is over the device coordinates
+    /// `Pen::rrect` derives at real badge sizes -- `pr`'s own 0.14/0.32
+    /// horizontal span against its 0.09 radius -- so a case it finds is a badge
+    /// that can be drawn, not one invented to break the arithmetic.
+    #[test]
+    fn rrect_contains_survives_a_collapsed_corner_band() {
+        // The exactly-equal case, which was always fine.
+        assert!(rrect_contains(2.0, 5.0, 0.0, 0.0, 4.0, 20.0, 2.0));
+
+        let mut inverted = 0;
+        for size in 1..4_000u32 {
+            let hi = size as f32;
+            let (x0, x1) = (0.14 * hi, 0.32 * hi);
+            let r = (0.09 * hi).min((x1 - x0) / 2.0);
+            if x0 + r > x1 - r {
+                inverted += 1;
+                // Answers rather than aborting, and answers correctly: the
+                // band's own point is inside the shape that spans it.
+                assert!(rrect_contains(x0 + r, (x0 + x1) / 2.0, x0, x0, x1, x1, r));
+            }
+        }
+        assert!(
+            inverted > 0,
+            "no f32-inverted corner band in the scanned range; \
+             this test is no longer testing anything"
+        );
     }
 }

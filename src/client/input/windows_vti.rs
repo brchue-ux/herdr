@@ -16,9 +16,13 @@ pub(super) fn raw_console_reader_loop(
     handle: windows_sys::Win32::Foundation::HANDLE,
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
+    host_cell_size_query_sent: bool,
 ) {
     let mut mapper = WindowsInputMapper::default();
     let mut pump = WindowsInputPump::default();
+    if host_cell_size_query_sent {
+        pump.framer.host_cell_size_query_sent();
+    }
 
     while !should_quit.load(Ordering::Acquire) {
         match windows_console_input_items(handle, &mut mapper) {
@@ -31,7 +35,10 @@ pub(super) fn raw_console_reader_loop(
                 if !process_platform_input_items(mapper.idle(), &mut pump, &event_tx) {
                     return;
                 }
-                if !send_windows_client_input_events(pump.idle(), &event_tx) {
+                let events = pump.idle();
+                if !drain_pump_host_cell_size(&mut pump, &event_tx)
+                    || !send_windows_client_input_events(events, &event_tx)
+                {
                     return;
                 }
             }
@@ -47,11 +54,27 @@ fn process_platform_input_items(
     event_tx: &mpsc::Sender<ClientLoopEvent>,
 ) -> bool {
     for item in items {
-        if !send_windows_client_input_events(pump.process(item), event_tx) {
+        let events = pump.process(item);
+        if !drain_pump_host_cell_size(pump, event_tx)
+            || !send_windows_client_input_events(events, event_tx)
+        {
             return false;
         }
     }
     true
+}
+
+#[cfg(windows)]
+fn drain_pump_host_cell_size(
+    pump: &mut WindowsInputPump,
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    match pump.take_host_cell_size() {
+        Some((width_px, height_px)) => {
+            super::send_windows_host_cell_size(width_px, height_px, event_tx)
+        }
+        None => true,
+    }
 }
 
 #[cfg(windows)]
@@ -185,6 +208,14 @@ struct WindowsInputMapper {
 struct WindowsInputPump {
     framer: crate::raw_input::RawInputFramer,
     paste_from_win32_key_records: bool,
+    /// The most recent `CSI 16 t` reply seen in a batch, held until the reader
+    /// loop drains it.
+    ///
+    /// Kept here rather than returned alongside the client events because the
+    /// pump's whole output shape is "what the app should be told", and the cell
+    /// size is the one thing in the stream that the *client* asked for and the
+    /// app must never see. See `super::host_cell_size_from_raw_events`.
+    host_cell_size: Option<(u32, u32)>,
 }
 
 impl Default for WindowsInputPump {
@@ -192,6 +223,7 @@ impl Default for WindowsInputPump {
         Self {
             framer: crate::raw_input::RawInputFramer::for_host_input(),
             paste_from_win32_key_records: false,
+            host_cell_size: None,
         }
     }
 }
@@ -297,7 +329,15 @@ impl WindowsInputPump {
         {
             self.paste_from_win32_key_records = false;
         }
+        if let Some(cell) = super::host_cell_size_from_raw_events(&events) {
+            self.host_cell_size = Some(cell);
+        }
         Self::raw_events_to_client_events(events)
+    }
+
+    /// The cell size reply seen since this was last asked, if any.
+    fn take_host_cell_size(&mut self) -> Option<(u32, u32)> {
+        self.host_cell_size.take()
     }
 
     fn raw_events_to_client_events(
@@ -319,6 +359,10 @@ struct WindowsInputTranslator {
 
 #[cfg(test)]
 impl WindowsInputTranslator {
+    fn host_cell_size(&mut self) -> Option<(u32, u32)> {
+        self.pump.take_host_cell_size()
+    }
+
     fn translate(&mut self, record: WindowsInputRecord) -> Vec<crate::protocol::ClientInputEvent> {
         let mut events = Vec::new();
         for item in self.mapper.translate(record) {
@@ -2495,5 +2539,42 @@ mod tests {
                 crate::protocol::ClientInputEvent::FocusLost,
             ]
         );
+    }
+
+    /// The host terminal's `CSI 16 t` reply is the client's own answer, not the
+    /// app's input.
+    ///
+    /// The Windows path converts raw events into semantic `ClientInputEvent`s
+    /// and drops whatever is not one, which is right for a reply the app must
+    /// never see and wrong for one the client asked for: without this the
+    /// answer is parsed, discarded, and the client keeps rasterising the
+    /// sidebar for a cell size it guessed.
+    #[test]
+    fn vti_captures_the_host_cell_size_reply_without_forwarding_it_as_input() {
+        let mut translator = WindowsInputTranslator::default();
+        let events: Vec<_> = "\x1b[6;21;11t"
+            .chars()
+            .flat_map(|ch| translator.translate(key_char(ch)))
+            .collect();
+
+        assert_eq!(translator.host_cell_size(), Some((11, 21)));
+        assert!(
+            events.is_empty(),
+            "the cell size reply leaked into the app as input: {events:?}"
+        );
+        // Drained, so the next batch does not re-report a stale cell.
+        assert_eq!(translator.host_cell_size(), None);
+    }
+
+    /// Ordinary input is untouched by the capture above.
+    #[test]
+    fn vti_ordinary_keys_report_no_host_cell_size() {
+        let mut translator = WindowsInputTranslator::default();
+        let events: Vec<_> = "hi"
+            .chars()
+            .flat_map(|ch| translator.translate(key_char(ch)))
+            .collect();
+        assert_eq!(translator.host_cell_size(), None);
+        assert!(!events.is_empty());
     }
 }

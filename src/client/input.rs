@@ -44,12 +44,8 @@ pub fn stdin_reader_loop(
 ) {
     #[cfg(windows)]
     {
-        let _ = (
-            host_color_query_sent,
-            host_cell_size_query_sent,
-            host_mouse_capture_active,
-        );
-        windows_stdin_reader_loop(event_tx, should_quit);
+        let _ = (host_color_query_sent, host_mouse_capture_active);
+        windows_stdin_reader_loop(event_tx, should_quit, host_cell_size_query_sent);
     }
 
     #[cfg(unix)]
@@ -201,15 +197,21 @@ fn idle_flush_timeout_ms(
 fn windows_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
+    host_cell_size_query_sent: bool,
 ) {
     if !super::windows_vti_input_backend_enabled() {
-        windows_crossterm_reader_loop(event_tx, should_quit);
+        windows_crossterm_reader_loop(event_tx, should_quit, host_cell_size_query_sent);
     } else {
         match windows_vti::console_input_handle() {
             Ok(handle) if windows_vti::virtual_terminal_input_enabled(handle) => {
-                windows_vti::raw_console_reader_loop(handle, event_tx, should_quit);
+                windows_vti::raw_console_reader_loop(
+                    handle,
+                    event_tx,
+                    should_quit,
+                    host_cell_size_query_sent,
+                );
             }
-            _ => windows_crossterm_reader_loop(event_tx, should_quit),
+            _ => windows_crossterm_reader_loop(event_tx, should_quit, host_cell_size_query_sent),
         }
     }
 }
@@ -218,8 +220,12 @@ fn windows_stdin_reader_loop(
 fn windows_crossterm_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
+    host_cell_size_query_sent: bool,
 ) {
     let mut framer = crate::raw_input::RawInputFramer::for_host_input();
+    if host_cell_size_query_sent {
+        framer.host_cell_size_query_sent();
+    }
 
     while !should_quit.load(Ordering::Acquire) {
         match crossterm::event::poll(Duration::from_millis(10)) {
@@ -364,6 +370,11 @@ fn send_windows_raw_events(
     event_tx: &mpsc::Sender<ClientLoopEvent>,
 ) -> bool {
     let raw_event_count = events.len();
+    if let Some((width_px, height_px)) = host_cell_size_from_raw_events(&events) {
+        if !send_windows_host_cell_size(width_px, height_px, event_tx) {
+            return false;
+        }
+    }
     let events = events
         .into_iter()
         .filter_map(windows_client_input_event_from_raw)
@@ -379,6 +390,41 @@ fn send_windows_raw_events(
     );
     event_tx
         .blocking_send(ClientLoopEvent::StdinEvents(events))
+        .is_ok()
+}
+
+/// The host terminal's own answer to `CSI 16 t`, if one is in this batch.
+///
+/// The Windows input path turns raw events into semantic
+/// `ClientInputEvent`s and drops everything that is not one, which is right for
+/// a reply the *app* must never see and wrong for one the *client* asked for.
+/// The Unix path reads the same event out of its own byte stream
+/// (`client::reported_cell_size_from_events`); this is that read, on the side
+/// of the boundary where the raw events still exist.
+#[cfg(any(windows, test))]
+fn host_cell_size_from_raw_events(
+    events: &[crate::raw_input::RawInputEvent],
+) -> Option<(u32, u32)> {
+    events.iter().rev().find_map(|event| match event {
+        crate::raw_input::RawInputEvent::HostCellSizeReport {
+            width_px,
+            height_px,
+        } => Some((*width_px, *height_px)),
+        _ => None,
+    })
+}
+
+#[cfg(windows)]
+fn send_windows_host_cell_size(
+    width_px: u32,
+    height_px: u32,
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    event_tx
+        .blocking_send(ClientLoopEvent::HostCellSizeReported {
+            width_px,
+            height_px,
+        })
         .is_ok()
 }
 
@@ -766,5 +812,27 @@ mod windows_tests {
                 source: crate::protocol::ClientKeySource::Vt { bytes: vec![0x1b] },
             }
         );
+    }
+
+    /// The last cell size in a batch wins, and a batch without one reports
+    /// nothing — the same rule the Unix client's own reader applies to the
+    /// events it parses out of its byte stream.
+    #[test]
+    fn host_cell_size_is_read_out_of_raw_events_before_they_become_input() {
+        let none = crate::raw_input::parse_raw_input_bytes_sync(b"hello");
+        assert_eq!(host_cell_size_from_raw_events(&none), None);
+
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[6;16;8t\x1b[6;21;11t");
+        assert_eq!(host_cell_size_from_raw_events(&events), Some((11, 21)));
+    }
+
+    /// A cell size reply is never handed to the app as a keystroke.
+    #[test]
+    fn a_host_cell_size_reply_is_not_a_client_input_event() {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[6;21;11t");
+        assert!(!events.is_empty(), "the reply parsed to nothing at all");
+        assert!(events
+            .into_iter()
+            .all(|event| windows_client_input_event_from_raw(event).is_none()));
     }
 }
