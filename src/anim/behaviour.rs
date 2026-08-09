@@ -34,7 +34,7 @@ use crate::ui::color::mix_rgb;
 
 /// Loop period every built-in idle behaviour is written against unless it says
 /// otherwise. Long enough to read as breathing rather than as flashing.
-const DEFAULT_PERIOD: Duration = Duration::from_millis(1_600);
+const DEFAULT_PERIOD: Duration = Duration::from_millis(2_240);
 
 /// Default spacing between two frames anyone could tell apart.
 ///
@@ -860,16 +860,16 @@ pub(crate) mod names {
 /// Deliberately far slower than either live badge. Rest is told apart from lit
 /// by tempo before it is told apart by anything else, and a resting slot that
 /// breathed at a lit slot's speed would just look like a dimmer version of it.
-const BADGE_REST_PERIOD: Duration = Duration::from_millis(4_200);
+const BADGE_REST_PERIOD: Duration = Duration::from_millis(5_880);
 
 /// How long one snap-and-settle takes on a lit badge.
-const BADGE_CHARGE_PERIOD: Duration = Duration::from_millis(1_900);
+const BADGE_CHARGE_PERIOD: Duration = Duration::from_millis(2_660);
 
 /// How long one snap-and-settle takes on an escalated badge.
 ///
 /// Under half the lit period, which is the gap at which two rhythms read as
 /// two rhythms rather than as one that drifted.
-const BADGE_ALERT_PERIOD: Duration = Duration::from_millis(760);
+const BADGE_ALERT_PERIOD: Duration = Duration::from_millis(1_064);
 
 /// Frame spacing for a badge that is moving.
 ///
@@ -920,10 +920,10 @@ const CHARGE_ARCS: [char; 8] = ['╪', '╫', '╬', '┼', '╳', '╱', '╲',
 /// tempo first, and a whole tree of cards breathing at a badge's rate would be
 /// a panel full of movement saying nothing — the visual-target spec's *"back
 /// burner"* is the absence of demand, not a dimmer setting.
-const CARD_REST_PERIOD: Duration = Duration::from_millis(5_200);
+const CARD_REST_PERIOD: Duration = Duration::from_millis(7_280);
 
 /// How long one snap-and-settle takes on a card with work behind it.
-const CARD_LIVE_PERIOD: Duration = Duration::from_millis(2_400);
+const CARD_LIVE_PERIOD: Duration = Duration::from_millis(3_360);
 
 /// How far a resting card's breath swings.
 ///
@@ -949,7 +949,7 @@ const CARD_LIVE_DEPTH: f32 = 0.55;
 /// at half the stated period would sit inside that span and read as a card
 /// merely working hard. Half of 1,412 is where the escalation is unambiguous,
 /// which lands within a breath of [`BADGE_ALERT_PERIOD`]'s own 760 ms.
-const CARD_ALERT_PERIOD: Duration = Duration::from_millis(680);
+const CARD_ALERT_PERIOD: Duration = Duration::from_millis(952);
 
 /// How far an escalated card's breath swings.
 ///
@@ -978,13 +978,13 @@ const CARD_FRAME_INTERVAL: Duration = SMOOTH_FRAME_INTERVAL;
 /// Long enough that the snap is a movement across the card rather than a
 /// flash, short enough that the card has arrived in its new state before a
 /// reader's eye has finished travelling to it.
-pub(crate) const CARD_WASH_PERIOD: Duration = Duration::from_millis(520);
+pub(crate) const CARD_WASH_PERIOD: Duration = Duration::from_millis(728);
 
 /// How long a command-acknowledgement marker takes to snap in.
 ///
 /// Faster than [`CARD_WASH_PERIOD`]: a wash crosses a whole card, a marker is
 /// one glyph, and the snap should read as a flick rather than a sweep.
-pub(crate) const CMD_ACK_MOUNT_PERIOD: Duration = Duration::from_millis(280);
+pub(crate) const CMD_ACK_MOUNT_PERIOD: Duration = Duration::from_millis(392);
 
 /// How long a command-acknowledgement marker holds at full brightness before
 /// it is allowed to start fading.
@@ -993,10 +993,10 @@ pub(crate) const CMD_ACK_MOUNT_PERIOD: Duration = Duration::from_millis(280);
 /// totals a visible lifetime of about 1.7s — in the neighbourhood the scoping
 /// report recommended (roughly 1.5–2.0s, alongside every other "notice me"
 /// timing already tuned on this fork).
-pub(crate) const CMD_ACK_HOLD_PERIOD: Duration = Duration::from_millis(1_100);
+pub(crate) const CMD_ACK_HOLD_PERIOD: Duration = Duration::from_millis(1_540);
 
 /// How long a command-acknowledgement marker takes to fade once its hold ends.
-pub(crate) const CMD_ACK_DISMOUNT_PERIOD: Duration = Duration::from_millis(320);
+pub(crate) const CMD_ACK_DISMOUNT_PERIOD: Duration = Duration::from_millis(448);
 
 /// How long the failure spider takes to climb to a card, or to retreat back
 /// down it.
@@ -1005,7 +1005,7 @@ pub(crate) const CMD_ACK_DISMOUNT_PERIOD: Duration = Duration::from_millis(320);
 /// that the climb reads as travel along the trunk/branch rather than a jump,
 /// short enough that it has arrived before a reader's eye has finished moving
 /// to the card that just failed.
-pub(crate) const FAILURE_SPIDER_CLIMB_PERIOD: Duration = Duration::from_millis(650);
+pub(crate) const FAILURE_SPIDER_CLIMB_PERIOD: Duration = Duration::from_millis(910);
 
 /// How long one snap-and-settle takes on a resting failure spider.
 ///
@@ -1014,7 +1014,7 @@ pub(crate) const FAILURE_SPIDER_CLIMB_PERIOD: Duration = Duration::from_millis(6
 /// of the escalated ladder those two play, so a failing card's own alert
 /// breath and the spider sitting on its border read as one rhythm rather than
 /// two competing ones.
-const FAILURE_SPIDER_PULSE_PERIOD: Duration = Duration::from_millis(720);
+const FAILURE_SPIDER_PULSE_PERIOD: Duration = Duration::from_millis(1_008);
 
 /// How far the resting failure spider's pulse swings.
 ///
@@ -1211,7 +1211,7 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 24] {
                 field: HORIZONTAL,
                 shape: Shape::Band { width: 0.45 },
                 paint: Paint::tint(Ink::Accent, 0.85),
-                period: Duration::from_millis(1_400),
+                period: Duration::from_millis(1_960),
                 frame_interval: SMOOTH_FRAME_INTERVAL,
                 ..BASE
             },
@@ -1255,7 +1255,7 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 24] {
                 field: HORIZONTAL,
                 shape: Shape::Band { width: 0.5 },
                 paint: Paint::tint(Ink::Accent, 0.9),
-                period: Duration::from_millis(1_600),
+                period: Duration::from_millis(2_240),
                 frame_interval: SMOOTH_FRAME_INTERVAL,
                 depth_drive: Drive::Activity {
                     at_rest: 0.15,
@@ -1472,6 +1472,16 @@ fn built_in_behaviours() -> [(&'static str, Behaviour); 24] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The factor every cycle in the sidebar was slowed by.
+    ///
+    /// The captain asked for the panel's animation to run about two fifths
+    /// slower, which is this multiplier on every duration in this module. It is
+    /// stated here rather than applied to the constants at runtime because the
+    /// slowed number is the number the design is now drawn at — the periods are
+    /// literals, and this is what a test pinning one to its own history has to
+    /// account for.
+    const SLOWDOWN: f32 = 1.4;
 
     const PALETTE: InkPalette = InkPalette {
         surface: (0, 0, 0),
@@ -1765,10 +1775,20 @@ mod tests {
         }
 
         let behaviour = get(names::PULSE);
+        // The *ramp* is the parity claim and it is checked below, over
+        // normalised progress, so it holds at any period. The period itself no
+        // longer matches those sixteen frames: every cycle in the panel was
+        // deliberately slowed by two fifths, so this is that same sixteen-frame
+        // pulse taken to 1.4x its length, and the check is pinned to the
+        // relationship rather than dropped.
         assert_eq!(
             behaviour.period,
-            crate::app::ANIMATION_INTERVAL * HALF_CYCLE_FRAMES * 2,
-            "the engine's period must be the sixteen frames the sidebar used"
+            Duration::from_millis(
+                ((crate::app::ANIMATION_INTERVAL * HALF_CYCLE_FRAMES * 2).as_millis() as f32
+                    * SLOWDOWN)
+                    .round() as u64,
+            ),
+            "the pulse must be the sidebar's sixteen frames, at the panel's slowed pace"
         );
         for tick in 0..(HALF_CYCLE_FRAMES * 2) {
             let progress = tick as f32 / (HALF_CYCLE_FRAMES * 2) as f32;

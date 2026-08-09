@@ -16,10 +16,15 @@ use crate::app::state::AppState;
 /// How long each frame is shown once playback is armed. Slow enough to read as ambient rather
 /// than distracting; matches the report's own `z=600`-class proof-of-concept cadence closely
 /// enough that autonomous playback is easy to eyeball against a stopwatch during verification.
-pub(crate) const FRAME_GAP_MS: u32 = 100;
+///
+/// Taken from the 100 ms it was drawn at when the panel's cycles were all slowed by two fifths.
+/// The frame *count* is deliberately left alone: the sweep is generated once per resize and
+/// uploaded whole, so buying the slower loop with more frames would pay for pacing in upload
+/// bytes, which is the one budget this field has already been trimmed against twice.
+pub(crate) const FRAME_GAP_MS: u32 = 140;
 
 /// Samples per full rotation. 24 is enough for the sweep to read as continuous motion rather
-/// than a slideshow at [`FRAME_GAP_MS`]'s cadence (2.4s per loop), while keeping the one-time
+/// than a slideshow at [`FRAME_GAP_MS`]'s cadence (3.4s per loop), while keeping the one-time
 /// generation-plus-upload cost — paid only on a resize, never per tick — bounded.
 const FRAME_COUNT: usize = 24;
 
