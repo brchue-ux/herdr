@@ -830,6 +830,7 @@ impl App {
             signal_tray_graphics: None,
             signal_tray_graphics_key: 0,
             signal_tray_published: crate::app::state::PublishedSurfaceRaster::default(),
+            sidebar_card_graphics_client_rasterized: false,
             signal_tray_graphics_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,

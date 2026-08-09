@@ -268,11 +268,16 @@ fn desktop_tab_bar_and_terminal_area(
 /// whose cards change about once every ninety seconds rasterises about that
 /// often rather than on every frame.
 ///
-/// Returns whether *this* pass published card artwork, which is what
-/// `ViewState::sidebar_card_layers_published` carries to both halves of the
-/// pixel path. A pass that leaves the foreground client's cards alone answers
-/// `false`: the artwork exists, but not for this pass, so that pass keeps
-/// drawing its character cards and is sent none of the images.
+/// Returns whether a card is going to be drawn over each of these rows, which
+/// is what `ViewState::sidebar_card_layers_published` carries to both halves of
+/// the pixel path. A pass that leaves the foreground client's cards alone
+/// answers `false`: the artwork exists, but not for this pass, so that pass
+/// keeps drawing its character cards and is sent none of the images.
+///
+/// "A card is coming" and "this pass drew one" are the same answer everywhere
+/// except when every attached viewer rasterises its own cards, where the cards
+/// are coming and none of them are drawn here — see
+/// [`sidebar::image_card::CardsUpdate::Delegated`].
 ///
 /// It also stamps each row's resolved motion offset back onto `cards`, so the
 /// character renderer draws the tree's connectors at the cells the placement
@@ -316,6 +321,17 @@ fn update_sidebar_card_layers(
         sidebar::image_card::CardsUpdate::Unchanged => {}
         sidebar::image_card::CardsUpdate::Rebuilt(layers) => app.sidebar_card_layers = layers,
         sidebar::image_card::CardsUpdate::Empty => app.sidebar_card_layers.clear(),
+        // Published by somebody else. The panel holds nothing — anything held
+        // here would be pixels no attached viewer is sent — but the answer is
+        // still `true`, because a card *is* going to be drawn over every one of
+        // these rows and the character cards underneath have to stand down for
+        // it exactly as they would for artwork built here. Any artwork left over
+        // from before delegation started is dropped with it, so nothing stale
+        // can be placed if a viewer that draws its own cards leaves.
+        sidebar::image_card::CardsUpdate::Delegated => {
+            app.sidebar_card_layers.clear();
+            return true;
+        }
     }
     // Published, not merely intended: a build that produced nothing falls back
     // to the character cards rather than blanking the tree.
