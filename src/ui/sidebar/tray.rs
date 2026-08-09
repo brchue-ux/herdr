@@ -297,7 +297,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
         );
     }
 
-    if artwork_covers_grid(app) {
+    if artwork_covers_grid(app, tray) {
         return;
     }
 
@@ -329,7 +329,17 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
 /// graphics* form, and a mark showing through a mostly-transparent badge is
 /// worse than either alone — so what matters is that badges are coming, not
 /// which machine drew them.
-fn artwork_covers_grid(app: &AppState) -> bool {
+///
+/// Third, and it is a *not*: badges that exist are still not coming to a pass
+/// whose overlay covers the tray, because an image is never placed under one
+/// (`crate::ui::OverlayOcclusion`). The popover a badge click opens is anchored
+/// above the tray precisely so the badges stay readable behind it, and leaving
+/// the marks off for artwork that pass is not going to place is what emptied
+/// the tray on that click instead.
+fn artwork_covers_grid(app: &AppState, tray: Rect) -> bool {
+    if crate::ui::overlay_occlusion(app).hides(tray) {
+        return false;
+    }
     app.signal_tray_graphics.is_some() || app.signal_tray_graphics_client_rasterized
 }
 
@@ -1023,6 +1033,87 @@ mod tests {
             marks_drawn(&app),
             0,
             "the fallback marks were drawn under badges the client is about to composite"
+        );
+    }
+
+    /// The marks come back for an overlay that takes the badges off the
+    /// terminal, and stay off for one that does not reach them.
+    ///
+    /// A Kitty image composites above the cell text, so no image is placed under
+    /// an open overlay ([`crate::ui::OverlayOcclusion`]) — and the marks stood
+    /// down for artwork that pass was no longer going to place, which is why
+    /// clicking a badge emptied the tray it opened. The popover is anchored
+    /// *above* the tray on purpose, so it is also the case that must not flip
+    /// the marks back on.
+    #[test]
+    fn the_marks_come_back_for_an_overlay_that_takes_the_badges_off_the_terminal() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = app_with_tray(42, 34);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.mode = crate::app::Mode::Terminal;
+        app.view.terminal_area = Rect::new(42, 0, 58, 34);
+        app.signal_tray_graphics = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Rgba,
+            1,
+            1,
+            vec![0, 0, 0, 0],
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        ));
+
+        let marks_drawn = |app: &AppState| {
+            let area = app.view.sidebar_rect;
+            let mut terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("backend");
+            terminal
+                .draw(|frame| render(app, frame, crate::ui::sidebar::sidebar_content_rect(area)))
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            FleetSignal::ALL
+                .into_iter()
+                .filter(|signal| {
+                    (0..area.height)
+                        .any(|y| (0..area.width).any(|x| buffer[(x, y)].symbol() == signal.mark()))
+                })
+                .count()
+        };
+
+        assert_eq!(
+            marks_drawn(&app),
+            0,
+            "the badges are coming, so this starts from the wrong state"
+        );
+
+        let tray = tray_rect(&app, content(&app));
+        assert!(tray.height > 0, "the tray is off, so this tests nothing");
+
+        // An overlay drawn over the tray: the badges are not placed, so the
+        // marks are the only thing that can say what the eight slots hold.
+        app.mode = crate::app::Mode::ContextMenu;
+        app.context_menu = Some(crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            x: 1,
+            y: tray.y,
+            list: crate::app::state::MenuListState::new(0),
+        });
+        assert_eq!(
+            marks_drawn(&app),
+            FleetSignal::COUNT,
+            "the tray drew neither its badges nor its marks"
+        );
+
+        // One that misses it entirely leaves the badges alone.
+        app.context_menu = Some(crate::app::state::ContextMenuState {
+            kind: crate::app::state::ContextMenuKind::Workspace { ws_idx: 0 },
+            x: 60,
+            y: 1,
+            list: crate::app::state::MenuListState::new(0),
+        });
+        assert_eq!(
+            marks_drawn(&app),
+            0,
+            "a menu nowhere near the tray put marks under badges that are still coming"
         );
     }
 
