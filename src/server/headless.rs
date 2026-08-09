@@ -4732,6 +4732,13 @@ impl HeadlessServer {
         // See `AppState::every_app_viewer_shares_host_cell_size`.
         self.app.state.every_app_viewer_shares_host_cell_size =
             self.every_app_viewer_shares_host_cell_size();
+        // Alongside it, and for the same structural reason: the card layers are
+        // shared artwork on `AppState`, so whether this process still has to
+        // draw them is a fold across every attached viewer rather than the
+        // foreground one's opinion. Read by `crate::ui::update_sidebar_card_layers`
+        // on the render pass this tick is about to feed.
+        self.app.state.sidebar_card_graphics_client_rasterized =
+            self.every_app_viewer_rasterizes_sidebar_cards();
         changed |= self
             .app
             .observe_signal_tray(now, self.every_app_viewer_rasterizes_signal_tray());
@@ -4828,6 +4835,31 @@ impl HeadlessServer {
             .filter(|client| client.is_full_app_client())
             .peekable();
         viewers.peek().is_some() && viewers.all(|client| client.wants_client_rasterized_signal_tray)
+    }
+
+    /// True when there is at least one client rendering the app and *every* one
+    /// of them draws the sidebar's cards itself from a
+    /// `ServerMessage::CardScene`.
+    ///
+    /// The card twin of [`Self::every_app_viewer_rasterizes_signal_tray`], with
+    /// the same shape and the same reason for it: `AppState::sidebar_card_layers`
+    /// is one set of images every viewer is placed a copy of, so it can only be
+    /// left undrawn when nobody is left who would be sent it. A fallback client
+    /// attaching beside a delegating one puts the server straight back to
+    /// drawing them, which is what keeps that client's tree from going bare.
+    ///
+    /// False with no app viewers at all, unlike the two *withdrawing* predicates
+    /// above: cards rasterised for nobody are wasted either way, but the honest
+    /// reading of "they all draw them themselves" needs at least one of them to
+    /// exist, and the standing artwork is what a client attaching mid-session is
+    /// sent before its own first scene arrives.
+    fn every_app_viewer_rasterizes_sidebar_cards(&self) -> bool {
+        let mut viewers = self
+            .clients
+            .values()
+            .filter(|client| client.is_full_app_client())
+            .peekable();
+        viewers.peek().is_some() && viewers.all(|client| client.wants_client_rasterized_cards)
     }
 
     /// Initiates graceful shutdown.
@@ -10949,6 +10981,51 @@ next_tab = ""
             "a client whose own pass disagrees with the shared view must not be \
              encoded from that view"
         );
+    }
+
+    /// One fallback client attaching beside a delegating one puts the server
+    /// straight back to drawing the cards.
+    ///
+    /// The predicate is unanimous-or-nothing because the layers are one set of
+    /// images on shared `AppState` that every viewer is placed a copy of — the
+    /// same fold `every_app_viewer_rasterizes_signal_tray` makes for the tray,
+    /// and the reason a mixed pair is the case that has to be got right: the
+    /// non-delegating client is sent whatever this decides, and it is sent
+    /// nothing if the answer is wrong.
+    #[test]
+    fn the_server_stops_drawing_cards_only_when_every_viewer_draws_its_own() {
+        let (mut server, _rx1, _rx2) = two_app_client_test_server();
+
+        assert!(
+            !server.every_app_viewer_rasterizes_sidebar_cards(),
+            "two ordinary clients had their cards withheld"
+        );
+
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .wants_client_rasterized_cards = true;
+        assert!(
+            !server.every_app_viewer_rasterizes_sidebar_cards(),
+            "the fallback client beside a delegating one was left with a bare tree"
+        );
+
+        server
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .wants_client_rasterized_cards = true;
+        assert!(
+            server.every_app_viewer_rasterizes_sidebar_cards(),
+            "every viewer draws its own cards and the server drew them anyway"
+        );
+
+        // And with nobody attached at all the answer is false, not vacuously
+        // true: standing artwork is what a client attaching mid-session is sent
+        // before its own first scene arrives.
+        server.clients.clear();
+        assert!(!server.every_app_viewer_rasterizes_sidebar_cards());
     }
 
     /// The mirror of the case above: when every app client's own last pass

@@ -137,13 +137,29 @@ pub(crate) struct PublishedSurfaceRaster {
 }
 
 impl PublishedSurfaceRaster {
-    /// Whether `pixels` is far enough from what the terminal is showing to be
-    /// worth an upload, recording it as published when it is.
+    /// The raster a surface has just handed a terminal, as the anchor every
+    /// later one is measured against.
     ///
-    /// Geometry always publishes: a surface that changed size is a different
-    /// image whatever its pixels say, and there is nothing to compare it to.
-    pub(crate) fn accept(&mut self, width: u32, height: u32, pixels: &[u8]) -> bool {
-        let worth_sending = match &self.published {
+    /// For a producer that cannot record into a `&mut self` — the card path
+    /// draws its surfaces across several threads, so each one builds its own
+    /// anchor and hands it back with the layer rather than writing into a shared
+    /// one. See [`Self::holds`].
+    pub(crate) fn of(width: u32, height: u32, pixels: &[u8]) -> Self {
+        Self {
+            published: Some((width, height, pixels.to_vec())),
+        }
+    }
+
+    /// Whether the artwork this surface already put on screen still stands for
+    /// `pixels` — every channel within [`SURFACE_DRIFT_LEVELS`] of it — so there
+    /// is nothing a viewer could see in sending the new raster.
+    ///
+    /// The half of [`Self::accept`] that decides, split out because it records
+    /// nothing and so can be asked from anywhere. Geometry never holds: a
+    /// surface that changed size is a different image whatever its pixels say,
+    /// and there is nothing to compare it to.
+    pub(crate) fn holds(&self, width: u32, height: u32, pixels: &[u8]) -> bool {
+        match &self.published {
             Some((published_width, published_height, published))
                 if *published_width == width
                     && *published_height == height
@@ -152,10 +168,16 @@ impl PublishedSurfaceRaster {
                 published
                     .iter()
                     .zip(pixels)
-                    .any(|(was, now)| was.abs_diff(*now) > SURFACE_DRIFT_LEVELS)
+                    .all(|(was, now)| was.abs_diff(*now) <= SURFACE_DRIFT_LEVELS)
             }
-            _ => true,
-        };
+            _ => false,
+        }
+    }
+
+    /// Whether `pixels` is far enough from what the terminal is showing to be
+    /// worth an upload, recording it as published when it is.
+    pub(crate) fn accept(&mut self, width: u32, height: u32, pixels: &[u8]) -> bool {
+        let worth_sending = !self.holds(width, height, pixels);
         if worth_sending {
             self.published = Some((width, height, pixels.to_vec()));
         }
@@ -2141,6 +2163,24 @@ pub struct AppState {
     /// fallback marks off the grid, because badges are coming — just not from
     /// here. Recomputed from the attached clients every pass, never persisted.
     pub(crate) signal_tray_graphics_client_rasterized: bool,
+    /// Whether the sidebar's cards are being rasterised by whoever is watching
+    /// rather than here — every attached viewer asked for them as a
+    /// `ServerMessage::CardScene` and draws them from that.
+    ///
+    /// The card twin of [`Self::signal_tray_graphics_client_rasterized`], and it
+    /// exists for the reason #95 gave when it took the tray off the server:
+    /// withholding the pixels was only ever half of moving the work, because the
+    /// server went on *drawing* them. `crate::ui::update_sidebar_card_layers`
+    /// reads it and stops after the layout, which on an idle fleet is the
+    /// difference between ten cards rasterised and PNG-encoded on every frame
+    /// tier and none.
+    ///
+    /// Unanimous-or-nothing, and false with no app viewers at all — the layers
+    /// are one set of images on this shared state that every viewer is placed a
+    /// copy of, so they can only be left undrawn when nobody is left who would
+    /// be sent them. See `every_app_viewer_rasterizes_sidebar_cards`.
+    /// Recomputed from the attached clients every pass, never persisted.
+    pub(crate) sidebar_card_graphics_client_rasterized: bool,
     /// The sidebar's ambient particle-field wash, its loop frames included via
     /// [`GraphicsLayer::animation`]. `None` when disabled, not yet generated, or the sidebar
     /// column has no area.
@@ -3394,6 +3434,7 @@ impl AppState {
             signal_tray_graphics_key: 0,
             signal_tray_published: PublishedSurfaceRaster::default(),
             signal_tray_graphics_client_rasterized: false,
+            sidebar_card_graphics_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
             background_scene: None,

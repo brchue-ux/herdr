@@ -2829,6 +2829,7 @@ mod tests {
             signature: 1,
             content_signature: 1,
             undissolved: None,
+            published: crate::app::state::PublishedSurfaceRaster::default(),
             layer: crate::app::state::GraphicsLayer::new(
                 crate::api::schema::PaneGraphicsFormat::Rgba,
                 u32::from(rect.width) * test_cell_size().width_px,

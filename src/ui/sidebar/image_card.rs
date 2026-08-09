@@ -314,6 +314,29 @@ pub(crate) struct SidebarCardLayer {
     /// `None` whenever the panel is settled or the effect is off, so a Herdr
     /// nobody has configured this on carries no extra megabyte around.
     pub undissolved: Option<UndissolvedSheet>,
+    /// The pixels this *host image slot* last actually handed the terminal.
+    ///
+    /// [`Self::signature`] says the artwork may have moved; this says whether
+    /// the move is one a viewer could see. A resting card's breath moves the
+    /// signature on every frame of the tier and the pixels by a fraction of one
+    /// 8-bit level, and without this every one of those is a whole-surface
+    /// re-encode and re-upload — see
+    /// [`crate::app::state::PublishedSurfaceRaster`], which the signal tray has
+    /// used since #104 and which this is the card half of.
+    ///
+    /// It rides on the layer rather than sitting beside the list because that is
+    /// what makes it right on both sides of the wire at once: the server's
+    /// `AppState::sidebar_card_layers` and a delegating client's
+    /// `previous_card_layers` are the same type through the same
+    /// [`Rasteriser::shapes`], so one anchor per layer is one anchor per surface
+    /// wherever the surface is drawn.
+    ///
+    /// **Anchored by slot, not by card.** What the terminal is showing at
+    /// `HostSurfaceId::SidebarCards(i)` is whatever layer stood at index `i`, so
+    /// this is compared against the previous list *positionally* — and dropped
+    /// whenever an image moves to a different slot, because then the id it is
+    /// showing under is not the one it was published to.
+    pub published: crate::app::state::PublishedSurfaceRaster,
     pub layer: crate::app::state::GraphicsLayer,
 }
 
@@ -1985,6 +2008,14 @@ pub(crate) enum CardsUpdate {
     Rebuilt(Vec<SidebarCardLayer>),
     /// The pixel path is not live, or the tree has no agent cards in it.
     Empty,
+    /// Every viewer draws the cards itself from a `ServerMessage::CardScene`, so
+    /// this pass laid them out and stopped there.
+    ///
+    /// Opposite to [`Self::Empty`] in the one way that matters even though both
+    /// leave the panel holding no artwork: the cards *are* coming, just not from
+    /// here, so the character cards still stand down. Spelling them the same way
+    /// is how a delegating client ends up with the tree drawn twice.
+    Delegated,
 }
 
 /// What one pass over the tree's cards concluded, and where it decided to put
@@ -2009,11 +2040,19 @@ pub(crate) struct CardsBuild {
 
 /// Build the images for the tree's current cards.
 ///
-/// `previous` is what the last frame produced. A frame whose content signature
-/// matches it reports [`CardsUpdate::Unchanged`]: nothing is rasterised and
-/// nothing is re-encoded, which is what makes a fleet whose cards change about
-/// once every ninety seconds cost about that often rather than sixty times a
-/// second.
+/// `previous` is what the last frame produced, and it answers two questions.
+/// A frame whose content signature matches it reports [`CardsUpdate::Unchanged`]:
+/// nothing is rasterised and nothing is re-encoded, which is what makes a fleet
+/// whose cards change about once every ninety seconds cost about that often
+/// rather than sixty times a second. A frame whose signature *moved* but whose
+/// pixels did not — every resting card, on every step of its breath — is drawn
+/// and then measured against what the same slot last put on screen, and carried
+/// forward rather than encoded again. See
+/// [`SidebarCardLayer::published`] and [`Rasteriser::finish`].
+///
+/// When `AppState::sidebar_card_graphics_client_rasterized` says every attached
+/// viewer draws its own cards, this stops after the layout and reports
+/// [`CardsUpdate::Delegated`] without drawing anything at all.
 ///
 /// # Two drawing models
 ///
@@ -2040,12 +2079,7 @@ pub(crate) fn build_cards(
     // "nothing moved" rather than "no answer": a pass that drew nothing must
     // leave the character renderer drawing the tree where the layout put it.
     let mut motion = vec![(0, 0); cards.len()];
-    let update = match build_cards_inner(app, cards, sidebar_area, cell_size, previous, &mut motion)
-    {
-        Ok(Some(layers)) => CardsUpdate::Rebuilt(layers),
-        Ok(None) => CardsUpdate::Unchanged,
-        Err(()) => CardsUpdate::Empty,
-    };
+    let update = build_cards_inner(app, cards, sidebar_area, cell_size, previous, &mut motion);
     CardsBuild { update, motion }
 }
 
@@ -2220,8 +2254,25 @@ fn build_cards_inner(
     cell_size: HostCellSize,
     previous: &[SidebarCardLayer],
     motion: &mut [(i32, i32)],
-) -> Result<Option<Vec<SidebarCardLayer>>, ()> {
-    let placement = compute_card_placement(app, cards, sidebar_area, cell_size, motion)?;
+) -> CardsUpdate {
+    let Ok(placement) = compute_card_placement(app, cards, sidebar_area, cell_size, motion) else {
+        return CardsUpdate::Empty;
+    };
+
+    // Laid out, and that is the whole of it: every attached viewer draws these
+    // cards for itself from a `ServerMessage::CardScene`, so rasterising and
+    // PNG-encoding ten of them here produces pixels this pass will then withhold
+    // — see `crate::server::headless`, which sends the scene *instead of* them.
+    //
+    // The placement above still runs, and has to. It is the cheap half (rects,
+    // content and the row offsets, no pixels), it is what stamps each row's
+    // motion back for the character connectors, and its failing is the one
+    // honest way to say the client will have no cards either. This is the card
+    // half of what `AppRuntime::refresh_signal_tray_graphics` has done for the
+    // tray since #95.
+    if app.sidebar_card_graphics_client_rasterized {
+        return CardsUpdate::Delegated;
+    }
 
     let rasteriser = Rasteriser {
         font: placement.font,
@@ -2239,10 +2290,16 @@ fn build_cards_inner(
         host_graphics_is_local: app.host_graphics_is_local,
     };
 
-    if app.sidebar_card_shapes {
-        return rasteriser.shapes(&placement.placed, &placement.offsets, previous);
+    let drawn = if app.sidebar_card_shapes {
+        rasteriser.shapes(&placement.placed, &placement.offsets, previous)
+    } else {
+        rasteriser.sheet(&placement.placed, previous)
+    };
+    match drawn {
+        Ok(Some(layers)) => CardsUpdate::Rebuilt(layers),
+        Ok(None) => CardsUpdate::Unchanged,
+        Err(()) => CardsUpdate::Empty,
     }
-    rasteriser.sheet(&placement.placed, previous)
 }
 
 /// A wire-safe mirror of [`CardContent`], for `ServerMessage::CardScene`.
@@ -2613,9 +2670,16 @@ impl Rasteriser<'_> {
                 previous.content_signature == content_signature && previous.rect == sheet_rect
             })
             .and_then(|previous| previous.undissolved.clone());
-        let mut layer = self.finish(sheet_rect, held, signature, content_signature, || {
-            self.rasterise(placed, sheet_rect, true)
-        })?;
+        // The sheet is one image at one slot, so what is standing under its id is
+        // simply the previous sheet.
+        let mut layer = self.finish(
+            sheet_rect,
+            held,
+            signature,
+            content_signature,
+            previous,
+            || self.rasterise(placed, sheet_rect, true),
+        )?;
         // The sheet never moves: it is one image spanning every row, so there is
         // no "one row" in it to slide. It is aimed anyway, at zero offset, so
         // both paths hand the pipeline the same shape and the clip box is not a
@@ -2679,7 +2743,7 @@ impl Rasteriser<'_> {
         let sources = self.match_held(&planned, previous);
 
         // The expensive half, and the only part that is parallel.
-        let mut drawn = self.draw_shapes(&planned, &sources, placed);
+        let mut drawn = self.draw_shapes(&planned, &sources, placed, previous);
 
         let clip = self.clip();
         let mut layers = Vec::with_capacity(planned.len());
@@ -2689,7 +2753,18 @@ impl Rasteriser<'_> {
                 // the drawing is not redone, and the drawing is the expensive
                 // half by an order of magnitude. This is the case every frame of
                 // a slide takes.
-                ShapeSource::Held(slot) => SidebarCardLayer::clone(&previous[*slot]),
+                ShapeSource::Held(slot) => {
+                    let mut held = SidebarCardLayer::clone(&previous[*slot]);
+                    if *slot != index {
+                        // A held image that changed slot goes to the terminal
+                        // under a different id — `HostSurfaceId::SidebarCards`
+                        // is keyed by position — so what it published is no
+                        // longer what this slot is showing, and the next raster
+                        // here has nothing it may be measured against.
+                        held.published.forget();
+                    }
+                    held
+                }
                 // Assembled in layout order out of slots keyed by index, so what
                 // comes back does not depend on which thread finished first, or
                 // on how many threads there were. A slot that is still empty
@@ -2780,6 +2855,7 @@ impl Rasteriser<'_> {
         planned: &[PlannedShape],
         sources: &[ShapeSource],
         placed: &[(Rect, CardContent)],
+        previous: &[SidebarCardLayer],
     ) -> Vec<Option<Result<SidebarCardLayer, ()>>> {
         let todo: Vec<usize> = sources
             .iter()
@@ -2799,7 +2875,7 @@ impl Rasteriser<'_> {
             // this path takes most often are exactly the ones that would only
             // pay for the machinery.
             for &index in &todo {
-                out[index] = Some(self.draw_one(index, planned, sources, placed));
+                out[index] = Some(self.draw_one(index, planned, sources, placed, previous));
             }
             return out;
         }
@@ -2823,7 +2899,10 @@ impl Rasteriser<'_> {
                                 let Some(&index) = todo.get(slot) else {
                                     break;
                                 };
-                                local.push((index, self.draw_one(index, planned, sources, placed)));
+                                local.push((
+                                    index,
+                                    self.draw_one(index, planned, sources, placed, previous),
+                                ));
                             }
                             local
                         })
@@ -2856,6 +2935,7 @@ impl Rasteriser<'_> {
         planned: &[PlannedShape],
         sources: &[ShapeSource],
         placed: &[(Rect, CardContent)],
+        previous: &[SidebarCardLayer],
     ) -> Result<SidebarCardLayer, ()> {
         let ShapeSource::Draw(base) = &sources[index] else {
             return Err(());
@@ -2870,6 +2950,9 @@ impl Rasteriser<'_> {
             base.clone(),
             planned.signature,
             planned.content_signature,
+            // Positional: what the terminal is showing under this card's own
+            // host image id is whichever layer stood at this index.
+            previous.get(index),
             || self.rasterise(one, planned.rect, false),
         )
     }
@@ -2932,12 +3015,26 @@ impl Rasteriser<'_> {
 
     /// Encode one finished image, reusing held pixels when a transition frame
     /// already has them.
+    ///
+    /// `standing` is what this host image slot is currently showing — the
+    /// previous list's layer at the *same index*, because that is what the
+    /// terminal has under this surface's id. A freshly drawn card within
+    /// [`crate::app::state::SURFACE_DRIFT_LEVELS`] of it is not encoded at all:
+    /// the standing layer's bytes are carried forward under the new signature,
+    /// so the graphics cache sees an unchanged `data_fingerprint` and the
+    /// terminal keeps the image it already has.
+    ///
+    /// The signature is still adopted, so this is not a throttle and the card
+    /// does not stall: the next frame is measured against the *published*
+    /// raster rather than against this one, which is what bounds the drift — a
+    /// breath that really is going somewhere crosses the tolerance and arrives.
     fn finish(
         &self,
         rect: Rect,
         held: Option<UndissolvedSheet>,
         signature: u64,
         content_signature: u64,
+        standing: Option<&SidebarCardLayer>,
         draw: impl FnOnce() -> Result<Canvas, ()>,
     ) -> Result<SidebarCardLayer, ()> {
         // A held canvas covers the frame that *ends* a transition too, which has
@@ -2958,6 +3055,34 @@ impl Rasteriser<'_> {
             }
             None => &base.0,
         };
+        // Drawn, and within a couple of levels of the artwork this slot already
+        // put on screen: the terminal keeps what it has, and the PNG encode
+        // below — which on an idle fleet is the whole of the card path's server
+        // cost — does not happen either. `rect` as well as the pixels because it
+        // is what `card_layer` counts the placement's grid out of, so a layer
+        // drawn for another box is not this box's image however close its pixels
+        // land.
+        if let Some(standing) = standing.filter(|standing| {
+            standing.rect == rect
+                && standing
+                    .published
+                    .holds(canvas.width(), canvas.height(), canvas.rgba8())
+        }) {
+            return Ok(SidebarCardLayer {
+                rect,
+                clip: rect,
+                signature,
+                content_signature,
+                // Cloned rather than moved: `canvas` may still be borrowing it
+                // for the comparison just made, and it is an `Arc` either way.
+                undissolved: self.dissolve.map(|_| base.clone()),
+                // Unchanged: what is on screen is still what was published, and
+                // moving the anchor to these pixels is exactly the creep the
+                // published anchor exists to prevent.
+                published: standing.published.clone(),
+                layer: standing.layer.clone(),
+            });
+        }
         // Picked once per image rather than per client: the same rasterised
         // bytes back every attached client's placement of this image, so a
         // single "is the host terminal local and known-fast" answer — the
@@ -2969,6 +3094,14 @@ impl Rasteriser<'_> {
             self.host_graphics_is_local,
         );
         let data = encode_canvas(canvas, format).ok_or(())?;
+        // These are the bytes going to the terminal, so they are what every
+        // later frame of this surface is measured against. Taken before the
+        // struct below, which moves the canvas the dissolve is held in.
+        let published = crate::app::state::PublishedSurfaceRaster::of(
+            canvas.width(),
+            canvas.height(),
+            canvas.rgba8(),
+        );
         Ok(SidebarCardLayer {
             rect,
             // Replaced by `aim_at` before this reaches anything that draws. The
@@ -2981,6 +3114,7 @@ impl Rasteriser<'_> {
             // Only while a transition is running: a settled panel keeps no
             // second copy of artwork it is not about to take apart.
             undissolved: self.dissolve.map(|_| base),
+            published,
             layer: card_layer(format, width_px, height_px, data, rect),
         })
     }
@@ -3595,7 +3729,10 @@ mod tests {
                 Some(layer) => SheetUpdate::Rebuilt(layer),
                 None => SheetUpdate::Empty,
             },
-            CardsUpdate::Empty => SheetUpdate::Empty,
+            // No test drives this shim with the delegated flag set: the sheet
+            // is server artwork by definition, and a client that draws for
+            // itself always draws shapes.
+            CardsUpdate::Empty | CardsUpdate::Delegated => SheetUpdate::Empty,
         }
     }
 
@@ -6593,6 +6730,51 @@ mod a_card_is_its_own_shape {
         ));
     }
 
+    /// A delegating pass suppresses the character cards even though it drew
+    /// nothing, because the cards are coming — just not from here.
+    ///
+    /// This is the one way the skip in `build_cards_inner` could be worse than
+    /// the cost it removes, and it is the same trap #95 named for the tray: a
+    /// surface that stopped being drawn here is not a surface that stopped
+    /// existing, and spelling the two the same way renders the tree twice. A
+    /// shape is transparent outside its own glow, so the character card
+    /// underneath one shows straight through it.
+    #[test]
+    fn a_pass_whose_cards_are_drawn_elsewhere_still_stands_the_characters_down() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        let mut drawing = shape_fleet_app();
+        let Some(fold) = shape_pass(&mut drawing, &runtimes) else {
+            return; // No face on this machine.
+        };
+
+        let mut delegating = shape_fleet_app();
+        delegating.sidebar_card_graphics_client_rasterized = true;
+        delegating.sidebar_width = sidebar_rect().width;
+        let cell_size = delegating.host_cell_size;
+        crate::ui::compute_view_with_cell_size(&mut delegating, &runtimes, pass_area(), cell_size);
+
+        assert!(
+            delegating.sidebar_card_layers.is_empty(),
+            "the server drew card pixels no attached viewer would be sent"
+        );
+        assert!(
+            delegating.view.sidebar_card_layers_published,
+            "a delegating pass answered `no cards here` and left the tree to \
+             draw its character cards under the client's shapes"
+        );
+        assert!(
+            shape_covers_row(&delegating, fold),
+            "the character cards were drawn under shapes the client is about to \
+             lay over them"
+        );
+
+        // The placement stage walks exactly this list — see
+        // `kitty_graphics::surface_layer_placement_targets` — so an empty one is
+        // also the whole of "nothing stale is offered to a viewer that draws for
+        // itself".
+    }
+
     /// Characters are suppressed only where a shape actually got drawn.
     ///
     /// The suppression and the artwork are decided in two different places — the
@@ -6953,7 +7135,7 @@ mod rows_make_room_for_each_other {
         match build_cards(app, cards, rect, app.host_cell_size, previous).update {
             CardsUpdate::Rebuilt(layers) => Some(layers),
             // No proportional face on this machine, or nothing moved.
-            CardsUpdate::Unchanged | CardsUpdate::Empty => None,
+            CardsUpdate::Unchanged | CardsUpdate::Empty | CardsUpdate::Delegated => None,
         }
     }
 
@@ -8522,6 +8704,324 @@ mod cards_breathe_and_wash {
             right.bloom < unbreathed_old.bloom || unbreathed_old.bloom == 0.0,
             "the far side of the front was drawn without the breath the rest of \
              the card has: {right:?} against {unbreathed_old:?}"
+        );
+    }
+
+    // ---- what reaches the terminal --------------------------------------
+
+    /// The breathing fleet with every agent at rest, which is what a fleet with
+    /// nothing happening on it looks like — and the case
+    /// [`crate::app::state::PublishedSurfaceRaster`] exists for.
+    fn fleet_all_in(state: AgentState) -> (AppState, Instant) {
+        let (mut app, now) = breathing_fleet();
+        let ids: Vec<_> = app.terminals.keys().cloned().collect();
+        for id in ids {
+            if let Some(terminal) = app.terminals.get_mut(&id) {
+                terminal.state = state;
+            }
+        }
+        (app, now)
+    }
+
+    /// Step the tree for `frames` of the tier the animator actually uses, and
+    /// count how many card images were *drawn* against how many the terminal was
+    /// handed.
+    ///
+    /// The second number is taken off `data_fingerprint`, which is what the
+    /// graphics cache keys an upload on — so it is the count of real uploads
+    /// rather than a restatement of the rule under test.
+    fn drawn_and_uploaded(app: &mut AppState, start: Instant, frames: u32) -> (u32, u32) {
+        let rect = sidebar_rect();
+        app.sidebar_width = rect.width;
+        let cell = app.host_cell_size;
+        let mut layers: Vec<SidebarCardLayer> = Vec::new();
+        let (mut drawn, mut uploaded) = (0, 0);
+        for step in 1..=frames {
+            app.anim.advance(start + Duration::from_millis(50) * step);
+            let cards = super::super::compute_workspace_card_areas(app, rect);
+            let CardsUpdate::Rebuilt(next) = build_cards(app, &cards, rect, cell, &layers).update
+            else {
+                continue;
+            };
+            for (index, layer) in next.iter().enumerate() {
+                let was = layers.get(index);
+                if was.is_none_or(|was| was.signature != layer.signature) {
+                    drawn += 1;
+                }
+                if was.is_none_or(|was| was.layer.data_fingerprint != layer.layer.data_fingerprint)
+                {
+                    uploaded += 1;
+                }
+            }
+            layers = next;
+        }
+        (drawn, uploaded)
+    }
+
+    /// A tree of resting cards costs the terminal almost nothing, and a card
+    /// that actually changed costs it a whole image on the very next frame.
+    ///
+    /// The card statement of `PublishedSurfaceRaster`'s whole claim, and the
+    /// direct sibling of the tray's
+    /// `a_resting_tray_stops_re_uploading_and_a_lit_one_does_not`. One test
+    /// rather than two for the reason it gives: a rule that merely slowed the
+    /// panel down would satisfy either half alone, and only the two together
+    /// say the drift is *bounded*.
+    ///
+    /// A resting card's breath is a five-second settle whose consecutive frames
+    /// differ by a fraction of one 8-bit level. A card whose agent changed state
+    /// is a different picture, and waiting even one frame to say so is the
+    /// throttle this deliberately is not.
+    #[test]
+    fn a_resting_card_stops_re_uploading_and_a_changed_one_publishes_at_once() {
+        const FRAMES: u32 = 40;
+        let rect = sidebar_rect();
+
+        let (mut app, now) = fleet_all_in(AgentState::Idle);
+        let (drawn, uploaded) = drawn_and_uploaded(&mut app, now, FRAMES);
+        assert!(
+            drawn > 0,
+            "no card was rasterised at all, so this measured nothing — is there \
+             a proportional face?"
+        );
+        assert!(
+            uploaded > 0,
+            "a resting tree uploaded nothing across {FRAMES} frames; the drift is \
+             bounded, so a breath still has to arrive"
+        );
+        assert!(
+            uploaded * 3 < drawn,
+            "a resting tree uploaded {uploaded} of {drawn} rasters; nothing was \
+             saved on the fleet's common case"
+        );
+
+        // The other half. Everything above holds just as well for a rule that
+        // simply drew less often, and this is what tells them apart.
+        let cell = app.host_cell_size;
+        let settled = now + Duration::from_millis(50) * (FRAMES + 1);
+        app.anim.advance(settled);
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let CardsUpdate::Rebuilt(before) = build_cards(&app, &cards, rect, cell, &[]).update else {
+            panic!("a cold build drew nothing");
+        };
+
+        let pane = agent_in(&app, AgentState::Idle).expect("a resting agent to change");
+        set_pane_state(&mut app, pane, AgentState::Blocked);
+        app.anim.advance(settled + Duration::from_millis(50));
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let CardsUpdate::Rebuilt(after) = build_cards(&app, &cards, rect, cell, &before).update
+        else {
+            panic!("an agent changing state moved nothing at all");
+        };
+        let republished = after
+            .iter()
+            .zip(&before)
+            .filter(|(after, before)| after.layer.data_fingerprint != before.layer.data_fingerprint)
+            .count();
+        assert!(
+            republished > 0,
+            "an agent changed state and not one of {} cards was handed to the \
+             terminal again; this is a throttle, not a bound on what the screen \
+             may drift",
+            after.len()
+        );
+    }
+
+    /// The whole delegated round trip, which is the path the change is for: the
+    /// server lays out and ships a `CardScene`, the client draws it, and what
+    /// reaches the terminal is counted at the client's end.
+    ///
+    /// A resting card's scene is a *different* scene on nearly every frame tier
+    /// — the breath is a continuous envelope quantized to 48 levels — so
+    /// `previous_card_layers` alone stops none of them, and each one used to buy
+    /// the terminal ten fresh card images for a change of a fraction of an 8-bit
+    /// level. This is the card statement of what
+    /// `decode_and_rasterise_tray_scene`'s own doc says about the tray.
+    ///
+    /// The two counts come off the same list the client keeps, so nothing here
+    /// is a restatement of the rule: `signature` is what the rasteriser redrew,
+    /// `data_fingerprint` is what the graphics cache uploads on.
+    #[test]
+    fn a_delegating_client_stops_re_uploading_a_resting_tree() {
+        const FRAMES: u32 = 30;
+        let (mut app, now) = fleet_all_in(AgentState::Idle);
+        let rect = sidebar_rect();
+        app.sidebar_width = rect.width;
+        let cell = app.host_cell_size;
+        // The server half: laid out, shipped, and not one pixel drawn here.
+        app.sidebar_card_graphics_client_rasterized = true;
+
+        let mut client: Vec<SidebarCardLayer> = Vec::new();
+        let (mut scenes, mut drawn, mut uploaded) = (0u32, 0u32, 0u32);
+        let mut last: Option<Vec<u8>> = None;
+        for step in 1..=FRAMES {
+            app.anim.advance(now + Duration::from_millis(50) * step);
+            let cards = super::super::compute_workspace_card_areas(&app, rect);
+            let Some(scene) = build_card_scene(&app, &cards, rect, cell) else {
+                continue;
+            };
+            let bytes = encode_card_scene(&scene).expect("encode CardScene");
+            if last.as_ref() == Some(&bytes) {
+                // The server only sends a scene that moved.
+                continue;
+            }
+            last = Some(bytes.clone());
+            scenes += 1;
+
+            let decoded = decode_card_scene(&bytes).expect("decode CardScene");
+            let Ok(Some(next)) = rasterise_card_scene(
+                &decoded,
+                None,
+                cell,
+                crate::kitty_graphics::HostTerminalKind::Rio,
+                false,
+                &client,
+            ) else {
+                continue;
+            };
+            for (index, layer) in next.iter().enumerate() {
+                let was = client.get(index);
+                if was.is_none_or(|was| was.signature != layer.signature) {
+                    drawn += 1;
+                }
+                if was.is_none_or(|was| was.layer.data_fingerprint != layer.layer.data_fingerprint)
+                {
+                    uploaded += 1;
+                }
+            }
+            client = next;
+        }
+
+        assert!(
+            drawn > 0,
+            "the client drew no cards at all — is there a proportional face?"
+        );
+        assert!(
+            scenes * 4 > FRAMES,
+            "only {scenes} of {FRAMES} frames shipped a scene, so this measured \
+             an idle wire rather than the gate"
+        );
+        assert!(
+            uploaded > 0,
+            "the client uploaded nothing across {scenes} scenes; the drift is \
+             bounded, so a breath still has to arrive"
+        );
+        assert!(
+            uploaded * 3 < drawn,
+            "a delegating client uploaded {uploaded} of {drawn} card rasters to \
+             its terminal; the resting fleet's churn is still on the wire to Rio"
+        );
+    }
+
+    /// Every viewer draws the cards itself, so this pass lays them out and stops.
+    ///
+    /// The card sibling of `a_delegated_tray_tracks_the_animation_without_rasterising_it`.
+    /// What must survive the skip is everything that is not pixels: the row
+    /// offsets the character connectors are drawn at, and the answer that says
+    /// the character cards stand down — the cards are coming, just not from
+    /// here.
+    #[test]
+    fn a_delegated_pass_lays_the_cards_out_and_rasterises_none_of_them() {
+        let (mut app, now) = fleet_all_in(AgentState::Idle);
+        let rect = sidebar_rect();
+        app.sidebar_width = rect.width;
+        app.sidebar_card_graphics_client_rasterized = true;
+        app.anim.advance(now + Duration::from_millis(50));
+
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        assert!(!cards.is_empty(), "the fixture drew no rows");
+        let build = build_cards(&app, &cards, rect, app.host_cell_size, &[]);
+        assert!(
+            matches!(build.update, CardsUpdate::Delegated),
+            "the server drew cards for a fleet whose every viewer draws its own"
+        );
+        assert_eq!(
+            build.motion.len(),
+            cards.len(),
+            "the layout stopped with the pixels, so the character connectors \
+             lost the offsets they are drawn at"
+        );
+
+        // And the same pass with nobody delegating draws them, so what is being
+        // measured is the flag and not a fixture that could never draw at all.
+        app.sidebar_card_graphics_client_rasterized = false;
+        assert!(
+            matches!(
+                build_cards(&app, &cards, rect, app.host_cell_size, &[]).update,
+                CardsUpdate::Rebuilt(_)
+            ),
+            "the fixture cannot draw cards either way, so the skip proved nothing"
+        );
+    }
+
+    /// A card measured against a layer drawn for another box is not this card.
+    ///
+    /// `card_layer` counts the placement's grid out of the rect, and nothing
+    /// downstream re-derives it — `aim_at` moves a layer, it does not resize
+    /// one. So a standing layer whose pixels are within the tolerance is still
+    /// only this surface's image if it was drawn for this surface's box, and the
+    /// rect is checked beside the pixels for exactly that reason.
+    #[test]
+    fn a_layer_drawn_for_another_box_is_not_carried_forward_however_close_its_pixels() {
+        let (mut app, now) = fleet_all_in(AgentState::Idle);
+        let rect = sidebar_rect();
+        app.sidebar_width = rect.width;
+        let cell = app.host_cell_size;
+        app.anim.advance(now + Duration::from_millis(50));
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let CardsUpdate::Rebuilt(first) = build_cards(&app, &cards, rect, cell, &[]).update else {
+            panic!("the fixture drew no cards — is there a proportional face?");
+        };
+
+        // Standing layers holding exactly the pixels this tree just published,
+        // carrying bytes no rasterisation would ever arrive at. Whether the
+        // marker survives is which branch ran.
+        let marked = |nudge_rect: bool| -> Vec<SidebarCardLayer> {
+            first
+                .iter()
+                .map(|layer| {
+                    let mut marked = layer.clone();
+                    if nudge_rect {
+                        marked.rect.height += 1;
+                    }
+                    // No signature this tree can plan to, so the gate is always
+                    // what decides rather than the held-image match.
+                    marked.signature = marked.signature.wrapping_add(1);
+                    marked.layer = crate::app::state::GraphicsLayer::new(
+                        layer.layer.format,
+                        layer.layer.image_width,
+                        layer.layer.image_height,
+                        vec![0xA5; 64],
+                        layer.layer.render,
+                    );
+                    marked
+                })
+                .collect()
+        };
+
+        let survived = |standing: &[SidebarCardLayer]| -> usize {
+            let CardsUpdate::Rebuilt(built) =
+                build_cards(&app, &cards, rect, cell, standing).update
+            else {
+                panic!("a tree whose every held signature mismatches reported nothing to do");
+            };
+            built
+                .iter()
+                .zip(standing)
+                .filter(|(built, standing)| {
+                    built.layer.data_fingerprint == standing.layer.data_fingerprint
+                })
+                .count()
+        };
+
+        assert!(
+            survived(&marked(false)) > 0,
+            "no card was carried forward at all, so this test cannot tell the two branches apart"
+        );
+        assert_eq!(
+            survived(&marked(true)),
+            0,
+            "a layer drawn for a taller box was handed to the terminal as this box's image"
         );
     }
 }
