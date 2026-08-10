@@ -2459,6 +2459,65 @@ impl WorktreeSpaceGroup {
     }
 }
 
+/// The life a sidebar row is given, off the configuration alone.
+///
+/// Extracted from [`AppState::sidebar_row_lifecycle_given_cards`], which is now
+/// the call that reads those five facts off an `AppState`. Everything a row's
+/// life depends on is configuration, and `herdr bench combined` has to build
+/// the same life with no `AppState` to read it from — `AppState::test_new` is
+/// `#[cfg(test)]`, so a shipped binary cannot stand a fleet up. One body rather
+/// than two means a benchmark's rows arrive and leave on exactly the clock the
+/// panel's do.
+pub(crate) fn sidebar_row_lifecycle_from(
+    animation: &crate::config::SidebarAnimationConfig,
+    agents: &crate::config::AgentsSidebarConfig,
+    spaces: &crate::config::SpacesSidebarConfig,
+    cards: &crate::config::SidebarCardsConfig,
+    moves: bool,
+    cards_animate: bool,
+) -> crate::anim::Lifecycle {
+    let mut lifecycle = crate::anim::Lifecycle::still();
+    lifecycle.mount = animation.row_enter_stage(moves);
+    lifecycle.dismount = animation.row_exit_stage(moves);
+    // Token emphases are layers: a row whose state icon shimmers while its
+    // branch name pulses is drawing both at once, so both count towards the
+    // tier it is stepped on.
+    for behaviour in agents
+        .animated_behaviours()
+        .into_iter()
+        .chain(spaces.animated_behaviours())
+    {
+        lifecycle = lifecycle.with_idle(behaviour);
+    }
+    // The card's own breath rides the row's element rather than one of its own:
+    // a card *is* the row, so there is no second membership to reconcile and no
+    // way for the two to disagree about when a card exists. All three breaths
+    // are declared whichever one the card's state wants today, for the reason
+    // `Lifecycle::idle` gives — but as *alternates*, because a card is in one
+    // state and draws one of them. `crate::ui::sidebar_agent_row_members` names
+    // the one it is on, and without that the engine steps every resting card on
+    // `card-live`'s tier.
+    if cards_animate {
+        for behaviour in cards.pulse_behaviours() {
+            lifecycle = lifecycle.with_alternate(*behaviour);
+        }
+    }
+    lifecycle
+}
+
+/// The life a trunk segment is given, off the configuration alone.
+///
+/// Split from [`AppState::sidebar_trunk_lifecycle`] for the reason
+/// [`sidebar_row_lifecycle_from`] is split from its own method.
+pub(crate) fn sidebar_trunk_lifecycle_from(
+    animation: &crate::config::SidebarAnimationConfig,
+) -> crate::anim::Lifecycle {
+    let mut lifecycle = crate::anim::Lifecycle::still();
+    lifecycle.mount = animation.row_enter_stage(false);
+    lifecycle.dismount = animation.row_exit_stage(false);
+    lifecycle
+}
+
 impl AppState {
     /// Resolve the parent/child group for one worktree space key.
     ///
@@ -2656,36 +2715,14 @@ impl AppState {
         &self,
         cards_animate: bool,
     ) -> crate::anim::Lifecycle {
-        let moves = self.sidebar_rows_move();
-        let mut lifecycle = crate::anim::Lifecycle::still();
-        lifecycle.mount = self.sidebar_animation.row_enter_stage(moves);
-        lifecycle.dismount = self.sidebar_animation.row_exit_stage(moves);
-        // Token emphases are layers: a row whose state icon shimmers while its
-        // branch name pulses is drawing both at once, so both count towards the
-        // tier it is stepped on.
-        for behaviour in self
-            .sidebar_agents
-            .animated_behaviours()
-            .into_iter()
-            .chain(self.sidebar_spaces.animated_behaviours())
-        {
-            lifecycle = lifecycle.with_idle(behaviour);
-        }
-        // The card's own breath rides the row's element rather than one of
-        // its own: a card *is* the row, so there is no second membership to
-        // reconcile and no way for the two to disagree about when a card
-        // exists. All three breaths are declared whichever one the card's state
-        // wants today, for the reason `Lifecycle::idle` gives — but as
-        // *alternates*, because a card is in one state and draws one of them.
-        // `crate::ui::sidebar_agent_row_members` names the one it is on, and
-        // without that the engine steps every resting card on `card-live`'s
-        // tier.
-        if cards_animate {
-            for behaviour in self.sidebar_cards.pulse_behaviours() {
-                lifecycle = lifecycle.with_alternate(*behaviour);
-            }
-        }
-        lifecycle
+        sidebar_row_lifecycle_from(
+            &self.sidebar_animation,
+            &self.sidebar_agents,
+            &self.sidebar_spaces,
+            &self.sidebar_cards,
+            self.sidebar_rows_move(),
+            cards_animate,
+        )
     }
 
     /// The life a trunk segment is given when its gap opens.
@@ -2701,10 +2738,7 @@ impl AppState {
     /// segment's steady state is unanimated until something is asked to
     /// travel it, which is a later piece of work, not this one.
     pub(crate) fn sidebar_trunk_lifecycle(&self) -> crate::anim::Lifecycle {
-        let mut lifecycle = crate::anim::Lifecycle::still();
-        lifecycle.mount = self.sidebar_animation.row_enter_stage(false);
-        lifecycle.dismount = self.sidebar_animation.row_exit_stage(false);
-        lifecycle
+        sidebar_trunk_lifecycle_from(&self.sidebar_animation)
     }
 
     /// Whether Herdr's own pixel surfaces reach a screen at all on this host.

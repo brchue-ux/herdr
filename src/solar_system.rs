@@ -236,6 +236,17 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
 }
 
 impl SceneLayout {
+    /// How many bodies this scene draws.
+    ///
+    /// For a caller building a [`SceneEffects`] over it: every effect names the
+    /// body it lands on by index, so one that does not know how many there are
+    /// can only guess. `herdr bench combined` is the caller — everything in
+    /// production derives its effects from the fleet the layout was built from
+    /// and already knows.
+    pub(crate) fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.bodies.is_empty()
     }

@@ -75,6 +75,37 @@ impl Fleet {
     }
 }
 
+/// One row of a fleet as a benchmark drives it.
+///
+/// [`scene`] builds the settled case — row `i` draws card `i` at rest — and
+/// `herdr bench combined` builds a churning one, where the two come apart:
+/// which card a row draws is a fact about the pane that owns it, and where the
+/// row is drawn is a fact about how far through its arrival it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveRow {
+    /// Which card this row draws.
+    ///
+    /// Stable for the whole of a row's life, so a row that has not changed can
+    /// be carried forward by `Rasteriser::match_held` exactly as it is in
+    /// production, and a row that has just arrived cannot be mistaken for the
+    /// one whose slot it took.
+    pub(crate) seed: usize,
+    /// Where this row is drawn relative to the slot the layout gave it, in
+    /// whole cells — what [`crate::ui::sidebar::motion::cell_offsets`] resolves
+    /// and what `WorkspaceCardArea::motion_cells` carries.
+    pub(crate) motion: (i32, i32),
+}
+
+impl LiveRow {
+    /// A row sitting in its own slot, which is every row of a settled panel.
+    pub(crate) const fn settled(seed: usize) -> Self {
+        Self {
+            seed,
+            motion: (0, 0),
+        }
+    }
+}
+
 /// Why a synthetic fleet could not be stood up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoFleet {
@@ -98,11 +129,30 @@ impl std::fmt::Display for NoFleet {
     }
 }
 
-/// Stand up a synthetic `CardScene` of `fleet.cards` cards.
+/// The cell arithmetic every card in one fleet shares.
 ///
-/// The panel is sized to hold them: a run asking for more cards than a screen
-/// holds gets a taller panel, not a clipped tree.
-pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
+/// Resolved once and handed to both [`scene_of`] and [`panel_metrics`], because
+/// the row span the motion offsets accumulate over and the row span the
+/// placement lays rows out on have to be the same number — two derivations of
+/// it would be two numbers, and a card would part company from the connector
+/// pointing at it.
+struct Geometry {
+    cell_w: f32,
+    cell_h: f32,
+    /// A card's own height in whole cells.
+    row_cells: u16,
+    /// That plus the gap under it: the vertical space a row occupies, which is
+    /// the whole span that appears and disappears with it.
+    span_cells: u16,
+    /// The panel the tree is laid out in, after the scrollbar column.
+    bounds: Rect,
+}
+
+/// The air the layout leaves under a row. One cell is what the character layout
+/// puts between rows, and it is what the bloom of the card above spills into.
+const ROW_GAP_CELLS: u16 = 1;
+
+fn geometry(fleet: Fleet) -> Result<Geometry, NoFleet> {
     let font = font::card_font(None).ok_or(NoFleet::NoFace)?;
     if fleet.cards == 0 {
         return Err(NoFleet::Ungeometric);
@@ -121,15 +171,14 @@ pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
         let wanted = card_height_px(title_metrics, tidbit_metrics);
         ((wanted / cell_h).ceil() as u16).max(crate::ui::sidebar::card::CHROME_ROWS + 1)
     };
-    // The air the layout leaves under a row. One cell is what the character
-    // layout puts between rows, and it is what the bloom of the card above
-    // spills into.
-    const ROW_GAP_CELLS: u16 = 1;
-    let span = row_cells + ROW_GAP_CELLS;
+    let span_cells = row_cells + ROW_GAP_CELLS;
 
+    // Sized for the fleet's *capacity*, not for how many rows happen to be live
+    // this frame. A panel that shrank as panes were torn down would move every
+    // surviving row on every churn event, which is not what a screen does.
     let rows = u16::try_from(fleet.cards).map_err(|_| NoFleet::Ungeometric)?;
     let panel_rows = rows
-        .checked_mul(span)
+        .checked_mul(span_cells)
         .ok_or(NoFleet::Ungeometric)?
         .checked_add(2)
         .ok_or(NoFleet::Ungeometric)?;
@@ -138,26 +187,79 @@ pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
     if bounds.width == 0 || bounds.height == 0 {
         return Err(NoFleet::Ungeometric);
     }
+    Ok(Geometry {
+        cell_w,
+        cell_h,
+        row_cells,
+        span_cells,
+        bounds,
+    })
+}
+
+/// The two lengths [`crate::ui::sidebar::motion::row_offsets`] needs, in pixels:
+/// how much room one row takes up, and how wide the panel an arriving row
+/// starts off the right-hand edge of is.
+pub(crate) fn panel_metrics(fleet: Fleet) -> Result<(f32, f32), NoFleet> {
+    let geometry = geometry(fleet)?;
+    Ok((
+        f32::from(geometry.span_cells) * geometry.cell_h,
+        f32::from(geometry.bounds.width) * geometry.cell_w,
+    ))
+}
+
+/// Stand up a synthetic `CardScene` of `fleet.cards` cards, all settled.
+///
+/// The panel is sized to hold them: a run asking for more cards than a screen
+/// holds gets a taller panel, not a clipped tree.
+pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
+    let rows: Vec<LiveRow> = (0..fleet.cards).map(LiveRow::settled).collect();
+    scene_of(fleet, &rows)
+}
+
+/// Stand up a `CardScene` of whichever rows are live right now.
+///
+/// `rows` is in panel order and may be shorter than the fleet's capacity — that
+/// is a fleet mid-churn, with panes torn down and their slots not yet reused.
+/// Each row's own `motion` reaches the rasteriser as `CardScene::offsets`,
+/// which is the same field a real client fills from
+/// `WorkspaceCardArea::motion_cells`, so a slide here escapes the placement
+/// exactly as it does in production rather than redrawing the card.
+pub(crate) fn scene_of(fleet: Fleet, rows: &[LiveRow]) -> Result<CardScene, NoFleet> {
+    let geometry = geometry(fleet)?;
+    let Geometry {
+        cell_w,
+        cell_h,
+        row_cells,
+        span_cells,
+        bounds,
+    } = geometry;
+    if rows.is_empty() {
+        return Err(NoFleet::Ungeometric);
+    }
+
     // No tray in a synthetic panel, so the bloom may reach the panel's floor —
     // the same answer `compute_card_placement` gives when `tray_rect` is empty.
     let bloom_floor = bounds.y.saturating_add(bounds.height);
 
     let hues = synthetic_hues();
-    let mut placed: Vec<(Rect, CardContentWire)> = Vec::with_capacity(fleet.cards);
-    for index in 0..fleet.cards {
-        let depth = depth_of(index);
+    let mut placed: Vec<(Rect, CardContentWire)> = Vec::with_capacity(rows.len());
+    for (slot, row) in rows.iter().enumerate() {
+        let depth = depth_of(row.seed);
         // `card_frame_for`'s geometry, with the rank inset folded into the
         // prefix: what matters to the rasteriser is that cards at different
         // depths are different widths, which is what rank is *for*.
         let prefix =
-            u16::try_from(crate::ui::sidebar::tree_prefix_width(depth, index)).unwrap_or(0);
+            u16::try_from(crate::ui::sidebar::tree_prefix_width(depth, row.seed)).unwrap_or(0);
         let width = bounds.width.saturating_sub(prefix);
         if width <= crate::ui::sidebar::card::CHROME_COLS {
             return Err(NoFleet::Ungeometric);
         }
-        let y = bounds.y + u16::try_from(index).map_err(|_| NoFleet::Ungeometric)? * span;
+        let y = bounds.y + u16::try_from(slot).map_err(|_| NoFleet::Ungeometric)? * span_cells;
         let frame = Rect::new(bounds.x + prefix, y, width, row_cells);
-        placed.push((frame, CardContentWire::from(&content(index, depth, hues))));
+        placed.push((
+            frame,
+            CardContentWire::from(&content(row.seed, depth, hues)),
+        ));
     }
 
     let extents: Vec<Rect> = placed.iter().map(|(frame, _)| *frame).collect();
@@ -165,7 +267,7 @@ pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
         .ok_or(NoFleet::Ungeometric)?;
 
     Ok(CardScene {
-        offsets: vec![(0, 0); placed.len()],
+        offsets: rows.iter().map(|row| row.motion).collect(),
         placed,
         field,
         bounds,
@@ -181,7 +283,28 @@ pub(crate) fn scene(fleet: Fleet) -> Result<CardScene, NoFleet> {
 /// the shipped path and not a copy of it. Which bloom backend runs inside is
 /// decided by [`crate::gpu::enabled`], which the benchmark pins.
 pub(crate) fn draw(scene: &CardScene, cell: HostCellSize) -> Result<Frame, ()> {
-    let layers = rasterise_card_scene(
+    // `None` is "nothing changed", which cannot happen with no previous layers.
+    let (frame, _) = draw_over(scene, cell, &[])?;
+    Ok(frame)
+}
+
+/// Draw one frame of `scene` against the layers a previous frame left standing.
+///
+/// The difference from [`draw`] is the whole of what churn costs. With
+/// `previous` in hand `Rasteriser::match_held` carries a row whose card has not
+/// changed straight through — the bytes are copied, the drawing is not redone —
+/// so what a frame pays for is the rows that really did arrive, leave or move.
+/// That is the frame a fleet under churn actually draws, and it is not the one
+/// [`draw`] measures.
+///
+/// Returns the layers to hand the next frame, and `None` for a frame the
+/// rasteriser declined to redraw at all because nothing it can see had changed.
+pub(crate) fn draw_over(
+    scene: &CardScene,
+    cell: HostCellSize,
+    previous: &[SidebarCardLayer],
+) -> Result<(Frame, Option<Vec<SidebarCardLayer>>), ()> {
+    let drawn = rasterise_card_scene(
         scene,
         None,
         cell,
@@ -190,18 +313,18 @@ pub(crate) fn draw(scene: &CardScene, cell: HostCellSize) -> Result<Frame, ()> {
         // encoder, and the encode is a real share of a frame.
         crate::kitty_graphics::HostTerminalKind::Kitty,
         true,
-        &[],
-    )?
-    // `None` is "nothing changed", which cannot happen with no previous layers.
-    .ok_or(())?;
-    Ok(Frame {
+        previous,
+    )?;
+    let layers = drawn.as_deref().unwrap_or(previous);
+    let frame = Frame {
         cards: layers.len(),
         bytes: layers.iter().map(|layer| layer.layer.data.len()).sum(),
         pixels: layers
             .iter()
             .map(|layer| u64::from(layer.layer.image_width) * u64::from(layer.layer.image_height))
             .sum(),
-    })
+    };
+    Ok((frame, drawn))
 }
 
 /// Every stage's hue, resolved off the default palette against a default host
@@ -219,7 +342,12 @@ fn synthetic_hues() -> StageHues {
 
 /// A fleet's shape: a first mate, then mates and workers under it, repeating.
 /// Three depths is what the rank ladder actually draws.
-fn depth_of(index: usize) -> u8 {
+///
+/// `pub(crate)` because `herdr bench combined` builds the ambient scene's own
+/// tree out of the same fleet, and a body's kind is its row's depth — deriving
+/// that twice would let the sidebar and the wash disagree about the shape of the
+/// fleet they are both drawing.
+pub(crate) fn depth_of(index: usize) -> u8 {
     match index % 5 {
         0 => 0,
         1 | 3 => 1,

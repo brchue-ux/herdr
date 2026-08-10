@@ -3749,6 +3749,13 @@ impl Rasteriser<'_> {
         // every decision about *which* cards are drawn has already been made,
         // in order, by one thread.
         let sources = self.match_held(&planned, previous);
+        CARDS_RASTERISED.fetch_add(
+            sources
+                .iter()
+                .filter(|source| matches!(source, ShapeSource::Draw(_)))
+                .count() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // The expensive half, and the only part that is parallel.
         let prebloom = self.gpu_prebloom(&planned, &sources, placed);
@@ -4590,6 +4597,21 @@ fn test_thread_override() -> usize {
 #[cfg(test)]
 static RASTER_THREADS_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Cards this process has actually rasterised, as opposed to carried forward.
+///
+/// The positive control for `herdr bench combined`, and the same kind of thing
+/// `crate::gpu::bloom::TILES_COMPOSED` is for the compute pass: a churn run's
+/// whole claim is that rows really are arriving and leaving, and the only
+/// evidence for it that the frame times themselves cannot supply is how many
+/// cards the matcher declined to carry. A run that rasterised one card per
+/// frame was measuring a settled panel whatever its churn rate said.
+///
+/// One relaxed add per `shapes` call, not per card, so nothing in the pass
+/// scales with it. Never reset — a reader takes a difference across the window
+/// it cares about.
+pub(crate) static CARDS_RASTERISED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// One card's frame and content, fed into a signature.
 ///
