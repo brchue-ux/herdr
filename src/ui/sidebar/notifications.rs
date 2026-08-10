@@ -1,27 +1,39 @@
-//! The fleet signal bar: eight fixed slots on the panel's reserved header row.
+//! The fleet pulse: one counted line on the panel's reserved header row.
 //!
-//! The bar is always drawn once it is configured on, and always draws all eight
-//! slots. A slot whose signal is quiet is its own name in the panel's muted
-//! grey; a slot whose signal is live is its own colour, animated by
-//! [`crate::anim`], and stays that way until the signal clears. That is the
-//! whole design: the resting bar is the legend for the alerting bar, so a
-//! reader learns what the eight things are by looking at a fleet where nothing
-//! is happening.
+//! This row used to be a second copy of the notification tray — the same eight
+//! [`FleetSignal`]s, in the same order, drawn as marks instead of as badges.
+//! Two readouts of one set of booleans is one readout and some noise, so the
+//! row now says the thing the tray structurally cannot: **how much**, rather
+//! than **what kind**.
+//!
+//! Three numbers, and each is a different question from the one the tray
+//! answers:
+//!
+//! - `3 running` — panes with an agent working in them. Not a signal at all:
+//!   nobody owns a running agent and it clears itself, which is exactly why
+//!   [`crate::app::fleet_signals`] refused it a slot. As a count it is the most
+//!   useful single fact about a fleet, and the tray has nowhere to put it.
+//! - `1 needs you` — panes with something outstanding for the captain. The
+//!   tray's first row says *which of four kinds* of waiting exist; this says how
+//!   many panes are actually waiting, which is the number that decides whether
+//!   to go and look. Four lit badges can mean four panes or one.
+//! - `quota 62%` — the account's 5-hour window, read from the same
+//!   [`crate::quota`] token the sidebar's `quota_5h` token renders. Nothing in
+//!   the tray reads it, because it is not something you can go and clear.
 //!
 //! Three properties this module is responsible for holding:
 //!
-//! - **A slot never moves.** [`crate::app::fleet_signals::FleetSignal::ALL`] is
-//!   the order, always, and no slot is ever omitted for being quiet. Position
-//!   is half of what makes a one-cell mark readable at a glance, and a bar that
-//!   packed only its live slots would make position meaningless.
-//! - **Narrowing drops detail, never slots.** The width ladder gives up the
-//!   names first and then the gaps between marks, so eight signals survive down
-//!   to eight columns. Below that the bar draws nothing rather than a prefix of
-//!   itself, because five of eight marks with no way to tell which five is
-//!   worse than no bar at all.
 //! - **Nothing here decides what is true.** Every reading comes from
-//!   [`crate::app::fleet_signals`], and every frame from the animation engine.
-//!   This module owns colour, glyph placement and width, and nothing else.
+//!   [`crate::app::fleet_signals`] and every frame from the animation engine.
+//!   This module owns wording, colour and width, and nothing else.
+//! - **Narrowing shortens words, never drops a number.** The ladder gives up
+//!   the long labels first and then the labels themselves, so all three numbers
+//!   survive down to eight columns. Below that the row draws nothing rather
+//!   than a prefix of itself, because two of three numbers with no way to tell
+//!   which two is worse than no row at all.
+//! - **An unpublished reading is absent, not zero.** The quota segment is
+//!   dropped whole when no publisher has reported one — `quota 0%` and "no
+//!   quota reporter wired up" are opposite facts.
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -34,271 +46,393 @@ use ratatui::{
 use crate::app::fleet_signals::{FleetSignal, FleetSignals};
 use crate::app::state::{AppState, Palette};
 
-/// Columns between two slots, in every tier that has room for any.
-const SLOT_GAP: u16 = 1;
-
-/// Which form the bar draws in.
+/// What sits between two readings.
 ///
-/// Ordered widest first, which is also the order [`Tier::widest_fitting`]
-/// searches: the bar always shows as much as the panel can hold.
+/// A middot rather than a bar or a comma: it separates without reading as
+/// punctuation belonging to either side, and it is one cell wide in every font
+/// Herdr has to survive.
+const SEPARATOR: &str = " · ";
+
+/// What sits between two readings once the row cannot afford the spaces.
+const TIGHT_SEPARATOR: &str = "·";
+
+/// At or above this percentage the quota reading stops being muted.
+const QUOTA_WARN_PERCENT: f64 = 75.0;
+
+/// At or above this percentage the quota reading is drawn as an alert.
+const QUOTA_ALERT_PERCENT: f64 = 90.0;
+
+/// Which of the three readings a span belongs to, for styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Running,
+    Awaiting,
+    Quota,
+    Separator,
+}
+
+/// Which form the row draws in.
+///
+/// Ordered widest first, which is also the order [`Pulse::tier`] searches: the
+/// row always says as much as the panel can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tier {
-    /// Every slot's mark and its name: `●review ◉ask ≡report …`.
-    Named,
-    /// Marks alone, one gap between them: `● ◉ ≡ ◐ ⊘ ~ ↑ ⋔`.
-    Marks,
-    /// Marks alone, no gaps: `●◉≡◐⊘~↑⋔`. One column per signal, which is the
-    /// floor — there is no honest way to say eight things in seven columns.
+    /// Every reading spelled out: `3 running · 1 needs you · quota 62%`.
+    Full,
+    /// The numbers with the shortest labels that still name them:
+    /// `3 run · 1 you · 62%`.
+    Compact,
+    /// The numbers alone: `3·1·62%`. Position and colour carry what the words
+    /// carried — the counts are always running then waiting, and each keeps the
+    /// colour it had in the wider tiers — which is the same trade the tree's
+    /// own state dots make. The wider tiers are the legend for this one.
     Tight,
 }
 
 impl Tier {
-    const ALL: [Self; 3] = [Self::Named, Self::Marks, Self::Tight];
+    const ALL: [Self; 3] = [Self::Full, Self::Compact, Self::Tight];
+
+    /// What separates two readings in this tier.
+    fn separator(self) -> &'static str {
+        match self {
+            Self::Full | Self::Compact => SEPARATOR,
+            Self::Tight => TIGHT_SEPARATOR,
+        }
+    }
+}
+
+/// One frame's reading of the fleet, ready to be measured and drawn.
+///
+/// Resolved once per frame and handed to both the width query and the
+/// renderer, so the columns reserved for the row and the columns it draws
+/// cannot come from two different passes over the panes. That matters for cost
+/// as much as for correctness: resolving is a walk of every pane in every tab
+/// in every workspace, and this row is not allowed to walk it twice.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Pulse {
+    signals: FleetSignals,
+}
+
+impl Pulse {
+    /// Read the fleet, or `None` when the row is switched off or has nowhere to
+    /// draw.
+    pub(super) fn resolve(app: &AppState) -> Option<Self> {
+        app.fleet_pulse_active().then(|| Self {
+            signals: FleetSignals::resolve(app),
+        })
+    }
+
+    /// The readings this tier draws, in order, already worded.
+    ///
+    /// Separators are pieces too rather than something the renderer inserts
+    /// between pieces, so the measured width and the drawn width come from
+    /// walking the same list.
+    fn pieces(&self, tier: Tier) -> Vec<(Role, String)> {
+        let mut readings: Vec<(Role, String)> = Vec::with_capacity(3);
+
+        readings.push((
+            Role::Running,
+            match tier {
+                Tier::Full => format!("{} running", self.signals.running()),
+                Tier::Compact => format!("{} run", self.signals.running()),
+                Tier::Tight => self.signals.running().to_string(),
+            },
+        ));
+        readings.push((
+            Role::Awaiting,
+            match tier {
+                Tier::Full => format!("{} needs you", self.signals.awaiting()),
+                Tier::Compact => format!("{} you", self.signals.awaiting()),
+                Tier::Tight => self.signals.awaiting().to_string(),
+            },
+        ));
+        if let Some(percent) = self.signals.quota_percent() {
+            let percent = crate::quota::format_percent(percent);
+            readings.push((
+                Role::Quota,
+                match tier {
+                    Tier::Full => format!("quota {percent}%"),
+                    Tier::Compact | Tier::Tight => format!("{percent}%"),
+                },
+            ));
+        }
+
+        let mut pieces = Vec::with_capacity(readings.len() * 2);
+        for (index, reading) in readings.into_iter().enumerate() {
+            if index > 0 {
+                pieces.push((Role::Separator, tier.separator().to_string()));
+            }
+            pieces.push(reading);
+        }
+        pieces
+    }
 
     /// Columns this tier occupies.
     ///
-    /// Measured from the same table the renderer draws from, so the reserved
+    /// Measured from the same list the renderer draws from, so the reserved
     /// width and the drawn width cannot drift apart the way they could if the
-    /// number were written down here.
-    pub(super) fn width(self) -> u16 {
-        let slots = FleetSignal::COUNT as u16;
-        let gaps = slots.saturating_sub(1);
-        match self {
-            Self::Named => {
-                FleetSignal::ALL
-                    .into_iter()
-                    .map(|signal| crate::ui::text::display_width_u16(&slot_text(signal, self)))
-                    .sum::<u16>()
-                    + gaps * SLOT_GAP
-            }
-            Self::Marks => slots + gaps * SLOT_GAP,
-            Self::Tight => slots,
-        }
+    /// number were written down here. Unlike the old bar's, these widths depend
+    /// on the readings — a fleet of three panes and a fleet of thirty do not
+    /// take the same columns — which is why nothing may cache them.
+    fn tier_width(&self, tier: Tier) -> u16 {
+        self.pieces(tier)
+            .iter()
+            .map(|(_, text)| crate::ui::text::display_width_u16(text))
+            .sum()
     }
 
     /// The most detailed tier that fits `available` columns, or `None` when not
-    /// even one column per signal fits.
-    pub(super) fn widest_fitting(available: u16) -> Option<Self> {
-        Self::ALL.into_iter().find(|tier| tier.width() <= available)
+    /// even the compact form does.
+    fn tier(&self, available: u16) -> Option<Tier> {
+        Tier::ALL
+            .into_iter()
+            .find(|tier| self.tier_width(*tier) <= available)
     }
-}
 
-/// What one slot draws in a given tier.
-///
-/// The named tier hangs the name straight off the mark with no space between
-/// them — `●review` rather than `● review` — which buys back eight columns and
-/// still reads as one thing, because the mark is a glyph and the name is a
-/// word. The two narrow tiers draw the mark alone.
-fn slot_text(signal: FleetSignal, tier: Tier) -> String {
-    match tier {
-        Tier::Named => format!("{}{}", signal.mark(), signal.name()),
-        Tier::Marks | Tier::Tight => signal.mark().to_string(),
+    /// Columns the row will occupy on a header row `available` wide.
+    ///
+    /// `0` when the row cannot hold even the compact form. The layout asks this
+    /// before drawing so the session status beside it knows what is left.
+    pub(super) fn width(&self, available: u16) -> u16 {
+        self.tier(available).map_or(0, |tier| self.tier_width(tier))
     }
-}
 
-/// The colour a slot draws in while its signal is live.
-///
-/// Eight signals, eight different palette roles. The ones that restate
-/// something the tree already
-/// says take the tree's own colour for it — `review` is the teal Herdr already
-/// uses for a done-but-unseen pane, `ask` the red it uses for blocked, `busy`
-/// the yellow it uses for working — so the bar and the rows under it never
-/// disagree about what a colour means.
-///
-/// Deliberately not `accent`. The palette has six hues plus `text`, and
-/// `accent` is a *copy* of one of them — `blue` in every bundled theme — so a
-/// slot drawn in it would be indistinguishable from `push`. It is user-settable
-/// on top of that, so any slot bound to it could be made to collide with any
-/// other at will. `pr` takes the bright neutral instead.
-///
-/// Two live slots *may* share a colour, and on some bundled themes they do:
-/// `dracula` gives `blue` and `teal` the same value, `vesper` does the same to
-/// `peach` and `yellow`. That is survivable for exactly the reason Herdr's own
-/// state dots are: a slot is identified by its mark and its fixed position, and
-/// colour only has to say live-or-resting. What is *not* survivable is a live
-/// slot that draws in the resting grey, which is what `terminal` would do to
-/// `report` — see [`live_style`].
-fn live_color(signal: FleetSignal, p: &Palette) -> Color {
-    match signal {
-        FleetSignal::Ask => p.red,
-        FleetSignal::Review => p.teal,
-        FleetSignal::Report => p.mauve,
-        FleetSignal::Stopped => p.peach,
-        FleetSignal::Push => p.blue,
-        FleetSignal::Sync => p.green,
-        FleetSignal::Pr => p.text,
-        FleetSignal::Checks => p.yellow,
-    }
-}
-
-/// How a live slot is drawn, as against [`resting_style`].
-///
-/// Bold as well as coloured. Bold is the one distinction from the resting state
-/// that no palette can take away, and some can: the `terminal` theme resolves
-/// `mauve` to the same value as `overlay0`, which would leave a live `report`
-/// looking exactly like a quiet one. The colour falls back to `text` whenever it
-/// would land on the resting grey, and the weight covers whatever is left.
-fn live_style(signal: FleetSignal, p: &Palette) -> Style {
-    let color = live_color(signal, p);
-    let color = if color == p.overlay0 { p.text } else { color };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-/// How a quiet slot is drawn: named, muted, and holding still.
-fn resting_style(p: &Palette) -> Style {
-    Style::default().fg(p.overlay0)
-}
-
-/// Columns the bar will occupy on a header row `available` wide.
-///
-/// `0` when the bar is switched off or when the row cannot hold even the
-/// tightest tier. The layout asks this before drawing so the session status
-/// beside it knows what is left.
-pub(super) fn fleet_signal_bar_width(app: &AppState, available: u16) -> u16 {
-    if !app.fleet_signal_bar_active() {
-        return 0;
-    }
-    Tier::widest_fitting(available).map_or(0, Tier::width)
-}
-
-/// Draw the bar into `area`, which must be exactly
-/// [`fleet_signal_bar_width`] columns wide.
-pub(super) fn render_fleet_signal_bar(app: &AppState, frame: &mut Frame, area: Rect) {
-    if area.width == 0 || area.height == 0 || !app.fleet_signal_bar_active() {
-        return;
-    }
-    let Some(tier) = Tier::widest_fitting(area.width) else {
-        return;
-    };
-
-    let signals = FleetSignals::resolve(app);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (index, signal) in FleetSignal::ALL.into_iter().enumerate() {
-        if index > 0 && tier != Tier::Tight {
-            spans.push(Span::raw(" ".repeat(usize::from(SLOT_GAP))));
+    /// Draw the row into `area`, which must be exactly [`Self::width`] columns
+    /// wide.
+    pub(super) fn render(&self, app: &AppState, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
         }
-        push_slot(&mut spans, app, &signals, signal, tier);
+        let Some(tier) = self.tier(area.width) else {
+            return;
+        };
+
+        let palette = &app.sidebar_palette;
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (role, text) in self.pieces(tier) {
+            let style = self.style(role, palette);
+            match self.animated_element(role) {
+                Some(element) => {
+                    let animation = app
+                        .anim
+                        .frame(&element, None)
+                        .filter(|frame| frame.behaviour.is_some());
+                    super::push_animated_span(
+                        &mut spans,
+                        text,
+                        style,
+                        animation,
+                        super::backdrop_rgb(app),
+                        &app.palette,
+                        &app.host_terminal_theme,
+                    );
+                }
+                None => spans.push(Span::styled(text, style)),
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
+            area,
+        );
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-        area,
-    );
+    /// How one reading is drawn.
+    ///
+    /// The whole row rests in the panel's muted grey and a reading leaves it
+    /// only when it has something to say, which is the same rule the tray's
+    /// badges follow and the reason the two never disagree about what colour
+    /// means. Bold as well as coloured on every alerting reading: bold is the
+    /// one distinction no palette can take away, and some can — `terminal`
+    /// resolves several hues onto the resting grey.
+    fn style(&self, role: Role, p: &Palette) -> Style {
+        let resting = Style::default().fg(p.overlay0);
+        let alert = |color: Color| {
+            let color = if color == p.overlay0 { p.text } else { color };
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        match role {
+            Role::Separator => resting,
+            // Yellow is already Herdr's colour for a working pane, in the tree
+            // and in the tray alike.
+            Role::Running if self.signals.running() > 0 => alert(p.yellow),
+            // Red is already the colour of a blocked agent. A fleet with
+            // nothing waiting on the captain is the good case and stays grey.
+            Role::Awaiting if self.signals.awaiting() > 0 => alert(p.red),
+            Role::Quota => match self.signals.quota_percent() {
+                Some(percent) if percent >= QUOTA_ALERT_PERCENT => alert(p.red),
+                Some(percent) if percent >= QUOTA_WARN_PERCENT => alert(p.peach),
+                _ => resting,
+            },
+            Role::Running | Role::Awaiting => resting,
+        }
+    }
+
+    /// The animation element a reading borrows while it is alerting, if any.
+    ///
+    /// Only `needs you` moves, and it moves on an element the fleet signals
+    /// already publish rather than one this row invents: whichever of the four
+    /// captain-facing signals is live, in their fixed order. That keeps the
+    /// engine's element table exactly as it was — the row cannot mount anything
+    /// — while still making the one reading that means "go and look" the only
+    /// thing on the header row that moves.
+    fn animated_element(&self, role: Role) -> Option<crate::anim::ElementId> {
+        if role != Role::Awaiting || self.signals.awaiting() == 0 {
+            return None;
+        }
+        FleetSignal::ALL
+            .into_iter()
+            .take(FleetSignal::PER_ROW)
+            .find(|signal| self.signals.is_live(*signal))
+            .map(FleetSignal::element_id)
+    }
 }
 
-/// One slot's spans, resting or live.
+/// Columns the pulse row will occupy on a header row `available` wide.
 ///
-/// A quiet slot is a plain grey span and asks the animation engine nothing — it
-/// has no element, because an element that never moves is state the engine
-/// would carry for no reason. A live slot takes its own colour and whatever
-/// frame its element is on, which is what makes the change from resting to
-/// alerting a change in both colour and motion rather than in colour alone.
-fn push_slot(
-    spans: &mut Vec<Span<'static>>,
-    app: &AppState,
-    signals: &FleetSignals,
-    signal: FleetSignal,
-    tier: Tier,
-) {
-    let text = slot_text(signal, tier);
-    if !signals.is_live(signal) {
-        spans.push(Span::styled(text, resting_style(&app.sidebar_palette)));
-        return;
-    }
-
-    let style = live_style(signal, &app.sidebar_palette);
-    let frame = app
-        .anim
-        .frame(&signal.element_id(), None)
-        .filter(|frame| frame.behaviour.is_some());
-    super::push_animated_span(
-        spans,
-        text,
-        style,
-        frame,
-        super::backdrop_rgb(app),
-        &app.palette,
-        &app.host_terminal_theme,
-    );
+/// For callers that only need the geometry — hit-testing the control that sits
+/// after the row — and so resolve the fleet for themselves. The render path
+/// must use [`Pulse::resolve`] once and pass the value around instead.
+pub(super) fn fleet_pulse_width(app: &AppState, available: u16) -> u16 {
+    Pulse::resolve(app).map_or(0, |pulse| pulse.width(available))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::state::AppState;
+
+    /// A pulse with the readings set directly, so the wording and width tests
+    /// do not have to build a fleet to say what they mean.
+    fn pulse(running: usize, awaiting: usize, quota: Option<f64>) -> Pulse {
+        Pulse {
+            signals: FleetSignals::test_reading(running, awaiting, quota),
+        }
+    }
 
     #[test]
-    fn the_ladder_gives_up_detail_before_it_gives_up_a_signal() {
-        // Every tier still says all eight things; what shortens is how much it
-        // says about each.
-        assert_eq!(Tier::Tight.width(), FleetSignal::COUNT as u16);
-        assert!(Tier::Marks.width() > Tier::Tight.width());
-        assert!(Tier::Named.width() > Tier::Marks.width());
+    fn the_row_states_all_three_readings_in_full() {
+        let text: String = pulse(3, 1, Some(62.0))
+            .pieces(Tier::Full)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(text, "3 running · 1 needs you · quota 62%");
+    }
+
+    #[test]
+    fn the_compact_tier_shortens_the_words_and_keeps_every_number() {
+        let compact: String = pulse(3, 1, Some(62.0))
+            .pieces(Tier::Compact)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(compact, "3 run · 1 you · 62%");
+
+        let tight: String = pulse(3, 1, Some(62.0))
+            .pieces(Tier::Tight)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(tight, "3·1·62%");
+
+        let pulse = pulse(3, 1, Some(62.0));
+        assert!(
+            pulse.tier_width(Tier::Tight) < pulse.tier_width(Tier::Compact),
+            "the tight tier is not actually narrower than the compact one"
+        );
+        assert!(
+            pulse.tier_width(Tier::Compact) < pulse.tier_width(Tier::Full),
+            "the compact tier is not actually narrower than the full one"
+        );
+    }
+
+    /// Every tier states every reading the fleet published. Narrowing may take
+    /// away words; it may never take away a number.
+    #[test]
+    fn no_tier_drops_a_reading() {
+        let pulse = pulse(3, 1, Some(62.0));
+        for tier in Tier::ALL {
+            let roles: Vec<Role> = pulse
+                .pieces(tier)
+                .into_iter()
+                .map(|(role, _)| role)
+                .filter(|role| *role != Role::Separator)
+                .collect();
+            assert_eq!(
+                roles,
+                [Role::Running, Role::Awaiting, Role::Quota],
+                "{tier:?} does not state all three readings, in order"
+            );
+        }
+    }
+
+    /// The one thing the row may drop is a reading nobody published. A count of
+    /// zero is a fact and stays.
+    #[test]
+    fn an_unpublished_quota_is_absent_and_a_zero_count_is_not() {
+        let text: String = pulse(0, 0, None)
+            .pieces(Tier::Full)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(text, "0 running · 0 needs you");
+        assert!(!text.contains("quota"));
+
+        let zeroed: String = pulse(0, 0, Some(0.0))
+            .pieces(Tier::Full)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(zeroed, "0 running · 0 needs you · quota 0%");
+    }
+
+    /// The reserved width and the drawn width are the same number, or the
+    /// session status beside the row is laid out over the top of it.
+    #[test]
+    fn every_tier_draws_exactly_the_width_it_reserves() {
+        for reading in [(3, 1, Some(62.0)), (0, 0, None), (128, 99, Some(7.5))] {
+            let pulse = pulse(reading.0, reading.1, reading.2);
+            for tier in Tier::ALL {
+                let drawn: usize = pulse
+                    .pieces(tier)
+                    .iter()
+                    .map(|(_, text)| crate::ui::text::display_width(text))
+                    .sum();
+                assert_eq!(
+                    drawn,
+                    usize::from(pulse.tier_width(tier)),
+                    "{tier:?} draws {drawn} columns but reserves {}",
+                    pulse.tier_width(tier)
+                );
+            }
+        }
     }
 
     #[test]
     fn the_widest_tier_that_fits_is_the_one_chosen() {
-        assert_eq!(Tier::widest_fitting(Tier::Named.width()), Some(Tier::Named));
+        let pulse = pulse(3, 1, Some(62.0));
+        assert_eq!(pulse.tier(pulse.tier_width(Tier::Full)), Some(Tier::Full));
         assert_eq!(
-            Tier::widest_fitting(Tier::Named.width() - 1),
-            Some(Tier::Marks)
+            pulse.tier(pulse.tier_width(Tier::Full) - 1),
+            Some(Tier::Compact)
         );
         assert_eq!(
-            Tier::widest_fitting(Tier::Marks.width() - 1),
+            pulse.tier(pulse.tier_width(Tier::Compact) - 1),
             Some(Tier::Tight)
         );
-        // One column short of one column per signal: there is nothing honest
-        // left to draw, so nothing is drawn.
-        assert_eq!(Tier::widest_fitting(Tier::Tight.width() - 1), None);
-        assert_eq!(Tier::widest_fitting(0), None);
+        // One column short of the numbers alone: there is nothing honest left
+        // to draw, so nothing is drawn.
+        assert_eq!(pulse.tier(pulse.tier_width(Tier::Tight) - 1), None);
+        assert_eq!(pulse.width(pulse.tier_width(Tier::Tight) - 1), 0);
+        assert_eq!(pulse.tier(0), None);
     }
 
-    /// The reserved width and the drawn width are the same number or the
-    /// session status beside the bar is laid out over the top of it.
+    /// The row is grey until it has something to say, and every alerting
+    /// reading is distinguishable from a resting one on every bundled theme —
+    /// `terminal` in particular collapses hues onto the resting grey.
     #[test]
-    fn every_tier_draws_exactly_the_width_it_reserves() {
-        for tier in Tier::ALL {
-            let gaps =
-                usize::from(SLOT_GAP) * usize::from(tier != Tier::Tight) * (FleetSignal::COUNT - 1);
-            let drawn = FleetSignal::ALL
-                .into_iter()
-                .map(|signal| crate::ui::text::display_width(&slot_text(signal, tier)))
-                .sum::<usize>()
-                + gaps;
-            assert_eq!(
-                drawn,
-                usize::from(tier.width()),
-                "{tier:?} draws {drawn} columns but reserves {}",
-                tier.width()
-            );
-        }
-    }
-
-    #[test]
-    fn the_named_tier_names_every_signal() {
-        for signal in FleetSignal::ALL {
-            let text = slot_text(signal, Tier::Named);
-            assert!(text.starts_with(signal.mark()));
-            assert!(
-                text.ends_with(signal.name()),
-                "{signal:?} does not draw its own name in the named tier"
-            );
-        }
-    }
-
-    /// A live slot must never be drawable as a resting one. Colour alone
-    /// cannot promise that: the `terminal` theme resolves `mauve` to the same
-    /// value as `overlay0`, and `test_new` collapses the whole palette, so the
-    /// live style falls back to `text` and carries bold on top.
-    ///
-    /// Note what is *not* asserted: that no two live signals share a colour.
-    /// `dracula` gives `blue` and `teal` one value and `vesper` does the same to
-    /// `peach` and `yellow`, so on those themes two slots genuinely match. That
-    /// is the same trade Herdr's own state dots make - identity is carried by a
-    /// distinct one-cell mark in a fixed position (see
-    /// `every_mark_is_one_cell_and_no_two_are_the_same`), and colour only has to
-    /// say live-or-resting.
-    #[test]
-    fn a_live_slot_is_never_drawn_the_way_a_resting_one_is() {
+    fn a_reading_that_alerts_is_never_drawn_the_way_a_quiet_one_is() {
         for (name, p) in [
             ("catppuccin", Palette::catppuccin()),
             ("catppuccin_latte", Palette::catppuccin_latte()),
@@ -319,18 +453,81 @@ mod tests {
             ("rose_pine_dawn", Palette::rose_pine_dawn()),
             ("vesper", Palette::vesper()),
         ] {
-            let resting = resting_style(&p);
-            for signal in FleetSignal::ALL {
-                let live = live_style(signal, &p);
-                assert_ne!(
-                    live, resting,
-                    "{signal:?} is drawn identically live and at rest on {name}"
-                );
-                assert!(
-                    live.add_modifier.contains(Modifier::BOLD),
-                    "{signal:?} is not bold when live on {name}"
+            let resting = Style::default().fg(p.overlay0);
+            let quiet = pulse(0, 0, Some(10.0));
+            for role in [Role::Running, Role::Awaiting, Role::Quota] {
+                assert_eq!(
+                    quiet.style(role, &p),
+                    resting,
+                    "{role:?} is not resting on a quiet fleet on {name}"
                 );
             }
+
+            let loud = pulse(2, 1, Some(95.0));
+            for role in [Role::Running, Role::Awaiting, Role::Quota] {
+                let style = loud.style(role, &p);
+                assert_ne!(
+                    style, resting,
+                    "{role:?} is drawn identically alerting and at rest on {name}"
+                );
+                assert!(
+                    style.add_modifier.contains(Modifier::BOLD),
+                    "{role:?} is not bold when alerting on {name}"
+                );
+            }
+
+            // The middle quota band is an alert too, and a distinct one.
+            assert_ne!(
+                pulse(0, 0, Some(80.0)).style(Role::Quota, &p),
+                resting,
+                "a three-quarters-spent quota reads as quiet on {name}"
+            );
         }
+    }
+
+    /// Only the reading that means "go and look" moves, and only on an element
+    /// the fleet signals already publish — this row must not be able to mount
+    /// anything of its own.
+    #[test]
+    fn only_the_waiting_count_borrows_an_animation_element() {
+        let quiet = pulse(4, 0, Some(20.0));
+        for role in [Role::Running, Role::Awaiting, Role::Quota, Role::Separator] {
+            assert_eq!(quiet.animated_element(role), None, "{role:?} moved at rest");
+        }
+
+        let mut signals = FleetSignals::test_reading(0, 2, None);
+        signals.set_for_test(FleetSignal::Review);
+        let waiting = Pulse { signals };
+        assert_eq!(
+            waiting.animated_element(Role::Awaiting),
+            Some(FleetSignal::Review.element_id())
+        );
+        for role in [Role::Running, Role::Quota, Role::Separator] {
+            assert_eq!(waiting.animated_element(role), None, "{role:?} moved");
+        }
+    }
+
+    /// The flagship wins when more than one kind of waiting is live, so the
+    /// motion a reader sees is always the most urgent thing's.
+    #[test]
+    fn the_most_urgent_live_signal_drives_the_motion() {
+        let mut signals = FleetSignals::test_reading(0, 3, None);
+        signals.set_for_test(FleetSignal::Stopped);
+        signals.set_for_test(FleetSignal::Ask);
+        signals.set_for_test(FleetSignal::Review);
+        assert_eq!(
+            Pulse { signals }.animated_element(Role::Awaiting),
+            Some(FleetSignal::Ask.element_id())
+        );
+    }
+
+    /// The row does not exist until it is configured on, whatever the fleet is
+    /// doing.
+    #[test]
+    fn an_unconfigured_herdr_has_no_pulse_row() {
+        let app = AppState::test_new();
+        assert!(!app.fleet_pulse_active());
+        assert!(Pulse::resolve(&app).is_none());
+        assert_eq!(fleet_pulse_width(&app, 80), 0);
     }
 }

@@ -30,7 +30,15 @@
 //! - **A source that has never answered is quiet, not alarming.** The Git and
 //!   forge caches are `None` until their first refresh lands, and `None` reads
 //!   as "nothing outstanding" rather than as an alert, so a Herdr that has just
-//!   started does not light its own bar up.
+//!   started does not light its own tray up. A quota window nobody has
+//!   published reads as absent for the same reason, never as zero.
+//!
+//! The same walk also counts three things that are *not* signals — how many
+//! panes are running, how many are waiting on the captain, and the account's
+//! quota window. They are counted here rather than in a second pass because
+//! this one already visits every pane in every tab in every workspace, and the
+//! surface that draws them ([`crate::ui::sidebar::notifications`]) runs once a
+//! frame.
 
 use crate::app::state::AppState;
 use crate::detect::AgentState;
@@ -56,7 +64,7 @@ pub(crate) enum FleetSignal {
     /// A worker has published a completion summary that is still standing.
     ///
     /// The same `summary` token family the worker-summary badge counts, so the
-    /// bar and the badge can never disagree about whether a report exists.
+    /// tray and the badge can never disagree about whether a report exists.
     Report,
     /// A pane the fleet owns is no longer running an agent.
     ///
@@ -150,7 +158,7 @@ impl FleetSignal {
     /// Reused from Herdr's own vocabulary wherever one exists — `●` and `◉` are
     /// the marks the state dot already draws for done and blocked, and `↑` and
     /// `↓` are git's own porcelain marks, already drawn by the `git_status`
-    /// token. A reader who knows the tree already knows most of the bar.
+    /// token. A reader who knows the tree already knows most of the tray.
     ///
     /// These marks are the *fallback*, not the design. The tray draws the eight
     /// as images (see [`crate::ui::sidebar::tray`]); one cell of a font Herdr
@@ -238,6 +246,13 @@ pub(crate) struct FleetSignals {
     live: [bool; FleetSignal::COUNT],
     /// Busiest pane's smoothed work volume, in `0.0..=1.0`.
     fleet_activity: f32,
+    /// Panes with an agent actually working right now.
+    running: usize,
+    /// Panes with something outstanding for the captain.
+    awaiting: usize,
+    /// The account's 5-hour window, as a percentage used, when a publisher has
+    /// reported one.
+    quota_percent: Option<f64>,
 }
 
 impl FleetSignals {
@@ -249,6 +264,23 @@ impl FleetSignals {
         };
 
         for workspace in &app.workspaces {
+            // The quota windows are account-level facts a fleet publisher
+            // happens to write onto a workspace, so every workspace that
+            // carries one is reporting the same account. The worst reading
+            // wins rather than the first: a stale publisher that has not
+            // caught up must not talk the readout down.
+            if let Some(percent) = workspace
+                .metadata_tokens
+                .get(crate::quota::SESSION_TOKEN)
+                .and_then(crate::quota::parse)
+                .map(|readout| readout.percent_used)
+            {
+                signals.quota_percent = Some(match signals.quota_percent {
+                    Some(seen) => seen.max(percent),
+                    None => percent,
+                });
+            }
+
             if let Some((ahead, behind)) = workspace.git_ahead_behind() {
                 if ahead > 0 {
                     signals.set(FleetSignal::Push);
@@ -275,14 +307,30 @@ impl FleetSignals {
                     .get(crate::app::agent_tree::OWNER_TOKEN)
                     .is_some_and(|owner| !owner.trim().is_empty());
 
+                // Whether this one pane has anything outstanding for the
+                // captain. Accumulated per pane rather than per signal so a
+                // pane that is both unlooked-at and carrying a standing report
+                // is one thing waiting, not two.
+                let mut awaiting = false;
+
                 match terminal.state {
-                    AgentState::Blocked => signals.set(FleetSignal::Ask),
-                    AgentState::Idle if !pane.seen => signals.set(FleetSignal::Review),
+                    AgentState::Blocked => {
+                        signals.set(FleetSignal::Ask);
+                        awaiting = true;
+                    }
+                    AgentState::Idle if !pane.seen => {
+                        signals.set(FleetSignal::Review);
+                        awaiting = true;
+                    }
                     // A pane the fleet owns and that is no longer running an
                     // agent is a worker that stopped. An unowned shell is just
-                    // a shell, and lighting the bar for one would make the
+                    // a shell, and lighting the tray for one would make the
                     // signal useless in any session with a spare terminal open.
-                    AgentState::Unknown if owned => signals.set(FleetSignal::Stopped),
+                    AgentState::Unknown if owned => {
+                        signals.set(FleetSignal::Stopped);
+                        awaiting = true;
+                    }
+                    AgentState::Working => signals.running += 1,
                     _ => {}
                 }
 
@@ -292,7 +340,10 @@ impl FleetSignals {
                         .get(crate::app::worker_summary::SUMMARY_TOKEN),
                 ) {
                     signals.set(FleetSignal::Report);
+                    awaiting = true;
                 }
+
+                signals.awaiting += usize::from(awaiting);
             }
         }
 
@@ -303,13 +354,37 @@ impl FleetSignals {
         self.live[index(signal)] = true;
     }
 
+    /// A reading with the three counted facts set directly.
+    ///
+    /// So a renderer's wording, width and colour tests can say what fleet they
+    /// mean in one line instead of assembling panes to imply it.
+    #[cfg(test)]
+    pub(crate) fn test_reading(
+        running: usize,
+        awaiting: usize,
+        quota_percent: Option<f64>,
+    ) -> Self {
+        Self {
+            running,
+            awaiting,
+            quota_percent,
+            ..Self::default()
+        }
+    }
+
+    /// Light one signal on a test reading.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&mut self, signal: FleetSignal) {
+        self.set(signal);
+    }
+
     pub(crate) fn is_live(&self, signal: FleetSignal) -> bool {
         self.live[index(signal)]
     }
 
     /// True when anything at all is asserting.
     ///
-    /// Test-facing only: the bar draws all eight slots whether or not any of
+    /// Test-facing only: the tray draws all eight badges whether or not any of
     /// them is live, so nothing in the draw path has a reason to ask.
     #[cfg(test)]
     pub(crate) fn any_live(&self) -> bool {
@@ -324,6 +399,40 @@ impl FleetSignals {
     /// whole rather than of any one slot.
     pub(crate) fn intensity(&self, signal: FleetSignal) -> f32 {
         f32::from(u8::from(self.is_live(signal)))
+    }
+
+    /// How many panes have an agent working in them right now.
+    ///
+    /// A count, not a lamp, and that is the point: the eight signals answer
+    /// *what kind of thing* is outstanding, and this answers *how much*. It is
+    /// the one reading in this roll-up that is deliberately not an action item
+    /// — nobody owns a running agent and it clears itself — which is exactly
+    /// why it is a number on the pulse row rather than a ninth signal.
+    pub(crate) fn running(&self) -> usize {
+        self.running
+    }
+
+    /// How many panes have something outstanding for the captain.
+    ///
+    /// The first four signals — `ask`, `review`, `report`, `stopped` — are the
+    /// fleet waiting on the captain, and this is that same condition counted
+    /// over panes instead of collapsed to four booleans. A pane in two of those
+    /// conditions at once is one thing waiting, so this is always at most the
+    /// number of panes. Not the complement of [`Self::running`]: a worker can
+    /// leave a report standing and carry on working, and that report is still
+    /// waiting to be read.
+    pub(crate) fn awaiting(&self) -> usize {
+        self.awaiting
+    }
+
+    /// The account's 5-hour quota window, as a percentage used.
+    ///
+    /// `None` when no publisher has written [`crate::quota::SESSION_TOKEN`],
+    /// which is the normal state of a Herdr nobody has wired a quota reporter
+    /// into. A reader that has never been published is absent, never zero:
+    /// "no reading" and "none used" are opposite facts.
+    pub(crate) fn quota_percent(&self) -> Option<f64> {
+        self.quota_percent
     }
 
     /// How hard the fleet is working, in `0.0..=1.0`.
@@ -370,7 +479,7 @@ fn index(signal: FleetSignal) -> usize {
 /// The busiest pane in the whole fleet, in `0.0..=1.0`.
 ///
 /// The busiest rather than the mean, for the same reason a Space row rolls up
-/// the same way: the bar stands for whatever is happening anywhere, and
+/// the same way: the tray stands for whatever is happening anywhere, and
 /// averaging one working pane against nine idle ones would report a quiet fleet
 /// for a session that is plainly busy.
 fn fleet_activity(app: &AppState) -> f32 {
@@ -385,7 +494,7 @@ fn fleet_activity(app: &AppState) -> f32 {
 /// The Git scan and the forge fetch are demand-gated on something actually
 /// rendering their counts, so a bar that draws `dirty`, `push` or `pr` has to
 /// declare that demand the same way a configured sidebar token does — otherwise
-/// the bar would render three slots that could never light up.
+/// the surface would render slots that could never light up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FleetSignalDemand {
     pub(crate) git_dirty: bool,
@@ -464,9 +573,9 @@ mod tests {
         }
     }
 
-    /// The compact tier draws marks alone, one column each. A mark two cells
-    /// wide would shift every slot after it and the bar would stop being a
-    /// fixed set of positions.
+    /// A badge's fallback mark is one column. A mark two cells wide would shift
+    /// every slot after it and the tray would stop being a fixed set of
+    /// positions.
     #[test]
     fn every_mark_is_one_cell_and_no_two_are_the_same() {
         let mut used: Vec<&'static str> = Vec::new();

@@ -893,7 +893,7 @@
           "key": "ui.sidebar.notifications.enabled",
           "type": "boolean",
           "default": "false",
-          "description": "Draw the fleet signal bar on the row above the Spaces tree: eight fixed slots (ask, review, report, stopped, push, sync, pr, checks), each named and grey while quiet and coloured and animated while its signal is live. Switching it on also arms the pull request and branch-upstream refreshes its pr, checks, push and sync slots read."
+          "description": "Draw the fleet pulse on the row above the Spaces tree: one counted line reading how many panes are running, how many are waiting on you, and the account's 5-hour quota window when a publisher reports one. Switching it on also arms the pull request and branch-upstream refreshes the notification tray's pr, checks, push and sync slots read."
         },
         {
           "key": "ui.sidebar.notifications.emphasis",

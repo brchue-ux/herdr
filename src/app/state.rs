@@ -2728,17 +2728,17 @@ impl AppState {
             && self.ambient_wash_is_safe_on_every_viewer()
     }
 
-    /// True when the fleet signal bar is drawn.
+    /// True when the fleet pulse row is drawn.
     ///
-    /// The bar lives on the reserved header row of the expanded panel, so a
+    /// The row lives on the reserved header row of the expanded panel, so a
     /// collapsed sidebar has nowhere to draw it and asks nothing of it.
-    pub(crate) fn fleet_signal_bar_active(&self) -> bool {
+    pub(crate) fn fleet_pulse_active(&self) -> bool {
         !self.sidebar_collapsed && self.sidebar_notifications.enabled
     }
 
-    /// True when a drawn signal bar has something moving in it.
+    /// True when a drawn pulse row has something moving in it.
     pub(crate) fn fleet_signal_animation_active(&self) -> bool {
-        self.fleet_signal_bar_active() && self.sidebar_notifications.animates()
+        self.fleet_pulse_active() && self.sidebar_notifications.animates()
     }
 
     /// True when the tray's badges are moving.

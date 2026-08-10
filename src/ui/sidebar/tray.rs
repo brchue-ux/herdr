@@ -227,9 +227,9 @@ fn contains(rect: Rect, col: u16, row: u16) -> bool {
 
 /// The colour a badge's fallback mark draws in.
 ///
-/// The same palette roles the signal bar uses, so a reader who has learnt the
-/// bar has learnt the tray. `Idle` is the panel's muted grey — the same grey a
-/// resting bar slot draws in.
+/// The eight palette roles, and since the header row stopped drawing its own
+/// copy of the signals this table is their only home. `Idle` is the panel's
+/// muted grey — the same grey the fleet pulse row rests in.
 fn mark_style(signal: FleetSignal, state: BadgeState, p: &Palette) -> Style {
     let live = match signal {
         FleetSignal::Ask => p.red,
@@ -241,8 +241,8 @@ fn mark_style(signal: FleetSignal, state: BadgeState, p: &Palette) -> Style {
         FleetSignal::Pr => p.text,
         FleetSignal::Checks => p.yellow,
     };
-    // Same fallback the bar makes: a hue that resolves to the resting grey on
-    // some themes would leave a live badge looking dead.
+    // A hue that resolves to the resting grey on some themes would leave a live
+    // badge looking dead, so it falls back to the bright neutral.
     let live = if live == p.overlay0 { p.text } else { live };
     match state {
         BadgeState::Idle => Style::default().fg(p.overlay0),
@@ -871,7 +871,7 @@ mod tests {
     /// and advanced by `elapsed`.
     ///
     /// Drives the real membership path rather than reaching into the animator,
-    /// for the same reason the signal bar's own test does: the app loop is what
+    /// for the same reason the fleet pulse's own test does: the app loop is what
     /// publishes, and a test that mounted elements by hand would pass over a
     /// tray that never published any.
     fn animated_tray(elapsed: std::time::Duration) -> AppState {

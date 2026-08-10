@@ -59,7 +59,7 @@ impl App {
     }
 
     fn pull_requests_are_rendered(&self) -> bool {
-        // The signal bar's `pr` slot is a second renderer of the same count, so
+        // The tray's `pr` badge is a second renderer of the same count, so
         // it arms the same fetch. Nothing else does: the fetch crosses the
         // network, so it stays gated on something actually drawing the answer.
         let bar_reads_them = self.state.sidebar_notifications.enabled
