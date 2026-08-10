@@ -380,10 +380,23 @@ impl HostTerminalKind {
     ///    design asked for a continuous scene.
     ///
     /// Measured rather than assumed (`data/herdr-terminal-alternatives`,
-    /// firstmate home): Rio answers `EINVAL:unsupported action` to both `a=f`
-    /// and `a=a`, Ghostty ignores them silently, and WezTerm's parser has no
-    /// `a=a` arm at all — so of the terminals that have been probed only
-    /// kitty has (2), and (1) has only ever been confirmed on kitty.
+    /// firstmate home): of the terminals that have been probed, stock Rio
+    /// answered `EINVAL:unsupported action` to both `a=f` and `a=a`, Ghostty
+    /// ignores them silently, and WezTerm's parser has no `a=a` arm at all.
+    ///
+    /// Rio is nonetheless allowed here. The Rio build herdr is run against is
+    /// a private downstream patch of the captain's own, in which both (1) and
+    /// (2) have been fixed and looked at on screen. That fix is not an
+    /// upstream release, so there is no version to gate on: the patched binary
+    /// still answers XTVERSION with a plain `Rio 0.5.19`, byte for byte what
+    /// an unpatched 0.5.19 answers. A version allowlist would therefore be
+    /// unable to tell the two apart, and there is no population of other Rio
+    /// users here for it to protect — so this is an unconditional allow rather
+    /// than a half-built allowlist. Revisit it if herdr ever ships to someone
+    /// running stock Rio.
+    ///
+    /// `Other` stays refused: an unidentified terminal is the case neither
+    /// measurement nor a patch can speak for.
     ///
     /// This is deliberately one predicate rather than two. A caller cannot
     /// usefully have one without the other: a wash that cannot move is not
@@ -391,8 +404,8 @@ impl HostTerminalKind {
     /// text is worse than nothing.
     pub(crate) fn draws_ambient_wash(self) -> bool {
         match self {
-            Self::Kitty => true,
-            Self::Rio | Self::Other => false,
+            Self::Kitty | Self::Rio => true,
+            Self::Other => false,
         }
     }
 }
@@ -4225,13 +4238,21 @@ mod local_transport_tests {
 
     /// Kitty-graphics *capability* and "draws an opaque wash where I put it"
     /// are two different facts, and only the second one may gate an ambient
-    /// wash. Rio answers the capability probe and still rejects `a=f`/`a=a`
-    /// outright (measured, `data/herdr-terminal-alternatives`), which is why
-    /// answering the probe cannot stand in for this.
+    /// wash. A terminal can answer the capability probe and still reject
+    /// `a=f`/`a=a` outright (measured on stock Rio,
+    /// `data/herdr-terminal-alternatives`), which is why answering the probe
+    /// cannot stand in for this — the named hosts are allowed because their
+    /// below-text placement has been looked at on screen, not because they
+    /// answered `a=q`.
     #[test]
     fn only_a_measured_host_is_handed_an_opaque_ambient_wash() {
         assert!(HostTerminalKind::Kitty.draws_ambient_wash());
-        assert!(!HostTerminalKind::Rio.draws_ambient_wash());
+        assert!(
+            HostTerminalKind::Rio.draws_ambient_wash(),
+            "the Rio build herdr runs against carries the private compositing \
+             and animation-frame patch, and reports no version that could be \
+             allowlisted separately from a stock build"
+        );
         assert!(
             !HostTerminalKind::Other.draws_ambient_wash(),
             "an unidentified terminal must be refused, not guessed at: getting this \

@@ -1062,10 +1062,11 @@ pub struct ExperimentalConfig {
     /// wire cost is near zero once armed — see `src/kitty_graphics.rs` and
     /// `src/ui/sidebar/particle_background.rs`.
     ///
-    /// Drawn only on a host terminal herdr has positively identified as kitty. The wash is an
-    /// opaque image placed under the text, and a terminal with partial Kitty-graphics support
-    /// draws that same image over the sidebar tree instead — so an unrecognised terminal is
-    /// refused rather than risked. See `HostTerminalKind::draws_ambient_wash`.
+    /// Drawn only on a host terminal herdr has positively identified as one that draws it where
+    /// it was placed (kitty, and Rio on the patched build). The wash is an opaque image placed
+    /// under the text, and a terminal with partial Kitty-graphics support draws that same image
+    /// over the sidebar tree instead — so an unrecognised terminal is refused rather than
+    /// risked. See `HostTerminalKind::draws_ambient_wash`.
     ///
     /// Only read while `kitty_graphics` is on.
     pub sidebar_particle_field: bool,
@@ -1079,11 +1080,11 @@ pub struct ExperimentalConfig {
     /// impact or a win comet regenerates only the small overlay layer, and only while at least
     /// one is live.
     ///
-    /// Drawn only on a host terminal herdr has positively identified as kitty. The scene is a
-    /// full-surface opaque image placed under the text, and a terminal with partial
-    /// Kitty-graphics support draws that same image over every glyph on screen instead — so an
-    /// unrecognised terminal is refused rather than risked. See
-    /// `HostTerminalKind::draws_ambient_wash`.
+    /// Drawn only on a host terminal herdr has positively identified as one that draws it where
+    /// it was placed (kitty, and Rio on the patched build). The scene is a full-surface opaque
+    /// image placed under the text, and a terminal with partial Kitty-graphics support draws
+    /// that same image over every glyph on screen instead — so an unrecognised terminal is
+    /// refused rather than risked. See `HostTerminalKind::draws_ambient_wash`.
     ///
     /// Only read while `kitty_graphics` is on.
     pub persistent_background: bool,

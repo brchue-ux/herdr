@@ -24,11 +24,13 @@
 //!
 //! Both name-and-version shapes are in the wild — `name version` and
 //! `name(version)` — so both are parsed here. The version is carried rather
-//! than discarded because a per-terminal capability policy has to be able to
-//! tell one release from another: the Rio compositing bug that
-//! `HostTerminalKind::draws_ambient_wash` refuses today is a bug with a known
-//! fix, and when it lands the allowlist will need to name the version it
-//! landed in.
+//! than discarded so that a per-terminal capability policy *can* tell one
+//! release from another if it ever needs to. Note what it cannot do: the Rio
+//! compositing and animation-frame bugs that once made
+//! `HostTerminalKind::draws_ambient_wash` refuse Rio are fixed in a private
+//! downstream build rather than an upstream release, and that build still
+//! answers `Rio 0.5.19` — identical to an unpatched 0.5.19. So the wash gate
+//! allows Rio by name alone; no version here distinguishes the two.
 
 /// XTVERSION. A terminal that does not implement it simply does not answer,
 /// which the caller treats as "keep the environment's guess" rather than

@@ -2617,10 +2617,7 @@ mod tests {
     /// make unreachable rather than to apologise for afterwards.
     #[test]
     fn the_background_scene_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
-        for kind in [
-            crate::kitty_graphics::HostTerminalKind::Rio,
-            crate::kitty_graphics::HostTerminalKind::Other,
-        ] {
+        for kind in [crate::kitty_graphics::HostTerminalKind::Other] {
             let mut app = background_scene_app();
             app.state.host_terminal_kind = kind;
             assert!(
@@ -2667,7 +2664,7 @@ mod tests {
         assert!(app.observe_background_scene());
         assert!(app.state.background_scene.is_some());
 
-        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Rio;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Other;
         assert!(
             app.observe_background_scene(),
             "retiring the scene did not report a change to redraw"
@@ -2681,7 +2678,7 @@ mod tests {
     #[test]
     fn the_sidebar_particle_field_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
         let mut app = particle_field_app();
-        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Rio;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Other;
         assert!(!app.observe_sidebar_particle_field());
         assert!(app.state.sidebar_particle_field.is_none());
     }
