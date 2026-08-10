@@ -22,7 +22,9 @@ use windows_sys::{
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
         System::{
             Console::GetConsoleWindow,
-            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            DataExchange::{
+                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+            },
             Diagnostics::{
                 Debug::ReadProcessMemory,
                 ToolHelp::{
@@ -35,7 +37,7 @@ use windows_sys::{
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Memory::{
-                GlobalAlloc, GlobalLock, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
+                GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
                 MEMORY_BASIC_INFORMATION,
             },
             Ole::CF_UNICODETEXT,
@@ -1216,7 +1218,67 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
 }
 
 pub fn read_clipboard_text() -> Option<String> {
-    None
+    unsafe {
+        let owner = GetConsoleWindow();
+        if owner.is_null() || OpenClipboard(owner) == 0 {
+            return None;
+        }
+        // Held for the whole scope so every return path below closes the
+        // clipboard through `Drop`.
+        let _clipboard = ClipboardGuard;
+
+        let handle = GetClipboardData(CF_UNICODETEXT as u32);
+        if handle.is_null() {
+            return None;
+        }
+
+        // The clipboard owns this handle, so it is locked for reading only and
+        // never freed here.
+        let locked = GlobalLock(handle);
+        if locked.is_null() {
+            return None;
+        }
+        let byte_len = GlobalSize(handle);
+        let text = if byte_len == 0 {
+            None
+        } else {
+            decode_clipboard_utf16(std::slice::from_raw_parts(
+                locked.cast::<u16>(),
+                byte_len / size_of::<u16>(),
+            ))
+        };
+        GlobalUnlock(handle);
+
+        text
+    }
+}
+
+/// Decodes a `CF_UNICODETEXT` buffer into a `String`.
+///
+/// `GlobalSize` reports the allocation size, which can be rounded up past the
+/// terminator, so the slice length is only an upper bound and the string ends
+/// at the first NUL. Callers on other platforms cap clipboard reads at 1 MiB;
+/// the same ceiling applies here so one oversized clipboard cannot be pasted
+/// into an input in a single shot.
+///
+/// `CF_UNICODETEXT` is CRLF-delimited by convention while the Unix readers hand
+/// back LF, so line endings are normalized here and every caller sees one shape.
+fn decode_clipboard_utf16(units: &[u16]) -> Option<String> {
+    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    if end == 0 || end * size_of::<u16>() > MAX_CLIPBOARD_TEXT_BYTES {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&units[..end]);
+    Some(if text.contains('\r') {
+        text.replace("\r\n", "\n")
+    } else {
+        text
+    })
 }
 
 pub fn open_url(url: &str) -> std::io::Result<()> {
@@ -1786,6 +1848,54 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    #[test]
+    fn windows_clipboard_utf16_decode_stops_at_terminator() {
+        let mut buffer: Vec<u16> = "paste me".encode_utf16().collect();
+        buffer.push(0);
+        // `GlobalSize` can report more than the string needs, so trailing
+        // allocation slack must not leak into the pasted text.
+        buffer.extend([0u16; 4]);
+
+        assert_eq!(
+            super::decode_clipboard_utf16(&buffer).as_deref(),
+            Some("paste me")
+        );
+    }
+
+    #[test]
+    fn windows_clipboard_utf16_decode_handles_unterminated_and_empty_buffers() {
+        let unterminated: Vec<u16> = "no terminator".encode_utf16().collect();
+        assert_eq!(
+            super::decode_clipboard_utf16(&unterminated).as_deref(),
+            Some("no terminator")
+        );
+
+        assert_eq!(super::decode_clipboard_utf16(&[]), None);
+        assert_eq!(super::decode_clipboard_utf16(&[0]), None);
+    }
+
+    #[test]
+    fn windows_clipboard_utf16_decode_normalizes_crlf() {
+        let buffer: Vec<u16> = "first\r\nsecond\r\n".encode_utf16().chain([0]).collect();
+
+        assert_eq!(
+            super::decode_clipboard_utf16(&buffer).as_deref(),
+            Some("first\nsecond\n")
+        );
+    }
+
+    #[test]
+    fn windows_clipboard_utf16_decode_rejects_oversized_text() {
+        let oversized = vec![u16::from(b'a'); 1024 * 1024];
+        assert_eq!(super::decode_clipboard_utf16(&oversized), None);
+
+        let at_limit = vec![u16::from(b'a'); 512 * 1024];
+        assert_eq!(
+            super::decode_clipboard_utf16(&at_limit).map(|text| text.len()),
+            Some(512 * 1024)
+        );
+    }
 
     #[test]
     fn windows_conpty_native_encoder_uses_canonical_phase_and_repeat_count() {
