@@ -71,6 +71,18 @@ impl HeadlessServer {
             crate::render_prof::event("retained_graphics_fallback.full_redraw_pending");
             return RetainedGraphicsOutcome::Fallback;
         }
+        // A re-presented pane's pixels *are* its text, so they have to be
+        // rasterised from a freshly composed frame — and this path deliberately
+        // has no such frame, which is the whole reason it is fast. Encoding
+        // from here would find no pane-text layer where the last pass published
+        // one and emit a delete for it, dropping the pane back to bare
+        // characters for a frame. So the retained fast path simply does not
+        // apply to a re-presented pane; that cost is named in
+        // `[experimental] pixel_text_panes`.
+        if self.app.state.pixel_text_panes_active() {
+            crate::render_prof::event("retained_graphics_fallback.pixel_text_panes");
+            return RetainedGraphicsOutcome::Fallback;
+        }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
         let mut app_view_size = None;
@@ -148,6 +160,10 @@ impl HeadlessServer {
                     cell_size,
                     &mut next_graphics_cache,
                     embedded_surfaces,
+                    // No freshly composed frame here by construction; the guard
+                    // at the top of this function keeps re-presented panes off
+                    // this path entirely.
+                    None,
                 ));
             crate::render_prof::duration_since("retained_graphics.graphics_encode", encode_started);
             if bytes.len() > MAX_GRAPHICS_FRAME_SIZE {

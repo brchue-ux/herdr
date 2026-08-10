@@ -2065,6 +2065,15 @@ pub struct AppState {
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
     pub sidebar_card_font: Option<String>,
+    /// `[experimental] pixel_text_panes`: rasterise each pane's character grid
+    /// and composite it over the pane as an image, rather than leaving the host
+    /// terminal to set the text. Only read while `kitty_graphics_enabled` is
+    /// also true. See `src/grid_raster/`.
+    pub pixel_text_panes_enabled: bool,
+    /// `[experimental] pixel_text_font`: the monospaced face a re-presented
+    /// pane is set in. `None` means search — which finds *a* face, not
+    /// necessarily the host terminal's own.
+    pub pixel_text_font: Option<String>,
     /// `[experimental] sidebar_card_shapes`: draw each card as its own
     /// transparent shape at its own placement rather than as one opaque sheet
     /// spanning the tree. See the field's doc on `ExperimentalConfig`.
@@ -2848,6 +2857,20 @@ impl AppState {
             && self.ambient_wash_is_safe_on_every_viewer()
     }
 
+    /// True when panes are re-presented as pixels rather than left as text.
+    ///
+    /// Two facts, not the three [`Self::sidebar_particle_field_active`] needs.
+    /// The third — that every attached viewer draws an under-text image where
+    /// it was placed — does not apply here: a re-presented pane is composited
+    /// at `z = 0`, *above* the cells, and the failure that gate exists to
+    /// prevent is an opaque image landing on top of text it was supposed to sit
+    /// under. This image is supposed to be on top, and it contains the text
+    /// itself, so a host that gets the band wrong has nothing to get wrong. See
+    /// `src/grid_raster/`.
+    pub(crate) fn pixel_text_panes_active(&self) -> bool {
+        self.kitty_graphics_enabled && self.pixel_text_panes_enabled
+    }
+
     /// True when the fleet pulse row is drawn.
     ///
     /// The row lives on the reserved header row of the expanded panel, so a
@@ -3541,6 +3564,8 @@ impl AppState {
             persistent_background_enabled: false,
             sidebar_card_font: None,
             sidebar_card_shapes: false,
+            pixel_text_panes_enabled: false,
+            pixel_text_font: None,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,

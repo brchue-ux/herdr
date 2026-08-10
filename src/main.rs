@@ -77,6 +77,7 @@ mod events;
 mod forge;
 mod ghostty;
 mod gpu;
+mod grid_raster;
 // Live handoff is a Unix-only path; the whole transfer form goes with it.
 #[cfg(unix)]
 mod handoff_metadata;
