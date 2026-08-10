@@ -2617,16 +2617,19 @@ mod tests {
     /// make unreachable rather than to apologise for afterwards.
     #[test]
     fn the_background_scene_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
-        for kind in [crate::kitty_graphics::HostTerminalKind::Other] {
-            let mut app = background_scene_app();
-            app.state.host_terminal_kind = kind;
-            assert!(
-                !app.observe_background_scene(),
-                "{kind:?} was handed a scene it has not been measured to draw below text"
-            );
-            assert!(app.state.background_scene.is_none());
-            assert!(app.state.background_scene_layout.is_none());
-        }
+        // One kind rather than the list this used to walk: Rio moved to the
+        // drawing side of the gate when it was measured (#127), leaving
+        // `Other` — every terminal nobody has measured — as the whole of the
+        // refusal, which is the case that actually has to hold.
+        let kind = crate::kitty_graphics::HostTerminalKind::Other;
+        let mut app = background_scene_app();
+        app.state.host_terminal_kind = kind;
+        assert!(
+            !app.observe_background_scene(),
+            "{kind:?} was handed a scene it has not been measured to draw below text"
+        );
+        assert!(app.state.background_scene.is_none());
+        assert!(app.state.background_scene_layout.is_none());
     }
 
     /// The other half of the same gate: the terminal this was designed and
