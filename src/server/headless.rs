@@ -1653,6 +1653,25 @@ impl HeadlessServer {
         }
     }
 
+    /// Routes an XTVERSION answer to the client that sent it.
+    ///
+    /// Per client rather than onto `AppState` directly, for the same reason
+    /// the attach-time probe is: each client is looking at its own terminal,
+    /// and the shared washes are gated on a fold across all of them
+    /// (`every_app_viewer_draws_ambient_wash`), which is recomputed every tick
+    /// from these per-connection values. `sync_foreground_client_state` then
+    /// copies the foreground client's kind onto `AppState`.
+    fn update_client_host_terminal_identity_from_events(
+        &mut self,
+        client_id: u64,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> bool {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.update_host_terminal_identity_from_events(events)
+    }
+
     fn update_client_outer_focus_from_events(
         &mut self,
         client_id: u64,
@@ -2810,6 +2829,11 @@ impl HeadlessServer {
         let divider_detent_before = self.app.state.sidebar_divider_detent;
         let kitty_graphics_capability_changed =
             self.update_client_kitty_graphics_capability_from_events(client_id, &events);
+        // A reclassified terminal changes which surfaces may be drawn at all
+        // and in which pixel format, so it is a repaint even though no key was
+        // pressed and nothing on screen moved.
+        let host_terminal_kind_changed =
+            self.update_client_host_terminal_identity_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
         self.app.route_client_events_from(client_id, events, false);
@@ -2849,6 +2873,7 @@ impl HeadlessServer {
                 || theme_changed
                 || divider_hover_changed
                 || kitty_graphics_capability_changed
+                || host_terminal_kind_changed
                 || (interaction && !render_neutral_mouse_motion)
         }
     }
@@ -6026,6 +6051,178 @@ new_tab = "prefix+t"
         assert_eq!(
             server.app.state.host_terminal_kind,
             crate::kitty_graphics::HostTerminalKind::Other
+        );
+    }
+
+    /// The environment cannot cross an SSH hop; the pty can.
+    ///
+    /// Every value here was measured through a real hop — real Rio 0.5.19 and
+    /// real kitty 0.45.0 under Xvfb, running `ssh -tt` into a private sshd,
+    /// with the probe on the far side. On both, `TERM_PROGRAM` was gone and
+    /// `KITTY_WINDOW_ID` was gone, which is the whole of what herdr's
+    /// environment rule has to name Rio by; and on both, the same pty answered
+    /// XTVERSION with the exact bytes below. It is the same shape of report
+    /// that made every client on a live fleet — local and remote alike —
+    /// classify as `Other`
+    /// (`data/herdr-rio-render-capability-research-20260810/report.md` §4,
+    /// firstmate home).
+    #[test]
+    fn ssh_attached_client_is_reclassified_from_its_terminals_own_xtversion_reply() {
+        for (reply, expected, expected_version) in [
+            // Measured: `TERM_PROGRAM` unset, `TERM='rio'` — and `TERM` alone
+            // never named Rio, so the environment says `Other` either way.
+            (
+                "\x1bP>|Rio 0.5.19\x1b\\",
+                crate::kitty_graphics::HostTerminalKind::Rio,
+                "0.5.19",
+            ),
+            (
+                "\x1bP>|kitty(0.45.0)\x1b\\",
+                crate::kitty_graphics::HostTerminalKind::Kitty,
+                "0.45.0",
+            ),
+        ] {
+            let mut server = test_headless_server();
+            let (writer, _control, _render) = test_client_writer();
+
+            assert!(server.handle_server_event(ServerEvent::ClientConnected {
+                client_id: 1,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                render_encoding: RenderEncoding::SemanticFrame,
+                keybindings: None,
+                direct_attach_requested: false,
+                wants_client_rasterized_cards: false,
+                wants_client_rasterized_signal_tray: false,
+                // Everything an SSH'd-in client can see of its terminal.
+                host_terminal: crate::protocol::HostTerminalReport {
+                    term_program: None,
+                    term: Some("xterm-256color".to_owned()),
+                    kitty_window_id_set: false,
+                    is_local: false,
+                },
+                writer,
+            }));
+            assert_eq!(
+                server.app.state.host_terminal_kind,
+                crate::kitty_graphics::HostTerminalKind::Other,
+                "the environment alone can never name an SSH-attached terminal"
+            );
+
+            server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 1,
+                data: reply.as_bytes().to_vec(),
+            });
+
+            let client = server.clients.get(&1).expect("client connected");
+            assert_eq!(client.host_terminal_kind, expected);
+            assert_eq!(
+                client
+                    .host_terminal_identity
+                    .as_ref()
+                    .and_then(crate::host_terminal_identity::HostTerminalIdentity::version),
+                Some(expected_version),
+                "the version is carried, so a later allowlist can be version-aware"
+            );
+            assert_eq!(
+                server.app.state.host_terminal_kind, expected,
+                "the foreground client's new classification must reach AppState"
+            );
+        }
+    }
+
+    /// A terminal that does not implement XTVERSION answers nothing at all —
+    /// measured, over the same real SSH hop, against a bare pty with no
+    /// emulator behind it: the query drew an empty reply and so did the Kitty
+    /// capability probe beside it. There is no "unsupported" reply to detect,
+    /// so silence has to leave the environment's classification exactly where
+    /// it was rather than degrading it.
+    #[test]
+    fn a_terminal_that_never_answers_keeps_the_classification_the_environment_made() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
+            host_terminal: crate::protocol::HostTerminalReport {
+                term_program: Some("rio".to_owned()),
+                term: None,
+                kitty_window_id_set: false,
+                is_local: true,
+            },
+            writer,
+        }));
+
+        // Ordinary typing, and nothing else, for the whole session.
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"hello".to_vec(),
+        });
+
+        let client = server.clients.get(&1).expect("client connected");
+        assert!(client.host_terminal_identity.is_none());
+        assert_eq!(
+            client.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Rio
+        );
+    }
+
+    /// An answer outranks the environment in both directions. A stale
+    /// `TERM=xterm-kitty` inherited by a multiplexer used to be enough to be
+    /// handed an opaque full-screen wash; the terminal saying otherwise has to
+    /// be able to take that back.
+    #[test]
+    fn an_in_band_answer_can_demote_a_terminal_the_environment_flattered() {
+        let mut server = test_headless_server();
+        let (writer, _control, _render) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            wants_client_rasterized_cards: false,
+            wants_client_rasterized_signal_tray: false,
+            host_terminal: crate::protocol::HostTerminalReport {
+                term_program: None,
+                term: Some("xterm-kitty".to_owned()),
+                kitty_window_id_set: false,
+                is_local: true,
+            },
+            writer,
+        }));
+        assert_eq!(
+            server.app.state.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Kitty
+        );
+
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"\x1bP>|tmux 3.5a\x1b\\".to_vec(),
+        });
+
+        assert_eq!(
+            server.app.state.host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Other
+        );
+        assert!(
+            !server.every_app_viewer_draws_ambient_wash(),
+            "a terminal herdr cannot name must not be handed an opaque wash"
         );
     }
 

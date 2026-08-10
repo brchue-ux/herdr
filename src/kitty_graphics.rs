@@ -397,6 +397,40 @@ impl HostTerminalKind {
     }
 }
 
+/// Classifies a terminal that named *itself*, in band, in answer to XTVERSION
+/// (`CSI > q` — see [`crate::host_terminal_identity`]).
+///
+/// This is the primary source, and it outranks
+/// [`host_terminal_kind_for_env`] wherever both have an opinion: the
+/// environment describes the process herdr is running in, the reply describes
+/// the terminal herdr is *drawing on*, and over an SSH hop those are not the
+/// same machine. `TERM_PROGRAM` does not survive that hop at all, so the
+/// env rule's answer there is `Other` no matter what the terminal is.
+///
+/// A terminal that answers with a name herdr does not know resolves to
+/// `Other` rather than deferring to the environment. That is deliberate, and
+/// it is the safe direction: every ranking above `Other` grants something
+/// (a raw pixel format, an opaque wash over the whole screen), so an
+/// unrecognised-but-positively-identified terminal keeping a `Kitty` guess
+/// that `TERM=xterm-kitty` left lying around is exactly the mistake that
+/// erases somebody's screen. The clearest case is a multiplexer: `tmux`
+/// running inside kitty answers as `tmux`, inherits kitty's `TERM`, and
+/// genuinely cannot be handed either grant.
+pub(crate) fn host_terminal_kind_for_identity(name: &str) -> HostTerminalKind {
+    if name.eq_ignore_ascii_case("rio") {
+        return HostTerminalKind::Rio;
+    }
+    if name.eq_ignore_ascii_case("kitty") {
+        return HostTerminalKind::Kitty;
+    }
+    HostTerminalKind::Other
+}
+
+/// The fallback, for a terminal that did not answer XTVERSION at all.
+///
+/// Correct only when the process reading these variables shares a machine
+/// with the terminal — see [`host_terminal_kind_for_identity`] for why that
+/// is a real restriction rather than a theoretical one.
 pub(crate) fn host_terminal_kind_for_env(
     term_program: Option<&str>,
     term: Option<&str>,
@@ -4134,6 +4168,46 @@ mod local_transport_tests {
             host_terminal_kind_for_env(Some("WezTerm"), Some("xterm-256color"), false),
             HostTerminalKind::Other
         );
+    }
+
+    // ---- host_terminal_kind_for_identity -----------------------------
+
+    #[test]
+    fn identifies_terminals_from_the_names_they_report_themselves() {
+        assert_eq!(
+            host_terminal_kind_for_identity("Rio"),
+            HostTerminalKind::Rio
+        );
+        assert_eq!(
+            host_terminal_kind_for_identity("kitty"),
+            HostTerminalKind::Kitty
+        );
+        // Both replies are transcripts of real binaries, so the case is
+        // whatever the terminal happens to brand itself with.
+        assert_eq!(
+            host_terminal_kind_for_identity("RIO"),
+            HostTerminalKind::Rio
+        );
+        assert_eq!(
+            host_terminal_kind_for_identity("Kitty"),
+            HostTerminalKind::Kitty
+        );
+    }
+
+    /// A terminal that named itself and was not recognised gets nothing —
+    /// rather than keeping whatever the environment guessed. Every rank above
+    /// `Other` grants something a wrong guess pays for on screen.
+    #[test]
+    fn a_named_but_unrecognised_terminal_is_other() {
+        assert_eq!(
+            host_terminal_kind_for_identity("WezTerm"),
+            HostTerminalKind::Other
+        );
+        assert_eq!(
+            host_terminal_kind_for_identity("tmux"),
+            HostTerminalKind::Other
+        );
+        assert_eq!(host_terminal_kind_for_identity(""), HostTerminalKind::Other);
     }
 
     // ---- host_graphics_locality_for_env ------------------------------

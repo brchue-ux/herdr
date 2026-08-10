@@ -149,6 +149,11 @@ pub enum RawInputEvent {
     /// probe. Always `true` today — see
     /// `terminal_theme::parse_kitty_graphics_capability_response`.
     KittyGraphicsCapability(bool),
+    /// The real outer terminal named itself in answer to XTVERSION. Unlike
+    /// every other host fact herdr has, this one arrived over the pty rather
+    /// than out of an environment variable, so it is still true on the far
+    /// side of an SSH hop — see `crate::host_terminal_identity`.
+    HostTerminalIdentity(crate::host_terminal_identity::HostTerminalIdentity),
     Unsupported,
 }
 
@@ -816,6 +821,11 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             crate::terminal_theme::parse_kitty_graphics_capability_response(seq)
         {
             return Some((RawInputEvent::KittyGraphicsCapability(confirmed), seq_len));
+        }
+        if let Some(identity) =
+            crate::host_terminal_identity::parse_host_terminal_version_response(seq)
+        {
+            return Some((RawInputEvent::HostTerminalIdentity(identity), seq_len));
         }
 
         match seq {
@@ -1499,6 +1509,35 @@ mod tests {
         };
         assert_eq!(consumed, 11);
         assert!(confirmed);
+    }
+
+    /// End to end through the framer, not just `extract_one_event`: the
+    /// XTVERSION answer is a DCS, and the whole reason it is worth asking for
+    /// is that it reaches herdr as ordinary pty input from an arbitrarily
+    /// distant terminal. It has to survive the same framing every keystroke
+    /// does, and it must not reach a pane as text.
+    #[test]
+    fn frames_an_xtversion_reply_into_one_identity_event() {
+        let events = parse_raw_input_bytes_sync(b"\x1bP>|Rio 0.5.19\x1b\\");
+        let [RawInputEvent::HostTerminalIdentity(identity)] = events.as_slice() else {
+            panic!("expected exactly one host terminal identity event, got {events:?}");
+        };
+        assert_eq!(identity.name(), "Rio");
+        assert_eq!(identity.version(), Some("0.5.19"));
+    }
+
+    /// The reply arrives in the same read as whatever the user was typing,
+    /// which is the normal case at attach time.
+    #[test]
+    fn an_xtversion_reply_does_not_swallow_the_input_beside_it() {
+        let events = parse_raw_input_bytes_sync(b"\x1bP>|kitty(0.45.0)\x1b\\a");
+        let [RawInputEvent::HostTerminalIdentity(identity), RawInputEvent::Key(key)] =
+            events.as_slice()
+        else {
+            panic!("expected an identity event then a key, got {events:?}");
+        };
+        assert_eq!(identity.name(), "kitty");
+        assert_eq!(key.code, crossterm::event::KeyCode::Char('a'));
     }
 
     #[test]

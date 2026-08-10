@@ -365,6 +365,47 @@ size 18. Read the emitted `a=p` controls back and divide `w`/`h` by `c`/`r`;
 that number is the cell the client believed, and it either is or is not the one
 the terminal answers with.
 
+### Which terminal is on the other end is a measurement too
+
+`HostTerminalKind` gates an opaque full-screen wash and the raw pixel formats
+(`kitty_graphics::draws_ambient_wash`, `preferred_local_pixel_format`), so
+getting it wrong costs either a feature or the whole readable screen. There are
+two sources and they do not agree over SSH:
+
+- **In band, primary.** The client asks XTVERSION (`CSI > q`) on the same round
+  trip as the Kitty `a=q` probe; the reply is a DCS that reaches the server as
+  ordinary pty input and is classified by
+  `kitty_graphics::host_terminal_kind_for_identity`. See
+  `host_terminal_identity`.
+- **Environment, fallback.** `TERM_PROGRAM` / `TERM` / `KITTY_WINDOW_ID` from
+  the *client* process (`kitty_graphics::host_terminal_report_from_env`), sent
+  in `Hello` and classified by `host_terminal_kind_for_env`.
+
+The environment is the fallback because it does not survive an SSH hop, and
+`herdr` over SSH is a first-class route. Measured through a real hop into real
+terminals: `TERM_PROGRAM` and `KITTY_WINDOW_ID` are both gone on the far side,
+so **Rio classifies as `Other`** there however real it is (`TERM` survives, but
+`TERM` alone never named Rio); kitty survives only because `TERM=xterm-kitty`
+does. Both answered XTVERSION over the same hop — `DCS >|Rio 0.5.19 ST` and
+`DCS >|kitty(0.45.0) ST`. A terminal with no emulator behind the pty answered
+neither query at all, so *silence is the only "unsupported" signal there is* and
+must leave the environment's classification untouched.
+
+An answer outranks the environment in both directions, including downward: a
+terminal that names itself and is not recognised becomes `Other` rather than
+keeping a flattering `TERM`. Every rank above `Other` grants something, and
+`tmux` inside kitty inherits kitty's `TERM` while being able to honour none of
+it.
+
+To verify a classification change for real without driving any Herdr session:
+run the real terminal under `Xvfb` (Rio from its GitHub release `.deb`, kitty
+from the box), have it launch `ssh -tt` into a **private sshd** — your own
+`sshd_config` with your own host key on a high port, which needs no root — and
+put the probe on the far side. It records what the environment can still see and
+what the pty answers, in one run. Feed the captured bytes into
+`ServerEvent::ClientInput` in a `server::headless` test to close the loop; that
+covers everything except the client's own 4-byte write.
+
 ### Exercising the `--remote` client path without a second machine
 
 Neither standing rig covers the remote bridge, and it is a genuinely different
