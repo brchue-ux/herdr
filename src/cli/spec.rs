@@ -42,7 +42,8 @@ pub(super) fn command() -> Command {
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
-        .subcommand(plugin_command());
+        .subcommand(plugin_command())
+        .subcommand(bench_command());
     configure_help(command, true)
 }
 
@@ -842,6 +843,31 @@ fn session_command() -> Command {
                 .about("Delete a stopped session")
                 .arg(required("name", "NAME"))
                 .arg(json_flag()),
+        )
+}
+
+/// `herdr bench` — on-demand performance measurement, not a regression gate.
+///
+/// Deliberately not wired into CI: the numbers are a property of the machine it
+/// runs on (see `crate::cli::bench`), so a threshold here would mean a different
+/// thing on every runner.
+fn bench_command() -> Command {
+    Command::new("bench")
+        .about("Measure rasterisation throughput on this machine")
+        .subcommand(
+            Command::new("cards")
+                .about("Time card rasterisation on the CPU and GPU bloom backends")
+                .arg(option("cards", "N").help("Cards in the synthetic fleet"))
+                .arg(option("frames", "N").help("Timed frames per backend"))
+                .arg(option("warmup", "N").help("Untimed frames before the clock starts"))
+                .arg(
+                    option("backend", "BACKEND")
+                        .value_parser(["cpu", "gpu", "both"])
+                        .help("Which bloom backends to run"),
+                )
+                .arg(option("panel-cols", "N").help("Sidebar width in cells"))
+                .arg(option("cell-width", "PX").help("Host cell width in pixels"))
+                .arg(option("cell-height", "PX").help("Host cell height in pixels")),
         )
 }
 

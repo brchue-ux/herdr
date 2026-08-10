@@ -62,12 +62,14 @@ pub(crate) mod bloom;
 /// Unix dev box or CI, so this is how a Unix process is driven through the same
 /// code path for testing and measurement.
 ///
-/// Read once. This sits under `Rasteriser::shapes`, which is on the render
-/// path, and the answer cannot change inside a process.
+/// Read once per frame, under `Rasteriser::shapes` — not per card and not per
+/// pixel. The environment and the platform gate are cached because they cannot
+/// change inside a process; [`PINNED`] is a relaxed load in front of that cache
+/// for the two callers that need the answer to change inside one, and costs a
+/// load from a static.
 pub(crate) fn enabled() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = forced_for_test() {
-        return forced;
+    if let Some(pinned) = pinned() {
+        return pinned;
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -89,26 +91,54 @@ pub(crate) fn enabled() -> bool {
 /// there is no way to do that from the outside otherwise. This is how the
 /// captain's RX 6900 XT gets a number rather than a prediction.
 pub(crate) fn ignore_cost_model() -> bool {
+    if COST_MODEL_PINNED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| std::env::var("HERDR_GPU_CARD_BLOOM").ok().as_deref() == Some("force"))
 }
 
-/// Pin [`enabled`] for a test that has to compare the two backends.
+/// [`enabled`], pinned: `0` is "ask the real gate", `1` on, `2` off.
 ///
 /// The real gate is answered once per process and cached, because it cannot
-/// change inside one — which is right in production and useless to a test that
-/// needs to draw the same frame both ways. This is the same shape
-/// `particle_field::FIELD_THREADS_FOR_TEST` uses for the same reason.
-#[cfg(test)]
-static FORCED_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// change inside one — which is right in production and wrong for the two
+/// callers whose entire job is drawing the same frame both ways: the parity
+/// tests ([`ForceEnabled`]) and `herdr bench cards`. Nothing in the ordinary
+/// client or server path ever writes it, so production reads a zero for the
+/// life of the process and takes the cached answer below.
+static PINNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-#[cfg(test)]
-fn forced_for_test() -> Option<bool> {
-    match FORCED_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+/// [`ignore_cost_model`], pinned on. Set alongside [`PINNED`] whenever the GPU
+/// is pinned *on*: a caller that has pinned the backend is measuring or
+/// comparing it, and a cost model that declines the batch would leave it
+/// measuring the CPU under a GPU label.
+static COST_MODEL_PINNED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn pinned() -> Option<bool> {
+    match PINNED.load(std::sync::atomic::Ordering::Relaxed) {
         1 => Some(true),
         2 => Some(false),
         _ => None,
     }
+}
+
+/// Pin the bloom backend for the rest of this process.
+///
+/// For `herdr bench cards`, which runs both backends in one process so the two
+/// numbers come off one machine in one state. Pinning the GPU on also stands
+/// the cost model down — see [`ignore_cost_model`]; the benchmark's whole job is
+/// to produce the measurement the model is otherwise predicting from.
+///
+/// This does not *create* a device. A machine with no adapter pinned to the GPU
+/// still declines every batch to the CPU, which the benchmark reports as such
+/// rather than passing off as a GPU number.
+pub(crate) fn pin_backend(gpu: bool) {
+    COST_MODEL_PINNED_OFF.store(gpu, std::sync::atomic::Ordering::Relaxed);
+    PINNED.store(
+        if gpu { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Hold [`enabled`] at `on` until the returned guard drops.
@@ -130,7 +160,7 @@ impl ForceEnabled {
     /// concurrently-running parity test happened to have pinned.
     pub(crate) fn released() -> Self {
         let guard = Self::lock();
-        FORCED_FOR_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+        PINNED.store(0, std::sync::atomic::Ordering::Relaxed);
         bloom::PRETEND_INSTANT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
         Self(guard)
     }
@@ -142,7 +172,7 @@ impl ForceEnabled {
 
     pub(crate) fn new(on: bool) -> Self {
         let guard = Self::lock();
-        FORCED_FOR_TEST.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+        PINNED.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
         // A known state on the way in as well as out: holding the lock is only
         // half of it if the previous holder left the cost model pinned.
         bloom::PRETEND_INSTANT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -165,7 +195,7 @@ impl ForceEnabled {
 #[cfg(test)]
 impl Drop for ForceEnabled {
     fn drop(&mut self) {
-        FORCED_FOR_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+        PINNED.store(0, std::sync::atomic::Ordering::Relaxed);
         bloom::PRETEND_INSTANT_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }

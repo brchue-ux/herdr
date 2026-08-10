@@ -222,6 +222,27 @@ impl CardSpider {
     }
 }
 
+/// A spider from four resolved numbers, with no engine behind them.
+///
+/// [`resolve`] is the only way a real card gets one, and it needs an `AppState`
+/// and a running animation. `super::bench` has neither: it stands a synthetic
+/// fleet up in a shipped binary, and a quarter of that fleet has to carry a
+/// spider or the benchmark would be drawing cards with the marker's whole pixel
+/// path skipped.
+pub(super) fn synthetic_for_bench(
+    climb: f32,
+    pulse: f32,
+    intensity: f32,
+    squash: f32,
+) -> CardSpider {
+    CardSpider {
+        climb,
+        pulse,
+        intensity,
+        squash,
+    }
+}
+
 /// Resolve the spider on one row, or `None` when that row has none.
 ///
 /// A **pure read** of the engine and of the row's own published signal, exactly

@@ -42,6 +42,7 @@
 //! panel keeps its character cards; none of them can be missing *and* have this
 //! draw a worse card.
 
+pub(crate) mod bench;
 mod canvas;
 mod font;
 mod measured;
@@ -4567,6 +4568,14 @@ fn raster_threads(work: usize) -> usize {
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     work.min(CARD_RASTER_MAX_THREADS).min((cores / 2).max(1))
+}
+
+/// [`raster_threads`] for `herdr bench cards`, which has to say in its report
+/// how many threads the CPU column was drawn on: the GPU pass is serial and
+/// races that pool rather than one core, so the thread count is half of what
+/// any speedup number means.
+pub(crate) fn raster_threads_for_bench(cards: usize) -> usize {
+    raster_threads(cards)
 }
 
 /// Pin the thread count for a test that needs to compare two of them.
