@@ -540,7 +540,28 @@ pub struct PaneInfo {
     /// went missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// How many finished workers this pane has taken back, if it is a mate
+    /// somebody reports `completed` to.
+    ///
+    /// Counted from the `completed` relation signals Herdr already accepts,
+    /// credited to the `owner` the tree resolves for the row that finished, so
+    /// this and the sidebar's rings are the same number and not two tallies
+    /// that can drift. Uncapped here — the eight-ring cap is a fact about the
+    /// drawing, and a script asking how much a mate has absorbed wants the
+    /// count.
+    ///
+    /// Read-only and derived. Zero for everything that has absorbed nothing,
+    /// which is most panes.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub absorbed: u32,
     pub revision: u64,
+}
+
+/// Keeps a zero `absorbed` off the wire, the same way an absent `owner` stays
+/// off it: the overwhelmingly common value should cost a subscriber nothing.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` hands a reference.
+pub(crate) fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

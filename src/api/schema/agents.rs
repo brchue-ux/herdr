@@ -236,6 +236,12 @@ pub struct AgentInfo {
     /// reference `pane.get` just to see the fact behind `relation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// How many finished workers this agent has taken back, mirroring
+    /// [`crate::api::schema::PaneInfo::absorbed`] for the same reason `owner`
+    /// is mirrored here: a script reading the fleet through `agent.list`
+    /// should not have to reference `pane.get` to see it.
+    #[serde(default, skip_serializing_if = "super::panes::is_zero_u32")]
+    pub absorbed: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,

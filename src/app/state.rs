@@ -2059,6 +2059,20 @@ pub struct AppState {
     /// correct, so a client that attaches late, or a server that restarts, is
     /// right to show the settled row and nothing else.
     pub(crate) relation_signals: crate::app::relation_signal::RelationSignals,
+    /// What each mate has absorbed: one ring per finished worker taken back.
+    ///
+    /// The settled residue the transient `completed` signal above leaves
+    /// behind, keyed by the owner handle the sidebar tree resolves. See
+    /// [`crate::app::residue`].
+    ///
+    /// Unlike `relation_signals` this one *is* meant to survive: a mate six
+    /// workers deep should still read that way after a reattach. It is not in
+    /// `persist::SessionSnapshot` yet — the counts are rebuilt from the fleet's
+    /// own reporting, and a restored server showing a bare card until the next
+    /// absorption is wrong in the same direction as showing a stale one, so
+    /// this waits on the durable-fleet-facts pass rather than growing a
+    /// snapshot field that only this feature reads.
+    pub(crate) residue: crate::app::residue::Residue,
     /// Live per-terminal work volume, sampled by Herdr's own loop.
     ///
     /// Deliberately absent from both `persist::SessionSnapshot` and the live
@@ -2452,6 +2466,34 @@ impl AppState {
 
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Drop the residue of every mate that is no longer here.
+    ///
+    /// Called when a Space closes rather than on a timer, because that is the
+    /// only thing that can make a tracked owner stop existing — the map is
+    /// keyed by tree handle, and a handle survives a pane being replaced. It
+    /// keeps [`crate::app::residue::MAX_TRACKED_OWNERS`] a budget for the
+    /// fleet that is *running* rather than for every mate this server has ever
+    /// seen, which is what would otherwise lock a long-lived session out of
+    /// tracking anything new.
+    ///
+    /// Both kinds of handle are collected, because a mate can be a Space or a
+    /// pane and [`crate::app::residue`] cannot tell them apart by name.
+    pub(crate) fn prune_residue(&mut self) {
+        if self.residue.is_empty() {
+            return;
+        }
+        let mut live: Vec<String> = (0..self.workspaces.len())
+            .filter_map(|ws_idx| crate::ui::sidebar::space_tree_name(self, ws_idx))
+            .collect();
+        live.extend(
+            self.terminals
+                .values()
+                .filter_map(|terminal| terminal.agent_name.clone()),
+        );
+        self.residue
+            .retain_live(live.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
     /// True when a visible sidebar element opts into animation.
@@ -3436,6 +3478,7 @@ impl AppState {
             state_age_now: Instant::now(),
             wall_now: SystemTime::now(),
             relation_signals: crate::app::relation_signal::RelationSignals::default(),
+            residue: crate::app::residue::Residue::default(),
             pane_activity: crate::app::pane_activity::PaneActivityMap::default(),
             pane_unread: crate::app::pane_unread::PaneUnreadTracker::default(),
             anim: crate::anim::Animator::default(),

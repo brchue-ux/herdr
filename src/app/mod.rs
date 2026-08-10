@@ -31,6 +31,7 @@ pub(crate) mod pending_effects;
 mod popup;
 mod pull_requests;
 pub(crate) mod relation_signal;
+pub(crate) mod residue;
 mod runtime;
 mod runtime_mutations;
 mod session;
@@ -635,6 +636,7 @@ impl App {
         );
 
         let mut state = AppState {
+            residue: crate::app::residue::Residue::default(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),

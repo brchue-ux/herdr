@@ -845,6 +845,12 @@
         },
         "PaneInfo": {
           "properties": {
+            "absorbed": {
+              "description": "How many finished workers this pane has taken back, if it is a mate\nsomebody reports `completed` to.\n\nCounted from the `completed` relation signals Herdr already accepts,\ncredited to the `owner` the tree resolves for the row that finished, so\nthis and the sidebar's rings are the same number and not two tallies\nthat can drift. Uncapped here — the eight-ring cap is a fact about the\ndrawing, and a script asking how much a mate has absorbed wants the\ncount.\n\nRead-only and derived. Zero for everything that has absorbed nothing,\nwhich is most panes.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "activity": {
               "anyOf": [
                 {
@@ -1214,6 +1220,12 @@
         },
         "WorkspaceInfo": {
           "properties": {
+            "absorbed": {
+              "description": "How many finished workers this Space has taken back. See\n[`super::PaneInfo::absorbed`] — a mate can be either, and the count is\nresolved by the same rule for both.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "active_tab_id": {
               "type": "string"
             },
@@ -6680,6 +6692,12 @@
       "$defs": {
         "AgentInfo": {
           "properties": {
+            "absorbed": {
+              "description": "How many finished workers this agent has taken back, mirroring\n[`crate::api::schema::PaneInfo::absorbed`] for the same reason `owner`\nis mirrored here: a script reading the fleet through `agent.list`\nshould not have to reference `pane.get` to see it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "agent": {
               "type": [
                 "string",
@@ -8145,6 +8163,12 @@
         },
         "PaneInfo": {
           "properties": {
+            "absorbed": {
+              "description": "How many finished workers this pane has taken back, if it is a mate\nsomebody reports `completed` to.\n\nCounted from the `completed` relation signals Herdr already accepts,\ncredited to the `owner` the tree resolves for the row that finished, so\nthis and the sidebar's rings are the same number and not two tallies\nthat can drift. Uncapped here — the eight-ring cap is a fact about the\ndrawing, and a script asking how much a mate has absorbed wants the\ncount.\n\nRead-only and derived. Zero for everything that has absorbed nothing,\nwhich is most panes.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "activity": {
               "anyOf": [
                 {
@@ -10801,6 +10825,12 @@
         },
         "WorkspaceInfo": {
           "properties": {
+            "absorbed": {
+              "description": "How many finished workers this Space has taken back. See\n[`super::PaneInfo::absorbed`] — a mate can be either, and the count is\nresolved by the same rule for both.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "active_tab_id": {
               "type": "string"
             },

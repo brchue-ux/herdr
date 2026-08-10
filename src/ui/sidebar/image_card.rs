@@ -728,6 +728,15 @@ struct CardContent {
     lifted: bool,
     /// The project mark, once there are any. See [`CardMark`].
     mark: Option<CardMark>,
+    /// How many finished workers this mate has taken back, already capped to
+    /// the stack the card can draw. See [`crate::app::residue`].
+    ///
+    /// **Not a state channel.** `stage` is the hue, `severity` is the
+    /// intensity, and both say what the work on this card is doing *now*. This
+    /// says what has already happened and is over, which is why it draws as
+    /// contour lines in the card's own edge colour rather than as a third
+    /// colour anybody has to learn.
+    residue: u8,
     /// The controls hung on the card's right margin. See [`ControlRail`].
     controls: ControlRail,
     /// This frame of the card's breath, quantized to [`CARD_BREATH_STEPS`].
@@ -760,6 +769,10 @@ impl CardContent {
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
         self.mark.is_some().hash(hasher);
+        // A ring is settled state, so nothing else about the card moves when
+        // one is added: a signature blind to this would carry the old pixels
+        // forward and the sixth absorption would never appear.
+        self.residue.hash(hasher);
         // Every part of it: a worker reporting back, a summary being read, and a
         // group being folded all change the card's pixels and nothing else about
         // it, so a card carried forward on a signature blind to this would keep
@@ -1888,6 +1901,85 @@ fn reserved_margin(width: f32, gap: f32) -> f32 {
 }
 
 /// Draw one card's body, plate, chip and text over whatever is already there.
+/// Depth of the newest residue ring, as a fraction of the card's own height.
+///
+/// Measured in from the card's boundary rather than out from it, which is the
+/// one real departure from the approved concept's geometry and is forced: the
+/// concept draws a 60px box with 90px of clear space around it, and a sidebar
+/// row has none — the row above is a card and so is the row below. Rings drawn
+/// outward would be drawn on the neighbours. Inward, the same concentric stack
+/// reads as contour lines in the card's own surface, which is if anything a
+/// truer picture of residue than a halo: it is *in* the mate, not around it.
+const RESIDUE_INSET: f32 = 0.075;
+/// Gap between one ring and the next, as a fraction of the card's height.
+///
+/// [`crate::app::residue::MAX_RINGS`] of these plus [`RESIDUE_INSET`] must stay
+/// clear of the card's own centre line, or the deepest rings would collapse
+/// into each other and the last absorptions would stop being countable — see
+/// `a_full_ring_stack_fits_inside_the_card`, which is what holds these two
+/// numbers to that.
+const RESIDUE_STEP: f32 = 0.042;
+/// Half-width of a ring's line, as a fraction of the card's height.
+///
+/// Thinner than the card's own stroke (`measured::STROKE_W`, 0.033 of the
+/// nominal height, so 0.0165 either side of the boundary). A ring must not be
+/// mistakeable for the card's edge repeated: it is quieter than the edge in
+/// both weight and alpha.
+const RESIDUE_HALF_W: f32 = 0.007;
+
+/// The residue stack of one card, resolved once and then sampled per pixel.
+///
+/// Sampled from the *same* signed distance the fill, the inner glow and the
+/// stroke are already reading, so the rings cost the card no second pass over
+/// its pixels — which matters because this is inside the pane-scaled render
+/// path. The per-pixel work is one divide, one round and one bounds check,
+/// independent of how many rings are up.
+#[derive(Debug, Clone, Copy)]
+struct RingStack {
+    count: u8,
+    inset: f32,
+    step: f32,
+    half_w: f32,
+    alphas: [f32; crate::app::residue::MAX_RINGS],
+}
+
+impl RingStack {
+    fn new(residue: u8, height: f32) -> Option<Self> {
+        let count = residue.min(crate::app::residue::MAX_RINGS as u8);
+        if count == 0 {
+            return None;
+        }
+        let mut alphas = [0.0; crate::app::residue::MAX_RINGS];
+        for ring in crate::app::residue::stack(count) {
+            alphas[usize::from(ring.age)] = ring.alpha;
+        }
+        Some(Self {
+            count,
+            inset: RESIDUE_INSET * height,
+            step: (RESIDUE_STEP * height).max(1.0),
+            half_w: (RESIDUE_HALF_W * height).max(0.35),
+            alphas,
+        })
+    }
+
+    /// What this pixel owes the rings, given its signed distance to the card's
+    /// boundary. `None` everywhere outside the stack, which is most of a card.
+    fn at(&self, distance: f32) -> Option<f32> {
+        // Inside is negative; a ring lives at a positive depth in from the edge.
+        let depth = -distance;
+        if depth < self.inset - self.half_w {
+            return None;
+        }
+        let age = ((depth - self.inset) / self.step).round();
+        if age < 0.0 || age >= f32::from(self.count) {
+            return None;
+        }
+        let age = age as usize;
+        let cover = coverage((depth - (self.inset + age as f32 * self.step)).abs() - self.half_w);
+        (cover > 0.0).then(|| cover * self.alphas[age])
+    }
+}
+
 fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // The card's chrome and its type are drawn at the settled light; only the
     // body — stroke, fill and inner glow — sweeps with the wash and swings with
@@ -1922,6 +2014,10 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // for the card, which is what carries the wash: with none they are the same
     // pair every column and this is the gradient it always was, and with one
     // the column ahead of the front is still lit by the state the card left.
+    // The residue this card is carrying, resolved once. `None` on a card that
+    // has absorbed nothing, which is the branch every card took before this
+    // existed and is still the branch most cards take.
+    let rings = RingStack::new(content.residue, height);
     let inks = card.inks();
     let columns: Vec<(Rgb, Rgb)> = (x0..x1)
         .map(|x| {
@@ -1953,6 +2049,17 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                     if inner > 0.001 {
                         sheet.blend(x, y, gradient, inner * body);
                     }
+                }
+            }
+
+            // Residue, in the card's own edge colour at this column: contour
+            // lines of the same material the card's boundary is drawn in, not
+            // a new hue. Under the stroke and under every mark and every glyph
+            // that follows, because it is the quietest thing on the card and
+            // must never take a pixel off the state it is actually in.
+            if let Some(rings) = rings {
+                if let Some(alpha) = rings.at(d) {
+                    sheet.blend(x, y, gradient, alpha * body);
                 }
             }
 
@@ -2542,6 +2649,14 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.active == Some(*ws_idx),
                 mark: None,
+                // Keyed by the Space's own tree handle, which is exactly what
+                // a worker's `owner` token names and what the credit in
+                // `App::absorbing_owner` resolves to — so a mate that has no
+                // handle has no rings, rather than sharing a blank key with
+                // every other unnamed Space.
+                residue: super::space_tree_name(app, *ws_idx)
+                    .map(|name| app.residue.rings(&name))
+                    .unwrap_or(0),
                 // Filled in by `compute_card_placement`, which is the pass that
                 // has the row's cells and can therefore ask whether a control is
                 // clickable there at all. See `control_rail`.
@@ -2584,6 +2699,14 @@ fn content_for(
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
                 mark: None,
+                // A mate can be a pane rather than a Space, and it is named
+                // the same way: `agent_name` is "this pane's own handle, the
+                // thing another pane's `owner` token names".
+                residue: detail
+                    .agent_name
+                    .as_deref()
+                    .map(|name| app.residue.rings(name))
+                    .unwrap_or(0),
                 controls: ControlRail::default(),
                 breath,
                 wash: wash(app, crate::anim::CardRow::Agent(detail.pane_id)),
@@ -2969,6 +3092,7 @@ pub(crate) struct CardContentWire {
     depth: u8,
     lifted: bool,
     mark: Option<CardMark>,
+    residue: u8,
     controls: ControlRail,
     breath: f32,
 }
@@ -2989,6 +3113,7 @@ impl From<&CardContent> for CardContentWire {
             depth: content.depth,
             lifted: content.lifted,
             mark: content.mark,
+            residue: content.residue,
             controls: content.controls,
             breath: content.breath,
         }
@@ -3011,6 +3136,7 @@ impl From<CardContentWire> for CardContent {
             depth: wire.depth,
             lifted: wire.lifted,
             mark: wire.mark,
+            residue: wire.residue,
             controls: wire.controls,
             breath: wire.breath,
             wash: None,
@@ -10892,6 +11018,178 @@ mod cards_breathe_and_wash {
     /// one. So a standing layer whose pixels are within the tolerance is still
     /// only this surface's image if it was drawn for this surface's box, and the
     /// rect is checked beside the pixels for exactly that reason.
+    /// A full stack has to stay a stack: eight contour lines inside a card that
+    /// is only so deep, with a gap between each pair and clear air at the
+    /// centre. If [`RESIDUE_INSET`] and [`RESIDUE_STEP`] ever grow past this,
+    /// the deepest rings run into each other and the last absorptions stop
+    /// being countable — which is the failure the eight-ring cap exists to
+    /// avoid in the first place.
+    #[test]
+    fn a_full_ring_stack_fits_inside_the_card() {
+        // Every card height the real path produces on the cell sizes this crate
+        // is tested at, and then some.
+        for height in [24.0_f32, 36.0, 48.0, 63.0, 84.0, 120.0] {
+            let stack = RingStack::new(crate::app::residue::MAX_RINGS as u8, height)
+                .expect("a full stack is not empty");
+            let deepest = stack.inset + f32::from(stack.count - 1) * stack.step;
+            assert!(
+                deepest + stack.half_w < height / 2.0,
+                "at height {height} the oldest ring reaches {deepest} px in, past the card's own \
+                 centre line at {}",
+                height / 2.0
+            );
+            assert!(
+                stack.step > stack.half_w * 2.0,
+                "at height {height} rings {} px apart cannot be told apart at {} px wide",
+                stack.step,
+                stack.half_w * 2.0
+            );
+        }
+    }
+
+    /// The stack is sampled off the card's own signed distance, so this is the
+    /// whole of what the pixel loop asks it. Each ring answers at its own depth
+    /// and nowhere else, and the alphas fall with age.
+    #[test]
+    fn every_ring_answers_at_its_own_depth_and_the_older_ones_answer_fainter() {
+        let stack = RingStack::new(6, 63.0).expect("six rings is not empty");
+        let mut seen = Vec::new();
+        for age in 0..6 {
+            let depth = stack.inset + age as f32 * stack.step;
+            let alpha = stack
+                .at(-depth)
+                .unwrap_or_else(|| panic!("ring {age} drew nothing at its own depth"));
+            seen.push(alpha);
+        }
+        for pair in seen.windows(2) {
+            assert!(
+                pair[1] < pair[0],
+                "an older ring drew at least as strongly as a newer one: {seen:?}"
+            );
+        }
+
+        // Outside the card, at the card's edge, and past the last ring: all
+        // nothing. A ring must never leak onto a neighbouring row, and a
+        // seven-ring stack must not draw an eighth.
+        assert_eq!(stack.at(4.0), None, "a ring drew outside the card");
+        assert_eq!(
+            stack.at(0.0),
+            None,
+            "a ring drew on the card's own boundary"
+        );
+        let past = stack.inset + 6.0 * stack.step;
+        assert_eq!(stack.at(-past), None, "a stack of six drew a seventh ring");
+    }
+
+    /// A mate that has absorbed nothing takes the branch it always took.
+    #[test]
+    fn a_card_with_no_residue_has_no_ring_stack_at_all() {
+        assert!(RingStack::new(0, 63.0).is_none());
+        assert!(RingStack::new(1, 63.0).is_some());
+    }
+
+    /// The point of the whole feature, in pixels: six absorbed workers and none
+    /// are two different cards, and the difference is inside the card rather
+    /// than over its edge or its text.
+    #[test]
+    fn a_mate_that_has_absorbed_workers_draws_a_different_card_from_one_that_has_not() {
+        let Some(font) = font::card_font(None) else {
+            return;
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 4.0,
+            y: 4.0,
+            w: 220.0,
+            h: 63.0,
+            r: geometry.radius,
+        };
+        let painted = |residue: u8| {
+            let content = residue_test_content(residue);
+            let mut sheet = Canvas::new(240, 76);
+            draw_card(
+                &mut sheet,
+                &PlacedCard {
+                    rect,
+                    content: &content,
+                    geometry: CardGeometry::new(21.0, false),
+                },
+                font,
+            );
+            sheet.rgba8().to_vec()
+        };
+        let bare = painted(0);
+        let six = painted(6);
+        assert_ne!(
+            bare, six,
+            "six absorbed workers drew the same card as none — the residue is not reaching the \
+             pixels"
+        );
+
+        // Where it differs: only inside the card, and only in the band the ring
+        // stack occupies. A difference at the boundary would mean the residue
+        // is being mistaken for the card's own stroke; one outside it would
+        // mean a ring is drawing on the neighbouring row.
+        let mut differing_depths: Vec<f32> = Vec::new();
+        for y in 0..76u32 {
+            for x in 0..240u32 {
+                let i = ((y * 240 + x) * 4) as usize;
+                if bare[i..i + 4] != six[i..i + 4] {
+                    differing_depths.push(-rect.distance(x as f32 + 0.5, y as f32 + 0.5));
+                }
+            }
+        }
+        assert!(
+            !differing_depths.is_empty(),
+            "the two cards differ but not at any pixel — impossible"
+        );
+        let stack = RingStack::new(6, rect.h).expect("six rings is not empty");
+        let shallowest = stack.inset - stack.half_w - 1.0;
+        let deepest = stack.inset + 5.0 * stack.step + stack.half_w + 1.0;
+        for depth in &differing_depths {
+            assert!(
+                *depth >= shallowest && *depth <= deepest,
+                "residue changed a pixel {depth} px in from the card's edge, outside the ring \
+                 band {shallowest}..={deepest}"
+            );
+        }
+    }
+
+    /// A card carried forward on a stale signature would never show the sixth
+    /// absorption: nothing else about the card moves when a ring is added.
+    #[test]
+    fn adding_a_ring_changes_the_cards_signature() {
+        let signature = |residue: u8| {
+            let mut hasher = DefaultHasher::new();
+            residue_test_content(residue).hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(signature(0), signature(1));
+        assert_ne!(signature(5), signature(6));
+    }
+
+    fn residue_test_content(residue: u8) -> CardContent {
+        CardContent {
+            title: "2ndmate-explore".into(),
+            tidbit: None,
+            state_label: "idle".into(),
+            state: AgentState::Idle,
+            stage: LifecycleStage::Done,
+            severity: Severity::Clear,
+            hues: StageHues([0.0; 5]),
+            ground: measured::CANVAS,
+            split_channels: true,
+            seen: true,
+            depth: 1,
+            lifted: false,
+            mark: None,
+            residue,
+            controls: ControlRail::default(),
+            breath: 0.0,
+            wash: None,
+        }
+    }
+
     #[test]
     fn a_layer_drawn_for_another_box_is_not_carried_forward_however_close_its_pixels() {
         let (mut app, now) = fleet_all_in(AgentState::Idle);

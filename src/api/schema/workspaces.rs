@@ -131,6 +131,11 @@ pub struct WorkspaceInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// How many finished workers this Space has taken back. See
+    /// [`super::PaneInfo::absorbed`] — a mate can be either, and the count is
+    /// resolved by the same rule for both.
+    #[serde(default, skip_serializing_if = "super::panes::is_zero_u32")]
+    pub absorbed: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
