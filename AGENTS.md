@@ -530,6 +530,22 @@ When updating libghostty-vt, check every active patch in `vendor/libghostty-vt.p
 
 `just check` runs maintenance tests that verify local libghostty-vt patch files are listed in the index and reverse-apply cleanly against the vendored tree. Do not leave a patch file untracked or an indexed patch unapplied.
 
+### Cross-building a Windows binary from Linux
+
+CI builds the Windows artifact on a native Windows runner with `LIBGHOSTTY_VT_SIMD=true` (`.github/workflows/build-artifacts-manual.yml`, `preview.yml`). A Linux cross-build cannot do that, and the reason is not fixable from this repo: `-Dsimd=true` pulls libghostty-vt's two C++ dependencies (`simdutf`, `highway`) into the build, and zig has no C++ headers for the MSVC ABI, so they fail with `'cstring' file not found` before any Rust code is compiled. This is why `just windows-lint` pins `LIBGHOSTTY_VT_SIMD=false`; a cross-built *binary* has to do the same.
+
+```bash
+export ZIG=/path/to/zig-0.15.2
+LIBGHOSTTY_VT_OPTIMIZE=ReleaseFast LIBGHOSTTY_VT_SIMD=false \
+  cargo xwin build --release --locked --target x86_64-pc-windows-msvc --bin herdr
+```
+
+The cost is that libghostty-vt's UTF-8 scanning runs scalar rather than vectorised — VT parser throughput, not behaviour. A build meant to be measured, released, or compared against a release must come from the Windows runner instead.
+
+Two things a cross-built exe does not get, both of which need Windows: the app-local ConPTY bundle (`scripts/package_windows_conpty.ps1` verifies Microsoft's Authenticode signatures, so it cannot be staged on Linux — a bare `herdr.exe` with no sibling `conpty/` directory falls back to the system ConPTY, see `vendor/portable-pty/src/win/psuedocon.rs`), and any execution at all.
+
+Set `HERDR_BUILD_CHANNEL`/`HERDR_BUILD_ID` when handing a one-off build to someone, or it is unidentifiable: `build_info::version()` returns the bare `CARGO_PKG_VERSION` on the default `stable` channel and appends the build id on every other channel. A channel string other than `preview` keeps `is_preview()` false, so update behaviour stays on the stable path.
+
 ## Docs
 
 Unreleased docs live in `docs/next/website/src/content/docs/`. Update those when a user-facing change needs docs before the next release. They are committed drafts but are never production website input. `docs/next/README.md` and `docs/next/CHANGELOG.md` stage root README and changelog changes.
