@@ -57,7 +57,7 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
 mod agent_resume;
 mod agent_view;
 // The animation engine deliberately publishes a wider surface than its
-// consumers bind to. The sidebar's token emphasis and the fleet signal bar are
+// consumers bind to. The sidebar's token emphasis and the fleet pulse row are
 // wired; animation quality, live tree expansion, and view transitions are
 // queued and build on the same surface — the dismount phase in particular is
 // complete and tested with no consumer drawing it yet. Narrowing it to today's

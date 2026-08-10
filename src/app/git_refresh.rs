@@ -109,7 +109,7 @@ impl App {
                 _ => {}
             }
         }
-        // A configured signal bar reads the same counts, so it carries the same
+        // A configured fleet pulse arms the same counts, so it carries the same
         // demand. Without this its `push` and `sync` slots would be drawn over
         // counts nothing ever refreshed and could never go live.
         if self.state.sidebar_notifications.enabled {

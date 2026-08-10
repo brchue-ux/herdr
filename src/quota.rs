@@ -58,7 +58,7 @@ pub(crate) fn parse(raw: &str) -> Option<QuotaReadout> {
 
 /// The percentage, formatted with no more precision than the source
 /// published: whole when it is whole, one decimal when it is not.
-fn format_percent(percent_used: f64) -> String {
+pub(crate) fn format_percent(percent_used: f64) -> String {
     if percent_used.fract() == 0.0 {
         format!("{percent_used:.0}")
     } else {

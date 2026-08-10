@@ -1588,38 +1588,42 @@ pub(crate) fn workspace_list_header_rect(area: Rect) -> Rect {
 /// better blank than wrong.
 const MIN_SESSION_STATUS_WIDTH: u16 = 6;
 
-/// Columns between the signal bar and whatever shares its row.
+/// Columns between the pulse row and whatever shares its row.
 const HEADER_ROW_GAP: u16 = 2;
 
-/// Draw the panel's reserved header row: the fleet signal bar, then the session
+/// Draw the panel's reserved header row: the fleet pulse, then the session
 /// status in whatever is left.
 ///
-/// The bar takes its columns from the left and the status right-aligns in the
+/// The pulse takes its columns from the left and the status right-aligns in the
 /// remainder, so the two never overlap and neither has to know the other's
-/// content. The bar is measured first on purpose: it is a fixed readout whose
-/// positions a reader learns, while the status is arbitrary publisher text that
-/// already knows how to elide and how to drop when it cannot be read.
+/// content. The pulse is measured first on purpose: it is a permanent readout
+/// whose positions a reader learns, while the status is arbitrary publisher
+/// text that already knows how to elide and how to drop when it cannot be read.
 fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
     let header = workspace_list_header_rect(area);
     if header.height == 0 {
         return;
     }
 
-    let bar_width = notifications::fleet_signal_bar_width(app, header.width);
-    if bar_width > 0 {
-        notifications::render_fleet_signal_bar(
+    // Resolved once and reused for both the width and the draw. Reading the
+    // fleet is a walk of every pane in every tab in every workspace, and this
+    // row is not allowed to walk it twice per frame.
+    let pulse = notifications::Pulse::resolve(app);
+    let pulse_width = pulse.map_or(0, |pulse| pulse.width(header.width));
+    if let (Some(pulse), true) = (pulse, pulse_width > 0) {
+        pulse.render(
             app,
             frame,
-            Rect::new(header.x, header.y, bar_width, header.height),
+            Rect::new(header.x, header.y, pulse_width, header.height),
         );
     }
 
-    let mut taken = bar_width.saturating_add(if bar_width > 0 { HEADER_ROW_GAP } else { 0 });
+    let mut taken = pulse_width.saturating_add(if pulse_width > 0 { HEADER_ROW_GAP } else { 0 });
 
-    // The way out of a re-rooted tree sits after the bar, never before it. The
-    // bar is a permanent readout whose positions a reader learns, and a control
-    // that comes and goes with the current view must not shift it.
-    let breadcrumb = sidebar_tree_breadcrumb_rect(app, area);
+    // The way out of a re-rooted tree sits after the pulse, never before it.
+    // The pulse is a permanent readout whose positions a reader learns, and a
+    // control that comes and goes with the current view must not shift it.
+    let breadcrumb = breadcrumb_rect_after_pulse(app, area, pulse_width);
     if breadcrumb.width > 0 {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -1665,10 +1669,26 @@ fn sidebar_tree_breadcrumb(app: &AppState) -> Option<&'static str> {
 ///
 /// On the reserved header row, which is the one row above the tree and
 /// therefore the only place a "go up" control can sit without taking a column
-/// away from a row. It follows the fleet signal bar rather than preceding it,
+/// away from a row. It follows the fleet pulse rather than preceding it,
 /// so a control that comes and goes with the current view never shifts a
 /// permanent readout. `area` is the panel's own list rect.
 pub(crate) fn sidebar_tree_breadcrumb_rect(app: &AppState, area: Rect) -> Rect {
+    let header = workspace_list_header_rect(area);
+    // Reads the fleet for itself, which the render path must not do a second
+    // time — see [`breadcrumb_rect_after_pulse`]. This entry point exists for
+    // hit-testing a click, which happens once per event rather than once per
+    // frame.
+    let pulse = notifications::fleet_pulse_width(app, header.width);
+    breadcrumb_rect_after_pulse(app, area, pulse)
+}
+
+/// The breadcrumb's rect given the columns the pulse row already took.
+///
+/// Split out so the render path, which has just measured the pulse, does not
+/// have to walk every pane again to learn the same number. Measured against the
+/// same allocation `render_header_row` walks, so the control is hit-tested
+/// exactly where it was drawn.
+fn breadcrumb_rect_after_pulse(app: &AppState, area: Rect, pulse_width: u16) -> Rect {
     let Some(label) = sidebar_tree_breadcrumb(app) else {
         return Rect::default();
     };
@@ -1676,11 +1696,7 @@ pub(crate) fn sidebar_tree_breadcrumb_rect(app: &AppState, area: Rect) -> Rect {
     if header.height == 0 {
         return Rect::default();
     }
-    // Measured against the same allocation `render_header_row` walks, so the
-    // control is hit-tested exactly where it was drawn however many columns the
-    // signal bar took first.
-    let bar = notifications::fleet_signal_bar_width(app, header.width);
-    let offset = bar.saturating_add(if bar > 0 { HEADER_ROW_GAP } else { 0 });
+    let offset = pulse_width.saturating_add(if pulse_width > 0 { HEADER_ROW_GAP } else { 0 });
     let width = display_width(label) as u16;
     if header.width.saturating_sub(offset) < width {
         return Rect::default();
@@ -6989,36 +7005,60 @@ mod tests {
         );
     }
 
-    /// Renders a sidebar with the fleet signal bar switched on, optionally with
-    /// two of its signals driven live, and returns the drawn rows.
+    /// Puts `working` panes into the working state and `blocked` panes into the
+    /// blocked state, one per pane, so a test can say how big each count is
+    /// without assembling terminals by hand.
+    fn drive_pane_states(app: &mut crate::app::state::AppState, working: usize, blocked: usize) {
+        let ids: Vec<_> = app.terminals.keys().cloned().collect();
+        assert!(
+            ids.len() >= working + blocked,
+            "the fleet has {} panes but {} were asked for",
+            ids.len(),
+            working + blocked
+        );
+        for (index, id) in ids.into_iter().take(working + blocked).enumerate() {
+            app.terminals.get_mut(&id).expect("terminal exists").state = if index < working {
+                crate::detect::AgentState::Working
+            } else {
+                crate::detect::AgentState::Blocked
+            };
+        }
+    }
+
+    /// Renders a sidebar with the fleet pulse switched on and returns the drawn
+    /// rows.
     ///
-    /// `dirty` is driven through the workspace's own cached Git counts and
-    /// `blocked` through a pane's detected agent state, which are the same two
-    /// facts the tree below the bar already reads — so the test drives real
-    /// state rather than reaching into the bar.
-    fn signal_bar_rows(width: u16, ahead: bool, blocked: bool) -> Vec<String> {
+    /// Every reading is driven through the state the tree below it already
+    /// reads — detected agent state for the counts, a workspace metadata token
+    /// for the quota — so the test drives a real fleet rather than reaching
+    /// into the row.
+    fn fleet_pulse_rows(
+        width: u16,
+        working: usize,
+        blocked: usize,
+        quota: Option<&str>,
+    ) -> Vec<String> {
         let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("one")];
+        app.workspaces = (0..(working + blocked).max(1))
+            .map(|index| Workspace::test_new(&format!("ws{index}")))
+            .collect();
         app.ensure_test_terminals();
         app.active = Some(0);
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
         app.sidebar_notifications.enabled = true;
 
-        if ahead {
-            app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
+        if let Some(quota) = quota {
+            app.workspaces[0].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    crate::quota::SESSION_TOKEN.to_string(),
+                    Some(quota.to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
         }
-        if blocked {
-            let terminal_id = app
-                .terminals
-                .keys()
-                .next()
-                .expect("a terminal exists")
-                .clone();
-            app.terminals
-                .get_mut(&terminal_id)
-                .expect("terminal exists")
-                .state = crate::detect::AgentState::Blocked;
-        }
+
+        drive_pane_states(&mut app, working, blocked);
 
         // The app loop is what publishes the live set; a render-only test has
         // to stand in for it or nothing would ever be mounted.
@@ -7029,8 +7069,8 @@ mod tests {
             .collect();
         app.anim
             .observe(now, crate::anim::Family::Named, &lifecycle, live);
-        // Past the arrival, so a live slot is drawn in its steady state rather
-        // than mid-fade.
+        // Past the arrival, so an alerting reading is drawn in its steady state
+        // rather than mid-fade.
         app.anim
             .advance(now + std::time::Duration::from_millis(600));
 
@@ -7047,178 +7087,113 @@ mod tests {
             .collect()
     }
 
-    /// Foreground each signal's mark is drawn in on the header row.
-    ///
-    /// Keyed by the mark rather than by column so the assertion does not have
-    /// to know which tier the width picked.
-    fn signal_bar_mark_colors(
-        width: u16,
-        ahead: bool,
-        blocked: bool,
-    ) -> std::collections::HashMap<String, Option<ratatui::style::Color>> {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("one")];
-        app.ensure_test_terminals();
-        app.active = Some(0);
-        app.sidebar_notifications.enabled = true;
-        // Colour, not motion, is what this reads; a still live slot keeps its
-        // own colour and makes the assertion independent of the frame clock.
-        app.sidebar_notifications.emphasis = crate::config::SidebarTokenEmphasis::None;
-        app.sidebar_notifications.enter = crate::config::SidebarTokenEmphasis::None;
-
-        if ahead {
-            app.workspaces[0].cached_git_ahead_behind = Some((1, 0));
-        }
-        if blocked {
-            let terminal_id = app
-                .terminals
-                .keys()
-                .next()
-                .expect("a terminal exists")
-                .clone();
-            app.terminals
-                .get_mut(&terminal_id)
-                .expect("terminal exists")
-                .state = crate::detect::AgentState::Blocked;
-        }
-
-        let area = Rect::new(0, 0, width, 12);
-        app.view.sidebar_rect = area;
-        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
-        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        terminal
-            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-
-        let mut colors = std::collections::HashMap::new();
-        for column in 0..area.width {
-            let cell = &buffer[(column, 0)];
-            colors
-                .entry(cell.symbol().to_string())
-                .or_insert(cell.style().fg);
-        }
-        colors
-    }
-
-    /// Resting slots are the panel's muted grey; a live one is its own colour.
-    /// The change from one to the other is what the bar is for.
+    /// The whole point of the row. It used to draw the same eight signals the
+    /// tray draws, in the same order, and a second copy of a readout is not a
+    /// readout. Nothing the tray already says may appear here.
     #[test]
-    fn a_live_signal_leaves_the_resting_grey_for_its_own_colour() {
-        let palette = crate::app::state::AppState::test_new().palette;
-        let width = notifications::Tier::Marks.width() + 2;
+    fn the_pulse_row_says_nothing_the_tray_below_it_already_says() {
+        let rows = fleet_pulse_rows(60, 3, 1, Some("62"));
+        let header = &rows[0];
 
-        let resting = signal_bar_mark_colors(width, false, false);
-        for signal in crate::app::fleet_signals::FleetSignal::ALL {
-            assert_eq!(
-                resting.get(signal.mark()).copied().flatten(),
-                Some(palette.overlay0),
-                "{signal:?} is not grey on a resting bar"
-            );
-        }
-
-        let alerting = signal_bar_mark_colors(width, true, true);
-        assert_eq!(
-            alerting.get("↑").copied().flatten(),
-            Some(palette.blue),
-            "unpushed work did not colour its own slot"
-        );
-        assert_eq!(
-            alerting.get("◉").copied().flatten(),
-            Some(palette.red),
-            "a blocked agent did not colour its own slot"
-        );
-        // And the six that are still quiet have not moved.
-        assert_eq!(
-            alerting.get("⋔").copied().flatten(),
-            Some(palette.overlay0),
-            "a quiet slot changed colour because a different signal went live"
-        );
-    }
-
-    /// The bar's whole promise: at rest it is still there, and it says what the
-    /// eight things are.
-    #[test]
-    fn a_quiet_fleet_still_draws_all_eight_signals_named() {
-        let width = notifications::Tier::Named.width() + 4;
-        let rows = signal_bar_rows(width, false, false);
-        let screen = rows.join("\n");
-
-        for signal in crate::app::fleet_signals::FleetSignal::ALL {
-            assert!(
-                rows[0].contains(signal.name()),
-                "{signal:?} is not named on a resting bar:\n{screen}"
-            );
-            assert!(
-                rows[0].contains(signal.mark()),
-                "{signal:?} has no mark on a resting bar:\n{screen}"
-            );
-        }
-    }
-
-    /// Going live changes a slot's colour and its motion, never its text. That
-    /// is what lets a reader learn where a signal sits: the bar cannot reflow
-    /// as alerts come and go.
-    #[test]
-    fn a_signal_going_live_never_moves_the_bar() {
-        for width in [
-            notifications::Tier::Named.width() + 4,
-            notifications::Tier::Marks.width() + 2,
-            notifications::Tier::Tight.width() + 1,
-        ] {
-            let resting = signal_bar_rows(width, false, false);
-            let alerting = signal_bar_rows(width, true, true);
-            assert_eq!(
-                resting[0], alerting[0],
-                "the bar's text moved at {width} columns when two signals went live"
-            );
-        }
-    }
-
-    /// The narrow ladder: names go first, then the gaps, and all eight marks
-    /// survive to the floor.
-    #[test]
-    fn a_narrow_sidebar_keeps_every_signal_and_drops_the_names() {
-        for (width, tier) in [
-            (notifications::Tier::Marks.width(), "marks"),
-            (notifications::Tier::Tight.width(), "tight"),
-        ] {
-            let rows = signal_bar_rows(width + 1, false, false);
-            let screen = rows.join("\n");
-            for signal in crate::app::fleet_signals::FleetSignal::ALL {
-                assert!(
-                    rows[0].contains(signal.mark()),
-                    "{signal:?} vanished from the {tier} tier at {width} columns:\n{screen}"
-                );
-                assert!(
-                    !rows[0].contains(signal.name()),
-                    "{signal:?} still drew its name in the {tier} tier:\n{screen}"
-                );
-            }
-        }
-    }
-
-    /// A real 26-column sidebar - the default width - still shows all eight.
-    #[test]
-    fn the_default_sidebar_width_holds_the_whole_bar() {
-        let rows = signal_bar_rows(26, false, false);
-        let screen = rows.join("\n");
         assert!(
-            notifications::Tier::widest_fitting(25).is_some(),
-            "the default sidebar cannot hold the bar at all"
+            header.contains("3 running"),
+            "the running count is missing:\n{header}"
         );
+        assert!(
+            header.contains("1 needs you"),
+            "the waiting count is missing:\n{header}"
+        );
+        assert!(
+            header.contains("quota 62%"),
+            "the quota reading is missing:\n{header}"
+        );
+
         for signal in crate::app::fleet_signals::FleetSignal::ALL {
             assert!(
-                rows[0].contains(signal.mark()),
-                "{signal:?} is missing at the default 26 columns:\n{screen}"
+                !header.contains(signal.mark()),
+                "{signal:?} still draws the tray's mark on the header row:\n{header}"
+            );
+            assert!(
+                !header.contains(signal.name()),
+                "{signal:?} still draws the tray's name on the header row:\n{header}"
             );
         }
+    }
+
+    /// A count, not a lamp. Two blocked panes light exactly one tray badge, so
+    /// this is information the tray structurally cannot carry.
+    #[test]
+    fn the_row_counts_panes_where_the_tray_can_only_light_a_kind() {
+        let one = fleet_pulse_rows(60, 0, 1, None);
+        let two = fleet_pulse_rows(60, 0, 2, None);
+
+        assert!(one[0].contains("1 needs you"), "{}", one[0]);
+        assert!(two[0].contains("2 needs you"), "{}", two[0]);
+
+        // The tray's own reading of the same two fleets is identical: `ask` is
+        // lit either way.
+        for panes in [1, 2] {
+            let mut app = crate::app::state::AppState::test_new();
+            app.workspaces = (0..panes)
+                .map(|index| Workspace::test_new(&format!("ws{index}")))
+                .collect();
+            app.ensure_test_terminals();
+            drive_pane_states(&mut app, 0, panes);
+            assert!(
+                crate::app::fleet_signals::FleetSignals::resolve(&app)
+                    .is_live(crate::app::fleet_signals::FleetSignal::Ask),
+                "the tray reads {panes} blocked panes as nothing at all"
+            );
+        }
+    }
+
+    /// A reading nobody published is absent rather than zero, and the counts
+    /// are still stated on a fleet where nothing is happening — "all clear" is
+    /// a fact worth a row.
+    #[test]
+    fn a_quiet_fleet_still_states_its_counts_and_omits_an_unpublished_quota() {
+        let rows = fleet_pulse_rows(60, 0, 0, None);
+        assert!(rows[0].contains("0 running"), "{}", rows[0]);
+        assert!(rows[0].contains("0 needs you"), "{}", rows[0]);
+        assert!(
+            !rows[0].contains("quota"),
+            "an unpublished quota drew anyway:\n{}",
+            rows[0]
+        );
+    }
+
+    /// A real 26-column sidebar - the default width - still says all three
+    /// numbers, in the compact wording.
+    #[test]
+    fn the_default_sidebar_width_holds_the_whole_pulse() {
+        let rows = fleet_pulse_rows(26, 3, 1, Some("62"));
+        let header = &rows[0];
+        assert!(header.contains("3 run"), "{header}");
+        assert!(header.contains("1 you"), "{header}");
+        assert!(header.contains("62%"), "{header}");
+    }
+
+    /// A sidebar too narrow for any wording still states all three numbers.
+    /// The row this replaced survived to eight columns, and giving that up
+    /// would make the change a narrowing as well as a rewrite.
+    #[test]
+    fn a_narrow_sidebar_keeps_every_number_and_drops_the_words() {
+        let rows = fleet_pulse_rows(18, 3, 1, Some("62"));
+        let header = &rows[0];
+        assert!(
+            header.starts_with("3·1·62%"),
+            "the numbers did not survive an 18-column sidebar:\n{header}"
+        );
+        assert!(
+            !header.contains("run") && !header.contains("you"),
+            "a word drew at 18 columns:\n{header}"
+        );
     }
 
     /// Off by default: an unconfigured Herdr draws the header row exactly as it
-    /// did before the bar existed.
+    /// did before the row existed.
     #[test]
-    fn the_bar_is_not_drawn_until_it_is_configured_on() {
+    fn the_pulse_is_not_drawn_until_it_is_configured_on() {
         let without = mate_fleet_sidebar_rows(26, None);
         assert!(
             without[0].chars().all(|ch| ch.is_whitespace() || ch == '│'),
@@ -7227,16 +7202,16 @@ mod tests {
         );
     }
 
-    /// The bar takes the left of the row and the status keeps the right, so
-    /// turning the bar on never writes over a published status.
+    /// The pulse takes the left of the row and the status keeps the right, so
+    /// turning the pulse on never writes over a published status.
     #[test]
-    fn the_bar_and_the_session_status_share_the_header_row_without_overlapping() {
+    fn the_pulse_and_the_session_status_share_the_header_row_without_overlapping() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.ensure_test_terminals();
         app.active = Some(0);
         app.sidebar_notifications.enabled = true;
-        app.session_status = Some("62%".to_string());
+        app.session_status = Some("weekly".to_string());
 
         let area = Rect::new(0, 0, 40, 12);
         app.view.sidebar_rect = area;
@@ -7248,28 +7223,28 @@ mod tests {
         let row = row_text(terminal.backend().buffer(), 0, area.width);
 
         assert!(
-            row.starts_with('◉'),
-            "the bar is not hung on the left: {row}"
+            row.starts_with('0'),
+            "the pulse is not hung on the left: {row}"
         );
         assert!(
-            row.trim_end_matches('│').ends_with("62%"),
-            "the status is not right-aligned beside the bar: {row}"
+            row.trim_end_matches('│').ends_with("weekly"),
+            "the status is not right-aligned beside the pulse: {row}"
         );
 
-        // Both measured in columns: the bar's last slot has to end before the
-        // status begins, or one has been drawn over the other.
+        // Both measured in columns: the pulse's last reading has to end before
+        // the status begins, or one has been drawn over the other.
         let columns: Vec<char> = row.chars().collect();
-        let last_slot = columns
-            .iter()
-            .position(|ch| *ch == '⋔')
-            .expect("the bar's last slot is missing");
+        let pulse_end = row
+            .find("needs you")
+            .map(|byte| row[..byte].chars().count() + "needs you".chars().count())
+            .expect("the pulse's last reading is missing");
         let status_start = columns
-            .windows(3)
-            .position(|window| window == ['6', '2', '%'])
+            .windows(6)
+            .position(|window| window.iter().collect::<String>() == "weekly")
             .expect("the status is missing");
         assert!(
-            status_start > last_slot,
-            "the status overlapped the bar: {row}"
+            status_start >= pulse_end,
+            "the status overlapped the pulse: {row}"
         );
     }
 

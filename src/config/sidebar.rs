@@ -1023,10 +1023,11 @@ impl SidebarNotificationsConfig {
 
 /// The notification tray at the foot of the Spaces panel.
 ///
-/// Off by default for the same reason the signal bar is, and then some: four of
-/// its eight slots read counts that cost a network round trip to the forge or a
-/// `git status` scan, and both are demand-gated on something rendering them.
-/// The tray also arms the scan the bar deliberately does not, because its `sync`
+/// Off by default for the same reason the fleet pulse row is, and then some:
+/// four of its eight slots read counts that cost a network round trip to the
+/// forge or a `git status` scan, and both are demand-gated on something
+/// rendering them. The tray also arms the scan the pulse row deliberately does
+/// not, because its `sync`
 /// slot refuses on a dirty tree — see
 /// [`crate::app::fleet_signals::FleetSignalDemand::for_tray`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1488,14 +1489,14 @@ row_motion = "slide"
     /// it on is what pays for the Git scan and the forge request behind three
     /// of its slots, so it must never arrive switched on.
     #[test]
-    fn the_signal_bar_is_off_until_it_is_asked_for() {
+    fn the_fleet_pulse_is_off_until_it_is_asked_for() {
         let config = SidebarConfig::default();
         assert!(!config.notifications.enabled);
         assert!(!config.notifications.animates());
     }
 
     #[test]
-    fn a_configured_signal_bar_declares_its_own_life() {
+    fn a_configured_fleet_pulse_declares_its_own_life() {
         let config: crate::config::Config = toml::from_str(
             r#"
 [ui.sidebar.notifications]
@@ -1505,7 +1506,7 @@ enter = "wipe"
 enter_ms = 900
 "#,
         )
-        .expect("signal bar config");
+        .expect("fleet pulse config");
         let notifications = config.ui.sidebar.notifications;
 
         assert!(notifications.enabled);
@@ -1527,7 +1528,7 @@ enter_ms = 900
     /// A live slot can be colour-only. It is still a change the eye catches,
     /// and it costs the loop nothing.
     #[test]
-    fn a_still_signal_bar_asks_the_animation_clock_for_nothing() {
+    fn a_still_fleet_pulse_asks_the_animation_clock_for_nothing() {
         let config: crate::config::Config = toml::from_str(
             r#"
 [ui.sidebar.notifications]
@@ -1536,7 +1537,7 @@ emphasis = "none"
 enter = "none"
 "#,
         )
-        .expect("still signal bar config");
+        .expect("still fleet pulse config");
         let notifications = config.ui.sidebar.notifications;
 
         assert!(notifications.enabled);

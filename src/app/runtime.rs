@@ -818,7 +818,7 @@ impl App {
     /// one the engine retires a departed row on the spot and memory would be a
     /// copy nobody reads.
     ///
-    /// `tree` is false when the signal bar is the only reason this pass is
+    /// `tree` is false when the fleet signals are the only reason this pass is
     /// running at all. The rows are then published as an empty set rather than
     /// skipped: a family that is not being animated should say so, not go
     /// unmentioned.
@@ -2713,7 +2713,7 @@ mod tests {
     /// The families are checked to coexist for the same reason the tray's are.
     /// A wash published as `Family::AgentRow` or `Family::WorkspaceRow` would be
     /// swept by the row reconciliation it shares a pass with; published as
-    /// `Named` the fleet signal bar would retire it mid-sweep.
+    /// `Named` the fleet signals' own pass would retire it mid-sweep.
     #[test]
     fn a_state_change_mounts_one_wash_and_it_retires_when_its_window_closes() {
         let mut app = card_app();
@@ -2797,7 +2797,7 @@ mod tests {
 
     /// The reason the badges are their own family.
     ///
-    /// The signal bar reconciles `Family::Named` against the signals that are
+    /// The fleet signals reconcile `Family::Named` against the ones that are
     /// *live*, and a resting badge is not live. Published under the same family
     /// the tray's eight would be retired by the bar's own pass every frame —
     /// they would mount, be told to leave, and never move. This asserts the two
@@ -3478,7 +3478,7 @@ mod tests {
     }
 
     /// The combination neither feature was tested in on its own: a fleet with
-    /// both the signal bar and row exits switched on.
+    /// both the fleet signals and row exits switched on.
     ///
     /// The bar's slots and the tree's rows are different families sharing one
     /// engine, so the risk is that publishing one disturbs the other. A group
@@ -3514,7 +3514,7 @@ mod tests {
         assert_eq!(
             tree_worker_names(&app),
             vec!["left-worker-2", "left-worker-1", "right-worker"],
-            "a live signal bar cost the departing row its exit"
+            "a live fleet signal cost the departing row its exit"
         );
         assert!(!app.state.sidebar_tree_row_memory.is_empty());
 
@@ -3563,7 +3563,7 @@ mod tests {
         );
     }
 
-    /// Collapsing the sidebar switches the tree's animation and the signal bar
+    /// Collapsing the sidebar switches the tree's animation and the fleet signals
     /// off together.
     ///
     /// `observe_agent_rows` leans on this: it is what makes "the bar is the

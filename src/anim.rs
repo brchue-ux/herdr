@@ -81,8 +81,8 @@ pub(crate) enum ElementId {
     /// The sidebar tree's own view, as a whole.
     ///
     /// A family of exactly one, and deliberately not [`Self::Named`]: a
-    /// subsystem that reconciles `Named` by membership — the fleet signal bar
-    /// does — would retire any other named element it did not publish, which
+    /// subsystem that reconciles `Named` by membership — the fleet pulse row's
+    /// waiting count does — would retire any other named element it did not publish, which
     /// mid-switch means the incoming view is told to leave the moment it
     /// arrives. Driven by [`Animator::enter`]/[`Animator::leave`] rather than
     /// by a membership set, because there is nothing to enumerate.
@@ -90,9 +90,9 @@ pub(crate) enum ElementId {
     /// One badge in the notification tray, by the signal it stands for.
     ///
     /// Its own family rather than a [`Self::Named`] element, and that is not
-    /// tidiness. The fleet signal bar reconciles `Named` against the signals
-    /// that are *live*, so a tray badge published as `Named` would be retired
-    /// the moment the bar's own pass ran — and a resting badge, which is most
+    /// tidiness. The fleet signals reconcile `Named` against the ones that are
+    /// *live*, so a tray badge published as `Named` would be retired
+    /// the moment that pass ran — and a resting badge, which is most
     /// of them most of the time, would never survive a single frame. The tray
     /// publishes all eight always, because rest is one of the three things a
     /// badge has to be able to say.
@@ -104,7 +104,7 @@ pub(crate) enum ElementId {
     /// row families are reconciled against the rows that *exist*, and a wash is
     /// not a row — it is one bounded event on a row that outlives it. Published
     /// as [`Self::AgentRow`] it would fight the row's own life; published as
-    /// [`Self::Named`] the fleet signal bar's pass would retire it mid-sweep.
+    /// [`Self::Named`] the fleet signals' own pass would retire it mid-sweep.
     ///
     /// The change it carries is part of its name rather than a payload, which
     /// is what makes a second change *restart* the wash instead of being
