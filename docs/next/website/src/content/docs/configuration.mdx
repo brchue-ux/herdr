@@ -417,6 +417,15 @@ stage the work is at, so a stage change never reads as the defect getting worse.
 Publishing `sev=-` says the defect is closed and takes the marker off the card
 entirely.
 
+The marker is drawn twice, and which one you see depends on whether the sidebar
+is drawing pixel cards. On a character sidebar it is a single cell. On a pixel
+card it is a drawn creature that climbs the card's own border to rest at the top
+centre, at the same size on every rank whether the row is a first mate or a
+worker. Its colour is the row's lifecycle stage throughout, so it walks the same
+ladder the card does as the problem is found, picked up, fixed and proved
+solved; at the `done` stage it collapses flat onto the border it is standing on
+rather than merely turning green.
+
 `state_age` reports elapsed time and nothing else. It is not a stall warning:
 nothing about it changes colour or shape as the number grows, because Herdr has
 no evidence that a long-held state is a bad one. Reading it that way is the

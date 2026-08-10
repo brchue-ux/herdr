@@ -4062,12 +4062,22 @@ fn trunk_rail_cell(trunk: Option<&TrunkRailPaint<'_>>, level: u8, base: Style) -
 /// the crowded surface the sidebar's own width rules protect, the border is
 /// not.
 ///
-/// Character shell only, for now. A pixel card's sheet is opaque and drawn
-/// over these same cells (see [`image_card::shape_covers_row`]), so a
-/// character-cell marker under it would be invisible rather than merely
-/// covered — see the `AGENTS.md` bullet on the sidebar's two renderers.
-/// Rasterising the spider into `image_card::build_cards` so it survives the
-/// pixel path is a named follow-up, not a gap here.
+/// # The character shell's half of the marker
+///
+/// This is one of *two* renderings of the same creature, and it draws only when
+/// the other one is not going to. A pixel card covers the cells this marker
+/// would stand on — the sheet is opaque over them, a shape stands the character
+/// card down entirely — so on that path the spider is rasterised into the card
+/// itself by the `image_card` spider module, at a size a character cell has no way to
+/// offer, and this returns early. [`image_card::card_covers_row`] is the one
+/// question both sides ask, so exactly one of them draws.
+///
+/// The two are held to the same three facts and may not re-derive any of them:
+/// existence from the fleet's own defect token, hue from the row's
+/// [`crate::anim::cell::LifecycleStage`], intensity from
+/// [`crate::quality_streak::DefectMark::intensity`]. Everything below this line
+/// is how a *cell* says that; the pixel module's own doc comment is how a card
+/// says it.
 fn render_failure_spiders(
     app: &AppState,
     frame: &mut Frame,
@@ -4076,7 +4086,7 @@ fn render_failure_spiders(
     agents: &[AgentPanelEntry],
     fold_width: u16,
 ) {
-    if image_card::shape_covers_row(app, fold_width) {
+    if image_card::card_covers_row(app, fold_width) {
         return;
     }
     for card in cards {

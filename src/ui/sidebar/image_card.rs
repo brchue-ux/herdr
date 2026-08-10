@@ -45,6 +45,7 @@
 mod canvas;
 mod font;
 mod measured;
+mod spider;
 mod summary;
 
 use std::collections::hash_map::DefaultHasher;
@@ -527,9 +528,28 @@ pub(crate) fn card_face_available(override_path: Option<&str>) -> bool {
 ///
 /// [`MAX_IMAGE_PIXELS`]: Rasteriser::rasterise
 pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
-    app.view.sidebar_card_layers_published
-        && app.sidebar_card_shapes
-        && is_available(app, fold_width)
+    app.sidebar_card_shapes && card_covers_row(app, fold_width)
+}
+
+/// Whether a pixel card is going to be drawn over this row at all, by either
+/// drawing model.
+///
+/// [`shape_covers_row`] without the shapes term, and the two are genuinely
+/// different questions. That one asks *"must the character card stand down"*,
+/// which only the transparent model forces. This one asks *"is a pixel card
+/// covering this row's cells"*, which the opaque sheet does too — it is opaque
+/// over exactly the cells each row owns, so anything drawn in characters there
+/// is under it rather than beside it.
+///
+/// The distinction has one caller and it is the failure spider: the marker is
+/// drawn *on the card* by [`spider`] on both pixel models, and drawn as a
+/// character cell by [`crate::ui::sidebar::render_failure_spiders`] when neither
+/// is live. Gating the character one on `shape_covers_row` would leave the sheet
+/// path drawing a glyph underneath an opaque sheet *and* the pixel creature on
+/// top of it — one marker too many, and the one nobody can see is the one that
+/// costs a `Buffer` write on every frame of a climb.
+pub(crate) fn card_covers_row(app: &AppState, fold_width: u16) -> bool {
+    app.view.sidebar_card_layers_published && is_available(app, fold_width)
 }
 
 /// The height a card wants, in pixels. The same on every rank.
@@ -753,6 +773,9 @@ struct CardContent {
     residue: u8,
     /// The controls hung on the card's right margin. See [`ControlRail`].
     controls: ControlRail,
+    /// The failure spider riding this card, if the fleet says it owns an open
+    /// defect. See [`spider`].
+    spider: Option<spider::CardSpider>,
     /// This frame of the card's breath, quantized to [`CARD_BREATH_STEPS`].
     /// `0.0` is the card at its own settled light, which is what a host with no
     /// card animation draws, and `1.0` is a full breath — but a snapping
@@ -792,6 +815,14 @@ impl CardContent {
         // it, so a card carried forward on a signature blind to this would keep
         // a stale count or a chevron pointing the wrong way.
         self.controls.hash(hasher);
+        // Presence first, then the frame: a row that has just been marked and a
+        // row that has none are two different cards even before the marker has
+        // moved. See [`spider::CardSpider::hash_into`] for why the frame itself
+        // is cheap to hash every pass.
+        self.spider.is_some().hash(hasher);
+        if let Some(spider) = &self.spider {
+            spider.hash_into(hasher);
+        }
         // Both quantized before they reach here, so a card whose light has not
         // moved by a step anyone could see hashes the same and is carried
         // forward without being redrawn. This is the whole of what keeps a tree
@@ -2783,12 +2814,12 @@ fn content_for(
                 .aggregate_state_changed_at(&app.terminals)
                 .map(|at| app.state_age_now.saturating_duration_since(at));
             let row = crate::anim::ElementId::workspace_row(&workspace.id);
-            let stage = crate::app::lifecycle::stage(
-                tokens
-                    .get(crate::app::lifecycle::STAGE_TOKEN)
-                    .map(String::as_str),
-                state,
-            );
+            // One reading of the row's signal for both channels the card draws
+            // and for the marker on it, so the stage a card is painted at and
+            // the stage its spider is painted at cannot disagree — the same
+            // rule `render_failure_spiders` holds on the character side.
+            let signal = crate::app::lifecycle::row_signal(&tokens, state);
+            let stage = signal.stage;
             let severity = crate::app::lifecycle::severity(
                 tokens
                     .get(crate::app::lifecycle::SEVERITY_TOKEN)
@@ -2828,6 +2859,11 @@ fn content_for(
                 // clickable there at all. See `control_rail`.
                 controls: ControlRail::default(),
                 breath,
+                spider: spider::resolve(
+                    app,
+                    crate::anim::CardRow::Space(workspace.id.clone()),
+                    signal,
+                ),
                 wash: wash(app, crate::anim::CardRow::Space(workspace.id.clone())),
             })
         }
@@ -2837,13 +2873,9 @@ fn content_for(
                 .last_agent_state_change_at
                 .map(|at| app.state_age_now.saturating_duration_since(at));
             let row = crate::anim::ElementId::agent_row(detail.pane_id);
-            let stage = crate::app::lifecycle::stage(
-                detail
-                    .tokens
-                    .get(crate::app::lifecycle::STAGE_TOKEN)
-                    .map(String::as_str),
-                detail.state,
-            );
+            // See the Space arm: one reading, both channels and the marker.
+            let signal = crate::app::lifecycle::row_signal(&detail.tokens, detail.state);
+            let stage = signal.stage;
             let severity = crate::app::lifecycle::severity(
                 detail
                     .tokens
@@ -2875,6 +2907,7 @@ fn content_for(
                     .unwrap_or(0),
                 controls: ControlRail::default(),
                 breath,
+                spider: spider::resolve(app, crate::anim::CardRow::Agent(detail.pane_id), signal),
                 wash: wash(app, crate::anim::CardRow::Agent(detail.pane_id)),
             })
         }
@@ -3270,6 +3303,10 @@ pub(crate) struct CardContentWire {
     residue: u8,
     controls: ControlRail,
     breath: f32,
+    /// Carried, unlike `wash`: the spider is four resolved numbers with no
+    /// borrowed catalogue entry behind them, so a client that rasterises its own
+    /// cards draws exactly the marker the server would have.
+    spider: Option<spider::CardSpider>,
 }
 
 impl From<&CardContent> for CardContentWire {
@@ -3291,6 +3328,7 @@ impl From<&CardContent> for CardContentWire {
             residue: content.residue,
             controls: content.controls,
             breath: content.breath,
+            spider: content.spider,
         }
     }
 }
@@ -3314,6 +3352,7 @@ impl From<CardContentWire> for CardContent {
             residue: wire.residue,
             controls: wire.controls,
             breath: wire.breath,
+            spider: wire.spider,
             wash: None,
         }
     }
@@ -4286,6 +4325,14 @@ impl Rasteriser<'_> {
                 // rule the character card's lifted glow ramp follows.
                 lift(&mut canvas, card);
             }
+            // After the card and after the lift, and outside `draw_card`, which
+            // returns early on a card too narrow to set its title in. A marker
+            // that a narrow panel silently dropped is the same defect this
+            // module was added to fix, one gate further in. It is deliberately
+            // not lifted with the card either: the selection ramp is the card
+            // saying it is the selected one, and a defect marker is not part of
+            // that sentence.
+            spider::draw(&mut canvas, card);
         }
         Ok(canvas)
     }
@@ -11771,6 +11818,8 @@ mod cards_breathe_and_wash {
             mark: None,
             residue,
             controls: ControlRail::default(),
+            // This fixture isolates the residue rings, so it carries no spider.
+            spider: None,
             breath: 0.0,
             wash: None,
         }
@@ -12336,6 +12385,205 @@ mod the_gpu_draws_what_the_cpu_draws {
         assert!(
             !expected.is_empty(),
             "the fixture published no cards, so this tests nothing"
+        );
+    }
+}
+
+/// The failure spider survives the pixel path.
+///
+/// The defect this whole module's [`spider`] submodule exists to fix: the marker
+/// shipped as a character cell, and every one of the captain's own frames is a
+/// pixel card drawn over exactly those cells, so it had never once been on his
+/// screen. These assert against *published layer bytes* rather than against the
+/// drawing functions, because "the creature is correct" and "the creature
+/// reaches a card" are two different claims and only the second one was ever in
+/// doubt.
+#[cfg(test)]
+mod the_spider_reaches_the_pixel_card {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+
+    /// The fleet on the shapes path, with `marked` rows carrying an open defect
+    /// and a failed lifecycle, and their spiders mounted and settled.
+    ///
+    /// The lifecycle comes from [`crate::app::runtime::failure_spider_lifecycle`]
+    /// rather than a copy: a fixture with its own stage table would keep passing
+    /// after the real one changed.
+    fn marked_fleet(marked: &[usize], defect: &str) -> AppState {
+        let mut app = pixel_fleet_app();
+        app.sidebar_card_shapes = true;
+        app.view.sidebar_card_layers_published = true;
+        let now = std::time::Instant::now();
+        app.state_age_now = now;
+
+        // The tree's own order, not the pane map's: a `HashMap`'s iteration
+        // order is not stable across processes, and a fixture that marked a
+        // different row each run would be a flake rather than a test.
+        let panes: Vec<crate::layout::PaneId> = super::super::sidebar_agent_entries(&app)
+            .iter()
+            .map(|entry| entry.pane_id)
+            .collect();
+        let mut members: Vec<(crate::anim::ElementId, crate::anim::behaviour::DriveInputs)> =
+            Vec::new();
+        for index in marked {
+            let Some(pane) = panes.get(*index) else {
+                continue;
+            };
+            let terminal_id = app.workspaces[0].tabs[0].panes[pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("a test terminal");
+            terminal.state = AgentState::Blocked;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([
+                    (
+                        crate::app::lifecycle::STAGE_TOKEN.to_string(),
+                        Some("failed".to_string()),
+                    ),
+                    (
+                        crate::quality_streak::DEFECT_TOKEN.to_string(),
+                        Some(defect.to_string()),
+                    ),
+                ]),
+                None,
+                now,
+            );
+            members.push((
+                crate::anim::ElementId::failure_spider(crate::anim::CardRow::Agent(*pane)),
+                crate::anim::behaviour::DriveInputs::default(),
+            ));
+        }
+
+        let lifecycle = crate::app::runtime::failure_spider_lifecycle();
+        app.anim
+            .observe(now, crate::anim::Family::FailureSpider, &lifecycle, members);
+        // Past the climb, so the spider under test is the settled one rather
+        // than a frame of its arrival.
+        app.anim.advance(
+            now + crate::anim::behaviour::FAILURE_SPIDER_CLIMB_PERIOD
+                + std::time::Duration::from_millis(50),
+        );
+        app
+    }
+
+    /// Every published card's own bytes, in layout order, or `None` on a
+    /// machine with no proportional face and so no pixel path to test.
+    fn layers(app: &AppState) -> Option<Vec<Vec<u8>>> {
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        match build_cards(app, &cards, sidebar_rect(), app.host_cell_size, &[]).update {
+            CardsUpdate::Rebuilt(layers) => {
+                Some(layers.into_iter().map(|l| l.layer.data).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// How many of a tree's cards carry a spider, or `None` on a machine with
+    /// no pixel path to ask.
+    fn spiders_in(app: &AppState) -> Option<usize> {
+        let cards = super::super::compute_workspace_card_areas(app, sidebar_rect());
+        let scene = build_card_scene(app, &cards, sidebar_rect(), app.host_cell_size)?;
+        Some(
+            scene
+                .placed
+                .iter()
+                .filter(|(_, content)| content.spider.is_some())
+                .count(),
+        )
+    }
+
+    #[test]
+    fn a_marked_card_is_drawn_differently_from_the_same_card_unmarked() {
+        let Some(unmarked) = layers(&marked_fleet(&[], "-")) else {
+            return;
+        };
+        let marked = layers(&marked_fleet(&[1], "S1")).expect("the same fleet still draws");
+        assert_eq!(
+            unmarked.len(),
+            marked.len(),
+            "marking a row changed how many cards the tree has"
+        );
+        let differing: Vec<usize> = unmarked
+            .iter()
+            .zip(&marked)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            !differing.is_empty(),
+            "an open defect changed nothing about the pixels — the spider is still \
+             invisible on the pixel path, which is the whole defect"
+        );
+        // One row and no other. A marker that repainted its neighbours would
+        // be the card's own stage leaking into the tree. Which index it lands
+        // on is deliberately not asserted: the tree's layout order is the
+        // sidebar's business, and pinning it here would make this test fail for
+        // a reason that has nothing to do with the spider.
+        assert_eq!(
+            differing.len(),
+            1,
+            "marking one row changed {} cards: {differing:?}",
+            differing.len()
+        );
+    }
+
+    #[test]
+    fn the_marker_is_drawn_at_the_severity_the_fleet_published() {
+        let Some(loud) = layers(&marked_fleet(&[1], "S1")) else {
+            return;
+        };
+        let quiet = layers(&marked_fleet(&[1], "S4")).expect("the same fleet still draws");
+        assert_ne!(
+            loud, quiet,
+            "S1 and S4 drew the same tree — the defect ladder reaches no pixel"
+        );
+    }
+
+    #[test]
+    fn a_dash_closes_the_defect_and_takes_the_marker_with_it() {
+        let Some(open) = layers(&marked_fleet(&[1], "S2")) else {
+            return;
+        };
+        let closed = layers(&marked_fleet(&[1], "-")).expect("the same fleet still draws");
+        assert_ne!(open, closed, "closing the defect changed nothing");
+        // The same row, still failed, still blocked, and carrying no marker:
+        // only the fleet can know a defect is closed, and `-` is it saying so.
+        // Counted off the scene rather than off the pixels, because the two
+        // trees differ in the *stage* too and a byte comparison could not tell
+        // which of the two changes it was looking at.
+        assert_eq!(spiders_in(&marked_fleet(&[1], "S2")), Some(1));
+        assert_eq!(spiders_in(&marked_fleet(&[1], "-")), Some(0));
+    }
+
+    /// The delegating path: a client that rasterises its own cards has to draw
+    /// the same marker, or the captain's Windows box loses the spider again for
+    /// a different reason.
+    #[test]
+    fn the_marker_crosses_the_wire_to_a_client_that_draws_its_own_cards() {
+        let app = marked_fleet(&[1], "S1");
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let Some(scene) = build_card_scene(&app, &cards, sidebar_rect(), app.host_cell_size) else {
+            return;
+        };
+        let bytes = encode_card_scene(&scene).expect("a scene that encodes");
+        let decoded = decode_card_scene(&bytes).expect("a scene that decodes");
+        assert_eq!(
+            decoded, scene,
+            "the scene did not survive its own round trip"
+        );
+        let carried = decoded
+            .placed
+            .iter()
+            .filter(|(_, content)| content.spider.is_some())
+            .count();
+        assert_eq!(
+            carried, 1,
+            "the marked row's spider did not cross the wire — a delegating client \
+             would draw the tree with no marker on it"
         );
     }
 }

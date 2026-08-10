@@ -39,7 +39,10 @@ fn background_scene_key(
     hasher.finish()
 }
 
-fn failure_spider_lifecycle() -> crate::anim::Lifecycle {
+/// `pub(crate)` so the pixel card's own tests mount the *real* lifecycle
+/// rather than a copy of it: a spider whose test fixture had its own stage
+/// table would keep passing after this one changed shape.
+pub(crate) fn failure_spider_lifecycle() -> crate::anim::Lifecycle {
     use crate::anim::behaviour::{names, FAILURE_SPIDER_CLIMB_PERIOD};
     use crate::anim::{Lifecycle, Stage};
 
