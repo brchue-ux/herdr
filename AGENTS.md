@@ -263,6 +263,20 @@ drag, `\e[<0;C;Rm` release, `64`/`65` wheel up/down, `66`/`67` wheel
 left/right, with `C` and `R` 1-based in the nested TUI's own coordinates.
 crossterm parses them off stdin exactly as it would from a real terminal.
 
+For a pane *geometry* question — what grid a pane's terminal is actually
+running at, as opposed to what rect the layout drew — read it instead of
+inferring it from a capture. `herdr pane list` reports each pane's
+`scroll.viewport_rows`, which is the ghostty grid's own height, so a whole
+resize sequence can be sampled from the CLI. It needs a client attached: with
+none, `server::headless`'s `render_and_stream` passes
+`resize_panes = view.pane_infos.is_empty()`, so panes are resized on the first
+frame only and a clientless lab shows a grid that never moves. Note also that
+two independent paths write that size — the active tab's through
+`app::pane_resize_reflow`, and every *other* tab's straight from
+`ui::panes::resize_tab_panes`, on every frame — so anything that caches or
+remembers a pane's size has to reconcile against the runtime rather than
+against what it last set; `pane_resize_reflow`'s own module docs carry why.
+
 ### Live checks for anything that draws
 
 A PTY capture reads the bytes a client receives; it cannot see what a terminal
