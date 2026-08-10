@@ -102,6 +102,20 @@ impl Canvas {
         }
     }
 
+    /// Adopt pixels drawn somewhere else, `None` unless they are exactly the
+    /// straight-alpha RGBA8 an image this size holds.
+    ///
+    /// The one caller is the GPU bloom pass (`crate::gpu::bloom`), which hands
+    /// back a whole frame's card images as flat byte runs. The length check is
+    /// the seam's only guard: everything past here treats the buffer as
+    /// `width * height` pixels and indexes into it without bounds checks.
+    pub(super) fn from_rgba8(width: u32, height: u32, px: Vec<u8>) -> Option<Self> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
+        (px.len() == expected).then_some(Self { width, height, px })
+    }
+
     pub(super) fn width(&self) -> u32 {
         self.width
     }

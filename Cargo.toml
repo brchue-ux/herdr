@@ -19,6 +19,16 @@ include = [
     "Cargo.toml",
 ]
 
+[features]
+default = ["gpu-raster"]
+# GPU compute for the client-side card rasteriser's bloom splat/blend pass
+# (`src/gpu/`). On by default so shipped binaries carry it; a Linux-only server
+# build that never rasterises cards for a client can drop `wgpu` and its backend
+# tree with `--no-default-features`. Turning it off does not change any pixel:
+# `src/gpu/bloom_disabled.rs` reports the compute path unavailable and every
+# caller keeps the CPU path it already had.
+gpu-raster = ["dep:wgpu"]
+
 [dependencies]
 # Glyph rasterisation for the sidebar's pixel cards. Pure Rust, no system
 # library, and no font of its own: the face comes off the machine at runtime
@@ -51,11 +61,37 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
 schemars = { version = "1.2.1", features = ["derive"] }
+# GPU compute for the card bloom pass (`src/gpu/`). `default-features = false`
+# keeps this to the compute half of wgpu: no surface, no windowing, no WebGPU —
+# Herdr never presents a swapchain, it reads a storage buffer back and hands the
+# pixels to the Kitty graphics protocol. Backends are added per target below:
+# there is no portable set, and pulling every backend onto every platform is
+# most of what wgpu costs to build.
+wgpu = { version = "27", default-features = false, features = [
+    "wgsl",
+], optional = true }
+
+# Vulkan on Unix covers Mesa's hardware drivers and, for a machine with no GPU
+# at all, its `lavapipe` software adapter — which is how a Unix dev box or CI
+# exercises this path at all. GL is the fallback for a driver stack too old for
+# Vulkan compute.
+[target.'cfg(unix)'.dependencies]
+wgpu = { version = "27", default-features = false, features = [
+    "vulkan",
+    "gles",
+], optional = true }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
 
 [target.'cfg(windows)'.dependencies]
+# DX12 is the first-class compute backend on Windows and the one the captain's
+# RX 6900 XT runs; Vulkan is kept as the second answer for a machine whose DX12
+# driver refuses a device. See the `wgpu` entry under `[dependencies]`.
+wgpu = { version = "27", default-features = false, features = [
+    "dx12",
+    "vulkan",
+], optional = true }
 wmi = { version = "0.18.4", default-features = false }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_System_Threading",

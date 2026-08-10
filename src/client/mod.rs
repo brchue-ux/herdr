@@ -804,6 +804,18 @@ fn is_remote_client_process() -> bool {
 /// is no Windows hardware to exercise the real gate from a Unix dev box or CI,
 /// so this is how a Unix client is driven through the same code path for
 /// testing.
+/// Whether this process draws sidebar cards itself, for anything outside the
+/// client loop that needs to know.
+///
+/// The one caller is `crate::gpu::enabled`: whether to hold a GPU queue open for
+/// card rasterisation is exactly the question of whether this process
+/// rasterises cards at all, and a server rasterising them *for* clients answers
+/// no. Kept as a re-export of [`wants_client_rasterized_cards`] rather than a
+/// second gate, because two gates would be two answers.
+pub(crate) fn rasterises_cards_locally() -> bool {
+    wants_client_rasterized_cards()
+}
+
 fn wants_client_rasterized_cards() -> bool {
     match std::env::var("HERDR_CLIENT_RASTERIZED_CARDS")
         .ok()

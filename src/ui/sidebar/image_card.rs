@@ -1402,9 +1402,52 @@ impl CardInks {
 /// anything; maxed, each card's halo is exactly the one it was measured to
 /// have.
 fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
+    if let Some(splat) = plan_bloom(card, bloom.width, bloom.height) {
+        lay_splat(bloom, &splat);
+    }
+}
+
+/// One card's bloom, resolved down to numbers and nothing else.
+///
+/// Split out of [`lay_bloom`] so the CPU loop below and the GPU compute pass in
+/// [`crate::gpu::bloom`] consume the *same* plan. The card's look is decided
+/// here, once: neither backend re-derives a rect, a sigma, a reach or a column
+/// ink, so the two cannot disagree about what a card looks like — only about
+/// which processor drew it.
+#[derive(Clone)]
+struct BloomSplat {
+    rect: RoundRect,
+    near_sigma: f32,
+    far_sigma: f32,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    /// The profile is a function of distance alone, so it is a curve rather than
+    /// a calculation: sampled once per half pixel out to the reach and read back
+    /// by index. Two exponentials per pixel over a card and the ground around it
+    /// is most of what drawing a card costs otherwise.
+    ///
+    /// The card's own bloom strength is deliberately *not* baked into it: it
+    /// varies across the card — the breath swings it and a state wash carries
+    /// two different values either side of its front — so it is a per-column
+    /// multiplier in [`Self::columns`], applied where the profile is read.
+    profile: Vec<f32>,
+    /// `(ink, strength)` per pixel column in `x0..x1`. The bloom's colour runs
+    /// the stroke's own gradient, so like the stroke it depends on the column
+    /// and nothing else.
+    columns: Vec<(Rgb, f32)>,
+}
+
+/// Steps per pixel the bloom's falloff profile is sampled at.
+const PROFILE_STEPS_PER_PX: f32 = 8.0;
+
+/// Resolve `card`'s bloom against a `width x height` field, or `None` when it
+/// lays down no light at all.
+fn plan_bloom(card: &PlacedCard<'_>, width: u32, height: u32) -> Option<BloomSplat> {
     let inks = card.inks();
     if inks.peak_bloom() <= 0.0 {
-        return;
+        return None;
     }
     let rect = card.rect;
     let near_sigma = card.geometry.bloom_sigma;
@@ -1416,19 +1459,9 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
 
     let x0 = (rect.x - reach).floor().max(0.0) as u32;
     let y0 = (rect.y - reach).floor().max(0.0) as u32;
-    let x1 = ((rect.x + rect.w + reach).ceil() as u32).min(bloom.width);
-    let y1 = ((rect.y + rect.h + reach).ceil() as u32).min(bloom.height);
+    let x1 = ((rect.x + rect.w + reach).ceil() as u32).min(width);
+    let y1 = ((rect.y + rect.h + reach).ceil() as u32).min(height);
 
-    // The profile is a function of distance alone, so it is a curve rather than
-    // a calculation: sampled once per half pixel out to the reach and read back
-    // by index. Two exponentials per pixel over a card and the ground around it
-    // is most of what drawing a card costs otherwise.
-    //
-    // The card's own bloom strength is deliberately *not* baked into it any
-    // more: it now varies across the card — the breath swings it and a state
-    // wash carries two different values either side of its front — so it is a
-    // per-column multiplier applied where the profile is read.
-    const PROFILE_STEPS_PER_PX: f32 = 8.0;
     let profile: Vec<f32> = (0..=((reach * PROFILE_STEPS_PER_PX).ceil() as usize))
         .map(|step| {
             let d = step as f32 / PROFILE_STEPS_PER_PX;
@@ -1438,8 +1471,6 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
                 * (measured::BLOOM_NEAR_WEIGHT * near + measured::BLOOM_FAR_WEIGHT * far)
         })
         .collect();
-    // The bloom's colour runs the stroke's own gradient, so like the stroke it
-    // depends on the column and nothing else.
     let columns: Vec<(Rgb, f32)> = (x0..x1)
         .map(|x| {
             let t = card.column_t(x);
@@ -1448,21 +1479,124 @@ fn lay_bloom(bloom: &mut BloomField, card: &PlacedCard<'_>) {
         })
         .collect();
 
-    for y in y0..y1 {
+    Some(BloomSplat {
+        rect,
+        near_sigma,
+        far_sigma,
+        x0,
+        y0,
+        x1,
+        y1,
+        profile,
+        columns,
+    })
+}
+
+/// Lay one planned splat into `bloom`, on this thread.
+///
+/// The scatter half of the two backends: walk the splat's own box and keep the
+/// brightest contribution per pixel. [`crate::gpu::bloom`] gathers the same
+/// numbers instead — every pixel reads every splat that can reach it — which is
+/// the same sum in the same order and comes out bit for bit identical.
+fn lay_splat(bloom: &mut BloomField, splat: &BloomSplat) {
+    for y in splat.y0..splat.y1 {
         let py = y as f32 + 0.5;
-        for (column, x) in (x0..x1).enumerate() {
-            let d = rect.distance(x as f32 + 0.5, py);
+        for (column, x) in (splat.x0..splat.x1).enumerate() {
+            let d = splat.rect.distance(x as f32 + 0.5, py);
             if d <= 0.0 {
                 continue;
             }
-            let Some(amount) = profile.get((d * PROFILE_STEPS_PER_PX) as usize) else {
+            let Some(amount) = splat.profile.get((d * PROFILE_STEPS_PER_PX) as usize) else {
                 continue;
             };
-            let (color, bloom_mul) = columns[column];
+            let (color, bloom_mul) = splat.columns[column];
             let amount = *amount * bloom_mul;
             if amount > BLOOM_PAINT_FLOOR {
                 bloom.lighten(x, y, color, amount);
             }
+        }
+    }
+}
+
+/// What the CPU bloom costs per pixel it touches.
+///
+/// Measured by [`the_gpu_draws_what_the_cpu_draws::the_two_backends_cost`] on
+/// this repository's dev box: ten real cards, 355k image pixels and about 266k
+/// splat-box pixels on top, at 2.41 ms on one thread. That is a shade under 4 ns
+/// for each pixel the splat loop walks plus each pixel the composite pass
+/// touches, and it is the only number in the comparison that is *not* measured
+/// on the machine actually running — the GPU side calibrates itself, because
+/// that is the side that varies by two orders of magnitude between an
+/// integrated adapter and a discrete card.
+const CPU_BLOOM_NS_PER_PIXEL: f64 = 4.0;
+
+/// How much faster the GPU has to be before it is used at all.
+///
+/// A tie is not worth taking: the GPU path has a device, a driver and a readback
+/// in it, and the CPU path is the one every other machine is already running.
+const GPU_MUST_BEAT_THE_CPU_BY: f64 = 1.25;
+
+/// Whether handing this frame's blooms to the GPU actually beats laying them on
+/// the threads that are about to draw the cards anyway.
+///
+/// Both sides are wall clock, which is why `threads` is here: the GPU pass is
+/// serial and happens before [`Rasteriser::draw_shapes`] spawns anything, so
+/// what it has to beat is not the CPU's total work but that work divided across
+/// the pool. On a twelve-core box drawing ten cards that is a factor of six, and
+/// ignoring it would send batches to the GPU that the CPU would have finished
+/// first.
+fn gpu_beats_the_threads(tiles: &[crate::gpu::bloom::Tile], threads: usize) -> bool {
+    let Some(gpu_ms) = crate::gpu::bloom::estimated_ms(tiles) else {
+        return false;
+    };
+    if crate::gpu::ignore_cost_model() {
+        return true;
+    }
+    let touched: u64 = tiles.iter().map(crate::gpu::bloom::Tile::cpu_pixels).sum();
+    let cpu_ms = touched as f64 * CPU_BLOOM_NS_PER_PIXEL / 1_000_000.0 / threads.max(1) as f64;
+    cpu_ms > gpu_ms * GPU_MUST_BEAT_THE_CPU_BY
+}
+
+/// The falloff constants the GPU pass needs, so the shader carries no copy of
+/// any of them.
+fn bloom_curve() -> crate::gpu::bloom::Curve {
+    crate::gpu::bloom::Curve {
+        steps_per_px: PROFILE_STEPS_PER_PX,
+        peak: measured::BLOOM_PEAK,
+        near_weight: measured::BLOOM_NEAR_WEIGHT,
+        far_weight: measured::BLOOM_FAR_WEIGHT,
+        paint_floor: BLOOM_PAINT_FLOOR,
+    }
+}
+
+impl BloomSplat {
+    /// This splat as the compute pass's own wire form.
+    ///
+    /// The profile becomes a `max_step` and nothing else: the shader evaluates
+    /// the curve from [`bloom_curve`] at the same quantised distance rather than
+    /// being handed the table, which is the same number without a per-card
+    /// upload. What it does need is where the table *ends*, because that
+    /// truncation is [`BLOOM_REACH_SIGMAS`] and is part of how a card looks.
+    fn for_gpu(&self) -> crate::gpu::bloom::Splat {
+        crate::gpu::bloom::Splat {
+            rect: [self.rect.x, self.rect.y, self.rect.w, self.rect.h],
+            radius: self.rect.r,
+            near_sigma: self.near_sigma,
+            far_sigma: self.far_sigma,
+            max_step: self.profile.len().saturating_sub(1) as u32,
+            bounds: [self.x0, self.y0, self.x1, self.y1],
+            columns: self
+                .columns
+                .iter()
+                .map(|(ink, strength)| {
+                    [
+                        f32::from(ink.0),
+                        f32::from(ink.1),
+                        f32::from(ink.2),
+                        *strength,
+                    ]
+                })
+                .collect(),
         }
     }
 }
@@ -3509,7 +3643,10 @@ impl Rasteriser<'_> {
             signature,
             content_signature,
             previous,
-            || self.rasterise(placed, sheet_rect, true),
+            // The sheet is the server's own path and stays on the CPU: see
+            // `Rasteriser::gpu_prebloom` for why the GPU is offered to the
+            // shapes path only.
+            || self.rasterise(placed, sheet_rect, true, None),
         )?;
         // The sheet never moves: it is one image spanning every row, so there is
         // no "one row" in it to slide. It is aimed anyway, at zero offset, so
@@ -3574,7 +3711,8 @@ impl Rasteriser<'_> {
         let sources = self.match_held(&planned, previous);
 
         // The expensive half, and the only part that is parallel.
-        let mut drawn = self.draw_shapes(&planned, &sources, placed, previous);
+        let prebloom = self.gpu_prebloom(&planned, &sources, placed);
+        let mut drawn = self.draw_shapes(&planned, &sources, placed, previous, prebloom);
 
         let clip = self.clip();
         let mut layers = Vec::with_capacity(planned.len());
@@ -3687,7 +3825,19 @@ impl Rasteriser<'_> {
         sources: &[ShapeSource],
         placed: &[(Rect, CardContent)],
         previous: &[SidebarCardLayer],
+        prebloom: Vec<Option<Canvas>>,
     ) -> Vec<Option<Result<SidebarCardLayer, ()>>> {
+        // One slot per card, taken by whichever thread draws that card. Behind a
+        // lock only because the slots are handed out at run time rather than
+        // sliced up front; it is uncontended by construction, since no two
+        // threads ever reach for the same index.
+        let prebloom: Vec<std::sync::Mutex<Option<Canvas>>> =
+            prebloom.into_iter().map(std::sync::Mutex::new).collect();
+        let take_prebloom = |index: usize| -> Option<Canvas> {
+            prebloom
+                .get(index)
+                .and_then(|slot| slot.lock().ok().and_then(|mut held| held.take()))
+        };
         let todo: Vec<usize> = sources
             .iter()
             .enumerate()
@@ -3706,7 +3856,14 @@ impl Rasteriser<'_> {
             // this path takes most often are exactly the ones that would only
             // pay for the machinery.
             for &index in &todo {
-                out[index] = Some(self.draw_one(index, planned, sources, placed, previous));
+                out[index] = Some(self.draw_one(
+                    index,
+                    planned,
+                    sources,
+                    placed,
+                    previous,
+                    take_prebloom(index),
+                ));
             }
             return out;
         }
@@ -3732,7 +3889,14 @@ impl Rasteriser<'_> {
                                 };
                                 local.push((
                                     index,
-                                    self.draw_one(index, planned, sources, placed, previous),
+                                    self.draw_one(
+                                        index,
+                                        planned,
+                                        sources,
+                                        placed,
+                                        previous,
+                                        take_prebloom(index),
+                                    ),
                                 ));
                             }
                             local
@@ -3767,6 +3931,7 @@ impl Rasteriser<'_> {
         sources: &[ShapeSource],
         placed: &[(Rect, CardContent)],
         previous: &[SidebarCardLayer],
+        prebloom: Option<Canvas>,
     ) -> Result<SidebarCardLayer, ()> {
         let ShapeSource::Draw(base) = &sources[index] else {
             return Err(());
@@ -3784,7 +3949,7 @@ impl Rasteriser<'_> {
             // Positional: what the terminal is showing under this card's own
             // host image id is whichever layer stood at this index.
             previous.get(index),
-            || self.rasterise(one, planned.rect, false),
+            || self.rasterise(one, planned.rect, false, prebloom),
         )
     }
 
@@ -3950,60 +4115,160 @@ impl Rasteriser<'_> {
         })
     }
 
+    /// The pixel size of an image covering `rect`, or `None` when that is no
+    /// image at all or an implausibly large one.
+    ///
+    /// An image larger than the ceiling here is a sidebar nobody has — 8
+    /// megapixels is a panel over a thousand pixels wide and seven thousand
+    /// tall. The guard exists so a nonsense cell-size report cannot turn into a
+    /// huge allocation: at four bytes a pixel for the canvas and eight more for
+    /// the bloom field, that ceiling is about 96 MB, held only while it is being
+    /// built.
+    fn image_size_px(&self, rect: Rect) -> Option<(u32, u32)> {
+        const MAX_IMAGE_PIXELS: u32 = 8_000_000;
+        let width_px = u32::from(rect.width) * self.cell_size.width_px;
+        let height_px = u32::from(rect.height) * self.cell_size.height_px;
+        (width_px > 0 && height_px > 0 && width_px.saturating_mul(height_px) <= MAX_IMAGE_PIXELS)
+            .then_some((width_px, height_px))
+    }
+
+    /// This frame's card blooms, computed on the GPU in one dispatch.
+    ///
+    /// Returns one slot per planned card, `None` for every card the GPU did not
+    /// draw — which on a machine with no adapter, a build without the
+    /// `gpu-raster` feature, or any process that is not a Windows client is
+    /// every one of them. A `None` slot is not a failure: [`Self::rasterise`]
+    /// simply lays that card's bloom on the CPU as it always has.
+    ///
+    /// # Why the whole frame at once
+    ///
+    /// A card's image is around 400x110 pixels and its bloom costs about half a
+    /// millisecond on one core, which is the same order as the fixed cost of
+    /// reaching a GPU and getting bytes back. Per card, that is a loss. Batched
+    /// across the frame — one buffer, one pass, one readback — the round trip is
+    /// paid once for all twelve, which is the case worth accelerating: the frame
+    /// where the tree's content actually changed and every card is redrawn at
+    /// once.
+    ///
+    /// Only cards that will genuinely be rasterised are in the batch. A card
+    /// holding a base (`ShapeSource::Draw(Some(_))`) re-uses pixels it already
+    /// has and never reaches `rasterise`, and one taking a held image
+    /// (`ShapeSource::Held`) is not redrawn at all.
+    fn gpu_prebloom(
+        &self,
+        planned: &[PlannedShape],
+        sources: &[ShapeSource],
+        placed: &[(Rect, CardContent)],
+    ) -> Vec<Option<Canvas>> {
+        let mut out: Vec<Option<Canvas>> = std::iter::repeat_with(|| None)
+            .take(planned.len())
+            .collect();
+        if !crate::gpu::enabled() {
+            return out;
+        }
+
+        let mut slots = Vec::new();
+        let mut tiles = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            if !matches!(source, ShapeSource::Draw(None)) {
+                continue;
+            }
+            let (Some(planned), Some((frame, content))) = (planned.get(index), placed.get(index))
+            else {
+                continue;
+            };
+            // A card whose image is nonsense is left out and fails in
+            // `rasterise` exactly as it would have without a GPU in the picture.
+            let Some((width, height)) = self.image_size_px(planned.rect) else {
+                continue;
+            };
+            let card = self.place(*frame, content, planned.rect);
+            let splats = plan_bloom(&card, width, height)
+                .map(|splat| vec![splat.for_gpu()])
+                .unwrap_or_default();
+            tiles.push(crate::gpu::bloom::Tile {
+                width,
+                height,
+                splats,
+            });
+            slots.push(index);
+        }
+
+        if !gpu_beats_the_threads(&tiles, raster_threads(tiles.len())) {
+            return out;
+        }
+        match crate::gpu::bloom::compose(&tiles, bloom_curve()) {
+            Ok(images) => {
+                for ((slot, tile), image) in slots.iter().zip(&tiles).zip(images) {
+                    out[*slot] = Canvas::from_rgba8(tile.width, tile.height, image);
+                }
+            }
+            Err(declined) => crate::gpu::bloom::warn_once(&declined),
+        }
+        out
+    }
+
     /// Draw `placed` into an image covering `rect`.
     ///
     /// `paint_backdrop` is true only for the sheet, which has to cover the
     /// character card standing under it. A shape leaves those pixels transparent
     /// — that is the whole point of it — which is sound because the character
     /// content beneath a shape is not drawn at all.
+    ///
+    /// `prebloom` is this image's bloom already drawn, from
+    /// [`Self::gpu_prebloom`]. `None` is the ordinary case and means "lay it
+    /// here, on this thread".
     fn rasterise(
         &self,
         placed: &[(Rect, CardContent)],
         rect: Rect,
         paint_backdrop: bool,
+        prebloom: Option<Canvas>,
     ) -> Result<Canvas, ()> {
-        let width_px = u32::from(rect.width) * self.cell_size.width_px;
-        let height_px = u32::from(rect.height) * self.cell_size.height_px;
-        // An image larger than this is a sidebar nobody has — 8 megapixels is a
-        // panel over a thousand pixels wide and seven thousand tall. The guard is
-        // here so a nonsense cell-size report cannot turn into a huge allocation:
-        // at four bytes a pixel for the canvas and eight more for the bloom
-        // field, this ceiling is about 96 MB, held only while it is being built.
-        const MAX_IMAGE_PIXELS: u32 = 8_000_000;
-        if width_px == 0 || height_px == 0 || width_px.saturating_mul(height_px) > MAX_IMAGE_PIXELS
-        {
-            return Err(());
-        }
+        let (width_px, height_px) = self.image_size_px(rect).ok_or(())?;
 
-        let mut canvas = Canvas::new(width_px, height_px);
         let cards: Vec<PlacedCard<'_>> = placed
             .iter()
             .map(|(frame, content)| self.place(*frame, content, rect))
             .collect();
 
-        if paint_backdrop {
-            // Over exactly the cells each row owns. The sheet is otherwise
-            // transparent, so this is what covers the character card standing
-            // underneath — including in the gutter, where the card itself does
-            // not reach — while leaving the tree's connectors and everything
-            // outside a row showing through.
-            for (frame, _) in placed {
-                fill_row_backdrop(
-                    &mut canvas,
-                    frame,
-                    rect,
-                    self.cell_w,
-                    self.cell_h,
-                    self.backdrop,
-                );
+        // A canvas already holding this image's bloom, computed for the whole
+        // frame in one GPU dispatch by [`Self::gpu_prebloom`]. Only ever offered
+        // to the shapes path, which paints no backdrop — so there is nothing the
+        // bloom had to be laid *over*, and skipping straight to it is the same
+        // pixels.
+        let mut canvas = match prebloom.filter(|canvas| {
+            !paint_backdrop && canvas.width() == width_px && canvas.height() == height_px
+        }) {
+            Some(canvas) => canvas,
+            None => {
+                let mut canvas = Canvas::new(width_px, height_px);
+                if paint_backdrop {
+                    // Over exactly the cells each row owns. The sheet is
+                    // otherwise transparent, so this is what covers the
+                    // character card standing underneath — including in the
+                    // gutter, where the card itself does not reach — while
+                    // leaving the tree's connectors and everything outside a row
+                    // showing through.
+                    for (frame, _) in placed {
+                        fill_row_backdrop(
+                            &mut canvas,
+                            frame,
+                            rect,
+                            self.cell_w,
+                            self.cell_h,
+                            self.backdrop,
+                        );
+                    }
+                }
+                let mut bloom = BloomField::new(width_px, height_px);
+                for card in &cards {
+                    lay_bloom(&mut bloom, card);
+                }
+                bloom.composite(&mut canvas);
+                canvas
             }
-        }
-
-        let mut bloom = BloomField::new(width_px, height_px);
-        for card in &cards {
-            lay_bloom(&mut bloom, card);
-        }
-        bloom.composite(&mut canvas);
+        };
 
         // Under the cards, so a join that runs a hair into the border it meets
         // is covered by that border rather than drawn over it. `paint_backdrop`
@@ -11753,6 +12018,324 @@ mod the_tree_lines_reach_the_cards_they_join {
         assert!(
             !sheet.inked(ink, bottom - 1),
             "the last card in the tree left a rail hanging out of its bottom"
+        );
+    }
+}
+
+/// The GPU compute path draws the same cards the CPU path draws.
+///
+/// This is the whole safety argument for `crate::gpu`. A client picks a backend
+/// from what its machine happens to have, so two people looking at the same
+/// fleet must not be looking at two different pictures of it — and the CPU path
+/// has to stay a working answer, not a theoretical one, on every machine that
+/// cannot or should not use a GPU.
+///
+/// Both tests go through [`rasterise_card_scene`], the real client entry point,
+/// rather than reaching into the pass: what has to agree is the bytes a client
+/// hands its terminal, not an intermediate buffer.
+#[cfg(test)]
+mod the_gpu_draws_what_the_cpu_draws {
+    use super::tests::{pixel_fleet_app, sidebar_rect};
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// A fleet's cards as the client's own path produces them, drawn fresh with
+    /// no previous layers to carry forward.
+    fn client_cards(app: &AppState, scene: &CardScene) -> Vec<SidebarCardLayer> {
+        rasterise_card_scene(
+            scene,
+            None,
+            app.host_cell_size,
+            crate::kitty_graphics::HostTerminalKind::Kitty,
+            true,
+            &[],
+        )
+        .expect("the client rasterised the scene")
+        .expect("the scene produced cards")
+    }
+
+    /// A real fleet's `CardScene`, or `None` on a machine with no face to set
+    /// the cards in.
+    fn scene() -> Option<(AppState, CardScene)> {
+        let app = pixel_fleet_app();
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let scene = build_card_scene(&app, &cards, rect, app.host_cell_size)?;
+        (!scene.placed.is_empty()).then_some((app, scene))
+    }
+
+    /// Draw a fleet on the CPU, draw it again on the GPU, and compare the bytes
+    /// that would reach the terminal.
+    ///
+    /// Skips — loudly — on a machine with no adapter, because there is no
+    /// comparison to make there. It does not *pass* quietly: the tile counter is
+    /// the positive control, and `HERDR_GPU_TEST_REQUIRE=1` turns the skip into
+    /// a failure for a run whose whole point was to exercise a real device.
+    #[test]
+    fn the_gpu_and_the_cpu_agree_on_every_card_byte() {
+        let Some((app, scene)) = scene() else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+
+        let cpu = {
+            let _gate = crate::gpu::ForceEnabled::new(false);
+            client_cards(&app, &scene)
+        };
+
+        let before = crate::gpu::bloom::TILES_COMPOSED.load(Ordering::Relaxed);
+        let gpu = {
+            let _gate = crate::gpu::ForceEnabled::new(true).ignoring_the_cost();
+            client_cards(&app, &scene)
+        };
+        let composed = crate::gpu::bloom::TILES_COMPOSED.load(Ordering::Relaxed) - before;
+
+        if composed == 0 {
+            assert!(
+                std::env::var("HERDR_GPU_TEST_REQUIRE").is_err(),
+                "HERDR_GPU_TEST_REQUIRE is set but no tile reached a GPU: {}",
+                crate::gpu::bloom::adapter_description()
+                    .unwrap_or_else(|| "no adapter".to_string())
+            );
+            println!("SKIP: no GPU adapter composed a tile on this machine");
+            return;
+        }
+
+        assert_eq!(
+            cpu.len(),
+            gpu.len(),
+            "the two backends drew a different number of cards"
+        );
+        for (index, (cpu, gpu)) in cpu.iter().zip(&gpu).enumerate() {
+            assert_eq!(cpu.rect, gpu.rect, "card {index} was placed differently");
+            assert_eq!(
+                cpu.layer.data,
+                gpu.layer.data,
+                "card {index} came out different on the GPU ({} bytes vs {})",
+                cpu.layer.data.len(),
+                gpu.layer.data.len()
+            );
+        }
+    }
+
+    /// With the gate open but the shipped threshold in force, the cards are
+    /// still exactly the CPU's cards — whichever way the batch actually went.
+    ///
+    /// The fallback is the point. `compose` declines for four different reasons
+    /// and none of them is an error the caller can see in the pixels, so the
+    /// invariant that has to hold is not "the GPU ran" but "it did not matter
+    /// whether it ran".
+    #[test]
+    fn declining_the_gpu_is_never_a_different_card() {
+        let Some((app, scene)) = scene() else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+
+        let cpu = {
+            let _gate = crate::gpu::ForceEnabled::new(false);
+            client_cards(&app, &scene)
+        };
+        let shipped = {
+            let _gate = crate::gpu::ForceEnabled::new(true);
+            client_cards(&app, &scene)
+        };
+
+        assert_eq!(cpu.len(), shipped.len());
+        for (index, (cpu, shipped)) in cpu.iter().zip(&shipped).enumerate() {
+            assert_eq!(
+                cpu.layer.data, shipped.layer.data,
+                "card {index} changed when the GPU gate was opened"
+            );
+        }
+    }
+
+    /// What the two backends actually cost on this machine, on a real fleet's
+    /// cards.
+    ///
+    /// Ignored, because it is a measurement and not an assertion: the numbers
+    /// are a property of whatever adapter and CPU it happens to run on, and
+    /// there is no threshold here that would mean the same thing on two boxes.
+    /// Run it with
+    ///
+    /// ```text
+    /// cargo test --release --bin herdr the_two_backends_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// The fleet is repeated up to `WORTH_A_DISPATCH` so the batch is the size
+    /// the GPU path is actually for — a frame where the whole tree was redrawn —
+    /// rather than the handful of cards the fixture happens to hold.
+    #[test]
+    #[ignore]
+    fn the_two_backends_cost() {
+        let Some((app, scene)) = scene() else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        let font = font::card_font(None).expect("a face");
+        let cell = app.host_cell_size;
+        let rasteriser = Rasteriser {
+            font,
+            title_metrics: font.metrics(TITLE_PX),
+            tidbit_metrics: font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+            cell_size: cell,
+            cell_w: f32::from(cell.width_px as u16),
+            cell_h: f32::from(cell.height_px as u16),
+            field: scene.field,
+            bounds: scene.bounds,
+            bloom_floor: scene.bloom_floor,
+            backdrop: scene.backdrop,
+            rail: None,
+            dissolve: None,
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::Kitty,
+            host_graphics_is_local: true,
+        };
+
+        // (image size, the one splat that lights it) for every card, repeated
+        // until the batch is a real frame's worth of work.
+        let mut plans: Vec<(u32, u32, BloomSplat)> = Vec::new();
+        for (frame, wire) in &scene.placed {
+            let content = CardContent::from(wire.clone());
+            let Some(rect) = rasteriser.card_rect(*frame) else {
+                continue;
+            };
+            let Some((width, height)) = rasteriser.image_size_px(rect) else {
+                continue;
+            };
+            let card = rasteriser.place(*frame, &content, rect);
+            if let Some(splat) = plan_bloom(&card, width, height) {
+                plans.push((width, height, splat));
+            }
+        }
+        assert!(!plans.is_empty(), "the fixture planned no card blooms");
+        let one_round = plans.len();
+        // A twelve-card frame's worth of pixels, which is what the GPU path is
+        // for: the frame where the tree's content changed and every card is
+        // redrawn at once.
+        const A_WHOLE_TREE: u64 = 500_000;
+        while plans
+            .iter()
+            .map(|(w, h, _)| u64::from(*w) * u64::from(*h))
+            .sum::<u64>()
+            < A_WHOLE_TREE
+        {
+            for index in 0..one_round {
+                let (w, h, splat) = &plans[index];
+                plans.push((*w, *h, splat.clone()));
+            }
+        }
+
+        let cpu = |plans: &[(u32, u32, BloomSplat)]| {
+            let mut out = Vec::with_capacity(plans.len());
+            for (width, height, splat) in plans {
+                let mut canvas = Canvas::new(*width, *height);
+                let mut field = BloomField::new(*width, *height);
+                lay_splat(&mut field, splat);
+                field.composite(&mut canvas);
+                out.push(canvas);
+            }
+            out
+        };
+        let tiles: Vec<crate::gpu::bloom::Tile> = plans
+            .iter()
+            .map(|(width, height, splat)| crate::gpu::bloom::Tile {
+                width: *width,
+                height: *height,
+                splats: vec![splat.for_gpu()],
+            })
+            .collect();
+
+        let best = |mut run: Box<dyn FnMut()>| {
+            let mut best = f64::INFINITY;
+            for _ in 0..12 {
+                let at = std::time::Instant::now();
+                run();
+                best = best.min(at.elapsed().as_secs_f64() * 1000.0);
+            }
+            best
+        };
+
+        let cpu_ms = best(Box::new(|| {
+            std::hint::black_box(cpu(&plans));
+        }));
+        let _gate = crate::gpu::ForceEnabled::new(true);
+        let gpu_ms = best(Box::new(|| {
+            std::hint::black_box(crate::gpu::bloom::compose(&tiles, bloom_curve()).is_ok());
+        }));
+
+        let pixels: u64 = plans
+            .iter()
+            .map(|(w, h, _)| u64::from(*w) * u64::from(*h))
+            .sum();
+        println!(
+            "cards={} pixels={pixels} cpu(1 thread)={cpu_ms:.2}ms gpu={gpu_ms:.2}ms speedup={:.2}x\nadapter={}",
+            plans.len(),
+            cpu_ms / gpu_ms,
+            crate::gpu::bloom::adapter_description().unwrap_or_else(|| "none".into())
+        );
+    }
+
+    /// A pre-bloomed canvas the wrong size for the image is refused, and the
+    /// card is drawn on the CPU instead of over the wrong pixels.
+    ///
+    /// `Canvas::from_rgba8` guards the length and `rasterise` guards the shape;
+    /// this holds the second one, which is the only thing standing between a
+    /// mismatched batch and a card drawn into someone else's image.
+    #[test]
+    fn a_prebloom_of_the_wrong_size_is_refused() {
+        let Some((app, scene)) = scene() else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        let expected = {
+            let _gate = crate::gpu::ForceEnabled::new(false);
+            client_cards(&app, &scene)
+        };
+
+        let font = font::card_font(None).expect("a face");
+        let cell = app.host_cell_size;
+        let rasteriser = Rasteriser {
+            font,
+            title_metrics: font.metrics(TITLE_PX),
+            tidbit_metrics: font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+            cell_size: cell,
+            cell_w: f32::from(cell.width_px as u16),
+            cell_h: f32::from(cell.height_px as u16),
+            field: scene.field,
+            bounds: scene.bounds,
+            bloom_floor: scene.bloom_floor,
+            backdrop: scene.backdrop,
+            rail: None,
+            dissolve: None,
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::Kitty,
+            host_graphics_is_local: true,
+        };
+        let placed: Vec<(Rect, CardContent)> = scene
+            .placed
+            .iter()
+            .cloned()
+            .map(|(rect, wire)| (rect, CardContent::from(wire)))
+            .collect();
+        let one = &placed[0..1];
+        let rect = rasteriser
+            .card_rect(placed[0].0)
+            .expect("the first card has an image");
+
+        let honest = rasteriser
+            .rasterise(one, rect, false, None)
+            .expect("the CPU drew the first card");
+        let with_junk = rasteriser
+            .rasterise(one, rect, false, Canvas::from_rgba8(4, 4, vec![9; 64]))
+            .expect("a mismatched prebloom still draws the card");
+
+        assert_eq!(
+            honest.rgba8(),
+            with_junk.rgba8(),
+            "a prebloom of the wrong size was drawn over instead of refused"
+        );
+        assert!(
+            !expected.is_empty(),
+            "the fixture published no cards, so this tests nothing"
         );
     }
 }
