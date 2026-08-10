@@ -36,32 +36,20 @@ name: Live compositing (real kitty under Xvfb)
 
 on:
   workflow_dispatch:
+  # Deliberately NOT path-filtered at the trigger. `live compositing` is a
+  # required status check, and a workflow that never triggers creates no
+  # check-run at all — the requirement then sits "Expected" forever and blocks
+  # an otherwise green pull request (this happened on #130 and #132, both
+  # force-merged). A job GitHub marks "skipped" *does* satisfy a required
+  # check, so the path filtering moved down to the jobs' `if:` below. Same cost
+  # saving, but the check-run always exists.
   pull_request:
     types: [opened, synchronize, reopened]
-    # Path-filtered for the same reason the byte-level check is: the release
-    # build dominates the cost, and a change that cannot reach a pixel should
-    # not pay for it.
-    paths:
-      - 'src/ui.rs'
-      - 'src/ui/**'
-      - 'src/anim.rs'
-      - 'src/anim/**'
-      - 'src/kitty_graphics.rs'
-      - 'src/solar_system.rs'
-      - 'src/app/background_scene.rs'
-      - 'src/app/background_legibility.rs'
-      - 'src/app/signal_tray.rs'
-      - 'src/client/**'
-      - 'src/server/render_stream.rs'
-      - 'src/server/headless.rs'
-      - 'src/server/headless/**'
-      - 'src/config/sidebar.rs'
-      - 'src/config/model.rs'
-      - 'data/herdr-live-composite/**'
-      - '.github/workflows/live-composite.yml'
 
 permissions:
   contents: read
+  # dorny/paths-filter reads the pull request's changed files over the API.
+  pull-requests: read
 
 env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
@@ -80,8 +68,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The one place the path list lives. Both expensive jobs below gate on this
+  # job's output rather than on a trigger-level `paths:` filter.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      composite: ${{ steps.filter.outputs.composite }}
+    steps:
+      - id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.3
+        with:
+          # The release build dominates the cost, and a change that cannot
+          # reach a pixel should not pay for it.
+          filters: |
+            composite:
+              - 'src/ui.rs'
+              - 'src/ui/**'
+              - 'src/anim.rs'
+              - 'src/anim/**'
+              - 'src/kitty_graphics.rs'
+              - 'src/solar_system.rs'
+              - 'src/app/background_scene.rs'
+              - 'src/app/background_legibility.rs'
+              - 'src/app/signal_tray.rs'
+              - 'src/client/**'
+              - 'src/server/render_stream.rs'
+              - 'src/server/headless.rs'
+              - 'src/server/headless/**'
+              - 'src/config/sidebar.rs'
+              - 'src/config/model.rs'
+              - 'data/herdr-live-composite/**'
+              - '.github/workflows/live-composite.yml'
+
   detectors:
     name: detectors can fail
+    needs: changes
+    # workflow_dispatch always runs it; a pull request only when the diff
+    # touches a path above.
+    if: github.event_name != 'pull_request' || needs.changes.outputs.composite == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -142,7 +168,12 @@ jobs:
 
   composite:
     name: live compositing
-    needs: detectors
+    needs: [changes, detectors]
+    # Gated on the filter output directly, not only on `detectors` being
+    # skipped: this is the job branch protection requires by name, so its own
+    # `if:` must be what decides, and an `if:`-skipped job always reports a
+    # "skipped" conclusion.
+    if: github.event_name != 'pull_request' || needs.changes.outputs.composite == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
