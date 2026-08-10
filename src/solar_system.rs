@@ -279,6 +279,23 @@ pub(crate) struct AsteroidInFlight {
     pub(crate) approach_angle: f32,
 }
 
+/// The burst of short rays thrown off an impact at the moment of strike.
+///
+/// A separate effect from [`Crater`] rather than a phase of it, because the two live on completely
+/// different timescales — the rays are a sub-second flash, the scar they leave behind fades for
+/// most of a minute — and because only the rays are drawn *outside* the struck body's own disk.
+/// Like [`Crater::age`], `age` is a caller-resolved fraction so this module never reads a clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Ejecta {
+    pub(crate) body: usize,
+    /// Where on the body the strike landed, in the same local frame [`Crater`] uses — the rays
+    /// fan outward around this direction, so they read as thrown *from* the crater.
+    pub(crate) angle_on_surface: f32,
+    pub(crate) severity: Severity,
+    /// `0.0` = the instant of impact, `1.0` = the last dust has faded.
+    pub(crate) age: f32,
+}
+
 /// A comet crossing the whole scene. `start`/`end` are normalised `0.0..=1.0` scene coordinates;
 /// `magnitude` is the already-resolved work-size intensity (`0.0..=1.0`, quiet green-test tier at
 /// the bottom, a landed large task at the top) driving both brightness and tail length.
@@ -286,6 +303,11 @@ pub(crate) struct AsteroidInFlight {
 pub(crate) struct Comet {
     pub(crate) start: (f32, f32),
     pub(crate) end: (f32, f32),
+    /// The body this comet is flying *into*, if it is an arrival rather than a crossing — a
+    /// landing comet ends on the body the work landed on, which moves along its own orbit, so the
+    /// endpoint has to be resolved per-frame here rather than frozen into `end` at spawn time.
+    /// `None` (a crossing) uses `end` exactly as given, which is the round-1 behaviour unchanged.
+    pub(crate) target: Option<usize>,
     pub(crate) magnitude: f32,
     /// `0.0` = just launched, `1.0` = crossed off-scene.
     pub(crate) progress: f32,
@@ -296,6 +318,7 @@ pub(crate) struct Comet {
 pub(crate) struct SceneEffects {
     pub(crate) asteroids: Vec<AsteroidInFlight>,
     pub(crate) craters: Vec<Crater>,
+    pub(crate) ejecta: Vec<Ejecta>,
     pub(crate) comets: Vec<Comet>,
 }
 
@@ -473,10 +496,29 @@ fn draw_body(
 /// the glue side — kept here as the one place the *visual* fade curve is defined).
 pub(crate) const CRATER_MIN_ALPHA: f32 = 0.0;
 
+/// Shape of the crater's fade against its own age: `(1 - age)^CRATER_FADE_EXPONENT`.
+///
+/// An exponent below `1.0` is an ease-out — the scar holds most of its opacity through the early
+/// life of the fade and gives it all up late, instead of bleeding away linearly from the first
+/// frame. Costs nothing (one `powf` per crater per frame, not per pixel) and spends none of the
+/// 45s budget: the crater still clears at exactly `age == 1.0`, it is just legible for more of the
+/// way there. `0.42` is the storyboard's own approved value
+/// (`data/decisions/2026-08-08-ambient-storyboard-picks-autonomous.md`, firstmate home).
+const CRATER_FADE_EXPONENT: f32 = 0.42;
+
 /// How much faster a parent planet's ripple echo fades than the struck moon's own crater. Matches
 /// `src/app/background_scene.rs`'s `CRATER_FADE` (45s) over `RIPPLE_FADE` (18s) — kept as a plain
 /// ratio, not a second duration, so this module never has to read a clock to derive it.
 const RIPPLE_FADE_RATIO: f32 = 2.5;
+
+/// How strongly a parent planet's ripple echo draws relative to the struck moon's own crater.
+///
+/// Deliberately well above the round-1 value (`0.35`): the echo is drawn on a planet whose own
+/// disk is brighter and larger than the moon's, and at `0.35` it measured as a low-single-digit
+/// change in average patch alpha — present in the buffer, not visible on screen. The ripple still
+/// has to read as the *fainter* half of the pair, so this stays below `1.0` and keeps the much
+/// faster [`RIPPLE_FADE_RATIO`] fade that already distinguishes it.
+const RIPPLE_STRENGTH: f32 = 0.62;
 
 /// Draw a crater (or its fainter ripple echo) as a dark, irregular patch blended onto the
 /// already-shaded body underneath it — craters darken and roughen a surface, they do not recolour
@@ -489,7 +531,7 @@ fn draw_crater(
     body: &BodyLayout,
     position: (f32, f32),
 ) {
-    let fade = clamp01(1.0 - crater.age);
+    let fade = clamp01(1.0 - crater.age).powf(CRATER_FADE_EXPONENT);
     if fade <= CRATER_MIN_ALPHA {
         return;
     }
@@ -497,7 +539,12 @@ fn draw_crater(
     // sidebar card's intensity — a mild problem leaves a small, shallow mark; a critical one
     // leaves a large, dark one.
     let severity_scale = mix(0.55, 1.0, crater.severity.amount());
-    let strength = severity_scale * if crater.is_ripple { 0.35 } else { 1.0 };
+    let strength = severity_scale
+        * if crater.is_ripple {
+            RIPPLE_STRENGTH
+        } else {
+            1.0
+        };
     let patch_radius =
         body.body_radius_px * severity_scale * if crater.is_ripple { 0.55 } else { 0.42 };
     let cx = position.0 + body.body_radius_px * 0.35 * crater.angle_on_surface.cos();
@@ -522,6 +569,117 @@ fn draw_crater(
             let alpha = edge * roughness * strength * fade * 0.85;
             let idx = py as usize * width as usize + px as usize;
             blend(&mut buf[idx], (0.05, 0.04, 0.04), alpha);
+        }
+    }
+}
+
+/// Colour of thrown-up impact dust: the same neutral rock tone [`draw_asteroid`] uses, lifted to
+/// read as lit debris rather than a second silhouette. Deliberately hueless — the strike says
+/// "something hit this", the body's own colour already says what state it is in.
+const EJECTA_RGB: (f32, f32, f32) = (0.86, 0.80, 0.70);
+
+/// How far the longest ray reaches past the impact point, as a multiple of the struck body's own
+/// radius, at the mildest and most severe ends of the severity channel. A moon is only a dozen or
+/// so pixels across at the real target resolution, so the rays have to leave the disk entirely to
+/// be the thing that is readable from across the window — which is the whole reason the storyboard
+/// picked "rock in + ejecta ray system" over the crater alone.
+const EJECTA_REACH: (f32, f32) = (2.4, 4.6);
+
+/// Rays in one burst, at the mildest and most severe ends of the severity channel.
+const EJECTA_RAYS: (usize, usize) = (7, 13);
+
+/// How wide the fan of rays opens around the outward normal at the impact point, in radians. Just
+/// under a full hemisphere: rays thrown backwards through the body would draw on the wrong side of
+/// a disk this renderer has no depth information about.
+const EJECTA_SPREAD: f32 = PI * 0.92;
+
+/// Draw the burst of short rays an impact throws off at the moment of strike: a fan of thin,
+/// neutral-coloured streaks radiating outward from the crater, flying out and fading as they go.
+///
+/// Runs after [`draw_crater`] for the same body — the rays are dust *above* the surface, and they
+/// deliberately extend past the body's own limb, which is what makes an impact on a 13px moon
+/// visible at all.
+fn draw_ejecta(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    ejecta: &Ejecta,
+    body: &BodyLayout,
+    position: (f32, f32),
+) {
+    // Rays are a flash, not a scar: quadratic so they are essentially gone well before the crater
+    // they leave behind has begun to fade noticeably.
+    let fade = clamp01(1.0 - ejecta.age);
+    let alpha_scale = fade * fade;
+    if alpha_scale <= 0.0 {
+        return;
+    }
+
+    let amount = ejecta.severity.amount();
+    let rays = mix(EJECTA_RAYS.0 as f32, EJECTA_RAYS.1 as f32, amount).round() as usize;
+    let reach = body.body_radius_px * mix(EJECTA_REACH.0, EJECTA_REACH.1, amount);
+    let seed = body_seed(ejecta.body).wrapping_add(5701);
+
+    // The impact point, matching `draw_crater`'s own placement exactly so the rays leave from the
+    // mark rather than from somewhere near it.
+    let (sin_a, cos_a) = ejecta.angle_on_surface.sin_cos();
+    let cx = position.0 + body.body_radius_px * 0.35 * cos_a;
+    let cy = position.1 + body.body_radius_px * 0.35 * sin_a;
+
+    // The whole burst flies outward over its life: the near end of every ray leaves the surface
+    // and the far end runs ahead of it, so the fan expands rather than just dimming in place.
+    let inner = body.body_radius_px * 0.2 + reach * 0.55 * ejecta.age;
+    let ray_len = reach * mix(0.55, 0.22, ejecta.age);
+
+    for i in 0..rays.max(1) {
+        let spread_t = if rays > 1 {
+            i as f32 / (rays - 1) as f32 - 0.5
+        } else {
+            0.0
+        };
+        // Even spacing would read as a mechanical starburst; the noise jitter keeps each body's
+        // fan its own shape while staying fully deterministic, like every other seed here.
+        let jitter = (value_noise(i as f32 * 1.7 + 0.5, 0.5, seed) - 0.5) * 0.34;
+        let angle = ejecta.angle_on_surface + spread_t * EJECTA_SPREAD + jitter;
+        let (rs, rc) = angle.sin_cos();
+        // Length varies per ray for the same reason, and the shortest ray still clears the limb.
+        let len = ray_len * mix(0.6, 1.0, value_noise(i as f32 * 3.1, 2.0, seed));
+
+        let steps = (len.ceil() as i32).max(1);
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let dist = inner + len * t;
+            let px = cx + rc * dist;
+            let py = cy + rs * dist;
+            // Thin at the leading tip, thicker at the root, and thinning overall as it flies.
+            let radius = mix(1.5, 0.5, t) * mix(1.0, 0.6, ejecta.age);
+            // Brightest at the root, gone at the tip.
+            let alpha = alpha_scale * mix(0.9, 0.0, t * t);
+            if alpha <= 0.004 {
+                continue;
+            }
+
+            let x0 = (px - radius).floor().max(0.0) as i32;
+            let x1 = (px + radius).ceil().min(width as f32) as i32;
+            let y0 = (py - radius).floor().max(0.0) as i32;
+            let y1 = (py + radius).ceil().min(height as f32) as i32;
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let dx = xx as f32 + 0.5 - px;
+                    let dy = yy as f32 + 0.5 - py;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let falloff = radius.max(0.5);
+                    if d > falloff {
+                        continue;
+                    }
+                    let idx = yy as usize * width as usize + xx as usize;
+                    blend(
+                        &mut buf[idx],
+                        EJECTA_RGB,
+                        alpha * clamp01(1.0 - d / falloff),
+                    );
+                }
+            }
         }
     }
 }
@@ -559,12 +717,16 @@ fn draw_asteroid(
 }
 
 /// Draw a comet: a bright core plus a fading tail along its direction of travel.
-fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet) {
+///
+/// `end` is passed in rather than read off `comet` because an arrival comet's endpoint is the
+/// live position of an orbiting body, which only [`effects_frame`] can resolve — see
+/// [`Comet::target`]. For a crossing comet it is exactly `comet.end`.
+fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet, end: (f32, f32)) {
     let pos = (
-        mix(comet.start.0, comet.end.0, comet.progress) * width as f32,
-        mix(comet.start.1, comet.end.1, comet.progress) * height as f32,
+        mix(comet.start.0, end.0, comet.progress) * width as f32,
+        mix(comet.start.1, end.1, comet.progress) * height as f32,
     );
-    let dir = (comet.end.0 - comet.start.0, comet.end.1 - comet.start.1);
+    let dir = (end.0 - comet.start.0, end.1 - comet.start.1);
     let dir_len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(0.0001);
     let dir = (dir.0 / dir_len, dir.1 / dir_len);
 
@@ -682,6 +844,16 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
         }
     }
 
+    // After every crater, so the dust a strike throws up sits above the mark it left, and above
+    // any other body's crater drawn this frame.
+    for ejecta in &effects.ejecta {
+        let Some(body) = layout.bodies.get(ejecta.body) else {
+            continue;
+        };
+        let pos = layout.position(ejecta.body, phase);
+        draw_ejecta(&mut buf, width, height, ejecta, body, pos);
+    }
+
     for asteroid in &effects.asteroids {
         if let Some(target) = layout.bodies.get(asteroid.target) {
             let target_pos = layout.position(asteroid.target, phase);
@@ -699,7 +871,21 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     }
 
     for comet in &effects.comets {
-        draw_comet(&mut buf, width, height, comet);
+        // An arrival comet ends on a body that is itself orbiting, so its endpoint is resolved
+        // against this frame's `phase` rather than frozen at spawn time — that is what makes it
+        // read as flying *into* the thing the work landed on rather than past where it used to be.
+        let end = comet
+            .target
+            .filter(|idx| *idx < layout.bodies.len())
+            .map(|idx| {
+                let pos = layout.position(idx, phase);
+                (
+                    pos.0 / (width.max(1)) as f32,
+                    pos.1 / (height.max(1)) as f32,
+                )
+            })
+            .unwrap_or(comet.end);
+        draw_comet(&mut buf, width, height, comet, end);
     }
 
     pack_rgba8(&buf, false)
@@ -1172,6 +1358,7 @@ mod tests {
             comets: vec![Comet {
                 start: (0.0, 0.0),
                 end: (1.0, 1.0),
+                target: None,
                 magnitude: 0.8,
                 progress: 0.5,
             }],
@@ -1247,6 +1434,247 @@ mod tests {
     }
 
     /// A representative mid-size fleet: one sun, four planets, three moons each.
+    /// A moon with a planet parent, in a scene big enough that a moon is several pixels across —
+    /// the shared fixture for the effect-pixel tests below.
+    fn struck_moon_scene() -> (SceneLayout, usize, usize) {
+        let nodes = [
+            node(None, BodyKind::Sun),
+            node(Some(0), BodyKind::Planet),
+            node(Some(1), BodyKind::Moon),
+        ];
+        (build_layout(&nodes, 1600, 900), 2, 1)
+    }
+
+    /// Highest effects-layer alpha anywhere inside a disk of `radius` about `centre`. Reading the
+    /// real rendered buffer rather than re-deriving the formula is the point: these assert what
+    /// actually lands on screen.
+    fn peak_alpha(rgba: &[u8], width: u32, centre: (f32, f32), radius: f32) -> f32 {
+        let height = rgba.len() / 4 / width as usize;
+        let mut peak = 0.0f32;
+        for y in 0..height {
+            for x in 0..width as usize {
+                let dx = x as f32 + 0.5 - centre.0;
+                let dy = y as f32 + 0.5 - centre.1;
+                if (dx * dx + dy * dy).sqrt() > radius {
+                    continue;
+                }
+                peak = peak.max(f32::from(rgba[(y * width as usize + x) * 4 + 3]) / 255.0);
+            }
+        }
+        peak
+    }
+
+    fn crater_only(body: usize, age: f32) -> SceneEffects {
+        SceneEffects {
+            craters: vec![Crater {
+                body,
+                angle_on_surface: 0.9,
+                severity: Severity::Critical,
+                age,
+                is_ripple: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Q2's fade curve: `(1 - age)^0.42` is an ease-out, so a scar at the halfway point of its
+    /// 45s budget still carries most of the opacity it landed with — where a linear fade would be
+    /// down to exactly half. Measured on the rendered buffer, not on the expression.
+    #[test]
+    fn the_crater_fade_holds_the_scar_longer_than_linear() {
+        let (layout, moon, _) = struck_moon_scene();
+        let phase = 0.8;
+        let pos = layout.position(moon, phase);
+        let radius = layout.bodies[moon].body_radius_px * 1.5;
+
+        let fresh = peak_alpha(
+            &effects_frame(&layout, &crater_only(moon, 0.0), phase),
+            layout.width,
+            pos,
+            radius,
+        );
+        let halfway = peak_alpha(
+            &effects_frame(&layout, &crater_only(moon, 0.5), phase),
+            layout.width,
+            pos,
+            radius,
+        );
+        assert!(fresh > 0.0, "a fresh crater draws nothing at all");
+
+        let retained = halfway / fresh;
+        // Linear would be 0.50 here; the approved curve is 0.5^0.42 ≈ 0.75.
+        assert!(
+            retained > 0.65,
+            "a half-aged crater retained only {retained:.2} of its opacity — that is the linear \
+             fade this curve replaced"
+        );
+        assert!(
+            retained < 0.85,
+            "a half-aged crater retained {retained:.2} — it is barely fading at all"
+        );
+
+        // The budget itself is unchanged: the scar still clears completely at the end.
+        assert_eq!(
+            peak_alpha(
+                &effects_frame(&layout, &crater_only(moon, 1.0), phase),
+                layout.width,
+                pos,
+                radius
+            ),
+            0.0
+        );
+    }
+
+    /// F3: the echo on a struck moon's parent has to be visible, not merely present in the
+    /// buffer. It still has to read as the *fainter* half of the pair.
+    #[test]
+    fn a_parent_planet_ripple_reads_as_more_than_a_trace() {
+        let (layout, moon, planet) = struck_moon_scene();
+        let phase = 0.8;
+        let rgba = effects_frame(&layout, &crater_only(moon, 0.05), phase);
+
+        let on_moon = peak_alpha(
+            &rgba,
+            layout.width,
+            layout.position(moon, phase),
+            layout.bodies[moon].body_radius_px * 1.2,
+        );
+        let on_planet = peak_alpha(
+            &rgba,
+            layout.width,
+            layout.position(planet, phase),
+            layout.bodies[planet].body_radius_px * 1.2,
+        );
+
+        // Measured: 0.27 at the current strength, against 0.15 at the round-1 0.35 this replaced.
+        // The threshold sits between the two, so a regression back toward the invisible value
+        // fails here rather than passing quietly.
+        assert!(
+            on_planet > 0.21,
+            "the parent ripple peaks at {on_planet:.2} alpha — that is the barely-visible 0.35 \
+             strength this raised"
+        );
+        assert!(
+            on_planet < on_moon,
+            "the ripple ({on_planet:.2}) is not fainter than the strike itself ({on_moon:.2})"
+        );
+    }
+
+    /// Q2's ejecta: the whole reason the storyboard picked rays over a crater alone is that a moon
+    /// is barely a dozen pixels across at the real target resolution, so the readable part of an
+    /// impact has to happen *outside* the struck body's own disk.
+    #[test]
+    fn an_impact_throws_rays_clear_of_the_struck_body() {
+        let (layout, moon, _) = struck_moon_scene();
+        let phase = 0.8;
+        let pos = layout.position(moon, phase);
+        let body_radius = layout.bodies[moon].body_radius_px;
+
+        let burst = SceneEffects {
+            ejecta: vec![Ejecta {
+                body: moon,
+                angle_on_surface: 0.9,
+                severity: Severity::Critical,
+                age: 0.0,
+            }],
+            ..Default::default()
+        };
+        let rgba = effects_frame(&layout, &burst, phase);
+
+        let mut past_limb = 0usize;
+        let mut furthest = 0.0f32;
+        for y in 0..layout.height as usize {
+            for x in 0..layout.width as usize {
+                if rgba[(y * layout.width as usize + x) * 4 + 3] < 8 {
+                    continue;
+                }
+                let dx = x as f32 + 0.5 - pos.0;
+                let dy = y as f32 + 0.5 - pos.1;
+                let dist = (dx * dx + dy * dy).sqrt() / body_radius;
+                if dist > 1.0 {
+                    past_limb += 1;
+                }
+                furthest = furthest.max(dist);
+            }
+        }
+        assert!(
+            past_limb > 0,
+            "the burst drew nothing outside the moon's own disk — it adds no reach at all"
+        );
+        assert!(
+            furthest > 1.5,
+            "the burst reached only {furthest:.2}x the body radius"
+        );
+
+        // And it is a flash: fully gone by the end of its own short life.
+        let spent = SceneEffects {
+            ejecta: vec![Ejecta {
+                body: moon,
+                angle_on_surface: 0.9,
+                severity: Severity::Critical,
+                age: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(effects_frame(&layout, &spent, phase)
+            .chunks_exact(4)
+            .all(|px| px[3] == 0));
+    }
+
+    /// Q3's landing tier: an arrival comet ends on the body the work landed on — and that body is
+    /// orbiting, so the endpoint has to follow it rather than be frozen at spawn time.
+    #[test]
+    fn an_arrival_comet_ends_on_its_target_wherever_that_body_has_orbited_to() {
+        let (layout, _, planet) = struck_moon_scene();
+        let arriving = SceneEffects {
+            comets: vec![Comet {
+                start: (0.0, 0.0),
+                // A crossing endpoint deliberately nowhere near the target, so anything landing on
+                // the body can only have come from `target`.
+                end: (1.0, 1.0),
+                target: Some(planet),
+                magnitude: 0.8,
+                progress: 1.0,
+            }],
+            ..Default::default()
+        };
+
+        for phase in [0.0f32, 2.0, 4.0] {
+            let pos = layout.position(planet, phase);
+            let rgba = effects_frame(&layout, &arriving, phase);
+            let on_target = peak_alpha(
+                &rgba,
+                layout.width,
+                pos,
+                layout.bodies[planet].body_radius_px,
+            );
+            assert!(
+                on_target > 0.5,
+                "at phase {phase} the arrival peaked at {on_target:.2} on its target — it is not \
+                 tracking the body's orbit"
+            );
+        }
+
+        // The same comet without a target is the round-1 crossing, unchanged: it ends at `end`.
+        let crossing = SceneEffects {
+            comets: vec![Comet {
+                target: None,
+                ..arriving.comets[0]
+            }],
+            ..Default::default()
+        };
+        let rgba = effects_frame(&layout, &crossing, 0.0);
+        assert_eq!(
+            peak_alpha(
+                &rgba,
+                layout.width,
+                layout.position(planet, 0.0),
+                layout.bodies[planet].body_radius_px
+            ),
+            0.0
+        );
+    }
+
     fn representative_fleet() -> Vec<TreeNode> {
         let mut nodes = vec![node(None, BodyKind::Sun)];
         for planet in 0..4 {
@@ -1286,9 +1714,18 @@ mod tests {
                 age: 0.2,
                 is_ripple: false,
             }],
+            // A live ejecta burst is part of the worst case this benchmark exists to bound: it
+            // is the only effect that draws outside a body's own disk on the struck-moon path.
+            ejecta: vec![Ejecta {
+                body: 2,
+                angle_on_surface: 1.0,
+                severity: Severity::Critical,
+                age: 0.2,
+            }],
             comets: vec![Comet {
                 start: (0.0, 0.2),
                 end: (1.0, 0.8),
+                target: None,
                 magnitude: 0.9,
                 progress: 0.4,
             }],

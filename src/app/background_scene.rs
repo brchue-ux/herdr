@@ -67,13 +67,39 @@ const ASTEROID_FLIGHT: Duration = Duration::from_millis(900);
 /// not an instant clear" (`data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`,
 /// firstmate home).
 const CRATER_FADE: Duration = Duration::from_secs(45);
-/// How long a comet takes to cross the scene.
+/// How long the rays an impact throws off stay visible. A flash, not a scar: a small fraction of
+/// [`CRATER_FADE`], so the burst is over long before the mark it leaves has begun to fade.
+const EJECTA_FADE: Duration = Duration::from_millis(1100);
+/// How long a comet takes to cross the scene. The middle tier — a landing arrival takes
+/// [`COMET_ARRIVAL_FLIGHT`], a quiet green pass takes [`COMET_PASS_FLIGHT`].
 const COMET_FLIGHT: Duration = Duration::from_millis(2200);
+/// How long a quiet green-test-pass comet takes to cross. Deliberately the quickest tier: this is
+/// the highest-frequency trigger of the three, and a small, fast streak reads as a passing detail
+/// rather than as an event demanding the eye.
+const COMET_PASS_FLIGHT: Duration = Duration::from_millis(1250);
+/// How long a landing comet takes to reach the body it landed on. The slowest tier — it is the
+/// only one with a destination, and the arrival is the thing worth watching.
+const COMET_ARRIVAL_FLIGHT: Duration = Duration::from_millis(2600);
 /// How long a streak-milestone shower's comets stay staggered across, so they read as a burst
 /// rather than one simultaneous flash.
 const SHOWER_STAGGER: Duration = Duration::from_millis(260);
 /// Comets in one streak-milestone shower.
 const SHOWER_SIZE: usize = 6;
+/// How far a crossing comet's exit angle may wander from the point diametrically opposite its
+/// entry, in radians. Applies to the quiet green-pass tier, unchanged from round 1.
+const CROSS_CHORD_JITTER: f32 = 0.3 * std::f32::consts::PI;
+/// The *smallest* deflection a shower comet's exit angle takes from diametrically opposite its
+/// entry, in radians.
+///
+/// A chord between opposite edges runs through the middle of the scene, which is exactly where the
+/// sun is — six of them at once all radiate through it. Forcing a minimum deflection pushes every
+/// chord off-centre by a margin that clears the sun's disk instead of leaving it to chance; see
+/// this module's `a_shower_spreads_its_comets_clear_of_the_sun` test, which measures that clearance
+/// against the sun's real drawn radius.
+const SHOWER_MIN_CHORD_DEFLECTION: f32 = 0.62;
+/// How much further past [`SHOWER_MIN_CHORD_DEFLECTION`] a shower comet's exit angle may wander,
+/// in radians — the part that keeps the six comets from tracing one repeated arc.
+const SHOWER_CHORD_JITTER: f32 = 0.75;
 
 /// Where a bug-impact effect on one pane currently is: still travelling, or already landed and
 /// fading. Kept as one state per pane rather than a list, so a second trigger on an
@@ -92,11 +118,35 @@ enum AsteroidLifecycle {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+/// How a comet moves, chosen by *what triggered it* rather than applied uniformly.
+///
+/// The three triggers this module already distinguishes are three different kinds of event, and
+/// the storyboard's approved pick (`data/decisions/2026-08-08-ambient-storyboard-picks-autonomous.md`,
+/// firstmate home) is to let the motion say which one happened — information the scene already has
+/// for free. This resolves the "motion pattern round 1 left open" note that used to sit in
+/// [`spawn_comet`].
+#[derive(Debug, Clone)]
+enum CometMotion {
+    /// A quiet green-test pass: small and fast, straight across the scene, no destination.
+    Pass,
+    /// A PR merge / clean landing: flies in from the edge and straight into the body the work
+    /// landed on. Carried as a [`CardRow`] rather than a body index because the tree is rebuilt
+    /// every pass — the index is re-resolved at draw time, exactly like an asteroid's target.
+    Arrival { target: CardRow },
+    /// One comet of a quality-streak milestone shower: crosses on a deliberately off-centre chord
+    /// so the whole shower fans out instead of converging on the sun. `index` is the comet's place
+    /// within its own shower, which is what alternates the chords to either side.
+    Shower { index: usize },
+}
+
+#[derive(Debug, Clone)]
 struct ActiveComet {
     started_at: Instant,
+    flight: Duration,
     start: (f32, f32),
     end: (f32, f32),
+    /// Set only for [`CometMotion::Arrival`]; a crossing comet flies to `end` unchanged.
+    target: Option<CardRow>,
     magnitude: f32,
 }
 
@@ -283,7 +333,17 @@ pub(crate) fn spawn_new_effects(
             let is_landing = outcome == "pr_merged" || outcome == "landed";
             let already_seen = state.seen_outcome.get(ws_id).map(String::as_str) == Some(outcome);
             if is_landing && !already_seen {
-                spawn_comet(state, ws_idx, now, work_size_magnitude(workspace));
+                // A landing has a *place* it landed, so this tier alone flies into it rather than
+                // past it — the workspace's own body in the scene.
+                spawn_comet(
+                    state,
+                    ws_idx,
+                    now,
+                    work_size_magnitude(workspace),
+                    CometMotion::Arrival {
+                        target: CardRow::Space(ws_id.clone()),
+                    },
+                );
             }
             state
                 .seen_outcome
@@ -294,9 +354,9 @@ pub(crate) fn spawn_new_effects(
             let all_clear = counts.checks_failing == 0 && counts.checks_pending == 0;
             let had_outstanding = state.seen_checks_clear.get(ws_id) == Some(&false);
             if all_clear && had_outstanding {
-                // The quiet, high-frequency tier: every green pass gets a star, kept small and
-                // dim so it never competes with a landing or a streak shower.
-                spawn_comet(state, ws_idx, now, 0.15);
+                // The quiet, high-frequency tier: every green pass gets a star, kept small, dim
+                // and quick so it never competes with a landing or a streak shower.
+                spawn_comet(state, ws_idx, now, 0.15, CometMotion::Pass);
             }
             state.seen_checks_clear.insert(ws_id.clone(), !all_clear);
         }
@@ -323,10 +383,17 @@ pub(crate) fn spawn_new_effects(
                 let previous = state.seen_streak_band.get(ws_id).copied();
                 if previous.is_some_and(|prev| band > prev) {
                     // A milestone is an accumulated streak, not one landed thing, so it reads as
-                    // a shower of several comets rather than one bigger one.
+                    // a shower of several comets rather than one bigger one — fanned wide, since
+                    // six comets all crossing through the middle would converge on the sun.
                     for i in 0..SHOWER_SIZE {
                         let stagger = SHOWER_STAGGER * i as u32;
-                        spawn_comet(state, ws_idx, now + stagger, 0.9);
+                        spawn_comet(
+                            state,
+                            ws_idx,
+                            now + stagger,
+                            0.9,
+                            CometMotion::Shower { index: i },
+                        );
                     }
                 }
                 state.seen_streak_band.insert(ws_id.clone(), band);
@@ -365,24 +432,46 @@ fn spawn_comet(
     ws_idx: usize,
     started_at: Instant,
     magnitude: f32,
+    motion: CometMotion,
 ) {
     // Varies with how many comets are already in flight this pass, so a shower's own several
     // calls (same `ws_idx`, same rough `started_at`) do not all pick the same path.
     let seed = (ws_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (state.comets.len() as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    // Crossing the scene: the motion pattern round 1 left open
-    // (`data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`, firstmate
-    // home) — picked here as the simplest reading of "comet/shooting star" that needs no
-    // specific target body and naturally scales to a multi-comet shower.
     let entry_edge = pseudo_angle(seed);
     let start = edge_point(entry_edge);
-    let end = edge_point(
-        entry_edge + std::f32::consts::PI + (pseudo_angle(seed ^ 7) - std::f32::consts::PI) * 0.3,
-    );
+    let opposite = entry_edge + std::f32::consts::PI;
+    // Every tier still enters from an edge — what differs is where it goes, and how long it takes
+    // to get there. See [`CometMotion`].
+    let (flight, target, exit_angle) = match &motion {
+        CometMotion::Pass => (
+            COMET_PASS_FLIGHT,
+            None,
+            opposite
+                + (pseudo_angle(seed ^ 7) / std::f32::consts::TAU - 0.5) * 2.0 * CROSS_CHORD_JITTER,
+        ),
+        CometMotion::Arrival { target } => (COMET_ARRIVAL_FLIGHT, Some(target.clone()), opposite),
+        CometMotion::Shower { index } => {
+            // Alternating sides, each already deflected clear of the middle, is what turns six
+            // chords into a fan rather than six near-copies of the same line through the sun.
+            let side = if index % 2 == 0 { 1.0 } else { -1.0 };
+            let spread = pseudo_angle(seed ^ 0x5157) / std::f32::consts::TAU;
+            (
+                COMET_FLIGHT,
+                None,
+                opposite + side * (SHOWER_MIN_CHORD_DEFLECTION + spread * SHOWER_CHORD_JITTER),
+            )
+        }
+    };
     state.comets.push(ActiveComet {
         started_at,
+        flight,
         start,
-        end,
+        // An arrival overrides this with the live body position at draw time; kept as a real
+        // crossing endpoint anyway so a target that has since left the tree degrades to the
+        // round-1 crossing rather than to a comet flying at nothing.
+        end: edge_point(exit_angle),
+        target,
         magnitude: magnitude.clamp(0.05, 1.0),
     });
 }
@@ -429,6 +518,7 @@ pub(crate) fn advance_and_build_effects(
                         angle_on_surface: angle,
                     };
                     push_crater(&mut effects, target, angle, severity, 0.0);
+                    push_ejecta(&mut effects, target, angle, severity, 0.0);
                 } else {
                     let progress = elapsed.as_secs_f32() / ASTEROID_FLIGHT.as_secs_f32();
                     effects.asteroids.push(solar_system::AsteroidInFlight {
@@ -451,6 +541,12 @@ pub(crate) fn advance_and_build_effects(
                 }
                 let age = elapsed.as_secs_f32() / CRATER_FADE.as_secs_f32();
                 push_crater(&mut effects, target, angle_on_surface, severity, age);
+                // The rays live on their own much shorter clock inside the same lifecycle, so a
+                // strike that happened a minute ago still shows its scar and no dust.
+                if elapsed < EJECTA_FADE {
+                    let ejecta_age = elapsed.as_secs_f32() / EJECTA_FADE.as_secs_f32();
+                    push_ejecta(&mut effects, target, angle_on_surface, severity, ejecta_age);
+                }
                 true
             }
         }
@@ -463,13 +559,20 @@ pub(crate) fn advance_and_build_effects(
 
     state.comets.retain(|comet| {
         let elapsed = now.saturating_duration_since(comet.started_at);
-        if elapsed >= COMET_FLIGHT {
+        if elapsed >= comet.flight {
             return false;
         }
-        let progress = elapsed.as_secs_f32() / COMET_FLIGHT.as_secs_f32();
+        let progress = elapsed.as_secs_f32() / comet.flight.as_secs_f32();
         effects.comets.push(solar_system::Comet {
             start: comet.start,
             end: comet.end,
+            // Re-resolved every pass against the *current* tree, exactly like an asteroid's
+            // target: a landing whose workspace has since gone finishes its flight as a plain
+            // crossing rather than vanishing or aiming at whatever now holds that index.
+            target: comet
+                .target
+                .as_ref()
+                .and_then(|row| identity.iter().position(|candidate| candidate == row)),
             magnitude: comet.magnitude,
             progress: progress.clamp(0.0, 1.0),
         });
@@ -498,6 +601,23 @@ fn push_crater(
     });
 }
 
+/// Queue the burst of rays a strike throws off, on the same body and at the same point on its
+/// surface as the crater that strike leaves behind — the two are one event drawn on two clocks.
+fn push_ejecta(
+    effects: &mut solar_system::SceneEffects,
+    target: usize,
+    angle: f32,
+    severity: Severity,
+    age: f32,
+) {
+    effects.ejecta.push(solar_system::Ejecta {
+        body: target,
+        angle_on_surface: angle,
+        severity,
+        age,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +633,173 @@ mod tests {
         assert!(FlameBand::of(2.0) < FlameBand::of(15.0));
         assert!(FlameBand::of(15.0) < FlameBand::of(25.0));
         assert!(FlameBand::of(25.0) < FlameBand::of(50.0));
+    }
+
+    /// Shortest distance from `p` to the segment `a`..`b`.
+    fn distance_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+        let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+        let len_sq = abx * abx + aby * aby;
+        let t = if len_sq <= f32::EPSILON {
+            0.0
+        } else {
+            (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len_sq).clamp(0.0, 1.0)
+        };
+        let (cx, cy) = (a.0 + abx * t, a.1 + aby * t);
+        ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+    }
+
+    /// The scene's real 1440p target, so this measures the geometry the captain actually sees.
+    const SCENE: (f32, f32) = (2560.0, 1440.0);
+
+    fn to_px(point: (f32, f32)) -> (f32, f32) {
+        (point.0 * SCENE.0, point.1 * SCENE.1)
+    }
+
+    /// F4: a milestone shower must fan out, not converge. Six comets all crossing between opposite
+    /// edges all run through the middle of the scene, which is exactly where the sun is — this
+    /// measures each comet's real path against the sun's real drawn radius rather than trusting
+    /// the jitter to have spread them.
+    #[test]
+    fn a_shower_spreads_its_comets_clear_of_the_sun() {
+        let mut state = BackgroundEffectsState::default();
+        let now = Instant::now();
+        for index in 0..SHOWER_SIZE {
+            spawn_comet(&mut state, 3, now, 0.9, CometMotion::Shower { index });
+        }
+        assert_eq!(state.comets.len(), SHOWER_SIZE);
+
+        let sun = (SCENE.0 / 2.0, SCENE.1 / 2.0);
+        // `BodyKind::Sun::base_radius_fraction()` against `min(width, height)`, which is the
+        // radius the sun's own disk is drawn at in this scene.
+        let sun_radius = 0.050 * SCENE.1;
+
+        let mut sides = (false, false);
+        for comet in &state.comets {
+            let clearance = distance_to_segment(sun, to_px(comet.start), to_px(comet.end));
+            assert!(
+                clearance > sun_radius,
+                "a shower comet passes within {clearance:.0}px of the sun's {sun_radius:.0}px disk"
+            );
+            // Which side of the sun it went by — a fan needs both.
+            let (ax, ay) = (comet.end.0 - comet.start.0, comet.end.1 - comet.start.1);
+            let cross =
+                ax * (sun.1 / SCENE.1 - comet.start.1) - ay * (sun.0 / SCENE.0 - comet.start.0);
+            if cross > 0.0 {
+                sides.0 = true;
+            } else {
+                sides.1 = true;
+            }
+        }
+        assert!(
+            sides.0 && sides.1,
+            "every shower comet went past the sun on the same side — that is an arc, not a shower"
+        );
+    }
+
+    /// Q3: the three triggers are three different kinds of event, so they must not all move the
+    /// same way. This asserts the two facts that distinguish them mechanically — where the comet
+    /// is headed, and how long it takes to get there.
+    #[test]
+    fn each_comet_tier_moves_differently() {
+        let now = Instant::now();
+        let landed_on = CardRow::Space("ws-landed".to_string());
+
+        let mut pass = BackgroundEffectsState::default();
+        spawn_comet(&mut pass, 1, now, 0.15, CometMotion::Pass);
+        let mut arrival = BackgroundEffectsState::default();
+        spawn_comet(
+            &mut arrival,
+            1,
+            now,
+            0.6,
+            CometMotion::Arrival {
+                target: landed_on.clone(),
+            },
+        );
+        let mut shower = BackgroundEffectsState::default();
+        spawn_comet(&mut shower, 1, now, 0.9, CometMotion::Shower { index: 0 });
+
+        // A green pass has no destination and is the quickest of the three.
+        assert!(pass.comets[0].target.is_none());
+        assert!(pass.comets[0].flight < shower.comets[0].flight);
+        assert!(pass.comets[0].flight < arrival.comets[0].flight);
+
+        // A landing flies into the body it landed on, and is the slowest — the arrival is the
+        // thing worth watching.
+        assert_eq!(arrival.comets[0].target.as_ref(), Some(&landed_on));
+        assert!(arrival.comets[0].flight > shower.comets[0].flight);
+
+        // A shower comet crosses like a pass but on a deliberately off-centre chord.
+        assert!(shower.comets[0].target.is_none());
+        assert_ne!(shower.comets[0].end, pass.comets[0].end);
+    }
+
+    /// An arrival's endpoint is a body index re-resolved against the *current* tree every pass,
+    /// so a landing whose workspace has since disappeared finishes as a plain crossing rather
+    /// than aiming at whatever now happens to hold that index.
+    #[test]
+    fn an_arrival_re_resolves_its_target_and_degrades_to_a_crossing() {
+        let now = Instant::now();
+        let target = CardRow::Space("ws-landed".to_string());
+        let mut state = BackgroundEffectsState::default();
+        spawn_comet(
+            &mut state,
+            1,
+            now,
+            0.6,
+            CometMotion::Arrival {
+                target: target.clone(),
+            },
+        );
+
+        let present = [CardRow::Space("other".to_string()), target.clone()];
+        let effects = advance_and_build_effects(&mut state.clone(), &present, now);
+        assert_eq!(effects.comets[0].target, Some(1));
+
+        let gone = [CardRow::Space("other".to_string())];
+        let effects = advance_and_build_effects(&mut state.clone(), &gone, now);
+        assert_eq!(effects.comets[0].target, None);
+        // The crossing endpoint it was spawned with is still there to fall back on.
+        assert!(effects.comets[0].end.0.is_finite());
+    }
+
+    /// Q2: the rays are a flash and the crater they leave is a scar. One impact drives both, but
+    /// on clocks far enough apart that the burst is long gone while the mark is still legible.
+    #[test]
+    fn a_strike_throws_rays_that_are_gone_long_before_its_crater() {
+        let pane = PaneId::from_raw(7);
+        let identity = [CardRow::Agent(pane)];
+        let now = Instant::now();
+        let mut state = BackgroundEffectsState::default();
+        state.asteroids.insert(
+            pane,
+            AsteroidLifecycle::Cratering {
+                started_at: now,
+                severity: Severity::Critical,
+                angle_on_surface: 0.9,
+            },
+        );
+
+        let at_impact = advance_and_build_effects(&mut state.clone(), &identity, now);
+        assert_eq!(at_impact.craters.len(), 1);
+        assert_eq!(at_impact.ejecta.len(), 1);
+        assert_eq!(at_impact.ejecta[0].angle_on_surface, 0.9);
+        assert_eq!(at_impact.ejecta[0].body, at_impact.craters[0].body);
+
+        // Halfway through the burst: both live, the rays already well into their own fade.
+        let mid = advance_and_build_effects(&mut state.clone(), &identity, now + EJECTA_FADE / 2);
+        assert_eq!(mid.ejecta.len(), 1);
+        assert!(mid.ejecta[0].age > 0.4 && mid.ejecta[0].age < 0.6);
+        assert!(
+            mid.craters[0].age < 0.02,
+            "the scar has barely begun to fade"
+        );
+
+        // A strike from ten seconds ago still shows its scar and no dust at all.
+        let later =
+            advance_and_build_effects(&mut state.clone(), &identity, now + Duration::from_secs(10));
+        assert_eq!(later.craters.len(), 1);
+        assert!(later.ejecta.is_empty());
     }
 
     #[test]
