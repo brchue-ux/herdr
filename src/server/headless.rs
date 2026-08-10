@@ -9132,10 +9132,10 @@ next_tab = ""
     /// `HostTerminalKind::draws_ambient_wash()` of `AppState::host_terminal_kind`
     /// — the *foreground* client's terminal — but the wash is one image on
     /// shared state that every attached viewer is placed a copy of. With a
-    /// kitty client and a Rio client both attached, the kitty client being
-    /// foreground generated an opaque full-surface wash and shipped it to the
-    /// Rio client too, which does not honour the negative-`z` band and
-    /// composited it over its own panes.
+    /// drawing client and an unidentified one both attached, the drawing
+    /// client being foreground generated an opaque full-surface wash and
+    /// shipped it to the unidentified client too, which need not honour the
+    /// negative-`z` band and composited it over its own panes.
     #[tokio::test]
     async fn a_wash_is_refused_while_any_attached_viewer_would_composite_it_over_its_panes() {
         let mut server = test_headless_server();
@@ -9171,11 +9171,11 @@ next_tab = ""
         );
         assert!(server.app.state.sidebar_particle_field_active());
 
-        // A Rio client attaches. The foreground terminal has not changed, but
+        // An unidentified client attaches. The foreground terminal has not changed, but
         // what the fleet can be shown has.
         server
             .clients
-            .insert(2, client(2, crate::kitty_graphics::HostTerminalKind::Rio));
+            .insert(2, client(2, crate::kitty_graphics::HostTerminalKind::Other));
         server.app.state.every_app_viewer_draws_ambient_wash =
             server.every_app_viewer_draws_ambient_wash();
         assert_eq!(
@@ -9206,7 +9206,7 @@ next_tab = ""
             "moving focus back to the kitty client brought the wash back"
         );
 
-        // The Rio client leaves: the remaining fleet can be shown a wash again.
+        // The unidentified client leaves: the remaining fleet can be shown a wash again.
         server.clients.remove(&2);
         server.app.state.every_app_viewer_draws_ambient_wash =
             server.every_app_viewer_draws_ambient_wash();
