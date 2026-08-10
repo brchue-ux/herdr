@@ -71,14 +71,22 @@ wgpu = { version = "27", default-features = false, features = [
     "wgsl",
 ], optional = true }
 
-# Vulkan on Unix covers Mesa's hardware drivers and, for a machine with no GPU
-# at all, its `lavapipe` software adapter — which is how a Unix dev box or CI
+# Vulkan on Linux covers Mesa's hardware drivers and, for a machine with no GPU
+# at all, its `lavapipe` software adapter — which is how a Linux dev box or CI
 # exercises this path at all. GL is the fallback for a driver stack too old for
-# Vulkan compute.
-[target.'cfg(unix)'.dependencies]
+# Vulkan compute. Deliberately not `cfg(unix)`: macOS is Unix and implements
+# neither, and `wgpu::Instance::new` panics on a target with no backend
+# compiled in.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wgpu = { version = "27", default-features = false, features = [
     "vulkan",
     "gles",
+], optional = true }
+
+# Metal is the only compute backend macOS implements.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "27", default-features = false, features = [
+    "metal",
 ], optional = true }
 
 [patch.crates-io]

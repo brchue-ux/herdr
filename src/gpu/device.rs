@@ -39,6 +39,19 @@ pub(super) fn context() -> Option<&'static Context> {
 }
 
 fn acquire() -> Option<Context> {
+    // `wgpu::Instance::new` *panics* on a target none of the compiled-in
+    // backends implements — it does not return an error — so the backend set is
+    // checked before an instance is asked for. Cargo picks those per target
+    // (see the `wgpu` entries in `Cargo.toml`) and a target that acquires a new
+    // one, or loses the backend it had, must degrade to the CPU rather than
+    // take the client down on its first card.
+    if wgpu::Instance::enabled_backend_features().is_empty() {
+        warn!(
+            target_os = std::env::consts::OS,
+            "no wgpu backend is compiled in for this target; keeping the CPU path"
+        );
+        return None;
+    }
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     // `HighPerformance` is the whole point of the exercise on the captain's box:
     // the discrete card should do this, not the integrated one sharing the

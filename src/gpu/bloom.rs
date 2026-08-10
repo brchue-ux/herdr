@@ -565,6 +565,24 @@ mod tests {
         assert_eq!(compose(&[], curve()), Ok(Vec::new()));
     }
 
+    /// This target has a backend compiled in.
+    ///
+    /// Backends are chosen per target in `Cargo.toml`, and a target left without
+    /// one does not merely lose the GPU: `wgpu::Instance::new` *panics*. That is
+    /// how the first attempt at this shipped — `vulkan` and `gles` under
+    /// `cfg(unix)`, and macOS is Unix and implements neither. `device::acquire`
+    /// now checks before it asks, so the consequence is a CPU fallback rather
+    /// than a crash; this makes it a build failure instead of a silent one.
+    #[test]
+    fn this_target_has_a_wgpu_backend() {
+        assert!(
+            !wgpu::Instance::enabled_backend_features().is_empty(),
+            "no wgpu backend is compiled in for {} — every machine on this \
+             target silently falls back to the CPU",
+            std::env::consts::OS
+        );
+    }
+
     /// The shader compiles on this machine's driver.
     ///
     /// Its own test because the failure it guards is invisible from anywhere
