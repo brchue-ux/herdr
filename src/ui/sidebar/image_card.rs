@@ -2540,7 +2540,13 @@ fn content_for(
                 split_channels: app.sidebar_cards.stage_hue,
                 seen,
                 depth: entry.depth(),
-                lifted: app.active == Some(*ws_idx),
+                // The same rows the character card lifts its glow ramp for. The
+                // drawn card is the *only* thing carrying selection on a row it
+                // covers — the row wash that used to show it is not painted
+                // under a shape, because it cannot be clipped to a border drawn
+                // inside a cell — so a cursor that only lifted the active Space
+                // would leave the keyboard cursor with nothing to stand on.
+                lifted: super::workspace_row_highlighted(app, *ws_idx),
                 mark: None,
                 // Filled in by `compute_card_placement`, which is the pass that
                 // has the row's cells and can therefore ask whether a control is
@@ -8573,6 +8579,165 @@ mod a_card_is_its_own_shape {
                 samples[samples.len() - 1],
             );
         }
+    }
+
+    /// The selection highlight belongs to the card, and it stops at the card's
+    /// own border.
+    ///
+    /// The defect, from the captain's screenshot: the cursor's row was washed
+    /// with a flat `surface0` rectangle over *every cell the row owns*, and a
+    /// row is wider and taller than the card standing on it. Under a drawn card
+    /// that wash was the only part of the selection anyone could see, and what
+    /// it looked like was a lit rectangle with a card floating inside it — the
+    /// glow spilling past the wireframe border on both sides.
+    ///
+    /// Two halves, because either one alone is satisfied by a wrong rule.
+    /// Painting nothing at all under a shape is only right if the *card* has
+    /// taken the selection over, and lifting the card is only right if the row
+    /// around it went back to being the panel.
+    #[test]
+    fn a_drawn_card_carries_the_selection_and_washes_nothing_around_itself() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 100, 46);
+
+        // The same panel twice, differing only in which row the cursor is on.
+        // Row 1 is the cursor's row in one and an ordinary row in the other,
+        // and row 0 is the active Space in both, so the *only* thing this
+        // comparison can see is what selecting a row does to its own cells.
+        let panel = |cursor: usize| {
+            let mut app = three_rank_pixel_app();
+            app.sidebar_card_shapes = true;
+            app.mode = crate::app::state::Mode::Navigate;
+            app.active = Some(0);
+            app.selected = cursor;
+            app.sidebar_width = sidebar_rect().width;
+            let cell = app.host_cell_size;
+            crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("test backend");
+            terminal
+                .draw(|frame| {
+                    super::super::render_sidebar(&app, &runtimes, frame, app.view.sidebar_rect)
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            (app, buffer)
+        };
+
+        let (selected, on) = panel(1);
+        let (_, off) = panel(0);
+        if selected.sidebar_card_layers.is_empty() {
+            return; // No face on this machine, so no shapes to stand on.
+        }
+        let row = *selected
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_none() && card.ws_idx == 1)
+            .expect("the second Space has a row");
+
+        let mut washed: Vec<(u16, u16, ratatui::style::Color)> = Vec::new();
+        for y in row.rect.y..row.rect.y + row.rect.height {
+            for x in row.rect.x..row.rect.x + row.rect.width {
+                if on[(x, y)].bg != off[(x, y)].bg {
+                    washed.push((x, y, on[(x, y)].bg));
+                }
+            }
+        }
+        washed.truncate(8);
+        assert!(
+            washed.is_empty(),
+            "selecting a row repainted cells under a drawn card, which is a \
+             highlight the card's own border cannot contain, from: {washed:?}"
+        );
+
+        // And the card itself took it over. Without this the assertion above is
+        // passed by a panel that simply stopped showing selection.
+        let entries = super::super::workspace_list_entries(&selected);
+        let entry = entries
+            .iter()
+            .find(|entry| matches!(entry, super::super::WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == 1))
+            .expect("the second Space is a row of the tree");
+        let content = content_for(&selected, entry, &[]).expect("the row has a card");
+        assert!(
+            content.lifted,
+            "the cursor's row drew an unlifted card, so nothing at all says \
+             which row the cursor is on"
+        );
+    }
+
+    /// The character card's wash is clipped to the card too.
+    ///
+    /// Same defect, one path over: with no shapes the row still owns rails and a
+    /// gutter the card does not, and a wash over all of it is a highlight
+    /// outside the drawn border. Inside the frame it must still change, or the
+    /// clip has been turned into a deletion.
+    #[test]
+    fn a_character_card_is_washed_only_inside_its_own_frame() {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 100, 46);
+        let panel = |cursor: usize| {
+            let mut app = three_rank_pixel_app();
+            app.kitty_graphics_enabled = false;
+            app.kitty_graphics_capability_confirmed = false;
+            app.sidebar_card_shapes = false;
+            app.mode = crate::app::state::Mode::Navigate;
+            app.active = Some(0);
+            app.selected = cursor;
+            app.sidebar_width = sidebar_rect().width;
+            let cell = app.host_cell_size;
+            crate::ui::compute_view_with_cell_size(&mut app, &runtimes, area, cell);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("test backend");
+            terminal
+                .draw(|frame| {
+                    super::super::render_sidebar(&app, &runtimes, frame, app.view.sidebar_rect)
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            (app, buffer)
+        };
+
+        let (selected, on) = panel(1);
+        let (_, off) = panel(0);
+        let row = *selected
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.agent.is_none() && card.ws_idx == 1)
+            .expect("the second Space has a row");
+        let frame = row.card_frame.expect("a 42-column panel draws card shells");
+
+        let mut outside: Vec<(u16, u16)> = Vec::new();
+        let mut inside = 0usize;
+        for y in row.rect.y..row.rect.y + row.rect.height {
+            for x in row.rect.x..row.rect.x + row.rect.width {
+                if on[(x, y)].bg == off[(x, y)].bg {
+                    continue;
+                }
+                let within = x >= frame.x
+                    && x < frame.x + frame.width
+                    && y >= frame.y
+                    && y < frame.y + frame.height;
+                if within {
+                    inside += 1;
+                } else {
+                    outside.push((x, y));
+                }
+            }
+        }
+        outside.truncate(8);
+        assert!(
+            outside.is_empty(),
+            "the selection wash reached cells outside the card's frame \
+             {frame:?}, from: {outside:?}"
+        );
+        assert!(
+            inside > 0,
+            "selecting the row changed nothing inside the card either"
+        );
     }
 
     /// A card's glow stops at the notification tray, exactly as the sheet's did.

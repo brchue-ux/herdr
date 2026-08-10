@@ -4622,6 +4622,23 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
     style
 }
 
+/// Whether a workspace row is the one the panel is calling out: the row the
+/// cursor is on, the active Space, or the row being dragged.
+///
+/// Shared with the drawn card so the two card paths cannot disagree about which
+/// row is lifted. The character card's glow ramp and the pixel card's lift are
+/// the same selection cue at two resolutions, and the wash below is only ever
+/// drawn where neither of them is.
+pub(super) fn workspace_row_highlighted(app: &AppState, ws_idx: usize) -> bool {
+    let selected = ws_idx == app.selected && matches!(app.mode, Mode::Navigate);
+    let dragged = matches!(
+        app.drag.as_ref().map(|drag| &drag.target),
+        Some(crate::app::state::DragTarget::WorkspaceReorder { source_ws_idx, .. })
+            if *source_ws_idx == ws_idx
+    );
+    selected || Some(ws_idx) == app.active || dragged
+}
+
 fn render_workspace_list(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -4680,12 +4697,11 @@ fn render_workspace_list(
             None => (0, Vec::new(), true),
         };
         let own_ancestors = own_ancestors.as_slice();
-        let row_y = card.rect.y;
         let row_height = card.rect.height;
         let selected = i == app.selected && is_navigating;
         let is_active = Some(i) == app.active;
         let is_dragged = dragged_ws_idx == Some(i);
-        let highlighted = selected || is_active || is_dragged;
+        let highlighted = workspace_row_highlighted(app, i);
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
 
         // A card's first content row is its title, and it gets full weight
@@ -4743,7 +4759,24 @@ fn render_workspace_list(
         // shell is known so it can, and before anything else this row paints so
         // it is still under all of it — it patches the background and leaves
         // every symbol alone.
-        if highlighted && motion.0 == 0 {
+        //
+        // # Why it is clipped to the card, and dropped under a drawn one
+        //
+        // A row is wider than the card standing on it: the rails, the prefix and
+        // the gutter either side are the row's, not the card's. A wash over the
+        // whole row therefore paints a flat rectangle *around* the card, and on
+        // a card row that rectangle is the only part of it anyone ever sees —
+        // inside the frame the card's own glow ramp paints over it completely.
+        // Clipped to the frame, the highlight stops exactly where the card's
+        // border is drawn.
+        //
+        // Under a drawn card there is no cell-sized box to clip to at all: the
+        // shape's border sits *inside* its first and last cell and leaves a
+        // gutter above and below it, so even a frame-clipped wash would show as
+        // a halo a fraction of a cell outside the drawn edge. The card carries
+        // the selection itself there — see `image_card::lift` — so nothing is
+        // painted under it.
+        if highlighted && motion.0 == 0 && !covered {
             let bg = if selected {
                 p.surface0
             } else if is_dragged {
@@ -4751,12 +4784,13 @@ fn render_workspace_list(
             } else {
                 p.surface_dim
             };
+            let wash = card.card_frame.unwrap_or(card.rect);
             let buf = frame.buffer_mut();
-            for y in row_y..row_y + row_height {
+            for y in wash.y..wash.y + wash.height {
                 let Some(drawn_y) = moved_row(y, motion.1, area.y, list_bottom) else {
                     continue;
                 };
-                for x in card.rect.x..card.rect.x + card.rect.width {
+                for x in wash.x..wash.x + wash.width {
                     buf[(x, drawn_y)].set_style(Style::default().bg(bg));
                 }
             }
