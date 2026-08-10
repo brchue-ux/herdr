@@ -2617,7 +2617,8 @@ mod tests {
     /// make unreachable rather than to apologise for afterwards.
     #[test]
     fn the_background_scene_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
-        for kind in [crate::kitty_graphics::HostTerminalKind::Other] {
+        {
+            let kind = crate::kitty_graphics::HostTerminalKind::Other;
             let mut app = background_scene_app();
             app.state.host_terminal_kind = kind;
             assert!(
