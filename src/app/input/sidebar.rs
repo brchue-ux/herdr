@@ -271,7 +271,7 @@ impl AppState {
             self.view.workspace_card_areas.clone()
         };
         cards.iter().find_map(|card| {
-            let chevron = crate::ui::workspace_group_chevron_rect(card);
+            let chevron = card.drawn(crate::ui::workspace_group_chevron_rect(card))?;
             (chevron.width > 0
                 && col == chevron.x
                 && row == chevron.y
@@ -488,9 +488,7 @@ impl AppState {
             self.view.workspace_card_areas.clone()
         };
 
-        cards
-            .into_iter()
-            .find(|card| row >= card.rect.y && row < card.rect.y + card.rect.height)
+        cards.into_iter().find(|card| card.drawn_covers_row(row))
     }
 
     /// The Space under `row`. An agent row is deliberately not one: it draws in
@@ -549,11 +547,43 @@ impl AppState {
         } else {
             self.view.workspace_card_areas.clone()
         };
+        // The slots are laid out in the tree's *settled* coordinates, and so is
+        // the indicator drawn from them, but the pointer is over the panel as
+        // drawn. Translate through the row actually under the cursor so a drag
+        // that lands mid-reflow drops where it looks like it will.
+        let pointer = cards
+            .iter()
+            .find(|card| card.drawn_covers_row(row))
+            .and_then(|card| {
+                i32::from(row)
+                    .checked_sub(card.motion_cells.1)
+                    .and_then(|layout_row| u16::try_from(layout_row).ok())
+            })
+            .unwrap_or(row);
         crate::ui::workspace_drop_slots(self, &cards, area)
             .into_iter()
             .enumerate()
-            .min_by_key(|(slot_idx, (_, slot_row))| (row.abs_diff(*slot_row), *slot_idx))
+            .min_by_key(|(slot_idx, (_, slot_row))| (pointer.abs_diff(*slot_row), *slot_idx))
             .map(|(_, (target, _))| target)
+    }
+
+    /// The pane a Space row stands for: the focused pane of that Space's first
+    /// tab.
+    ///
+    /// A Space row is a row like any other, and the captain's rule for every row
+    /// is "any pane I click, I go there, regardless of where I am currently".
+    /// Answering `FocusWorkspace` alone cannot honour that, because focusing the
+    /// workspace you are already in is a no-op — the click on a second mate's
+    /// row did nothing whenever a pane inside that mate's Space had focus. The
+    /// Space's first tab is its home: it is the tab it was created with, and in
+    /// a fleet it is the mate's own pane rather than one of the workers that
+    /// hang off it in their own tabs.
+    ///
+    /// The tab's *focused* pane rather than its root, so a home tab that has
+    /// been split still lands where the user last was inside it.
+    pub(super) fn workspace_home_pane(&self, ws_idx: usize) -> Option<crate::layout::PaneId> {
+        let tab = self.workspaces.get(ws_idx)?.tabs.first()?;
+        Some(tab.layout.focused())
     }
 
     pub(super) fn workspace_move_block_params(
@@ -2518,5 +2548,420 @@ mod tests {
 
         assert!(!app.state.sidebar_divider_detent);
         assert_eq!(app.state.sidebar_width, 34);
+    }
+}
+
+/// **A click goes to the row it lands on.** The tree's rows reflow around an
+/// arrival or a departure: the layout gives every row its settled slot and the
+/// renderers draw it at that slot plus
+/// [`crate::app::state::WorkspaceCardArea::motion_cells`], so for the whole of
+/// every transition a row is on screen up to a full row-height away from where
+/// the layout put it.
+///
+/// The hit tests used to read the settled slot alone, which made a click during
+/// a reflow focus the row *above* the one under the cursor, and made a click on
+/// the row that had moved over a departing row's vacated slot do nothing at all
+/// — the departing row's pane is already gone, so it answers no target and the
+/// press never arms.
+///
+/// Both are asserted here through the real gesture, `App::handle_mouse`, against
+/// a settled control click on the same row.
+#[cfg(test)]
+mod a_click_lands_on_the_row_it_is_drawn_on {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    use super::super::{app_for_mouse_test, mouse};
+    use crate::workspace::Workspace;
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 106,
+        height: 60,
+    };
+
+    /// The captain's cell, which is what fixes a card at three rows.
+    fn cell() -> crate::kitty_graphics::HostCellSize {
+        crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        }
+    }
+
+    /// A first mate, two second-mate Spaces, and `workers` worker panes under
+    /// each — one per tab, so which pane has focus is readable as a tab index.
+    ///
+    /// The pixel path is live and rows slide, which is the only configuration
+    /// where `motion_cells` is ever non-zero: see
+    /// `AppState::rows_move_given_face`.
+    fn sliding_fleet(workers: usize) -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        let mut spaces = vec![Workspace::test_new("firstmate")];
+        let mut plan = Vec::new();
+        for mate in 0..2usize {
+            let mut space = Workspace::test_new(&format!("2nd-{mate}"));
+            let ws_idx = mate + 1;
+            for worker in 0..workers {
+                let tab = space.test_add_tab(None);
+                plan.push((
+                    ws_idx,
+                    tab,
+                    space.tabs[tab].root_pane,
+                    format!("w{mate}{worker}"),
+                ));
+            }
+            spaces.push(space);
+        }
+        app.state.workspaces = spaces;
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.sidebar_width = 42;
+        app.state.sidebar_max_width = 42;
+        app.state.kitty_graphics_enabled = true;
+        app.state.kitty_graphics_capability_confirmed = true;
+        app.state.sidebar_card_shapes = true;
+        app.state.host_cell_size = cell();
+        app.state.sidebar_animation.row_motion = crate::config::SidebarRowMotion::Slide;
+        app.state.sidebar_animation.row_enter = crate::config::SidebarTokenEmphasis::Dissolve;
+        app.state.sidebar_animation.row_exit = crate::config::SidebarTokenEmphasis::Dissolve;
+
+        let now = std::time::Instant::now();
+        for ws_idx in [1usize, 2] {
+            app.state.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        for (ws_idx, tab, pane, name) in plan {
+            let terminal_id = app.state.workspaces[ws_idx].tabs[tab].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal");
+            terminal.set_agent_name(name);
+            terminal.state = crate::detect::AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some(format!("2nd-{}", ws_idx - 1)),
+                )]),
+                None,
+                now,
+            );
+        }
+        view(&mut app);
+        app
+    }
+
+    /// Publish the row membership the app loop would, optionally holding one
+    /// pane back so it is the only thing arriving on the pass after.
+    fn publish(
+        app: &mut crate::app::App,
+        now: std::time::Instant,
+        hold: Option<crate::layout::PaneId>,
+    ) {
+        let lifecycle = app.state.sidebar_row_lifecycle();
+        let rows: Vec<_> = crate::ui::sidebar_agent_live_entries(&app.state)
+            .iter()
+            .filter(|entry| Some(entry.pane_id) != hold)
+            .map(|entry| {
+                (
+                    crate::anim::ElementId::agent_row(entry.pane_id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.state
+            .anim
+            .observe(now, crate::anim::Family::AgentRow, &lifecycle, rows);
+        let spaces: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    crate::anim::ElementId::workspace_row(&workspace.id),
+                    crate::anim::behaviour::DriveInputs::default(),
+                )
+            })
+            .collect();
+        app.state
+            .anim
+            .observe(now, crate::anim::Family::WorkspaceRow, &lifecycle, spaces);
+    }
+
+    fn view(app: &mut crate::app::App) {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        crate::ui::compute_view_with_cell_size(&mut app.state, &runtimes, AREA, cell());
+    }
+
+    fn row(app: &crate::app::App, name: &str) -> crate::app::state::WorkspaceCardArea {
+        let entries = crate::ui::workspace_list_entries(&app.state);
+        let entry_idx = entries
+            .iter()
+            .position(|entry| {
+                crate::ui::sidebar_tree_handle(&app.state, entry).as_deref() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("{name} is not in the tree"));
+        *app.state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.entry_idx == entry_idx)
+            .unwrap_or_else(|| panic!("{name} was not laid out"))
+    }
+
+    /// Where a row is on screen, derived straight from the layout slot and the
+    /// published offset rather than through
+    /// [`crate::app::state::WorkspaceCardArea::drawn_rect`] — a test that aimed
+    /// with the function under test would pass however that function behaved.
+    fn drawn_y(card: &crate::app::state::WorkspaceCardArea) -> u16 {
+        u16::try_from(i32::from(card.rect.y) + card.motion_cells.1).expect("the row is on screen")
+    }
+
+    fn click(app: &mut crate::app::App, row: u16) {
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, row));
+    }
+
+    fn focus(app: &crate::app::App) -> (Option<usize>, usize) {
+        let ws_idx = app.state.active.unwrap_or(0);
+        (app.state.active, app.state.workspaces[ws_idx].active_tab)
+    }
+
+    /// A fleet settled, and the same fleet one frame into a row's arrival.
+    ///
+    /// `None` when this machine has no proportional face, which is the same skip
+    /// every other pixel-card test takes — without one no card is placed, so no
+    /// row ever moves and there is nothing here to assert.
+    fn settled_and_arriving() -> Option<(crate::app::App, crate::app::App)> {
+        let mut settled = sliding_fleet(4);
+        let now = std::time::Instant::now();
+        publish(&mut settled, now, None);
+        settled
+            .state
+            .anim
+            .advance(now + std::time::Duration::from_secs(2));
+        view(&mut settled);
+        if !settled.state.view.sidebar_card_layers_published {
+            return None;
+        }
+
+        let mut arriving = sliding_fleet(4);
+        // The newest pane is the one that enters at the head of its group.
+        let newest = arriving.state.workspaces[1]
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.keys())
+            .copied()
+            .max_by_key(|pane_id| pane_id.raw())
+            .expect("the fleet has worker panes");
+        publish(&mut arriving, now, Some(newest));
+        let settled_at = now + std::time::Duration::from_secs(2);
+        arriving.state.anim.advance(settled_at);
+        publish(&mut arriving, settled_at, None);
+        view(&mut arriving);
+        Some((settled, arriving))
+    }
+
+    #[test]
+    fn clicking_a_worker_mid_arrival_focuses_the_worker_it_is_drawn_on() {
+        let Some((mut settled, mut arriving)) = settled_and_arriving() else {
+            return;
+        };
+
+        let target = row(&settled, "w01");
+        assert_eq!(
+            target.motion_cells,
+            (0, 0),
+            "the control fleet is not settled"
+        );
+        click(&mut settled, target.rect.y + 1);
+        let want = focus(&settled);
+
+        let target = row(&arriving, "w01");
+        assert_ne!(
+            target.motion_cells.1, 0,
+            "no row moved, so this is not an arrival frame"
+        );
+        click(&mut arriving, drawn_y(&target) + 1);
+
+        assert_eq!(
+            focus(&arriving),
+            want,
+            "clicking a worker where it is drawn focused a different pane than clicking it at rest"
+        );
+    }
+
+    #[test]
+    fn a_departing_rows_slot_does_not_swallow_the_row_drawn_over_it() {
+        let mut app = sliding_fleet(3);
+        let now = std::time::Instant::now();
+        publish(&mut app, now, None);
+        app.state
+            .anim
+            .advance(now + std::time::Duration::from_secs(2));
+        view(&mut app);
+        if !app.state.view.sidebar_card_layers_published {
+            return;
+        }
+
+        // The last worker under the first second mate finishes: its pane closes,
+        // its row stays for the dismount, and the second mate below it is drawn
+        // up into the slot the departing row still owns in the layout.
+        let victim = row(&app, "w00").agent.expect("an agent row").pane_id;
+        app.state.sidebar_tree_row_memory = crate::ui::sidebar_agent_live_entries(&app.state);
+        app.state.workspaces[1].active_tab = 0;
+        app.state.workspaces[1].close_pane(victim);
+        app.state.active = Some(1);
+        let settled_at = now + std::time::Duration::from_secs(2);
+        publish(&mut app, settled_at, None);
+        app.state
+            .anim
+            .advance(settled_at + std::time::Duration::from_millis(250));
+        view(&mut app);
+
+        let mate = row(&app, "2nd-1");
+        assert_ne!(
+            mate.motion_cells.1, 0,
+            "the tree did not contract, so this is not a departure frame"
+        );
+        let before = focus(&app);
+        click(&mut app, drawn_y(&mate) + 1);
+
+        assert_ne!(
+            focus(&app),
+            before,
+            "clicking the second mate where it is drawn did nothing: the departing \
+             row's slot swallowed it"
+        );
+        assert_eq!(
+            app.state.active,
+            Some(2),
+            "the click landed somewhere other than the second mate it was aimed at"
+        );
+    }
+}
+
+/// **Every row navigates, whatever has focus now.** The captain's rule is *"any
+/// pane I click, I go there, regardless of where I am currently"*.
+///
+/// A Space row used to answer `FocusWorkspace`, and focusing the workspace you
+/// are already inside changes nothing — so clicking a second mate's row was a
+/// silent no-op for as long as any pane in that mate's Space had focus. It goes
+/// to the Space's own pane now, which is a navigation in both cases.
+#[cfg(test)]
+mod a_space_row_goes_to_its_own_pane {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    use super::super::{app_for_mouse_test, mouse};
+    use crate::workspace::Workspace;
+
+    /// A second mate Space whose first tab is its own pane, with `workers`
+    /// worker panes under it in tabs of their own.
+    fn mate_with_workers(workers: usize) -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        let mut mate = Workspace::test_new("2nd-a");
+        let mut plan = Vec::new();
+        for worker in 0..workers {
+            let tab = mate.test_add_tab(None);
+            plan.push((tab, mate.tabs[tab].root_pane, format!("worker-{worker}")));
+        }
+        app.state.workspaces = vec![Workspace::test_new("firstmate"), mate];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.state.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.state.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+        for (tab, pane, name) in plan {
+            let terminal_id = app.state.workspaces[1].tabs[tab].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal");
+            terminal.set_agent_name(name);
+            terminal.state = crate::detect::AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some("2nd-a".to_string()))]),
+                None,
+                now,
+            );
+        }
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 40));
+        app
+    }
+
+    fn mate_row(app: &crate::app::App) -> u16 {
+        let entries = crate::ui::workspace_list_entries(&app.state);
+        let entry_idx = entries
+            .iter()
+            .position(|entry| {
+                crate::ui::sidebar_tree_handle(&app.state, entry).as_deref() == Some("2nd-a")
+            })
+            .expect("the mate is in the tree");
+        app.state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.entry_idx == entry_idx)
+            .expect("the mate was laid out")
+            .rect
+            .y
+    }
+
+    #[test]
+    fn clicking_the_mate_row_from_another_space_still_goes_there() {
+        let mut app = mate_with_workers(3);
+        let row = mate_row(&app);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, row));
+
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(
+            app.state.workspaces[1].active_tab, 0,
+            "the mate's row goes to the mate's own tab"
+        );
+    }
+
+    /// The reported no-op: every worker under this mate lives in the same Space,
+    /// so focusing that Space again used to change nothing at all.
+    #[test]
+    fn clicking_the_mate_row_from_inside_its_own_space_goes_to_the_mate() {
+        for tab in 1..4usize {
+            let mut app = mate_with_workers(3);
+            app.state.active = Some(1);
+            app.state.workspaces[1].active_tab = tab;
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 40));
+            let row = mate_row(&app);
+
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, row));
+            app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, row));
+
+            assert_eq!(app.state.active, Some(1));
+            assert_eq!(
+                app.state.workspaces[1].active_tab, 0,
+                "clicking the mate's row from its own worker tab {tab} did not go to the mate"
+            );
+        }
     }
 }

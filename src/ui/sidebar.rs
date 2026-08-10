@@ -10686,8 +10686,7 @@ mod a_branch_line_meets_its_card_in_the_middle {
         app.kitty_graphics_enabled = true;
         app.kitty_graphics_capability_confirmed = true;
         app.sidebar_card_shapes = true;
-        app.sidebar_card_shapes = std::env::var("HERDR_SCRATCH_SHAPES").is_ok();
-        app.view.sidebar_card_layers_published = app.sidebar_card_shapes;
+        app.view.sidebar_card_layers_published = true;
         app.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 10,
             height_px: 11,

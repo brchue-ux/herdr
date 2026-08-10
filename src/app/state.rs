@@ -947,14 +947,17 @@ pub struct WorkspaceCardArea {
     /// rows are not moving on this host.
     ///
     /// Deliberately beside [`WorkspaceCardArea::rect`] rather than folded into
-    /// it. The layout stays the sole authority on where a row *is* — hit
-    /// testing, the wheel, the scrollbar and the workspace drop slots all read
-    /// `rect`, and moving it would make a click during a transition land on a
-    /// row the user is not pointing at. This is the drawing side of the same
-    /// row, and only the two renderers that draw it read it: the pixel card's
-    /// placement and the tree's connector rails beside it. Both take the number
-    /// from here rather than deriving it, because being attached to each other
-    /// is the whole point.
+    /// it, so the layout stays the sole authority on where a row *settles*.
+    /// Everything that answers "where is this row on screen right now" — both
+    /// renderers and every hit test — reads the two together through
+    /// [`Self::drawn_rect`] / [`Self::drawn`].
+    ///
+    /// This used to be documented as a drawing-only number that hit testing
+    /// deliberately ignored. That was the defect: a click during a reflow landed
+    /// on the row that *settles* under the cursor rather than the row drawn
+    /// there, which is a different row for as long as any arrival or departure
+    /// is playing. Both readers take the offset from here rather than deriving
+    /// it, because being attached to each other is the whole point.
     ///
     /// Stamped by [`crate::ui::sidebar::image_card::build_cards`], which is the
     /// one place the offset is resolved — see
@@ -972,6 +975,47 @@ pub struct WorkspaceCardArea {
 }
 
 impl WorkspaceCardArea {
+    /// One of this row's own rectangles, moved to where it is actually drawn.
+    ///
+    /// `rect` is anything laid out in the row's coordinates — the row itself,
+    /// its summary badge, its group chevron. `None` means the row owns no cells
+    /// on the panel at all right now, which is true in two cases and both of
+    /// them matter:
+    ///
+    /// - It is travelling *sideways* (`motion_cells.0 != 0`), so it is mid-slide
+    ///   across the panel's right margin and has not landed. The character
+    ///   renderer already declines to draw its rails for exactly this reason
+    ///   (see `render_card_border_rails`), and a hit test must decline for the
+    ///   same one — otherwise a departing row keeps swallowing clicks aimed at
+    ///   whatever row has moved up over its vacated slot.
+    /// - The offset would put it off the top of the screen.
+    ///
+    /// This is the one place [`Self::rect`] and [`Self::motion_cells`] are
+    /// combined, so a renderer and a hit test cannot end up a row apart.
+    pub fn drawn(&self, rect: Rect) -> Option<Rect> {
+        if self.motion_cells.0 != 0 {
+            return None;
+        }
+        let y = i32::from(rect.y).checked_add(self.motion_cells.1)?;
+        Some(Rect::new(
+            rect.x,
+            u16::try_from(y).ok()?,
+            rect.width,
+            rect.height,
+        ))
+    }
+
+    /// Where this whole row is drawn. See [`Self::drawn`].
+    pub fn drawn_rect(&self) -> Option<Rect> {
+        self.drawn(self.rect)
+    }
+
+    /// Whether this row is drawn over `row`.
+    pub fn drawn_covers_row(&self, row: u16) -> bool {
+        self.drawn_rect()
+            .is_some_and(|rect| row >= rect.y && row < rect.y.saturating_add(rect.height))
+    }
+
     /// The first row of this card that carries content rather than chrome.
     pub fn content_y(&self) -> u16 {
         self.card_frame
