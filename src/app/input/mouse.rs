@@ -872,6 +872,19 @@ impl AppState {
                     None => {
                         if let Some(press) = workspace_press {
                             self.mode = Mode::Terminal;
+                            // A Space row goes to the Space's *pane*, not merely
+                            // to the Space. Focusing a workspace you are already
+                            // in changes nothing, which made a click on a second
+                            // mate's row a silent no-op for as long as any pane
+                            // inside that mate had focus. Every row now navigates
+                            // whatever the current focus is — see
+                            // `AppState::workspace_home_pane`.
+                            if let Some(pane_id) = self.workspace_home_pane(press.ws_idx) {
+                                return Some(MouseAction::FocusPane {
+                                    ws_idx: press.ws_idx,
+                                    pane_id,
+                                });
+                            }
                             return Some(MouseAction::FocusWorkspace {
                                 ws_idx: press.ws_idx,
                             });

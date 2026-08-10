@@ -42,8 +42,8 @@ impl AppState {
         let agents = crate::ui::sidebar_agent_entries(self);
         cards.iter().find_map(|card| {
             let (owner, count) = crate::ui::worker_summary_badge(self, &entries, &agents, card)?;
-            rect_contains(crate::ui::worker_summary_badge_rect(card, count), col, row)
-                .then_some(owner)
+            let badge = card.drawn(crate::ui::worker_summary_badge_rect(card, count))?;
+            rect_contains(badge, col, row).then_some(owner)
         })
     }
 
