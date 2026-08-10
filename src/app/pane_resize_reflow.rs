@@ -91,9 +91,14 @@ impl GrowingTo {
 
 #[derive(Debug, Clone, Copy)]
 struct AxisReflow {
-    /// Last value actually handed to the runtime on this axis — the ground
-    /// truth this module resolves against, since it is also the only thing
-    /// that decides what the runtime is told next.
+    /// Last value this module handed the runtime on this axis.
+    ///
+    /// Deliberately *not* treated as the grid's real size: this module is not
+    /// the only thing that resizes a pane, so the two agree only until
+    /// something else writes the runtime. [`Self::resolve`] takes the grid's
+    /// own size alongside the target and plans from that instead; `current` is
+    /// only what tells it whether a flight in progress is still the one the
+    /// grid is actually flying.
     current: u16,
     /// Set while easing toward a larger value than `current`. Absent for a
     /// settled axis and never used for a shrink, which resolves in one step.
@@ -108,13 +113,24 @@ impl AxisReflow {
         }
     }
 
-    fn resolve(&mut self, target: u16, now: Instant) -> u16 {
+    /// The size this axis's grid should be this frame, given the layout wants
+    /// `target` and the grid is currently `actual`.
+    fn resolve(&mut self, target: u16, actual: u16, now: Instant) -> u16 {
+        // Settled where the layout still wants it. `actual` is deliberately
+        // ignored here: a grid that has drifted off a target that never moved
+        // was taken somewhere by something else — a direct terminal attach
+        // resizes the runtime to the attaching terminal while the layout
+        // stands still — and putting it back is a restoration, not a
+        // transition to pace.
         if self.growing.is_none() && self.current == target {
             return target;
         }
 
+        // A flight is worth continuing only while the grid is still where the
+        // flight left it. If it is not, something resized the pane underneath
+        // this module and the flight's starting premise is gone with it.
         if let Some(growing) = self.growing {
-            if growing.to == target {
+            if growing.to == target && actual == self.current {
                 if growing.finished(now) {
                     self.current = target;
                     self.growing = None;
@@ -126,11 +142,21 @@ impl AxisReflow {
             }
         }
 
-        // Either settled at a value that is no longer the target, or
-        // mid-flight toward a target that just moved: resolve fresh from
-        // wherever this axis is visibly sitting right now, never from
-        // history.
-        let from = self.current;
+        // Settled at a value that is no longer the target, mid-flight toward a
+        // target that just moved, or flying from a premise the grid has left:
+        // resolve fresh from where the grid *actually* is, never from what this
+        // module last handed out.
+        //
+        // The difference is the whole point. Every tab that is not the active
+        // one is resized straight to its final size on every frame by
+        // [`crate::ui::panes::resize_tab_panes`], which never comes through
+        // here, so a pane re-entered after the layout grew is usually already
+        // exactly the size the layout wants. Easing from the size it had when
+        // it was last on screen would reflow it *down* to that first — a shrink
+        // the layout never asked for — and walk it back up over the following
+        // frames.
+        let from = actual;
+        self.current = actual;
         if target <= from {
             // Shrinking (or exactly arrived): no safe range to ease through,
             // since the frame this resolves for is already drawn into a
@@ -174,7 +200,13 @@ pub(crate) struct PaneResizeReflow {
 
 impl PaneResizeReflow {
     /// The size a terminal's grid should actually be resized to *this frame*,
-    /// given the layout wants `target_rows`/`target_cols`.
+    /// given the layout wants `target_rows`/`target_cols` and the grid is
+    /// currently `grid_rows`/`grid_cols`.
+    ///
+    /// `grid_rows`/`grid_cols` are the runtime's own current size, not what
+    /// this module last handed out — the two disagree whenever something else
+    /// resized the pane, which the background-tab path does routinely. An ease
+    /// is only ever planned from the real one; see [`AxisReflow::resolve`].
     ///
     /// Rows and columns resolve independently, because one axis can grow
     /// while the other shrinks — a pane getting taller and narrower at once
@@ -189,15 +221,19 @@ impl PaneResizeReflow {
         terminal_id: TerminalId,
         target_rows: u16,
         target_cols: u16,
+        (grid_rows, grid_cols): (u16, u16),
         now: Instant,
     ) -> (u16, u16) {
+        // Seeded at the target rather than at the grid, so first sight settles
+        // there immediately: seeding from the grid would turn every pane's
+        // first layout pass into an animation of its own creation.
         let tracked = self.tracked.entry(terminal_id).or_insert(TrackedTerminal {
             rows: AxisReflow::new(target_rows),
             cols: AxisReflow::new(target_cols),
         });
         (
-            tracked.rows.resolve(target_rows, now),
-            tracked.cols.resolve(target_cols, now),
+            tracked.rows.resolve(target_rows, grid_rows, now),
+            tracked.cols.resolve(target_cols, grid_cols, now),
         )
     }
 
@@ -231,80 +267,120 @@ mod tests {
         TerminalId::alloc()
     }
 
+    /// One pane's runtime as the render pass sees it.
+    ///
+    /// Mirrors the real call shape: the grid handed to [`PaneResizeReflow::resolve`]
+    /// is the runtime's own size, which is whatever the last resolve resized it
+    /// to — until [`Self::resized_outside`] stands in for the background-tab
+    /// path writing the same runtime directly.
+    struct Pane {
+        reflow: PaneResizeReflow,
+        terminal: TerminalId,
+        grid: (u16, u16),
+    }
+
+    impl Pane {
+        fn new(grid_rows: u16, grid_cols: u16) -> Self {
+            Self {
+                reflow: PaneResizeReflow::default(),
+                terminal: id(),
+                grid: (grid_rows, grid_cols),
+            }
+        }
+
+        fn frame(&mut self, target_rows: u16, target_cols: u16, now: Instant) -> (u16, u16) {
+            let resolved = self.reflow.resolve(
+                self.terminal.clone(),
+                target_rows,
+                target_cols,
+                self.grid,
+                now,
+            );
+            self.grid = resolved;
+            resolved
+        }
+
+        /// The pane's runtime resized by something that never goes through
+        /// this module — `crate::ui::panes::resize_tab_panes`, in production.
+        fn resized_outside(&mut self, rows: u16, cols: u16) {
+            self.grid = (rows, cols);
+        }
+
+        fn next_deadline(&self, now: Instant) -> Option<Instant> {
+            self.reflow.next_deadline(now)
+        }
+    }
+
     #[test]
     fn a_terminal_seen_for_the_first_time_resolves_straight_to_target() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        assert_eq!(reflow.resolve(id(), 40, 100, now), (40, 100));
+        let mut pane = Pane::new(24, 80);
+        assert_eq!(pane.frame(40, 100, now), (40, 100));
     }
 
     #[test]
     fn growing_eases_rather_than_snapping() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 20, 100, now);
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
 
         // The very frame the target changes still resolves to the old size:
         // the ease begins on the *next* frame, not this one.
-        let first = reflow.resolve(terminal.clone(), 40, 100, now);
+        let first = pane.frame(40, 100, now);
         assert_eq!(first, (20, 100));
 
-        let mid = reflow.resolve(terminal.clone(), 40, 100, now + RESIZE_REFLOW_DURATION / 2);
+        let mid = pane.frame(40, 100, now + RESIZE_REFLOW_DURATION / 2);
         assert!(
             mid.0 > 20 && mid.0 < 40,
             "half-way through should sit strictly between old and new: {mid:?}"
         );
 
-        let done = reflow.resolve(terminal, 40, 100, now + RESIZE_REFLOW_DURATION);
+        let done = pane.frame(40, 100, now + RESIZE_REFLOW_DURATION);
         assert_eq!(done, (40, 100));
     }
 
     #[test]
     fn shrinking_snaps_immediately_never_overshooting_the_new_smaller_bound() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 40, 100, now);
+        let mut pane = Pane::new(40, 100);
+        pane.frame(40, 100, now);
 
         // A shrink resolves to its target on the very frame it is issued —
         // never a size larger than the target, which is the one thing that
         // would draw past a buffer already sized to it.
-        let shrunk = reflow.resolve(terminal.clone(), 20, 100, now);
+        let shrunk = pane.frame(20, 100, now);
         assert_eq!(shrunk, (20, 100));
-        assert_eq!(reflow.next_deadline(now), None);
+        assert_eq!(pane.next_deadline(now), None);
     }
 
     #[test]
     fn one_axis_can_grow_while_the_other_shrinks() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 20, 100, now);
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
 
         // Rows grow (20 -> 40), columns shrink (100 -> 50): each axis must
         // follow its own rule independently.
-        let first = reflow.resolve(terminal, 40, 50, now);
+        let first = pane.frame(40, 50, now);
         assert_eq!(first, (20, 50), "rows still easing, cols already snapped");
     }
 
     #[test]
     fn a_retarget_mid_growth_restarts_from_where_it_visibly_is() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 20, 100, now);
-        reflow.resolve(terminal.clone(), 40, 100, now);
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
+        pane.frame(40, 100, now);
 
         let partway = now + RESIZE_REFLOW_DURATION / 2;
-        let visible_before_retarget = reflow.resolve(terminal.clone(), 40, 100, partway);
+        let visible_before_retarget = pane.frame(40, 100, partway);
         assert!(visible_before_retarget.0 < 40);
 
         // The target grows again before the first ease finished. The very
         // next resolve must not jump back to 20 (the original start) or snap
         // straight to the new target — it has to continue from what was just
         // visible.
-        let just_after_retarget = reflow.resolve(terminal, 50, 100, partway);
+        let just_after_retarget = pane.frame(50, 100, partway);
         assert_eq!(
             just_after_retarget, visible_before_retarget,
             "a retarget must not move the pane on the frame it is issued"
@@ -314,26 +390,25 @@ mod tests {
     #[test]
     fn next_deadline_is_armed_only_while_something_is_growing() {
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        assert_eq!(reflow.next_deadline(now), None);
+        let mut pane = Pane::new(20, 100);
+        assert_eq!(pane.next_deadline(now), None);
 
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 20, 100, now);
+        pane.frame(20, 100, now);
         assert_eq!(
-            reflow.next_deadline(now),
+            pane.next_deadline(now),
             None,
             "first sight of a terminal settles immediately; nothing to wake for"
         );
 
-        reflow.resolve(terminal.clone(), 40, 100, now);
+        pane.frame(40, 100, now);
         assert_eq!(
-            reflow.next_deadline(now),
+            pane.next_deadline(now),
             Some(now + RESIZE_REFLOW_FRAME_INTERVAL)
         );
 
-        reflow.resolve(terminal, 40, 100, now + RESIZE_REFLOW_DURATION);
+        pane.frame(40, 100, now + RESIZE_REFLOW_DURATION);
         assert_eq!(
-            reflow.next_deadline(now + RESIZE_REFLOW_DURATION),
+            pane.next_deadline(now + RESIZE_REFLOW_DURATION),
             None,
             "settled again; the loop should stop waking for this terminal"
         );
@@ -345,19 +420,109 @@ mod tests {
         // actually depends on: at no point in a growth ease may the
         // resolved value be larger than the target it is easing toward.
         let now = Instant::now();
-        let mut reflow = PaneResizeReflow::default();
-        let terminal = id();
-        reflow.resolve(terminal.clone(), 10, 10, now);
-        reflow.resolve(terminal.clone(), 90, 90, now);
+        let mut pane = Pane::new(10, 10);
+        pane.frame(10, 10, now);
+        pane.frame(90, 90, now);
 
         let mut t = Duration::ZERO;
         while t <= RESIZE_REFLOW_DURATION {
-            let (rows, cols) = reflow.resolve(terminal.clone(), 90, 90, now + t);
+            let (rows, cols) = pane.frame(90, 90, now + t);
             assert!(
                 rows <= 90 && cols <= 90,
                 "overshot at {t:?}: ({rows}, {cols})"
             );
             t += RESIZE_REFLOW_FRAME_INTERVAL;
         }
+    }
+
+    #[test]
+    fn a_pane_resized_while_backgrounded_is_never_shrunk_back_to_its_remembered_size() {
+        // The bug this guards: a pane last seen at 19 rows is resized to 49 by
+        // the background-tab path while its tab is off screen, so entering the
+        // tab again finds a grid that is already exactly what the layout wants.
+        // Easing from the remembered 19 would resize it back down first, and
+        // ghostty-vt would reflow the pane's whole scrollback into 19 rows —
+        // which draws the pane's live output pinned to the top of a 49-row
+        // rect with a blank tail below it, then walks it back down.
+        let now = Instant::now();
+        let mut pane = Pane::new(19, 90);
+        pane.frame(19, 90, now);
+
+        pane.resized_outside(49, 90);
+
+        assert_eq!(
+            pane.frame(49, 90, now),
+            (49, 90),
+            "a grid already at the target must be left exactly where it is"
+        );
+        assert_eq!(
+            pane.next_deadline(now),
+            None,
+            "nothing was reflowed, so nothing should be waking the loop to finish it"
+        );
+    }
+
+    #[test]
+    fn an_outside_resize_mid_ease_is_adopted_rather_than_eased_away_from() {
+        // Same collision, caught mid-flight: switching away from a pane that is
+        // still easing leaves this module holding an intermediate size, and the
+        // background path immediately snaps the runtime to the full one.
+        let now = Instant::now();
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
+        pane.frame(60, 100, now);
+
+        let partway = pane.frame(60, 100, now + RESIZE_REFLOW_DURATION / 2);
+        assert!(partway.0 > 20 && partway.0 < 60);
+
+        pane.resized_outside(60, 100);
+
+        assert_eq!(
+            pane.frame(60, 100, now + RESIZE_REFLOW_DURATION / 2),
+            (60, 100),
+            "the flight was planned from a size the grid has left; reality wins"
+        );
+    }
+
+    #[test]
+    fn a_grid_moved_off_a_target_that_never_changed_is_restored_in_one_step() {
+        // A direct terminal attach resizes the runtime to the attaching
+        // terminal's size while the layout stands still. Releasing it puts the
+        // pane back where the layout always wanted it, which is a restoration
+        // and not a transition — `terminal_attach_disconnect_restores_app_pane_size`
+        // in the headless server depends on it landing on the frame the lock is
+        // released.
+        let now = Instant::now();
+        let mut pane = Pane::new(39, 93);
+        pane.frame(39, 93, now);
+
+        pane.resized_outside(24, 80);
+
+        assert_eq!(pane.frame(39, 93, now), (39, 93));
+        assert_eq!(pane.next_deadline(now), None);
+    }
+
+    #[test]
+    fn a_grid_genuinely_behind_its_target_still_eases() {
+        // The counterpart the fix must not break: when the runtime really is
+        // smaller than the layout wants, the reflow this module exists to pace
+        // is still ahead of it, so it still eases.
+        let now = Instant::now();
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
+
+        pane.resized_outside(24, 100);
+
+        let first = pane.frame(60, 100, now);
+        assert_eq!(
+            first,
+            (24, 100),
+            "eases from the grid's real size, not the remembered one"
+        );
+        assert_eq!(
+            pane.next_deadline(now),
+            Some(now + RESIZE_REFLOW_FRAME_INTERVAL)
+        );
+        assert_eq!(pane.frame(60, 100, now + RESIZE_REFLOW_DURATION), (60, 100));
     }
 }

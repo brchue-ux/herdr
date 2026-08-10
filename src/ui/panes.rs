@@ -143,6 +143,18 @@ fn runtime_for_tab_pane<'a>(
         .map(|runtime| (terminal_id, runtime))
 }
 
+/// What a pane's runtime needs resized this frame, and what it is sized to now.
+///
+/// Both come off the same runtime borrow, because resolving the resize needs
+/// `&mut AppState` and so cannot hold one. `grid` is what keeps
+/// [`crate::app::pane_resize_reflow`] honest about panes something else already
+/// resized — every tab that is not the active one, on every frame.
+#[derive(Clone, Copy)]
+struct PaneResizePlan {
+    target: (u16, u16),
+    grid: (u16, u16),
+}
+
 fn stable_scrollbar_gutter(
     rt: &TerminalRuntime,
     pane_inner: Rect,
@@ -242,21 +254,26 @@ pub(super) fn compute_pane_infos(
         let pane_inner = pane_inner_rect(area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
-        let mut resize_target: Option<(u16, u16)> = None;
+        let mut resize_plan: Option<PaneResizePlan> = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            resize_target = Some((inner_rect.height, inner_rect.width));
+            resize_plan = Some(PaneResizePlan {
+                target: (inner_rect.height, inner_rect.width),
+                grid: rt.current_size(),
+            });
         }
         let locked_terminal_id = ws.terminal_id(focused_id).cloned();
-        if let (true, Some((target_rows, target_cols)), Some(terminal_id)) =
-            (resize_panes, resize_target, locked_terminal_id)
+        if let (true, Some(plan), Some(terminal_id)) =
+            (resize_panes, resize_plan, locked_terminal_id)
         {
             if !app.direct_attach_resize_locks.contains(&terminal_id) {
+                let (target_rows, target_cols) = plan.target;
                 let (eased_rows, eased_cols) = app.pane_resize_reflow.resolve(
                     terminal_id,
                     target_rows,
                     target_cols,
+                    plan.grid,
                     std::time::Instant::now(),
                 );
                 if let Some(rt) =
@@ -290,21 +307,26 @@ pub(super) fn compute_pane_infos(
 
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
-        let mut resize_target: Option<(u16, u16)> = None;
+        let mut resize_plan: Option<PaneResizePlan> = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            resize_target = Some((inner_rect.height, inner_rect.width));
+            resize_plan = Some(PaneResizePlan {
+                target: (inner_rect.height, inner_rect.width),
+                grid: rt.current_size(),
+            });
         }
         let locked_terminal_id = ws.terminal_id(info.id).cloned();
-        if let (true, Some((target_rows, target_cols)), Some(terminal_id)) =
-            (resize_panes, resize_target, locked_terminal_id)
+        if let (true, Some(plan), Some(terminal_id)) =
+            (resize_panes, resize_plan, locked_terminal_id)
         {
             if !app.direct_attach_resize_locks.contains(&terminal_id) {
+                let (target_rows, target_cols) = plan.target;
                 let (eased_rows, eased_cols) = app.pane_resize_reflow.resolve(
                     terminal_id,
                     target_rows,
                     target_cols,
+                    plan.grid,
                     std::time::Instant::now(),
                 );
                 if let Some(rt) =
@@ -1473,5 +1495,100 @@ mod tests {
             panic!("selection background should resolve to rgb");
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
+    }
+
+    /// A pane resized while its workspace was off screen must come back the
+    /// size it already is — not be shrunk to the size it had when it was last
+    /// on screen and then reflowed back up.
+    ///
+    /// The shrink is what the captain sees as a pane's output "force scrolled
+    /// to the top": `GhosttyPaneTerminal::render` draws the grid's rows
+    /// top-aligned into the pane's rect, so a grid reflowed down to 19 rows
+    /// inside a 49-row rect puts the pane's newest output near the top with a
+    /// blank tail under it.
+    ///
+    /// Deliberately asserted a frame at a time with no sleeping: the collapse
+    /// happens on the very frame the workspace is re-entered, because a growth
+    /// resolves to its starting size before it eases anywhere.
+    #[tokio::test]
+    async fn re_entering_a_workspace_does_not_shrink_a_pane_already_at_its_target() {
+        fn seeded_runtime() -> TerminalRuntime {
+            let mut bytes = Vec::new();
+            for line in 0..300 {
+                bytes.extend_from_slice(format!("line {line:04} out\r\n").as_bytes());
+            }
+            TerminalRuntime::test_with_scrollback_bytes(90, 18, 1 << 20, &bytes)
+        }
+
+        // Registered in the real registry under the workspace's own terminal
+        // id, so the active-tab path and the background-tab path resolve to the
+        // same runtime exactly as they do in production.
+        fn workspace(
+            name: &str,
+            runtimes: &mut TerminalRuntimeRegistry,
+        ) -> crate::workspace::Workspace {
+            let ws = crate::workspace::Workspace::test_new(name);
+            let pane_id = ws.tabs[0].root_pane;
+            let terminal_id = ws.tabs[0]
+                .terminal_id(pane_id)
+                .expect("terminal id")
+                .clone();
+            runtimes.insert(terminal_id, seeded_runtime());
+            ws
+        }
+
+        fn grid_rows(app: &AppState, runtimes: &TerminalRuntimeRegistry, ws_idx: usize) -> u16 {
+            let pane_id = app.workspaces[ws_idx].tabs[0].root_pane;
+            app.runtime_for_pane_in_workspace(runtimes, ws_idx, pane_id)
+                .expect("runtime")
+                .current_size()
+                .0
+        }
+
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            workspace("alpha", &mut runtimes),
+            workspace("beta", &mut runtimes),
+        ];
+        let runtimes = runtimes;
+
+        let short = Rect::new(0, 0, 120, 20);
+        let tall = Rect::new(0, 0, 120, 50);
+
+        // Alpha settles at the short geometry while it is on screen.
+        app.active = Some(0);
+        app.selected = 0;
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, short);
+        let settled_short = grid_rows(&app, &runtimes, 0);
+
+        // Switch to beta, then the host terminal grows. Alpha is backgrounded,
+        // so the background-tab path resizes its runtime straight to the tall
+        // geometry without going through the resize-reflow.
+        app.active = Some(1);
+        app.selected = 1;
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, short);
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, tall);
+        let backgrounded = grid_rows(&app, &runtimes, 0);
+        assert!(
+            backgrounded > settled_short,
+            "the background path should have grown alpha's grid: {settled_short} -> {backgrounded}"
+        );
+
+        // Go back into alpha.
+        app.active = Some(0);
+        app.selected = 0;
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, tall);
+
+        assert_eq!(
+            grid_rows(&app, &runtimes, 0),
+            backgrounded,
+            "re-entry must not reflow alpha's grid back down to its remembered size"
+        );
+        let info = app.view.pane_infos.first().expect("pane info");
+        assert_eq!(
+            info.inner_rect.height, backgrounded,
+            "and the pane must be drawn over its whole rect, not just the top of it"
+        );
     }
 }
