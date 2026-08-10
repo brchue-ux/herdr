@@ -4360,6 +4360,11 @@ impl HeadlessServer {
             let wants_client_rasterized_cards = client.wants_client_rasterized_cards;
             let wants_client_rasterized_signal_tray = client.wants_client_rasterized_signal_tray;
             let embedded_surfaces = client.embedded_surfaces();
+            let composed = if self.app.state.pixel_text_panes_active() {
+                client.renderer.rendered_buffer()
+            } else {
+                None
+            };
             if is_app_client && self.app.state.host_paints_pixel_surfaces() && cell_size.is_known()
             {
                 if graphics_surface_reset_pending {
@@ -4375,6 +4380,11 @@ impl HeadlessServer {
                         cell_size,
                         &mut next_graphics_cache,
                         embedded_surfaces,
+                        // The frame this client's own pass just composed, which
+                        // a re-presented pane is rasterised from. Read only
+                        // while `pixel_text_panes` is on — see
+                        // `crate::grid_raster`.
+                        composed,
                     ));
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
             } else {

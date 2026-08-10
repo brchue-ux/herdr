@@ -1106,6 +1106,38 @@ pub struct ExperimentalConfig {
     ///
     /// Only read while `kitty_graphics` is on.
     pub kitty_graphics_local_transport: bool,
+    /// Re-present each visible pane as pixels: rasterise the character grid
+    /// herdr already owns and composite it over the pane at `z = 0`, instead of
+    /// leaving the host terminal to set the text in its own font. Default:
+    /// false.
+    ///
+    /// This is the one image band a terminal cannot get wrong by drawing it in
+    /// the wrong order — a surface that already contains the text cannot hide
+    /// it — so unlike `sidebar_particle_field` and `persistent_background` it
+    /// carries no host-terminal allowlist. See `src/grid_raster/`.
+    ///
+    /// The costs are real and accepted: every changed frame crosses the wire as
+    /// pixels, the retained-PTY fast path stops applying to a re-presented
+    /// pane, and the text is set in whatever face `pixel_text_font` names
+    /// rather than in the host terminal's own.
+    ///
+    /// The characters are still written underneath the image, so a terminal
+    /// that ignores the placement degrades to a normal text pane.
+    ///
+    /// Only read while `kitty_graphics` is on.
+    pub pixel_text_panes: bool,
+    /// Path to a monospaced `.ttf`/`.otf` that `pixel_text_panes` sets pane
+    /// text in. Empty means search the usual system font directories.
+    ///
+    /// Herdr cannot ask the host terminal which font file it opened, so this is
+    /// the only way to make a re-presented pane match the surrounding terminal
+    /// exactly: point it at the same file the terminal is configured with. The
+    /// search is a fallback that keeps the feature working, not a claim that it
+    /// found the right face.
+    ///
+    /// Only read while `kitty_graphics` and `pixel_text_panes` are on, and only
+    /// at startup.
+    pub pixel_text_font: String,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when

@@ -202,6 +202,17 @@ enum HostSurfaceId {
     /// itself so the (rarely regenerated) ambient loop and the (regenerated only while something
     /// is live) overlay never have to share one upload/caching lifecycle.
     BackgroundEffects,
+    /// A pane's own character grid, rasterised by Herdr and composited back
+    /// over the pane at `z = 0` (`src/grid_raster/`).
+    ///
+    /// A separate identity from [`Self::Pane`] for the same reason
+    /// [`Self::SidebarCards`] is separate from [`Self::Sidebar`]: the two have
+    /// different owners. `Pane` is whatever an API client published onto the
+    /// pane, and this is Herdr re-presenting the pane's own text. Sharing one
+    /// identity would make a client's pane image and the re-presented text
+    /// silently evict each other, and a client drawing *over* a re-presented
+    /// pane is exactly the case that has to keep working.
+    PaneText(PaneId),
 }
 
 impl HostSurfaceId {
@@ -220,6 +231,10 @@ impl HostSurfaceId {
             Self::SidebarParticleField => "surface.sidebar.particle-field".hash(hasher),
             Self::BackgroundScene => "surface.background.scene".hash(hasher),
             Self::BackgroundEffects => "surface.background.effects".hash(hasher),
+            Self::PaneText(pane_id) => {
+                "surface.pane.text".hash(hasher);
+                pane_id.raw().hash(hasher);
+            }
         }
     }
 }
@@ -703,6 +718,7 @@ pub(crate) fn paint_local_pane_graphics(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
+    composed: Option<&ratatui::buffer::Buffer>,
 ) -> io::Result<()> {
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let mut bytes = Vec::new();
@@ -714,6 +730,7 @@ pub(crate) fn paint_local_pane_graphics(
             cell_size,
             &mut cache,
             EmbeddedSurfaces::ALL,
+            composed,
         );
     }
     if bytes.is_empty() {
@@ -737,6 +754,7 @@ pub(crate) fn encode_local_pane_graphics(
     cell_size: HostCellSize,
     cache: &mut HostGraphicsCache,
     embedded: EmbeddedSurfaces,
+    composed: Option<&ratatui::buffer::Buffer>,
 ) -> Vec<u8> {
     let occlusion = crate::ui::overlay_occlusion(app);
     let mode_ok = occlusion != crate::ui::OverlayOcclusion::Screen;
@@ -771,6 +789,7 @@ pub(crate) fn encode_local_pane_graphics(
         &cache.images,
         embedded,
         occlusion,
+        composed,
     );
     tracing::debug!(
         placements_collected = placements.len(),
@@ -1250,6 +1269,7 @@ fn collect_visible_placements(
     uploaded_images: &HashMap<u32, ImageSignature>,
     embedded: EmbeddedSurfaces,
     occlusion: crate::ui::OverlayOcclusion,
+    composed: Option<&ratatui::buffer::Buffer>,
 ) -> Vec<HostPlacement> {
     let mut placements = Vec::new();
 
@@ -1304,6 +1324,24 @@ fn collect_visible_placements(
         "collect_visible_placements: starting iteration"
     );
     for info in surface.pane_infos {
+        // Herdr's own re-presentation of the pane's text, below any image a
+        // client published onto the same pane: a client painting over a
+        // re-presented pane has to land on top, which is the order these two
+        // are pushed in.
+        if let Some(layer) = pane_text_layer(app, info.inner_rect, composed) {
+            let placement = layer_host_placement(
+                HostSurfaceId::PaneText(info.id),
+                info.inner_rect,
+                cell_size,
+                &layer,
+                uploaded_images,
+                true,
+            );
+            if !hidden_by_overlay(&placement) {
+                placements.push(placement);
+            }
+        }
+
         if let Some(layer) = app.pane_graphics_layers.get(&info.id) {
             let placement = layer_host_placement(
                 HostSurfaceId::Pane(info.id),
@@ -1359,6 +1397,63 @@ fn collect_visible_placements(
         "collect_visible_placements: done"
     );
     placements
+}
+
+/// The pane's own text, rasterised into a layer to be composited back over it.
+///
+/// `None` — and so an ordinary text pane — whenever any of the four things this
+/// needs is missing: the feature is off, this pass has no composed buffer to
+/// read (the caller renders straight to a device rather than to a `Buffer`),
+/// the pane is empty, or the machine has no monospaced face to set the text in.
+/// Each is a reason to leave the pane alone, not to publish a broken surface.
+///
+/// The buffer read here is the one this frame just composed, so the pixels
+/// inherit the selection highlight, the copy-mode search highlights, the
+/// inactive-pane dimming and the cursor that [`crate::ui::panes`] already
+/// applied to those cells — see the module doc on [`crate::grid_raster`].
+///
+/// **This is per-pane, per-frame work at native resolution**, which is the
+/// accepted cost of the feature rather than an oversight: the flag is off by
+/// default and the whole body is skipped by one bool when it is. Note what is
+/// *not* skipped once it is on — the raster is recomputed every pass even when
+/// the pane has not changed, and only the *upload* is then suppressed by
+/// `uploaded_images` finding an identical signature. Memoising the raster
+/// itself against the buffer region is the obvious next optimisation and is
+/// deliberately not in this slice.
+fn pane_text_layer(
+    app: &AppState,
+    area: Rect,
+    composed: Option<&ratatui::buffer::Buffer>,
+) -> Option<crate::app::state::GraphicsLayer> {
+    if !app.pixel_text_panes_active() {
+        return None;
+    }
+    let composed = composed?;
+    let cell_size = app.host_cell_size;
+    let raster = crate::grid_raster::rasterise_region(
+        composed,
+        area,
+        cell_size.width_px,
+        cell_size.height_px,
+        &app.host_terminal_theme,
+        app.pixel_text_font.as_deref(),
+    )?;
+    Some(crate::app::state::GraphicsLayer::new(
+        crate::api::schema::PaneGraphicsFormat::Rgba,
+        raster.width,
+        raster.height,
+        raster.rgba,
+        crate::api::schema::PaneGraphicsPlacementParams {
+            viewport_col: 0,
+            viewport_row: 0,
+            grid_cols: u32::from(area.width),
+            grid_rows: u32::from(area.height),
+            // The whole point of the route: `z = 0` draws over the cell's text,
+            // which is the one band a terminal cannot render in the wrong order
+            // relative to the glyphs, because the glyphs are in the image.
+            z: 0,
+        },
+    ))
 }
 
 /// Every non-pane rect that currently carries an image layer.
@@ -2359,6 +2454,308 @@ mod tests {
         }
     }
 
+    // ---- pixel text panes -------------------------------------------
+
+    /// One pane occupying `rect`, with no borders, as the placement path sees
+    /// it.
+    fn pane_info_at(id: PaneId, rect: Rect) -> crate::layout::PaneInfo {
+        crate::layout::PaneInfo {
+            id,
+            rect,
+            inner_rect: rect,
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }
+    }
+
+    /// An `AppState` with a live workspace and one pane, ready to have its
+    /// text re-presented. The pane walk in `collect_visible_placements` is
+    /// gated on an active workspace *and* an active tab, so both have to be
+    /// real here rather than stubbed.
+    fn app_with_pixel_text_pane(enabled: bool) -> (AppState, PaneId) {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.kitty_graphics_enabled = true;
+        app.pixel_text_panes_enabled = enabled;
+        app.host_cell_size = test_cell_size();
+        let workspace = crate::workspace::Workspace::test_new("pixel-text");
+        let pane_id = workspace
+            .active_tab()
+            .map(|tab| tab.root_pane)
+            .unwrap_or_else(|| PaneId::from_raw(1));
+        app.workspaces.push(workspace);
+        app.active = Some(0);
+        (app, pane_id)
+    }
+
+    /// A composed frame with readable text in the pane's rect.
+    fn composed_frame(area: Rect, text: &str) -> ratatui::buffer::Buffer {
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        for (index, ch) in text.chars().enumerate() {
+            let Ok(x) = u16::try_from(index) else { break };
+            if x >= area.width {
+                break;
+            }
+            if let Some(cell) = buffer.cell_mut((area.x + x, area.y)) {
+                cell.set_symbol(&ch.to_string());
+            }
+        }
+        buffer
+    }
+
+    /// The claim the whole route rests on: a re-presented pane reaches the
+    /// terminal as an image in the one band a terminal cannot draw in the wrong
+    /// order relative to the glyphs — `z = 0`, over the text — rather than in
+    /// the negative band the background scene has to use.
+    #[test]
+    fn a_re_presented_pane_is_placed_over_the_text_at_z_zero() {
+        if crate::grid_raster::font::all_available_faces().is_empty() {
+            return;
+        }
+        let rect = Rect::new(0, 0, 8, 2);
+        let (app, pane_id) = app_with_pixel_text_pane(true);
+        let panes = [pane_info_at(pane_id, rect)];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+        let composed = composed_frame(rect, "herdr");
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface,
+            test_cell_size(),
+            &HashMap::new(),
+            EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
+            Some(&composed),
+        );
+
+        let text = placements
+            .iter()
+            .find(|placement| placement.surface == HostSurfaceId::PaneText(pane_id))
+            .expect("the pane's own text should be published as a layer");
+        assert_eq!(
+            text.placement.z, 0,
+            "z=0 is the band that composites over the glyphs; a negative band is the one \
+             terminals get wrong"
+        );
+        assert_eq!(text.area, rect);
+        assert_eq!(
+            text.placement.data.len(),
+            (8 * 10) * (2 * 10) * 4,
+            "the surface should be the pane's cells at the host cell size, RGBA8"
+        );
+    }
+
+    /// The feature is off by default, and off has to mean *no* placement rather
+    /// than an empty one — an empty layer would still cost an upload and an id.
+    #[test]
+    fn a_pane_is_left_as_text_when_the_flag_is_off() {
+        let rect = Rect::new(0, 0, 8, 2);
+        let (app, pane_id) = app_with_pixel_text_pane(false);
+        let panes = [pane_info_at(pane_id, rect)];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+        let composed = composed_frame(rect, "herdr");
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface,
+            test_cell_size(),
+            &HashMap::new(),
+            EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
+            Some(&composed),
+        );
+        assert!(
+            !placements
+                .iter()
+                .any(|placement| matches!(placement.surface, HostSurfaceId::PaneText(_))),
+            "no pane-text layer should exist while the flag is off"
+        );
+    }
+
+    /// A pass with no composed frame — the retained graphics path — must leave
+    /// the pane alone rather than publish a blank surface over its text.
+    #[test]
+    fn a_pass_without_a_composed_frame_publishes_no_pane_text() {
+        let rect = Rect::new(0, 0, 8, 2);
+        let (app, pane_id) = app_with_pixel_text_pane(true);
+        let panes = [pane_info_at(pane_id, rect)];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface,
+            test_cell_size(),
+            &HashMap::new(),
+            EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
+            None,
+        );
+        assert!(
+            !placements
+                .iter()
+                .any(|placement| matches!(placement.surface, HostSurfaceId::PaneText(_))),
+            "without a frame to rasterise there is nothing honest to publish"
+        );
+    }
+
+    /// A client's own pane image and Herdr's re-presentation of the pane's text
+    /// are two separate surfaces, and the client's has to land on top — a
+    /// client painting over a re-presented pane is the case that has to keep
+    /// working. Sharing one identity would make them evict each other instead.
+    #[test]
+    fn a_client_pane_image_and_the_re_presented_text_are_separate_and_ordered() {
+        if crate::grid_raster::font::all_available_faces().is_empty() {
+            return;
+        }
+        let rect = Rect::new(0, 0, 8, 2);
+        let (mut app, pane_id) = app_with_pixel_text_pane(true);
+        app.pane_graphics_layers.insert(
+            pane_id,
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                80,
+                20,
+                vec![9; 80 * 20 * 4],
+                crate::api::schema::PaneGraphicsPlacementParams::default(),
+            ),
+        );
+        let panes = [pane_info_at(pane_id, rect)];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+        let composed = composed_frame(rect, "herdr");
+
+        let placements = collect_visible_placements(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface,
+            test_cell_size(),
+            &HashMap::new(),
+            EmbeddedSurfaces::ALL,
+            crate::ui::OverlayOcclusion::None,
+            Some(&composed),
+        );
+
+        let text_at = placements
+            .iter()
+            .position(|placement| placement.surface == HostSurfaceId::PaneText(pane_id))
+            .expect("re-presented text");
+        let client_at = placements
+            .iter()
+            .position(|placement| placement.surface == HostSurfaceId::Pane(pane_id))
+            .expect("the client's own pane image");
+        assert!(
+            text_at < client_at,
+            "the client's image is published after the text so it composites above it"
+        );
+        assert_ne!(
+            layer_host_image_id(HostSurfaceId::PaneText(pane_id)),
+            layer_host_image_id(HostSurfaceId::Pane(pane_id)),
+            "sharing a host image id would let each silently replace the other"
+        );
+    }
+
+    /// Re-presented pixels have to dedup like every other layer, or an idle
+    /// pane re-uploads its whole surface every frame forever. The rasteriser is
+    /// deterministic precisely so this signature can match.
+    #[test]
+    fn an_unchanged_pane_does_not_re_upload_its_pixels() {
+        if crate::grid_raster::font::all_available_faces().is_empty() {
+            return;
+        }
+        let rect = Rect::new(0, 0, 8, 2);
+        let (app, pane_id) = app_with_pixel_text_pane(true);
+        let panes = [pane_info_at(pane_id, rect)];
+        let composed = composed_frame(rect, "herdr");
+        let surface = || crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+
+        let mut cache = HostGraphicsCache::default();
+        let first = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface(),
+            test_cell_size(),
+            &mut cache,
+            EmbeddedSurfaces::ALL,
+            Some(&composed),
+        );
+        assert!(
+            String::from_utf8_lossy(&first).contains("a=t"),
+            "the first pass has to transmit the pixels"
+        );
+
+        let second = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface(),
+            test_cell_size(),
+            &mut cache,
+            EmbeddedSurfaces::ALL,
+            Some(&composed),
+        );
+        assert!(
+            !String::from_utf8_lossy(&second).contains("a=t"),
+            "an identical frame must not cross the wire twice"
+        );
+    }
+
+    /// And the other half of that: changed text *does* re-upload, or the pane
+    /// freezes at whatever it first showed.
+    #[test]
+    fn changed_text_re_uploads_the_pane() {
+        if crate::grid_raster::font::all_available_faces().is_empty() {
+            return;
+        }
+        let rect = Rect::new(0, 0, 8, 2);
+        let (app, pane_id) = app_with_pixel_text_pane(true);
+        let panes = [pane_info_at(pane_id, rect)];
+        let surface = || crate::ui::TabSurfaceView {
+            pane_infos: &panes,
+            split_borders: &[],
+        };
+
+        let mut cache = HostGraphicsCache::default();
+        let _ = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface(),
+            test_cell_size(),
+            &mut cache,
+            EmbeddedSurfaces::ALL,
+            Some(&composed_frame(rect, "herdr")),
+        );
+        let changed = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            surface(),
+            test_cell_size(),
+            &mut cache,
+            EmbeddedSurfaces::ALL,
+            Some(&composed_frame(rect, "moved")),
+        );
+        assert!(
+            String::from_utf8_lossy(&changed).contains("a=t"),
+            "new text has to reach the terminal"
+        );
+    }
+
     /// The client's own bytes are the server's own bytes.
     ///
     /// Moving a surface across the boundary is only safe if what reaches the
@@ -2398,6 +2795,7 @@ mod tests {
             cell,
             &mut server_cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         assert!(
             !embedded.is_empty(),
@@ -2625,6 +3023,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
 
         assert_eq!(placements.len(), 1);
@@ -2661,6 +3060,7 @@ mod tests {
                 &HashMap::new(),
                 EmbeddedSurfaces::ALL,
                 crate::ui::overlay_occlusion(app),
+                None,
             )
             .into_iter()
             .map(|placement| placement.surface)
@@ -2739,6 +3139,7 @@ mod tests {
                 test_cell_size(),
                 &mut HostGraphicsCache::default(),
                 EmbeddedSurfaces::ALL,
+                None,
             )
             .is_empty(),
             "an unbounded overlay must still withhold every surface"
@@ -2766,6 +3167,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("visible sidebar layer");
 
@@ -2806,6 +3208,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
         let (clipped, _) = clipped_placement(&placements[0]).expect("a card part-way in");
         assert_eq!((clipped.x, clipped.y), (18, 3));
@@ -2833,6 +3236,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
         assert!(
             clipped_placement(&placements[0]).is_none(),
@@ -2856,6 +3260,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
 
         assert_eq!(placements.len(), 1, "the layer is still stored");
@@ -2895,6 +3300,7 @@ mod tests {
                 test_cell_size(),
                 &mut cache,
                 EmbeddedSurfaces::ALL,
+                None,
             );
             let emitted = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -2921,6 +3327,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -2933,6 +3340,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
 
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
@@ -2975,6 +3383,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("a=t"), "root frame uploaded");
@@ -2992,6 +3401,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         assert!(
             bytes.is_empty(),
@@ -3072,6 +3482,7 @@ mod tests {
             &HashMap::new(),
             EmbeddedSurfaces::ALL,
             crate::ui::OverlayOcclusion::None,
+            None,
         );
         assert_eq!(placements.len(), 2);
 
@@ -3144,6 +3555,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         assert!(String::from_utf8_lossy(&bytes).contains("a=t"));
         let host_id = *cache.images.keys().next().expect("uploaded host image");
@@ -3158,6 +3570,7 @@ mod tests {
             test_cell_size(),
             &mut cache,
             EmbeddedSurfaces::ALL,
+            None,
         );
         assert!(String::from_utf8_lossy(&bytes).contains(&format!("a=d,d=I,i={host_id}")));
         assert!(cache.is_empty());

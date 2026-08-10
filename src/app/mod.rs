@@ -341,12 +341,14 @@ fn agent_panel_sort_from_config(
     }
 }
 
-/// The configured sidebar card face, or `None` to search for one.
+/// A configured font path, or `None` to search for one.
 ///
-/// An unset key and a key set to whitespace mean the same thing — search — so a
-/// half-edited config file falls back to the default rather than to a font path
-/// that is one space long.
-fn sidebar_card_font(configured: &str) -> Option<String> {
+/// Shared by `[experimental] sidebar_card_font` and
+/// `[experimental] pixel_text_font`, which want different faces but read their
+/// keys identically: an unset key and a key set to whitespace mean the same
+/// thing — search — so a half-edited config file falls back to the default
+/// rather than to a font path that is one space long.
+fn configured_font_path(configured: &str) -> Option<String> {
     let trimmed = configured.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
@@ -786,8 +788,10 @@ impl App {
             kitty_graphics_capability_confirmed: false,
             sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
             persistent_background_enabled: config.experimental.persistent_background,
-            sidebar_card_font: sidebar_card_font(&config.experimental.sidebar_card_font),
+            sidebar_card_font: configured_font_path(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
+            pixel_text_panes_enabled: config.experimental.pixel_text_panes,
+            pixel_text_font: configured_font_path(&config.experimental.pixel_text_font),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -1353,7 +1357,7 @@ impl App {
                     self.full_redraw_pending = false;
                 }
                 let mut cell_size = crate::kitty_graphics::HostCellSize::default();
-                terminal.draw(|frame| {
+                let completed = terminal.draw(|frame| {
                     let area = frame.area();
                     if kitty_graphics_enabled {
                         let observed_cell_size =
@@ -1383,11 +1387,23 @@ impl App {
                         frame,
                     );
                 })?;
+                // The frame that was just composed. `Terminal::draw` swaps its
+                // buffers before returning, so the drawn one is reachable
+                // through the completed frame and *not* through
+                // `current_buffer_mut`, which by now points at the next
+                // (already reset) buffer. Borrowed rather than cloned, and only
+                // when something will actually read it: a re-presented pane
+                // rasterises from it — see `crate::grid_raster`.
+                let composed = self
+                    .state
+                    .pixel_text_panes_active()
+                    .then_some(completed.buffer);
                 if self.state.host_paints_pixel_surfaces() {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
                         &self.terminal_runtimes,
                         cell_size,
+                        composed,
                     )?;
                 }
                 self.sync_pending_agent_resume_deadline(now);
@@ -1828,7 +1844,9 @@ impl App {
                 self.state.background_effects.forget_all();
             }
             self.state.sidebar_card_font =
-                sidebar_card_font(&config.experimental.sidebar_card_font);
+                configured_font_path(&config.experimental.sidebar_card_font);
+            self.state.pixel_text_panes_enabled = config.experimental.pixel_text_panes;
+            self.state.pixel_text_font = configured_font_path(&config.experimental.pixel_text_font);
             // Switching the drawing model invalidates every card already held:
             // the two paths publish different rects and different placements, so
             // a stale layer from the other path would leave an orphan on screen.

@@ -2616,6 +2616,10 @@ mod tests {
     /// erase every glyph on screen, which is the failure this gate exists to
     /// make unreachable rather than to apologise for afterwards.
     #[test]
+    // The refused set is down to one member since Rio was allowed on the
+    // patched build, but it is still a *set* — the next unmeasured terminal
+    // joins this array rather than restructuring the test — so the loop stays.
+    #[allow(clippy::single_element_loop)]
     fn the_background_scene_is_refused_on_a_host_that_does_not_draw_an_ambient_wash() {
         for kind in [crate::kitty_graphics::HostTerminalKind::Other] {
             let mut app = background_scene_app();

@@ -436,6 +436,15 @@ impl VirtualRenderer {
             .buffer()
     }
 
+    /// The frame just drawn, or `None` if this renderer has not rendered yet.
+    ///
+    /// The fallible sibling of [`Self::buffer`], for callers that reach a
+    /// renderer through shared client state rather than immediately after
+    /// driving it themselves and so cannot prove a render already happened.
+    pub(crate) fn rendered_buffer(&self) -> Option<&ratatui::buffer::Buffer> {
+        Some(self.terminal.as_ref()?.backend().buffer())
+    }
+
     /// Renders the AppState into this renderer's buffer.
     ///
     /// This produces the same output as the monolithic binary's terminal draw,
