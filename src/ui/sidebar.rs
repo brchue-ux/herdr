@@ -516,6 +516,21 @@ impl WorkspaceListEntry {
     }
 }
 
+/// Whether something hangs off the row at `idx`.
+///
+/// The next row one level deeper is exactly how the walk emits a subtree, so a
+/// row opens a branch if and only if the row after it is drawn one column
+/// further in. Measured in *drawn* depth — [`crate::app::agent_tree::display_depth`]
+/// — because a row past the display cap shares its parent's column and hangs no
+/// line of its own off it.
+pub(crate) fn row_opens_a_branch(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+    let drawn = |entry: &WorkspaceListEntry| crate::app::agent_tree::display_depth(entry.depth());
+    entries
+        .get(idx)
+        .zip(entries.get(idx.saturating_add(1)))
+        .is_some_and(|(row, next)| drawn(next) > drawn(row))
+}
+
 pub(crate) fn next_entry_is_worktree_child(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
@@ -3132,6 +3147,7 @@ fn render_agent_row(
             connector,
             above,
             below,
+            row_opens_a_branch(entries, card.entry_idx).then(|| branch_rail_span(p)),
             list_entry_gap(app, entries, card.entry_idx),
             list_top,
             list_bottom,
@@ -3367,6 +3383,15 @@ fn moved_row(y: u16, dy: i32, list_top: u16, list_bottom: u16) -> Option<u16> {
 /// here. Without this the tree's vertical rules would break every time they
 /// passed a card — which, at four rows an entity, is most of the panel.
 ///
+/// `branch_rail` is the rail this card's *own children* hang off, and it is the
+/// one rail that does not fit beside the card: a child's connector stands in the
+/// column its parent's left border stands in — see
+/// [`every_branch_starts_in_the_column_its_parents_border_stands_in`] — so the
+/// line leaving a parent has to be drawn *in* that border column rather than to
+/// the left of it. `Some` on a row something hangs off, and then only the rows
+/// below the connector carry it: above the connector that column is the card's
+/// own top corner, and the branch has not left yet.
+///
 /// `motion` is [`row_motion_cells`]. The rail travels with the card because the
 /// two are one thing seen by two renderers: a connector left at the layout's
 /// row while the card it points at is four rows higher is an arrow at empty
@@ -3382,7 +3407,8 @@ fn render_card_border_rails(
     card: &crate::app::state::WorkspaceCardArea,
     connector: Vec<Span<'static>>,
     above: Vec<Span<'static>>,
-    below: Vec<Span<'static>>,
+    mut below: Vec<Span<'static>>,
+    branch_rail: Option<Span<'static>>,
     trailing_gap: u16,
     list_top: u16,
     list_bottom: u16,
@@ -3394,6 +3420,15 @@ fn render_card_border_rails(
     let width = shell_frame.x.saturating_sub(card.rect.x);
     if width == 0 || shell_frame.height == 0 || motion.0 != 0 {
         return;
+    }
+    // One column wider than the rails beside the card, because this rail stands
+    // *in* the card's own border column. Harmless under the character shell and
+    // under the sheet, where the card's border and the sheet's backdrop are both
+    // drawn over it afterwards; it is the shape shell — which draws no character
+    // border at all — that would otherwise leave the line missing.
+    let below_width = width.saturating_add(u16::from(branch_rail.is_some()));
+    if let Some(rail) = branch_rail {
+        below.push(rail);
     }
     // Where the branch line meets this card. On a character card that is its
     // *name* — its first content row, not the corner of its box, because a rail
@@ -3414,16 +3449,16 @@ fn render_card_border_rails(
         let Some(drawn_y) = moved_row(y, motion.1, list_top, list_bottom) else {
             continue;
         };
-        let spans = if y == connector_y {
-            connector.clone()
+        let (spans, cols) = if y == connector_y {
+            (connector.clone(), width)
         } else if y < connector_y {
-            above.clone()
+            (above.clone(), width)
         } else {
-            below.clone()
+            (below.clone(), below_width)
         };
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(card.rect.x, drawn_y, width, 1),
+            Rect::new(card.rect.x, drawn_y, cols, 1),
         );
     }
 }
@@ -3730,6 +3765,20 @@ fn card_rail_prefix(
 /// at the border.
 fn connector_joint_span(p: &Palette) -> Span<'static> {
     Span::styled("─", Style::default().fg(p.overlay0))
+}
+
+/// The rail leaving a card downwards, in the card's own border column.
+///
+/// The vertical twin of [`connector_joint_span`], and it exists for the same
+/// reason: a child's connector stands in its parent's border column, so the
+/// stretch of that line which crosses the parent's own rows has nowhere else to
+/// be drawn. Under the character shell the card's border is a `│` in that column
+/// already and this changes nothing; under a drawn card the border is a shape
+/// that stops short of the row's last pixel row, and without this the line
+/// leaving the first mate starts a gutter below the card it leaves — the
+/// captain's *"the trunk does not touch firstmate"*.
+fn branch_rail_span(p: &Palette) -> Span<'static> {
+    Span::styled("│", Style::default().fg(p.overlay0))
 }
 
 /// The `├──` / `└──` connector of a child row's first line, charge and all.
@@ -4918,6 +4967,7 @@ fn render_workspace_list(
                 connector,
                 above,
                 below,
+                row_opens_a_branch(&entries, card.entry_idx).then(|| branch_rail_span(p)),
                 list_entry_gap(app, &entries, card.entry_idx),
                 area.y,
                 list_bottom,
@@ -10095,7 +10145,7 @@ mod ownership_is_drawn_as_written {
 
     /// The tree the captain's own fleet has: a first mate, two second mates
     /// under it, and workers under each mate.
-    fn mate_fleet() -> crate::app::state::AppState {
+    pub(super) fn mate_fleet() -> crate::app::state::AppState {
         interleaved_worker_fleet()
     }
 
@@ -10651,6 +10701,8 @@ mod a_branch_line_meets_its_card_in_the_middle {
         app.kitty_graphics_enabled = true;
         app.kitty_graphics_capability_confirmed = true;
         app.sidebar_card_shapes = true;
+        app.sidebar_card_shapes = std::env::var("HERDR_SCRATCH_SHAPES").is_ok();
+        app.view.sidebar_card_layers_published = app.sidebar_card_shapes;
         app.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 10,
             height_px: 11,
@@ -10697,5 +10749,137 @@ mod a_branch_line_meets_its_card_in_the_middle {
             vec![card.connector_y()],
             "the worker's branch is not on the row its card's middle falls in"
         );
+    }
+}
+
+/// **The line leaving a card.** A child's connector stands in the column its
+/// parent's own border stands in, so the stretch of that line which crosses the
+/// parent's own rows has nowhere to be drawn except *in* that border column.
+///
+/// Under the character shell the card's border already fills it and nothing was
+/// missing. Under a drawn card it is not filled by anything: the shape shell
+/// draws no character border at all, and the sheet paints its backdrop over the
+/// cells either way. That is the captain's *"the trunk line from firstmate does
+/// not visually touch the firstmate root node"* — the trunk started a gutter
+/// below the card it leaves. The character half of the fix is asserted here; the
+/// pixel half is [`super::sidebar::image_card`]'s `the_tree_lines_reach_the_cards_they_join`.
+#[cfg(test)]
+mod a_branch_leaves_its_parents_own_border_column {
+    use super::tests::interleaved_worker_fleet;
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// Where each row's card stands, and the whole panel as drawn, on a panel
+    /// running the *shape* shell — the one that draws no character card, so the
+    /// only thing that can be in a card's border column is the tree.
+    fn shaped_fleet_screen() -> (Vec<Rect>, Vec<String>) {
+        let width = 42u16;
+        let area = Rect::new(0, 0, width, 40);
+        let mut app = interleaved_worker_fleet();
+        app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
+        app.sidebar_card_shapes = true;
+        app.view.sidebar_card_layers_published = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).expect("test backend");
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .expect("draw");
+        let rows: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let frames = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .filter_map(|card| card.card_frame)
+            .collect();
+        (frames, rows)
+    }
+
+    fn glyph(rows: &[String], x: u16, y: u16) -> String {
+        rows.get(usize::from(y))
+            .and_then(|row| row.chars().nth(usize::from(x)))
+            .map(|glyph| glyph.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The first mate's own rows carry the trunk in the column the second mates
+    /// point at, from its connector row down to its last row.
+    ///
+    /// The first mate is the case that cannot be got at any other way: every
+    /// other rail in the tree runs *beside* the cards it passes, and this one
+    /// runs through the root card's own frame because the root card starts in
+    /// the trunk's column.
+    #[test]
+    fn the_trunk_is_drawn_inside_the_first_mates_own_frame() {
+        let (frames, rows) = shaped_fleet_screen();
+        let first_mate = frames.first().copied().expect("the fixture drew no cards");
+        let connector = first_mate.y + (first_mate.height.saturating_sub(1)) / 2;
+        let screen = rows.join("\n");
+        assert!(
+            first_mate.y + first_mate.height > connector + 1,
+            "the fixture has no row below the connector to carry the trunk:\n{screen}"
+        );
+        for y in connector + 1..first_mate.y + first_mate.height {
+            assert_eq!(
+                glyph(&rows, first_mate.x, y),
+                "│",
+                "row {y} of the first mate's card does not carry the trunk in \
+                 its own border column:\n{screen}"
+            );
+        }
+    }
+
+    /// And a row nothing hangs off does not grow one. A rail leaving a card with
+    /// no children is a line pointing at nothing, and it would also be the one
+    /// glyph standing between the last card of a group and the panel below it.
+    #[test]
+    fn a_card_with_nothing_under_it_leaves_no_rail_behind() {
+        let (frames, rows) = shaped_fleet_screen();
+        // `b-one` is the last row of the whole tree: nothing hangs off it and
+        // nothing follows it.
+        let last = frames.last().copied().expect("the fixture drew no cards");
+        let connector = last.y + (last.height.saturating_sub(1)) / 2;
+        let screen = rows.join("\n");
+        for y in connector + 1..last.y + last.height {
+            assert_ne!(
+                glyph(&rows, last.x, y),
+                "│",
+                "the last card in the tree grew a rail out of its bottom:\n{screen}"
+            );
+        }
+    }
+
+    /// The predicate itself, at the display cap: two rows the tree keeps at
+    /// different depths but *draws* in the same column have no line between
+    /// them, so the deeper one is not a branch off the shallower one.
+    #[test]
+    fn a_row_past_the_display_cap_opens_no_branch() {
+        let entry = |depth: u8| WorkspaceListEntry::Workspace {
+            ws_idx: 0,
+            worktree_child: false,
+            depth,
+            ancestors_continue: Vec::new(),
+            is_last_child: false,
+        };
+        let cap = crate::app::agent_tree::MAX_DISPLAY_DEPTH;
+        assert!(row_opens_a_branch(&[entry(0), entry(1)], 0));
+        assert!(!row_opens_a_branch(&[entry(1), entry(1)], 0));
+        assert!(
+            !row_opens_a_branch(&[entry(cap), entry(cap + 1)], 0),
+            "a row drawn in its parent's own column must not open a branch off it"
+        );
+        assert!(!row_opens_a_branch(&[entry(0)], 0), "nothing follows it");
     }
 }
