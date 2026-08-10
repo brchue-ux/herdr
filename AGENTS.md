@@ -190,6 +190,8 @@ After changing anything under `src/api/schema/`, regenerate the committed protoc
 
 Unit tests live next to the code (`#[cfg(test)] mod tests`). New `AppState` or `Workspace` behavior should be testable with `AppState::test_new()` and `Workspace::test_new()` without PTYs.
 
+Windows CI does not run the whole unit-test binary: `scripts/windows_check.ps1` selects tests by *name* substring (`windows_`, plus two explicit paths), so a `#[cfg(windows)]` test whose name lacks that prefix compiles on Windows and is never executed anywhere. Name new Windows-only tests `windows_*`, and note that `just windows-lint` is lint-only — it does not build test targets at all.
+
 For broad refactors or release-risk regressions, classify the risk before editing. Treat changes as refactor-risk when they touch two or more core surfaces, persisted state, protocol/API IDs, workspace/tab/pane identity, restore/handoff, agent detection authority, or UI/input state projection. Before moving code, identify the protected behavior and add or name characterization tests. Identity/state refactors should use the test-only invariants `AppState::assert_invariants_for_test()` or `Workspace::assert_invariants_for_test()` with adversarial state from `AppState::test_with_adversarial_identity_state()` or `Workspace::test_adversarial_identity_state()`. Run a roundtable for broad refactors and release-risk regressions, not for routine local fixes.
 
 When testing a new Herdr build from inside an existing Herdr session, use
