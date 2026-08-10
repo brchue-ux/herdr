@@ -32,7 +32,7 @@ mod popup;
 mod pull_requests;
 pub(crate) mod relation_signal;
 pub(crate) mod residue;
-mod runtime;
+pub(crate) mod runtime;
 mod runtime_mutations;
 mod session;
 pub(crate) mod signal_tray;
