@@ -473,6 +473,21 @@ pub enum ClientMessage {
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
     },
+
+    /// Text read from this client's own OS clipboard, answering a
+    /// [`ServerMessage::RequestClipboardText`].
+    ///
+    /// Appended at the end rather than beside `ClipboardImage` so it does not
+    /// shift the wire tag of every variant declared after it — see
+    /// `client_message_wire_tags_preserve_protocol_15_order` for why that
+    /// stability matters.
+    ClipboardText {
+        /// The `request_id` of the request being answered.
+        request_id: u64,
+        /// The clipboard's text, or `None` when this client's clipboard holds
+        /// no readable text.
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +797,29 @@ pub enum ServerMessage {
     TrayScene {
         /// Bincode-encoded `crate::ui::sidebar::tray::TrayScene`.
         bytes: Vec<u8>,
+    },
+
+    /// Ask this client to read its own OS clipboard and answer with
+    /// [`ClientMessage::ClipboardText`].
+    ///
+    /// The server process is not necessarily on the machine the user is typing
+    /// on: under `herdr --remote` the runtime — and therefore every modal text
+    /// input — lives on the far host while the keyboard, the terminal, and the
+    /// clipboard the user just copied into are all on the near one. A paste
+    /// shortcut the host terminal delivers as a plain key rather than a
+    /// bracketed paste carries no text of its own, so the server has nothing to
+    /// insert until a client that can actually see that clipboard answers.
+    ///
+    /// Genuine bracketed paste never needs this: it arrives as
+    /// `ClientInputEvent::Paste`/`Input` already carrying the client's text.
+    ///
+    /// Appended after `TrayScene` for the same reason `TrayScene` was appended
+    /// after `CardScene` — a variant added anywhere else shifts the wire tag of
+    /// everything declared below it.
+    RequestClipboardText {
+        /// Correlates the answer with this request. Echoed back unchanged so a
+        /// reply to a superseded request can be told apart from a live one.
+        request_id: u64,
     },
 }
 
@@ -1168,6 +1206,36 @@ mod tests {
             }),
             9
         );
+        assert_eq!(
+            tag(&ClientMessage::ClipboardText {
+                request_id: 1,
+                text: None,
+            }),
+            10
+        );
+    }
+
+    #[test]
+    fn client_clipboard_text_roundtrip() {
+        for text in [None, Some(String::new()), Some("café ✂ line\n".to_owned())] {
+            let msg = ClientMessage::ClipboardText {
+                request_id: u64::MAX,
+                text,
+            };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[test]
+    fn server_request_clipboard_text_roundtrip() {
+        let msg = ServerMessage::RequestClipboardText { request_id: 7 };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).unwrap();
+        let decoded: ServerMessage = read_message(&mut buf.as_slice(), MAX_FRAME_SIZE).unwrap();
+        assert_eq!(msg, decoded);
     }
 
     #[test]

@@ -86,9 +86,7 @@ impl App {
         }
         let key_event = key.as_key_event();
         if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
-            if let Some(text) = crate::platform::read_clipboard_text() {
-                self.paste_into_active_text_input(&text);
-            }
+            self.request_modal_clipboard_paste(super::LOCAL_INPUT_SOURCE);
             return None;
         }
 

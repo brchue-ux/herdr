@@ -394,6 +394,13 @@ pub(crate) enum ServerEvent {
         extension: String,
         data: Vec<u8>,
     },
+    /// A client answered a `ServerMessage::RequestClipboardText` with the text
+    /// on its own machine's clipboard.
+    ClientClipboardText {
+        client_id: u64,
+        request_id: u64,
+        text: Option<String>,
+    },
     /// A client requested direct attach to one terminal.
     ClientAttachTerminal {
         client_id: u64,
@@ -886,6 +893,31 @@ fn client_read_loop(
                         client_id,
                         extension,
                         data,
+                    }
+                }
+            }
+            ClientMessage::ClipboardText { request_id, text } => {
+                let size = text.as_ref().map_or(0, String::len);
+                if size > MAX_INPUT_PAYLOAD {
+                    // Same policy an oversized interactive paste gets: the user
+                    // copied too much, which is not the client misbehaving, so
+                    // say so instead of dropping the connection.
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized clipboard text from client, rejecting"
+                    );
+                    ServerEvent::ClientPasteRejected {
+                        client_id,
+                        size,
+                        max: MAX_INPUT_PAYLOAD,
+                    }
+                } else {
+                    ServerEvent::ClientClipboardText {
+                        client_id,
+                        request_id,
+                        text,
                     }
                 }
             }

@@ -80,7 +80,7 @@ use crossterm::{
 use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, Notify};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::events::AppEvent;
@@ -189,9 +189,42 @@ pub struct App {
     /// The headless server sets this to false: the switch belongs to the foreground client,
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
+    /// Whether this process's own OS clipboard is the one the user copies into.
+    /// The headless server sets this to false: with `herdr --remote` the app
+    /// runs on the far host, so a modal paste has to be answered by the client
+    /// that pressed the shortcut. See [`App::request_modal_clipboard_paste`].
+    pub(crate) local_clipboard_reads: bool,
+    /// The modal paste waiting on an input source's clipboard answer, if any.
+    pending_clipboard_read: Option<PendingClipboardRead>,
+    next_clipboard_request_id: u64,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
+
+/// A modal paste that asked an input source for its clipboard and is waiting
+/// for the answer.
+///
+/// Only ever one: a second paste shortcut supersedes the first rather than
+/// queueing behind it, because both would land in the same text input and the
+/// user pressing the key again means they want the current clipboard.
+#[derive(Debug)]
+struct PendingClipboardRead {
+    request_id: u64,
+    source_id: InputSourceId,
+    /// Which modal was focused when the request went out. An answer that
+    /// arrives after the user left that modal belongs to a text input that no
+    /// longer exists.
+    mode: Mode,
+    requested_at: Instant,
+}
+
+/// How long a clipboard answer stays applicable.
+///
+/// A client answers in the time one socket round trip and one clipboard read
+/// take. Past this the modal the user is looking at is a different one they
+/// opened since, even when it happens to be the same [`Mode`], so the text is
+/// dropped rather than pasted somewhere it was never meant to go.
+const CLIPBOARD_READ_TTL: Duration = Duration::from_secs(2);
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
@@ -971,6 +1004,9 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             local_input_source_switch: true,
+            local_clipboard_reads: true,
+            pending_clipboard_read: None,
+            next_clipboard_request_id: 0,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
@@ -2071,7 +2107,7 @@ impl App {
                             let target = if initial_context.is_some() {
                                 self.handle_terminal_key_headless_from(source_id, key.clone())
                             } else {
-                                self.handle_non_terminal_key_headless(key.clone());
+                                self.handle_non_terminal_key_headless(source_id, key.clone());
                                 None
                             };
                             let resulting_context = self.terminal_input_context();
@@ -2186,18 +2222,97 @@ impl App {
         self.release_input_source_headless(source_id);
     }
 
+    /// Fills the focused modal text input from the clipboard belonging to
+    /// whoever pressed the paste shortcut.
+    ///
+    /// Reached only when the shortcut arrived as a plain key: a genuine
+    /// bracketed paste already carries the client's text and is inserted
+    /// directly by the `Paste` arm of [`Self::route_client_events_from`].
+    ///
+    /// The clipboard that matters is the one on the machine the user copied on,
+    /// and this process is not always that machine — under `herdr --remote` the
+    /// app runs on the far host while the user's clipboard is on the near one.
+    /// So the answer is asked for rather than read, except in monolithic herdr,
+    /// which *is* the terminal the user is typing into and has nobody to ask.
+    pub(crate) fn request_modal_clipboard_paste(&mut self, source_id: InputSourceId) {
+        if self.local_clipboard_reads {
+            if let Some(text) = crate::platform::read_clipboard_text() {
+                self.paste_into_active_text_input(&text);
+            }
+            return;
+        }
+
+        let request_id = self.next_clipboard_request_id;
+        self.next_clipboard_request_id = self.next_clipboard_request_id.wrapping_add(1);
+        if let Err(err) = self
+            .event_tx
+            .try_send(crate::events::AppEvent::ClipboardRead {
+                source_id,
+                request_id,
+            })
+        {
+            warn!(%err, "failed to ask input source for clipboard text");
+            return;
+        }
+        self.pending_clipboard_read = Some(PendingClipboardRead {
+            request_id,
+            source_id,
+            mode: self.state.mode,
+            requested_at: Instant::now(),
+        });
+    }
+
+    /// Applies an input source's clipboard answer to the modal paste that asked
+    /// for it.
+    ///
+    /// Returns whether text actually reached a text input, so the caller can
+    /// decide the frame needs redrawing. Answers that no longer apply — a
+    /// superseded request, a different input source, an empty clipboard, a
+    /// modal the user has since left, or one that took longer than
+    /// [`CLIPBOARD_READ_TTL`] to come back — are dropped rather than pasted.
+    pub(crate) fn apply_clipboard_read_response(
+        &mut self,
+        source_id: InputSourceId,
+        request_id: u64,
+        text: Option<String>,
+    ) -> bool {
+        let answers_pending = self.pending_clipboard_read.as_ref().is_some_and(|pending| {
+            pending.request_id == request_id && pending.source_id == source_id
+        });
+        if !answers_pending {
+            // A late answer to a request that has already been superseded. The
+            // outstanding one is still waiting on its own answer, so leave it.
+            return false;
+        }
+        let Some(pending) = self.pending_clipboard_read.take() else {
+            return false;
+        };
+        let Some(text) = text else {
+            return false;
+        };
+        if Instant::now().saturating_duration_since(pending.requested_at) >= CLIPBOARD_READ_TTL {
+            return false;
+        }
+        if self.state.mode != pending.mode || !input::modal_paste_target_active(&self.state) {
+            return false;
+        }
+        self.paste_into_active_text_input(&text)
+    }
+
     /// Handles a key event in non-terminal mode for the headless server.
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
     /// since the server doesn't have the async context of the monolithic App.
-    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
+    fn handle_non_terminal_key_headless(
+        &mut self,
+        source_id: InputSourceId,
+        key: crate::input::TerminalKey,
+    ) {
         let key_event = key.as_key_event();
         if input::modal_paste_target_active(&self.state)
             && input::is_modal_paste_shortcut(&key_event)
         {
-            if let Some(text) = crate::platform::read_clipboard_text() {
-                self.paste_into_active_text_input(&text);
-            }
+            self.request_modal_clipboard_paste(source_id);
             return;
         }
 
@@ -6534,6 +6649,152 @@ last_pane = "prefix+tab"
         assert!(app.event_hub.events_after(0).iter().any(|(_, event)| {
             matches!(event.event, crate::api::schema::EventKind::WorkspaceClosed)
         }));
+    }
+
+    /// Drain the app event channel, returning the `(source_id, request_id)` of
+    /// any emitted `ClipboardRead` — the "ask this input source for its
+    /// clipboard" intents.
+    fn drained_clipboard_reads(app: &mut App) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = app.event_rx.try_recv() {
+            if let crate::events::AppEvent::ClipboardRead {
+                source_id,
+                request_id,
+            } = ev
+            {
+                out.push((source_id, request_id));
+            }
+        }
+        out
+    }
+
+    /// An app in a rename modal, set up the way the headless server runs it:
+    /// its own clipboard is not the one the user copied on.
+    fn app_in_rename_modal_with_remote_clipboard() -> App {
+        let mut app = test_app();
+        app.local_clipboard_reads = false;
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::RenameWorkspace;
+        app.state.name_input = String::new();
+        app.state.name_input_replace_on_type = false;
+        app
+    }
+
+    /// The regression this guards: a raw Ctrl+V used to be answered inline from
+    /// `platform::read_clipboard_text()`, which under `--remote` runs on the
+    /// server rather than on the machine the user copied on. The keypress must
+    /// now paste nothing by itself and instead ask the input source it arrived
+    /// from, whose answer is the text that lands.
+    #[test]
+    fn modal_paste_shortcut_asks_its_input_source_instead_of_reading_locally() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+
+        app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+
+        assert_eq!(
+            app.state.name_input, "",
+            "the keypress alone must not paste: this process's clipboard is not the user's"
+        );
+        assert_eq!(
+            drained_clipboard_reads(&mut app),
+            vec![(7, 0)],
+            "the input source that pressed the shortcut is the one asked"
+        );
+
+        assert!(app.apply_clipboard_read_response(7, 0, Some("from-client".to_owned())));
+        assert_eq!(app.state.name_input, "from-client");
+    }
+
+    #[test]
+    fn a_clipboard_answer_to_a_superseded_request_never_reaches_the_modal() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+        let ctrl_v = || crate::raw_input::parse_raw_input_bytes_sync(&[0x16]);
+
+        app.route_client_events_from(7, ctrl_v(), false);
+        app.route_client_events_from(7, ctrl_v(), false);
+        assert_eq!(drained_clipboard_reads(&mut app), vec![(7, 0), (7, 1)]);
+
+        // The first request's answer arrives late. Only the live one counts,
+        // and it is still owed an answer of its own.
+        assert!(!app.apply_clipboard_read_response(7, 0, Some("stale".to_owned())));
+        assert_eq!(app.state.name_input, "");
+
+        assert!(app.apply_clipboard_read_response(7, 1, Some("current".to_owned())));
+        assert_eq!(app.state.name_input, "current");
+    }
+
+    #[test]
+    fn a_clipboard_answer_is_dropped_once_the_modal_it_was_asked_for_is_gone() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+
+        app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+        assert_eq!(drained_clipboard_reads(&mut app), vec![(7, 0)]);
+
+        // The user closed the rename prompt while the answer was in flight.
+        app.state.mode = Mode::Navigate;
+
+        assert!(!app.apply_clipboard_read_response(7, 0, Some("too late".to_owned())));
+        assert_eq!(app.state.name_input, "");
+    }
+
+    #[test]
+    fn a_clipboard_answer_from_another_input_source_is_ignored() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+
+        app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+        assert_eq!(drained_clipboard_reads(&mut app), vec![(7, 0)]);
+
+        // A second attached client answering a request it was never sent.
+        assert!(!app.apply_clipboard_read_response(9, 0, Some("other client".to_owned())));
+        assert_eq!(app.state.name_input, "");
+
+        // The client that was actually asked can still answer.
+        assert!(app.apply_clipboard_read_response(7, 0, Some("asked client".to_owned())));
+        assert_eq!(app.state.name_input, "asked client");
+    }
+
+    #[test]
+    fn an_empty_client_clipboard_leaves_the_modal_untouched() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+        app.state.name_input = "keep".to_owned();
+
+        app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+        assert_eq!(drained_clipboard_reads(&mut app), vec![(7, 0)]);
+
+        assert!(!app.apply_clipboard_read_response(7, 0, None));
+        assert_eq!(app.state.name_input, "keep");
+    }
+
+    #[test]
+    fn a_paste_shortcut_outside_a_modal_asks_nobody() {
+        let mut app = app_in_rename_modal_with_remote_clipboard();
+        app.state.mode = Mode::Navigate;
+
+        app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+
+        assert!(drained_clipboard_reads(&mut app).is_empty());
     }
 
     #[test]

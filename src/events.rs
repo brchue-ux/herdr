@@ -167,6 +167,20 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A modal text input needs the clipboard's text because a paste shortcut
+    /// arrived as a plain key carrying none. Only the machine the user is
+    /// typing on can answer, so the main loop asks that input source rather
+    /// than reading its own clipboard: the headless server forwards this to the
+    /// client as `ServerMessage::RequestClipboardText`. Monolithic herdr *is*
+    /// that machine and answers inline without ever emitting this.
+    /// See `App::request_modal_clipboard_paste`.
+    ClipboardRead {
+        /// The input source that pressed the shortcut, which in the headless
+        /// server is the id of the client connection it arrived on.
+        source_id: u64,
+        /// Correlates the answer with this request.
+        request_id: u64,
+    },
     /// Prefix-mode ASCII input-source request, emitted on entering/leaving the ASCII input
     /// realm. The foreground process applies the host-local TIS switch (`active = true`) /
     /// restore (`active = false`): the client in server mode (via server forwarding), the

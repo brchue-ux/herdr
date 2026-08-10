@@ -1883,6 +1883,18 @@ async fn run_client_loop(
                     forward_clipboard(&data);
                     let _ = io::stdout().flush();
                 }
+                ServerMessage::RequestClipboardText { request_id } => {
+                    // This process is on the machine the user copied on; the
+                    // server may not be. Answer even when the clipboard is
+                    // empty, so the server can retire the request instead of
+                    // holding it open — see
+                    // `ServerMessage::RequestClipboardText`.
+                    let text = crate::platform::read_clipboard_text();
+                    let msg = ClientMessage::ClipboardText { request_id, text };
+                    if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        return Err(ClientError::ConnectionLost(e));
+                    }
+                }
                 ServerMessage::WindowTitle { title } => {
                     write_window_title(title.as_deref());
                     let _ = io::stdout().flush();
