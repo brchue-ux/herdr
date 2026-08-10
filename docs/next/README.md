@@ -84,3 +84,5 @@ just check       # formatting, tests, and maintenance checks
 ## license
 
 Herdr is licensed under the [Apache License 2.0](LICENSE).
+
+<!-- ci verification: temporary no-op touch, do not merge -->
