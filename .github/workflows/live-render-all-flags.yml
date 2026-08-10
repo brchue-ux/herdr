@@ -14,21 +14,20 @@ on:
   # only fires for `claude/**` cannot see anyone else's change, and cannot be
   # made a required status check either — GitHub can only require a check that
   # runs on the pull request itself.
+  # Deliberately NOT path-filtered at the trigger. `live-render` is a required
+  # status check, and a workflow that never triggers creates no check-run at
+  # all — the requirement then sits "Expected" forever and blocks an otherwise
+  # green pull request (this happened on #130 and #132, both force-merged).
+  # A job GitHub marks "skipped" *does* satisfy a required check, so the path
+  # filtering moved down to the job's `if:` below. Same cost saving, but the
+  # check-run always exists.
   pull_request:
     types: [opened, synchronize, reopened]
-    # Path-filtered: the build dominates this job's cost, so it should not run
-    # for changes that cannot affect what reaches the wire.
-    paths:
-      - 'src/ui/sidebar/**'
-      - 'src/kitty_graphics.rs'
-      - 'src/anim/**'
-      - 'src/anim.rs'
-      - 'src/config/sidebar.rs'
-      - 'data/herdr-all-flags-live/**'
-      - '.github/workflows/live-render-all-flags.yml'
 
 permissions:
   contents: read
+  # dorny/paths-filter reads the pull request's changed files over the API.
+  pull-requests: read
 
 env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
@@ -38,7 +37,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The one place the path list lives. The expensive job below gates on this
+  # job's output rather than on a trigger-level `paths:` filter.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      live_render: ${{ steps.filter.outputs.live_render }}
+    steps:
+      - id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.3
+        with:
+          # The build dominates the cost, so it should not run for changes that
+          # cannot affect what reaches the wire.
+          filters: |
+            live_render:
+              - 'src/ui/sidebar/**'
+              - 'src/kitty_graphics.rs'
+              - 'src/anim/**'
+              - 'src/anim.rs'
+              - 'src/config/sidebar.rs'
+              - 'data/herdr-all-flags-live/**'
+              - '.github/workflows/live-render-all-flags.yml'
+
   live-render:
+    needs: changes
+    # workflow_dispatch always runs it; a pull request only when the diff
+    # touches a path above. Skipped still reports a conclusion, which is the
+    # point — see the trigger comment.
+    if: github.event_name != 'pull_request' || needs.changes.outputs.live_render == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
