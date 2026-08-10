@@ -312,6 +312,20 @@ fn bloom_reach_px(cell_height: f32) -> f32 {
 /// is exactly the error being removed here.
 const RAIL_INK_COLUMN_FRACTION: f32 = 0.5;
 
+/// How thick a tree rail's ink is, as a fraction of a cell's width.
+///
+/// The joins in [`Rasteriser::draw_tree_joins`] continue a line a *font* drew,
+/// and Herdr cannot measure the host's glyph outlines — the same limit
+/// [`RAIL_INK_COLUMN_FRACTION`] runs into. A box-drawing stem is a hairline: a
+/// tenth of the cell is what that comes to at the sizes a sidebar is read at,
+/// and never less than the one pixel a terminal cannot draw under. Drawn at the
+/// *card's* stroke instead — the obvious alternative — the join arrives at the
+/// rail twice its weight and reads as a blob at the joint rather than as the
+/// line continuing.
+fn rail_stroke_px(cell_w: f32) -> f32 {
+    (cell_w * 0.1).max(1.0)
+}
+
 /// How far a card's ink sits from the middle of its own cells, so that it is
 /// centred on the row the tree's branch line meets it on.
 ///
@@ -866,6 +880,18 @@ fn backdrop_rgb(app: &AppState) -> Rgb {
     crate::ui::sidebar::backdrop_rgb(app)
         .map(|(r, g, b)| Rgb(r, g, b))
         .unwrap_or(measured::CANVAS)
+}
+
+/// The ink the tree's own rails are drawn in, read off the same palette the
+/// character renderer styles them from.
+///
+/// Resolved against the host theme exactly as [`backdrop_rgb`] is, because a
+/// join painted in a hardcoded grey beside a rail the terminal drew in the
+/// user's `overlay0` is two colours where the eye expects one line.
+fn rail_rgb(app: &AppState) -> Rgb {
+    crate::ui::color::resolve_color_rgb(app.sidebar_palette.overlay0, &app.host_terminal_theme)
+        .map(|(r, g, b)| Rgb(r, g, b))
+        .unwrap_or(measured::STROKE_A)
 }
 
 /// The chip's ink.
@@ -2872,6 +2898,9 @@ struct CardPlacement {
     bounds: Rect,
     bloom_floor: u16,
     backdrop: Rgb,
+    /// See [`Rasteriser::rail`]. Not on [`CardScene`]: the wire path draws
+    /// shapes, which paint no backdrop and so cover no rail.
+    rail: Rgb,
     font: &'static CardFont,
     title_metrics: FontMetrics,
     tidbit_metrics: FontMetrics,
@@ -2923,6 +2952,7 @@ fn compute_card_placement(
         }
     };
     let backdrop = backdrop_rgb(app);
+    let rail = rail_rgb(app);
 
     // How far through its own arrival or departure each drawn row is, gathered
     // in layout order beside the cards themselves so the two lists index
@@ -3009,6 +3039,7 @@ fn compute_card_placement(
         bounds,
         bloom_floor,
         backdrop,
+        rail,
         font,
         title_metrics,
         tidbit_metrics,
@@ -3060,6 +3091,10 @@ fn build_cards_inner(
         bounds: placement.bounds,
         bloom_floor: placement.bloom_floor,
         backdrop: placement.backdrop,
+        // Only the sheet claims the cells the tree's lines cross. `shapes`
+        // leaves them transparent and the character rail shows through
+        // untouched, so it owes the tree nothing. See `draw_tree_joins`.
+        rail: (!app.sidebar_card_shapes).then_some(placement.rail),
         dissolve: sheet_dissolve(app, cell_size),
         host_terminal_kind: app.host_terminal_kind,
         host_graphics_is_local: app.host_graphics_is_local,
@@ -3265,6 +3300,10 @@ pub(crate) fn rasterise_card_scene(
         bounds: scene.bounds,
         bloom_floor: scene.bloom_floor,
         backdrop: scene.backdrop,
+        // A client rasterises shapes and never the sheet, so nothing it draws
+        // covers the tree's own rails: the character line is still on screen
+        // under the transparency and needs no join painted over it.
+        rail: None,
         dissolve: None,
         host_terminal_kind,
         host_graphics_is_local,
@@ -3406,6 +3445,10 @@ struct Rasteriser<'a> {
     bounds: Rect,
     bloom_floor: u16,
     backdrop: Rgb,
+    /// The ink the character tree draws its rails in, for the joins this image
+    /// has to carry itself. `Some` only on the path that paints the backdrop —
+    /// see [`Rasteriser::draw_tree_joins`] for why the two go together.
+    rail: Option<Rgb>,
     dissolve: Option<DissolveFrame<'a>>,
     /// The foreground client's detected host terminal, from `AppState`. See
     /// `crate::kitty_graphics::preferred_sidebar_pixel_format`.
@@ -3962,6 +4005,15 @@ impl Rasteriser<'_> {
         }
         bloom.composite(&mut canvas);
 
+        // Under the cards, so a join that runs a hair into the border it meets
+        // is covered by that border rather than drawn over it. `paint_backdrop`
+        // is the same condition as `self.rail` being `Some` and is repeated here
+        // because it is the *reason*: this image only owes the tree a join where
+        // it has painted over the tree's own line.
+        if let Some(rail) = self.rail.filter(|_| paint_backdrop) {
+            self.draw_tree_joins(&mut canvas, placed, &cards, rect, rail);
+        }
+
         for card in &cards {
             draw_card(&mut canvas, card, self.font);
             if card.content.lifted {
@@ -3971,6 +4023,81 @@ impl Rasteriser<'_> {
             }
         }
         Ok(canvas)
+    }
+
+    /// Carry the tree's own lines across the cells this image has claimed.
+    ///
+    /// # The bug this exists to fix
+    ///
+    /// The captain: *"the trunk line from firstmate does not visually touch the
+    /// firstmate root node"*, and the same gap at every second mate's connector.
+    ///
+    /// [`RAIL_INK_COLUMN_FRACTION`] put the card's border in the rail's *column*.
+    /// What is left is the two places the line and the card meet along that
+    /// column, and both are inside cells this image is opaque over:
+    ///
+    /// * **Down.** A card's children hang off its own border column, and the
+    ///   drawn card is shorter than the cells it was given — the leftover is the
+    ///   gutter that separates it from its neighbour. So between the card's last
+    ///   pixel row and the first cell the character rail can occupy there is a
+    ///   gutter of backdrop, and the trunk starts that far below the first mate.
+    /// * **Left.** A child's `├──` ends at the boundary of its card's first
+    ///   cell, and the border ink stands half a cell further in. The character
+    ///   renderer already draws a joint glyph in that cell, but the card's own
+    ///   character border is drawn over it and this backdrop is painted over
+    ///   that, so it has never reached a screen.
+    ///
+    /// Both are painted in the tree's own ink rather than the card's, because
+    /// what they continue is the line and not the card.
+    fn draw_tree_joins(
+        &self,
+        canvas: &mut Canvas,
+        placed: &[(Rect, CardContent)],
+        cards: &[PlacedCard<'_>],
+        rect: Rect,
+        rail: Rgb,
+    ) {
+        for (index, card) in cards.iter().enumerate() {
+            let Some((frame, content)) = placed.get(index) else {
+                continue;
+            };
+            let stroke = rail_stroke_px(self.cell_w);
+            let cell_left = f32::from(frame.x.saturating_sub(rect.x)) * self.cell_w;
+            let cell_bottom =
+                f32::from(frame.y.saturating_sub(rect.y).saturating_add(frame.height))
+                    * self.cell_h;
+            // The card is centred on the row its branch line lands on — see
+            // `connector_row_offset_px` — so its own middle *is* that row's
+            // middle, and the joint needs no second opinion about which row it
+            // is on.
+            let middle = card.rect.y + card.rect.h / 2.0;
+
+            if content.depth > 0 {
+                fill_px_rect(
+                    canvas,
+                    (cell_left, middle - stroke / 2.0),
+                    (card.rect.x + stroke, middle + stroke / 2.0),
+                    rail,
+                );
+            }
+            // Something hangs off this card exactly when the next row is drawn
+            // further in, which is how the walk emits a subtree — the pixel twin
+            // of `super::row_opens_a_branch`.
+            if placed
+                .get(index.saturating_add(1))
+                .is_some_and(|(next, _)| next.x > frame.x)
+            {
+                fill_px_rect(
+                    canvas,
+                    (
+                        card.rect.x - stroke / 2.0,
+                        card.rect.y + card.rect.h - stroke,
+                    ),
+                    (card.rect.x + stroke / 2.0, cell_bottom),
+                    rail,
+                );
+            }
+        }
     }
 
     /// One card's rounded rect, in the coordinates of an image covering `rect`.
@@ -4062,6 +4189,9 @@ impl Rasteriser<'_> {
         self.backdrop.0.hash(hasher);
         self.backdrop.1.hash(hasher);
         self.backdrop.2.hash(hasher);
+        // The tree's joins are drawn in it, so a theme change that moves it has
+        // to redraw the sheet exactly as one that moves the backdrop does.
+        self.rail.hash(hasher);
     }
 }
 
@@ -4207,6 +4337,32 @@ fn fill_row_backdrop(
     for y in y0..y1 {
         for x in x0..x1 {
             sheet.blend(x, y, backdrop, 1.0);
+        }
+    }
+}
+
+/// Paint an axis-aligned rectangle given in pixels, edges included at whatever
+/// fraction of a pixel they cover.
+///
+/// The tree's joins are fractions of a cell wide and land on sub-pixel bounds,
+/// so a whole-pixel fill would make one of them a pixel thicker than the rail it
+/// continues on some cell sizes and a pixel thinner on others.
+fn fill_px_rect(canvas: &mut Canvas, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ink: Rgb) {
+    if !(x1 > x0 && y1 > y0) {
+        return;
+    }
+    let first = |v: f32| v.floor().max(0.0) as u32;
+    let last = |v: f32, limit: u32| (v.ceil().max(0.0) as u32).min(limit);
+    for y in first(y0)..last(y1, canvas.height()) {
+        let cover_y = ((y as f32 + 1.0).min(y1) - (y as f32).max(y0)).clamp(0.0, 1.0);
+        if cover_y <= 0.0 {
+            continue;
+        }
+        for x in first(x0)..last(x1, canvas.width()) {
+            let cover_x = ((x as f32 + 1.0).min(x1) - (x as f32).max(x0)).clamp(0.0, 1.0);
+            if cover_x > 0.0 {
+                canvas.blend(x, y, ink, cover_x * cover_y);
+            }
         }
     }
 }
@@ -11427,3 +11583,176 @@ mod cards_breathe_and_wash {
 // They reuse the crate's own test fixtures (tests::pixel_fleet_app, 42-column
 // sidebar_rect, 10x21 px cell) and the real build_cards() path, so what they
 // measure is the actual PNG bytes the server puts on the wire.
+
+/// **The tree's lines reach the cards they join.**
+///
+/// The captain, on the fleet he actually runs: *"the trunk line from firstmate
+/// does not visually touch the firstmate root node"*, and the same gap where
+/// every second mate's connector arrives at its card.
+///
+/// Both are the sheet's doing rather than the tree's. The character renderer
+/// draws the whole line — [`RAIL_INK_COLUMN_FRACTION`] already put it in the
+/// right column — but the sheet is opaque over every cell a row owns, so the
+/// two stretches of that line which cross a card's own cells are painted over:
+/// the branch leaving a parent, which runs down the parent's own border column,
+/// and the last half column of a child's connector, which runs into the border
+/// it points at. [`Rasteriser::draw_tree_joins`] is what puts them back, and
+/// this is read off the published pixels rather than off that function.
+#[cfg(test)]
+mod the_tree_lines_reach_the_cards_they_join {
+    use super::tests::{sidebar_rect, three_rank_pixel_app};
+    use super::*;
+
+    /// The captain's own cell, and the one every geometry constant here was
+    /// measured against.
+    const CELL: (u32, u32) = (10, 21);
+
+    /// One published sheet, decoded, with everything needed to ask a question
+    /// about a pixel of it.
+    struct Sheet {
+        origin: Rect,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        backdrop: Rgb,
+    }
+
+    impl Sheet {
+        /// Whether anything was drawn at this pixel beyond the ground the sheet
+        /// lays down over a row's cells. The ground is the *whole* question: a
+        /// gap in the tree is exactly a run of pixels where the backdrop is all
+        /// there is.
+        fn inked(&self, x: u32, y: u32) -> bool {
+            if x >= self.width || y >= self.height {
+                return false;
+            }
+            let at = ((y * self.width + x) * 4) as usize;
+            let (r, g, b, a) = (
+                self.pixels[at],
+                self.pixels[at + 1],
+                self.pixels[at + 2],
+                self.pixels[at + 3],
+            );
+            a > 0
+                && (r.abs_diff(self.backdrop.0) as u16
+                    + g.abs_diff(self.backdrop.1) as u16
+                    + b.abs_diff(self.backdrop.2) as u16)
+                    > 12
+        }
+
+        /// The pixel column a rail's ink stands in for a card at `frame`, and
+        /// the pixel rows that card's cells cover.
+        fn rail(&self, frame: Rect) -> (u32, u32, u32, u32) {
+            let left = u32::from(frame.x.saturating_sub(self.origin.x)) * CELL.0;
+            let top = u32::from(frame.y.saturating_sub(self.origin.y)) * CELL.1;
+            let ink = left + (CELL.0 as f32 * RAIL_INK_COLUMN_FRACTION) as u32;
+            (left, ink, top, top + u32::from(frame.height) * CELL.1)
+        }
+
+        /// The pixel row the branch line lands on: the middle of the card, which
+        /// is the middle of the row its connector is drawn on. Mirrors
+        /// `WorkspaceCardArea::connector_y`.
+        fn connector_row(&self, frame: Rect) -> u32 {
+            let top = u32::from(frame.y.saturating_sub(self.origin.y)) * CELL.1;
+            top + u32::from((frame.height.saturating_sub(1)) / 2) * CELL.1 + CELL.1 / 2
+        }
+    }
+
+    /// The sheet a fleet of three ranks publishes, and the frames it was drawn
+    /// for. `None` on a machine with no proportional face, where there is no
+    /// pixel path to read at all.
+    fn sheet() -> Option<(Sheet, Vec<Rect>)> {
+        let app = three_rank_pixel_app();
+        assert!(
+            !app.sidebar_card_shapes,
+            "the joins are the sheet's to draw, so this fixture must be on the sheet"
+        );
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let frames: Vec<Rect> = cards.iter().filter_map(|card| card.card_frame).collect();
+        assert!(frames.len() >= 3, "the fixture lost a rank: {frames:?}");
+        let CardsUpdate::Rebuilt(layers) =
+            build_cards(&app, &cards, rect, app.host_cell_size, &[]).update
+        else {
+            return None;
+        };
+        let layer = layers.into_iter().next()?;
+        let decoder = png::Decoder::new(layer.layer.data.as_slice());
+        let mut reader = decoder.read_info().expect("a layer that is not a PNG");
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut pixels).expect("a PNG with no frame");
+        pixels.truncate(info.buffer_size());
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        Some((
+            Sheet {
+                origin: layer.rect,
+                width: info.width,
+                height: info.height,
+                pixels,
+                backdrop: backdrop_rgb(&app),
+            },
+            frames,
+        ))
+    }
+
+    /// **The trunk touches the first mate.** From the row the first mate's own
+    /// branch line lands on, straight down to the foot of the cells it was
+    /// given, its border column is inked with nothing missing — so the character
+    /// rail that picks the line up on the next row starts where the card ends
+    /// and not a gutter below it.
+    ///
+    /// Every pixel row, not the endpoints: the bug was a run of six clear pixels
+    /// between two inked ones, which an endpoint check passes.
+    #[test]
+    fn the_trunk_leaves_the_first_mates_card_with_no_gap_under_it() {
+        let Some((sheet, frames)) = sheet() else {
+            return;
+        };
+        let first_mate = frames[0];
+        let (_, ink, _, bottom) = sheet.rail(first_mate);
+        for y in sheet.connector_row(first_mate)..bottom {
+            assert!(
+                sheet.inked(ink, y) || sheet.inked(ink.saturating_sub(1), y),
+                "the trunk is broken at pixel row {y} of the first mate's own cells"
+            );
+        }
+    }
+
+    /// **A connector arrives at the border it points at.** The `├──` ends at the
+    /// boundary of the card's first cell and the border ink stands half a cell
+    /// further in; the half column between them is inside the sheet, and it was
+    /// backdrop.
+    #[test]
+    fn a_connector_crosses_the_half_column_to_the_border_it_points_at() {
+        let Some((sheet, frames)) = sheet() else {
+            return;
+        };
+        for frame in frames.iter().skip(1) {
+            let (left, ink, ..) = sheet.rail(*frame);
+            let row = sheet.connector_row(*frame);
+            for x in left..ink {
+                assert!(
+                    sheet.inked(x, row),
+                    "the connector stops at pixel column {x} instead of reaching \
+                     the card's border at {ink}"
+                );
+            }
+        }
+    }
+
+    /// And nothing is drawn where no line goes. A card with nothing under it
+    /// keeps its gutter clear — otherwise the deepest card in every group would
+    /// trail a stub into the row below it.
+    #[test]
+    fn a_card_with_nothing_under_it_grows_no_stub() {
+        let Some((sheet, frames)) = sheet() else {
+            return;
+        };
+        let leaf = *frames.last().expect("the fixture drew no cards");
+        let (_, ink, _, bottom) = sheet.rail(leaf);
+        assert!(
+            !sheet.inked(ink, bottom - 1),
+            "the last card in the tree left a rail hanging out of its bottom"
+        );
+    }
+}
