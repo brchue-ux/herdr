@@ -141,6 +141,16 @@ Examples:
 - Sidebar layout, token placement, colors, selection, modals, mouse/viewport state: TUI/client.
 - Workspace/tab/pane remain shared session organization for now, but avoid making them mandatory identity for unrelated runtime features.
 
+The same boundary applies to *host side effects*, not just to data. `App` is
+constructed server-side (`src/server/headless.rs`), so any `crate::platform::`
+call reached from app code runs on the server — which under `herdr --remote` is
+not the machine the user is sitting at. Clipboard, sound, desktop
+notifications, window title, and input-source switching all belong to the
+client. The established pattern is a `local_*` flag on `App`/`AppState` that the
+headless server clears, plus an `AppEvent` the server forwards as a
+`ServerMessage`; grep `local_clipboard_reads` for a request/response pair and
+`local_input_source_switch` for a one-way one.
+
 ## Maintainer Workflow
 
 This section applies only to verified maintainers as defined under Scope and

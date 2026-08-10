@@ -2191,6 +2191,31 @@ impl HeadlessServer {
                 }
                 true
             }
+            AppEvent::ClipboardRead {
+                source_id,
+                request_id,
+            } => {
+                // Only the machine the user copied on can answer this, and that
+                // is the client, not this process — see
+                // `ServerMessage::RequestClipboardText`. `source_id` is the
+                // client id the shortcut arrived on, so the answer comes from
+                // the same keyboard that asked rather than from whichever
+                // client happens to be in the foreground.
+                let (source_id, request_id) = (*source_id, *request_id);
+                if self.send_to_client(
+                    source_id,
+                    ServerMessage::RequestClipboardText { request_id },
+                ) {
+                    return false;
+                }
+                // No client to ask: an API-injected key, or a client that left
+                // between the keypress and here. The server's own clipboard is
+                // then the only one in play, which is also what herdr did
+                // before clipboard reads crossed the wire at all.
+                let text = crate::platform::read_clipboard_text();
+                self.app
+                    .apply_clipboard_read_response(source_id, request_id, text)
+            }
             AppEvent::PrefixInputSource { active } => {
                 // Input-source switching is a client-local host side effect; forward it to the
                 // foreground client (which owns the real TIS switch + run-loop pump), like clipboard.
@@ -3088,6 +3113,20 @@ impl HeadlessServer {
                         true
                     }
                 }
+            }
+            ServerEvent::ClientClipboardText {
+                client_id,
+                request_id,
+                text,
+            } => {
+                debug!(
+                    client_id,
+                    request_id,
+                    len = text.as_ref().map_or(0, String::len),
+                    "client clipboard text received"
+                );
+                self.app
+                    .apply_clipboard_read_response(client_id, request_id, text)
             }
             ServerEvent::ClientResize {
                 client_id,
@@ -5175,9 +5214,13 @@ pub fn run_server() -> io::Result<()> {
         // as ServerMessage::Notify instead of emitted by the server process.
         // The prefix input-source switch is likewise forwarded to the foreground
         // client (ServerMessage::PrefixInputSource), never applied in-process.
+        // Modal paste reads are asked of the client that pressed the shortcut
+        // (ServerMessage::RequestClipboardText): the server's own clipboard is
+        // not the one the user copied on once the two are different machines.
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
+        app.local_clipboard_reads = false;
 
         // Create the headless server.
         let mut server = match HeadlessServer::new(
@@ -5283,6 +5326,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
+        app.local_clipboard_reads = false;
         crate::server::handoff::report_restored(&mut received.stream)?;
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(
@@ -5422,6 +5466,7 @@ mod tests {
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
+        app.local_clipboard_reads = false;
 
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}",
@@ -11402,6 +11447,104 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "background client should not receive clipboard writes"
+        );
+    }
+
+    /// The regression this guards: `herdr --remote` runs the app — and every
+    /// modal text input with it — on the far host, while the keyboard and the
+    /// clipboard the user just copied into are on the near one. A modal paste
+    /// used to be answered inline from `platform::read_clipboard_text()`, which
+    /// in this process reads the *server's* clipboard. Nothing crossed the wire
+    /// at all, so the two clipboards being different was unobservable and the
+    /// user got the wrong machine's text (or, far more often, nothing).
+    ///
+    /// The two clipboards are deliberately different here: this test answers as
+    /// the client with a value the server has no way to produce, and asserts
+    /// that value is what the modal receives — and that the keypress alone,
+    /// before any answer, pastes nothing.
+    #[test]
+    fn modal_paste_takes_the_clients_clipboard_not_the_servers() {
+        let mut server = test_headless_server();
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            7,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                7,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(7);
+        server.sync_foreground_client_state();
+
+        server.app.state.mode = crate::app::state::Mode::RenameWorkspace;
+        server.app.state.name_input = String::new();
+        server.app.state.name_input_replace_on_type = false;
+
+        // Ctrl+V as a raw key: the shape the host terminal delivers when it is
+        // not sending a bracketed paste, which is the only path that ever needs
+        // to read a clipboard.
+        server.app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+        server.drain_all_internal_events_with_forwarding();
+
+        assert_eq!(
+            server.app.state.name_input, "",
+            "the server must not answer a modal paste from its own clipboard"
+        );
+
+        let request_id = match read_server_message(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("client should be asked for its clipboard"),
+        ) {
+            ServerMessage::RequestClipboardText { request_id } => request_id,
+            other => panic!("expected a clipboard text request, got {other:?}"),
+        };
+
+        assert!(
+            server.handle_server_event(ServerEvent::ClientClipboardText {
+                client_id: 7,
+                request_id,
+                text: Some("copied on the client".to_owned()),
+            })
+        );
+        assert_eq!(server.app.state.name_input, "copied on the client");
+    }
+
+    /// Keys that did not arrive on a client connection — API-injected input, or
+    /// a client that disconnected between the keypress and the forwarding drain
+    /// — have no remote clipboard to ask, so the server's own is the only one
+    /// in play. That is also what herdr did before any of this crossed the wire.
+    #[test]
+    fn a_modal_paste_with_no_client_to_ask_falls_back_to_this_process() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::state::Mode::RenameWorkspace;
+        server.app.state.name_input = String::new();
+
+        server.app.route_client_events_from(
+            7,
+            crate::raw_input::parse_raw_input_bytes_sync(&[0x16]),
+            false,
+        );
+        // Client 7 was never registered, so the request cannot be delivered and
+        // the local read answers it instead. Whatever this machine's clipboard
+        // holds is not assertable here; that the request is retired rather than
+        // left dangling is.
+        server.drain_all_internal_events_with_forwarding();
+
+        assert!(
+            !server
+                .app
+                .apply_clipboard_read_response(7, 0, Some("late".to_owned())),
+            "the local fallback already answered request 0, so a later answer must not apply"
         );
     }
 

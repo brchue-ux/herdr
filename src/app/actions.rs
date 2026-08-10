@@ -2999,6 +2999,12 @@ impl AppState {
             // or via HeadlessServer forwarding to the foreground client (server); never touch
             // AppState. Kept for AppEvent exhaustiveness.
             AppEvent::ClipboardWrite { .. } => Vec::new(),
+            // Only ever emitted by the headless server's App, and answered by
+            // HeadlessServer forwarding it to the client that asked. Reaching
+            // here means an App-internal drain consumed it first, which leaves
+            // the modal unpasted rather than pasting the wrong machine's
+            // clipboard — see App::request_modal_clipboard_paste.
+            AppEvent::ClipboardRead { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
             AppEvent::CommandAcknowledged { .. } => Vec::new(),
             AppEvent::PaneIssueDetected {
