@@ -318,6 +318,9 @@ impl App {
             crate::raw_input::RawInputEvent::KittyGraphicsCapability(confirmed) => {
                 self.update_kitty_graphics_capability(confirmed)
             }
+            crate::raw_input::RawInputEvent::HostTerminalIdentity(identity) => {
+                self.update_host_terminal_identity(&identity)
+            }
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
         self.sync_prefix_input_source(previous_mode);

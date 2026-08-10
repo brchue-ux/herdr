@@ -1553,6 +1553,9 @@ async fn run_client_loop(
 
     if state.attach_escape.is_none() && state.kitty_graphics_enabled {
         query_kitty_graphics_capability();
+        if should_query_host_terminal_version() {
+            query_host_terminal_version();
+        }
     }
 
     // Spawn the resize poller thread.
@@ -2660,6 +2663,31 @@ fn write_kitty_graphics_capability_query(mut writer: impl io::Write) -> io::Resu
     writer.flush()
 }
 
+fn query_host_terminal_version() {
+    let _ = write_host_terminal_version_query(io::stdout());
+}
+
+/// Asked on the same round trip as the Kitty capability probe beside it, and
+/// under the same conditions, because it answers the same class of question —
+/// what may be drawn on this screen — and because the reply framing both rely
+/// on is already armed at this moment by the color query.
+///
+/// Windows is excluded for the reason `should_query_host_terminal_theme` is:
+/// the Windows client parses its own stdin into `ClientInputEvent`s, which
+/// have no arm for a host reply, so an answer would be discarded before it
+/// could reach the server. Asking a question whose answer cannot be delivered
+/// is just noise on the wire.
+fn should_query_host_terminal_version() -> bool {
+    !cfg!(windows)
+}
+
+fn write_host_terminal_version_query(mut writer: impl io::Write) -> io::Result<()> {
+    writer.write_all(
+        crate::host_terminal_identity::HOST_TERMINAL_VERSION_QUERY_SEQUENCE.as_bytes(),
+    )?;
+    writer.flush()
+}
+
 /// XTWINOPS request for the host terminal cell size in pixels.
 const HOST_CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
 
@@ -3085,6 +3113,19 @@ mod tests {
         write_host_cell_size_query(&mut output).unwrap();
 
         assert_eq!(output, b"\x1b[16t");
+    }
+
+    #[test]
+    fn write_host_terminal_version_query_emits_xtversion_request() {
+        let mut output = Vec::new();
+        write_host_terminal_version_query(&mut output).unwrap();
+
+        assert_eq!(output, b"\x1b[>q");
+    }
+
+    #[test]
+    fn host_terminal_version_query_is_disabled_on_windows() {
+        assert_eq!(should_query_host_terminal_version(), !cfg!(windows));
     }
 
     /// The ioctl is used when it is all there is, and only then.

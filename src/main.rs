@@ -80,6 +80,7 @@ mod ghostty;
 #[cfg(unix)]
 mod handoff_metadata;
 mod handoff_runtime;
+mod host_terminal_identity;
 mod input;
 mod integration;
 mod ipc;

@@ -17,6 +17,35 @@ impl App {
         let _ = std::io::stdout().flush();
     }
 
+    pub(super) fn query_host_terminal_version(&self) {
+        use std::io::Write;
+
+        let _ = std::io::stdout().write_all(
+            crate::host_terminal_identity::HOST_TERMINAL_VERSION_QUERY_SEQUENCE.as_bytes(),
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Reclassifies the host terminal from its own XTVERSION answer, which
+    /// outranks the environment read done at construction — see
+    /// `crate::kitty_graphics::host_terminal_kind_for_identity`.
+    pub(super) fn update_host_terminal_identity(
+        &mut self,
+        identity: &crate::host_terminal_identity::HostTerminalIdentity,
+    ) -> bool {
+        let kind = crate::kitty_graphics::host_terminal_kind_for_identity(identity.name());
+        let previous_kind = self.state.host_terminal_kind;
+        tracing::info!(
+            name = identity.name(),
+            version = identity.version().unwrap_or("unreported"),
+            classified_kind = ?kind,
+            ?previous_kind,
+            "host terminal identified in band"
+        );
+        self.state.host_terminal_kind = kind;
+        previous_kind != kind
+    }
+
     /// Records that the real outer terminal confirmed Kitty Graphics Protocol
     /// support. Monotonic: once confirmed, stays confirmed for the session.
     pub(super) fn update_kitty_graphics_capability(&mut self, confirmed: bool) -> bool {

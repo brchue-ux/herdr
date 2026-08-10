@@ -1192,6 +1192,11 @@ impl App {
         self.query_host_terminal_theme();
         if self.state.kitty_graphics_enabled {
             self.query_kitty_graphics_capability();
+            // Monolithic mode read the environment at construction, which is
+            // right when this process shares a machine with its terminal and
+            // wrong the moment somebody runs `herdr --no-session` over SSH.
+            // The terminal's own answer settles it either way.
+            self.query_host_terminal_version();
         }
 
         let mut needs_render = true;
@@ -2134,6 +2139,13 @@ impl App {
                 // is drawn on. The foreground client's own report is the only
                 // one that speaks for the screen.
                 crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => {}
+                // Same reasoning, and the same authority: which terminal is on
+                // the other end is a per-client fact, so the connection that
+                // received the answer records it
+                // (`ClientConnection::update_host_terminal_identity_from_events`)
+                // and the foreground client's classification is what reaches
+                // `AppState`.
+                crate::raw_input::RawInputEvent::HostTerminalIdentity(_) => {}
                 crate::raw_input::RawInputEvent::KittyGraphicsCapability(confirmed) => {
                     if apply_host_terminal_theme {
                         self.update_kitty_graphics_capability(confirmed);

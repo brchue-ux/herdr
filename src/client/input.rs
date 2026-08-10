@@ -482,6 +482,10 @@ fn windows_client_input_event_from_raw(
         // cell size on the next resize rather than as an input event.
         | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
         | crate::raw_input::RawInputEvent::KittyGraphicsCapability(_)
+        // Never produced on this path: the Windows client is not asked to send
+        // the XTVERSION query, precisely because there is no arm here to carry
+        // an answer back. See `client::should_query_host_terminal_version`.
+        | crate::raw_input::RawInputEvent::HostTerminalIdentity(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
 }

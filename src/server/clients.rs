@@ -53,9 +53,16 @@ pub(crate) struct ClientConnection {
     pub(crate) host_terminal_appearance_explicit: bool,
     /// Last reported focus state for this client's outer terminal.
     pub(crate) outer_terminal_focus: Option<bool>,
-    /// This client's own host terminal, classified from its attach-time
-    /// host-capability probe. See `crate::protocol::HostTerminalReport`.
+    /// This client's own host terminal, classified from whichever source has
+    /// spoken: the terminal's own XTVERSION answer once it arrives, and until
+    /// then the attach-time environment probe
+    /// (`crate::protocol::HostTerminalReport`). See
+    /// [`ClientConnection::update_host_terminal_identity_from_events`].
     pub(crate) host_terminal_kind: crate::kitty_graphics::HostTerminalKind,
+    /// What this client's terminal called itself, if it answered XTVERSION.
+    /// `None` for a terminal that does not implement the query — which is the
+    /// case the environment probe still has to cover.
+    pub(crate) host_terminal_identity: Option<crate::host_terminal_identity::HostTerminalIdentity>,
     /// Whether this client positively established that it shares a
     /// filesystem with its terminal.
     pub(crate) host_graphics_is_local: bool,
@@ -160,6 +167,7 @@ impl ClientConnection {
             host_terminal_theme,
             outer_terminal_focus,
             host_terminal_kind: crate::kitty_graphics::HostTerminalKind::default(),
+            host_terminal_identity: None,
             host_graphics_is_local: false,
             kitty_graphics_capability_confirmed: false,
             wants_client_rasterized_cards: false,
@@ -212,12 +220,22 @@ impl ClientConnection {
     /// / `host_graphics_locality_for_env` — the same pure rule the monolithic
     /// (`--no-session`) path applies to its own process environment — so a
     /// client's reported facts and a live env read are judged identically.
+    ///
+    /// This is the *fallback* source for the terminal kind. It runs at Hello,
+    /// before the terminal has had time to answer XTVERSION, so it is what
+    /// herdr goes on until the reply arrives — and all there ever is for a
+    /// terminal that does not implement the query. Once the terminal has named
+    /// itself, its own answer stands and this cannot demote it back to an
+    /// environment guess.
     pub(crate) fn set_host_terminal(&mut self, report: &crate::protocol::HostTerminalReport) {
-        self.host_terminal_kind = crate::kitty_graphics::host_terminal_kind_for_env(
+        let env_kind = crate::kitty_graphics::host_terminal_kind_for_env(
             report.term_program.as_deref(),
             report.term.as_deref(),
             report.kitty_window_id_set,
         );
+        if self.host_terminal_identity.is_none() {
+            self.host_terminal_kind = env_kind;
+        }
         self.host_graphics_is_local = report.is_local;
         tracing::info!(
             term_program = ?report.term_program,
@@ -227,6 +245,42 @@ impl ClientConnection {
             classified_kind = ?self.host_terminal_kind,
             "client host-capability probe classified"
         );
+    }
+
+    /// Adopts an XTVERSION answer from this client's input stream, replacing
+    /// whatever the environment guessed. Returns whether the terminal kind
+    /// changed as a result.
+    ///
+    /// The answer came down the pty rather than out of an environment
+    /// variable, which is the whole point: an SSH-attached client's
+    /// environment describes the machine herdr runs on, not the terminal it
+    /// draws on, and that is why every remote client used to classify `Other`
+    /// however real its terminal was. See `crate::host_terminal_identity`.
+    pub(crate) fn update_host_terminal_identity_from_events(
+        &mut self,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> bool {
+        let Some(identity) = events.iter().rev().find_map(|event| match event {
+            crate::raw_input::RawInputEvent::HostTerminalIdentity(identity) => Some(identity),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if self.host_terminal_identity.as_ref() == Some(identity) {
+            return false;
+        }
+        let kind = crate::kitty_graphics::host_terminal_kind_for_identity(identity.name());
+        let previous_kind = self.host_terminal_kind;
+        tracing::info!(
+            name = identity.name(),
+            version = identity.version().unwrap_or("unreported"),
+            classified_kind = ?kind,
+            ?previous_kind,
+            "client host terminal identified in band"
+        );
+        self.host_terminal_identity = Some(identity.clone());
+        self.host_terminal_kind = kind;
+        previous_kind != kind
     }
 
     pub(crate) fn deferred_render(&self) -> DeferredRender {
