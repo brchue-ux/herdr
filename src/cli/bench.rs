@@ -29,6 +29,8 @@
 //! it counts tiles the compute pass really composed, and a "GPU" run that
 //! composed none did not use one.
 
+mod combined;
+
 use std::time::{Duration, Instant};
 
 use crate::ui::sidebar::image_card::bench as workload;
@@ -55,8 +57,17 @@ pub(super) fn run_bench_command(args: &[String]) -> std::io::Result<i32> {
                 Ok(2)
             }
         },
+        Some("combined") => match combined::parse(&args[1..]) {
+            Ok(options) => Ok(combined::run(options)),
+            Err(message) => {
+                eprintln!("error: {message}");
+                eprintln!("{}", combined::USAGE);
+                Ok(2)
+            }
+        },
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
+            println!("{}", combined::USAGE);
             Ok(0)
         }
         Some(other) => {
@@ -110,16 +121,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--panel-cols" => fleet.panel_cols = number(value(args, &mut index)?, flag)?,
             "--cell-width" => fleet.cell.width_px = number(value(args, &mut index)?, flag)?,
             "--cell-height" => fleet.cell.height_px = number(value(args, &mut index)?, flag)?,
-            "--backend" => {
-                backends = match value(args, &mut index)? {
-                    "cpu" => vec![Backend::Cpu],
-                    "gpu" => vec![Backend::Gpu],
-                    "both" => vec![Backend::Cpu, Backend::Gpu],
-                    other => {
-                        return Err(format!("--backend must be cpu, gpu or both, not {other}"))
-                    }
-                }
-            }
+            "--backend" => backends = self::backends(value(args, &mut index)?)?,
             other => return Err(format!("unknown option {other}")),
         }
         index += 1;
@@ -137,6 +139,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
         warmup,
         backends,
     })
+}
+
+/// `--backend`'s value, shared by every target so the flag means one thing.
+fn backends(raw: &str) -> Result<Vec<Backend>, String> {
+    match raw {
+        "cpu" => Ok(vec![Backend::Cpu]),
+        "gpu" => Ok(vec![Backend::Gpu]),
+        "both" => Ok(vec![Backend::Cpu, Backend::Gpu]),
+        other => Err(format!("--backend must be cpu, gpu or both, not {other}")),
+    }
 }
 
 /// The value after the flag at `index`, advancing `index` onto it.

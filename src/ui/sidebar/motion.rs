@@ -160,7 +160,19 @@ pub(crate) fn cell_offsets(offsets: &[(f32, f32)], cell_w: f32, cell_h: f32) -> 
 /// the honest answer for a panel with no animation configured and for a row the
 /// engine has already retired. A missing element must never make a card jump.
 pub(crate) fn settle(app: &AppState, id: &ElementId) -> f32 {
-    match app.anim.frame(id, None) {
+    settle_in(&app.anim, id)
+}
+
+/// [`settle`] against the engine alone.
+///
+/// Split out because the reading is a fact about the animator and nothing else,
+/// and `herdr bench combined` drives an `Animator` directly — it has no
+/// `AppState`, since `AppState::test_new` is `#[cfg(test)]` and a shipped
+/// binary cannot stand a fleet up. Keeping one body means the benchmark's rows
+/// slide off exactly the reading the panel's do, rather than off a copy of it
+/// that could drift.
+pub(crate) fn settle_in(anim: &crate::anim::Animator, id: &ElementId) -> f32 {
+    match anim.frame(id, None) {
         Some(frame) => match frame.phase {
             // A dismount's progress already counts down, so this is the same
             // reading in both directions.
