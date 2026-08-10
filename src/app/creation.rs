@@ -516,6 +516,14 @@ impl App {
                 &ws.id,
                 crate::ui::sidebar::space_tree_name(&self.state, ws_idx).as_deref(),
             ),
+            // Keyed by this pane's *own* handle, not by its owner: `owner`
+            // above says who this pane reports to, and this says what has
+            // reported to it.
+            absorbed: terminal
+                .agent_name
+                .as_deref()
+                .map(|name| self.state.residue.absorbed(name))
+                .unwrap_or(0),
             revision: terminal.revision,
         })
     }
@@ -577,6 +585,9 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            absorbed: crate::ui::sidebar::space_tree_name(&self.state, index)
+                .map(|name| self.state.residue.absorbed(&name))
+                .unwrap_or(0),
         }
     }
 }

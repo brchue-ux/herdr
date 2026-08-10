@@ -433,7 +433,15 @@ impl App {
             return encode_success(id, ResponseResult::Ok {});
         };
 
-        let _ = self.state.relation_signals.accept(
+        // Resolved before the carrier is moved into the signal, and only for
+        // the one kind that means it. `failed` is a different outcome and
+        // `idle` is not an outcome at all; neither is what the captain asked to
+        // be able to read off a resting card.
+        let absorbed_by = (kind == RelationSignalKind::Completed)
+            .then(|| self.absorbing_owner(&carrier))
+            .flatten();
+
+        let accepted = self.state.relation_signals.accept(
             &source,
             params.seq,
             kind,
@@ -441,7 +449,81 @@ impl App {
             ttl,
             std::time::Instant::now(),
         );
+
+        // A finished worker is one the mate above it has taken back, and the
+        // residue on that mate's card is what is left once this charge has
+        // arrived and expired.
+        //
+        // Counted for every report that is a *distinct event*, which is not the
+        // same set as the reports that get an animation:
+        //
+        // - `Coalesced` still counts. That rule bounds how many frames a
+        //   publisher can cost by refusing to restart a row's travel, and a
+        //   ring costs no frames. Two workers finishing in the same breath are
+        //   two workers.
+        // - `StaleSequence` must not. `seq` is what makes reporting idempotent
+        //   — "a report at or below the last accepted value is ignored, so
+        //   retries are safe" — and a retry that silently added a ring would
+        //   take that guarantee away from the one part of this report that is
+        //   not transient.
+        //
+        // No repaint is requested, for the same reason `accept` asks for none:
+        // the signal this rode in on arms the loop's own clock, and that clock
+        // paints the card the ring is on. The ring is in the card's signature,
+        // so the rebuild happens on the next frame the charge was already
+        // going to cost.
+        if !matches!(
+            accepted,
+            Err(crate::app::relation_signal::SignalDropped::StaleSequence)
+        ) {
+            if let Some(owner) = absorbed_by {
+                self.state.residue.absorb(&owner);
+            }
+        }
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Who takes the credit when `carrier` reports that it finished.
+    ///
+    /// The row *above* the one that finished, resolved through the exact rule
+    /// [`crate::app::agent_tree::resolve_owner`] already draws the tree with —
+    /// a published `owner` token, or the structural edge — so a ring can only
+    /// ever land on a mate the panel is really showing that worker under. A
+    /// publisher does not have to name the absorber a second time, and cannot
+    /// name one the tree disagrees with.
+    ///
+    /// Returns a tree *name*, which is what [`crate::app::residue`] is keyed
+    /// by; see its module doc for why an id would be the wrong handle.
+    fn absorbing_owner(&self, carrier: &CarrierId) -> Option<String> {
+        match carrier {
+            // A mate's own Space says who owns it with the same `owner` token
+            // a worker's pane uses, so a second mate finishing under a first
+            // mate rings the first mate's card by the same rule.
+            CarrierId::Workspace(workspace_id) => {
+                let index = self
+                    .state
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == *workspace_id)?;
+                crate::ui::sidebar::space_owner(&self.state, index)
+            }
+            CarrierId::Pane(public_pane_id) => {
+                let (ws_idx, pane_id) = self.parse_pane_id(public_pane_id)?;
+                let workspace = self.state.workspaces.get(ws_idx)?;
+                let pane = workspace.pane_state(pane_id)?;
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                crate::app::agent_tree::resolve_owner(
+                    terminal
+                        .metadata_tokens
+                        .values()
+                        .get(crate::app::agent_tree::OWNER_TOKEN)
+                        .map(String::as_str),
+                    terminal.created_by.as_ref(),
+                    &workspace.id,
+                    crate::ui::sidebar::space_tree_name(&self.state, ws_idx).as_deref(),
+                )
+            }
+        }
     }
 
     pub(super) fn handle_workspace_close(&mut self, id: String, target: WorkspaceTarget) -> String {
@@ -466,6 +548,8 @@ impl App {
             .unwrap_or_default();
         self.state.selected = index;
         self.state.close_selected_workspace();
+        // A mate that is gone keeps no residue; see `AppState::prune_residue`.
+        self.state.prune_residue();
         self.state.remove_plugin_pane_records(pane_ids);
         self.shutdown_detached_terminal_runtimes();
         self.emit_event(EventEnvelope {
@@ -1114,5 +1198,227 @@ mod tests {
         };
         assert_eq!(workspaces[0].workspace_id, moved_id);
         assert!(event_hub.events_after(0).is_empty());
+    }
+
+    /// A fleet reporting a finished worker is the whole input the residue has.
+    ///
+    /// Built the way `image_card::tests::three_rank_pixel_app` builds it — a
+    /// first mate, a second mate Space owning it, and a worker pane under the
+    /// second mate — because the credit runs through the *tree's* own owner
+    /// rule and a fixture that skips the tokens would be testing nothing.
+    fn fleet_with_a_worker() -> (App, String) {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.state.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+
+        let now = std::time::Instant::now();
+        app.state.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+        let worker_terminal = app.state.workspaces[1].tabs[0].panes[&worker_pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_agent_name("worker".to_string());
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("2ndmate-explore".to_string()),
+            )]),
+            None,
+            now,
+        );
+        let worker_id = app
+            .public_pane_id(1, worker_pane)
+            .expect("the worker pane has a public id");
+        (app, worker_id)
+    }
+
+    fn report(
+        app: &mut App,
+        kind: WorkspaceSignalKind,
+        from: &str,
+        seq: Option<u64>,
+    ) -> SuccessResponse {
+        let response = app.handle_workspace_report_signal(
+            "req".into(),
+            WorkspaceReportSignalParams {
+                source: "firstmate".into(),
+                kind,
+                from_workspace_id: Some(from.into()),
+                to_workspace_id: None,
+                seq,
+                ttl_ms: None,
+            },
+        );
+        serde_json::from_str(&response).expect("a signal report always answers success")
+    }
+
+    /// The credit follows the ownership tree, so the mate the worker is drawn
+    /// under is the mate that gets the ring — and nobody else does.
+    #[tokio::test]
+    async fn a_finished_worker_leaves_a_ring_on_the_mate_that_owns_it() {
+        let (mut app, worker_id) = fleet_with_a_worker();
+        assert_eq!(app.state.residue.absorbed("2ndmate-explore"), 0);
+
+        report(
+            &mut app,
+            WorkspaceSignalKind::Completed,
+            &worker_id,
+            Some(1),
+        );
+        report(
+            &mut app,
+            WorkspaceSignalKind::Completed,
+            &worker_id,
+            Some(2),
+        );
+
+        assert_eq!(app.state.residue.absorbed("2ndmate-explore"), 2);
+        assert_eq!(app.state.residue.rings("2ndmate-explore"), 2);
+        assert_eq!(
+            app.state.residue.absorbed("firstmate"),
+            0,
+            "the worker's grandparent took credit for work it did not absorb"
+        );
+        assert_eq!(
+            app.state.residue.absorbed("worker"),
+            0,
+            "the worker credited itself"
+        );
+    }
+
+    /// A second mate finishing its own charter rings the first mate, by the
+    /// same rule and with no second code path: a Space names its owner with the
+    /// token a pane uses.
+    #[tokio::test]
+    async fn a_mate_finishing_rings_the_mate_above_it() {
+        let (mut app, _) = fleet_with_a_worker();
+        let mate_id = app.public_workspace_id(1);
+
+        report(&mut app, WorkspaceSignalKind::Completed, &mate_id, Some(1));
+
+        assert_eq!(app.state.residue.absorbed("firstmate"), 1);
+    }
+
+    /// `seq` is what makes reporting idempotent, and the ring is the one part
+    /// of the report that is not transient — so a retry must not add one.
+    #[tokio::test]
+    async fn a_replayed_report_does_not_add_a_second_ring() {
+        let (mut app, worker_id) = fleet_with_a_worker();
+
+        report(
+            &mut app,
+            WorkspaceSignalKind::Completed,
+            &worker_id,
+            Some(7),
+        );
+        report(
+            &mut app,
+            WorkspaceSignalKind::Completed,
+            &worker_id,
+            Some(7),
+        );
+        report(
+            &mut app,
+            WorkspaceSignalKind::Completed,
+            &worker_id,
+            Some(3),
+        );
+
+        assert_eq!(app.state.residue.absorbed("2ndmate-explore"), 1);
+    }
+
+    /// Residue is what a mate *finished*. The other three kinds are different
+    /// facts and must leave nothing behind — `failed` most of all, since a card
+    /// that decorated failures the same way it decorates completions would be
+    /// actively misreporting the fleet.
+    #[tokio::test]
+    async fn only_a_completed_report_leaves_residue() {
+        for kind in [
+            WorkspaceSignalKind::Transfer,
+            WorkspaceSignalKind::Failed,
+            WorkspaceSignalKind::Idle,
+        ] {
+            let (mut app, worker_id) = fleet_with_a_worker();
+            // `transfer` carries on `to`, the others on `from`; either way the
+            // carrier is the worker's own row.
+            let response = app.handle_workspace_report_signal(
+                "req".into(),
+                WorkspaceReportSignalParams {
+                    source: "firstmate".into(),
+                    kind,
+                    from_workspace_id: Some(worker_id.clone()),
+                    to_workspace_id: Some(worker_id.clone()),
+                    seq: None,
+                    ttl_ms: None,
+                },
+            );
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                app.state.residue.absorbed("2ndmate-explore"),
+                0,
+                "a {kind:?} report left residue"
+            );
+        }
+    }
+
+    /// A worker nobody owns cannot ring anybody, and the report is still a
+    /// success — the same rule an unresolvable carrier already follows.
+    #[tokio::test]
+    async fn a_worker_with_no_owner_credits_nobody() {
+        let (mut app, worker_id) = fleet_with_a_worker();
+        let worker_terminal = {
+            let (ws_idx, pane_id) = app.parse_pane_id(&worker_id).unwrap();
+            app.state.workspaces[ws_idx].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone()
+        };
+        app.state
+            .terminals
+            .get_mut(&worker_terminal)
+            .unwrap()
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([("owner".to_string(), None)]),
+                None,
+                std::time::Instant::now(),
+            );
+
+        let success = report(&mut app, WorkspaceSignalKind::Completed, &worker_id, None);
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert!(app.state.residue.is_empty());
+    }
+
+    /// A mate that is gone keeps no residue, so a long-lived server's owner
+    /// budget belongs to the fleet that is running.
+    #[tokio::test]
+    async fn closing_a_mate_drops_its_residue() {
+        let (mut app, worker_id) = fleet_with_a_worker();
+        report(&mut app, WorkspaceSignalKind::Completed, &worker_id, None);
+        assert_eq!(app.state.residue.absorbed("2ndmate-explore"), 1);
+
+        let mate_id = app.public_workspace_id(1);
+        let response = app.handle_workspace_close(
+            "req".into(),
+            WorkspaceTarget {
+                workspace_id: mate_id,
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(app.state.residue.absorbed("2ndmate-explore"), 0);
     }
 }

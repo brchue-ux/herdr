@@ -895,6 +895,8 @@ If no native session reference is stored, the field is omitted.
 
 `agent.list` and `agent.get` also expose `relation` (`first_mate`, `second_mate`, or `worker`) and `owner` — the resolved place a pane's `owner` metadata token gives it in the fleet's ownership tree, the same tag-and-group projection the sidebar and the persistent background scene already draw. Both are omitted for a pane the tree draws no row for on its own, such as a mate's own driving pane, whose place is carried by its Space instead.
 
+`pane.get`, `pane.list`, `agent.get`, `agent.list`, `workspace.get`, and `workspace.list` expose `absorbed`: how many finished workers this mate has taken back. It is counted from the `completed` reports a fleet already sends with `workspace.report_signal`, credited to the `owner` the ownership tree resolves for the row that finished — so a worker's completion increments the mate it is drawn under, and a second mate's own completion increments the first mate above it. The count is idempotent under `seq`, so a retried report does not double it. It is omitted when zero, is not persisted across a cold restart, and is uncapped here even though the sidebar draws at most eight rings for it.
+
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
 
 ```json

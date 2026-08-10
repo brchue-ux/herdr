@@ -748,6 +748,7 @@ fn worktree_request_and_response_round_trip() {
                     checkout_path: "/worktrees/herdr/worktree-api".into(),
                     is_linked_worktree: true,
                 }),
+                absorbed: 0,
             },
             tab: TabInfo {
                 tab_id: "w_1:1".into(),
@@ -780,6 +781,7 @@ fn worktree_request_and_response_round_trip() {
                 agent_session: None,
                 scroll: None,
                 activity: None,
+                absorbed: 0,
                 revision: 0,
                 created_by: None,
                 owner: None,
@@ -839,6 +841,7 @@ fn worktree_lifecycle_events_round_trip() {
             checkout_path: "/worktrees/herdr/worktree-api".into(),
             is_linked_worktree: true,
         }),
+        absorbed: 0,
     };
     let worktree = WorktreeInfo {
         path: "/worktrees/herdr/worktree-api".into(),
@@ -1240,6 +1243,7 @@ fn create_response_round_trips_with_root_pane() {
                 agent_session: None,
                 scroll: None,
                 activity: None,
+                absorbed: 0,
                 revision: 0,
                 created_by: None,
                 owner: None,

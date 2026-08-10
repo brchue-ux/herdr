@@ -408,6 +408,7 @@ impl App {
             .get(&pane_id)
             .map(|relation| relation.as_str().to_string());
         let owner = pane.owner.clone();
+        let absorbed = pane.absorbed;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -422,6 +423,7 @@ impl App {
             tokens: pane.tokens,
             relation,
             owner,
+            absorbed,
             agent_session: pane.agent_session,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,

@@ -863,7 +863,7 @@ fn resolve_entry_owner(
 /// A Space publishes this with `workspace report-metadata --token owner=...`,
 /// the same token a pane uses. Nothing declares it by default, so a fleet that
 /// publishes nothing gets the flat list it has always had.
-fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
+pub(crate) fn space_owner(app: &AppState, ws_idx: usize) -> Option<String> {
     let ws = app.workspaces.get(ws_idx)?;
     ws.metadata_tokens
         .values()

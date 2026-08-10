@@ -679,6 +679,7 @@ mod tests {
             agent_session: None,
             scroll,
             activity: None,
+            absorbed: 0,
             revision: 0,
             created_by: None,
             owner: None,
