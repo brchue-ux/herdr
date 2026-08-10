@@ -17,7 +17,10 @@
 //! carries lifecycle stage, intensity carries severity
 //! (`data/decisions/2026-08-04-scaling-and-storyboard-answers.md` section 5), resolved through
 //! the exact same [`crate::anim::cell::signal_ink`] every sidebar card already uses. This module
-//! only chooses the surface those channels render onto.
+//! only chooses the surface those channels render onto. The one exemption is the sun, which
+//! holds a fixed warm star colour ([`SUN_STAR_RGB01`]) instead of resolving through that channel
+//! — see `data/decisions/2026-08-10-sun-fixed-star-color.md` (firstmate home) for why a star is
+//! not severity-coded. Planets and moons are unaffected.
 //!
 //! An impact is a solid asteroid, not a glowing meteor — no tail, realistic rock-coloured, sized
 //! by severity — that leaves a crater on the struck moon fading gradually over
@@ -43,6 +46,20 @@ use crate::anim::cell::{signal_ink, Severity};
 /// gets its own fixed surface for [`signal_ink`] to measure severity's lightness distance
 /// against.
 const SPACE_SURFACE: (u8, u8, u8) = (6, 8, 16);
+
+/// The sun's fixed star colour, as `0.0..=1.0` floats — a warm white with a yellow cast, the
+/// colour a G-type star reads as in the realistic space photography this scene is styled after
+/// (`data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`, firstmate home).
+///
+/// Deliberately *not* [`severity_rgb01`]: the captain's ruling in
+/// `data/decisions/2026-08-10-sun-fixed-star-color.md` is that a star does not change colour to
+/// match whatever a planet near it is doing, so tying the sun to the shared hue=stage channel
+/// made an idle fleet render a green sun beside an identically green planet. This is a sun-only
+/// exemption — planets and moons keep hue=stage/intensity=severity exactly as before.
+///
+/// Kept slightly under pure white so [`shade_surface`]'s self-luminous limb brightening (up to
+/// `1.05`) still has headroom to lift the core rather than clipping the whole disk flat.
+const SUN_STAR_RGB01: (f32, f32, f32) = (1.0, 0.945, 0.835);
 
 /// Cap on how many row bands a frame's background pass splits across.
 ///
@@ -441,7 +458,14 @@ fn draw_body(
     light_dir: (f32, f32, f32),
 ) {
     let glow = radius * if self_luminous { 2.6 } else { 1.4 };
-    let base = severity_rgb01(hue, severity);
+    // The sun is a star, not a severity-coded body: it holds one fixed warm colour regardless of
+    // fleet state, while every other body still resolves through the shared hue/severity channel.
+    // See [`SUN_STAR_RGB01`].
+    let base = if self_luminous {
+        SUN_STAR_RGB01
+    } else {
+        severity_rgb01(hue, severity)
+    };
 
     let x0 = (center.0 - glow).floor().max(0.0) as i32;
     let x1 = (center.0 + glow).ceil().min(width as f32) as i32;
@@ -966,6 +990,101 @@ mod tests {
             hue: 41.0,
             severity: Severity::Clear,
         }
+    }
+
+    /// Hue of the `Done`/idle lifecycle stage — the green every body in a quiet fleet resolves
+    /// to, and the case that exposed the green-sun-beside-a-green-planet bug.
+    const IDLE_HUE: f32 = 115.0;
+    /// Hue of the `Failed` stage, used to prove the sun ignores stage entirely.
+    const FAILED_HUE: f32 = 343.0;
+
+    fn body(parent: Option<usize>, kind: BodyKind, hue: f32, severity: Severity) -> TreeNode {
+        TreeNode {
+            parent,
+            kind,
+            hue,
+            severity,
+        }
+    }
+
+    /// Sample one rendered pixel of `frame`'s RGBA8 output as `(r, g, b)`.
+    fn pixel_at(rgba: &[u8], width: u32, pos: (f32, f32)) -> (u8, u8, u8) {
+        let idx = (pos.1.round() as usize * width as usize + pos.0.round() as usize) * 4;
+        (rgba[idx], rgba[idx + 1], rgba[idx + 2])
+    }
+
+    #[test]
+    fn the_sun_holds_a_warm_star_colour_while_an_idle_planet_stays_green() {
+        // The exact fleet that exposed the bug: everything idle, so every body resolved to the
+        // same lifecycle green and the sun rendered as just another green disk.
+        let nodes = [
+            body(None, BodyKind::Sun, IDLE_HUE, Severity::Clear),
+            body(Some(0), BodyKind::Planet, IDLE_HUE, Severity::Clear),
+        ];
+        let (width, height) = (400u32, 300u32);
+        let layout = build_layout(&nodes, width, height);
+        let phase = 0.0;
+        let rgba = frame(&layout, phase);
+
+        let sun = pixel_at(&rgba, width, layout.position(0, phase));
+        let planet = pixel_at(&rgba, width, layout.position(1, phase));
+
+        // The sun reads as a warm star: bright, and warm-biased rather than green-biased.
+        assert!(
+            sun.0 > sun.1 && sun.1 > sun.2,
+            "sun should be warm (r > g > b), got {sun:?}"
+        );
+        assert!(sun.0 > 180, "sun should read as a bright star, got {sun:?}");
+
+        // The planet is untouched by this change: still green-dominant for the idle stage.
+        assert!(
+            planet.1 > planet.0 && planet.1 > planet.2,
+            "idle planet should still be green-dominant, got {planet:?}"
+        );
+
+        // And the two no longer collapse onto the same colour.
+        let distance = (sun.0 as i32 - planet.0 as i32).abs()
+            + (sun.1 as i32 - planet.1 as i32).abs()
+            + (sun.2 as i32 - planet.2 as i32).abs();
+        assert!(
+            distance > 90,
+            "sun {sun:?} and idle planet {planet:?} should not render as the same colour"
+        );
+    }
+
+    #[test]
+    fn the_sun_renders_the_same_colour_whatever_the_fleet_is_doing() {
+        let (width, height) = (400u32, 300u32);
+        let phase = 0.0;
+
+        let idle = [
+            body(None, BodyKind::Sun, IDLE_HUE, Severity::Clear),
+            body(Some(0), BodyKind::Planet, IDLE_HUE, Severity::Clear),
+        ];
+        let failing = [
+            body(None, BodyKind::Sun, FAILED_HUE, Severity::Critical),
+            body(Some(0), BodyKind::Planet, FAILED_HUE, Severity::Critical),
+        ];
+
+        let idle_layout = build_layout(&idle, width, height);
+        let failing_layout = build_layout(&failing, width, height);
+        let idle_rgba = frame(&idle_layout, phase);
+        let failing_rgba = frame(&failing_layout, phase);
+
+        let idle_sun = pixel_at(&idle_rgba, width, idle_layout.position(0, phase));
+        let failing_sun = pixel_at(&failing_rgba, width, failing_layout.position(0, phase));
+        assert_eq!(
+            idle_sun, failing_sun,
+            "the sun's colour must not track lifecycle stage or severity"
+        );
+
+        // The planets, meanwhile, must still differ — the exemption is sun-only.
+        let idle_planet = pixel_at(&idle_rgba, width, idle_layout.position(1, phase));
+        let failing_planet = pixel_at(&failing_rgba, width, failing_layout.position(1, phase));
+        assert_ne!(
+            idle_planet, failing_planet,
+            "planets must keep tracking lifecycle stage and severity"
+        );
     }
 
     #[test]
