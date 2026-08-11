@@ -60,6 +60,7 @@
 //! All three are named in the plan this slice belongs to rather than discovered
 //! later; none of them is load-bearing for proving the compositing path.
 
+pub(crate) mod cell_shapes;
 pub(crate) mod font;
 
 use ab_glyph::{Font, Glyph, PxScale, ScaleFont};
@@ -206,18 +207,37 @@ pub(crate) fn rasterise_region_with_font(
             let hidden = style.add_modifier.contains(Modifier::HIDDEN);
             if glyph_is_worth_drawing(cell.symbol(), hidden) {
                 let bold = style.add_modifier.contains(Modifier::BOLD);
-                for ch in cell.symbol().chars() {
-                    draw_glyph(
+                // Box drawing and the block elements are computed from the cell
+                // rather than taken from the face, so they meet their
+                // neighbours exactly — see [`cell_shapes`].
+                match sole_char(cell.symbol())
+                    .and_then(|ch| cell_shapes::shape_for(ch, cell_width, cell_height))
+                {
+                    Some(shape) => draw_cell_shape(
                         &mut surface,
                         width,
-                        height,
-                        &scaled,
-                        ch,
-                        origin_x as f32 + fit.x_offset,
-                        origin_y as f32 + fit.baseline,
+                        origin_x,
+                        origin_y,
+                        cell_width,
+                        cell_height,
+                        &shape,
                         colors.fg,
-                        bold,
-                    );
+                    ),
+                    None => {
+                        for ch in cell.symbol().chars() {
+                            draw_glyph(
+                                &mut surface,
+                                width,
+                                height,
+                                &scaled,
+                                ch,
+                                origin_x as f32 + fit.x_offset,
+                                origin_y as f32 + fit.baseline,
+                                colors.fg,
+                                bold,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -244,6 +264,51 @@ pub(crate) fn rasterise_region_with_font(
         height,
         rgba: surface,
     })
+}
+
+/// The one character a cell holds, or `None` when it holds a cluster.
+///
+/// A base character followed by a combining mark is a cluster, and a cluster is
+/// never one of the shapes [`cell_shapes`] draws — so it goes to the face,
+/// which is the only path that can compose it at all.
+fn sole_char(symbol: &str) -> Option<char> {
+    let mut chars = symbol.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Some(ch),
+        _ => None,
+    }
+}
+
+/// Paints a computed cell shape, clipped to its own cell.
+///
+/// Unlike a glyph, a shape has no business outside the cell it belongs to: its
+/// whole purpose is to fill that rectangle exactly.
+#[allow(clippy::too_many_arguments)]
+fn draw_cell_shape(
+    surface: &mut [u8],
+    surface_width: u32,
+    origin_x: u32,
+    origin_y: u32,
+    cell_width: u32,
+    cell_height: u32,
+    shape: &cell_shapes::CellShape,
+    color: Rgb,
+) {
+    for y in 0..cell_height {
+        let row_start =
+            (((origin_y + y) as usize) * (surface_width as usize) + origin_x as usize) * 4;
+        for x in 0..cell_width {
+            let coverage = shape.coverage(x, y);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let index = row_start + (x as usize) * 4;
+            if index + 3 >= surface.len() {
+                return;
+            }
+            blend_pixel(&mut surface[index..index + 4], color, coverage);
+        }
+    }
 }
 
 fn fill_cell(
@@ -403,6 +468,98 @@ mod tests {
             .chunks_exact(4)
             .filter(|px| (px[0], px[1], px[2]) != bg)
             .count()
+    }
+
+    /// A buffer whose every cell holds `ch`.
+    fn buffer_filled_with(width: u16, height: u16, ch: char) -> Buffer {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let symbol = ch.to_string();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.set_symbol(&symbol);
+                }
+            }
+        }
+        buffer
+    }
+
+    /// The live defect this module's [`cell_shapes`] exists for: drawn from the
+    /// face, a full block is the height of the face's ink band, not the height
+    /// of the cell, so a wall of them is striped with seams.
+    #[test]
+    fn a_wall_of_full_blocks_has_no_seams() {
+        let Some(face) = any_face() else { return };
+        let (cw, ch) = (10, 21);
+        let buffer = buffer_filled_with(3, 3, '\u{2588}');
+        let raster =
+            rasterise_region_with_font(&buffer, Rect::new(0, 0, 3, 3), cw, ch, &theme(), &face)
+                .expect("a face is loaded and the cell is sane");
+        let fg =
+            resolve_cell_colors(buffer.cell((0, 0)).expect("the buffer has cells"), &theme()).fg;
+        for y in 0..raster.height {
+            for x in 0..raster.width {
+                let (r, g, b, _) = pixel(&raster, x, y);
+                assert_eq!(
+                    (r, g, b),
+                    fg,
+                    "pixel ({x}, {y}) is not solid ink, so the blocks do not tile"
+                );
+            }
+        }
+    }
+
+    /// The same defect on the other axis: a rule that stops short of the cell
+    /// edge turns a border into a dashed line at every cell boundary.
+    #[test]
+    fn a_stacked_vertical_rule_is_continuous() {
+        let Some(face) = any_face() else { return };
+        let (cw, ch) = (10, 21);
+        let buffer = buffer_filled_with(1, 3, '\u{2502}');
+        let raster =
+            rasterise_region_with_font(&buffer, Rect::new(0, 0, 1, 3), cw, ch, &theme(), &face)
+                .expect("a face is loaded and the cell is sane");
+        let bg =
+            resolve_cell_colors(buffer.cell((0, 0)).expect("the buffer has cells"), &theme()).bg;
+        for y in 0..raster.height {
+            let lit = (0..raster.width)
+                .filter(|&x| {
+                    let (r, g, b, _) = pixel(&raster, x, y);
+                    (r, g, b) != bg
+                })
+                .count();
+            assert!(
+                lit > 0,
+                "scanline {y} of a stacked vertical rule has no ink, so the rule is broken"
+            );
+        }
+    }
+
+    /// Box drawing must not inherit the glyph path's overhang: a shape belongs
+    /// to its own cell and nothing else.
+    #[test]
+    fn a_corner_stays_inside_its_own_cell() {
+        let Some(face) = any_face() else { return };
+        let (cw, ch) = (10, 21);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        if let Some(cell) = buffer.cell_mut((0, 0)) {
+            cell.set_symbol("\u{250C}");
+        }
+        let raster =
+            rasterise_region_with_font(&buffer, Rect::new(0, 0, 2, 1), cw, ch, &theme(), &face)
+                .expect("a face is loaded and the cell is sane");
+        let bg =
+            resolve_cell_colors(buffer.cell((1, 0)).expect("the buffer has cells"), &theme()).bg;
+        for y in 0..raster.height {
+            for x in cw..raster.width {
+                let (r, g, b, _) = pixel(&raster, x, y);
+                assert_eq!(
+                    (r, g, b),
+                    bg,
+                    "the corner in cell 0 put ink at ({x}, {y}), which is cell 1"
+                );
+            }
+        }
     }
 
     #[test]
