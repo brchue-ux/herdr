@@ -78,8 +78,9 @@ use crate::ui::sidebar::AgentPanelEntry;
 /// > *"i dont want height of the cards adjusted. it was only the width that
 /// > changed depending on relationship"*
 ///
-/// **Rank is carried by width, and only by width.** A row's right edge steps in
-/// by rank in `super::rank_right_inset`, and that step is now the whole signal.
+/// **Rank is carried by width, and only by width.** A row's left edge steps in
+/// by rank in `super::rank_width_inset` — the cards are right-aligned, so the
+/// ladder is spent entirely there — and that step is now the whole signal.
 /// So there is nothing left for a depth to scale: the height, the padding, the
 /// stroke, the radius, the plate and the bloom's sigma are all fractions of this
 /// one number on every rank, and a card's size says *what it is* in one
@@ -97,7 +98,7 @@ use crate::ui::sidebar::AgentPanelEntry;
 ///
 /// 68 × 0.8 = 54.4, and it is one number rather than a per-rank cut precisely
 /// because of the second sentence: the ladder is still width and only width
-/// (`super::rank_right_inset` is untouched), so every card shrinks by the same
+/// (`super::rank_width_inset` is untouched), so every card shrinks by the same
 /// fifth and the rank steps between them are exactly the ones that were there
 /// before.
 ///
@@ -5644,7 +5645,7 @@ mod tests {
         let cell = (10.0f32, 21.0f32);
         let bounds = Rect::new(0, 0, 40, 60);
         let bloom_floor = bounds.y + bounds.height;
-        // Three ranks, narrowing to the right the way `rank_right_inset` does.
+        // Three ranks, narrowing from the left the way `rank_width_inset` does.
         let cards = [
             Rect::new(1, 2, 38, 8),
             Rect::new(3, 10, 36, 6),
@@ -5770,7 +5771,7 @@ mod tests {
     /// Height carries no rank — that was the 2026-08-06 decision — so "every
     /// tier proportionally smaller" means every card takes the same fifth and
     /// the width steps between ranks come out the far side identical. This
-    /// measures the second half of that: `rank_right_inset` is what a rank is
+    /// measures the second half of that: `rank_width_inset` is what a rank is
     /// worth on screen, and the trim must not have moved it.
     #[test]
     fn the_trim_left_the_rank_ladder_exactly_where_it_was() {
@@ -5782,7 +5783,7 @@ mod tests {
                 AgentRelation::Worker,
             ]
             .into_iter()
-            .map(|rank| super::super::rank_right_inset(rank, fold))
+            .map(|rank| super::super::rank_width_inset(rank, fold))
             .collect();
             assert_eq!(
                 insets[0], 0,
@@ -8066,7 +8067,7 @@ mod a_card_is_its_own_shape {
 
     /// Width still reads as rank in the real render path: a worker's card is
     /// narrower than its second mate's, whose is narrower than the first mate's,
-    /// at the captain's 42-column width. This is [`super::rank_right_inset`],
+    /// at the captain's 42-column width. This is [`super::rank_width_inset`],
     /// unrelated to and unaffected by the height change — this test exists so a
     /// future change to height cannot silently take width down with it.
     #[test]
