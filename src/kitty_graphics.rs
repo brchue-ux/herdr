@@ -423,6 +423,19 @@ impl HostTerminalKind {
             Self::Other => false,
         }
     }
+
+    /// The stable lowercase name this classification is reported under on the
+    /// JSON API. Deliberately not the terminal's own branding — that is the
+    /// unparsed string [`crate::host_terminal_identity::HostTerminalIdentity`]
+    /// carries — but the name of the *bucket* herdr sorted it into, which is
+    /// what every capability decision here is actually made on.
+    pub(crate) fn api_name(self) -> &'static str {
+        match self {
+            Self::Kitty => "kitty",
+            Self::Rio => "rio",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// Classifies a terminal that named *itself*, in band, in answer to XTVERSION

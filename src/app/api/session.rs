@@ -106,6 +106,23 @@ impl App {
                 }
             }),
             status: self.state.session_status.clone(),
+            background_scene: self.background_scene_info(),
+        }
+    }
+
+    /// The background scene's live state, read from the same predicates the
+    /// renderer reads so a caller can never be told the scene is drawing while
+    /// the producers are standing down.
+    fn background_scene_info(&self) -> crate::api::schema::BackgroundSceneInfo {
+        let state = &self.state;
+        crate::api::schema::BackgroundSceneInfo {
+            active: state.background_scene_active(),
+            enabled: state.persistent_background_enabled,
+            kitty_graphics_enabled: state.kitty_graphics_enabled,
+            kitty_graphics_capability_confirmed: state.kitty_graphics_capability_confirmed,
+            host_terminal: state.host_terminal_kind.api_name().to_string(),
+            host_draws_ambient_wash: state.host_terminal_kind.draws_ambient_wash(),
+            every_viewer_draws_ambient_wash: state.every_app_viewer_draws_ambient_wash,
         }
     }
 }
@@ -255,5 +272,51 @@ mod tests {
             stored.map(|status| status.chars().count()),
             Some(super::MAX_SESSION_STATUS_CHARS)
         );
+    }
+    /// The whole point of reporting the conditions separately: a scene that is
+    /// off because the terminal was never identified must be distinguishable
+    /// from one that is off because the feature is disabled. Both are
+    /// `active: false`, and before this they were indistinguishable to a caller.
+    #[test]
+    fn an_unmet_condition_is_reported_separately_from_the_verdict() {
+        let mut app = app_with_two_tabs();
+        app.state.kitty_graphics_enabled = true;
+        app.state.persistent_background_enabled = true;
+        app.state.every_app_viewer_draws_ambient_wash = true;
+        // A terminal Herdr could not positively name — the case that stops the
+        // scene without any config being wrong.
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Other;
+
+        let info = app.background_scene_info();
+
+        assert!(!info.active, "an unidentified terminal refuses the scene");
+        assert!(info.enabled, "but the feature itself is on, and says so");
+        assert!(info.kitty_graphics_enabled);
+        assert!(!info.host_draws_ambient_wash);
+        assert_eq!(info.host_terminal, "other");
+    }
+
+    /// `active` may never disagree with the predicate the renderer reads, or the
+    /// command would tell someone the scene is drawing while nothing is drawn.
+    #[test]
+    fn active_tracks_the_renderers_own_predicate() {
+        let mut app = app_with_two_tabs();
+        app.state.kitty_graphics_enabled = true;
+        app.state.persistent_background_enabled = true;
+        app.state.every_app_viewer_draws_ambient_wash = true;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+
+        assert_eq!(
+            app.background_scene_info().active,
+            app.state.background_scene_active()
+        );
+        assert!(app.background_scene_info().active);
+
+        app.state.persistent_background_enabled = false;
+        assert_eq!(
+            app.background_scene_info().active,
+            app.state.background_scene_active()
+        );
+        assert!(!app.background_scene_info().active);
     }
 }
