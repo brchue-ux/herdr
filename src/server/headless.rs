@@ -9517,13 +9517,20 @@ next_tab = ""
         let active_pane = workspace.tabs[0].root_pane;
         let background_tab = workspace.test_add_tab(Some("background"));
         let background_pane = workspace.tabs[background_tab].root_pane;
+        // Two rows each, because the smaller client's first terminal-area row
+        // is spent on the pane-size-pin banner below; the pane content this
+        // test is actually about has to survive it.
         workspace.tabs[0].runtimes.insert(
             active_pane,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"active"),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"active\r\nactive"),
         );
         workspace.tabs[background_tab].runtimes.insert(
             background_pane,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"background"),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                80,
+                24,
+                b"background\r\nbackground",
+            ),
         );
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
@@ -9571,8 +9578,18 @@ next_tab = ""
         let mobile_text = frame_text(&mobile_frame);
         let mut mobile_rows = mobile_text.lines();
         let mobile_header = mobile_rows.by_ref().take(2).collect::<String>();
+        // This client is a different size from the one that owns the shared
+        // pane runtimes, so the first row of its terminal area is spent saying
+        // so — see `AppState::pane_size_pin`. It is the same top-of-area banner
+        // the config diagnostic uses, and it lands over pane content here for
+        // the same reason that one does.
+        let mobile_pin_notice = mobile_rows.next().unwrap_or_default().to_string();
         let mobile_surface = mobile_rows.collect::<String>();
         assert!(mobile_header.contains("test"), "header: {mobile_header:?}");
+        assert!(
+            mobile_pin_notice.contains("panes pinned to 120x40"),
+            "pin notice: {mobile_pin_notice:?}"
+        );
         assert!(
             mobile_surface.contains("active"),
             "surface: {mobile_surface:?}"

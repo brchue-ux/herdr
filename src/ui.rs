@@ -1204,6 +1204,27 @@ mod tests {
     }
 
     #[test]
+    fn narrow_client_shortens_the_pin_notice_instead_of_clipping_it() {
+        let mut app = pane_size_pin_test_app();
+        app.pane_size_pin = Some(crate::app::state::PaneSizePin {
+            shared: (120, 40),
+            client: (44, 20),
+        });
+
+        let rows = rendered_frame_text(&mut app, Rect::new(0, 0, 44, 20));
+        let banner = rows
+            .iter()
+            .find(|row| row.contains("pinned"))
+            .expect("the notice should still be drawn on a narrow client");
+
+        // The size that owns the panes survives every width; the prose around
+        // it is what gives way, so the row never ends mid-word.
+        assert!(banner.contains("120x40"), "{banner:?}");
+        assert!(!banner.contains("this one is"), "{banner:?}");
+        assert!(banner.trim_end().len() <= 44, "{banner:?}");
+    }
+
+    #[test]
     fn no_pane_size_pin_draws_no_banner() {
         let mut app = pane_size_pin_test_app();
 

@@ -214,11 +214,29 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
-/// Say why this client's panes are drawn around grids that are not its size.
+/// The pane-size-pin line, longest first, for [`render_pane_size_pin`] to pick
+/// the widest one that fits.
 ///
-/// The head of the line carries the fact and the culprit's size, because a
-/// narrow client truncates the tail: the shared size is what identifies which
-/// other client to detach.
+/// Every variant keeps the size that owns the panes, because that is what says
+/// which other client to detach; what drops away as the client narrows is the
+/// prose around it and then this client's own size, which it already knows.
+/// Shortening rather than letting the banner clip is the point: this line lands
+/// on top of pane content, and a clipped one would spend that row on half a
+/// word.
+fn pane_size_pin_lines(pin: &crate::app::state::PaneSizePin) -> [String; 4] {
+    let (shared_cols, shared_rows) = pin.shared;
+    let (client_cols, client_rows) = pin.client;
+    [
+        format!(
+            " panes pinned to {shared_cols}x{shared_rows} by another client; this one is {client_cols}x{client_rows} "
+        ),
+        format!(" panes pinned to {shared_cols}x{shared_rows} by another client "),
+        format!(" panes pinned to {shared_cols}x{shared_rows} "),
+        format!(" pinned {shared_cols}x{shared_rows} "),
+    ]
+}
+
+/// Say why this client's panes are drawn around grids that are not its size.
 pub(super) fn render_pane_size_pin(
     frame: &mut Frame,
     area: Rect,
@@ -226,17 +244,18 @@ pub(super) fn render_pane_size_pin(
     row: u16,
     p: &Palette,
 ) {
-    let (shared_cols, shared_rows) = pin.shared;
-    let (client_cols, client_rows) = pin.client;
-    render_banner_line(
-        frame,
-        area,
-        row,
-        &format!(
-            " panes pinned to {shared_cols}x{shared_rows} by another client; this one is {client_cols}x{client_rows} "
-        ),
-        p,
-    );
+    let lines = pane_size_pin_lines(pin);
+    // The shortest is the fallback: on a client too narrow even for that there
+    // is nothing better to say, and clipping it is still better than silence.
+    let line = lines
+        .iter()
+        .find(|line| display_width_u16(line) <= area.width)
+        .unwrap_or_else(|| {
+            lines
+                .last()
+                .expect("pane_size_pin_lines is a fixed non-empty array")
+        });
+    render_banner_line(frame, area, row, line, p);
 }
 
 /// The glyph half of [`state_icon`], for surfaces that build their own style
