@@ -1497,6 +1497,100 @@ mod tests {
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
     }
 
+    /// Closing a sibling pane while its workspace is on screen must grow the
+    /// survivor to its final size on the very first frame after the close.
+    ///
+    /// This is the captain's "output scrolls up and snaps back down": the
+    /// survivor's grid is genuinely smaller than the rect the layout hands it,
+    /// and a paced grow drew it at that smaller size first —
+    /// `GhosttyPaneTerminal::render` is top-aligned, so a terminal's
+    /// bottom-anchored newest output jumped to the top of the pane with a blank
+    /// tail below it, then crawled back down over the ease.
+    ///
+    /// Asserted against the pane's own pre-split size rather than a later
+    /// frame, so the test has no wall-clock component at all.
+    #[tokio::test]
+    async fn closing_a_sibling_on_screen_grows_the_survivor_in_one_frame() {
+        fn seeded_runtime() -> TerminalRuntime {
+            let mut bytes = Vec::new();
+            for line in 0..300 {
+                bytes.extend_from_slice(format!("line {line:04} out\r\n").as_bytes());
+            }
+            TerminalRuntime::test_with_scrollback_bytes(90, 18, 1 << 20, &bytes)
+        }
+
+        fn drawn_rows(app: &AppState, pane_id: PaneId) -> u16 {
+            app.view
+                .pane_infos
+                .iter()
+                .find(|info| info.id == pane_id)
+                .expect("pane info")
+                .inner_rect
+                .height
+        }
+
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        let ws = Workspace::test_new("alpha");
+        let survivor = ws.tabs[0].root_pane;
+        runtimes.insert(
+            ws.tabs[0]
+                .terminal_id(survivor)
+                .expect("terminal id")
+                .clone(),
+            seeded_runtime(),
+        );
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+
+        let area = Rect::new(0, 0, 120, 50);
+
+        // The size the layout gives this pane when it is alone in the tab.
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, area);
+        let alone = drawn_rows(&app, survivor);
+
+        // Split it, register the sibling's runtime, and settle the split.
+        let sibling = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        runtimes.insert(
+            app.workspaces[0].tabs[0]
+                .terminal_id(sibling)
+                .expect("terminal id")
+                .clone(),
+            seeded_runtime(),
+        );
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, area);
+        let split = drawn_rows(&app, survivor);
+        assert!(
+            split < alone,
+            "the split should have shrunk the survivor: {alone} -> {split}"
+        );
+
+        // Close the sibling while the workspace is on screen — the genuine
+        // grow, the one trigger that used to ease.
+        // `close_pane` reports whether the *workspace* should close, so the
+        // pane count is what says the sibling actually went away.
+        app.workspaces[0].close_pane(sibling);
+        assert_eq!(app.workspaces[0].tabs[0].layout.pane_count(), 1);
+        crate::ui::compute_view_with_runtime_registry(&mut app, &runtimes, area);
+
+        assert_eq!(
+            drawn_rows(&app, survivor),
+            alone,
+            "the survivor must be drawn over its whole rect on the first frame \
+             after the close, not at its old smaller size"
+        );
+        assert_eq!(
+            app.runtime_for_pane_in_workspace(&runtimes, 0, survivor)
+                .expect("runtime")
+                .current_size()
+                .0,
+            alone,
+            "and its grid must have been resized there in the same frame"
+        );
+    }
+
     /// A pane resized while its workspace was off screen must come back the
     /// size it already is — not be shrunk to the size it had when it was last
     /// on screen and then reflowed back up.

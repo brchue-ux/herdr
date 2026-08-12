@@ -32,6 +32,12 @@
 //! opening is nearly free, closing needs a mechanism (a snapshot of content
 //! that is about to go out of frame) this module does not have.
 //!
+//! Growth pacing is currently **off** — see [`GROW_EASE_ENABLED`] for why and
+//! for how to put it back. With it off this module still owns the same call
+//! site and still resolves both axes; it simply resolves a growing one straight
+//! to its target, so a pane reaches its final size on the frame the layout
+//! changes.
+//!
 //! [`RelationSignals`]: crate::app::relation_signal::RelationSignals
 
 use std::collections::HashMap;
@@ -47,6 +53,24 @@ use crate::terminal::TerminalId;
 /// that a single discrete resize — a split created or closed, a keybinding
 /// step — reads as a transition rather than a flicker.
 const RESIZE_REFLOW_DURATION: Duration = Duration::from_millis(220);
+
+/// Whether a growing axis is paced at all.
+///
+/// Off. A terminal grid is drawn top-aligned into its pane's rect while a
+/// terminal's content is bottom-anchored, so every intermediate size lifts the
+/// newest output off the bottom of the pane and parks it near the top with dead
+/// space below, then walks it back down as the ease completes — most visibly
+/// when a sibling pane closes and the survivor grows into the freed space. That
+/// artifact is the transition, not a flaw in it, so the pacing is disabled
+/// rather than reshaped: a growing axis resolves straight to its target the
+/// same way a shrinking one always has, and nothing is drawn at an intermediate
+/// size.
+///
+/// The mechanism below is kept whole behind this one flag. Flipping it back to
+/// `true` restores the eased behaviour exactly, and the tests covering that
+/// regime run against it directly through
+/// [`PaneResizeReflow::with_grow_ease_for_test`].
+const GROW_EASE_ENABLED: bool = false;
 
 /// Finest a resize-reflow is ever redrawn at.
 ///
@@ -115,7 +139,7 @@ impl AxisReflow {
 
     /// The size this axis's grid should be this frame, given the layout wants
     /// `target` and the grid is currently `actual`.
-    fn resolve(&mut self, target: u16, actual: u16, now: Instant) -> u16 {
+    fn resolve(&mut self, target: u16, actual: u16, now: Instant, ease_growth: bool) -> u16 {
         // Settled where the layout still wants it. `actual` is deliberately
         // ignored here: a grid that has drifted off a target that never moved
         // was taken somewhere by something else — a direct terminal attach
@@ -157,11 +181,16 @@ impl AxisReflow {
         // frames.
         let from = actual;
         self.current = actual;
-        if target <= from {
+        if target <= from || !ease_growth {
             // Shrinking (or exactly arrived): no safe range to ease through,
             // since the frame this resolves for is already drawn into a
             // buffer sized to `target`. Snap, the same as before this module
             // existed.
+            //
+            // Growing lands here too while pacing is disabled — see
+            // [`GROW_EASE_ENABLED`] — so a pane growing into a closed sibling's
+            // space is drawn at its final size on the very first frame, with no
+            // intermediate one to glitch.
             self.current = target;
             self.growing = None;
             return target;
@@ -193,12 +222,33 @@ struct TrackedTerminal {
 /// here changes, and it is called exactly where a pane's target size is
 /// already being computed for this frame — so there is nothing to advance
 /// independently of a render pass actually asking.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PaneResizeReflow {
     tracked: HashMap<TerminalId, TrackedTerminal>,
+    /// Whether a growing axis is paced; [`GROW_EASE_ENABLED`] in production.
+    ease_growth: bool,
+}
+
+impl Default for PaneResizeReflow {
+    fn default() -> Self {
+        Self {
+            tracked: HashMap::new(),
+            ease_growth: GROW_EASE_ENABLED,
+        }
+    }
 }
 
 impl PaneResizeReflow {
+    /// The same mechanism with growth pacing forced on, so the eased regime
+    /// stays covered while [`GROW_EASE_ENABLED`] is off.
+    #[cfg(test)]
+    fn with_grow_ease_for_test() -> Self {
+        Self {
+            ease_growth: true,
+            ..Self::default()
+        }
+    }
+
     /// The size a terminal's grid should actually be resized to *this frame*,
     /// given the layout wants `target_rows`/`target_cols` and the grid is
     /// currently `grid_rows`/`grid_cols`.
@@ -227,13 +277,18 @@ impl PaneResizeReflow {
         // Seeded at the target rather than at the grid, so first sight settles
         // there immediately: seeding from the grid would turn every pane's
         // first layout pass into an animation of its own creation.
+        let ease_growth = self.ease_growth;
         let tracked = self.tracked.entry(terminal_id).or_insert(TrackedTerminal {
             rows: AxisReflow::new(target_rows),
             cols: AxisReflow::new(target_cols),
         });
         (
-            tracked.rows.resolve(target_rows, grid_rows, now),
-            tracked.cols.resolve(target_cols, grid_cols, now),
+            tracked
+                .rows
+                .resolve(target_rows, grid_rows, now, ease_growth),
+            tracked
+                .cols
+                .resolve(target_cols, grid_cols, now, ease_growth),
         )
     }
 
@@ -280,11 +335,21 @@ mod tests {
     }
 
     impl Pane {
+        /// A pane under the shipped configuration.
         fn new(grid_rows: u16, grid_cols: u16) -> Self {
             Self {
                 reflow: PaneResizeReflow::default(),
                 terminal: id(),
                 grid: (grid_rows, grid_cols),
+            }
+        }
+
+        /// A pane with growth pacing forced on, for the tests that cover the
+        /// eased regime itself rather than what the app currently ships.
+        fn easing(grid_rows: u16, grid_cols: u16) -> Self {
+            Self {
+                reflow: PaneResizeReflow::with_grow_ease_for_test(),
+                ..Self::new(grid_rows, grid_cols)
             }
         }
 
@@ -312,6 +377,50 @@ mod tests {
     }
 
     #[test]
+    fn growth_is_not_paced_under_the_shipped_configuration() {
+        // What the app actually does: a growing axis lands on its target on the
+        // frame the layout asks for it, so no frame is ever drawn at an
+        // intermediate size and there is nothing for the loop to wake up and
+        // finish.
+        let now = Instant::now();
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
+
+        assert_eq!(pane.frame(40, 100, now), (40, 100));
+        assert_eq!(pane.next_deadline(now), None);
+    }
+
+    #[test]
+    fn a_sibling_closing_grows_the_survivor_in_one_step() {
+        // The reported artifact, in the module's own terms: the survivor's grid
+        // is genuinely behind the layout (25 rows in a rect that now wants 54),
+        // which is the one case that used to ease. It must resolve to 54
+        // immediately — a 25-row grid drawn into a 54-row rect is exactly the
+        // "output jumps to the top, then crawls back down" the captain sees.
+        let now = Instant::now();
+        let mut pane = Pane::new(25, 183);
+        pane.frame(25, 183, now);
+
+        assert_eq!(pane.frame(54, 183, now), (54, 183));
+        assert_eq!(pane.next_deadline(now), None);
+    }
+
+    #[test]
+    fn a_grid_genuinely_behind_its_target_lands_in_one_step() {
+        // Same as above but reached through the outside-resize path, the
+        // counterpart to `..._still_eases_when_pacing_is_enabled`: it still
+        // resolves from the grid's real size, it just no longer stops there.
+        let now = Instant::now();
+        let mut pane = Pane::new(20, 100);
+        pane.frame(20, 100, now);
+
+        pane.resized_outside(24, 100);
+
+        assert_eq!(pane.frame(60, 100, now), (60, 100));
+        assert_eq!(pane.next_deadline(now), None);
+    }
+
+    #[test]
     fn a_terminal_seen_for_the_first_time_resolves_straight_to_target() {
         let now = Instant::now();
         let mut pane = Pane::new(24, 80);
@@ -321,7 +430,7 @@ mod tests {
     #[test]
     fn growing_eases_rather_than_snapping() {
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         pane.frame(20, 100, now);
 
         // The very frame the target changes still resolves to the old size:
@@ -356,7 +465,7 @@ mod tests {
     #[test]
     fn one_axis_can_grow_while_the_other_shrinks() {
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         pane.frame(20, 100, now);
 
         // Rows grow (20 -> 40), columns shrink (100 -> 50): each axis must
@@ -368,7 +477,7 @@ mod tests {
     #[test]
     fn a_retarget_mid_growth_restarts_from_where_it_visibly_is() {
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         pane.frame(20, 100, now);
         pane.frame(40, 100, now);
 
@@ -390,7 +499,7 @@ mod tests {
     #[test]
     fn next_deadline_is_armed_only_while_something_is_growing() {
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         assert_eq!(pane.next_deadline(now), None);
 
         pane.frame(20, 100, now);
@@ -420,7 +529,7 @@ mod tests {
         // actually depends on: at no point in a growth ease may the
         // resolved value be larger than the target it is easing toward.
         let now = Instant::now();
-        let mut pane = Pane::new(10, 10);
+        let mut pane = Pane::easing(10, 10);
         pane.frame(10, 10, now);
         pane.frame(90, 90, now);
 
@@ -466,9 +575,11 @@ mod tests {
     fn an_outside_resize_mid_ease_is_adopted_rather_than_eased_away_from() {
         // Same collision, caught mid-flight: switching away from a pane that is
         // still easing leaves this module holding an intermediate size, and the
-        // background path immediately snaps the runtime to the full one.
+        // background path immediately snaps the runtime to the full one. Only
+        // reachable while growth pacing is enabled — nothing is ever mid-ease
+        // without it.
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         pane.frame(20, 100, now);
         pane.frame(60, 100, now);
 
@@ -503,12 +614,15 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_genuinely_behind_its_target_still_eases() {
-        // The counterpart the fix must not break: when the runtime really is
-        // smaller than the layout wants, the reflow this module exists to pace
-        // is still ahead of it, so it still eases.
+    fn a_grid_genuinely_behind_its_target_still_eases_when_pacing_is_enabled() {
+        // The counterpart PR #130's fix must not break: when the runtime really
+        // is smaller than the layout wants, the reflow this module exists to
+        // pace is still ahead of it, so it still eases — under the eased
+        // regime, which `GROW_EASE_ENABLED` currently turns off. Kept covering
+        // the mechanism so flipping that flag back restores known-good
+        // behaviour rather than untested behaviour.
         let now = Instant::now();
-        let mut pane = Pane::new(20, 100);
+        let mut pane = Pane::easing(20, 100);
         pane.frame(20, 100, now);
 
         pane.resized_outside(24, 100);
