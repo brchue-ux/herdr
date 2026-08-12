@@ -179,8 +179,20 @@ pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
 /// Resolved in [`crate::ui::compute_view`] and parked on
 /// [`crate::app::state::ViewState::sidebar_view_hidden`], so the draw reads a
 /// scalar instead of rebuilding the panel.
+///
+/// Answers early when no view is set, which is the unconfigured default: with
+/// nothing to filter there is nothing to hold back, and this runs on a path
+/// that already walks every pane of every tab of every Space. The rows are
+/// still classified before filtering, because a view may filter on `relation`
+/// and has to see what each pane *is*; only the tree arrangement is skipped,
+/// since counting what was removed never needs the survivors placed.
 pub(crate) fn agent_view_hidden(app: &AppState) -> AgentViewHidden {
-    agent_panel_entries_and_hidden_with_runtimes(app, None).1
+    if app.agent_views.active().is_none() {
+        return AgentViewHidden::default();
+    }
+    let mut entries = collect_agent_panel_entries_with_runtimes(app, None);
+    crate::app::agent_tree::classify_agent_relations(&mut entries);
+    crate::app::agent_view::apply_agent_view(app, &mut entries)
 }
 
 fn agent_panel_entries_with_runtimes(
