@@ -33,9 +33,6 @@ pub(crate) struct AgentViewHidden {
 }
 
 impl AgentViewHidden {
-    /// The hidden count still drives nothing on screen now that no surface
-    /// draws an agents header; the counts themselves stay covered by tests.
-    #[cfg(test)]
     pub(crate) fn any(self) -> bool {
         self.hidden > 0
     }

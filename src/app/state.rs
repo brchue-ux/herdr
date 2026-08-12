@@ -1245,6 +1245,14 @@ pub struct ViewState {
     /// draws a tree of bare connectors on one client and doubled borders on the
     /// other.
     pub sidebar_card_layers_published: bool,
+    /// What the active Agents view kept out of the tree on this pass.
+    ///
+    /// Stashed by [`crate::ui::compute_view`] rather than read during the draw
+    /// because resolving it walks every pane of every tab of every Space, and
+    /// the header row is explicitly not allowed to walk the fleet a second time
+    /// per frame — see [`crate::ui::sidebar::render_header_row`]. Render reads
+    /// two scalars off it and nothing else.
+    pub(crate) sidebar_view_hidden: crate::app::agent_view::AgentViewHidden,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
@@ -3482,6 +3490,7 @@ impl AppState {
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 sidebar_card_layers_published: false,
+                sidebar_view_hidden: Default::default(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),

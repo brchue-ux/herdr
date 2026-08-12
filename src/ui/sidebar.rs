@@ -174,6 +174,15 @@ pub(crate) fn all_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     collect_agent_panel_entries_with_runtimes(app, None)
 }
 
+/// What the active Agents view is holding back from the tree.
+///
+/// Resolved in [`crate::ui::compute_view`] and parked on
+/// [`crate::app::state::ViewState::sidebar_view_hidden`], so the draw reads a
+/// scalar instead of rebuilding the panel.
+pub(crate) fn agent_view_hidden(app: &AppState) -> AgentViewHidden {
+    agent_panel_entries_and_hidden_with_runtimes(app, None).1
+}
+
 fn agent_panel_entries_with_runtimes(
     app: &AppState,
     terminal_runtimes: Option<&TerminalRuntimeRegistry>,
@@ -1759,6 +1768,29 @@ fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
             .saturating_add(HEADER_ROW_GAP);
     }
 
+    // Next after the breadcrumb, for the same reason it sits there: both are
+    // controls that come and go with the current view rather than permanent
+    // readouts, so neither may shift the pulse a reader has learned to find.
+    let notice = view_notice_rect_after(app, area, taken);
+    if notice.width > 0 {
+        if let Some(label) = tree_view_notice_label(app.view.sidebar_view_hidden) {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    label,
+                    Style::default().fg(if app.view.sidebar_view_hidden.hidden_blocked > 0 {
+                        app.palette.yellow
+                    } else {
+                        app.palette.overlay0
+                    }),
+                )),
+                notice,
+            );
+            taken = taken
+                .saturating_add(notice.width)
+                .saturating_add(HEADER_ROW_GAP);
+        }
+    }
+
     let remaining = header.width.saturating_sub(taken);
     render_session_status(
         app,
@@ -1778,6 +1810,10 @@ fn render_header_row(app: &AppState, frame: &mut Frame, area: Rect) {
 /// names the destination rather than the current position because the row
 /// immediately below already says where you are.
 const TREE_BREADCRUMB_LABEL: &str = "◂ main";
+
+/// Leads the view notice. The same funnel the Agents view grammar is named for,
+/// so the row reads as "a view is filtering" rather than "the fleet is idle".
+const TREE_VIEW_NOTICE_GLYPH: &str = "⧨ ";
 
 /// The label for the control that leaves the current view, when there is one.
 ///
@@ -1810,6 +1846,43 @@ pub(crate) fn sidebar_tree_breadcrumb_rect(app: &AppState, area: Rect) -> Rect {
 /// have to walk every pane again to learn the same number. Measured against the
 /// same allocation `render_header_row` walks, so the control is hit-tested
 /// exactly where it was drawn.
+/// What the header says when the active view is holding rows back.
+///
+/// `None` when it is holding nothing back, which leaves the row exactly as it
+/// was before the slot existed. The blocked count is called out separately
+/// because a blocked agent is waiting on the user: "5 hidden" is a filter doing
+/// its job, and "5 hidden · 1 blocked" is somebody waiting behind it.
+pub(crate) fn tree_view_notice_label(hidden: AgentViewHidden) -> Option<String> {
+    if !hidden.any() {
+        return None;
+    }
+    let mut label = format!("{}{} hidden", TREE_VIEW_NOTICE_GLYPH, hidden.hidden);
+    if hidden.hidden_blocked > 0 {
+        label.push_str(&format!(" · {} blocked", hidden.hidden_blocked));
+    }
+    Some(label)
+}
+
+/// The columns the view notice takes, or an empty rect when it does not fit.
+///
+/// Measured against the same header the breadcrumb is measured against, and it
+/// yields the whole slot rather than truncating: a clipped count is a wrong
+/// count, the same rule the git counters and the state age already follow.
+fn view_notice_rect_after(app: &AppState, area: Rect, taken: u16) -> Rect {
+    let Some(label) = tree_view_notice_label(app.view.sidebar_view_hidden) else {
+        return Rect::default();
+    };
+    let header = workspace_list_header_rect(area);
+    if header.height == 0 {
+        return Rect::default();
+    }
+    let width = display_width(&label) as u16;
+    if header.width.saturating_sub(taken) < width {
+        return Rect::default();
+    }
+    Rect::new(header.x.saturating_add(taken), header.y, width, 1)
+}
+
 fn breadcrumb_rect_after_pulse(app: &AppState, area: Rect, pulse_width: u16) -> Rect {
     let Some(label) = sidebar_tree_breadcrumb(app) else {
         return Rect::default();
@@ -11283,5 +11356,239 @@ mod a_branch_leaves_its_parents_own_border_column {
             "a row drawn in its parent's own column must not open a branch off it"
         );
         assert!(!row_opens_a_branch(&[entry(0)], 0), "nothing follows it");
+    }
+}
+
+/// The tree has to say when a view is the reason it looks empty.
+///
+/// The captain reported he could not see the first mate or any second mate in
+/// the left-hand panel "at all". The tree itself was innocent — it draws the
+/// mates from worktree membership alone, with no `owner` token needed — but his
+/// durable Agents view filters on `exists owner`, and nothing in the fleet was
+/// publishing that token, so every worker row was filtered out and the panel
+/// gave no sign that a filter was responsible.
+///
+/// [`crate::app::agent_view::AgentViewHidden`] had counted exactly that all
+/// along and nothing drew it, which is the same hazard
+/// [`crate::agent_view::AgentViewSlots::durable`] names when it refuses to
+/// persist the UI tier: a filtered panel that comes back "with nothing on
+/// screen explaining why".
+#[cfg(test)]
+mod a_filtered_tree_says_what_it_is_holding_back {
+    use super::*;
+    use crate::app::state::AppState;
+    use crate::workspace::{Workspace, WorktreeSpaceMembership};
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
+
+    const REPO: &str = "/repo/firstmate";
+
+    fn membership(checkout: &str, linked: bool) -> WorktreeSpaceMembership {
+        WorktreeSpaceMembership {
+            key: "firstmate".to_string(),
+            label: "firstmate".to_string(),
+            repo_root: REPO.into(),
+            checkout_path: checkout.into(),
+            is_linked_worktree: linked,
+        }
+    }
+
+    /// The captain's fleet shape: a main checkout Space with the second mates
+    /// as linked worktrees of it, and a worker pane inside each.
+    fn fleet(publish_owner: bool) -> AppState {
+        let mut app = AppState::test_new();
+
+        let mut root = Workspace::test_new("firstmate");
+        root.identity_cwd = REPO.into();
+        root.cached_identity_cwd = REPO.into();
+        root.worktree_space = Some(membership(REPO, false));
+        app.workspaces = vec![root];
+
+        for (name, home) in [
+            ("2ndmate-herdr", "/pool/12/firstmate"),
+            ("2ndmate-game", "/pool/4/firstmate"),
+        ] {
+            let mut ws = Workspace::test_new(name);
+            ws.identity_cwd = home.into();
+            ws.cached_identity_cwd = home.into();
+            ws.worktree_space = Some(membership(home, true));
+            app.workspaces.push(ws);
+        }
+        app.ensure_test_terminals();
+
+        let now = std::time::Instant::now();
+        for (ws_idx, owner) in [(1usize, "2ndmate-herdr"), (2, "2ndmate-game")] {
+            let pane = app.workspaces[ws_idx].test_split(ratatui::layout::Direction::Vertical);
+            app.ensure_test_terminals();
+            let terminal_id = app.workspaces[ws_idx]
+                .pane_state(pane)
+                .expect("split pane")
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).expect("terminal");
+            terminal.set_agent_name(format!("{owner}-worker"));
+            if publish_owner {
+                terminal.metadata_tokens.patch(
+                    std::collections::HashMap::from([(
+                        "owner".to_string(),
+                        Some(owner.to_string()),
+                    )]),
+                    None,
+                    now,
+                );
+            }
+        }
+
+        app.active = Some(0);
+        app.selected = 0;
+        app.sidebar_width = 42;
+        app.default_sidebar_width = 42;
+        app
+    }
+
+    /// The captain's own `agent_view`, verbatim off his `session.json`.
+    fn workers_only(app: &mut AppState) {
+        app.agent_views.set(
+            crate::agent_view::AgentViewTier::Api,
+            Some(crate::api::schema::AgentViewSetParams {
+                source: "workers-only".to_string(),
+                label: None,
+                filter: Some(crate::api::schema::AgentViewFilter::Exists {
+                    field: crate::api::schema::AgentViewField::Token {
+                        token: "owner".to_string(),
+                    },
+                }),
+                sort: Vec::new(),
+            }),
+        );
+    }
+
+    fn panel(app: &AppState) -> String {
+        let rect = app.view.sidebar_rect;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| crate::ui::render(app, frame))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (rect.y..rect.y + rect.height)
+            .map(|y| {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn drawn(app: &mut AppState) -> String {
+        crate::ui::compute_view(app, Rect::new(0, 0, 120, 40));
+        panel(app)
+    }
+
+    /// The report, end to end: an unpublished `owner` token empties the panel
+    /// through the view, and the header now names the view as the reason.
+    #[test]
+    fn a_view_that_hides_every_worker_says_so_in_the_header() {
+        let mut app = fleet(false);
+        workers_only(&mut app);
+        let drawn = drawn(&mut app);
+
+        assert_eq!(
+            app.view.sidebar_view_hidden.hidden, 2,
+            "both workers were filtered out for carrying no `owner`"
+        );
+        assert!(
+            drawn.contains("2 hidden"),
+            "the header did not say the view was holding rows back:\n{drawn}"
+        );
+    }
+
+    /// The half the tree was always getting right, pinned so a future change to
+    /// the notice cannot be mistaken for a fix to the rows themselves: the
+    /// mates draw from worktree membership whether or not anything publishes an
+    /// `owner` token, and whether or not a view is filtering.
+    #[test]
+    fn the_mates_still_draw_under_a_filter_that_hides_every_worker() {
+        let mut app = fleet(false);
+        workers_only(&mut app);
+        let drawn = drawn(&mut app);
+
+        for mate in ["firstmate", "2ndmate-herdr", "2ndmate-game"] {
+            assert!(
+                drawn.contains(mate),
+                "the tree dropped {mate:?} under an active view:\n{drawn}"
+            );
+        }
+    }
+
+    /// The notice is about the *view*, not about an empty fleet: publishing the
+    /// token the view asks for retires it, leaving the header exactly as it was
+    /// before the slot existed.
+    #[test]
+    fn a_view_that_hides_nothing_draws_no_notice() {
+        let mut app = fleet(true);
+        workers_only(&mut app);
+        let drawn = drawn(&mut app);
+
+        assert!(!app.view.sidebar_view_hidden.any());
+        assert!(
+            !drawn.contains("hidden"),
+            "a view hiding nothing still drew a notice:\n{drawn}"
+        );
+    }
+
+    /// With no view at all there is nothing to explain, so the row is untouched.
+    #[test]
+    fn no_view_draws_no_notice() {
+        let mut app = fleet(false);
+        let drawn = drawn(&mut app);
+
+        assert!(!app.view.sidebar_view_hidden.any());
+        assert!(!drawn.contains("hidden"), "{drawn}");
+    }
+
+    /// A blocked agent is waiting on the user, so it is called out separately
+    /// rather than folded into the count — the case the counter was built for.
+    #[test]
+    fn a_hidden_blocked_agent_is_named_separately() {
+        let mut app = fleet(false);
+        workers_only(&mut app);
+        let terminal_id = app.workspaces[1]
+            .pane_details(&app.terminals)
+            .into_iter()
+            .find_map(|detail| app.workspaces[1].terminal_id(detail.pane_id).cloned())
+            .expect("a worker terminal");
+        app.terminals
+            .values_mut()
+            .find(|terminal| terminal.id == terminal_id)
+            .expect("terminal")
+            .state = crate::detect::AgentState::Blocked;
+
+        let drawn = drawn(&mut app);
+        assert_eq!(app.view.sidebar_view_hidden.hidden_blocked, 1);
+        assert!(
+            drawn.contains("blocked"),
+            "a blocked agent was hidden without being named:\n{drawn}"
+        );
+    }
+
+    /// The header is a fixed single row shared with the pulse, the breadcrumb
+    /// and the session status. A notice that does not fit is dropped whole,
+    /// because a clipped count is a wrong count.
+    #[test]
+    fn a_notice_that_does_not_fit_is_not_drawn_at_all() {
+        let mut app = fleet(false);
+        workers_only(&mut app);
+        crate::ui::compute_view(&mut app, Rect::new(0, 0, 120, 40));
+        let hidden = app.view.sidebar_view_hidden;
+        let label = tree_view_notice_label(hidden).expect("something is hidden");
+
+        let area = Rect::new(0, 0, display_width(&label) as u16, 8);
+        assert_eq!(
+            view_notice_rect_after(&app, area, 1).width,
+            0,
+            "the notice drew into columns it did not have"
+        );
     }
 }
