@@ -172,6 +172,20 @@ jobs:
           version: 0.15.2
           use-cache: false
 
+      # `use-cache: false` above leaves this job fetching vaxis's transitive zig
+      # packages over the network on every single run, and it is the only Windows
+      # job that does — `check (windows-latest)` restores the same `.zig-cache`
+      # and passed the runs this one failed. Same restore-key prefix so it reuses
+      # whatever that job already saved; its own primary key so two jobs in one
+      # run do not race to save the same entry.
+      - name: Restore Zig build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .zig-cache
+          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-${{ github.run_id }}-${{ github.run_attempt }}-conpty
+          restore-keys: |
+            zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
+
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
