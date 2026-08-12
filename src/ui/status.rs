@@ -168,30 +168,75 @@ pub(super) fn render_copy_feedback(
     frame.render_widget(Paragraph::new(text), inner);
 }
 
-pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+/// The shared look of the top-right warning banner: bold dark-on-yellow, right
+/// aligned, one row per line, clearing whatever it covers.
+fn render_banner_line(frame: &mut Frame, area: Rect, row: u16, text: &str, p: &Palette) {
+    if row >= area.height {
+        return;
+    }
     let style = Style::default()
         .fg(panel_contrast_fg(p))
         .bg(p.yellow)
         .add_modifier(Modifier::BOLD);
+    let width = display_width_u16(text).min(area.width);
+    let notif_area = Rect::new(
+        area.x + area.width.saturating_sub(width),
+        area.y + row,
+        width,
+        1,
+    );
 
-    for (row, line) in message
-        .lines()
-        .filter(|line| !line.trim().is_empty())
+    frame.render_widget(Clear, notif_area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(text.to_string(), style)),
+        notif_area,
+    );
+}
+
+/// How many banner rows [`render_config_diagnostic`] will occupy, so anything
+/// stacked under it starts below rather than over it.
+pub(super) fn config_diagnostic_rows(message: &str, area: Rect) -> u16 {
+    config_diagnostic_lines(message)
+        .take(area.height as usize)
+        .count() as u16
+}
+
+fn config_diagnostic_lines(message: &str) -> impl Iterator<Item = &str> {
+    message.lines().filter(|line| !line.trim().is_empty())
+}
+
+pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &str, p: &Palette) {
+    for (row, line) in config_diagnostic_lines(message)
         .take(area.height as usize)
         .enumerate()
     {
-        let text = format!(" {line} ");
-        let width = (text.len() as u16).min(area.width);
-        let notif_area = Rect::new(
-            area.x + area.width.saturating_sub(width),
-            area.y + row as u16,
-            width,
-            1,
-        );
-
-        frame.render_widget(Clear, notif_area);
-        frame.render_widget(Paragraph::new(Span::styled(text, style)), notif_area);
+        render_banner_line(frame, area, row as u16, &format!(" {line} "), p);
     }
+}
+
+/// Say why this client's panes are drawn around grids that are not its size.
+///
+/// The head of the line carries the fact and the culprit's size, because a
+/// narrow client truncates the tail: the shared size is what identifies which
+/// other client to detach.
+pub(super) fn render_pane_size_pin(
+    frame: &mut Frame,
+    area: Rect,
+    pin: &crate::app::state::PaneSizePin,
+    row: u16,
+    p: &Palette,
+) {
+    let (shared_cols, shared_rows) = pin.shared;
+    let (client_cols, client_rows) = pin.client;
+    render_banner_line(
+        frame,
+        area,
+        row,
+        &format!(
+            " panes pinned to {shared_cols}x{shared_rows} by another client; this one is {client_cols}x{client_rows} "
+        ),
+        p,
+    );
 }
 
 /// The glyph half of [`state_icon`], for surfaces that build their own style

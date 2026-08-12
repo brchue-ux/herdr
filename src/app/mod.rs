@@ -759,6 +759,7 @@ impl App {
             latest_release_notes_available,
             update_dismissed: false,
             config_diagnostic,
+            pane_size_pin: None,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,

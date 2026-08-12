@@ -59,8 +59,8 @@ use self::settings::render_settings_overlay;
 pub(crate) use self::sidebar::workspace_drop_indicator_row;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
-    copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
-    toast_notification_rect,
+    config_diagnostic_rows, copy_feedback_rect, render_config_diagnostic, render_copy_feedback,
+    render_pane_size_pin, render_toast_notification, toast_notification_rect,
 };
 pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
@@ -484,7 +484,7 @@ fn compute_view_internal(
             toast_notification_rect(
                 area,
                 toast,
-                app.config_diagnostic.is_some(),
+                warning_banner_present(app),
                 toast.position.unwrap_or(app.toast_config.herdr.position),
             )
         })
@@ -552,7 +552,7 @@ fn compute_mobile_view(
     let toast_hit_area = app
         .toast
         .as_ref()
-        .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
+        .map(|_| mobile_toast_banner_rect(area, warning_banner_present(app)))
         .unwrap_or_default();
 
     app.view = crate::app::ViewState {
@@ -713,17 +713,38 @@ fn render_navigation_chrome(
     }
 }
 
+/// Whether the top-right warning banner is drawn at all, and so whether the
+/// toast below it is offset by a row.
+///
+/// One predicate because `compute_view` decides the toast's *hit* area and
+/// `render_notifications` decides where it is *drawn*; two spellings of this
+/// would put the click somewhere other than the pixels.
+fn warning_banner_present(app: &AppState) -> bool {
+    app.config_diagnostic.is_some() || app.pane_size_pin.is_some()
+}
+
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    let has_config_diagnostic = app.config_diagnostic.is_some();
+    let diagnostic_area = if app.view.layout == ViewLayout::Mobile {
+        terminal_area
+    } else {
+        frame.area()
+    };
+    let mut banner_rows = 0;
     if let Some(message) = &app.config_diagnostic {
-        let diagnostic_area = if app.view.layout == ViewLayout::Mobile {
-            terminal_area
-        } else {
-            frame.area()
-        };
         render_config_diagnostic(frame, diagnostic_area, message, &app.palette);
+        banner_rows = config_diagnostic_rows(message, diagnostic_area);
     }
-    let mut copy_feedback_offset = u16::from(has_config_diagnostic);
+    // Stacked under the config diagnostic rather than over it: both are the same
+    // banner, and the config one is already where existing surfaces expect it.
+    if let Some(pin) = &app.pane_size_pin {
+        render_pane_size_pin(frame, diagnostic_area, pin, banner_rows, &app.palette);
+    }
+    // The toast/copy-feedback offset is "a banner is present", one row, as it
+    // has always been — a multi-line diagnostic did not widen it either. It
+    // must read the same predicate `compute_view` used for the toast's hit
+    // area, or the toast is clicked somewhere other than where it is drawn.
+    let has_warning_banner = warning_banner_present(app);
+    let mut copy_feedback_offset = u16::from(has_warning_banner);
     let mut toast_rect = None;
     if let Some(toast) = &app.toast {
         if app.view.layout == ViewLayout::Mobile {
@@ -731,7 +752,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 frame,
                 frame.area(),
                 toast,
-                has_config_diagnostic,
+                has_warning_banner,
                 &app.palette,
             );
         } else {
@@ -739,22 +760,19 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 frame,
                 frame.area(),
                 toast,
-                has_config_diagnostic,
+                has_warning_banner,
                 toast.position.unwrap_or(app.toast_config.herdr.position),
                 &app.palette,
             );
             toast_rect = Some(toast_notification_rect(
                 frame.area(),
                 toast,
-                has_config_diagnostic,
+                has_warning_banner,
                 toast.position.unwrap_or(app.toast_config.herdr.position),
             ));
         }
         if app.view.layout == ViewLayout::Mobile {
-            toast_rect = Some(mobile_toast_banner_rect(
-                frame.area(),
-                has_config_diagnostic,
-            ));
+            toast_rect = Some(mobile_toast_banner_rect(frame.area(), has_warning_banner));
         }
     }
     if let Some(feedback) = &app.copy_feedback {
@@ -1143,6 +1161,93 @@ mod tests {
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
         assert_eq!(app.view.toast_hit_area.x, 0);
+        assert_eq!(app.view.toast_hit_area.y, 1);
+    }
+
+    fn pane_size_pin_test_app() -> AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app
+    }
+
+    fn rendered_frame_text(app: &mut AppState, area: Rect) -> Vec<String> {
+        compute_view(app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (area.y..area.y + area.height)
+            .map(|row| buffer_row_text(buffer, area, row))
+            .collect()
+    }
+
+    #[test]
+    fn pane_size_pin_says_why_the_panes_do_not_fit() {
+        let mut app = pane_size_pin_test_app();
+        app.pane_size_pin = Some(crate::app::state::PaneSizePin {
+            shared: (100, 30),
+            client: (160, 50),
+        });
+
+        let rows = rendered_frame_text(&mut app, Rect::new(0, 0, 160, 20));
+
+        // The head of the line carries the shared size, which is what says
+        // which other client to detach.
+        assert!(
+            rows[0].contains("panes pinned to 100x30 by another client"),
+            "{:?}",
+            rows[0]
+        );
+        assert!(rows[0].contains("this one is 160x50"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn no_pane_size_pin_draws_no_banner() {
+        let mut app = pane_size_pin_test_app();
+
+        let rows = rendered_frame_text(&mut app, Rect::new(0, 0, 160, 20));
+
+        assert!(
+            !rows.iter().any(|row| row.contains("panes pinned to")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn pane_size_pin_stacks_under_the_config_diagnostic() {
+        let mut app = pane_size_pin_test_app();
+        app.config_diagnostic = Some("config.toml:100:10; herdr config check".into());
+        app.pane_size_pin = Some(crate::app::state::PaneSizePin {
+            shared: (100, 30),
+            client: (160, 50),
+        });
+
+        let rows = rendered_frame_text(&mut app, Rect::new(0, 0, 160, 20));
+
+        assert!(rows[0].contains("herdr config check"), "{:?}", rows[0]);
+        assert!(rows[1].contains("panes pinned to 100x30"), "{:?}", rows[1]);
+    }
+
+    #[test]
+    fn desktop_toast_hit_area_offsets_for_pane_size_pin() {
+        let mut app = pane_size_pin_test_app();
+        app.pane_size_pin = Some(crate::app::state::PaneSizePin {
+            shared: (100, 30),
+            client: (160, 50),
+        });
+        app.toast_config.herdr.position = crate::config::ToastHerdrPosition::TopLeft;
+        app.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "one".into(),
+            position: None,
+            target: None,
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
         assert_eq!(app.view.toast_hit_area.y, 1);
     }
 

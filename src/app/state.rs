@@ -1853,6 +1853,28 @@ pub struct CopyFeedback {
     pub message: String,
 }
 
+/// One client's view of the shared pane runtime size when it is not the client
+/// that set it.
+///
+/// The pane runtimes are one shared resource sized by whichever client is
+/// currently foreground, so a second client of a different size draws pane
+/// rects its own size around grids that are still the other client's size —
+/// a short block of real output above a blank tail, or output clipped off the
+/// bottom, for as long as both are attached. That is deliberate (see
+/// [`crate::ui::compute_view_without_resizing_panes`]); what is not deliberate
+/// is it being invisible, so the affected client says so.
+///
+/// Set by the server for the duration of that one client's draw and cleared
+/// after, beside the scroll offsets it already preserves the same way. Never
+/// persisted and never true of more than the client being drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneSizePin {
+    /// Columns and rows the shared pane runtimes are pinned to.
+    pub shared: (u16, u16),
+    /// Columns and rows of the client that is not getting them.
+    pub client: (u16, u16),
+}
+
 pub struct ReleaseNotesState {
     pub version: String,
     pub body: String,
@@ -1972,6 +1994,10 @@ pub struct AppState {
     pub latest_release_notes_available: bool,
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
+    /// Why this client's panes do not fill their rects, when that is because
+    /// another client of a different size currently owns the shared pane
+    /// runtime size. See [`PaneSizePin`].
+    pub pane_size_pin: Option<PaneSizePin>,
     pub toast: Option<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
@@ -3516,6 +3542,7 @@ impl AppState {
             latest_release_notes_available: false,
             update_dismissed: false,
             config_diagnostic: None,
+            pane_size_pin: None,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
