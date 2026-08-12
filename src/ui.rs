@@ -437,6 +437,14 @@ fn compute_view_internal(
     let sidebar_card_layers_published =
         update_sidebar_card_layers(app, &mut workspace_card_areas, sidebar_area, cell_size);
 
+    // A collapsed sidebar draws no tree and so has nothing to explain; asking
+    // anyway would walk every pane of every Space for a row that is not there.
+    let sidebar_view_hidden = if app.sidebar_collapsed {
+        crate::app::agent_view::AgentViewHidden::default()
+    } else {
+        sidebar::agent_view_hidden(app)
+    };
+
     let tab_label_decor = TabLabelDecor::from_state(app);
     let tab_bar_view = app
         .active
@@ -487,6 +495,7 @@ fn compute_view_internal(
         sidebar_rect: sidebar_area,
         workspace_card_areas,
         sidebar_card_layers_published,
+        sidebar_view_hidden,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -551,6 +560,7 @@ fn compute_mobile_view(
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         sidebar_card_layers_published: false,
+        sidebar_view_hidden: Default::default(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
         tab_scroll_left_hit_area: Rect::default(),

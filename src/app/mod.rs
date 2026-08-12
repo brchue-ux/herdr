@@ -733,6 +733,7 @@ impl App {
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 sidebar_card_layers_published: false,
+                sidebar_view_hidden: Default::default(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
