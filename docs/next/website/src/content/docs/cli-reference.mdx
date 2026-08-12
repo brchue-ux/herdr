@@ -94,6 +94,36 @@ herdr server reload-agent-manifests
 
 `herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `swap` live-swaps the running server onto a locally built binary, checking protocol compatibility and the workspace inventory before and after the handoff; see [Session state](/docs/session-state/#swapping-onto-a-locally-built-binary). `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
 
+## Background scene
+
+```bash
+herdr background on
+herdr background off
+herdr background status [--json]
+```
+
+Turns the persistent whole-terminal background scene on or off, and reports why it is not drawing when it is not.
+
+The scene draws the fleet as an orrery behind every pane — the root of each owner tree as a sun, its second-level workspaces as planets, their workers as moons — mirroring the same tree the sidebar draws.
+
+`on` sets both `[experimental] persistent_background` and `[experimental] kitty_graphics` in `config.toml`, because the scene is a Kitty Graphics surface and needs both; setting only the first is a silent no-op. `off` clears `persistent_background` and deliberately leaves `kitty_graphics` alone, since the sidebar's pixel cards and tray art read it too. Neither reaches into a running server: run `herdr server reload-config` afterwards to apply the change.
+
+`status` prints every condition the scene is gated on, met or not:
+
+```text
+background scene: DRAWING
+
+  yes [experimental] persistent_background
+  yes [experimental] kitty_graphics
+  yes host terminal draws an ambient wash under the text (identified as: kitty)
+  yes every attached viewer draws one too
+  yes host answered the Kitty Graphics probe (not a gate; other pixel surfaces need it)
+```
+
+The terminal condition is the one config alone cannot answer. The scene is an opaque image placed *under* the text, and a terminal that accepts the placement but ignores the negative-z band draws that same image over every glyph instead — so Herdr refuses it on any terminal it has not positively identified. The identity is read in band over the pty (XTVERSION), which means it survives an SSH hop where `TERM_PROGRAM` does not: `other` means the terminal did not answer or gave a name Herdr does not know, not that a variable was unset.
+
+The same conditions are on the JSON API as `background_scene` in the session snapshot.
+
 ## Notifications
 
 ```bash

@@ -6965,6 +6965,49 @@
           ],
           "type": "object"
         },
+        "BackgroundSceneInfo": {
+          "description": "The persistent whole-terminal background scene's live state, condition by\ncondition.\n\nEvery condition is reported separately rather than rolled into `active`\nalone, because the scene fails *silently*: an unmet condition draws nothing\nand says nothing, and three of the five are facts about the viewer's\nterminal that no amount of reading the config can reveal. A caller that\nwants the one-line answer reads [`Self::active`]; a caller asking why it is\nfalse reads the rest.",
+          "properties": {
+            "active": {
+              "description": "The scene is being drawn. True exactly when every other condition here\nthat gates it is met.",
+              "type": "boolean"
+            },
+            "enabled": {
+              "description": "`[experimental] persistent_background` in config.toml.",
+              "type": "boolean"
+            },
+            "every_viewer_draws_ambient_wash": {
+              "description": "Every other attached viewer draws one too. The scene is a single shared\nimage placed for all of them, so one viewer that would composite it over\nits own text withholds it from everybody.",
+              "type": "boolean"
+            },
+            "host_draws_ambient_wash": {
+              "description": "The host terminal is one Herdr has positively identified as drawing an\nopaque ambient wash *under* the text rather than over it.",
+              "type": "boolean"
+            },
+            "host_terminal": {
+              "description": "What the host terminal identified itself as, in band, over the pty\n(`kitty`, `rio`, or `other` for one Herdr could not positively name).\nOver an SSH hop this is the only source that survives.",
+              "type": "string"
+            },
+            "kitty_graphics_capability_confirmed": {
+              "description": "The host terminal answered the Kitty Graphics capability probe (`a=q`).\nReported for diagnosis rather than as a gate: it is what every *other*\npixel surface requires, so a terminal that fails it will draw no cards\nor tray art either.",
+              "type": "boolean"
+            },
+            "kitty_graphics_enabled": {
+              "description": "`[experimental] kitty_graphics` in config.toml. The scene is a Kitty\nGraphics surface, so this gates it too.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "active",
+            "enabled",
+            "kitty_graphics_enabled",
+            "kitty_graphics_capability_confirmed",
+            "host_terminal",
+            "host_draws_ambient_wash",
+            "every_viewer_draws_ambient_wash"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleReason": {
           "enum": [
             "set",
@@ -10707,6 +10750,19 @@
                 "$ref": "#/schemas/success_response/$defs/AgentInfo"
               },
               "type": "array"
+            },
+            "background_scene": {
+              "$ref": "#/schemas/success_response/$defs/BackgroundSceneInfo",
+              "default": {
+                "active": false,
+                "enabled": false,
+                "every_viewer_draws_ambient_wash": false,
+                "host_draws_ambient_wash": false,
+                "host_terminal": "",
+                "kitty_graphics_capability_confirmed": false,
+                "kitty_graphics_enabled": false
+              },
+              "description": "Whether the persistent whole-terminal background scene is drawing, and\nwhen it is not, which of its conditions is the one that is unmet."
             },
             "focused_pane_id": {
               "type": [

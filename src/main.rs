@@ -661,6 +661,7 @@ fn main() -> io::Result<()> {
         println!("       herdr server stop");
         println!("       herdr server reload-config");
         println!("       herdr api <subcommand> ...");
+        println!("       herdr background <on|off|status>");
         println!("       herdr completion <shell>");
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");
@@ -705,6 +706,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr api <subcommand>",
                 "Inspect socket API metadata and live runtime state",
+            ),
+            (
+                "herdr background <subcommand>",
+                "Turn the whole-terminal background scene on, off, or explain it",
             ),
             (
                 "herdr workspace <subcommand>",

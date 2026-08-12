@@ -28,6 +28,47 @@ pub struct SessionSnapshot {
     /// one, which is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Whether the persistent whole-terminal background scene is drawing, and
+    /// when it is not, which of its conditions is the one that is unmet.
+    #[serde(default)]
+    pub background_scene: BackgroundSceneInfo,
+}
+
+/// The persistent whole-terminal background scene's live state, condition by
+/// condition.
+///
+/// Every condition is reported separately rather than rolled into `active`
+/// alone, because the scene fails *silently*: an unmet condition draws nothing
+/// and says nothing, and three of the five are facts about the viewer's
+/// terminal that no amount of reading the config can reveal. A caller that
+/// wants the one-line answer reads [`Self::active`]; a caller asking why it is
+/// false reads the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BackgroundSceneInfo {
+    /// The scene is being drawn. True exactly when every other condition here
+    /// that gates it is met.
+    pub active: bool,
+    /// `[experimental] persistent_background` in config.toml.
+    pub enabled: bool,
+    /// `[experimental] kitty_graphics` in config.toml. The scene is a Kitty
+    /// Graphics surface, so this gates it too.
+    pub kitty_graphics_enabled: bool,
+    /// The host terminal answered the Kitty Graphics capability probe (`a=q`).
+    /// Reported for diagnosis rather than as a gate: it is what every *other*
+    /// pixel surface requires, so a terminal that fails it will draw no cards
+    /// or tray art either.
+    pub kitty_graphics_capability_confirmed: bool,
+    /// What the host terminal identified itself as, in band, over the pty
+    /// (`kitty`, `rio`, or `other` for one Herdr could not positively name).
+    /// Over an SSH hop this is the only source that survives.
+    pub host_terminal: String,
+    /// The host terminal is one Herdr has positively identified as drawing an
+    /// opaque ambient wash *under* the text rather than over it.
+    pub host_draws_ambient_wash: bool,
+    /// Every other attached viewer draws one too. The scene is a single shared
+    /// image placed for all of them, so one viewer that would composite it over
+    /// its own text withholds it from everybody.
+    pub every_viewer_draws_ambient_wash: bool,
 }
 
 /// Params for `session.status.set`.

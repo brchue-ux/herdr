@@ -33,6 +33,7 @@ pub(super) fn command() -> Command {
         .subcommand(channel_command())
         .subcommand(server_command())
         .subcommand(api_command())
+        .subcommand(background_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
@@ -200,6 +201,18 @@ fn server_command() -> Command {
         .subcommand(
             Command::new("reload-agent-manifests")
                 .about("Reload local agent detection manifest overrides"),
+        )
+}
+
+fn background_command() -> Command {
+    Command::new("background")
+        .about("Turn the persistent whole-terminal background scene on or off")
+        .subcommand(Command::new("on").about("Enable the background scene in config.toml"))
+        .subcommand(Command::new("off").about("Disable the background scene in config.toml"))
+        .subcommand(
+            Command::new("status")
+                .about("Report whether the scene is drawing, and what is stopping it")
+                .arg(json_flag()),
         )
 }
 
