@@ -1990,6 +1990,7 @@ switch_workspace = "ctrl+1..9"
             // averaged into an 8x16 cell, which produced no adjustment at all and made this test
             // meaningless; this is the actual bright case the mechanism exists for.
             severity: crate::anim::cell::Severity::Critical,
+            size: crate::solar_system::BodySize::Fixed,
         }];
         let layout = crate::solar_system::build_layout(&nodes, width_px, height_px);
 

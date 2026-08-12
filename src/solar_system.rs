@@ -78,22 +78,111 @@ fn field_threads(rows: usize) -> usize {
 }
 
 /// Which kind of body this node draws as. Carries no colour or size of its own — those are
-/// resolved per-node from lifecycle/severity and [`Self::base_radius_fraction`] — because two
-/// bodies of the same kind can be in wildly different states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// resolved per-node from lifecycle/severity and [`Self::radius_fraction`] — because two bodies
+/// of the same kind can be in wildly different states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BodyKind {
     Sun,
     Planet,
     Moon,
 }
 
+/// The top of the size register, in tracked files: a project at or above this draws at its tier's
+/// maximum radius, and the register saturates rather than running away.
+///
+/// `5,000` is the fleet orrery's own stated top — 2.0x the largest checkout measured on the box
+/// this scene was designed against (herdr itself, 2,470 files).
+const FILES_CEIL: u32 = 5_000;
+
+/// The baseline mass, in files, every project is floored at before its own files are added.
+///
+/// Ported verbatim from the orrery's solved constant rather than re-derived, so herdr and the
+/// artifact place the same project at the same point of the same register. It is what makes the
+/// band 2.38x wide from floor to ceiling — `((FILE_FLOOR + FILES_CEIL) / FILE_FLOOR).cbrt()` — and
+/// it is why an unmeasured project is still a body: a project the fleet has not measured is not a
+/// project with no files, and the floor is what absorbs the difference.
+const FILE_FLOOR: f32 = 398.42;
+
+/// How big a body is in the project-size register — the quantity that decides where inside its
+/// tier's band it draws.
+///
+/// The register is *tracked files at HEAD*, the same measure the fleet orrery's bridge publishes
+/// (`git ls-tree -r HEAD --name-only`, counted), so a project reads the same size in both places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum BodySize {
+    /// Outside the register, because this body is not a project and so has no file count to be
+    /// compared with: the sun (the fleet's router *to* the projects, not one of them — the
+    /// captain's ruling in `data/decisions/2026-08-12-project-size-driven-sizing.md`, firstmate
+    /// home) and every worker body (a pane is not a checkout). Draws at its tier's fixed radius,
+    /// exactly as it did before the register existed.
+    #[default]
+    Fixed,
+    /// A project whose size the fleet has not published — no token yet, no HEAD to count, or a
+    /// value that did not parse. Draws at the register's floor, **not** at zero: see
+    /// [`FILE_FLOOR`].
+    Unmeasured,
+    /// A project measured at this many tracked files at HEAD.
+    Files(u32),
+}
+
+impl BodySize {
+    /// Where this size sits in the register, as a fraction of the register's top —
+    /// `0.4195..=1.0`, never zero.
+    ///
+    /// Volume ~ mass, so the cube root is what made mass legible as size in the first place; that
+    /// is the part deliberately carried over unchanged. [`BodySize::Unmeasured`] and
+    /// [`BodySize::Fixed`] both contribute no files of their own and so land exactly on the floor,
+    /// which is the whole point of having one.
+    pub(crate) fn register_fraction(self) -> f32 {
+        let files = match self {
+            Self::Files(files) => files.min(FILES_CEIL) as f32,
+            Self::Unmeasured | Self::Fixed => 0.0,
+        };
+        ((FILE_FLOOR + files) / (FILE_FLOOR + FILES_CEIL as f32)).cbrt()
+    }
+}
+
 impl BodyKind {
-    /// Body pixel radius, as a fraction of `min(width, height)`.
-    fn base_radius_fraction(self) -> f32 {
+    /// The largest this tier ever draws, as a fraction of `min(width, height)` — the top of its
+    /// band, reached by a project at [`FILES_CEIL`] files or more.
+    ///
+    /// The planet ceiling is half the sun's locked radius: no planet rivals the sun, whatever it
+    /// grows to. (The orrery carries a perspective factor into that bound; herdr draws no
+    /// perspective, so half is half.) The moon ceiling keeps the 0.45 moon:planet proportion the
+    /// scene already read as hierarchy, so a nested project stays a moon.
+    fn max_radius_fraction(self) -> f32 {
+        match self {
+            Self::Sun => 0.050,
+            Self::Planet => 0.025,
+            Self::Moon => 0.01125,
+        }
+    }
+
+    /// Body pixel radius for a body outside the register, as a fraction of `min(width, height)` —
+    /// the sun, and every worker body. Unchanged from before project-size-driven sizing landed.
+    fn fixed_radius_fraction(self) -> f32 {
         match self {
             Self::Sun => 0.050,
             Self::Planet => 0.020,
             Self::Moon => 0.009,
+        }
+    }
+
+    /// Body pixel radius, as a fraction of `min(width, height)`.
+    ///
+    /// A project is placed inside its tier's band by `size`; everything else draws at
+    /// [`Self::fixed_radius_fraction`]. Note where the old flat constants land under the register:
+    /// a 2,470-file project (the largest real checkout this was measured against) draws at
+    /// `0.0202`/`0.0091` — within a percent of the `0.020`/`0.009` every body used to get — so the
+    /// register did not rescale the scene, it spread it around what was already there.
+    fn radius_fraction(self, size: BodySize) -> f32 {
+        match (self, size) {
+            // The sun is locked out of the register by decision, whatever a caller hands it: it
+            // routes to projects rather than being one, so there is nothing to compare it against.
+            (Self::Sun, _) | (_, BodySize::Fixed) => self.fixed_radius_fraction(),
+            (_, BodySize::Unmeasured | BodySize::Files(_)) => {
+                self.max_radius_fraction() * size.register_fraction()
+            }
         }
     }
 
@@ -131,6 +220,9 @@ pub(crate) struct TreeNode {
     /// Lifecycle-stage hue in degrees, from `crate::app::lifecycle::stage(...).hue(...)`.
     pub(crate) hue: f32,
     pub(crate) severity: Severity,
+    /// Where this body sits in the project-size register — [`BodySize::Fixed`] for anything that
+    /// is not a project.
+    pub(crate) size: BodySize,
 }
 
 /// One body's static placement facts, resolved once per topology change (mirrors
@@ -224,7 +316,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             severity: node.severity,
             base_angle,
             orbit_radius_px: node.kind.orbit_radius_fraction() * scale * nesting,
-            body_radius_px: node.kind.base_radius_fraction() * scale * nesting.max(0.35),
+            body_radius_px: node.kind.radius_fraction(node.size) * scale * nesting.max(0.35),
         });
     }
 
@@ -249,6 +341,14 @@ impl SceneLayout {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.bodies.is_empty()
+    }
+
+    /// The radius one body is drawn at, for a caller checking that a fleet fact reached the
+    /// picture. `src/app/background_scene.rs` owns the whole path from a workspace's tokens to
+    /// these nodes, so its tests are the ones that can prove a published size ends up as a size.
+    #[cfg(test)]
+    pub(crate) fn body_radius_px(&self, idx: usize) -> Option<f32> {
+        self.bodies.get(idx).map(|body| body.body_radius_px)
     }
 
     pub(crate) fn width(&self) -> u32 {
@@ -1186,6 +1286,15 @@ mod tests {
             kind,
             hue: 41.0,
             severity: Severity::Clear,
+            size: BodySize::Fixed,
+        }
+    }
+
+    /// A body inside the project-size register, for the tests that are about the register itself.
+    fn sized(parent: Option<usize>, kind: BodyKind, size: BodySize) -> TreeNode {
+        TreeNode {
+            size,
+            ..node(parent, kind)
         }
     }
 
@@ -1201,7 +1310,95 @@ mod tests {
             kind,
             hue,
             severity,
+            size: BodySize::Fixed,
         }
+    }
+
+    /// A real spread of checkouts, as measured on the box this register was designed against: a
+    /// two-file scratch project and herdr itself.
+    const TINY_PROJECT: u32 = 2;
+    const BIG_PROJECT: u32 = 2_470;
+
+    /// The radius one body draws at, in a scene whose `min(width, height)` is exactly 1,000 — so a
+    /// pixel radius reads directly as the fraction, times a thousand.
+    fn radius_of(kind: BodyKind, size: BodySize) -> f32 {
+        let nodes = [node(None, BodyKind::Sun), sized(Some(0), kind, size)];
+        build_layout(&nodes, 1_000, 1_000).bodies[1].body_radius_px
+    }
+
+    #[test]
+    fn a_bigger_project_draws_a_bigger_planet() {
+        let tiny = radius_of(BodyKind::Planet, BodySize::Files(TINY_PROJECT));
+        let big = radius_of(BodyKind::Planet, BodySize::Files(BIG_PROJECT));
+
+        // Not merely ordered — *visibly* bigger. The whole point of the register is that the
+        // difference survives being looked at, so a monotonicity assertion alone would pass on a
+        // spread of a tenth of a pixel and prove nothing anyone could see.
+        assert!(
+            big > tiny * 1.5,
+            "a 2,470-file project should visibly outdraw a 2-file one: {big} vs {tiny}"
+        );
+        assert!(
+            radius_of(BodyKind::Planet, BodySize::Files(500))
+                > radius_of(BodyKind::Planet, BodySize::Files(100)),
+            "the register has to be monotonic in between, not only at its ends"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_project_is_floored_rather_than_collapsed() {
+        let unmeasured = radius_of(BodyKind::Planet, BodySize::Unmeasured);
+        let biggest = radius_of(BodyKind::Planet, BodySize::Files(FILES_CEIL));
+
+        // A project nobody has measured is not a project with no files. It lands on the floor,
+        // which is a real body — a little over 40% of the ceiling, ten pixels across at this
+        // scene size — and never on zero.
+        assert!(unmeasured > 0.0);
+        assert!(
+            unmeasured > biggest * 0.4,
+            "the floor should be a body, not a dot: {unmeasured} against a ceiling of {biggest}"
+        );
+        // Zero files is the same case by construction, which is what makes the floor the one
+        // place the two are absorbed.
+        assert_eq!(unmeasured, radius_of(BodyKind::Planet, BodySize::Files(0)));
+        assert!(radius_of(BodyKind::Moon, BodySize::Unmeasured) > 0.0);
+    }
+
+    #[test]
+    fn the_register_saturates_at_its_stated_ceiling() {
+        let at_ceiling = radius_of(BodyKind::Planet, BodySize::Files(FILES_CEIL));
+        let far_past_it = radius_of(BodyKind::Planet, BodySize::Files(99_999));
+
+        assert_eq!(at_ceiling, far_past_it);
+        // And the ceiling is the bound that matters: no planet ever rivals the sun.
+        assert!(at_ceiling <= radius_of(BodyKind::Sun, BodySize::Fixed) / 2.0);
+    }
+
+    #[test]
+    fn the_sun_and_the_workers_stay_out_of_the_register() {
+        // The sun routes to projects rather than being one, so no size a caller hands it moves it.
+        let locked = radius_of(BodyKind::Sun, BodySize::Fixed);
+        assert_eq!(
+            locked,
+            radius_of(BodyKind::Sun, BodySize::Files(FILES_CEIL))
+        );
+        assert_eq!(locked, radius_of(BodyKind::Sun, BodySize::Unmeasured));
+
+        // A worker is not a checkout either: `Fixed` bodies draw exactly what every body drew
+        // before the register existed.
+        assert_eq!(radius_of(BodyKind::Planet, BodySize::Fixed), 20.0);
+        assert_eq!(radius_of(BodyKind::Moon, BodySize::Fixed), 9.0);
+    }
+
+    #[test]
+    fn the_biggest_real_checkout_still_draws_what_the_flat_constant_drew() {
+        // The register spread the scene around what was already there rather than rescaling it:
+        // the largest checkout measured on this box lands within ~1.5% of the flat constants every
+        // body used to get, so nothing about the composition moved to make room for it.
+        let planet = radius_of(BodyKind::Planet, BodySize::Files(BIG_PROJECT));
+        let moon = radius_of(BodyKind::Moon, BodySize::Files(BIG_PROJECT));
+        assert!((planet - 20.0).abs() < 20.0 * 0.015, "{planet}");
+        assert!((moon - 9.0).abs() < 9.0 * 0.015, "{moon}");
     }
 
     /// Sample one rendered pixel of `frame`'s RGBA8 output as `(r, g, b)`.

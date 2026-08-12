@@ -385,6 +385,7 @@ mod tests {
             kind: solar_system::BodyKind::Sun,
             hue: 41.0,
             severity: crate::anim::cell::Severity::Clear,
+            size: solar_system::BodySize::Fixed,
         }
     }
 }

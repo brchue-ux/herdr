@@ -39,6 +39,13 @@
 //!   the fleet's `fm-quality-event.sh` publishes, through [`crate::quality_streak`] — which owns
 //!   the token contract, the read-time decay and the band table for every surface that draws
 //!   them, so a shower fires on the same band the sidebar's own flame readout is showing.
+//!
+//! ## How big each body is drawn
+//!
+//! Not a trigger but a standing fact, and the one other thing this module reads from the fleet: a
+//! project's body is sized by the [`FILES_TOKEN`] workspace metadata token — its tracked files at
+//! HEAD — placed in [`solar_system::BodySize`]'s register. An unmeasured project is floored rather
+//! than drawn at nothing, and the sun and worker bodies are out of the register entirely.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -183,6 +190,19 @@ impl BackgroundEffectsState {
     }
 }
 
+/// The workspace metadata token carrying a project's size: its tracked files at HEAD, as a plain
+/// decimal count.
+///
+/// Same measure and same name as the fleet orrery's bridge already publishes for the web scene
+/// (`git ls-tree -r HEAD --name-only`, counted), so a project reads the same size in both places,
+/// and it rides the existing `workspace.report_metadata` path exactly like `lifecycle`/`severity`,
+/// `outcome`, `streak` and `quota_5h` do — no new transport for one more fleet fact.
+///
+/// **Absent is not zero.** A project with no token, no HEAD to count, or an unparseable value is
+/// [`solar_system::BodySize::Unmeasured`], which the register floors into a real body rather than
+/// collapsing to a dot — see [`solar_system::BodySize`]'s own doc.
+pub(crate) const FILES_TOKEN: &str = "files";
+
 /// Every node of the whole-fleet owner tree, in the exact shape `src/solar_system.rs` wants, plus
 /// the identity each index resolves back to.
 ///
@@ -206,7 +226,7 @@ pub(crate) fn tree_nodes(
         path.truncate(depth);
         let parent = path.last().copied();
 
-        let Some((row, hue, severity)) = row_for_entry(app, entry, &agents) else {
+        let Some((row, hue, severity, size)) = row_for_entry(app, entry, &agents) else {
             // A row this module cannot resolve to a colour (a dangling index between a pane
             // closing and the next tree rebuild) is skipped rather than drawn wrong — the next
             // pass, once the tree has settled, draws it correctly instead.
@@ -224,6 +244,7 @@ pub(crate) fn tree_nodes(
             kind,
             hue,
             severity,
+            size,
         });
         identity.push(row);
         path.push(nodes.len() - 1);
@@ -232,11 +253,30 @@ pub(crate) fn tree_nodes(
     (nodes, identity)
 }
 
+/// The size register reading for one workspace, from [`FILES_TOKEN`].
+///
+/// A missing or malformed token is [`solar_system::BodySize::Unmeasured`] rather than
+/// `Files(0)` — the two are deliberately different, and only the former is honest about a
+/// project nobody has measured yet.
+///
+/// Reads through [`crate::metadata_tokens::MetadataTokens::get`] rather than `values()`: this runs
+/// per workspace on every topology change, and materialising the whole token map to look at one
+/// key is exactly the aggregate-state collection the scene's hot paths are not allowed to do.
+fn work_size(workspace: &crate::workspace::Workspace) -> solar_system::BodySize {
+    workspace
+        .metadata_tokens
+        .get(FILES_TOKEN)
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .map_or(solar_system::BodySize::Unmeasured, |files| {
+            solar_system::BodySize::Files(files)
+        })
+}
+
 fn row_for_entry(
     app: &crate::app::state::AppState,
     entry: &crate::ui::sidebar::WorkspaceListEntry,
     agents: &[crate::ui::AgentPanelEntry],
-) -> Option<(CardRow, f32, Severity)> {
+) -> Option<(CardRow, f32, Severity, solar_system::BodySize)> {
     match entry {
         crate::ui::sidebar::WorkspaceListEntry::Workspace { ws_idx, .. } => {
             let workspace = app.workspaces.get(*ws_idx)?;
@@ -254,7 +294,12 @@ fn row_for_entry(
                     .map(String::as_str),
             );
             let hue = stage.hue(&app.palette, &app.host_terminal_theme);
-            Some((CardRow::Space(workspace.id.clone()), hue, severity))
+            Some((
+                CardRow::Space(workspace.id.clone()),
+                hue,
+                severity,
+                work_size(workspace),
+            ))
         }
         crate::ui::sidebar::WorkspaceListEntry::Agent { entry_idx, .. } => {
             let detail = agents.get(*entry_idx)?;
@@ -272,7 +317,14 @@ fn row_for_entry(
                     .map(String::as_str),
             );
             let hue = stage.hue(&app.palette, &app.host_terminal_theme);
-            Some((CardRow::Agent(detail.pane_id), hue, severity))
+            // A worker is not a project, so it stays out of the size register entirely and keeps
+            // its tier's fixed radius — the same reason the sun is out of it.
+            Some((
+                CardRow::Agent(detail.pane_id),
+                hue,
+                severity,
+                solar_system::BodySize::Fixed,
+            ))
         }
     }
 }
@@ -404,12 +456,13 @@ pub(crate) fn spawn_new_effects(
 
 /// The work-size magnitude a landing/merge comet scales by, `0.0..=1.0`.
 ///
-/// No fleet publisher carries per-event size yet (see this module's own doc) — `outcome`-token
-/// landings read as the mid tier (`M`, normalised `1.00` of the `0.25/0.50/1.00/1.75` scale,
-/// itself renormalised into `0.0..=1.0`) until one does, which is a deliberately visible, honest
-/// default rather than a guess dressed up as data.
-fn work_size_magnitude(_workspace: &crate::workspace::Workspace) -> f32 {
-    1.00 / 1.75
+/// This used to be a fixed mid tier, because nothing published a real size and a guess dressed up
+/// as data is worse than an admitted default. [`FILES_TOKEN`] is that publisher, so a landing on a
+/// big project now arrives as a bigger comet — read through the *same* register the body it lands
+/// on is sized by ([`solar_system::BodySize::register_fraction`]) rather than a second scale that
+/// could disagree with the picture, and floored for an unmeasured project exactly as the body is.
+fn work_size_magnitude(workspace: &crate::workspace::Workspace) -> f32 {
+    work_size(workspace).register_fraction()
 }
 
 fn pane_severity(app: &crate::app::state::AppState, pane_id: PaneId) -> Severity {
@@ -622,6 +675,137 @@ fn push_ejecta(
 mod tests {
     use super::*;
 
+    /// A workspace carrying one `files` token value, or none at all.
+    fn workspace_with_files(raw: Option<&str>) -> crate::workspace::Workspace {
+        let mut workspace = crate::workspace::Workspace::test_new("sized");
+        if let Some(raw) = raw {
+            workspace.metadata_tokens.patch(
+                HashMap::from([(FILES_TOKEN.to_string(), Some(raw.to_string()))]),
+                None,
+                Instant::now(),
+            );
+        }
+        workspace
+    }
+
+    #[test]
+    fn a_published_file_count_reaches_the_scene_as_a_measured_size() {
+        assert_eq!(
+            work_size(&workspace_with_files(Some("2470"))),
+            solar_system::BodySize::Files(2470)
+        );
+        // Publishers write with `printf`/`wc -l` and friends, so a trailing newline is the normal
+        // case rather than the exotic one.
+        assert_eq!(
+            work_size(&workspace_with_files(Some(" 2470\n"))),
+            solar_system::BodySize::Files(2470)
+        );
+    }
+
+    #[test]
+    fn an_unpublished_or_unreadable_size_is_unmeasured_never_zero() {
+        // The distinction the whole floor exists for: `Files(0)` is a claim about a project,
+        // `Unmeasured` is an admission about the fleet, and only one of them is true here.
+        for raw in [None, Some(""), Some("unknown"), Some("-3"), Some("12.5")] {
+            assert_eq!(
+                work_size(&workspace_with_files(raw)),
+                solar_system::BodySize::Unmeasured,
+                "{raw:?} is not a file count"
+            );
+        }
+        assert_eq!(
+            work_size(&workspace_with_files(Some("0"))),
+            solar_system::BodySize::Files(0),
+            "a real, published zero is still a measurement"
+        );
+    }
+
+    #[test]
+    fn a_landing_on_a_big_project_arrives_as_a_bigger_comet() {
+        let big = work_size_magnitude(&workspace_with_files(Some("2470")));
+        let tiny = work_size_magnitude(&workspace_with_files(Some("2")));
+        let unmeasured = work_size_magnitude(&workspace_with_files(None));
+
+        assert!(big > tiny, "{big} vs {tiny}");
+        // The comet reads the same register its target body is drawn by, floor included, so an
+        // unmeasured project's landing is a real comet rather than a vanishing one.
+        assert!(unmeasured > 0.0 && unmeasured <= tiny);
+        assert!(big <= 1.0);
+    }
+
+    /// Nest `ws_idx` under `owner`, the way `workspace report-metadata --token owner=...` does —
+    /// the one fact that makes a Space a planet in this scene rather than a second sun.
+    fn publish(app: &mut crate::app::state::AppState, ws_idx: usize, key: &str, value: &str) {
+        app.workspaces[ws_idx].metadata_tokens.patch(
+            HashMap::from([(key.to_string(), Some(value.to_string()))]),
+            None,
+            Instant::now(),
+        );
+    }
+
+    #[test]
+    fn a_published_size_reaches_the_body_the_scene_draws() {
+        // The whole path, end to end: a `files` token on a real workspace, through the same fleet
+        // tree the sidebar draws, into a radius. Three projects under one root — one tiny, one the
+        // size of this checkout, and one nobody has measured.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        for name in ["fleet", "tiny", "big", "unmeasured"] {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(name));
+        }
+        for ws_idx in 1..=3 {
+            publish(
+                &mut app,
+                ws_idx,
+                crate::app::agent_tree::OWNER_TOKEN,
+                "fleet",
+            );
+        }
+        publish(&mut app, 1, FILES_TOKEN, "2");
+        publish(&mut app, 2, FILES_TOKEN, "2470");
+
+        let (nodes, identity) = tree_nodes(&app);
+        let layout = solar_system::build_layout(&nodes, 1_000, 1_000);
+        let radius = |name: &str| {
+            let id = &app
+                .workspaces
+                .iter()
+                .find(|ws| ws.custom_name.as_deref() == Some(name))
+                .expect("workspace")
+                .id;
+            let idx = identity
+                .iter()
+                .position(|row| row == &CardRow::Space(id.clone()))
+                .expect("the scene draws a body for every Space in the tree");
+            layout.body_radius_px(idx).expect("a body has a radius")
+        };
+
+        assert_eq!(
+            nodes[0].kind,
+            solar_system::BodyKind::Sun,
+            "the root Space is the sun, and the three below it are its planets"
+        );
+        assert!(
+            radius("big") > radius("tiny") * 1.5,
+            "a 2,470-file project should visibly outdraw a 2-file one: {} vs {}",
+            radius("big"),
+            radius("tiny")
+        );
+        // Nobody published a size for this one, and it is still a planet: floored, not collapsed,
+        // and not silently treated as a project with no files in it.
+        assert_eq!(
+            radius("unmeasured"),
+            radius("tiny").min(radius("unmeasured"))
+        );
+        assert!(
+            radius("unmeasured") > radius("big") * 0.4,
+            "an unmeasured project drew {} against a measured {}",
+            radius("unmeasured"),
+            radius("big")
+        );
+    }
+
     /// The milestone rule this module holds is *crossing into a higher band*,
     /// so all it needs from the shared vocabulary is that the bands order by
     /// heat. The bands themselves, and the decay that places a score in one,
@@ -669,7 +853,7 @@ mod tests {
         assert_eq!(state.comets.len(), SHOWER_SIZE);
 
         let sun = (SCENE.0 / 2.0, SCENE.1 / 2.0);
-        // `BodyKind::Sun::base_radius_fraction()` against `min(width, height)`, which is the
+        // `BodyKind::Sun::fixed_radius_fraction()` against `min(width, height)`, which is the
         // radius the sun's own disk is drawn at in this scene.
         let sun_radius = 0.050 * SCENE.1;
 
