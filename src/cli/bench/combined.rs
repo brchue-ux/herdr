@@ -375,6 +375,10 @@ impl Fleet {
                 // scales with body *count*, so every run should draw the same body sizes as every
                 // other one rather than a spread that moves with whatever fixture built the rows.
                 size: crate::solar_system::BodySize::Fixed,
+                // ...and out of the streak register for the same reason: a ring that widens and a
+                // gas giant that swells are both size changes, and this rig holds size fixed so
+                // the number it reports is body *count* and nothing else.
+                streak: 0.0,
             });
         }
         nodes

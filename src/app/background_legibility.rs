@@ -386,6 +386,7 @@ mod tests {
             hue: 41.0,
             severity: crate::anim::cell::Severity::Clear,
             size: solar_system::BodySize::Fixed,
+            streak: 0.0,
         }
     }
 }

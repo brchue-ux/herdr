@@ -258,9 +258,73 @@ impl BodyKind {
     }
 }
 
+/// Which surface a body carries.
+///
+/// The captain's binding correction, in the fleet orrery's own words: *"Second mates are the gas
+/// giants and the ringed planets. Body type is theirs and is binding."* A worker is a moon and the
+/// firstmate is a star, so neither has one — [`Self::Plain`] is not a third kind of planet, it is
+/// the absence of the question.
+///
+/// Derived per layout build and never stored on a [`TreeNode`], because the rule is a *ranking*:
+/// see [`assign_body_types`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BodyType {
+    /// The sun, and every moon.
+    Plain,
+    /// A second mate carrying few, long workstreams: no ring, deep cloud banding, and a streak
+    /// that swells the gas rather than brightening anything.
+    Gas,
+    /// A second mate carrying many concurrent workers: the ring is the traffic of its own moons,
+    /// and a streak brightens and widens it.
+    Ringed,
+}
+
+/// How many bodies in three are gas giants: two.
+///
+/// A54's rule, ported with its reasoning intact — a mate is a gas giant *unless* its rank is
+/// `2 mod 3`. That is the captain's "even distribution" read as even **spacing** rather than as
+/// 50/50, because the same sentence asked for more gas planets and a 50/50 split adds none.
+const RINGED_RANK_MODULUS: usize = 3;
+const RINGED_RANK_REMAINDER: usize = 2;
+
+/// Assign a [`BodyType`] to every node, by rank in the project-size register.
+///
+/// Ranked by [`BodySize::register_fraction`] — the same key the size band already uses, so a mate
+/// with no published size ranks where it is *drawn* (at the floor) rather than below zero — with
+/// roster order breaking ties, which keeps the assignment stable for a fleet of equal-sized
+/// projects instead of shuffling on every rebuild.
+///
+/// **Recomputed, never stored** (A54(b)): a rule that is even only for the fleet that happened to
+/// exist at bake time is not a rule, and this fleet's roster changes under it. [`build_layout`] is
+/// that recompute — it already runs on every topology change, which is exactly the event that can
+/// move a rank.
+fn assign_body_types(nodes: &[TreeNode]) -> Vec<BodyType> {
+    let mut ranked: Vec<(usize, f32)> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == BodyKind::Planet)
+        .map(|(idx, node)| (idx, node.size.register_fraction()))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut types = vec![BodyType::Plain; nodes.len()];
+    for (rank, (idx, _)) in ranked.into_iter().enumerate() {
+        types[idx] = if rank % RINGED_RANK_MODULUS == RINGED_RANK_REMAINDER {
+            BodyType::Ringed
+        } else {
+            BodyType::Gas
+        };
+    }
+    types
+}
+
 /// One node of the fleet's owner tree, exactly as `src/app/background_scene.rs` derived it from
 /// `crate::ui::sidebar::workspace_list_entries_whole_fleet` — this module knows nothing about
-/// panes, workspaces or tokens, only shape and two already-resolved colour facts.
+/// panes, workspaces or tokens, only shape and already-resolved colour, size and streak facts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TreeNode {
     /// Index into the same slice, or `None` for a root (the sun tier).
@@ -272,6 +336,12 @@ pub(crate) struct TreeNode {
     /// Where this body sits in the project-size register — [`BodySize::Fixed`] for anything that
     /// is not a project.
     pub(crate) size: BodySize,
+    /// How hot this mate's quality streak is reading, `0.0..=1.0`, already resolved against
+    /// `crate::quality_streak`'s own published bands by `src/app/background_scene.rs` — this
+    /// module never sees a raw score or a clock.
+    ///
+    /// `0.0` for anything with no streak to read, which is every worker and the sun.
+    pub(crate) streak: f32,
 }
 
 /// One body's static placement facts, resolved once per topology change (mirrors
@@ -281,12 +351,97 @@ pub(crate) struct TreeNode {
 struct BodyLayout {
     parent: Option<usize>,
     kind: BodyKind,
+    body_type: BodyType,
     hue: f32,
     severity: Severity,
+    /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
+    streak: f32,
     /// Angle this body sits at within its parent's ring at `phase == 0`.
     base_angle: f32,
     orbit_radius_px: f32,
     body_radius_px: f32,
+}
+
+/// The streak expression's full range, in the artifact's own units: `visStreakCapped` runs
+/// `0..=11`, and every rate below is quoted per unit of it. herdr resolves its own streak to a
+/// `0.0..=1.0` fraction instead (its register is a decayed score in named bands, not a count of
+/// consecutive wins), so each ported rate is multiplied through by this once, here, rather than
+/// eleven constants being silently rescaled one at a time.
+const STREAK_UNITS: f32 = 11.0;
+
+/// Where a ring begins, as a multiple of its planet's own radius. Ports `ringGeom`'s `inner`.
+const RING_INNER: f32 = 1.40;
+
+/// Where a ring ends at no streak at all, and how far a full streak pushes that out. Ports
+/// `ringGeom`'s `outer: 1.78 + visStreakCapped * 0.070` — *"streak brightens and thickens the
+/// ring"*, and thickening it is what makes a sustained streak read from across the room.
+const RING_OUTER: f32 = 1.78;
+const RING_OUTER_PER_STREAK: f32 = 0.070 * STREAK_UNITS;
+
+/// How flat the ring's ellipse is drawn. The orrery's `RING_SQUASH` — the ring plane is tilted
+/// about the horizontal axis by `acos(0.34)`, roughly 70 degrees, which is what makes the ring
+/// read as a plane the body sits *in* rather than a halo drawn round it.
+const RING_SQUASH: f32 = 0.34;
+
+/// Ice and dust, straight off the orrery's own palette. Deliberately not severity-coded: a ring is
+/// material, and the body's own colour already carries what state the mate is in — the same
+/// exemption, and for the same reason, as [`SUN_STAR_RGB01`].
+const RING_RGB01: (f32, f32, f32) = (212.0 / 255.0, 198.0 / 255.0, 170.0 / 255.0);
+
+/// A ring's brightness at no streak, and how far a full streak lifts it. Ports `drawRing`'s
+/// `bright = 0.30 + visStreakCapped * 0.055`.
+const RING_BRIGHT: f32 = 0.30;
+const RING_BRIGHT_PER_STREAK: f32 = 0.055 * STREAK_UNITS;
+
+/// How far a full streak swells a gas giant, as a multiple of its register radius. Ports the
+/// artifact's `swell = 1 + visStreakCapped * 0.0295`.
+///
+/// F16 is explicit that this swell is *inside* the size bound rather than outside it: it is
+/// clamped, and the clamp is the stated price. [`build_layout`] applies that clamp, so a gas giant
+/// on a long streak grows toward the planet ceiling and stops there rather than through it.
+const GAS_SWELL_PER_STREAK: f32 = 0.0295 * STREAK_UNITS;
+
+/// How many latitudinal cloud bands each planet type carries. The orrery's `m.type==='gas'?7:5` —
+/// a ringed planet is banded too, just less deeply, which is most of what separates a second mate
+/// from a worker moon at a glance.
+const GAS_BAND_COUNT: f32 = 7.0;
+const RINGED_BAND_COUNT: f32 = 5.0;
+
+/// How much of the rocky surface mottling a gas giant keeps. The orrery's roughness pair
+/// (`0.42` for gas against `0.72` for everything else) as a ratio, because this renderer's mottle
+/// amplitude is already solved and only its *depth* differs by body type: cloud decks are smoother
+/// than rock, and a gas giant that mottles like a moon reads as a big moon.
+const GAS_MOTTLE_SCALE: f32 = 0.42 / 0.72;
+
+impl BodyType {
+    /// This type's band count, or `None` for a body that carries no bands at all.
+    fn band_count(self) -> Option<f32> {
+        match self {
+            Self::Plain => None,
+            Self::Gas => Some(GAS_BAND_COUNT),
+            Self::Ringed => Some(RINGED_BAND_COUNT),
+        }
+    }
+
+    fn mottle_scale(self) -> f32 {
+        match self {
+            Self::Gas => GAS_MOTTLE_SCALE,
+            Self::Plain | Self::Ringed => 1.0,
+        }
+    }
+}
+
+impl BodyLayout {
+    /// This body's ring, inner and outer radius in pixels, or `None` if it does not carry one.
+    fn ring_radii_px(&self) -> Option<(f32, f32)> {
+        if self.body_type != BodyType::Ringed {
+            return None;
+        }
+        Some((
+            self.body_radius_px * RING_INNER,
+            self.body_radius_px * (RING_OUTER + RING_OUTER_PER_STREAK * clamp01(self.streak)),
+        ))
+    }
 }
 
 /// Every body's static placement for one frame size, ready to be evaluated at any phase.
@@ -338,6 +493,10 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
         }
     }
 
+    // A54(b): the rank rule is recomputed here rather than carried on a node, because this is the
+    // recompute — `build_layout` runs on exactly the topology changes that can move a rank.
+    let types = assign_body_types(nodes);
+
     let mut bodies: Vec<BodyLayout> = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter().enumerate() {
         let siblings = node
@@ -358,14 +517,31 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
         let extra_depth = depth[idx].saturating_sub(2);
         let nesting = 0.62f32.powi(extra_depth as i32);
 
+        let body_type = types.get(idx).copied().unwrap_or(BodyType::Plain);
+        let streak = clamp01(node.streak);
+
+        // A gas giant on a streak swells. F16 puts that swell *inside* the size bound rather than
+        // outside it, so it is clamped at the planet ceiling — a mate that has been winning for a
+        // month grows toward the ceiling and stops, it does not grow into the sun's half of the
+        // frame. The clamp is the stated price of the mechanism, not an oversight in it.
+        let swell = if body_type == BodyType::Gas {
+            1.0 + GAS_SWELL_PER_STREAK * streak
+        } else {
+            1.0
+        };
+        let radius_fraction =
+            (node.kind.radius_fraction(node.size) * swell).min(node.kind.max_radius_fraction());
+
         bodies.push(BodyLayout {
             parent: node.parent,
             kind: node.kind,
+            body_type,
             hue: node.hue,
             severity: node.severity,
+            streak,
             base_angle,
             orbit_radius_px: node.kind.orbit_radius_fraction() * scale * nesting,
-            body_radius_px: node.kind.radius_fraction(node.size) * scale * nesting.max(0.35),
+            body_radius_px: radius_fraction * scale * nesting.max(0.35),
         });
     }
 
@@ -588,6 +764,32 @@ const RIM_TINT: (f32, f32, f32) = (1.0, 0.985, 0.94);
 /// night side that is not a flat fill. The orrery's `SHINE`.
 const PLANETSHINE: f32 = 0.075;
 
+/// Amplitude of the two banding harmonics, and the darker belt that breaks their regularity.
+/// The orrery's `0.145` / `0.075` pair and its `Math.abs(Math.abs(latW)-0.26) < 0.075` belt.
+const BAND_PRIMARY: f32 = 0.145;
+const BAND_SECONDARY: f32 = 0.075;
+const BAND_BELT_LATITUDE: f32 = 0.26;
+const BAND_BELT_HALF_WIDTH: f32 = 0.075;
+const BAND_BELT_DARKEN: f32 = 0.90;
+
+/// Everything about *what a body is made of* that per-pixel shading needs, resolved once per body
+/// rather than threaded through as five more positional arguments.
+///
+/// Exists because body types arrived: before them a body's surface was two facts (its colour and
+/// whether it emits light) and a positional argument each was fine; a gas giant's cloud deck adds
+/// band count and mottle depth, and a five-`f32`-and-two-`bool` call is where a caller starts
+/// passing them in the wrong order.
+#[derive(Debug, Clone, Copy)]
+struct Surface {
+    base: (f32, f32, f32),
+    seed: u32,
+    self_luminous: bool,
+    /// Latitudinal cloud bands and how many, or `None` for a rocky body that carries none.
+    bands: Option<f32>,
+    /// How much of the rocky surface mottling this body keeps, `0.0..=1.0`.
+    mottle_scale: f32,
+}
+
 /// Lambertian shading with a soft warm terminator, an atmospheric rim, planetshine, limb
 /// darkening and a mottled texture, for one pixel `(dx, dy)` offset from a body's centre, `dist`
 /// away, inside a body of `radius` pixels.
@@ -607,17 +809,45 @@ fn shade_surface(
     dy: f32,
     radius: f32,
     light_dir: (f32, f32, f32),
-    base: (f32, f32, f32),
-    seed: u32,
-    self_luminous: bool,
+    surface: Surface,
 ) -> (f32, f32, f32) {
+    let Surface {
+        base,
+        seed,
+        self_luminous,
+        bands,
+        mottle_scale,
+    } = surface;
     let nx = dx / radius;
     let ny = dy / radius;
     let nz = (1.0 - (nx * nx + ny * ny)).max(0.0).sqrt();
 
     let texture = value_noise(nx * 4.0 + 7.0, ny * 4.0 + 3.0, seed) * 0.5
         + value_noise(nx * 11.0, ny * 11.0, seed.wrapping_add(97)) * 0.5;
-    let mottle = mix(0.86, 1.0, texture);
+    // A cloud deck is smoother than rock, so a gas giant keeps only part of the rocky mottle's
+    // depth. A gas giant that mottles like a moon reads as a big moon.
+    let mottle = mix(1.0 - (1.0 - 0.86) * mottle_scale, 1.0, texture);
+
+    // Latitudinal cloud banding. `ny` *is* the latitude in this renderer's screen-oriented frame,
+    // which is the same frame the terminator and rim are already solved in, so the bands stay
+    // latitudinal without a second coordinate system. Two harmonics rather than one — one reads as
+    // a stripe — plus one darker belt, which is what stops an evenly banded body from reading as
+    // corduroy.
+    let banding = match bands {
+        None => 1.0,
+        Some(count) => {
+            let seed_phase = (seed & 0xFFFF) as f32 * (2.0 * PI / 65_536.0);
+            let latitude = ny;
+            let mut band = 1.0
+                + BAND_PRIMARY * (latitude * count * PI + seed_phase).sin()
+                + BAND_SECONDARY * (latitude * count * 2.7 * PI + seed_phase * 1.7).sin();
+            if (latitude.abs() - BAND_BELT_LATITUDE).abs() < BAND_BELT_HALF_WIDTH {
+                band *= BAND_BELT_DARKEN;
+            }
+            band
+        }
+    };
+    let mottle = mottle * banding;
 
     if self_luminous {
         // Bright core, gentle limb brightening rather than darkening — a rough stand-in for
@@ -736,28 +966,18 @@ const STAR_SCINTILLATION_MAGNITUDE: f32 = 0.80;
 /// Draw one body (disk, shading, and soft glow fringe) into `buf`, restricted to its own
 /// bounding box rather than the whole frame — the cost lever that keeps a handful of shaded
 /// spheres cheap even at 1440p, unlike `src/particle_field.rs`'s necessarily full-frame passes.
-#[allow(clippy::too_many_arguments)]
 fn draw_body(
     buf: &mut [[f32; 4]],
     width: u32,
     height: u32,
     center: (f32, f32),
     radius: f32,
-    hue: f32,
-    severity: Severity,
-    seed: u32,
-    self_luminous: bool,
+    surface: Surface,
     light_dir: (f32, f32, f32),
 ) {
+    let self_luminous = surface.self_luminous;
+    let base = surface.base;
     let glow = radius * if self_luminous { 2.6 } else { 1.4 };
-    // The sun is a star, not a severity-coded body: it holds one fixed warm colour regardless of
-    // fleet state, while every other body still resolves through the shared hue/severity channel.
-    // See [`SUN_STAR_RGB01`].
-    let base = if self_luminous {
-        SUN_STAR_RGB01
-    } else {
-        severity_rgb01(hue, severity)
-    };
 
     let x0 = (center.0 - glow).floor().max(0.0) as i32;
     let x1 = (center.0 + glow).ceil().min(width as f32) as i32;
@@ -773,12 +993,125 @@ fn draw_body(
 
             if dist <= radius {
                 let aa = clamp01((radius - dist) * 1.5);
-                let color = shade_surface(dx, dy, radius, light_dir, base, seed, self_luminous);
+                let color = shade_surface(dx, dy, radius, light_dir, surface);
                 blend(&mut buf[idx], color, aa.max(0.85));
             } else if dist <= glow {
                 let t = 1.0 - (dist - radius) / (glow - radius).max(0.001);
                 let alpha = t * t * if self_luminous { 0.55 } else { 0.22 };
                 blend(&mut buf[idx], base, alpha);
+            }
+        }
+    }
+}
+
+/// Which half of a ring is being drawn — the half behind the planet, or the half in front of it.
+///
+/// A ring is the one element in this scene that a body sits *inside*, so it cannot be one draw:
+/// the far arc has to go down before the planet and the near arc after it, or the planet renders
+/// as a disk with a bracelet painted over it. This renderer has no depth buffer, and it does not
+/// need one — the ring's own parametric angle says which half a particle is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RingHalf {
+    Back,
+    Front,
+}
+
+/// How many ring particles per pixel of the ring's own outer circumference.
+///
+/// Density, not a count: the orrery draws a fixed 168 because its bodies are a fixed size, while
+/// herdr's planets span the whole project-size register and a fixed count would make a large
+/// mate's ring a dotted line and a small one's a solid smear.
+///
+/// Denser than the orrery's own one-per-2.3px, and for a reason that is herdr's rather than a
+/// preference: a second mate here is 9 to 23 pixels across the radius against the orrery's ~35,
+/// so the same *angular* density lands far fewer particles on the arc and the ring reads as a
+/// dotted outline. Measured on the rendered frame at both ends of the register.
+const RING_PARTICLES_PER_PX: f32 = 1.0 / 1.1;
+
+/// Bounds on that count, so a ring at either end of the register is still a ring: enough particles
+/// to close the ellipse at the smallest planet, and a ceiling so the largest cannot walk the whole
+/// scene's cost up on its own.
+const RING_PARTICLE_BOUNDS: (usize, usize) = (170, 520);
+
+/// Full turns the ring's particle stream makes per animation loop.
+///
+/// An integer, for exactly the reason [`BodyKind::revolutions_per_loop`] is: the loop is baked
+/// once and played forever, so anything that moves in it has to land back where it started after
+/// [`FRAME_COUNT`] samples or the seam shows on every repeat. Two rather than one, because ring
+/// traffic that keeps pace with the planet it orbits does not read as traffic.
+const RING_REVOLUTIONS_PER_LOOP: f32 = 2.0;
+
+/// Draw one half of a ringed planet's ring: a stream of ice-and-dust particles on a squashed
+/// ellipse about the body's own centre.
+///
+/// Particles rather than a filled annulus, and deliberately: the ring is *the traffic of a mate's
+/// own moons*, so it should read as many small things rather than as a painted band, and a
+/// particle stream is also what lets the ring be occluded correctly by the body it circles for the
+/// cost of one sign test. It is the cheaper of the two as well — a couple of hundred small dots
+/// against an elliptical annulus's whole bounding box.
+fn draw_ring(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    body: &BodyLayout,
+    position: (f32, f32),
+    half: RingHalf,
+    phase: f32,
+    seed: u32,
+) {
+    let Some((inner, outer)) = body.ring_radii_px() else {
+        return;
+    };
+    if outer <= inner || outer <= 0.0 {
+        return;
+    }
+
+    let count = ((outer * 2.0 * PI * RING_PARTICLES_PER_PX) as usize)
+        .clamp(RING_PARTICLE_BOUNDS.0, RING_PARTICLE_BOUNDS.1);
+    let bright = RING_BRIGHT + RING_BRIGHT_PER_STREAK * body.streak;
+    let spin = phase * RING_REVOLUTIONS_PER_LOOP + body.base_angle;
+    // A particle is drawn about a pixel across at the sizes this scene works at; below that it
+    // stops being a particle and starts being noise.
+    let dot = (outer * 0.028).max(0.9);
+
+    for i in 0..count {
+        let angle = (i as f32 / count as f32) * 2.0 * PI + spin;
+        let (sin_a, cos_a) = angle.sin_cos();
+        // The near half of the ellipse is the half swept below the centre on screen. One sign
+        // test is the whole depth sort this element needs.
+        if (sin_a > 0.0) != (half == RingHalf::Front) {
+            continue;
+        }
+
+        // Where in the ring's own width this particle sits. Deterministic per particle and per
+        // body, so the ring is a fixed object being rotated rather than a fresh scatter every
+        // frame — which is what stops it boiling.
+        let spread = value_noise(i as f32 * 1.37, 0.5, seed);
+        let radius = inner + (outer - inner) * spread;
+        let px = position.0 + cos_a * radius;
+        let py = position.1 + sin_a * radius * RING_SQUASH;
+
+        // Brighter where the ring is denser and toward its outer edge, which is what a real ring's
+        // brightest arcs look like — a flat-alpha ring reads as a drawn outline.
+        let alpha = (bright * (0.55 + 0.75 * spread)).min(0.92);
+        if alpha <= 0.004 {
+            continue;
+        }
+
+        let x0 = (px - dot).floor().max(0.0) as i32;
+        let x1 = (px + dot).ceil().min(width as f32) as i32;
+        let y0 = (py - dot).floor().max(0.0) as i32;
+        let y1 = (py + dot).ceil().min(height as f32) as i32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let dx = xx as f32 + 0.5 - px;
+                let dy = yy as f32 + 0.5 - py;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > dot {
+                    continue;
+                }
+                let idx = yy as usize * width as usize + xx as usize;
+                blend(&mut buf[idx], RING_RGB01, alpha * clamp01(1.0 - dist / dot));
             }
         }
     }
@@ -1083,6 +1416,25 @@ pub(crate) const FRAME_COUNT: usize = 36;
 /// model means transient effects cannot live in a loop that is only regenerated on a fleet/resize
 /// change). See [`effects_frame`] for the asteroid/crater/comet overlay.
 pub(crate) fn frame(layout: &SceneLayout, phase: f32) -> Vec<u8> {
+    frame_inner(layout, phase, true)
+}
+
+/// [`frame`] with every ring suppressed and nothing else changed.
+///
+/// A test-only seam, and it earns its keep: it is the only way to isolate ring pixels *exactly*.
+/// Differencing a ringed mate against a gas one instead looks like an isolate and is not — the two
+/// types also band differently and a gas giant swells on a streak, so the difference carries three
+/// mechanisms and the test would pass on any of them. Against this the difference is the ring and
+/// provably nothing else, including inside the body's own disk, which is where the interesting
+/// half of the question lives (does the near arc draw over the planet, and does the far arc not).
+///
+/// Free in production: `rings` is a constant at both call sites.
+#[cfg(test)]
+fn frame_without_rings(layout: &SceneLayout, phase: f32) -> Vec<u8> {
+    frame_inner(layout, phase, false)
+}
+
+fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
     let (width, height) = (layout.width, layout.height);
     let pixels = width as usize * height as usize;
     let mut buf = vec![[0.0f32; 4]; pixels];
@@ -1094,21 +1446,66 @@ pub(crate) fn frame(layout: &SceneLayout, phase: f32) -> Vec<u8> {
     let sun_pos = sun_position(layout, phase);
     for (idx, body) in layout.bodies.iter().enumerate() {
         let pos = layout.position(idx, phase);
+        let seed = body_seed(idx);
+        // Back arc, body, front arc — the ring is the one element the body sits *inside*, so it
+        // straddles its own planet's draw rather than following it.
+        if rings {
+            draw_ring(
+                &mut buf,
+                width,
+                height,
+                body,
+                pos,
+                RingHalf::Back,
+                phase,
+                seed,
+            );
+        }
         draw_body(
             &mut buf,
             width,
             height,
             pos,
             body.body_radius_px,
-            body.hue,
-            body.severity,
-            body_seed(idx),
-            body.kind == BodyKind::Sun,
+            surface_of(body, seed),
             normalize3(light_dir_toward(sun_pos, pos, body.kind)),
         );
+        if rings {
+            draw_ring(
+                &mut buf,
+                width,
+                height,
+                body,
+                pos,
+                RingHalf::Front,
+                phase,
+                seed,
+            );
+        }
     }
 
     pack_rgba8(&buf, true)
+}
+
+/// What one laid-out body's surface is made of, for [`shade_surface`].
+///
+/// The sun is a star, not a severity-coded body: it holds one fixed warm colour regardless of
+/// fleet state, while every other body still resolves through the shared hue/severity channel —
+/// see [`SUN_STAR_RGB01`]. Bands and mottle depth come from the body's [`BodyType`], which is a
+/// second mate's own binding fact and nothing a worker or a star has.
+fn surface_of(body: &BodyLayout, seed: u32) -> Surface {
+    let self_luminous = body.kind == BodyKind::Sun;
+    Surface {
+        base: if self_luminous {
+            SUN_STAR_RGB01
+        } else {
+            severity_rgb01(body.hue, body.severity)
+        },
+        seed,
+        self_luminous,
+        bands: body.body_type.band_count(),
+        mottle_scale: body.body_type.mottle_scale(),
+    }
 }
 
 /// Render the event-driven overlay at `phase`: in-flight asteroids, fading craters (plus their
@@ -1480,6 +1877,7 @@ mod tests {
             hue: 41.0,
             severity: Severity::Clear,
             size: BodySize::Fixed,
+            streak: 0.0,
         }
     }
 
@@ -1504,6 +1902,7 @@ mod tests {
             hue,
             severity,
             size: BodySize::Fixed,
+            streak: 0.0,
         }
     }
 
@@ -1952,9 +2351,13 @@ mod tests {
                 ny * RADIUS,
                 RADIUS,
                 (1.0, 0.0, 0.0),
-                BASE,
-                17,
-                false,
+                Surface {
+                    base: BASE,
+                    seed: 17,
+                    self_luminous: false,
+                    bands: None,
+                    mottle_scale: 1.0,
+                },
             );
             sum = (sum.0 + r, sum.1 + g, sum.2 + b);
         }
@@ -2461,15 +2864,26 @@ mod tests {
         );
     }
 
+    /// A fleet shaped like a real one, for the benchmark to measure against.
+    ///
+    /// The mates carry real file counts and real streaks rather than one flat size, because both
+    /// registers now cost pixels: a mate's rank decides whether it draws a ring at all, and its
+    /// streak decides how wide that ring is and how far a gas giant swells. A fixture that left
+    /// them at the floor would benchmark the one fleet shape that is cheapest to draw.
+    ///
+    /// The file counts are the fleet orrery's own `MATES` table — the real checkouts on this box.
     fn representative_fleet() -> Vec<TreeNode> {
+        const MATES: [(u32, f32); 4] = [(2470, 1.0), (860, 0.6), (430, 0.3), (99, 0.0)];
         let mut nodes = vec![node(None, BodyKind::Sun)];
-        for planet in 0..4 {
-            nodes.push(node(Some(0), BodyKind::Planet));
+        for (files, streak) in MATES {
+            nodes.push(TreeNode {
+                streak,
+                ..sized(Some(0), BodyKind::Planet, BodySize::Files(files))
+            });
             let planet_idx = nodes.len() - 1;
             for _ in 0..3 {
                 nodes.push(node(Some(planet_idx), BodyKind::Moon));
             }
-            let _ = planet;
         }
         nodes
     }
@@ -2550,5 +2964,554 @@ mod tests {
             1000.0 / ambient_median,
             1000.0 / effects_median,
         );
+
+        // AGENTS.md's multiplicative-performance rule: a change that widens work in a pane-scaled
+        // loop has to report its *scaling* delta, not only one absolute number. Body count is this
+        // generator's cardinality axis — one mate against a fleet of fifteen, each with workers —
+        // and it is the axis body types moved, since a mate's rank decides whether it draws a ring
+        // at all and its streak decides how wide that ring is.
+        //
+        // What this exists to catch is a body-local cost that has quietly become full-frame. Every
+        // draw here is bounded to its own bounding box, so the per-body slope should stay small
+        // against the one genuinely full-frame pass — the gradient and starfield — which every run
+        // pays once whatever the fleet looks like.
+        let one_mate = scaling_fleet(1);
+        let fifteen_mates = scaling_fleet(15);
+        let one_median = median_ms(|phase| frame(&build_layout(&one_mate, w, h), phase));
+        let fifteen_median = median_ms(|phase| frame(&build_layout(&fifteen_mates, w, h), phase));
+        println!(
+            "  scaling: {} bodies {one_median:.2} ms -> {} bodies {fifteen_median:.2} ms \
+             ({:+.2} ms total, {:.3} ms per extra body)",
+            one_mate.len(),
+            fifteen_mates.len(),
+            fifteen_median - one_median,
+            (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Body types: rings and gas giants
+    // ---------------------------------------------------------------------------
+
+    /// A fleet of `mates` second mates with distinct, descending file counts, so every rank is
+    /// unambiguous and the assignment can be read off directly.
+    fn ranked_fleet(mates: usize) -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for i in 0..mates {
+            let files = (mates - i) as u32 * 100;
+            nodes.push(sized(Some(0), BodyKind::Planet, BodySize::Files(files)));
+        }
+        nodes
+    }
+
+    fn types_of(nodes: &[TreeNode]) -> Vec<BodyType> {
+        build_layout(nodes, 1_000, 1_000)
+            .bodies
+            .iter()
+            .map(|body| body.body_type)
+            .collect()
+    }
+
+    #[test]
+    fn two_second_mates_in_three_are_gas_giants_evenly_spaced() {
+        // A54's rule: a mate is a gas giant *unless* its rank is 2 mod 3. That is "even
+        // distribution" read as even spacing rather than as 50/50 — the captain asked for more gas
+        // planets in the same sentence, and a 50/50 split adds none.
+        let types = types_of(&ranked_fleet(9));
+        let mates = &types[1..];
+        assert_eq!(
+            mates,
+            [
+                BodyType::Gas,
+                BodyType::Gas,
+                BodyType::Ringed,
+                BodyType::Gas,
+                BodyType::Gas,
+                BodyType::Ringed,
+                BodyType::Gas,
+                BodyType::Gas,
+                BodyType::Ringed,
+            ],
+            "the ringed mates are not every third one, heaviest first"
+        );
+
+        // The proportion is the point, and it has to hold for a fleet that is not a multiple of
+        // three as well as one that is.
+        for count in 1..=20 {
+            let types = types_of(&ranked_fleet(count));
+            let ringed = types.iter().filter(|t| **t == BodyType::Ringed).count();
+            let gas = types.iter().filter(|t| **t == BodyType::Gas).count();
+            assert_eq!(ringed + gas, count, "every second mate needs a type");
+            assert!(
+                gas >= ringed,
+                "{count} mates split {gas} gas / {ringed} ringed — that is not two in three"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sun_and_the_workers_carry_no_body_type_at_all() {
+        // Body type is a second mate's fact and binding — a worker is a moon and the firstmate is
+        // a star, so neither has one. `Plain` is the absence of the question, not a third planet.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(500)),
+            node(Some(1), BodyKind::Moon),
+            node(Some(2), BodyKind::Moon),
+        ];
+        let types = types_of(&nodes);
+        assert_eq!(types[0], BodyType::Plain, "the sun is not a planet");
+        assert_ne!(types[1], BodyType::Plain, "a second mate always has a type");
+        assert_eq!(types[2], BodyType::Plain, "a worker is not a planet");
+        assert_eq!(types[3], BodyType::Plain, "nor is a worker's own worker");
+    }
+
+    #[test]
+    fn a_roster_change_reseats_the_types_rather_than_keeping_them() {
+        // A54(b): recomputed, never stored. A rule that is even only for the fleet that happened
+        // to exist at bake time is not a rule, and this fleet's roster changes under it.
+        let before = types_of(&[
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(300)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(200)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(100)),
+        ]);
+        assert_eq!(
+            before[3],
+            BodyType::Ringed,
+            "the lightest of three is rank 2"
+        );
+
+        // The lightest mate grows past both of the others. It is now rank 0, and the type has to
+        // follow the rank — not the body.
+        let after = types_of(&[
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(300)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(200)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(4_000)),
+        ]);
+        assert_eq!(
+            after[3],
+            BodyType::Gas,
+            "the mate that grew kept the type its old rank gave it"
+        );
+        assert_eq!(after[2], BodyType::Ringed, "...and rank 2 moved with it");
+
+        // A mate joining does the same thing, which is the case a stored type gets wrong most
+        // often: nothing about the existing bodies changed, and two of them still have to move.
+        let joined = types_of(&[
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(300)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(200)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(100)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(4_000)),
+        ]);
+        assert_eq!(
+            &joined[1..],
+            [
+                BodyType::Gas,
+                BodyType::Ringed,
+                BodyType::Gas,
+                BodyType::Gas
+            ],
+            "the new heaviest mate took rank 0, which pushed rank 2 up the roster"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_mate_ranks_where_it_is_drawn_rather_than_below_zero() {
+        // Same reasoning the size band already uses: a project nobody has measured is drawn at the
+        // register floor, so it ranks at the floor too — alongside an empty project, not beneath
+        // every project that exists.
+        let types = types_of(&[
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Unmeasured),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(0)),
+        ]);
+        assert_eq!(&types[1..], [BodyType::Gas, BodyType::Gas]);
+
+        // ...and ties fall back on roster order, so an all-unmeasured fleet is stable rather than
+        // shuffling its rings around on every rebuild.
+        let all_unmeasured: Vec<TreeNode> = std::iter::once(node(None, BodyKind::Sun))
+            .chain((0..6).map(|_| sized(Some(0), BodyKind::Planet, BodySize::Unmeasured)))
+            .collect();
+        assert_eq!(types_of(&all_unmeasured), types_of(&all_unmeasured));
+        assert_eq!(
+            types_of(&all_unmeasured)[3],
+            BodyType::Ringed,
+            "roster order should still seat rank 2"
+        );
+    }
+
+    /// The one second mate under test sits at index [`MATE`], in a fleet arranged so it lands on
+    /// `body_type`.
+    ///
+    /// Only the *filler* mates differ between the two arrangements: the mate under test keeps its
+    /// index, its size, its streak and therefore its seed, position and radius. That is what makes
+    /// differencing a ringed frame against a gas one an exact isolate of the ring — every other
+    /// pixel of the body is bit-identical between them, so anything that moved is ring material
+    /// and nothing has to be inferred from colour.
+    const MATE: usize = 3;
+
+    fn one_mate_scene(body_type: BodyType, streak: f32) -> SceneLayout {
+        let filler = |files| sized(Some(0), BodyKind::Planet, BodySize::Files(files));
+        let mate = TreeNode {
+            streak,
+            ..sized(Some(0), BodyKind::Planet, BodySize::Files(1_000))
+        };
+        // Rank 2 is the ringed one: heavier fillers push the mate down to rank 2, lighter fillers
+        // lift it to rank 0, which is a gas giant.
+        let nodes = match body_type {
+            BodyType::Ringed => vec![
+                node(None, BodyKind::Sun),
+                filler(4_000),
+                filler(3_000),
+                mate,
+            ],
+            _ => vec![node(None, BodyKind::Sun), filler(100), filler(50), mate],
+        };
+        let layout = build_layout(&nodes, 1_400, 1_400);
+        assert_eq!(
+            layout.bodies[MATE].body_type, body_type,
+            "fixture built the wrong type"
+        );
+        layout
+    }
+
+    /// The same ringed mate rendered with and without its ring, plus its on-screen geometry.
+    ///
+    /// Same layout, same phase, same seed — so every pixel that differs between the two is ring
+    /// material, and that stays true *inside* the body's own disk, which is where occlusion has to
+    /// be measured.
+    fn ringed_against_plain(streak: f32, phase: f32) -> (Vec<u8>, Vec<u8>, u32, (i32, i32), f32) {
+        let layout = one_mate_scene(BodyType::Ringed, streak);
+        let pos = layout.position(MATE, phase);
+        (
+            frame(&layout, phase),
+            frame_without_rings(&layout, phase),
+            layout.width,
+            (pos.0 as i32, pos.1 as i32),
+            layout.bodies[MATE].body_radius_px,
+        )
+    }
+
+    /// Count pixels in a box where the ringed frame differs from the unringed one — which, given
+    /// the two fixtures differ only in which mate is ranked where, is exactly the ring.
+    ///
+    /// Read off the real rendered buffers rather than re-deriving `draw_ring`'s own geometry, so
+    /// these assert what actually lands on screen. A colour test would not do the job: a ring
+    /// particle blended over a lit planet at partial alpha carries mostly the planet's own colour.
+    fn ring_pixels(
+        ringed: &[u8],
+        plain: &[u8],
+        width: u32,
+        (x0, y0): (i32, i32),
+        (x1, y1): (i32, i32),
+    ) -> usize {
+        let mut found = 0;
+        for y in y0.max(0)..y1 {
+            for x in x0.max(0)..x1 {
+                let i = (y as usize * width as usize + x as usize) * 4;
+                if i + 3 >= ringed.len() {
+                    continue;
+                }
+                // More than one step on some channel, so the count is material rather than
+                // rounding at the edge of a blend.
+                if (0..3).any(|c| ringed[i + c].abs_diff(plain[i + c]) > 1) {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_ringed_mate_draws_a_ring_and_a_gas_giant_does_not() {
+        let (ringed, plain, width, (cx, cy), radius) = ringed_against_plain(0.5, 0.0);
+
+        // The band outside the body's own disk on both sides — where only a ring can be. The glow
+        // fringe reaches 1.4x, so this starts past it.
+        let outer = (radius * (RING_OUTER + 0.3)) as i32;
+        let inner = (radius * 1.45) as i32;
+        let left = ring_pixels(
+            &ringed,
+            &plain,
+            width,
+            (cx - outer, cy - 4),
+            (cx - inner, cy + 4),
+        );
+        let right = ring_pixels(
+            &ringed,
+            &plain,
+            width,
+            (cx + inner, cy - 4),
+            (cx + outer, cy + 4),
+        );
+        assert!(
+            left > 0 && right > 0,
+            "a ringed mate has no ring material beside it: {left} left, {right} right"
+        );
+
+        // ...and a gas giant draws no ring at all — not "a fainter one", none: suppressing rings
+        // changes not one pixel anywhere a ring of its own could have reached. (Scoped to that
+        // mate's own box rather than the whole frame, because the fleet it is ranked inside still
+        // has to contain a ringed mate for it to be ranked *against*.)
+        let gas = one_mate_scene(BodyType::Gas, 0.5);
+        let gas_pos = gas.position(MATE, 0.0);
+        let reach = (gas.bodies[MATE].body_radius_px * (RING_OUTER + RING_OUTER_PER_STREAK)) as i32;
+        let (gx, gy) = (gas_pos.0 as i32, gas_pos.1 as i32);
+        assert_eq!(
+            ring_pixels(
+                &frame(&gas, 0.0),
+                &frame_without_rings(&gas, 0.0),
+                gas.width,
+                (gx - reach, gy - reach),
+                (gx + reach, gy + reach),
+            ),
+            0,
+            "a gas giant drew ring material"
+        );
+    }
+
+    #[test]
+    fn a_planet_occludes_the_back_of_its_own_ring_and_not_the_front() {
+        // The one thing a ring needs that nothing else in this scene does: the body sits *inside*
+        // it. `RING_SQUASH` puts the ring's near and far crossings of the body's own vertical at
+        // ~0.48 of its radius, so both land on the disk — the far one behind it, the near one in
+        // front. A ring drawn in one pass shows both, which is a planet with a bracelet painted
+        // over it.
+        let (ringed, plain, width, (cx, cy), radius) = ringed_against_plain(0.5, 0.0);
+        let reach = (radius * 0.75) as i32;
+        let half = (radius * 0.55) as i32;
+
+        let behind = ring_pixels(
+            &ringed,
+            &plain,
+            width,
+            (cx - reach, cy - half),
+            (cx + reach, cy - 1),
+        );
+        let in_front = ring_pixels(
+            &ringed,
+            &plain,
+            width,
+            (cx - reach, cy + 1),
+            (cx + reach, cy + half),
+        );
+
+        assert!(
+            in_front > 0,
+            "the near arc of the ring is not drawn over its own planet"
+        );
+        assert_eq!(
+            behind, 0,
+            "{behind} ring pixels are showing through the planet that should hide them"
+        );
+    }
+
+    #[test]
+    fn a_streak_widens_and_brightens_a_mates_ring() {
+        // *"Streak brightens and thickens the ring"* — the captain's binding correction, measured
+        // on the rendered buffer rather than on the two constants that produce it.
+        let phase = 0.0;
+        let measure = |streak: f32| {
+            let (ringed, plain, width, (cx, cy), radius) = ringed_against_plain(streak, phase);
+            let span = (radius * 3.0) as i32;
+            (
+                ring_pixels(
+                    &ringed,
+                    &plain,
+                    width,
+                    (cx - span, cy - span),
+                    (cx + span, cy + span),
+                ),
+                one_mate_scene(BodyType::Ringed, streak).bodies[MATE]
+                    .ring_radii_px()
+                    .map(|(_, outer)| outer)
+                    .unwrap_or(0.0),
+                radius,
+            )
+        };
+        let (cold_px, cold_outer, cold_radius) = measure(0.0);
+        let (hot_px, hot_outer, hot_radius) = measure(1.0);
+
+        // Thicker: the ring reaches further out. The body itself must not have moved — a ringed
+        // mate does not swell, only a gas giant does — so this is the ring and nothing else.
+        assert_eq!(cold_radius, hot_radius, "a ringed mate must not swell");
+        assert!(
+            hot_outer > cold_outer * 1.3,
+            "a full streak barely widened the ring: {cold_outer:.1} -> {hot_outer:.1}"
+        );
+        // ...and brighter and denser, which is what "brightens" reads as on a particle ring.
+        assert!(
+            hot_px > cold_px,
+            "a full streak drew no more ring material: {cold_px} -> {hot_px}"
+        );
+    }
+
+    #[test]
+    fn a_streak_swells_a_gas_giant_but_never_past_the_size_bound() {
+        let cold = one_mate_scene(BodyType::Gas, 0.0).bodies[MATE].body_radius_px;
+        let hot = one_mate_scene(BodyType::Gas, 1.0).bodies[MATE].body_radius_px;
+        assert!(
+            hot > cold * 1.2,
+            "a full streak barely swelled the gas: {cold:.2} -> {hot:.2}"
+        );
+
+        // F16 is explicit that the swell is *inside* the bound rather than outside it: it is
+        // clamped, and the clamp is the stated price. The heaviest possible mate on the longest
+        // possible streak still cannot rival the sun.
+        let maxed = build_layout(
+            &[
+                node(None, BodyKind::Sun),
+                TreeNode {
+                    streak: 1.0,
+                    ..sized(Some(0), BodyKind::Planet, BodySize::Files(u32::MAX))
+                },
+            ],
+            1_000,
+            1_000,
+        );
+        let planet = maxed.bodies[1].body_radius_px;
+        let sun = maxed.bodies[0].body_radius_px;
+        assert!(
+            planet <= sun / 2.0,
+            "a swollen gas giant ({planet}) broke F16's half-the-sun bound ({sun})"
+        );
+        // And it really is the clamp doing that rather than the swell being too small to reach it.
+        assert_eq!(planet, MATE_RADIUS_CEIL * 1_000.0);
+    }
+
+    /// How the shaded surface varies down a body's own meridian *because of banding alone*.
+    ///
+    /// Sampled as a ratio against the identical surface with `bands: None`, so everything the two
+    /// share — the Lambert term, limb darkening, the mottle — divides out exactly. Measuring the
+    /// banded surface on its own instead measures the sphere's geometry, which swamps the band
+    /// term by an order of magnitude and makes the assertion meaningless.
+    ///
+    /// Returns `(spread, crossings)`: how far the ratio departs from 1, and how many times it
+    /// crosses back through it — which is the band *count* rather than the band depth.
+    fn meridian_banding(bands: Option<f32>) -> (f32, usize) {
+        const RADIUS: f32 = 120.0;
+        let surface = |bands| Surface {
+            base: (0.8, 0.8, 0.8),
+            seed: 17,
+            self_luminous: false,
+            bands,
+            mottle_scale: 1.0,
+        };
+        // Straight down the lit centre of the disk, so the only thing varying is latitude.
+        let sample = |bands, ny: f32| {
+            luminance(shade_surface(
+                0.0,
+                ny * RADIUS,
+                RADIUS,
+                (0.0, 0.0, 1.0),
+                surface(bands),
+            ))
+        };
+        let ratios: Vec<f32> = (0..256)
+            .map(|i| {
+                // Well inside the limb: the rim and planetshine terms are added *after* the
+                // banded texture, so they do not divide out, and near the edge they are the
+                // larger signal. Sampling the face rather than the limb is what keeps this
+                // measuring bands.
+                let ny = (i as f32 / 255.0 - 0.5) * 1.2;
+                let plain = sample(None, ny);
+                if plain <= 0.0 {
+                    1.0
+                } else {
+                    sample(bands, ny) / plain
+                }
+            })
+            .collect();
+        let spread = ratios
+            .iter()
+            .map(|r| (r - 1.0).abs())
+            .fold(0.0f32, f32::max);
+        let crossings = ratios
+            .windows(2)
+            .filter(|w| (w[0] - 1.0).signum() != (w[1] - 1.0).signum())
+            .count();
+        (spread, crossings)
+    }
+
+    #[test]
+    fn a_second_mate_is_banded_and_a_worker_moon_is_not() {
+        // Latitudinal cloud banding is most of what separates a second mate from a worker at a
+        // glance, and it is why a gas giant reads as a gas giant rather than as a big moon.
+        let (plain, plain_crossings) = meridian_banding(None);
+        let (ringed, ringed_crossings) = meridian_banding(BodyType::Ringed.band_count());
+        let (gas, gas_crossings) = meridian_banding(BodyType::Gas.band_count());
+
+        // A worker moon carries no bands at all — not "fewer", none.
+        assert_eq!((plain, plain_crossings), (0.0, 0));
+        assert!(
+            ringed > 0.10,
+            "a ringed mate's banding is too shallow to see: {ringed:.4}"
+        );
+        assert!(
+            gas > 0.10,
+            "a gas giant's banding is too shallow to see: {gas:.4}"
+        );
+
+        // A gas giant carries more bands than a ringed planet — 7 against 5 — so its meridian
+        // crosses more of them. This is the half that a depth-only assertion misses: the two
+        // types have the same band *amplitude* and differ in band *count*.
+        assert!(
+            gas_crossings > ringed_crossings,
+            "a gas giant crosses {gas_crossings} bands against a ringed mate's {ringed_crossings}"
+        );
+        // ...and a cloud deck is smoother than rock, so a gas giant keeps less of the rocky
+        // mottle. Both facts together are what make the two types tell apart at a crop.
+        assert!(BodyType::Gas.mottle_scale() < BodyType::Ringed.mottle_scale());
+    }
+
+    #[test]
+    fn a_rings_particles_land_back_where_they_started_after_one_loop() {
+        // Same seamless-loop contract every orbit here obeys: the ambient loop is baked once and
+        // played forever, so anything that moves in it has to close. A fractional revolution count
+        // shows a seam on every repeat.
+        assert_eq!(
+            RING_REVOLUTIONS_PER_LOOP,
+            RING_REVOLUTIONS_PER_LOOP.round(),
+            "the ring's spin must be a whole number of turns per loop"
+        );
+        let layout = one_mate_scene(BodyType::Ringed, 0.5);
+        let start = frame(&layout, 0.0);
+        let looped = frame(&layout, 2.0 * PI);
+        // Not bit equality: `phase` and `phase + 2*PI` reach the same angle through different
+        // floats, so a particle can land a fraction of a pixel over and quantize one step away. A
+        // seam is a whole ring's worth of pixels in the wrong place, three orders of magnitude
+        // above that.
+        let moved = start
+            .chunks_exact(4)
+            .zip(looped.chunks_exact(4))
+            .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 1))
+            .count();
+        assert!(
+            moved * 2_000 < start.len() / 4,
+            "{moved} pixels moved across the loop seam — the ring does not close"
+        );
+    }
+
+    /// A fleet of `mates` second mates, each with three workers, spread across the whole
+    /// project-size register and the whole streak range — so both the ring and the gas path are
+    /// exercised at every count rather than one flat body repeated.
+    fn scaling_fleet(mates: usize) -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for i in 0..mates {
+            let files = (i as u32 * 337) % FILES_CEIL;
+            let streak = (i % 5) as f32 / 4.0;
+            nodes.push(TreeNode {
+                streak,
+                ..sized(Some(0), BodyKind::Planet, BodySize::Files(files))
+            });
+            let planet_idx = nodes.len() - 1;
+            for _ in 0..3 {
+                nodes.push(node(Some(planet_idx), BodyKind::Moon));
+            }
+        }
+        nodes
     }
 }

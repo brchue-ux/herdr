@@ -38,6 +38,11 @@ fn background_scene_key(
         // A project that grew is a body that has to be redrawn at its new radius; leaving `size`
         // out of the key would cache the scene at whatever size it first saw.
         node.size.hash(&mut hasher);
+        // ...and the same for the streak, which decides a mate's ring width and brightness, its
+        // gas swell, and — through the size ranking it shares with `size` — nothing else. A
+        // streak that climbed a band has to reach the picture, so it belongs in the key even
+        // though it is quantized to the nearest expression step rather than a raw score.
+        node.streak.to_bits().hash(&mut hasher);
     }
     hasher.finish()
 }
