@@ -142,39 +142,88 @@ impl BodySize {
     }
 }
 
+/// The sun's radius, as a fraction of `min(width, height)`. Locked: the sun is out of the
+/// project-size register entirely, so this is the one radius in the scene that is a constant
+/// rather than a solved bound.
+const SUN_RADIUS_FRACTION: f32 = 0.050;
+
+/// The largest a second mate ever draws — half the sun's, so no planet rivals the sun whatever it
+/// grows to. F16's first clause. (The orrery carries a perspective factor into that bound; herdr
+/// draws no perspective, so half is half.)
+const MATE_RADIUS_CEIL: f32 = SUN_RADIUS_FRACTION / 2.0;
+
+/// How far under F16's exact `r_min / 2` the moon ceiling is placed.
+///
+/// Sitting *exactly* on the bound makes the largest moon and the smallest planet an exact 2:1
+/// tie, which survives neither float rounding at an arbitrary scene size nor the round-to-whole-
+/// pixels every body goes through before anyone sees it. A hair inside keeps the ordering the
+/// rule is about legible on screen and keeps the rule itself provable in one direction.
+const MOON_HEADROOM: f32 = 0.98;
+
+/// A worker moon's radius as a share of the moon tier's ceiling.
+///
+/// Carried over from the pre-register pair (`0.009` against `0.01125`): a pane is not a checkout,
+/// so a worker draws at a fixed radius, and it draws a little under a maxed-out nested project
+/// rather than at the same size as one. Re-solving the ceiling moves the worker with it, which is
+/// what keeps that relationship a proportion rather than a coincidence of two constants.
+const WORKER_MOON_OF_CEILING: f32 = 0.8;
+
+/// The *smallest* a second mate ever draws: the planet tier's ceiling taken at the project-size
+/// register's own floor, which is where an unmeasured or empty checkout lands ([`FILE_FLOOR`]).
+///
+/// This is the quantity F16's moon clause is stated against — `r_min`, not the planet ceiling —
+/// and it is why the moon bound cannot be written as a flat constant: it is a function of the
+/// register's floor, so any change to [`FILE_FLOOR`] or [`FILES_CEIL`] moves it.
+fn mate_radius_floor() -> f32 {
+    MATE_RADIUS_CEIL * BodySize::Unmeasured.register_fraction()
+}
+
+/// F16's moon clause, solved rather than chosen: *"no second mate's drawn radius ... falls below
+/// TWICE the largest worker moon's AT EQUAL DEPTH"*.
+///
+/// Both tiers carry the same depth law in [`build_layout`] (a planet is always at tree depth 1 and
+/// so never nested at all; a moon at depth 2 has the same nesting factor of `1.0`, and deeper
+/// moons only ever shrink), so at equal depth the factor cancels exactly as the commitment says it
+/// does and the ratio reduces to `mate_radius_floor() / MOON_R_MAX`. Requiring that ratio to be at
+/// least 2 is one division.
+///
+/// The previous flat `0.01125` was picked to hold a 0.45 moon:planet proportion against the
+/// planet *ceiling*, which is the wrong end of the band: measured against the floor a maxed-out
+/// nested project drew at `1.07x` the smallest planet — a moon visibly outdrawing a planet, the
+/// exact thing F16 exists to forbid. Deriving the ceiling from the floor makes the violation
+/// unreachable instead of merely fixed once.
+fn moon_radius_ceil() -> f32 {
+    mate_radius_floor() * 0.5 * MOON_HEADROOM
+}
+
 impl BodyKind {
     /// The largest this tier ever draws, as a fraction of `min(width, height)` — the top of its
     /// band, reached by a project at [`FILES_CEIL`] files or more.
-    ///
-    /// The planet ceiling is half the sun's locked radius: no planet rivals the sun, whatever it
-    /// grows to. (The orrery carries a perspective factor into that bound; herdr draws no
-    /// perspective, so half is half.) The moon ceiling keeps the 0.45 moon:planet proportion the
-    /// scene already read as hierarchy, so a nested project stays a moon.
     fn max_radius_fraction(self) -> f32 {
         match self {
-            Self::Sun => 0.050,
-            Self::Planet => 0.025,
-            Self::Moon => 0.01125,
+            Self::Sun => SUN_RADIUS_FRACTION,
+            Self::Planet => MATE_RADIUS_CEIL,
+            Self::Moon => moon_radius_ceil(),
         }
     }
 
     /// Body pixel radius for a body outside the register, as a fraction of `min(width, height)` —
-    /// the sun, and every worker body. Unchanged from before project-size-driven sizing landed.
+    /// the sun, and every worker body.
     fn fixed_radius_fraction(self) -> f32 {
         match self {
-            Self::Sun => 0.050,
+            Self::Sun => SUN_RADIUS_FRACTION,
             Self::Planet => 0.020,
-            Self::Moon => 0.009,
+            Self::Moon => moon_radius_ceil() * WORKER_MOON_OF_CEILING,
         }
     }
 
     /// Body pixel radius, as a fraction of `min(width, height)`.
     ///
     /// A project is placed inside its tier's band by `size`; everything else draws at
-    /// [`Self::fixed_radius_fraction`]. Note where the old flat constants land under the register:
-    /// a 2,470-file project (the largest real checkout this was measured against) draws at
-    /// `0.0202`/`0.0091` — within a percent of the `0.020`/`0.009` every body used to get — so the
-    /// register did not rescale the scene, it spread it around what was already there.
+    /// [`Self::fixed_radius_fraction`]. The planet tier is unmoved by the register's arrival: a
+    /// 2,470-file project (the largest real checkout this was measured against) draws at `0.0202`,
+    /// within a percent of the flat `0.020` every planet used to get. The moon tier is *not*
+    /// unmoved, and deliberately — see [`moon_radius_ceil`] for the bound it now answers to.
     fn radius_fraction(self, size: BodySize) -> f32 {
         match (self, size) {
             // The sun is locked out of the register by decision, whatever a caller hands it: it
@@ -764,6 +813,21 @@ const RIPPLE_FADE_RATIO: f32 = 2.5;
 /// faster [`RIPPLE_FADE_RATIO`] fade that already distinguishes it.
 const RIPPLE_STRENGTH: f32 = 0.62;
 
+/// The shortest distance a crater's mark is allowed to fall off over, in pixels.
+///
+/// The mark fades linearly from its own centre to its own edge, which is right for a patch tens of
+/// pixels across and wrong for one two pixels across: at that size the very first pixel centre is
+/// already most of the way to the edge, so the darkest part of the mark is never sampled at all
+/// and a critical strike renders as a faint smudge. That is not a tuning question, it is the
+/// falloff being asked to resolve inside less than a pixel.
+///
+/// Flooring the falloff distance gives a small patch a solid core — which is also what a crater a
+/// few pixels wide actually looks like, a pit rather than a smear — and changes nothing whatsoever
+/// for any patch already wider than this. It became load-bearing when F16's bound re-solved the
+/// moon tier down (see [`moon_radius_ceil`]): a worker moon's crater is now a couple of pixels
+/// across at the real target resolution.
+const CRATER_MIN_FALLOFF_PX: f32 = 3.0;
+
 /// Draw a crater (or its fainter ripple echo) as a dark, irregular patch blended onto the
 /// already-shaded body underneath it — craters darken and roughen a surface, they do not recolour
 /// it, so this runs strictly after [`draw_body`] for the same body.
@@ -809,7 +873,7 @@ fn draw_crater(
                 continue;
             }
             let roughness = value_noise(dx / patch_radius * 3.0, dy / patch_radius * 3.0, seed);
-            let edge = clamp01(1.0 - dist / patch_radius);
+            let edge = clamp01(1.0 - dist / patch_radius.max(CRATER_MIN_FALLOFF_PX));
             let alpha = edge * roughness * strength * fade * 0.85;
             let idx = py as usize * width as usize + px as usize;
             blend(&mut buf[idx], (0.05, 0.04, 0.04), alpha);
@@ -1503,6 +1567,68 @@ mod tests {
         assert!(at_ceiling <= radius_of(BodyKind::Sun, BodySize::Fixed) / 2.0);
     }
 
+    /// The largest radius any moon can reach, over both of the two ways a moon is sized: a worker
+    /// (outside the register, [`BodySize::Fixed`]) and a nested project maxed out at the
+    /// register's ceiling. F16's clause names "the largest worker moon", so a scene where a
+    /// *nested-project* moon could outdraw a worker one would still have to answer for it.
+    fn largest_moon_radius() -> f32 {
+        radius_of(BodyKind::Moon, BodySize::Fixed)
+            .max(radius_of(BodyKind::Moon, BodySize::Files(FILES_CEIL)))
+            .max(radius_of(BodyKind::Moon, BodySize::Files(u32::MAX)))
+    }
+
+    /// The smallest radius any planet can reach — the register's floor, which is where both an
+    /// unmeasured project and an empty one land.
+    fn smallest_planet_radius() -> f32 {
+        radius_of(BodyKind::Planet, BodySize::Unmeasured)
+            .min(radius_of(BodyKind::Planet, BodySize::Files(0)))
+            .min(radius_of(BodyKind::Planet, BodySize::Files(1)))
+    }
+
+    #[test]
+    fn no_moon_ever_draws_half_the_smallest_planet() {
+        // F16's second clause, in its equal-depth reading: the smallest second mate on screen has
+        // to be at least twice the largest worker moon. This is the assertion the flat `0.01125`
+        // moon ceiling failed — it drew at 1.07x the register floor, so a maxed-out nested project
+        // rendered as a moon *bigger than* a planet beside it.
+        let moon = largest_moon_radius();
+        let planet = smallest_planet_radius();
+        assert!(
+            planet >= moon * 2.0,
+            "the smallest planet ({planet}) is not twice the largest moon ({moon}) — \
+             a moon can outdraw a planet, which F16 forbids"
+        );
+
+        // ...and the bound is answered by *solving* it, not by leaving a chasm: the largest moon
+        // still reaches most of the way to the bound it is held under, so the moon tier is as big
+        // as F16 permits rather than shrunk into a dot to make the assertion easy.
+        assert!(
+            moon * 2.0 > planet * 0.9,
+            "the moon ceiling ({moon}) is far under its own bound ({}) — re-solve it up",
+            planet / 2.0
+        );
+    }
+
+    #[test]
+    fn the_moon_bound_tracks_the_register_rather_than_a_frozen_constant() {
+        // The bound is a function of the register's floor, so the two tiers cannot drift apart the
+        // way a pair of hand-picked constants can. Proving that means proving the moon ceiling is
+        // *derived*: it must sit at exactly half the planet floor (less its stated headroom),
+        // whatever those two happen to be.
+        let expected = mate_radius_floor() * 0.5 * MOON_HEADROOM;
+        assert!(
+            (BodyKind::Moon.max_radius_fraction() - expected).abs() < 1e-9,
+            "the moon ceiling has been pinned to a literal again"
+        );
+        // And a worker moon keeps its proportion to that ceiling rather than its own literal.
+        assert!(
+            (BodyKind::Moon.fixed_radius_fraction()
+                - BodyKind::Moon.max_radius_fraction() * WORKER_MOON_OF_CEILING)
+                .abs()
+                < 1e-9
+        );
+    }
+
     #[test]
     fn the_sun_and_the_workers_stay_out_of_the_register() {
         // The sun routes to projects rather than being one, so no size a caller hands it moves it.
@@ -1513,21 +1639,47 @@ mod tests {
         );
         assert_eq!(locked, radius_of(BodyKind::Sun, BodySize::Unmeasured));
 
-        // A worker is not a checkout either: `Fixed` bodies draw exactly what every body drew
-        // before the register existed.
+        // A worker is not a checkout either: a `Fixed` body ignores the register entirely and
+        // draws one radius whatever it is handed.
         assert_eq!(radius_of(BodyKind::Planet, BodySize::Fixed), 20.0);
-        assert_eq!(radius_of(BodyKind::Moon, BodySize::Fixed), 9.0);
+        let worker_moon = radius_of(BodyKind::Moon, BodySize::Fixed);
+        assert_eq!(worker_moon, radius_of(BodyKind::Moon, BodySize::Fixed));
+        assert!(worker_moon > 0.0);
     }
 
     #[test]
     fn the_biggest_real_checkout_still_draws_what_the_flat_constant_drew() {
-        // The register spread the scene around what was already there rather than rescaling it:
-        // the largest checkout measured on this box lands within ~1.5% of the flat constants every
-        // body used to get, so nothing about the composition moved to make room for it.
+        // The register spread the *planet* tier around what was already there rather than
+        // rescaling it: the largest checkout measured on this box lands within ~1.5% of the flat
+        // constant every planet used to get, so nothing about the composition moved to make room
+        // for it. The moon tier is the one place that is no longer true, because F16's bound
+        // turned out to be the thing the old flat moon constants were violating — see
+        // `no_moon_ever_draws_half_the_smallest_planet`.
         let planet = radius_of(BodyKind::Planet, BodySize::Files(BIG_PROJECT));
-        let moon = radius_of(BodyKind::Moon, BodySize::Files(BIG_PROJECT));
         assert!((planet - 20.0).abs() < 20.0 * 0.015, "{planet}");
-        assert!((moon - 9.0).abs() < 9.0 * 0.015, "{moon}");
+    }
+
+    #[test]
+    fn a_moon_is_still_a_body_at_the_real_target_resolution() {
+        // Re-solving the ceiling down is only correct if what is left is still a rendered sphere.
+        // At the captain's confirmed 1440p target the smallest moon in the scene — a worker, which
+        // is the tier that shrank — has to keep enough pixels to carry the shading, terminator and
+        // rim `shade_surface` puts on it, or the fix has traded one visual failure for another.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            node(Some(0), BodyKind::Planet),
+            node(Some(1), BodyKind::Moon),
+        ];
+        let layout = build_layout(&nodes, 2560, 1440);
+        let moon = layout.body_radius_px(2).unwrap_or(0.0);
+        assert!(
+            moon >= 4.0,
+            "a worker moon draws {moon}px across the radius at 1440p — too few to shade"
+        );
+        // And it still clears its parent's own limb rather than orbiting inside it.
+        let planet = layout.body_radius_px(1).unwrap_or(0.0);
+        let orbit = BodyKind::Moon.orbit_radius_fraction() * 1440.0;
+        assert!(orbit > planet + moon, "a moon orbits inside its own planet");
     }
 
     /// Sample one rendered pixel of `frame`'s RGBA8 output as `(r, g, b)`.
@@ -2156,12 +2308,6 @@ mod tests {
         let phase = 0.8;
         let rgba = effects_frame(&layout, &crater_only(moon, 0.05), phase);
 
-        let on_moon = peak_alpha(
-            &rgba,
-            layout.width,
-            layout.position(moon, phase),
-            layout.bodies[moon].body_radius_px * 1.2,
-        );
         let on_planet = peak_alpha(
             &rgba,
             layout.width,
@@ -2177,9 +2323,26 @@ mod tests {
             "the parent ripple peaks at {on_planet:.2} alpha — that is the barely-visible 0.35 \
              strength this raised"
         );
+        // ...and it is still the *fainter* half of the pair. That comparison has to be made at
+        // each mark's own core, not over each body's whole disk: both marks are noise-modulated,
+        // so a peak taken over a wide area finds a higher noise sample than one taken over a
+        // narrow area, and the parent's patch covers far more pixels than a worker moon's does at
+        // the radius F16's bound leaves it (see `moon_radius_ceil`). Sampling the same small disk
+        // about each mark's own centre measures which mark is darker rather than which one had
+        // more pixels to draw a lucky sample from.
+        let mark_core = |body: usize| {
+            let pos = layout.position(body, phase);
+            let radius = layout.bodies[body].body_radius_px;
+            let centre = (
+                pos.0 + radius * 0.35 * 0.9f32.cos(),
+                pos.1 + radius * 0.35 * 0.9f32.sin(),
+            );
+            peak_alpha(&rgba, layout.width, centre, CRATER_MIN_FALLOFF_PX)
+        };
+        let (strike_core, echo_core) = (mark_core(moon), mark_core(planet));
         assert!(
-            on_planet < on_moon,
-            "the ripple ({on_planet:.2}) is not fainter than the strike itself ({on_moon:.2})"
+            echo_core < strike_core,
+            "the ripple ({echo_core:.2}) is not fainter than the strike itself ({strike_core:.2})"
         );
     }
 
