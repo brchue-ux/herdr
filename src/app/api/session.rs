@@ -115,6 +115,11 @@ impl App {
     /// the producers are standing down.
     fn background_scene_info(&self) -> crate::api::schema::BackgroundSceneInfo {
         let state = &self.state;
+        let (seated, beyond) = state
+            .background_scene_layout
+            .as_ref()
+            .map(|layout| layout.ladder_occupancy())
+            .unwrap_or((0, 0));
         crate::api::schema::BackgroundSceneInfo {
             active: state.background_scene_active(),
             enabled: state.persistent_background_enabled,
@@ -123,6 +128,12 @@ impl App {
             host_terminal: state.host_terminal_kind.api_name().to_string(),
             host_draws_ambient_wash: state.host_terminal_kind.draws_ambient_wash(),
             every_viewer_draws_ambient_wash: state.every_app_viewer_draws_ambient_wash,
+            ladder_capacity: crate::solar_system::ORBIT_LADDER_SLOTS as u32,
+            // Read off the layout the scene was actually built from rather than recounted from the
+            // workspace tree, so this can never disagree with the picture — which is the entire
+            // point of disclosing it.
+            mates_seated: seated as u32,
+            mates_beyond_ladder: beyond as u32,
         }
     }
 }

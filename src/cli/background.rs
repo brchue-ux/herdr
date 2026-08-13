@@ -111,6 +111,22 @@ fn print_status(info: &BackgroundSceneInfo) {
         mark(info.kitty_graphics_capability_confirmed)
     );
 
+    // A41(c): in the frame whenever it is non-zero, and absent when it is zero, because a
+    // disclosure of nothing is noise rather than population. It names the key it dropped by as
+    // well as the count — "9 dropped" and "the 9 smallest by tracked files at HEAD" are different
+    // statements, and only the second one can be argued with.
+    if info.mates_beyond_ladder > 0 {
+        println!();
+        println!(
+            "  {} of the fleet's {} second mates are seated on the orbit ring; {} beyond it\n\
+             \x20   (the ring seats {}, and the ones it drops are the smallest by tracked files at HEAD)",
+            info.mates_seated,
+            info.mates_seated + info.mates_beyond_ladder,
+            info.mates_beyond_ladder,
+            info.ladder_capacity,
+        );
+    }
+
     if info.active {
         return;
     }
@@ -300,11 +316,45 @@ mod tests {
             host_terminal: "other".into(),
             host_draws_ambient_wash: false,
             every_viewer_draws_ambient_wash: true,
+            ladder_capacity: 8,
+            mates_seated: 8,
+            mates_beyond_ladder: 0,
         };
         // The condition that is false is the terminal, and it is the one a
         // reader has to be able to pick out of the readout.
         assert!(!info.host_draws_ambient_wash);
         assert_eq!(info.host_terminal, "other");
         assert!(!info.active);
+    }
+
+    /// The overflow disclosure names the count *and* the key it dropped by, and
+    /// is absent entirely when nothing was dropped.
+    #[test]
+    fn the_ladder_overflow_is_disclosed_only_when_there_is_one() {
+        let base = BackgroundSceneInfo {
+            active: true,
+            enabled: true,
+            kitty_graphics_enabled: true,
+            kitty_graphics_capability_confirmed: true,
+            host_terminal: "kitty".into(),
+            host_draws_ambient_wash: true,
+            every_viewer_draws_ambient_wash: true,
+            ladder_capacity: 8,
+            mates_seated: 8,
+            mates_beyond_ladder: 9,
+        };
+        // A fleet of 17 with a ring that seats 8: the readout has to be able to
+        // say all three numbers, and which register the nine lost on.
+        assert_eq!(base.mates_seated + base.mates_beyond_ladder, 17);
+        assert_eq!(base.mates_seated, base.ladder_capacity);
+
+        // ...and a fleet that fits discloses nothing, because a disclosure of
+        // nothing is noise rather than population.
+        let fits = BackgroundSceneInfo {
+            mates_seated: 3,
+            mates_beyond_ladder: 0,
+            ..base
+        };
+        assert_eq!(fits.mates_beyond_ladder, 0);
     }
 }

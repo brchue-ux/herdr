@@ -345,6 +345,70 @@ pub(crate) enum BodyType {
 const RINGED_RANK_MODULUS: usize = 3;
 const RINGED_RANK_REMAINDER: usize = 2;
 
+/// How many second mates the ring seats.
+///
+/// A41(a): *"orbit slots are composition — they are the spacing the whole field is built on — so
+/// the capacity is a card number and not a code accident."* Eight is the fleet orrery's own
+/// `ORBIT_LADDER` length, and it is a decision rather than a limit found by measurement.
+pub(crate) const ORBIT_LADDER_SLOTS: usize = 8;
+
+/// Which second mates the ring seats when the roster exceeds [`ORBIT_LADDER_SLOTS`], and how many
+/// it could not.
+///
+/// A42: the mates that orbit are the ones with the **largest project size** — files at HEAD, the
+/// same register the radius band already draws mass from. Not roster order, not arrival, not
+/// event volume.
+///
+/// The key is [`BodySize::register_fraction`] rather than the raw file count, and that is A42(b)
+/// rather than convenience: an unmeasured project is not a zero-file project, the floor is what
+/// absorbs it, and ranking it on the raw field would put it *below* zero where it could never win
+/// a slot at all. It ranks where it is **drawn** — at the floor — so the selection and the picture
+/// agree about how big it is. Ties keep the roster's own order (A42(c)), so two identical
+/// snapshots can never seat different bodies.
+///
+/// A dropped mate takes its own workers with it: a worker orbits its mate, and a mate that is not
+/// in the picture has nothing for its workers to orbit.
+///
+/// Returns one flag per node — whether it is drawn — alongside the seated and overflow counts.
+fn seat_the_ladder(nodes: &[TreeNode]) -> (Vec<bool>, usize, usize) {
+    let mut mates: Vec<(usize, f32)> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == BodyKind::Planet)
+        .map(|(idx, node)| (idx, node.size.register_fraction()))
+        .collect();
+    let total = mates.len();
+    mates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut seated = vec![true; nodes.len()];
+    for (idx, _) in mates.into_iter().skip(ORBIT_LADDER_SLOTS) {
+        seated[idx] = false;
+    }
+    // A dropped mate's subtree goes with it. Nodes arrive parent-before-child, and the same
+    // defensive fixed-point pass the depth walk uses keeps this right if that ever stops holding.
+    for _ in 0..nodes.len() {
+        let mut changed = false;
+        for (idx, node) in nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                if parent < nodes.len() && parent != idx && !seated[parent] && seated[idx] {
+                    seated[idx] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let shown = total.min(ORBIT_LADDER_SLOTS);
+    (seated, shown, total.saturating_sub(ORBIT_LADDER_SLOTS))
+}
+
 /// Assign a [`BodyType`] to every node, by rank in the project-size register.
 ///
 /// Ranked by [`BodySize::register_fraction`] — the same key the size band already uses, so a mate
@@ -356,11 +420,15 @@ const RINGED_RANK_REMAINDER: usize = 2;
 /// exist at bake time is not a rule, and this fleet's roster changes under it. [`build_layout`] is
 /// that recompute — it already runs on every topology change, which is exactly the event that can
 /// move a rank.
-fn assign_body_types(nodes: &[TreeNode]) -> Vec<BodyType> {
+fn assign_body_types(nodes: &[TreeNode], seated: &[bool]) -> Vec<BodyType> {
     let mut ranked: Vec<(usize, f32)> = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == BodyKind::Planet)
+        .filter(|(idx, node)| {
+            // Only what is on the ring gets a type: an unseated mate is not in the picture, and
+            // letting it hold a rank would push a ring off a mate that *is*.
+            node.kind == BodyKind::Planet && seated.get(*idx).copied().unwrap_or(true)
+        })
         .map(|(idx, node)| (idx, node.size.register_fraction()))
         .collect();
     ranked.sort_by(|a, b| {
@@ -414,6 +482,9 @@ struct BodyLayout {
     severity: Severity,
     /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
     streak: f32,
+    /// Whether this body is drawn at all. `false` for a second mate the ring had no slot for, and
+    /// for everything under it — see [`seat_the_ladder`].
+    seated: bool,
     /// Whole orbits this body completes per animation loop, resolved from its own mass — see
     /// [`BodyKind::revolutions_per_loop`]. Held here rather than re-derived per frame because
     /// [`SceneLayout::position`] is called per body per frame and recursively up every parent
@@ -513,6 +584,12 @@ pub(crate) struct SceneLayout {
     bodies: Vec<BodyLayout>,
     width: u32,
     height: u32,
+    /// Second mates the ring seated, and second mates it had no slot for. Counted rather than
+    /// silently dropped: an instrument that quietly shows fewer bodies than the fleet has is lying
+    /// by omission (A41(b)). Surfaced in the scene by [`draw_overflow_mark`] and reported through
+    /// the session API by `App::observe_background_scene`.
+    mates_seated: usize,
+    mates_beyond_ladder: usize,
 }
 
 /// Place every node of `nodes` into a scene sized `width` x `height`.
@@ -525,8 +602,21 @@ pub(crate) struct SceneLayout {
 pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> SceneLayout {
     let scale = width.min(height) as f32;
 
+    // Both rules are recomputed here rather than carried on a node, because this is the recompute:
+    // `build_layout` runs on exactly the topology changes that can move a rank or a seat.
+    let (seated, mates_seated, mates_beyond_ladder) = seat_the_ladder(nodes);
+    let types = assign_body_types(nodes, &seated);
+
+    // Siblings, counting only what is drawn. A42(d): *"the slot is composition"* — the selected
+    // set is seated into the ladder's own slots, so eight mates chosen out of seventeen are spread
+    // evenly around the ring rather than left holding eight of seventeen positions with nine gaps
+    // where the dropped ones used to be. Spreading over the roster instead makes the ring visibly
+    // lopsided, which is the ladder's spacing being spent on a fact the picture is not showing.
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (idx, node) in nodes.iter().enumerate() {
+        if !seated[idx] {
+            continue;
+        }
         if let Some(parent) = node.parent {
             if parent < nodes.len() && parent != idx {
                 children[parent].push(idx);
@@ -555,10 +645,6 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             break;
         }
     }
-
-    // A54(b): the rank rule is recomputed here rather than carried on a node, because this is the
-    // recompute — `build_layout` runs on exactly the topology changes that can move a rank.
-    let types = assign_body_types(nodes);
 
     let mut bodies: Vec<BodyLayout> = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter().enumerate() {
@@ -602,6 +688,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             hue: node.hue,
             severity: node.severity,
             streak,
+            seated: seated.get(idx).copied().unwrap_or(true),
             revolutions_per_loop: node.kind.revolutions_per_loop(node.size),
             base_angle,
             orbit_radius_px: node.kind.orbit_radius_fraction() * scale * nesting,
@@ -613,6 +700,8 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
         bodies,
         width,
         height,
+        mates_seated,
+        mates_beyond_ladder,
     }
 }
 
@@ -626,6 +715,19 @@ impl SceneLayout {
     /// and already knows.
     pub(crate) fn body_count(&self) -> usize {
         self.bodies.len()
+    }
+
+    /// Second mates the ring seated, and second mates it had no slot for — the pair
+    /// `App::observe_background_scene` reports through the session API so the overflow can be read
+    /// as a number rather than counted off the picture.
+    pub(crate) fn ladder_occupancy(&self) -> (usize, usize) {
+        (self.mates_seated, self.mates_beyond_ladder)
+    }
+
+    /// Whether this body is drawn at all. An effect that lands on a body the ring had no slot for
+    /// has nothing to land on, so every effect path checks this before drawing.
+    fn is_seated(&self, idx: usize) -> bool {
+        self.bodies.get(idx).is_some_and(|body| body.seated)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1063,6 +1165,85 @@ fn draw_body(
                 let t = 1.0 - (dist - radius) / (glow - radius).max(0.001);
                 let alpha = t * t * if self_luminous { 0.55 } else { 0.22 };
                 blend(&mut buf[idx], base, alpha);
+            }
+        }
+    }
+}
+
+/// Where the unseated mates are marked, as a fraction of `min(width, height)` from the scene's
+/// centre — outside every orbit, so the ladder's own spacing is untouched by the disclosure.
+const OVERFLOW_ORBIT_FRACTION: f32 = 0.44;
+
+/// The arc the marks are spread over, centred straight down. A compact fan rather than a full
+/// ring: these are not bodies in orbit, they are a queue of mates the ring could not seat, and
+/// spreading them evenly round the scene would read as exactly the thing they are not.
+const OVERFLOW_FAN: f32 = 0.42;
+const OVERFLOW_ANGLE: f32 = PI * 0.5;
+
+/// One mark's radius in pixels, and its alpha. Deliberately smaller and dimmer than the smallest
+/// body the scene can draw — a mark must not be mistakable for a seated body, or the disclosure
+/// becomes the misreading it exists to prevent.
+const OVERFLOW_MARK_PX: f32 = 1.6;
+const OVERFLOW_MARK_ALPHA: f32 = 0.34;
+
+/// Colour of an overflow mark: the ring's own cold ice, which is the scene's existing "material
+/// rather than state" colour. Not severity-coded — these mates have states, and the whole point is
+/// that the scene is *not* showing them.
+const OVERFLOW_RGB01: (f32, f32, f32) = RING_RGB01;
+
+/// Mark the second mates the ring had no slot for: one small, dim, unshaded mote each, on a short
+/// arc outside every orbit.
+///
+/// A41(b): a ninth mate is *counted and dropped*, never a silent vanish — an instrument that
+/// quietly shows fewer bodies than the fleet has is lying by omission. The exact count also goes
+/// out over the session API, where it can be read as a number and argued with; this is the half
+/// that is in the frame, so a viewer who is only looking at the scene still knows the ring is not
+/// the whole fleet.
+///
+/// Absent at zero, because a disclosure of nothing is noise rather than population (A41(c)).
+///
+/// One mote per mate rather than a bar or a gauge: at these counts the marks are countable, which
+/// makes the reading exact without this generator needing a font.
+fn draw_overflow_mark(buf: &mut [[f32; 4]], width: u32, height: u32, beyond: usize, phase: f32) {
+    if beyond == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let scale = width.min(height) as f32;
+    let centre = (width as f32 / 2.0, height as f32 / 2.0);
+    let radius = OVERFLOW_ORBIT_FRACTION * scale;
+
+    for i in 0..beyond {
+        let spread = if beyond > 1 {
+            i as f32 / (beyond - 1) as f32 - 0.5
+        } else {
+            0.0
+        };
+        let angle = OVERFLOW_ANGLE + spread * OVERFLOW_FAN;
+        let (sin_a, cos_a) = angle.sin_cos();
+        let px = centre.0 + cos_a * radius;
+        let py = centre.1 + sin_a * radius;
+        // A slow shared breath, so the queue reads as present rather than as dead pixels. One
+        // whole cycle per loop, so it closes with everything else.
+        let alpha = OVERFLOW_MARK_ALPHA * mix(0.7, 1.0, 0.5 + 0.5 * phase.sin());
+
+        let x0 = (px - OVERFLOW_MARK_PX).floor().max(0.0) as i32;
+        let x1 = (px + OVERFLOW_MARK_PX).ceil().min(width as f32) as i32;
+        let y0 = (py - OVERFLOW_MARK_PX).floor().max(0.0) as i32;
+        let y1 = (py + OVERFLOW_MARK_PX).ceil().min(height as f32) as i32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let dx = xx as f32 + 0.5 - px;
+                let dy = yy as f32 + 0.5 - py;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > OVERFLOW_MARK_PX {
+                    continue;
+                }
+                let idx = yy as usize * width as usize + xx as usize;
+                blend(
+                    &mut buf[idx],
+                    OVERFLOW_RGB01,
+                    alpha * clamp01(1.0 - dist / OVERFLOW_MARK_PX),
+                );
             }
         }
     }
@@ -1507,8 +1688,15 @@ fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
         render_bands(&mut buf, width, height, phase);
     }
 
+    draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
+
     let sun_pos = sun_position(layout, phase);
     for (idx, body) in layout.bodies.iter().enumerate() {
+        // A mate the ring had no slot for is not in the picture, and neither is anything under it.
+        // It is not gone, though — see [`draw_overflow_mark`].
+        if !body.seated {
+            continue;
+        }
         let pos = layout.position(idx, phase);
         let seed = body_seed(idx);
         // Back arc, body, front arc — the ring is the one element the body sits *inside*, so it
@@ -1593,13 +1781,21 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     // is [`RIPPLE_FADE_RATIO`] applied to the crater's already-resolved age fraction, not a
     // second duration this module would have to read a clock to measure.
     for crater in &effects.craters {
-        let Some(body) = layout.bodies.get(crater.body) else {
+        let Some(body) = layout
+            .bodies
+            .get(crater.body)
+            .filter(|_| layout.is_seated(crater.body))
+        else {
             continue;
         };
         let pos = layout.position(crater.body, phase);
         draw_crater(&mut buf, width, height, crater, body, pos);
         if let Some(parent_idx) = body.parent {
-            if let Some(parent) = layout.bodies.get(parent_idx) {
+            if let Some(parent) = layout
+                .bodies
+                .get(parent_idx)
+                .filter(|_| layout.is_seated(parent_idx))
+            {
                 let parent_pos = layout.position(parent_idx, phase);
                 let ripple = Crater {
                     body: parent_idx,
@@ -1616,7 +1812,11 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     // After every crater, so the dust a strike throws up sits above the mark it left, and above
     // any other body's crater drawn this frame.
     for ejecta in &effects.ejecta {
-        let Some(body) = layout.bodies.get(ejecta.body) else {
+        let Some(body) = layout
+            .bodies
+            .get(ejecta.body)
+            .filter(|_| layout.is_seated(ejecta.body))
+        else {
             continue;
         };
         let pos = layout.position(ejecta.body, phase);
@@ -1624,7 +1824,11 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     }
 
     for asteroid in &effects.asteroids {
-        if let Some(target) = layout.bodies.get(asteroid.target) {
+        if let Some(target) = layout
+            .bodies
+            .get(asteroid.target)
+            .filter(|_| layout.is_seated(asteroid.target))
+        {
             let target_pos = layout.position(asteroid.target, phase);
             let approach_radius = target.body_radius_px * 6.0;
             let start = (
@@ -1645,7 +1849,7 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
         // read as flying *into* the thing the work landed on rather than past where it used to be.
         let end = comet
             .target
-            .filter(|idx| *idx < layout.bodies.len())
+            .filter(|idx| *idx < layout.bodies.len() && layout.is_seated(*idx))
             .map(|idx| {
                 let pos = layout.position(idx, phase);
                 (
@@ -3054,6 +3258,249 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // The ladder seats eight, and the overflow is a reading
+    // ---------------------------------------------------------------------------
+
+    /// A fleet whose mates carry the given file counts, each with one worker, so the "a dropped
+    /// mate takes its workers with it" rule has something to drop.
+    fn fleet_of(files: &[Option<u32>]) -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for size in files {
+            let size = size.map_or(BodySize::Unmeasured, BodySize::Files);
+            nodes.push(sized(Some(0), BodyKind::Planet, size));
+            let mate = nodes.len() - 1;
+            nodes.push(node(Some(mate), BodyKind::Moon));
+        }
+        nodes
+    }
+
+    #[test]
+    fn the_ring_seats_the_heaviest_eight_and_counts_the_rest() {
+        // The real case rather than a corner: seventeen mates, five of them unmeasured — the
+        // roster A42's own CHECK is driven by. The nine smallest have to be the nine dropped.
+        let mut files: Vec<Option<u32>> = (0..12).map(|i| Some((i + 1) * 200)).collect();
+        files.extend(std::iter::repeat_n(None, 5));
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+
+        let (seated, beyond) = layout.ladder_occupancy();
+        assert_eq!(
+            (seated, beyond),
+            (ORBIT_LADDER_SLOTS, 17 - ORBIT_LADDER_SLOTS)
+        );
+
+        // And they are the heaviest eight — 2400 down to 1000 — by tracked files, not by roster
+        // order and not by arrival.
+        let seated_files: Vec<Option<u32>> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, n)| n.kind == BodyKind::Planet && layout.bodies[*idx].seated)
+            .map(|(_, n)| match n.size {
+                BodySize::Files(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seated_files,
+            vec![
+                Some(1_000),
+                Some(1_200),
+                Some(1_400),
+                Some(1_600),
+                Some(1_800),
+                Some(2_000),
+                Some(2_200),
+                Some(2_400)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_mate_ranks_at_the_floor_rather_than_below_zero() {
+        // A42(b), and the reason the key is `register_fraction` rather than the raw file count:
+        // an unmeasured project is not a zero-file project. Ranked on the raw field it would sort
+        // below every measured mate and could never win a slot at all — and five of the mates on
+        // this box are unmeasured, so this is the case that occurs rather than a corner.
+        //
+        // Nine mates: eight measured *below* the floor's equivalent, and one unmeasured. The
+        // unmeasured one has to beat the small ones, because that is where it is drawn.
+        let files: Vec<Option<u32>> = std::iter::once(None)
+            .chain((0..ORBIT_LADDER_SLOTS).map(|_| Some(0)))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+        assert!(
+            layout.bodies[1].seated,
+            "the unmeasured mate lost its slot to a mate drawn exactly its own size"
+        );
+
+        // ...and it ties with an empty project rather than beating or losing to it, so the tie
+        // has to be broken by roster order — otherwise two identical snapshots seat different
+        // bodies (A42(c)).
+        let repeated = build_layout(&nodes, 1_000, 1_000);
+        let seats: Vec<bool> = layout.bodies.iter().map(|b| b.seated).collect();
+        let again: Vec<bool> = repeated.bodies.iter().map(|b| b.seated).collect();
+        assert_eq!(seats, again, "the seating is not deterministic");
+    }
+
+    #[test]
+    fn a_dropped_mate_takes_its_own_workers_with_it() {
+        // A worker orbits its mate, and a mate that is not in the picture has nothing for its
+        // workers to orbit. Leaving them behind would draw moons circling empty space.
+        let files: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 3)
+            .map(|i| Some((i as u32 + 1) * 100))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+
+        for (idx, n) in nodes.iter().enumerate() {
+            if n.kind != BodyKind::Moon {
+                continue;
+            }
+            let parent = n.parent.expect("a worker has a mate");
+            assert_eq!(
+                layout.bodies[idx].seated, layout.bodies[parent].seated,
+                "worker {idx} and its mate {parent} disagree about being in the picture"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fleet_that_fits_loses_nothing_and_discloses_nothing() {
+        for count in 0..=ORBIT_LADDER_SLOTS {
+            let files: Vec<Option<u32>> = (0..count).map(|i| Some(i as u32 * 37 + 1)).collect();
+            let layout = build_layout(&fleet_of(&files), 1_000, 1_000);
+            assert_eq!(layout.ladder_occupancy(), (count, 0));
+            assert!(
+                layout.bodies.iter().all(|b| b.seated),
+                "{count} mates fit the ring and something was still dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overflow_is_marked_in_the_frame_and_absent_when_there_is_none() {
+        // A41(b) and (c): counted and dropped, never a silent vanish — and absent at zero,
+        // because a disclosure of nothing is noise rather than population.
+        let fits = build_layout(&fleet_of(&[Some(1), Some(2)]), 900, 900);
+        let overflowing: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 6)
+            .map(|i| Some(i as u32 + 1))
+            .collect();
+        let overflowing = build_layout(&fleet_of(&overflowing), 900, 900);
+
+        // The mark lives outside every orbit, so the two frames can be differenced in a band no
+        // body ever reaches — and the starfield out there is identical between them, being a pure
+        // function of the frame size. Whatever differs is the disclosure and nothing else.
+        let centre = (450.0f32, 450.0f32);
+        let inner = OVERFLOW_ORBIT_FRACTION * 900.0 - 8.0;
+        let quiet = frame(&fits, 0.0);
+        let disclosed = frame(&overflowing, 0.0);
+        let marked = quiet
+            .chunks_exact(4)
+            .zip(disclosed.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let d = ((x - centre.0).powi(2) + (y - centre.1).powi(2)).sqrt();
+                d >= inner && (0..3).any(|c| a[c].abs_diff(b[c]) > 1)
+            })
+            .count();
+        assert!(
+            marked > 0,
+            "a fleet with {} mates beyond the ring marked nothing outside it",
+            overflowing.ladder_occupancy().1
+        );
+        // ...and the mark is small: it is a disclosure, not a second fleet. Well under the area
+        // one seated mate's own disk covers.
+        assert!(
+            marked < 2_000,
+            "the overflow mark is drawing {marked} pixels — that is a body, not a mark"
+        );
+        // A fleet that fits marks nothing at all out there, which is the "absent at zero" half.
+        let space = frame(&build_layout(&[], 900, 900), 0.0);
+        let when_it_fits = quiet
+            .chunks_exact(4)
+            .zip(space.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let d = ((x - centre.0).powi(2) + (y - centre.1).powi(2)).sqrt();
+                d >= inner && (0..3).any(|c| a[c].abs_diff(b[c]) > 1)
+            })
+            .count();
+        assert_eq!(
+            when_it_fits, 0,
+            "a fleet the ring seats whole still drew a disclosure"
+        );
+    }
+
+    #[test]
+    fn an_effect_on_an_unseated_mate_draws_nothing() {
+        // Effects name their body by index, and the indices are preserved across seating so a
+        // pane's identity still resolves. That makes "this body is not in the picture" a thing
+        // every effect path has to check, or a crater lands on empty space.
+        let files: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 2)
+            .map(|i| Some((i as u32 + 1) * 100))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 900, 900);
+        let dropped = layout
+            .bodies
+            .iter()
+            .position(|b| !b.seated)
+            .expect("this fleet overflows the ring");
+
+        let effects = SceneEffects {
+            craters: vec![Crater {
+                body: dropped,
+                angle_on_surface: 0.4,
+                severity: Severity::Critical,
+                age: 0.0,
+                is_ripple: false,
+            }],
+            ejecta: vec![Ejecta {
+                body: dropped,
+                angle_on_surface: 0.4,
+                severity: Severity::Critical,
+                age: 0.0,
+            }],
+            asteroids: vec![AsteroidInFlight {
+                target: dropped,
+                severity: Severity::Critical,
+                progress: 0.5,
+                approach_angle: 0.4,
+            }],
+            comets: vec![Comet {
+                start: (0.1, 0.1),
+                end: (0.9, 0.9),
+                target: Some(dropped),
+                magnitude: 1.0,
+                progress: 0.5,
+            }],
+        };
+        let drawn = effects_frame(&layout, &effects, 0.0);
+        let clean = effects_frame(&layout, &SceneEffects::default(), 0.0);
+        // The comet still crosses — it is a scene-wide event, and degrading to its own crossing
+        // path is the existing behaviour for a target that cannot be resolved. Everything that
+        // draws *on* the body draws nothing.
+        let on_body = drawn
+            .chunks_exact(4)
+            .zip(clean.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let pos = layout.position(dropped, 0.0);
+                let near = ((x - pos.0).powi(2) + (y - pos.1).powi(2)).sqrt() < 60.0;
+                near && a != b
+            })
+            .count();
+        assert_eq!(
+            on_body, 0,
+            "an effect drew on a mate the ring had no slot for"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Orbital period reads mass
     // ---------------------------------------------------------------------------
 
@@ -3252,7 +3699,8 @@ mod tests {
         // A54's rule: a mate is a gas giant *unless* its rank is 2 mod 3. That is "even
         // distribution" read as even spacing rather than as 50/50 — the captain asked for more gas
         // planets in the same sentence, and a 50/50 split adds none.
-        let types = types_of(&ranked_fleet(9));
+        // A full ladder, so this is about the modulus alone rather than about the ladder's cap.
+        let types = types_of(&ranked_fleet(ORBIT_LADDER_SLOTS));
         let mates = &types[1..];
         assert_eq!(
             mates,
@@ -3265,18 +3713,21 @@ mod tests {
                 BodyType::Ringed,
                 BodyType::Gas,
                 BodyType::Gas,
-                BodyType::Ringed,
             ],
             "the ringed mates are not every third one, heaviest first"
         );
 
         // The proportion is the point, and it has to hold for a fleet that is not a multiple of
-        // three as well as one that is.
+        // three as well as one that is — and, past the ladder, for the mates that got a seat.
         for count in 1..=20 {
             let types = types_of(&ranked_fleet(count));
             let ringed = types.iter().filter(|t| **t == BodyType::Ringed).count();
             let gas = types.iter().filter(|t| **t == BodyType::Gas).count();
-            assert_eq!(ringed + gas, count, "every second mate needs a type");
+            assert_eq!(
+                ringed + gas,
+                count.min(ORBIT_LADDER_SLOTS),
+                "every *seated* second mate needs a type, and nothing else may have one"
+            );
             assert!(
                 gas >= ringed,
                 "{count} mates split {gas} gas / {ringed} ringed — that is not two in three"

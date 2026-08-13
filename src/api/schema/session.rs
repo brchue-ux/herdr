@@ -69,6 +69,29 @@ pub struct BackgroundSceneInfo {
     /// image placed for all of them, so one viewer that would composite it over
     /// its own text withholds it from everybody.
     pub every_viewer_draws_ambient_wash: bool,
+    /// How many second mates the scene's orbit ring can seat at once.
+    ///
+    /// A composition number rather than a limit found by measurement: the ring's
+    /// spacing is what the whole field is built on, so its capacity is decided
+    /// rather than discovered.
+    /// `#[serde(default)]` on all three, matching this schema's own convention
+    /// for fields added after the fact: a newer CLI asking an older server for a
+    /// purely informational readout should report zero rather than fail to parse
+    /// the whole response.
+    #[serde(default)]
+    pub ladder_capacity: u32,
+    /// How many second mates are currently seated on it.
+    #[serde(default)]
+    pub mates_seated: u32,
+    /// How many second mates the fleet has that the ring had no slot for.
+    ///
+    /// Reported rather than dropped in silence: a scene that quietly shows fewer
+    /// bodies than the fleet has is lying by omission. The losers are the
+    /// *smallest* by tracked files at HEAD — the same register the scene already
+    /// draws each body's size from — so this number is arguable rather than
+    /// mysterious. Zero whenever the fleet fits.
+    #[serde(default)]
+    pub mates_beyond_ladder: u32,
 }
 
 /// Params for `session.status.set`.

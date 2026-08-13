@@ -6995,6 +6995,27 @@
             "kitty_graphics_enabled": {
               "description": "`[experimental] kitty_graphics` in config.toml. The scene is a Kitty\nGraphics surface, so this gates it too.",
               "type": "boolean"
+            },
+            "ladder_capacity": {
+              "default": 0,
+              "description": "How many second mates the scene's orbit ring can seat at once.\n\nA composition number rather than a limit found by measurement: the ring's\nspacing is what the whole field is built on, so its capacity is decided\nrather than discovered.\n`#[serde(default)]` on all three, matching this schema's own convention\nfor fields added after the fact: a newer CLI asking an older server for a\npurely informational readout should report zero rather than fail to parse\nthe whole response.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mates_beyond_ladder": {
+              "default": 0,
+              "description": "How many second mates the fleet has that the ring had no slot for.\n\nReported rather than dropped in silence: a scene that quietly shows fewer\nbodies than the fleet has is lying by omission. The losers are the\n*smallest* by tracked files at HEAD — the same register the scene already\ndraws each body's size from — so this number is arguable rather than\nmysterious. Zero whenever the fleet fits.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mates_seated": {
+              "default": 0,
+              "description": "How many second mates are currently seated on it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             }
           },
           "required": [
@@ -10760,7 +10781,10 @@
                 "host_draws_ambient_wash": false,
                 "host_terminal": "",
                 "kitty_graphics_capability_confirmed": false,
-                "kitty_graphics_enabled": false
+                "kitty_graphics_enabled": false,
+                "ladder_capacity": 0,
+                "mates_beyond_ladder": 0,
+                "mates_seated": 0
               },
               "description": "Whether the persistent whole-terminal background scene is drawing, and\nwhen it is not, which of its conditions is the one that is unmet."
             },
