@@ -38,6 +38,13 @@ use super::{
 
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
+/// How long a pane keeps drawing its last complete frame while its child is
+/// inside a DEC 2026 synchronized update.
+///
+/// The same cap Alacritty and kitty apply, and far longer than a single agent
+/// redraw, so a child that raises the mode and then stalls or dies cannot leave
+/// its pane frozen.
+const SYNCHRONIZED_UPDATE_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
@@ -178,6 +185,15 @@ pub(crate) struct GhosttyPaneCore {
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
+    /// When the child opened the synchronized update it is currently inside, so
+    /// the hold on painting can be bounded by [`SYNCHRONIZED_UPDATE_HOLD_TIMEOUT`].
+    synchronized_update_started_at: Option<Instant>,
+    /// Whether `render_state` holds a frame read from the live grid for drawing.
+    ///
+    /// The construction-time update in [`GhosttyPaneTerminal::new`] deliberately
+    /// does not count: it snapshots an empty grid, and holding that would render
+    /// a pane blank whose very first output arrives inside a synchronized update.
+    render_state_populated: bool,
     windows_powershell_prompt_cwd_reporting: bool,
 }
 
@@ -956,6 +972,8 @@ impl GhosttyPaneTerminal {
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
+                synchronized_update_started_at: None,
+                render_state_populated: false,
                 windows_powershell_prompt_cwd_reporting: false,
             }),
             key_encoder: Mutex::new(key_encoder),
@@ -1216,6 +1234,7 @@ impl GhosttyPaneTerminal {
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
             .unwrap_or(false);
+        observe_synchronized_output(&mut core, synchronized_output, Instant::now());
         if CURSOR_POSITION_SETTLE_ENABLED {
             let cursor_started = crate::render_prof::timer();
             let cursor_after_write = current_cursor_state(&mut core);
@@ -1452,6 +1471,9 @@ impl GhosttyPaneTerminal {
         cell_height_px: u32,
     ) -> Vec<Bytes> {
         if let Ok(mut core) = self.core.lock() {
+            // The retained frame was drawn at the old geometry, so it is no
+            // longer a frame worth holding for a synchronized update.
+            core.render_state_populated = false;
             let offset_from_bottom = core
                 .terminal
                 .scrollbar()
@@ -1674,6 +1696,19 @@ impl GhosttyPaneTerminal {
                     .ok()
             })
             .unwrap_or(false)
+    }
+
+    /// Ages the open synchronized update by `elapsed`, so tests can reach the
+    /// hold timeout without sleeping.
+    #[cfg(test)]
+    fn age_synchronized_update_for_test(&self, elapsed: Duration) {
+        if let Ok(mut core) = self.core.lock() {
+            if let Some(started) = core.synchronized_update_started_at.as_mut() {
+                if let Some(earlier) = started.checked_sub(elapsed) {
+                    *started = earlier;
+                }
+            }
+        }
     }
 
     pub fn encode_terminal_key(
@@ -1919,15 +1954,19 @@ impl GhosttyPaneTerminal {
         let host_theme = core.host_terminal_theme;
         let initial_default_foreground = core.initial_default_foreground;
         let initial_default_background = core.initial_default_background;
+        let held_for_synchronized_update = match refresh_render_state(&mut core, Instant::now()) {
+            RenderStateRefresh::Failed => return,
+            RenderStateRefresh::Held => {
+                crate::render_prof::event("render.synchronized_update_hold");
+                true
+            }
+            RenderStateRefresh::Updated => false,
+        };
         let GhosttyPaneCore {
-            terminal,
             render_state,
             decscusr_tracker,
             ..
         } = &mut *core;
-        if render_state.update(terminal).is_err() {
-            return;
-        }
         let colors = render_state.colors().ok();
         let default_bg = colors
             .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
@@ -2006,7 +2045,11 @@ impl GhosttyPaneTerminal {
             }
         }
 
-        ghostty_clear_render_dirty(render_state, area.height);
+        // A held frame consumed nothing from the live grid, so those rows must
+        // stay dirty for the draw that follows the batch.
+        if !held_for_synchronized_update {
+            ghostty_clear_render_dirty(render_state, area.height);
+        }
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
         if show_cursor {
@@ -2082,14 +2125,79 @@ fn render_delay_after_pty_write(
     }
 }
 
-fn current_cursor_state(core: &mut GhosttyPaneCore) -> Option<TerminalCursorState> {
+/// Records where the child is in its DEC 2026 synchronized update, so a hold on
+/// painting can be timed from the moment the batch opened.
+fn observe_synchronized_output(core: &mut GhosttyPaneCore, active: bool, now: Instant) {
+    if active {
+        core.synchronized_update_started_at.get_or_insert(now);
+    } else {
+        core.synchronized_update_started_at = None;
+    }
+}
+
+/// Whether this pane must draw its last complete frame instead of the live grid,
+/// because the child is part-way through a synchronized update.
+///
+/// False before the pane has ever drawn a live frame — a pane whose first output
+/// arrives inside a batch draws that batch rather than nothing — and false again
+/// once [`SYNCHRONIZED_UPDATE_HOLD_TIMEOUT`] has passed, so an unterminated batch
+/// cannot freeze the pane.
+fn synchronized_update_holds_frame(core: &mut GhosttyPaneCore, now: Instant) -> bool {
+    if !core.render_state_populated {
+        return false;
+    }
+    if !core
+        .terminal
+        .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // A batch observed here but never stamped (mode raised outside the PTY read
+    // path) is timed from this first sighting rather than held forever.
+    let started = *core.synchronized_update_started_at.get_or_insert(now);
+    now.duration_since(started) < SYNCHRONIZED_UPDATE_HOLD_TIMEOUT
+}
+
+/// Outcome of bringing `render_state` up to date before a pane is drawn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenderStateRefresh {
+    /// The live grid was read into `render_state`.
+    Updated,
+    /// The child is inside a synchronized update, so the last complete frame was
+    /// kept rather than a half-drawn one.
+    Held,
+    /// The live grid could not be read.
+    Failed,
+}
+
+/// Reads the live grid into `render_state` unless the child is inside a
+/// synchronized update, where the retained snapshot *is* the last complete frame.
+fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderStateRefresh {
+    if synchronized_update_holds_frame(core, now) {
+        return RenderStateRefresh::Held;
+    }
     let GhosttyPaneCore {
         terminal,
+        render_state,
+        ..
+    } = &mut *core;
+    if render_state.update(terminal).is_err() {
+        return RenderStateRefresh::Failed;
+    }
+    core.render_state_populated = true;
+    RenderStateRefresh::Updated
+}
+
+fn current_cursor_state(core: &mut GhosttyPaneCore) -> Option<TerminalCursorState> {
+    if refresh_render_state(core, Instant::now()) == RenderStateRefresh::Failed {
+        return None;
+    }
+    let GhosttyPaneCore {
         render_state,
         decscusr_tracker,
         ..
     } = core;
-    render_state.update(terminal).ok()?;
     cursor_state_from_render_state(render_state, decscusr_tracker)
 }
 
@@ -2172,14 +2280,18 @@ fn ghostty_collect_dirty_patch(
     let host_theme = core.host_terminal_theme;
     let initial_default_foreground = core.initial_default_foreground;
     let initial_default_background = core.initial_default_background;
-    let GhosttyPaneCore {
-        terminal,
-        render_state,
-        ..
-    } = core;
-    if render_state.update(terminal).is_err() {
-        fallback!("render_state_update_error");
+    match refresh_render_state(core, Instant::now()) {
+        RenderStateRefresh::Updated => {}
+        // The pane is mid-batch: it contributes nothing to this frame, so the
+        // retained frame keeps its last complete content and its rows stay dirty
+        // for the patch that follows the batch.
+        RenderStateRefresh::Held => {
+            crate::render_prof::event("dirty_collect.synchronized_update_hold");
+            finish!(TerminalDirtyPatchOutcome::Clean);
+        }
+        RenderStateRefresh::Failed => fallback!("render_state_update_error"),
     }
+    let GhosttyPaneCore { render_state, .. } = core;
     match render_state.dirty() {
         Ok(crate::ghostty::Dirty::Clean) => finish!(TerminalDirtyPatchOutcome::Clean),
         Ok(crate::ghostty::Dirty::Partial) => {}
@@ -4960,6 +5072,159 @@ mod tests {
 
         let end = pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026l", &tx);
         assert!(end.request_render);
+    }
+
+    /// Draws the pane the way the server does and returns its top row.
+    fn rendered_top_row(pane: &GhosttyPaneTerminal, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height), false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// A child redraw that replaces its screen: the intermediate content is
+    /// never part of a finished frame, so drawing it is a torn frame by
+    /// definition.
+    fn synchronized_victim_pane() -> (
+        GhosttyPaneTerminal,
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<Bytes>,
+        PaneId,
+    ) {
+        let (tx, rx) = mpsc::channel(64);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        (pane, tx, rx, PaneId::from_raw(1))
+    }
+
+    #[test]
+    fn synchronized_update_render_holds_last_complete_frame_until_batch_ends() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\r\x1b[KTORN", &tx);
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "COMPLETE",
+            "a render landing inside a synchronized update must keep the last complete frame"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KFINAL\x1b[?2026l", &tx);
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FINAL",
+            "the finished batch must be drawn once it closes"
+        );
+    }
+
+    #[test]
+    fn render_without_synchronized_output_still_draws_intermediate_state() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KTORN", &tx);
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "TORN",
+            "a child that does not ask for synchronized output must still be drawn live"
+        );
+    }
+
+    #[test]
+    fn synchronized_update_hold_expires_so_a_stalled_batch_cannot_freeze_a_pane() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        // Opens a batch and never closes it.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\r\x1b[KSTALLED", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.age_synchronized_update_for_test(
+            SYNCHRONIZED_UPDATE_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "STALLED",
+            "an unterminated synchronized update must stop holding the pane after the timeout"
+        );
+    }
+
+    #[test]
+    fn first_render_inside_synchronized_update_draws_the_live_grid() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026hFIRST", &tx);
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FIRST",
+            "a pane whose first output arrives inside a batch must not render blank"
+        );
+    }
+
+    #[test]
+    fn dirty_patch_is_clean_while_a_synchronized_update_holds_the_frame() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\r\x1b[KTORN", &tx);
+
+        assert!(
+            matches!(
+                pane.collect_dirty_patch(20, 3),
+                TerminalDirtyPatchOutcome::Clean
+            ),
+            "the retained frame path must not patch a pane that is mid-batch"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KFINAL\x1b[?2026l", &tx);
+
+        let patch = match pane.collect_dirty_patch(20, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected the finished batch to patch, got {other:?}"),
+        };
+        let (row, cells) = &patch.rows[0];
+        assert_eq!(*row, 0);
+        let text = cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert_eq!(
+            text.trim_end(),
+            "FINAL",
+            "rows held through a batch must still be dirty when it closes"
+        );
+    }
+
+    #[test]
+    fn resize_releases_the_synchronized_update_hold() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\r\x1b[KRESIZED", &tx);
+        pane.resize(3, 30, 9, 18);
+
+        assert_eq!(
+            rendered_top_row(&pane, 30, 3),
+            "RESIZED",
+            "the retained frame no longer matches the pane, so a resize must draw live"
+        );
     }
 
     #[test]
