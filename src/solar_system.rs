@@ -245,15 +245,73 @@ impl BodyKind {
         }
     }
 
-    /// Full orbits completed per animation loop. Planets complete exactly one; moons complete
-    /// several more so the loop reads as motion rather than a slow crawl, while both land back on
-    /// their starting angle after [`FRAME_COUNT`] samples — the same seamless-loop contract
-    /// `src/particle_field.rs::loop_frames` already relies on.
-    fn revolutions_per_loop(self) -> f32 {
+    /// Full orbits completed per animation loop by a body **outside** the size register — the sun,
+    /// and every worker. Unchanged from before period read mass, for the same reason
+    /// [`Self::fixed_radius_fraction`] is: a pane is not a checkout, so there is no mass to read.
+    ///
+    /// Every body lands back on its starting angle after [`FRAME_COUNT`] samples — the same
+    /// seamless-loop contract `src/particle_field.rs::loop_frames` already relies on — which is
+    /// why every value here and in [`Self::revolution_band`] is a whole number.
+    fn fixed_revolutions_per_loop(self) -> f32 {
         match self {
             Self::Sun => 0.0,
             Self::Planet => 1.0,
             Self::Moon => 4.0,
+        }
+    }
+
+    /// The slowest and fastest whole number of revolutions per loop this tier draws: the heaviest
+    /// project in the tier at the slow end, the lightest at the fast end.
+    ///
+    /// Whole numbers because of the loop contract, and a *narrow* band of them because of
+    /// [`FRAME_COUNT`]: a body doing `R` revolutions per loop is sampled `36/R` times per
+    /// revolution, so the fast end of each band is set by where the orbit stops reading as a
+    /// circle and starts reading as a polygon, not by how much spread would be nice to have.
+    /// A worker's own 4 sits inside the moon band, so nothing about the composition moves.
+    fn revolution_band(self) -> (f32, f32) {
+        match self {
+            Self::Sun => (0.0, 0.0),
+            Self::Planet => (1.0, 3.0),
+            Self::Moon => (3.0, 5.0),
+        }
+    }
+
+    /// Full orbits completed per animation loop, for a body of this kind at this size.
+    ///
+    /// **Period is a consequence of mass, not a cadence.** The fleet orrery states the law as
+    /// `T = k · a^1.5 · m^0.5` — Kepler's third, with a mass term — so rate goes as
+    /// `(a · m^0.5)^-1` and the heaviest body in a tier is its *slowest*. That is the opposite of
+    /// "big things move fast", and it is the whole reading: a mate that has grown into the biggest
+    /// checkout in the fleet comes round with a weight the small ones do not have.
+    ///
+    /// `m` is the register's own mass, and [`BodySize::register_fraction`] is its cube root, so
+    /// `m^0.5` is `register_fraction^1.5` and the law reduces to `rate ∝ (a · f^1.5)^-1`.
+    ///
+    /// **`a` cancels inside a tier, and that is a fact about herdr's ladder rather than a
+    /// shortcut.** The orrery spreads its mates over a ladder of orbital distances, so its `a`
+    /// term does real work per body. herdr draws one ring per tier — every second mate at
+    /// [`Self::orbit_radius_fraction`], every worker at its own — so within a tier `a` is a
+    /// constant and divides straight out of the normalisation below. The `a^1.5` separation has
+    /// not been dropped: it is exactly what [`Self::revolution_band`]'s two bands *are*, which is
+    /// also the artifact's own conclusion — *"distance from the sun stays what it has always been:
+    /// the ladder's fixed spacing, which is the field's composition. Mass is read off radius and
+    /// period."*
+    fn revolutions_per_loop(self, size: BodySize) -> f32 {
+        let (slowest, fastest) = self.revolution_band();
+        match (self, size) {
+            // The sun does not orbit, and a body with no mass to read keeps its tier's own rate.
+            (Self::Sun, _) | (_, BodySize::Fixed) => self.fixed_revolutions_per_loop(),
+            (_, BodySize::Unmeasured | BodySize::Files(_)) => {
+                // `f^-1.5`, normalised so the register's ceiling lands on the slow end of the band
+                // and its floor on the fast end. Normalised rather than scaled, so the law's own
+                // curvature survives the mapping — the band is not a linear restatement of `f`.
+                let rate = |fraction: f32| fraction.max(1e-4).powf(-1.5);
+                let heaviest = rate(1.0);
+                let lightest = rate(BodySize::Unmeasured.register_fraction());
+                let span = (lightest - heaviest).max(1e-6);
+                let t = clamp01((rate(size.register_fraction()) - heaviest) / span);
+                mix(slowest, fastest, t).round()
+            }
         }
     }
 }
@@ -356,6 +414,11 @@ struct BodyLayout {
     severity: Severity,
     /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
     streak: f32,
+    /// Whole orbits this body completes per animation loop, resolved from its own mass — see
+    /// [`BodyKind::revolutions_per_loop`]. Held here rather than re-derived per frame because
+    /// [`SceneLayout::position`] is called per body per frame and recursively up every parent
+    /// chain, and a `powf` per call on that path is work with no reason to be there.
+    revolutions_per_loop: f32,
     /// Angle this body sits at within its parent's ring at `phase == 0`.
     base_angle: f32,
     orbit_radius_px: f32,
@@ -539,6 +602,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             hue: node.hue,
             severity: node.severity,
             streak,
+            revolutions_per_loop: node.kind.revolutions_per_loop(node.size),
             base_angle,
             orbit_radius_px: node.kind.orbit_radius_fraction() * scale * nesting,
             body_radius_px: radius_fraction * scale * nesting.max(0.35),
@@ -597,7 +661,7 @@ impl SceneLayout {
         if body.orbit_radius_px <= 0.0 {
             return parent_pos;
         }
-        let angle = body.base_angle + phase * body.kind.revolutions_per_loop();
+        let angle = body.base_angle + phase * body.revolutions_per_loop;
         (
             parent_pos.0 + body.orbit_radius_px * angle.cos(),
             parent_pos.1 + body.orbit_radius_px * angle.sin(),
@@ -2986,6 +3050,177 @@ mod tests {
             fifteen_mates.len(),
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Orbital period reads mass
+    // ---------------------------------------------------------------------------
+
+    fn revolutions(kind: BodyKind, size: BodySize) -> f32 {
+        let nodes = [node(None, BodyKind::Sun), sized(Some(0), kind, size)];
+        build_layout(&nodes, 1_000, 1_000).bodies[1].revolutions_per_loop
+    }
+
+    #[test]
+    fn the_heaviest_project_takes_the_longest_to_come_round() {
+        // `T = k · a^1.5 · m^0.5` — Kepler's third with a mass term. Period *rises* with mass, so
+        // the heaviest mate in the fleet is the slowest thing on the ring. That is the reading:
+        // a mate that has grown into the biggest checkout comes round with a weight the small ones
+        // do not have.
+        let ceiling = revolutions(BodyKind::Planet, BodySize::Files(FILES_CEIL));
+        let floor = revolutions(BodyKind::Planet, BodySize::Unmeasured);
+        assert!(
+            ceiling < floor,
+            "the heaviest mate ({ceiling} rev/loop) is not slower than the lightest ({floor})"
+        );
+
+        // Monotonic all the way along, not merely ordered at its two ends.
+        let mut previous = f32::INFINITY;
+        for files in [0, 100, 400, 900, 1_600, 2_500, 3_600, FILES_CEIL] {
+            let rate = revolutions(BodyKind::Planet, BodySize::Files(files));
+            assert!(
+                rate <= previous,
+                "{files} files revolves faster than a lighter project: {rate} after {previous}"
+            );
+            previous = rate;
+        }
+
+        // And the spread is real rather than a rounding artefact — the fleet's own range of
+        // checkouts has to land on more than one rate or the register is not being read.
+        let real_fleet: Vec<f32> = [2_470, 860, 430, 314, 99, 2]
+            .into_iter()
+            .map(|files| revolutions(BodyKind::Planet, BodySize::Files(files)))
+            .collect();
+        let distinct: std::collections::BTreeSet<u32> =
+            real_fleet.iter().map(|r| *r as u32).collect();
+        assert!(
+            distinct.len() >= 3,
+            "the real fleet lands on only {} distinct periods: {real_fleet:?}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn every_body_completes_a_whole_number_of_orbits_per_loop() {
+        // The seamless-loop contract, and the reason the mass-driven period is *quantized* rather
+        // than continuous: the ambient loop is baked once into [`FRAME_COUNT`] frames and played
+        // forever, so a body on a fractional period jumps at every repeat.
+        for kind in [BodyKind::Sun, BodyKind::Planet, BodyKind::Moon] {
+            for size in [
+                BodySize::Fixed,
+                BodySize::Unmeasured,
+                BodySize::Files(0),
+                BodySize::Files(1),
+                BodySize::Files(431),
+                BodySize::Files(2_470),
+                BodySize::Files(FILES_CEIL),
+                BodySize::Files(u32::MAX),
+            ] {
+                let rate = revolutions(kind, size);
+                assert_eq!(
+                    rate,
+                    rate.round(),
+                    "{kind:?} at {size:?} draws {rate} revolutions per loop"
+                );
+                assert!((0.0..=8.0).contains(&rate), "{kind:?} at {size:?}: {rate}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mass_driven_orbit_still_lands_back_where_it_started() {
+        // The whole point of quantizing: whatever the register does to a body's rate, the loop
+        // still closes. A fleet spanning the register, every body checked.
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for files in [2_470u32, 860, 430, 99, 2] {
+            nodes.push(sized(Some(0), BodyKind::Planet, BodySize::Files(files)));
+            let planet = nodes.len() - 1;
+            nodes.push(node(Some(planet), BodyKind::Moon));
+            nodes.push(sized(
+                Some(planet),
+                BodyKind::Moon,
+                BodySize::Files(files / 2),
+            ));
+        }
+        let layout = build_layout(&nodes, 800, 800);
+        for idx in 0..nodes.len() {
+            let start = layout.position(idx, 0.0);
+            let looped = layout.position(idx, 2.0 * PI);
+            assert!(
+                (start.0 - looped.0).abs() < 0.01 && (start.1 - looped.1).abs() < 0.01,
+                "body {idx} does not close its loop: {start:?} -> {looped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_outside_the_register_keeps_its_tiers_own_rate() {
+        // A pane is not a checkout, so a worker has no mass to read — exactly the reason it keeps
+        // its tier's fixed *radius*. Its rate is the one every moon drew before period read mass,
+        // so nothing about the composition moved for the bodies the register does not cover.
+        assert_eq!(revolutions(BodyKind::Moon, BodySize::Fixed), 4.0);
+        assert_eq!(revolutions(BodyKind::Planet, BodySize::Fixed), 1.0);
+        // The sun does not orbit anything, whatever size a caller hands it.
+        for size in [BodySize::Fixed, BodySize::Unmeasured, BodySize::Files(9)] {
+            assert_eq!(revolutions(BodyKind::Sun, size), 0.0);
+        }
+        // ...and a worker's own rate sits inside the band the register would have put it in, so a
+        // fleet of workers and nested projects reads as one population rather than two.
+        let (slowest, fastest) = BodyKind::Moon.revolution_band();
+        let worker = revolutions(BodyKind::Moon, BodySize::Fixed);
+        assert!((slowest..=fastest).contains(&worker), "{worker}");
+    }
+
+    #[test]
+    fn the_fastest_body_is_still_sampled_often_enough_to_read_as_a_circle() {
+        // The band's fast end is set by [`FRAME_COUNT`], not by taste: a body doing `R`
+        // revolutions per loop is sampled `36/R` times per revolution, and below about seven
+        // samples an orbit stops reading as a circle and starts reading as a polygon. This is the
+        // constraint that makes the *quantized* period a narrow band rather than a wide one.
+        let fastest = [BodyKind::Planet, BodyKind::Moon]
+            .into_iter()
+            .map(|kind| kind.revolution_band().1)
+            .fold(0.0f32, f32::max);
+        let samples_per_revolution = FRAME_COUNT as f32 / fastest;
+        assert!(
+            samples_per_revolution >= 7.0,
+            "the fastest body gets {samples_per_revolution:.1} samples per revolution"
+        );
+    }
+
+    #[test]
+    fn two_mates_on_different_periods_actually_separate_on_screen() {
+        // The reading only exists if it is visible: two mates that start together have to be
+        // meaningfully apart by the middle of the loop, or the register is driving a number
+        // nobody can see. Measured as the angle between them about the sun.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(FILES_CEIL)),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(0)),
+        ];
+        let layout = build_layout(&nodes, 1_000, 1_000);
+        let sun = layout.position(0, 0.0);
+        let angle_to = |idx: usize, phase: f32| {
+            let p = layout.position(idx, phase);
+            (p.1 - sun.1).atan2(p.0 - sun.0)
+        };
+        let separation = |phase: f32| {
+            let mut d = (angle_to(1, phase) - angle_to(2, phase)).abs();
+            if d > PI {
+                d = 2.0 * PI - d;
+            }
+            d
+        };
+        // Their starting separation is the sibling spread, which is composition rather than
+        // motion; what has to grow is the *change* in it.
+        let start = separation(0.0);
+        let drifted = (0..=10)
+            .map(|i| (separation(i as f32 / 10.0 * 2.0 * PI) - start).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            drifted > 1.0,
+            "the heaviest and lightest mates never drift more than {drifted:.2} rad apart"
         );
     }
 
