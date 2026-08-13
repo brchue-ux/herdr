@@ -2379,6 +2379,9 @@ pub struct AppState {
     /// corner is a couple of hundred kilobytes, and re-rendering it once per legibility sample
     /// would cost more than storing it by a wide margin.
     pub(crate) machine_corner_rgba: Option<Vec<u8>>,
+    /// How much of its own orbit each body in the fleet has travelled — the one part of the scene
+    /// that survives a regeneration. See `crate::app::background_scene::OrbitTracks`.
+    pub(crate) orbit_tracks: crate::app::background_scene::OrbitTracks,
     /// Which fleet identity (`crate::anim::CardRow`) each index of
     /// `background_scene_layout` resolves to.
     pub(crate) background_scene_identity: Vec<crate::anim::CardRow>,
@@ -3703,6 +3706,7 @@ impl AppState {
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,
+            orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,

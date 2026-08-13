@@ -379,6 +379,10 @@ impl Fleet {
                 // gas giant that swells are both size changes, and this rig holds size fixed so
                 // the number it reports is body *count* and nothing else.
                 streak: 0.0,
+                // No accumulated wear either: this rig measures render cost against body count,
+                // and a track is a fixed annulus per body rather than something that scales with
+                // the fleet in a different way.
+                wear: 0.0,
             });
         }
         nodes

@@ -203,6 +203,93 @@ impl BackgroundEffectsState {
 /// collapsing to a dot — see [`solar_system::BodySize`]'s own doc.
 pub(crate) const FILES_TOKEN: &str = "files";
 
+/// How much of its own orbit each body in the fleet has completed, and therefore how worn its
+/// track is.
+///
+/// **This is the one part of the scene that is not regenerated from scratch.** The ambient loop is
+/// baked and rebaked; a groove is wear in the ground, and wear that vanished every time the scene
+/// was rebuilt would not be wear at all — it would be a decoration that happened to look like it.
+///
+/// ## What survives a regeneration, exactly
+///
+/// Keyed by **fleet identity** ([`crate::anim::CardRow`]) rather than by body index, so:
+///
+/// - A **resize** keeps every track. Nothing about the fleet changed; only the pixels did.
+/// - A **body joining or leaving** keeps every *other* track. Indices shift on a topology change
+///   and identities do not, which is the whole reason the key is what it is — keyed by index, one
+///   pane closing would hand its accumulated wear to whichever body slid into its slot.
+/// - A body that **leaves** loses its wear, and gets none back if it returns. A groove is how much
+///   has passed *here*, and a body that left took its orbit with it.
+/// - A **server restart** starts every track bare. This is in-memory state about a running
+///   session, not something the fleet publishes, and inventing a past for a scene that has just
+///   started would be the same fabrication the machine register refuses one module over.
+#[derive(Debug, Default)]
+pub(crate) struct OrbitTracks {
+    /// Revolutions completed, per body still in the fleet.
+    revolutions: HashMap<CardRow, f32>,
+    /// When the accumulation was last advanced.
+    advanced_at: Option<Instant>,
+}
+
+impl OrbitTracks {
+    /// Advance every live body's revolution count to `now`, and forget every body that has left.
+    ///
+    /// `bodies` is each live body's identity paired with the revolutions it completes per animation
+    /// loop — the rate `crate::solar_system` already resolved from its mass.
+    ///
+    /// Returns whether any body's *drawn* wear step moved, which is the only kind of change that
+    /// can reach the picture: the counts advance continuously and the steps do not, so a caller
+    /// that rebaked whenever a count moved would rebake every tick forever.
+    pub(crate) fn advance<'a>(
+        &mut self,
+        bodies: impl Iterator<Item = (&'a CardRow, f32)>,
+        now: Instant,
+    ) -> bool {
+        let elapsed = self
+            .advanced_at
+            .map(|last| now.saturating_duration_since(last))
+            .unwrap_or(Duration::ZERO);
+        self.advanced_at = Some(now);
+        let loops = elapsed.as_secs_f32() / (LOOP_DURATION_MS as f32 / 1_000.0);
+
+        let mut moved = false;
+        let mut live: HashMap<CardRow, f32> = HashMap::new();
+        for (row, per_loop) in bodies {
+            let was = self.revolutions.get(row).copied().unwrap_or(0.0);
+            let now_at = was + per_loop * loops;
+            if solar_system::OrbitWear::of(was) != solar_system::OrbitWear::of(now_at) {
+                moved = true;
+            }
+            live.insert(row.clone(), now_at);
+        }
+        // A body that has left is gone from `live` by construction, which is what forgets it.
+        // Deliberately *not* reported as a change: a body joining or leaving already moves
+        // `background_scene_key` through the node list itself, and reporting it here as well would
+        // be a second rebake trigger for the same event.
+        self.revolutions = live;
+        moved
+    }
+
+    /// One body's drawn wear, `0.0..=1.0`.
+    pub(crate) fn wear(&self, row: &CardRow) -> f32 {
+        solar_system::OrbitWear::of(self.revolutions.get(row).copied().unwrap_or(0.0)).fraction()
+    }
+
+    /// Revolutions completed by one body — the raw count behind the drawn step.
+    ///
+    /// Test-only for now: the drawn scene reads the quantized step and nothing else, so publishing
+    /// the raw count to production code before something needs it would be an API with no caller.
+    #[cfg(test)]
+    pub(crate) fn revolutions(&self, row: &CardRow) -> f32 {
+        self.revolutions.get(row).copied().unwrap_or(0.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.revolutions.len()
+    }
+}
+
 /// Every node of the whole-fleet owner tree, in the exact shape `src/solar_system.rs` wants, plus
 /// the identity each index resolves back to.
 ///
@@ -213,6 +300,15 @@ pub(crate) const FILES_TOKEN: &str = "files";
 /// walk is guaranteed parent-before-children.
 pub(crate) fn tree_nodes(
     app: &crate::app::state::AppState,
+) -> (Vec<solar_system::TreeNode>, Vec<CardRow>) {
+    tree_nodes_with_tracks(app, &app.orbit_tracks)
+}
+
+/// [`tree_nodes`], against a given track layer — so a test can hand one in and a caller that has
+/// borrowed the tracks mutably does not have to give them back first.
+pub(crate) fn tree_nodes_with_tracks(
+    app: &crate::app::state::AppState,
+    tracks: &OrbitTracks,
 ) -> (Vec<solar_system::TreeNode>, Vec<CardRow>) {
     let agents = crate::ui::sidebar::sidebar_agent_entries(app);
     let entries = crate::ui::sidebar::workspace_list_entries_whole_fleet(app);
@@ -246,6 +342,10 @@ pub(crate) fn tree_nodes(
             severity: facts.severity,
             size: facts.size,
             streak: facts.streak,
+            // The one fact here that is not read fresh from the fleet: how much of its own orbit
+            // this body has already travelled, which is accumulated across every regeneration of
+            // the scene. See [`OrbitTracks`].
+            wear: tracks.wear(&facts.row),
         });
         identity.push(facts.row);
         path.push(nodes.len() - 1);
@@ -797,6 +897,160 @@ mod tests {
             HashMap::from([(key.to_string(), Some(value.to_string()))]),
             None,
             Instant::now(),
+        );
+    }
+
+    /// A fleet of `count` Spaces under one root, all measured, so every body has a real rate.
+    fn fleet_app(count: usize) -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("fleet"));
+        for i in 0..count {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(&format!("mate{i}")));
+            publish(
+                &mut app,
+                i + 1,
+                crate::app::agent_tree::OWNER_TOKEN,
+                "fleet",
+            );
+            publish(
+                &mut app,
+                i + 1,
+                FILES_TOKEN,
+                &((i as u32 + 1) * 300).to_string(),
+            );
+        }
+        app
+    }
+
+    fn rates(app: &crate::app::state::AppState) -> Vec<(CardRow, f32)> {
+        let (nodes, identity) = tree_nodes(app);
+        identity
+            .into_iter()
+            .zip(nodes)
+            .map(|(row, node)| (row, node.kind.revolutions_per_loop(node.size)))
+            .collect()
+    }
+
+    fn advance(tracks: &mut OrbitTracks, app: &crate::app::state::AppState, at: Instant) -> bool {
+        let rates = rates(app);
+        tracks.advance(rates.iter().map(|(row, rate)| (row, *rate)), at)
+    }
+
+    #[test]
+    fn a_track_wears_with_the_revolutions_the_body_has_actually_completed() {
+        // Density is revolutions completed — a groove means "how much has passed here", so a body
+        // that has been round its orbit a thousand times has a deeper one than a body that has
+        // been round twice.
+        let app = fleet_app(2);
+        let mut tracks = OrbitTracks::default();
+        let start = Instant::now();
+        assert!(!advance(&mut tracks, &app, start), "nothing has passed yet");
+
+        let (_, identity) = tree_nodes(&app);
+        let mate = identity
+            .iter()
+            .find(|row| matches!(row, CardRow::Space(_)) && **row != identity[0])
+            .cloned()
+            .expect("a second mate");
+        assert_eq!(tracks.wear(&mate), 0.0);
+
+        // A minute of orbiting, then an hour.
+        advance(&mut tracks, &app, start + Duration::from_secs(60));
+        let after_a_minute = tracks.wear(&mate);
+        advance(&mut tracks, &app, start + Duration::from_secs(3_600));
+        let after_an_hour = tracks.wear(&mate);
+
+        assert!(after_an_hour > after_a_minute, "the track stopped wearing");
+        assert!(after_an_hour <= 1.0, "wear ran past full");
+        // ...and it saturates rather than running away: a groove that kept deepening forever would
+        // end up the loudest thing in the frame.
+        advance(&mut tracks, &app, start + Duration::from_secs(86_400 * 7));
+        let after_a_week = tracks.wear(&mate);
+        advance(&mut tracks, &app, start + Duration::from_secs(86_400 * 30));
+        assert_eq!(tracks.wear(&mate), after_a_week);
+    }
+
+    #[test]
+    fn wear_survives_the_scene_being_rebuilt_and_a_body_joining_or_leaving() {
+        // The point of the layer. The ambient loop is baked and rebaked; a groove is wear in the
+        // ground, and wear that vanished on every rebuild would be a decoration that happened to
+        // look like wear.
+        let mut app = fleet_app(3);
+        let mut tracks = OrbitTracks::default();
+        let start = Instant::now();
+        advance(&mut tracks, &app, start);
+        advance(&mut tracks, &app, start + Duration::from_secs(3_600));
+
+        let (_, identity) = tree_nodes(&app);
+        let survivor = identity[1].clone();
+        let leaver = identity[3].clone();
+        let before = tracks.revolutions(&survivor);
+        assert!(before > 0.0);
+        assert!(tracks.revolutions(&leaver) > 0.0);
+
+        // A rebuild of the scene changes nothing at all: this is not read from the layout.
+        let (_, identity_again) = tree_nodes(&app);
+        assert_eq!(identity_again, identity);
+        assert_eq!(tracks.revolutions(&survivor), before);
+
+        // A body leaves. Indices shift and identities do not, which is the whole reason the key is
+        // an identity: keyed by index, the survivor would inherit whatever slid into its slot.
+        app.workspaces.pop();
+        advance(&mut tracks, &app, start + Duration::from_secs(3_601));
+        assert!(
+            tracks.revolutions(&survivor) >= before,
+            "a body leaving took another body's wear with it"
+        );
+        assert_eq!(
+            tracks.revolutions(&leaver),
+            0.0,
+            "a body that left kept its groove"
+        );
+        assert_eq!(tracks.tracked(), 3, "the leaver is still being tracked");
+
+        // ...and a body joining starts bare rather than inheriting anyone's past.
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("newcomer"));
+        publish(&mut app, 3, crate::app::agent_tree::OWNER_TOKEN, "fleet");
+        publish(&mut app, 3, FILES_TOKEN, "50");
+        advance(&mut tracks, &app, start + Duration::from_secs(3_602));
+        let (_, joined) = tree_nodes(&app);
+        let newcomer = joined.last().cloned().expect("the new body");
+        assert!(
+            tracks.revolutions(&newcomer) < before / 100.0,
+            "a body that joined inherited a past it did not have"
+        );
+        assert!(tracks.revolutions(&survivor) >= before);
+    }
+
+    #[test]
+    fn advancing_only_reports_a_change_when_the_drawn_wear_actually_moves() {
+        // The counts advance continuously and the drawn steps do not. Reporting the former would
+        // rebake the whole ambient loop on every tick, forever — which is the entire reason the
+        // wear is quantized in the first place.
+        let app = fleet_app(2);
+        let mut tracks = OrbitTracks::default();
+        let start = Instant::now();
+        advance(&mut tracks, &app, start);
+
+        let mut reported = 0;
+        for step in 1..=600u32 {
+            if advance(
+                &mut tracks,
+                &app,
+                start + Duration::from_millis(u64::from(step) * 100),
+            ) {
+                reported += 1;
+            }
+        }
+        // A minute of ticking at 10Hz: the wear has genuinely moved a step or two, and nowhere
+        // near six hundred times.
+        assert!(
+            reported <= solar_system::OrbitWear::STEPS as usize,
+            "{reported} rebakes reported in one minute of ticking"
         );
     }
 
