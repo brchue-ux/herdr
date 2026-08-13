@@ -371,6 +371,10 @@ impl Fleet {
                     2 => crate::anim::cell::Severity::Serious,
                     _ => crate::anim::cell::Severity::Critical,
                 },
+                // Out of the project-size register on purpose: this rig measures how render cost
+                // scales with body *count*, so every run should draw the same body sizes as every
+                // other one rather than a spread that moves with whatever fixture built the rows.
+                size: crate::solar_system::BodySize::Fixed,
             });
         }
         nodes

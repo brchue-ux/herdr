@@ -35,6 +35,9 @@ fn background_scene_key(
         (node.kind as u8).hash(&mut hasher);
         node.hue.to_bits().hash(&mut hasher);
         node.severity.hash(&mut hasher);
+        // A project that grew is a body that has to be redrawn at its new radius; leaving `size`
+        // out of the key would cache the scene at whatever size it first saw.
+        node.size.hash(&mut hasher);
     }
     hasher.finish()
 }
