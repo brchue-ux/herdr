@@ -1198,6 +1198,83 @@ impl AppState {
         Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
     }
 
+    /// Where the machine register's readout is drawn, in cells.
+    ///
+    /// The top-right of the terminal area, inset by one cell. Top-right rather than anywhere else
+    /// because that is the corner a reader's eye is *least* often in — this is a readout about the
+    /// substrate, glanced at, never worked in — and because the sidebar owns the left edge.
+    ///
+    /// Returns an empty rect when the screen is too small to hold it, which is what stops the
+    /// readout from covering a terminal somebody is actually using on a narrow window. A corner
+    /// that will not fit is not drawn at all; it is not shrunk until it is unreadable.
+    pub(crate) fn machine_corner_rect(&self) -> Rect {
+        const COLS: u16 = 26;
+        const ROWS: u16 = 8;
+        const INSET: u16 = 1;
+
+        let screen = self.screen_rect();
+        // Measured against the **main area** — the frame outside the sidebar — rather than against
+        // the whole screen, because that is the area the readout actually spends. Against the
+        // screen, a narrow terminal with a wide sidebar passes the check and then covers most of
+        // the little sky it has: 60 columns with a 44-wide sidebar leaves 16, and a 26-wide corner
+        // in it takes two thirds of the main area. This is what makes `SKY_CLEAR_FLOOR` a
+        // structural guarantee rather than something that happens to hold at the sizes anyone
+        // tried — see `the_scene_keeps_most_of_the_main_area_to_itself`.
+        let main_width = screen.width.saturating_sub(self.view.sidebar_rect.width);
+        if main_width < COLS * 3 || screen.height < (ROWS + INSET * 2) * 2 {
+            return Rect::new(screen.x, screen.y, 0, 0);
+        }
+        Rect::new(
+            screen.x + screen.width - COLS - INSET,
+            screen.y + INSET,
+            COLS,
+            ROWS,
+        )
+    }
+
+    /// How much of the main area the scene still has to itself, in cells.
+    ///
+    /// H8, in herdr's own terms: *"of the frame outside the worker-tree panel, at least 60% of the
+    /// area carries no interface element over it. If the regions plus the tree crowd the sky out,
+    /// the thing the captain liked is gone."*
+    ///
+    /// **The main area is the frame outside the sidebar**, because the sidebar is the worker-tree
+    /// panel — it is what the clause measures *around*, not something it counts against the sky.
+    ///
+    /// **Pane text is not an interface element here, and that is a real distinction rather than a
+    /// convenient one.** herdr's scene is an opaque wash placed *under* the text with no pane
+    /// background of its own, so a terminal region is ink on the scene rather than a panel over
+    /// it — which is the state the artifact had to retire a clause to reach ("the terminal is
+    /// unboxed... they are ink on the scene"). What does count is anything that puts a *surface*
+    /// between the reader and the sky: today that is the machine register's corner.
+    ///
+    /// Returns `(covered_cells, main_area_cells)`.
+    pub(crate) fn sky_coverage(&self) -> (u32, u32) {
+        let screen = self.screen_rect();
+        let sidebar = self.view.sidebar_rect;
+        let main_width = screen.width.saturating_sub(sidebar.width);
+        let main = u32::from(main_width) * u32::from(screen.height);
+
+        let corner = self.machine_corner_rect();
+        // Clipped to the main area rather than counted whole: a corner that hung off the screen
+        // would otherwise be able to report more coverage than there is area to cover.
+        let corner_covered =
+            u32::from(corner.width.min(main_width)) * u32::from(corner.height.min(screen.height));
+
+        (corner_covered.min(main), main)
+    }
+
+    /// The fraction of the main area carrying no interface element, `0.0..=1.0`. See
+    /// [`Self::sky_coverage`]. A main area with no cells in it reads as fully clear, because a
+    /// screen with nothing in it has not crowded the sky out.
+    pub(crate) fn sky_clear_fraction(&self) -> f32 {
+        let (covered, main) = self.sky_coverage();
+        if main == 0 {
+            return 1.0;
+        }
+        1.0 - covered as f32 / main as f32
+    }
+
     pub(crate) fn context_menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         let screen = self.screen_rect();
@@ -1870,6 +1947,157 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    /// An `AppState` whose screen is exactly `cols` x `rows`.
+    fn state_sized(cols: u16, rows: u16) -> crate::app::state::AppState {
+        let mut state = crate::app::state::AppState::test_new();
+        state.view.sidebar_rect = Rect::new(0, 0, 0, rows);
+        state.view.terminal_area = Rect::new(0, 0, cols, rows);
+        state
+    }
+
+    #[test]
+    fn the_machine_corner_sits_top_right_inside_the_screen() {
+        let state = state_sized(120, 40);
+        let corner = state.machine_corner_rect();
+        let screen = state.screen_rect();
+
+        assert!(corner.width > 0 && corner.height > 0);
+        // Top-right, inset — the corner a reader's eye is least often in, and the edge the sidebar
+        // does not own.
+        assert_eq!(corner.x + corner.width, screen.x + screen.width - 1);
+        assert_eq!(corner.y, screen.y + 1);
+        // Wholly inside the screen, which is what stops the readout being clipped into nonsense.
+        assert!(corner.x >= screen.x);
+        assert!(corner.y + corner.height <= screen.y + screen.height);
+    }
+
+    #[test]
+    fn a_screen_too_small_for_the_machine_corner_does_not_get_a_shrunken_one() {
+        // A readout that will not fit is not drawn at all; it is not squeezed until it is
+        // unreadable, and it never takes more than half of a narrow screen. Somebody working in a
+        // 60-column terminal has not asked for a third of it to become a diagnostic.
+        for (cols, rows) in [(40u16, 40u16), (120, 6), (10, 10), (0, 0)] {
+            let corner = state_sized(cols, rows).machine_corner_rect();
+            assert_eq!(
+                (corner.width, corner.height),
+                (0, 0),
+                "a {cols}x{rows} screen was given a corner anyway"
+            );
+        }
+        // ...and a size that does fit gets the whole thing rather than a partial one.
+        let fits = state_sized(120, 40).machine_corner_rect();
+        assert_eq!((fits.width, fits.height), (26, 8));
+
+        // The threshold is about the *main* area rather than the screen: the same 60-column
+        // terminal fits a corner with no sidebar and does not fit one with a wide sidebar, because
+        // the second has almost no sky left to spend.
+        let mut narrow = state_sized(90, 24);
+        assert_ne!(
+            narrow.machine_corner_rect().width,
+            0,
+            "90 columns of main area is room for a 26-wide readout"
+        );
+        narrow.view.sidebar_rect = Rect::new(0, 0, 44, 24);
+        narrow.view.terminal_area = Rect::new(44, 0, 46, 24);
+        assert_eq!(
+            narrow.machine_corner_rect().width,
+            0,
+            "a corner was drawn into 46 columns of main area"
+        );
+    }
+
+    /// An `AppState` whose screen is `cols` x `rows` with a sidebar `sidebar` wide.
+    fn state_with_sidebar(cols: u16, rows: u16, sidebar: u16) -> crate::app::state::AppState {
+        let mut state = crate::app::state::AppState::test_new();
+        state.view.sidebar_rect = Rect::new(0, 0, sidebar, rows);
+        state.view.terminal_area = Rect::new(sidebar, 0, cols.saturating_sub(sidebar), rows);
+        state
+    }
+
+    #[test]
+    fn the_scene_keeps_most_of_the_main_area_to_itself() {
+        // The composition bound the whole scene exists to satisfy: if the interface crowds the sky
+        // out, the thing the scene is for is gone. Held at every size a terminal realistically
+        // reaches, against herdr's own real sidebar widths — not one flattering geometry.
+        // Swept down to sizes that genuinely do not fit, not only comfortable ones: the bound has
+        // to hold on a 40-column terminal with a wide sidebar as much as on a 240-column one, and
+        // that narrow case is exactly where a corner sized against the whole screen would cover
+        // most of the sky the reader has left.
+        for cols in [20u16, 40, 60, 80, 100, 120, 160, 200, 240, 400] {
+            for rows in [4u16, 10, 16, 20, 30, 40, 50, 80] {
+                for sidebar in [0u16, 26, 34, 44, 60] {
+                    if sidebar >= cols {
+                        continue;
+                    }
+                    let state = state_with_sidebar(cols, rows, sidebar);
+                    let clear = state.sky_clear_fraction();
+                    assert!(
+                        clear >= crate::app::state::SKY_CLEAR_FLOOR,
+                        "{cols}x{rows} with a {sidebar}-wide sidebar leaves the scene only \
+                         {:.1}% of the main area",
+                        clear * 100.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_sidebar_is_what_the_main_area_is_measured_around_not_against() {
+        // The sidebar *is* the worker-tree panel — the thing the clause measures around. Counting
+        // it as coverage would make a wide sidebar fail a bound that is not about it, and would
+        // make the number un-actionable: there is nothing to do about it.
+        let narrow = state_with_sidebar(200, 50, 26);
+        let wide = state_with_sidebar(200, 50, 44);
+        assert_eq!(narrow.sky_coverage().0, wide.sky_coverage().0);
+        assert!(
+            wide.sky_coverage().1 < narrow.sky_coverage().1,
+            "a wider sidebar has to leave a smaller main area"
+        );
+    }
+
+    #[test]
+    fn a_screen_with_no_room_for_the_corner_is_wholly_clear() {
+        // The corner is the only thing that puts a surface between the reader and the sky, so a
+        // screen too small to hold one has nothing over it at all. This is also the case that
+        // would divide by zero if the main area were empty.
+        assert_eq!(state_with_sidebar(40, 40, 26).sky_clear_fraction(), 1.0);
+        assert_eq!(state_with_sidebar(0, 0, 0).sky_clear_fraction(), 1.0);
+        assert_eq!(state_with_sidebar(26, 40, 26).sky_clear_fraction(), 1.0);
+    }
+
+    #[test]
+    fn the_corner_is_a_small_share_of_a_real_terminal() {
+        // Reported rather than only bounded: "it passes" and "it takes 2% of the main area" are
+        // different statements, and the second is the one that says whether there is room to add
+        // anything else here later.
+        let state = state_with_sidebar(200, 50, 34);
+        let (covered, main) = state.sky_coverage();
+        assert_eq!(main, (200 - 34) * 50);
+        assert_eq!(covered, 26 * 8);
+        assert!(
+            state.sky_clear_fraction() > 0.95,
+            "the corner covers {:.1}% of a 200x50 terminal",
+            (1.0 - state.sky_clear_fraction()) * 100.0
+        );
+    }
+
+    #[test]
+    fn the_machine_corner_reserves_only_its_own_box() {
+        // A49, in the form herdr can actually hold: the corner takes its own box and nothing else.
+        // The implementation this rules out is the obvious one — a full-width band across the rows
+        // the corner occupies — which would claim a whole screen's width of cells that have
+        // nothing over them.
+        let state = state_with_sidebar(200, 50, 34);
+        let corner = state.machine_corner_rect();
+        let (covered, _) = state.sky_coverage();
+        assert_eq!(covered, u32::from(corner.width) * u32::from(corner.height));
+        assert!(
+            covered < u32::from(state.screen_rect().width) * u32::from(corner.height),
+            "the reservation is a full-width band rather than the corner's own box"
+        );
+    }
 
     fn mark_worktree_space_member(workspace: &mut Workspace, ws_idx: usize, key: &str) {
         workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

@@ -345,6 +345,70 @@ pub(crate) enum BodyType {
 const RINGED_RANK_MODULUS: usize = 3;
 const RINGED_RANK_REMAINDER: usize = 2;
 
+/// How many second mates the ring seats.
+///
+/// A41(a): *"orbit slots are composition — they are the spacing the whole field is built on — so
+/// the capacity is a card number and not a code accident."* Eight is the fleet orrery's own
+/// `ORBIT_LADDER` length, and it is a decision rather than a limit found by measurement.
+pub(crate) const ORBIT_LADDER_SLOTS: usize = 8;
+
+/// Which second mates the ring seats when the roster exceeds [`ORBIT_LADDER_SLOTS`], and how many
+/// it could not.
+///
+/// A42: the mates that orbit are the ones with the **largest project size** — files at HEAD, the
+/// same register the radius band already draws mass from. Not roster order, not arrival, not
+/// event volume.
+///
+/// The key is [`BodySize::register_fraction`] rather than the raw file count, and that is A42(b)
+/// rather than convenience: an unmeasured project is not a zero-file project, the floor is what
+/// absorbs it, and ranking it on the raw field would put it *below* zero where it could never win
+/// a slot at all. It ranks where it is **drawn** — at the floor — so the selection and the picture
+/// agree about how big it is. Ties keep the roster's own order (A42(c)), so two identical
+/// snapshots can never seat different bodies.
+///
+/// A dropped mate takes its own workers with it: a worker orbits its mate, and a mate that is not
+/// in the picture has nothing for its workers to orbit.
+///
+/// Returns one flag per node — whether it is drawn — alongside the seated and overflow counts.
+fn seat_the_ladder(nodes: &[TreeNode]) -> (Vec<bool>, usize, usize) {
+    let mut mates: Vec<(usize, f32)> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == BodyKind::Planet)
+        .map(|(idx, node)| (idx, node.size.register_fraction()))
+        .collect();
+    let total = mates.len();
+    mates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut seated = vec![true; nodes.len()];
+    for (idx, _) in mates.into_iter().skip(ORBIT_LADDER_SLOTS) {
+        seated[idx] = false;
+    }
+    // A dropped mate's subtree goes with it. Nodes arrive parent-before-child, and the same
+    // defensive fixed-point pass the depth walk uses keeps this right if that ever stops holding.
+    for _ in 0..nodes.len() {
+        let mut changed = false;
+        for (idx, node) in nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                if parent < nodes.len() && parent != idx && !seated[parent] && seated[idx] {
+                    seated[idx] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let shown = total.min(ORBIT_LADDER_SLOTS);
+    (seated, shown, total.saturating_sub(ORBIT_LADDER_SLOTS))
+}
+
 /// Assign a [`BodyType`] to every node, by rank in the project-size register.
 ///
 /// Ranked by [`BodySize::register_fraction`] — the same key the size band already uses, so a mate
@@ -356,11 +420,15 @@ const RINGED_RANK_REMAINDER: usize = 2;
 /// exist at bake time is not a rule, and this fleet's roster changes under it. [`build_layout`] is
 /// that recompute — it already runs on every topology change, which is exactly the event that can
 /// move a rank.
-fn assign_body_types(nodes: &[TreeNode]) -> Vec<BodyType> {
+fn assign_body_types(nodes: &[TreeNode], seated: &[bool]) -> Vec<BodyType> {
     let mut ranked: Vec<(usize, f32)> = nodes
         .iter()
         .enumerate()
-        .filter(|(_, node)| node.kind == BodyKind::Planet)
+        .filter(|(idx, node)| {
+            // Only what is on the ring gets a type: an unseated mate is not in the picture, and
+            // letting it hold a rank would push a ring off a mate that *is*.
+            node.kind == BodyKind::Planet && seated.get(*idx).copied().unwrap_or(true)
+        })
         .map(|(idx, node)| (idx, node.size.register_fraction()))
         .collect();
     ranked.sort_by(|a, b| {
@@ -414,6 +482,9 @@ struct BodyLayout {
     severity: Severity,
     /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
     streak: f32,
+    /// Whether this body is drawn at all. `false` for a second mate the ring had no slot for, and
+    /// for everything under it — see [`seat_the_ladder`].
+    seated: bool,
     /// Whole orbits this body completes per animation loop, resolved from its own mass — see
     /// [`BodyKind::revolutions_per_loop`]. Held here rather than re-derived per frame because
     /// [`SceneLayout::position`] is called per body per frame and recursively up every parent
@@ -513,6 +584,12 @@ pub(crate) struct SceneLayout {
     bodies: Vec<BodyLayout>,
     width: u32,
     height: u32,
+    /// Second mates the ring seated, and second mates it had no slot for. Counted rather than
+    /// silently dropped: an instrument that quietly shows fewer bodies than the fleet has is lying
+    /// by omission (A41(b)). Surfaced in the scene by [`draw_overflow_mark`] and reported through
+    /// the session API by `App::observe_background_scene`.
+    mates_seated: usize,
+    mates_beyond_ladder: usize,
 }
 
 /// Place every node of `nodes` into a scene sized `width` x `height`.
@@ -525,8 +602,21 @@ pub(crate) struct SceneLayout {
 pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> SceneLayout {
     let scale = width.min(height) as f32;
 
+    // Both rules are recomputed here rather than carried on a node, because this is the recompute:
+    // `build_layout` runs on exactly the topology changes that can move a rank or a seat.
+    let (seated, mates_seated, mates_beyond_ladder) = seat_the_ladder(nodes);
+    let types = assign_body_types(nodes, &seated);
+
+    // Siblings, counting only what is drawn. A42(d): *"the slot is composition"* — the selected
+    // set is seated into the ladder's own slots, so eight mates chosen out of seventeen are spread
+    // evenly around the ring rather than left holding eight of seventeen positions with nine gaps
+    // where the dropped ones used to be. Spreading over the roster instead makes the ring visibly
+    // lopsided, which is the ladder's spacing being spent on a fact the picture is not showing.
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (idx, node) in nodes.iter().enumerate() {
+        if !seated[idx] {
+            continue;
+        }
         if let Some(parent) = node.parent {
             if parent < nodes.len() && parent != idx {
                 children[parent].push(idx);
@@ -555,10 +645,6 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             break;
         }
     }
-
-    // A54(b): the rank rule is recomputed here rather than carried on a node, because this is the
-    // recompute — `build_layout` runs on exactly the topology changes that can move a rank.
-    let types = assign_body_types(nodes);
 
     let mut bodies: Vec<BodyLayout> = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter().enumerate() {
@@ -602,6 +688,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             hue: node.hue,
             severity: node.severity,
             streak,
+            seated: seated.get(idx).copied().unwrap_or(true),
             revolutions_per_loop: node.kind.revolutions_per_loop(node.size),
             base_angle,
             orbit_radius_px: node.kind.orbit_radius_fraction() * scale * nesting,
@@ -613,6 +700,8 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
         bodies,
         width,
         height,
+        mates_seated,
+        mates_beyond_ladder,
     }
 }
 
@@ -626,6 +715,19 @@ impl SceneLayout {
     /// and already knows.
     pub(crate) fn body_count(&self) -> usize {
         self.bodies.len()
+    }
+
+    /// Second mates the ring seated, and second mates it had no slot for — the pair
+    /// `App::observe_background_scene` reports through the session API so the overflow can be read
+    /// as a number rather than counted off the picture.
+    pub(crate) fn ladder_occupancy(&self) -> (usize, usize) {
+        (self.mates_seated, self.mates_beyond_ladder)
+    }
+
+    /// Whether this body is drawn at all. An effect that lands on a body the ring had no slot for
+    /// has nothing to land on, so every effect path checks this before drawing.
+    fn is_seated(&self, idx: usize) -> bool {
+        self.bodies.get(idx).is_some_and(|body| body.seated)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -786,6 +888,22 @@ fn clamp01(v: f32) -> f32 {
 
 fn mix(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * clamp01(t)
+}
+
+/// A body falling toward something accelerates into it.
+///
+/// Every travelling thing in this scene moved at a constant speed: an asteroid crossed the last
+/// tenth of its approach as slowly as the first, and a comet arriving at a mate coasted in.
+/// Nothing falls like that. A quadratic ease-in is the standard accelerate — position goes as
+/// `t^2`, so speed goes as `2t` and rises linearly through the travel, which is what constant
+/// acceleration actually is rather than a curve chosen because it looked right.
+///
+/// Both endpoints are exact: `ease_in(0) == 0` and `ease_in(1) == 1`, so an effect still starts
+/// where it started and lands where it landed, and the caller's own `progress` stays the thing
+/// that says how far through it is.
+fn ease_in(t: f32) -> f32 {
+    let t = clamp01(t);
+    t * t
 }
 
 /// `signal_ink` as `0.0..=1.0` floats rather than `u8` triples, since shading multiplies it by a
@@ -1063,6 +1181,85 @@ fn draw_body(
                 let t = 1.0 - (dist - radius) / (glow - radius).max(0.001);
                 let alpha = t * t * if self_luminous { 0.55 } else { 0.22 };
                 blend(&mut buf[idx], base, alpha);
+            }
+        }
+    }
+}
+
+/// Where the unseated mates are marked, as a fraction of `min(width, height)` from the scene's
+/// centre — outside every orbit, so the ladder's own spacing is untouched by the disclosure.
+const OVERFLOW_ORBIT_FRACTION: f32 = 0.44;
+
+/// The arc the marks are spread over, centred straight down. A compact fan rather than a full
+/// ring: these are not bodies in orbit, they are a queue of mates the ring could not seat, and
+/// spreading them evenly round the scene would read as exactly the thing they are not.
+const OVERFLOW_FAN: f32 = 0.42;
+const OVERFLOW_ANGLE: f32 = PI * 0.5;
+
+/// One mark's radius in pixels, and its alpha. Deliberately smaller and dimmer than the smallest
+/// body the scene can draw — a mark must not be mistakable for a seated body, or the disclosure
+/// becomes the misreading it exists to prevent.
+const OVERFLOW_MARK_PX: f32 = 1.6;
+const OVERFLOW_MARK_ALPHA: f32 = 0.34;
+
+/// Colour of an overflow mark: the ring's own cold ice, which is the scene's existing "material
+/// rather than state" colour. Not severity-coded — these mates have states, and the whole point is
+/// that the scene is *not* showing them.
+const OVERFLOW_RGB01: (f32, f32, f32) = RING_RGB01;
+
+/// Mark the second mates the ring had no slot for: one small, dim, unshaded mote each, on a short
+/// arc outside every orbit.
+///
+/// A41(b): a ninth mate is *counted and dropped*, never a silent vanish — an instrument that
+/// quietly shows fewer bodies than the fleet has is lying by omission. The exact count also goes
+/// out over the session API, where it can be read as a number and argued with; this is the half
+/// that is in the frame, so a viewer who is only looking at the scene still knows the ring is not
+/// the whole fleet.
+///
+/// Absent at zero, because a disclosure of nothing is noise rather than population (A41(c)).
+///
+/// One mote per mate rather than a bar or a gauge: at these counts the marks are countable, which
+/// makes the reading exact without this generator needing a font.
+fn draw_overflow_mark(buf: &mut [[f32; 4]], width: u32, height: u32, beyond: usize, phase: f32) {
+    if beyond == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let scale = width.min(height) as f32;
+    let centre = (width as f32 / 2.0, height as f32 / 2.0);
+    let radius = OVERFLOW_ORBIT_FRACTION * scale;
+
+    for i in 0..beyond {
+        let spread = if beyond > 1 {
+            i as f32 / (beyond - 1) as f32 - 0.5
+        } else {
+            0.0
+        };
+        let angle = OVERFLOW_ANGLE + spread * OVERFLOW_FAN;
+        let (sin_a, cos_a) = angle.sin_cos();
+        let px = centre.0 + cos_a * radius;
+        let py = centre.1 + sin_a * radius;
+        // A slow shared breath, so the queue reads as present rather than as dead pixels. One
+        // whole cycle per loop, so it closes with everything else.
+        let alpha = OVERFLOW_MARK_ALPHA * mix(0.7, 1.0, 0.5 + 0.5 * phase.sin());
+
+        let x0 = (px - OVERFLOW_MARK_PX).floor().max(0.0) as i32;
+        let x1 = (px + OVERFLOW_MARK_PX).ceil().min(width as f32) as i32;
+        let y0 = (py - OVERFLOW_MARK_PX).floor().max(0.0) as i32;
+        let y1 = (py + OVERFLOW_MARK_PX).ceil().min(height as f32) as i32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let dx = xx as f32 + 0.5 - px;
+                let dy = yy as f32 + 0.5 - py;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > OVERFLOW_MARK_PX {
+                    continue;
+                }
+                let idx = yy as usize * width as usize + xx as usize;
+                blend(
+                    &mut buf[idx],
+                    OVERFLOW_RGB01,
+                    alpha * clamp01(1.0 - dist / OVERFLOW_MARK_PX),
+                );
             }
         }
     }
@@ -1427,9 +1624,12 @@ fn draw_asteroid(
 /// live position of an orbiting body, which only [`effects_frame`] can resolve — see
 /// [`Comet::target`]. For a crossing comet it is exactly `comet.end`.
 fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet, end: (f32, f32)) {
+    // Comets accelerate too, and an arriving one most visibly: it is falling toward the body the
+    // work landed on. See [`ease_in`].
+    let travel = ease_in(comet.progress);
     let pos = (
-        mix(comet.start.0, end.0, comet.progress) * width as f32,
-        mix(comet.start.1, end.1, comet.progress) * height as f32,
+        mix(comet.start.0, end.0, travel) * width as f32,
+        mix(comet.start.1, end.1, travel) * height as f32,
     );
     let dir = (end.0 - comet.start.0, end.1 - comet.start.1);
     let dir_len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(0.0001);
@@ -1507,8 +1707,15 @@ fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
         render_bands(&mut buf, width, height, phase);
     }
 
+    draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
+
     let sun_pos = sun_position(layout, phase);
     for (idx, body) in layout.bodies.iter().enumerate() {
+        // A mate the ring had no slot for is not in the picture, and neither is anything under it.
+        // It is not gone, though — see [`draw_overflow_mark`].
+        if !body.seated {
+            continue;
+        }
         let pos = layout.position(idx, phase);
         let seed = body_seed(idx);
         // Back arc, body, front arc — the ring is the one element the body sits *inside*, so it
@@ -1593,13 +1800,21 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     // is [`RIPPLE_FADE_RATIO`] applied to the crater's already-resolved age fraction, not a
     // second duration this module would have to read a clock to measure.
     for crater in &effects.craters {
-        let Some(body) = layout.bodies.get(crater.body) else {
+        let Some(body) = layout
+            .bodies
+            .get(crater.body)
+            .filter(|_| layout.is_seated(crater.body))
+        else {
             continue;
         };
         let pos = layout.position(crater.body, phase);
         draw_crater(&mut buf, width, height, crater, body, pos);
         if let Some(parent_idx) = body.parent {
-            if let Some(parent) = layout.bodies.get(parent_idx) {
+            if let Some(parent) = layout
+                .bodies
+                .get(parent_idx)
+                .filter(|_| layout.is_seated(parent_idx))
+            {
                 let parent_pos = layout.position(parent_idx, phase);
                 let ripple = Crater {
                     body: parent_idx,
@@ -1616,7 +1831,11 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     // After every crater, so the dust a strike throws up sits above the mark it left, and above
     // any other body's crater drawn this frame.
     for ejecta in &effects.ejecta {
-        let Some(body) = layout.bodies.get(ejecta.body) else {
+        let Some(body) = layout
+            .bodies
+            .get(ejecta.body)
+            .filter(|_| layout.is_seated(ejecta.body))
+        else {
             continue;
         };
         let pos = layout.position(ejecta.body, phase);
@@ -1624,16 +1843,22 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
     }
 
     for asteroid in &effects.asteroids {
-        if let Some(target) = layout.bodies.get(asteroid.target) {
+        if let Some(target) = layout
+            .bodies
+            .get(asteroid.target)
+            .filter(|_| layout.is_seated(asteroid.target))
+        {
             let target_pos = layout.position(asteroid.target, phase);
             let approach_radius = target.body_radius_px * 6.0;
             let start = (
                 target_pos.0 + approach_radius * asteroid.approach_angle.cos(),
                 target_pos.1 + approach_radius * asteroid.approach_angle.sin(),
             );
+            // A rock falling onto a body accelerates into it — see [`ease_in`].
+            let travel = ease_in(asteroid.progress);
             let pos = (
-                mix(start.0, target_pos.0, asteroid.progress),
-                mix(start.1, target_pos.1, asteroid.progress),
+                mix(start.0, target_pos.0, travel),
+                mix(start.1, target_pos.1, travel),
             );
             draw_asteroid(&mut buf, width, height, pos, asteroid.severity);
         }
@@ -1645,7 +1870,7 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
         // read as flying *into* the thing the work landed on rather than past where it used to be.
         let end = comet
             .target
-            .filter(|idx| *idx < layout.bodies.len())
+            .filter(|idx| *idx < layout.bodies.len() && layout.is_seated(*idx))
             .map(|idx| {
                 let pos = layout.position(idx, phase);
                 (
@@ -1716,6 +1941,10 @@ fn pack_rgba8(buf: &[[f32; 4]], force_opaque: bool) -> Vec<u8> {
 /// target. `Fast` compression is chosen over `Best`: the loop is generated on a resize/topology
 /// change, never per tick, so encode time trades against a cache miss that is already rare rather
 /// than against steady-state cost.
+pub(crate) fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode_png(width, height, rgba)
+}
+
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut encoder = png::Encoder::new(&mut buf, width, height);
@@ -1872,9 +2101,24 @@ pub(crate) fn effects_frame_png(
 /// cell's sampled colour the same way it changes what's actually on screen. `cols`x`rows` is the
 /// terminal-cell grid `width`x`height` divides into (the background scene canvas is always built
 /// as an exact multiple of the host cell size, `App::observe_background_scene`).
+/// A layer drawn over part of the scene rather than all of it, for
+/// [`sample_cell_backgrounds`] to composite in — the machine corner.
+///
+/// Carries its own origin **in cells** because that is what it is placed by, and its own pixel
+/// size because it is its own surface rather than a crop of the scene's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CornerLayer<'a> {
+    pub(crate) rgba: &'a [u8],
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) col: u32,
+    pub(crate) row: u32,
+}
+
 pub(crate) fn sample_cell_backgrounds(
     ambient: &[u8],
     effects: &[u8],
+    corner: Option<CornerLayer<'_>>,
     width: u32,
     height: u32,
     cell_width_px: u32,
@@ -1890,6 +2134,16 @@ pub(crate) fn sample_cell_backgrounds(
     let mut sums = vec![[0u32; 3]; cell_count];
     let mut counts = vec![0u32; cell_count];
 
+    // The corner's own pixel box in scene coordinates. Everything outside it is untouched, which
+    // is the whole shape of the rule: the reservation is the panel's own box and nothing else. A
+    // full-width band across the frame — the obvious implementation — would move the legibility
+    // decision for every cell on those rows, most of which have nothing over them at all.
+    let corner_box = corner.map(|layer| {
+        let x0 = layer.col * cell_width_px;
+        let y0 = layer.row * cell_height_px;
+        (layer, x0, y0, x0 + layer.width, y0 + layer.height)
+    });
+
     for y in 0..height as usize {
         let row = ((y as u32 / cell_height_px).min(rows - 1)) as usize;
         for x in 0..width as usize {
@@ -1897,10 +2151,32 @@ pub(crate) fn sample_cell_backgrounds(
             let px_idx = (y * width as usize + x) * 4;
 
             let effects_alpha = f32::from(effects[px_idx + 3]) / 255.0;
+            // The machine corner is a third surface placed over the same cells, so text sitting on
+            // it has to be measured against what is actually behind it. Sampling only the scene
+            // would read the void under a lit groove, commit the wrong foreground, and be wrong
+            // exactly where a readout the reader is looking at happens to be.
+            let over_corner = corner_box.and_then(|(layer, x0, y0, x1, y1)| {
+                let (px, py) = (x as u32, y as u32);
+                if px < x0 || px >= x1 || py < y0 || py >= y1 {
+                    return None;
+                }
+                let idx = ((py - y0) as usize * layer.width as usize + (px - x0) as usize) * 4;
+                (idx + 3 < layer.rgba.len()).then_some((layer.rgba, idx))
+            });
+            let corner_alpha = over_corner
+                .map(|(rgba, idx)| f32::from(rgba[idx + 3]) / 255.0)
+                .unwrap_or(0.0);
+
             let composite = |channel: usize| {
                 let ambient_c = f32::from(ambient[px_idx + channel]);
                 let effects_c = f32::from(effects[px_idx + channel]);
-                effects_c * effects_alpha + ambient_c * (1.0 - effects_alpha)
+                let scene = effects_c * effects_alpha + ambient_c * (1.0 - effects_alpha);
+                match over_corner {
+                    Some((rgba, idx)) => {
+                        f32::from(rgba[idx + channel]) * corner_alpha + scene * (1.0 - corner_alpha)
+                    }
+                    None => scene,
+                }
             };
 
             let cell_idx = row * cols as usize + col;
@@ -1928,6 +2204,258 @@ pub(crate) fn sample_cell_backgrounds(
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The machine corner
+// ---------------------------------------------------------------------------
+
+/// The host machine's own state, in the shape this renderer draws it — one already-resolved
+/// history per quantity plus one current load per logical CPU.
+///
+/// Plain numbers, because this module reads no clock, no `/proc` and no `AppState`. Everything
+/// about *where these came from* and *whether they are current* is settled by
+/// `crate::machine_register` before it gets here; a corner that had to decide for itself whether a
+/// sample was stale would be a second copy of that rule.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MachineCorner {
+    /// Each quantity's history, oldest sample first, in `crate::machine_register::Quantity::ALL`
+    /// order. An empty history draws no groove at all rather than a flat one — a groove with no
+    /// wear in it is a claim that the machine was idle, which is not the same statement as "not
+    /// measured".
+    pub(crate) grooves: Vec<Vec<f32>>,
+    /// Each logical CPU's current load, in the OS's own core order. A core that reported nothing
+    /// is `None` and is drawn absent rather than at zero.
+    pub(crate) cores: Vec<Option<f32>>,
+}
+
+impl MachineCorner {
+    /// Whether there is anything at all to draw. An empty corner draws nothing — never a seeded
+    /// history, never an idle trace, never a plausible number invented from nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.grooves.iter().all(|g| g.is_empty()) && self.cores.iter().all(Option::is_none)
+    }
+}
+
+/// The orbit track's own colour, `#2b6d84` — a worn groove.
+///
+/// A46(c): the corner introduces **no new material**. A metric's history *is* the orbit track,
+/// laid straight and read left to right in time, with the wear at each point the value measured at
+/// that point. That is not an analogy borrowed to justify a sparkline: a groove in this scene has
+/// always meant "how much has passed here", and a history trace is that sentence with time on the
+/// x axis.
+pub(crate) const TRACK_RGB01: (f32, f32, f32) = (43.0 / 255.0, 109.0 / 255.0, 132.0 / 255.0);
+
+/// How thick a groove is drawn where nothing has passed, and where the most has. The orrery's own
+/// 1–4px.
+const GROOVE_WIDTH_PX: (f32, f32) = (1.0, 4.0);
+
+/// How bright a groove is at no wear and at full. A groove at zero is still a groove — the track
+/// exists whether or not anything has worn it — but it is faint enough to read as unworn.
+const GROOVE_ALPHA: (f32, f32) = (0.22, 0.95);
+
+/// The largest a core body is drawn, as a fraction of **the corner surface's** own
+/// `min(width, height)`.
+///
+/// A46(c): *a core is a body* — shaded by the same [`shade_surface`] every planet is, sized at the
+/// cube root of its own load on the same law. A busy core is a heavier body.
+///
+/// Measured against the corner rather than against the scene, and that distinction is worth
+/// keeping straight: this is its own small surface placed over the scene, so the scene's own
+/// radius fractions are in a different coordinate space entirely and comparing the two would be a
+/// units error wearing the clothes of an invariant. What keeps a core from reading as a stray
+/// worker moon is [`CORE_RGB01`] — cores are the substrate, not the work, so they sit outside the
+/// lifecycle hue channel every fleet body resolves through.
+const CORE_RADIUS_FRACTION: f32 = 0.022;
+
+/// The smallest a core body is drawn, as a share of [`CORE_RADIUS_FRACTION`]. An idle core is
+/// still a core, and a core that draws at nothing is indistinguishable from one that reported
+/// nothing — which is a distinction H12 requires this corner to keep.
+const CORE_RADIUS_FLOOR: f32 = 0.34;
+
+/// Space between core bodies, as a multiple of the largest one's diameter.
+const CORE_GAP: f32 = 1.35;
+
+/// The hue a core body carries. Cores are the substrate rather than the work, so they are
+/// deliberately outside the lifecycle hue channel every fleet body resolves through — the same
+/// exemption the sun and the rings already hold, and for the same reason.
+const CORE_RGB01: (f32, f32, f32) = (0.62, 0.72, 0.80);
+
+/// Render the machine corner: one groove per quantity, and one shaded body per logical CPU.
+///
+/// Returns RGBA8 sized `width` x `height`, transparent everywhere nothing is drawn — this is its
+/// own small surface placed at the corner, not a pass over the whole scene. That is what makes it
+/// affordable: the register moves every two seconds, and re-baking the whole 36-frame ambient loop
+/// at that cadence would cost more CPU than it has.
+///
+/// Draws nothing at all when there is nothing measured. F21: no fabricated machine number, ever,
+/// and no decorative history — not a seeded trace, not an animated idle, not a zero standing in
+/// for an unknown.
+pub(crate) fn machine_corner_frame(corner: &MachineCorner, width: u32, height: u32) -> Vec<u8> {
+    let pixels = width as usize * height as usize;
+    let mut buf = vec![[0.0f32; 4]; pixels];
+    if width == 0 || height == 0 || corner.is_empty() {
+        return pack_rgba8(&buf, false);
+    }
+
+    let scale = width.min(height) as f32;
+    let pad = GROOVE_WIDTH_PX.1;
+    let inner_width = (width as f32 - pad * 2.0).max(1.0);
+
+    // A core body is sized to fit the row it is in, not to a fraction of the frame: this surface
+    // is a corner box a couple of dozen cells across, and a 64-core host has to fit the same width
+    // a 4-core one does. The cap the other way keeps a 2-core machine from drawing two moons.
+    let cores = corner.cores.len().max(1) as f32;
+    let core_radius_max = (CORE_RADIUS_FRACTION * scale)
+        .min(inner_width / (cores * 2.0 * CORE_GAP))
+        .max(1.2);
+
+    // The core row sits at the top, and the grooves fill the rest evenly. The cores identify the
+    // row below them by construction: the CPU groove is the one the cores belong to, which is what
+    // lets the four grooves be read in a fixed order without this generator needing a font. The
+    // labelled numbers go out over the session API, where they can be read as text — herdr's text
+    // surface is the terminal itself, and painting a private bitmap font into a wash that sits
+    // *under* real glyphs is exactly the thing this scene does not do.
+    let core_row_height = core_radius_max * 2.0 + pad * 2.0;
+    draw_core_row(
+        &mut buf,
+        width,
+        height,
+        &corner.cores,
+        (pad, pad + core_radius_max),
+        core_radius_max,
+    );
+
+    // Evenly over what is left, so the readout fills its box at any cell size rather than huddling
+    // at the top of one.
+    let rows = corner.grooves.len().max(1) as f32;
+    let band = ((height as f32 - core_row_height - pad) / rows).max(GROOVE_WIDTH_PX.1 * 1.5);
+    for (row, history) in corner.grooves.iter().enumerate() {
+        if history.is_empty() {
+            // No groove at all rather than a flat one: an unworn track and an unmeasured one are
+            // different statements, and only one of them is true here.
+            continue;
+        }
+        let y = core_row_height + band * (row as f32 + 0.5);
+        draw_groove(&mut buf, width, height, history, y, pad, width as f32 - pad);
+    }
+
+    pack_rgba8(&buf, false)
+}
+
+/// One quantity's history as a worn groove: a straight horizontal track whose thickness and
+/// brightness at each point is the value measured at that point, oldest at the left.
+///
+/// Deliberately *not* a sparkline — no y axis, no line rising and falling. A sparkline would be
+/// the widget-strip default this scene is refusing, and it would also introduce a second way of
+/// encoding a magnitude into a frame that already has one. Wear is the encoding this scene already
+/// uses for "how much has passed here".
+fn draw_groove(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    history: &[f32],
+    centre_y: f32,
+    x0: f32,
+    x1: f32,
+) {
+    if history.is_empty() || x1 <= x0 {
+        return;
+    }
+    let span = x1 - x0;
+    let px0 = x0.floor().max(0.0) as i32;
+    let px1 = x1.ceil().min(width as f32) as i32;
+
+    for px in px0..px1 {
+        // Time runs left to right, with the newest sample at the right-hand end. A partly-filled
+        // history draws only as far as it actually reaches rather than stretching to fill the
+        // groove: a corner that has been watching for ten seconds must not look like one that has
+        // been watching for two minutes.
+        let t = (px as f32 + 0.5 - x0) / span;
+        let position = t * HISTORY_GROOVE_SAMPLES as f32;
+        let filled_from = HISTORY_GROOVE_SAMPLES.saturating_sub(history.len()) as f32;
+        if position < filled_from {
+            continue;
+        }
+        let idx = ((position - filled_from) as usize).min(history.len() - 1);
+        let wear = clamp01(history[idx]);
+
+        let half = mix(GROOVE_WIDTH_PX.0, GROOVE_WIDTH_PX.1, wear) * 0.5;
+        let alpha = mix(GROOVE_ALPHA.0, GROOVE_ALPHA.1, wear);
+        let py0 = (centre_y - half).floor().max(0.0) as i32;
+        let py1 = (centre_y + half).ceil().min(height as f32) as i32;
+        for py in py0..py1 {
+            let dy = (py as f32 + 0.5 - centre_y).abs();
+            if dy > half {
+                continue;
+            }
+            let idx = py as usize * width as usize + px as usize;
+            // Softer at the groove's edges, so a 1px track and a 4px one are the same object at
+            // two depths rather than two different bars.
+            blend(
+                &mut buf[idx],
+                TRACK_RGB01,
+                alpha * clamp01(1.0 - (dy / half.max(0.5)) * 0.55),
+            );
+        }
+    }
+}
+
+/// How many samples a full groove is drawn as. Mirrors `crate::machine_register::HISTORY_SAMPLES`
+/// — kept as this module's own constant rather than imported, so the pure generator stays
+/// independent of the register's storage decisions and a caller handing it a shorter history gets
+/// a partly-drawn groove rather than a stretched one.
+pub(crate) const HISTORY_GROOVE_SAMPLES: usize = 60;
+
+/// The per-core row: one shaded sphere per logical CPU, sized by the cube root of its own load.
+///
+/// A core reporting nothing is drawn *absent* — no body, and no gap closed up behind it either, so
+/// core 5 does not silently become core 4. Twelve small bodies are exactly where an average would
+/// be invisible, which is why the row exists at all rather than the aggregate alone.
+fn draw_core_row(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    cores: &[Option<f32>],
+    origin: (f32, f32),
+    radius_max: f32,
+) {
+    if cores.is_empty() {
+        return;
+    }
+    let step = radius_max * 2.0 * CORE_GAP;
+    for (idx, core) in cores.iter().enumerate() {
+        let cx = origin.0 + radius_max + idx as f32 * step;
+        if cx - radius_max > width as f32 {
+            break;
+        }
+        let Some(load) = core else {
+            // Absent, and its slot is still spent — the row's positions are the OS's core order.
+            continue;
+        };
+        // Volume ~ mass, the same cube root every planet in this scene obeys: a busy core is a
+        // heavier body. Floored so an idle core is still a core.
+        let radius = radius_max * mix(CORE_RADIUS_FLOOR, 1.0, clamp01(*load).cbrt());
+        draw_body(
+            buf,
+            width,
+            height,
+            (cx, origin.1),
+            radius,
+            Surface {
+                base: CORE_RGB01,
+                seed: body_seed(idx).wrapping_add(31),
+                self_luminous: false,
+                bands: None,
+                mottle_scale: 1.0,
+            },
+            // Lit from the upper left, in the corner's own frame. The scene's real sun is off this
+            // surface entirely, so the alternative is an unlit disk — and an unshaded circle is a
+            // picture of an instrument rather than a body, which is the gauge-cluster default this
+            // corner is refusing.
+            normalize3((-0.55, -0.45, 0.70)),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2651,7 +3179,8 @@ mod tests {
         let effects = vec![0u8; (width * height * 4) as usize]; // fully transparent: no overlay
         let cols = 4;
         let rows = 2;
-        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, cols, rows);
+        let samples =
+            sample_cell_backgrounds(&ambient, &effects, None, width, height, 2, 2, cols, rows);
         assert_eq!(samples.len(), (cols * rows) as usize);
         for sample in samples {
             assert_eq!(sample, (40, 60, 80));
@@ -2666,7 +3195,7 @@ mod tests {
         // One fully-opaque bright pixel in the top-left cell, transparent everywhere else.
         let mut effects = vec![0u8; (width * height * 4) as usize];
         effects[0..4].copy_from_slice(&[255, 255, 255, 255]);
-        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, 2, 2);
+        let samples = sample_cell_backgrounds(&ambient, &effects, None, width, height, 2, 2, 2, 2);
         // The top-left cell's 4 pixels average 3 dark ambient pixels and 1 bright effect pixel.
         assert_eq!(samples[0], (71, 71, 71));
         // Every other cell is untouched ambient.
@@ -3054,6 +3583,703 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Travel accelerates
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_falling_thing_speeds_up_instead_of_coasting() {
+        // Both ends exact, so nothing starts or lands anywhere new.
+        assert_eq!(ease_in(0.0), 0.0);
+        assert_eq!(ease_in(1.0), 1.0);
+        // Behind linear the whole way through — it is accelerating *into* the target, so it is
+        // still short of halfway when half the time has gone.
+        assert!(ease_in(0.5) < 0.5 - 0.2, "{}", ease_in(0.5));
+        for i in 1..10 {
+            let t = i as f32 / 10.0;
+            assert!(ease_in(t) < t, "ease_in({t}) is not behind linear");
+        }
+        // Monotonic, and its *speed* rises: each successive tenth of the travel covers more ground
+        // than the one before it, which is what constant acceleration means.
+        let step = |t: f32| ease_in(t + 0.1) - ease_in(t);
+        let mut previous = 0.0;
+        for i in 0..9 {
+            let covered = step(i as f32 / 10.0);
+            assert!(
+                covered > previous,
+                "the {i}th tenth was not faster than the one before"
+            );
+            previous = covered;
+        }
+        // Clamped, so a caller's progress running past its own bounds cannot overshoot the target.
+        assert_eq!(ease_in(1.4), 1.0);
+        assert_eq!(ease_in(-0.3), 0.0);
+    }
+
+    #[test]
+    fn an_asteroid_covers_less_ground_early_and_still_lands_on_its_target() {
+        // A second mate rather than a worker: the approach distance scales off the struck body's
+        // own radius, and on a worker moon it is only a few times the rock's own size — too close
+        // together for "where a linear one would be" and "where an eased one is" to be separate
+        // places on screen at all. The eased travel is the same either way; this fixture is what
+        // lets the difference be *measured* rather than only computed.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(FILES_CEIL)),
+        ];
+        let layout = build_layout(&nodes, 1600, 900);
+        let moon = 1;
+        let phase = 0.4;
+        let target = layout.position(moon, phase);
+        let approach = layout.bodies[moon].body_radius_px * 6.0;
+        let angle = 0.7f32;
+        let start = (
+            target.0 + approach * angle.cos(),
+            target.1 + approach * angle.sin(),
+        );
+
+        let at = |progress: f32| {
+            let travel = ease_in(progress);
+            (
+                mix(start.0, target.0, travel),
+                mix(start.1, target.1, travel),
+            )
+        };
+        let distance = |p: (f32, f32)| ((p.0 - target.0).powi(2) + (p.1 - target.1).powi(2)).sqrt();
+
+        // Still most of the way out at the halfway point, where a linear approach would be exactly
+        // half way in.
+        assert!(
+            distance(at(0.5)) > approach * 0.7,
+            "halfway through the flight it is already {:.0}px from a {approach:.0}px approach",
+            distance(at(0.5))
+        );
+        // And it still starts where it started and lands where it lands — the acceleration changes
+        // the pacing, never the geometry.
+        assert!((distance(at(0.0)) - approach).abs() < 0.01);
+        assert!(distance(at(1.0)) < 0.01);
+
+        // Measured on the rendered buffer rather than only on the formula: the rock really is
+        // further out at the halfway point than a linear one would be.
+        let rendered = |progress: f32| {
+            let effects = SceneEffects {
+                asteroids: vec![AsteroidInFlight {
+                    target: moon,
+                    severity: Severity::Critical,
+                    progress,
+                    approach_angle: angle,
+                }],
+                ..Default::default()
+            };
+            effects_frame(&layout, &effects, phase)
+        };
+        let half = rendered(0.5);
+        // Where a *linear* asteroid would be at half-way: the midpoint of the approach.
+        let midpoint = (mix(start.0, target.0, 0.5), mix(start.1, target.1, 0.5));
+        assert_eq!(
+            peak_alpha(&half, layout.width, midpoint, 2.0),
+            0.0,
+            "the rock is sitting where a linear one would be"
+        );
+        assert!(
+            peak_alpha(&half, layout.width, at(0.5), 4.0) > 0.5,
+            "the rock is not where the eased travel puts it"
+        );
+    }
+
+    #[test]
+    fn an_arriving_comet_accelerates_into_the_body_it_lands_on() {
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(900)),
+        ];
+        let layout = build_layout(&nodes, 800, 600);
+        let phase = 0.3;
+        let comet = Comet {
+            start: (0.05, 0.05),
+            end: (0.5, 0.5),
+            target: Some(1),
+            magnitude: 1.0,
+            progress: 0.5,
+        };
+        let target = layout.position(1, phase);
+        let start_px = (comet.start.0 * 800.0, comet.start.1 * 600.0);
+        let travelled =
+            |p: (f32, f32)| ((p.0 - start_px.0).powi(2) + (p.1 - start_px.1).powi(2)).sqrt();
+
+        let rgba = effects_frame(
+            &layout,
+            &SceneEffects {
+                comets: vec![comet],
+                ..Default::default()
+            },
+            phase,
+        );
+        // The comet's core is the brightest thing it draws, so the furthest-along lit pixel along
+        // its own line is where its head is. Read off the buffer rather than recomputed.
+        let mut head = start_px;
+        for step in 0..=200 {
+            let t = step as f32 / 200.0;
+            let p = (mix(start_px.0, target.0, t), mix(start_px.1, target.1, t));
+            if peak_alpha(&rgba, layout.width, p, 1.5) > 0.5 {
+                head = p;
+            }
+        }
+        let whole = travelled(target);
+        assert!(
+            travelled(head) < whole * 0.45,
+            "halfway through its flight the comet has covered {:.0}px of {whole:.0}px",
+            travelled(head)
+        );
+        assert!(travelled(head) > 0.0, "the comet has not moved at all");
+    }
+
+    // ---------------------------------------------------------------------------
+    // What sits over the scene, and where
+    // ---------------------------------------------------------------------------
+
+    /// A corner-sized surface filled with one opaque colour, for the sampler to composite.
+    fn opaque_corner(width: u32, height: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = rgb.0;
+            px[1] = rgb.1;
+            px[2] = rgb.2;
+            px[3] = 255;
+        }
+        rgba
+    }
+
+    #[test]
+    fn a_surface_over_the_scene_is_sampled_where_it_is_and_nowhere_else() {
+        // The whole of it: a third surface placed over the same cells has to reach the legibility
+        // decision for the cells it covers — text sitting on a lit groove read against the void
+        // behind it commits the wrong foreground, and it does so exactly where a readout somebody
+        // is looking at happens to be — while every cell outside its box samples precisely what it
+        // sampled before. A full-width band across those rows, which is the obvious
+        // implementation, fails the second half.
+        let (cols, rows) = (8u32, 4u32);
+        let (cell_w, cell_h) = (4u32, 4u32);
+        let (width, height) = (cols * cell_w, rows * cell_h);
+        let layout = build_layout(&[], width, height);
+        let ambient = frame(&layout, 0.0);
+        let effects = effects_frame(&layout, &SceneEffects::default(), 0.0);
+
+        let without = sample_cell_backgrounds(
+            &ambient, &effects, None, width, height, cell_w, cell_h, cols, rows,
+        );
+
+        // Two cells wide, one tall, at the top right — the corner's own shape in miniature.
+        let (corner_cols, corner_rows) = (2u32, 1u32);
+        let corner_rgba = opaque_corner(corner_cols * cell_w, corner_rows * cell_h, (255, 0, 0));
+        let with = sample_cell_backgrounds(
+            &ambient,
+            &effects,
+            Some(CornerLayer {
+                rgba: &corner_rgba,
+                width: corner_cols * cell_w,
+                height: corner_rows * cell_h,
+                col: cols - corner_cols,
+                row: 0,
+            }),
+            width,
+            height,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+        );
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let idx = (row * cols + col) as usize;
+                let covered = row < corner_rows && col >= cols - corner_cols;
+                if covered {
+                    assert_eq!(
+                        with[idx],
+                        (255, 0, 0),
+                        "cell ({col}, {row}) is under the surface and did not sample it"
+                    );
+                } else {
+                    assert_eq!(
+                        with[idx], without[idx],
+                        "cell ({col}, {row}) is outside the surface's box and moved anyway"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_transparent_part_of_that_surface_shows_the_scene_through_it() {
+        // The corner is mostly transparent — it is a few grooves and a row of small bodies on
+        // nothing — so a cell it nominally covers is usually still reading the sky. Compositing it
+        // as an opaque box would darken text decisions across its whole rectangle for no reason.
+        let (cols, rows) = (4u32, 2u32);
+        let (cell_w, cell_h) = (4u32, 4u32);
+        let (width, height) = (cols * cell_w, rows * cell_h);
+        let layout = build_layout(&[node(None, BodyKind::Sun)], width, height);
+        let ambient = frame(&layout, 0.0);
+        let effects = effects_frame(&layout, &SceneEffects::default(), 0.0);
+
+        let without = sample_cell_backgrounds(
+            &ambient, &effects, None, width, height, cell_w, cell_h, cols, rows,
+        );
+        // Fully transparent: alpha zero everywhere.
+        let clear = vec![0u8; (width * height * 4) as usize];
+        let with = sample_cell_backgrounds(
+            &ambient,
+            &effects,
+            Some(CornerLayer {
+                rgba: &clear,
+                width,
+                height,
+                col: 0,
+                row: 0,
+            }),
+            width,
+            height,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+        );
+        assert_eq!(
+            with, without,
+            "a fully transparent overlay changed what is behind it"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The machine corner
+    // ---------------------------------------------------------------------------
+
+    fn corner_of(grooves: &[&[f32]], cores: &[Option<f32>]) -> MachineCorner {
+        MachineCorner {
+            grooves: grooves.iter().map(|g| g.to_vec()).collect(),
+            cores: cores.to_vec(),
+        }
+    }
+
+    /// How many pixels of the corner carry anything at all.
+    fn drawn_pixels(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
+    }
+
+    #[test]
+    fn an_unmeasured_machine_draws_nothing_at_all() {
+        // F21, the whole of it: no fabricated machine number, ever, and no decorative history.
+        // Not an idle trace, not a flat groove at zero, not a row of dark cores — nothing. A
+        // plausible number invented from nothing is worse than an empty corner.
+        let empty = MachineCorner::default();
+        assert!(empty.is_empty());
+        assert_eq!(drawn_pixels(&machine_corner_frame(&empty, 260, 168)), 0);
+
+        // A register that has cores but has measured none of them is the same case, and it is the
+        // one a "draw what you have" implementation gets wrong: the cores exist, so a naive draw
+        // puts twelve bodies on screen claiming twelve idle CPUs.
+        let all_absent = corner_of(&[&[], &[], &[], &[]], &[None; 12]);
+        assert!(all_absent.is_empty());
+        assert_eq!(
+            drawn_pixels(&machine_corner_frame(&all_absent, 260, 168)),
+            0
+        );
+    }
+
+    #[test]
+    fn a_quantity_with_no_history_draws_no_groove_rather_than_a_flat_one() {
+        // An unworn track and an unmeasured one are different statements about a machine, and only
+        // one of them is true. Drawing a groove at zero says "nothing has happened here", which is
+        // a claim; drawing nothing says "this was not measured", which is the truth.
+        let measured = corner_of(&[&[0.5; 60], &[0.5; 60], &[0.5; 60], &[0.5; 60]], &[]);
+        let one_missing = corner_of(&[&[0.5; 60], &[], &[0.5; 60], &[0.5; 60]], &[]);
+        let all_missing = corner_of(&[&[], &[], &[], &[]], &[Some(0.5)]);
+
+        let four = drawn_pixels(&machine_corner_frame(&measured, 260, 168));
+        let three = drawn_pixels(&machine_corner_frame(&one_missing, 260, 168));
+        assert!(three < four, "a missing quantity still drew a groove");
+        // ...and it is a whole groove's worth that went, not a rounding difference.
+        assert!(four - three > 200, "only {} pixels went", four - three);
+
+        // A corner with no history at all but one live core still draws the core: the rules are
+        // per quantity, not per corner.
+        assert!(drawn_pixels(&machine_corner_frame(&all_missing, 260, 168)) > 0);
+    }
+
+    #[test]
+    fn a_busier_quantity_wears_its_groove_harder() {
+        // A46(c): the wear at each point is the value measured at that point. That is the whole
+        // encoding — no y axis, no line rising and falling, because a sparkline would be a second
+        // way of encoding a magnitude into a frame that already has one.
+        let wear = |value: f32| {
+            let corner = corner_of(&[&vec![value; 60]], &[]);
+            let rgba = machine_corner_frame(&corner, 260, 60);
+            // Total ink, which is thickness and brightness together — both are the encoding.
+            rgba.chunks_exact(4).map(|px| u32::from(px[3])).sum::<u32>()
+        };
+        let quiet = wear(0.05);
+        let middling = wear(0.5);
+        let hammered = wear(1.0);
+        assert!(
+            quiet < middling && middling < hammered,
+            "wear is not monotonic in the value: {quiet} / {middling} / {hammered}"
+        );
+        // A busy machine has to be *obviously* different from a quiet one, not measurably so.
+        assert!(
+            hammered > quiet * 3,
+            "a fully loaded groove ({hammered}) barely outdraws an idle one ({quiet})"
+        );
+    }
+
+    #[test]
+    fn a_short_history_draws_short_rather_than_stretched() {
+        // A corner that has been watching for ten seconds must not look like one that has been
+        // watching for two minutes. Stretching a partial history to fill the groove is the
+        // specific lie: it claims a past the register does not have.
+        let young = corner_of(&[&[1.0; 6]], &[]);
+        let old = corner_of(&[&[1.0; HISTORY_GROOVE_SAMPLES]], &[]);
+        let young_ink = drawn_pixels(&machine_corner_frame(&young, 600, 60));
+        let old_ink = drawn_pixels(&machine_corner_frame(&old, 600, 60));
+        assert!(
+            (young_ink as f32) < old_ink as f32 * 0.3,
+            "six samples drew {young_ink} against a full history's {old_ink}"
+        );
+        assert!(young_ink > 0, "six samples drew nothing");
+    }
+
+    #[test]
+    fn a_busier_core_is_a_heavier_body_and_an_absent_one_is_not_drawn() {
+        // H12's hard case: twelve small bodies are exactly where an average would be invisible.
+        // A core is sized on the same cube root every planet obeys, and a core that reported
+        // nothing is drawn *absent* rather than at zero — which is the distinction that makes the
+        // row worth having.
+        let ink = |cores: &[Option<f32>]| {
+            drawn_pixels(&machine_corner_frame(&corner_of(&[], cores), 260, 60))
+        };
+        let idle = ink(&[Some(0.0); 4]);
+        let busy = ink(&[Some(1.0); 4]);
+        assert!(
+            busy > idle,
+            "a busy core is not a heavier body: {busy} vs {idle}"
+        );
+        // An idle core is still a core: a body that draws at nothing is indistinguishable from a
+        // core that reported nothing, and those are different machine states.
+        assert!(idle > 0, "an idle core drew nothing at all");
+
+        // Absent is absent, and its slot is still spent — the row's positions are the OS's core
+        // order, so closing a gap would silently renumber every core after it.
+        let one_absent = ink(&[Some(1.0), None, Some(1.0), Some(1.0)]);
+        assert!(
+            one_absent < busy,
+            "an absent core still drew a body: {one_absent} vs {busy}"
+        );
+        let mixed = machine_corner_frame(&corner_of(&[], &[Some(1.0), None, Some(1.0)]), 260, 60);
+        let shifted = machine_corner_frame(&corner_of(&[], &[Some(1.0), Some(1.0)]), 260, 60);
+        assert_ne!(
+            mixed, shifted,
+            "an absent core's slot was closed up, renumbering every core after it"
+        );
+    }
+
+    #[test]
+    fn the_corner_fits_however_many_cores_the_host_has() {
+        // A corner box is a couple of dozen cells across, and a 64-core host has to fit the same
+        // width a 4-core one does. Nothing may be drawn outside the surface it was given.
+        for count in [1usize, 4, 12, 32, 64, 256] {
+            let cores: Vec<Option<f32>> =
+                (0..count).map(|i| Some(i as f32 / count as f32)).collect();
+            let corner = corner_of(&[&[0.5; 60], &[0.5; 60], &[0.5; 60], &[0.5; 60]], &cores);
+            let rgba = machine_corner_frame(&corner, 260, 168);
+            assert_eq!(
+                rgba.len(),
+                260 * 168 * 4,
+                "{count} cores changed the surface size"
+            );
+            assert!(drawn_pixels(&rgba) > 0, "{count} cores drew nothing");
+        }
+    }
+
+    #[test]
+    fn the_corner_is_a_transparent_overlay_not_a_second_backdrop() {
+        // It is placed over the scene, so everywhere it does not draw has to show the sky through
+        // it. An opaque corner box would punch a rectangle out of the picture.
+        let corner = corner_of(&[&[1.0; 60]], &[Some(1.0)]);
+        let rgba = machine_corner_frame(&corner, 260, 168);
+        let transparent = rgba.chunks_exact(4).filter(|px| px[3] == 0).count();
+        assert!(
+            transparent > 260 * 168 / 2,
+            "the corner is opaque over {} of its own box",
+            260 * 168 - transparent
+        );
+    }
+
+    #[test]
+    fn the_corner_introduces_no_material_the_sky_does_not_already_have() {
+        // A46(c): a groove is the orbit track's own colour and a core is a body drawn by the same
+        // shader every planet uses. Held structurally rather than by eye — the corner cannot drift
+        // into its own palette without this failing.
+        assert_eq!(TRACK_RGB01, (43.0 / 255.0, 109.0 / 255.0, 132.0 / 255.0));
+
+        // ...and what keeps a core from reading as a worker moon that wandered into the corner is
+        // its colour rather than its size: the substrate sits outside the lifecycle hue channel
+        // every fleet body resolves through. Held against the real channel, at both ends of it,
+        // rather than against a remembered pair of numbers.
+        let cool = |rgb: (f32, f32, f32)| rgb.2 > rgb.0;
+        assert!(cool(CORE_RGB01), "a core has drifted warm");
+        assert!(cool(TRACK_RGB01), "the track has drifted warm");
+        for hue in [IDLE_HUE, FAILED_HUE, 41.0] {
+            for severity in [Severity::Clear, Severity::Critical] {
+                assert!(
+                    !cool(severity_rgb01(hue, severity)),
+                    "a fleet body at hue {hue} reads as cool as the substrate does"
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // The ladder seats eight, and the overflow is a reading
+    // ---------------------------------------------------------------------------
+
+    /// A fleet whose mates carry the given file counts, each with one worker, so the "a dropped
+    /// mate takes its workers with it" rule has something to drop.
+    fn fleet_of(files: &[Option<u32>]) -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for size in files {
+            let size = size.map_or(BodySize::Unmeasured, BodySize::Files);
+            nodes.push(sized(Some(0), BodyKind::Planet, size));
+            let mate = nodes.len() - 1;
+            nodes.push(node(Some(mate), BodyKind::Moon));
+        }
+        nodes
+    }
+
+    #[test]
+    fn the_ring_seats_the_heaviest_eight_and_counts_the_rest() {
+        // The real case rather than a corner: seventeen mates, five of them unmeasured — the
+        // roster A42's own CHECK is driven by. The nine smallest have to be the nine dropped.
+        let mut files: Vec<Option<u32>> = (0..12).map(|i| Some((i + 1) * 200)).collect();
+        files.extend(std::iter::repeat_n(None, 5));
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+
+        let (seated, beyond) = layout.ladder_occupancy();
+        assert_eq!(
+            (seated, beyond),
+            (ORBIT_LADDER_SLOTS, 17 - ORBIT_LADDER_SLOTS)
+        );
+
+        // And they are the heaviest eight — 2400 down to 1000 — by tracked files, not by roster
+        // order and not by arrival.
+        let seated_files: Vec<Option<u32>> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, n)| n.kind == BodyKind::Planet && layout.bodies[*idx].seated)
+            .map(|(_, n)| match n.size {
+                BodySize::Files(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seated_files,
+            vec![
+                Some(1_000),
+                Some(1_200),
+                Some(1_400),
+                Some(1_600),
+                Some(1_800),
+                Some(2_000),
+                Some(2_200),
+                Some(2_400)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_mate_ranks_at_the_floor_rather_than_below_zero() {
+        // A42(b), and the reason the key is `register_fraction` rather than the raw file count:
+        // an unmeasured project is not a zero-file project. Ranked on the raw field it would sort
+        // below every measured mate and could never win a slot at all — and five of the mates on
+        // this box are unmeasured, so this is the case that occurs rather than a corner.
+        //
+        // Nine mates: eight measured *below* the floor's equivalent, and one unmeasured. The
+        // unmeasured one has to beat the small ones, because that is where it is drawn.
+        let files: Vec<Option<u32>> = std::iter::once(None)
+            .chain((0..ORBIT_LADDER_SLOTS).map(|_| Some(0)))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+        assert!(
+            layout.bodies[1].seated,
+            "the unmeasured mate lost its slot to a mate drawn exactly its own size"
+        );
+
+        // ...and it ties with an empty project rather than beating or losing to it, so the tie
+        // has to be broken by roster order — otherwise two identical snapshots seat different
+        // bodies (A42(c)).
+        let repeated = build_layout(&nodes, 1_000, 1_000);
+        let seats: Vec<bool> = layout.bodies.iter().map(|b| b.seated).collect();
+        let again: Vec<bool> = repeated.bodies.iter().map(|b| b.seated).collect();
+        assert_eq!(seats, again, "the seating is not deterministic");
+    }
+
+    #[test]
+    fn a_dropped_mate_takes_its_own_workers_with_it() {
+        // A worker orbits its mate, and a mate that is not in the picture has nothing for its
+        // workers to orbit. Leaving them behind would draw moons circling empty space.
+        let files: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 3)
+            .map(|i| Some((i as u32 + 1) * 100))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 1_000, 1_000);
+
+        for (idx, n) in nodes.iter().enumerate() {
+            if n.kind != BodyKind::Moon {
+                continue;
+            }
+            let parent = n.parent.expect("a worker has a mate");
+            assert_eq!(
+                layout.bodies[idx].seated, layout.bodies[parent].seated,
+                "worker {idx} and its mate {parent} disagree about being in the picture"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fleet_that_fits_loses_nothing_and_discloses_nothing() {
+        for count in 0..=ORBIT_LADDER_SLOTS {
+            let files: Vec<Option<u32>> = (0..count).map(|i| Some(i as u32 * 37 + 1)).collect();
+            let layout = build_layout(&fleet_of(&files), 1_000, 1_000);
+            assert_eq!(layout.ladder_occupancy(), (count, 0));
+            assert!(
+                layout.bodies.iter().all(|b| b.seated),
+                "{count} mates fit the ring and something was still dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overflow_is_marked_in_the_frame_and_absent_when_there_is_none() {
+        // A41(b) and (c): counted and dropped, never a silent vanish — and absent at zero,
+        // because a disclosure of nothing is noise rather than population.
+        let fits = build_layout(&fleet_of(&[Some(1), Some(2)]), 900, 900);
+        let overflowing: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 6)
+            .map(|i| Some(i as u32 + 1))
+            .collect();
+        let overflowing = build_layout(&fleet_of(&overflowing), 900, 900);
+
+        // The mark lives outside every orbit, so the two frames can be differenced in a band no
+        // body ever reaches — and the starfield out there is identical between them, being a pure
+        // function of the frame size. Whatever differs is the disclosure and nothing else.
+        let centre = (450.0f32, 450.0f32);
+        let inner = OVERFLOW_ORBIT_FRACTION * 900.0 - 8.0;
+        let quiet = frame(&fits, 0.0);
+        let disclosed = frame(&overflowing, 0.0);
+        let marked = quiet
+            .chunks_exact(4)
+            .zip(disclosed.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let d = ((x - centre.0).powi(2) + (y - centre.1).powi(2)).sqrt();
+                d >= inner && (0..3).any(|c| a[c].abs_diff(b[c]) > 1)
+            })
+            .count();
+        assert!(
+            marked > 0,
+            "a fleet with {} mates beyond the ring marked nothing outside it",
+            overflowing.ladder_occupancy().1
+        );
+        // ...and the mark is small: it is a disclosure, not a second fleet. Well under the area
+        // one seated mate's own disk covers.
+        assert!(
+            marked < 2_000,
+            "the overflow mark is drawing {marked} pixels — that is a body, not a mark"
+        );
+        // A fleet that fits marks nothing at all out there, which is the "absent at zero" half.
+        let space = frame(&build_layout(&[], 900, 900), 0.0);
+        let when_it_fits = quiet
+            .chunks_exact(4)
+            .zip(space.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let d = ((x - centre.0).powi(2) + (y - centre.1).powi(2)).sqrt();
+                d >= inner && (0..3).any(|c| a[c].abs_diff(b[c]) > 1)
+            })
+            .count();
+        assert_eq!(
+            when_it_fits, 0,
+            "a fleet the ring seats whole still drew a disclosure"
+        );
+    }
+
+    #[test]
+    fn an_effect_on_an_unseated_mate_draws_nothing() {
+        // Effects name their body by index, and the indices are preserved across seating so a
+        // pane's identity still resolves. That makes "this body is not in the picture" a thing
+        // every effect path has to check, or a crater lands on empty space.
+        let files: Vec<Option<u32>> = (0..ORBIT_LADDER_SLOTS + 2)
+            .map(|i| Some((i as u32 + 1) * 100))
+            .collect();
+        let nodes = fleet_of(&files);
+        let layout = build_layout(&nodes, 900, 900);
+        let dropped = layout
+            .bodies
+            .iter()
+            .position(|b| !b.seated)
+            .expect("this fleet overflows the ring");
+
+        let effects = SceneEffects {
+            craters: vec![Crater {
+                body: dropped,
+                angle_on_surface: 0.4,
+                severity: Severity::Critical,
+                age: 0.0,
+                is_ripple: false,
+            }],
+            ejecta: vec![Ejecta {
+                body: dropped,
+                angle_on_surface: 0.4,
+                severity: Severity::Critical,
+                age: 0.0,
+            }],
+            asteroids: vec![AsteroidInFlight {
+                target: dropped,
+                severity: Severity::Critical,
+                progress: 0.5,
+                approach_angle: 0.4,
+            }],
+            comets: vec![Comet {
+                start: (0.1, 0.1),
+                end: (0.9, 0.9),
+                target: Some(dropped),
+                magnitude: 1.0,
+                progress: 0.5,
+            }],
+        };
+        let drawn = effects_frame(&layout, &effects, 0.0);
+        let clean = effects_frame(&layout, &SceneEffects::default(), 0.0);
+        // The comet still crosses — it is a scene-wide event, and degrading to its own crossing
+        // path is the existing behaviour for a target that cannot be resolved. Everything that
+        // draws *on* the body draws nothing.
+        let on_body = drawn
+            .chunks_exact(4)
+            .zip(clean.chunks_exact(4))
+            .enumerate()
+            .filter(|(i, (a, b))| {
+                let (x, y) = ((i % 900) as f32, (i / 900) as f32);
+                let pos = layout.position(dropped, 0.0);
+                let near = ((x - pos.0).powi(2) + (y - pos.1).powi(2)).sqrt() < 60.0;
+                near && a != b
+            })
+            .count();
+        assert_eq!(
+            on_body, 0,
+            "an effect drew on a mate the ring had no slot for"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Orbital period reads mass
     // ---------------------------------------------------------------------------
 
@@ -3252,7 +4478,8 @@ mod tests {
         // A54's rule: a mate is a gas giant *unless* its rank is 2 mod 3. That is "even
         // distribution" read as even spacing rather than as 50/50 — the captain asked for more gas
         // planets in the same sentence, and a 50/50 split adds none.
-        let types = types_of(&ranked_fleet(9));
+        // A full ladder, so this is about the modulus alone rather than about the ladder's cap.
+        let types = types_of(&ranked_fleet(ORBIT_LADDER_SLOTS));
         let mates = &types[1..];
         assert_eq!(
             mates,
@@ -3265,18 +4492,21 @@ mod tests {
                 BodyType::Ringed,
                 BodyType::Gas,
                 BodyType::Gas,
-                BodyType::Ringed,
             ],
             "the ringed mates are not every third one, heaviest first"
         );
 
         // The proportion is the point, and it has to hold for a fleet that is not a multiple of
-        // three as well as one that is.
+        // three as well as one that is — and, past the ladder, for the mates that got a seat.
         for count in 1..=20 {
             let types = types_of(&ranked_fleet(count));
             let ringed = types.iter().filter(|t| **t == BodyType::Ringed).count();
             let gas = types.iter().filter(|t| **t == BodyType::Gas).count();
-            assert_eq!(ringed + gas, count, "every second mate needs a type");
+            assert_eq!(
+                ringed + gas,
+                count.min(ORBIT_LADDER_SLOTS),
+                "every *seated* second mate needs a type, and nothing else may have one"
+            );
             assert!(
                 gas >= ringed,
                 "{count} mates split {gas} gas / {ringed} ringed — that is not two in three"

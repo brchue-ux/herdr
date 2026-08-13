@@ -64,19 +64,86 @@ fn background_status(args: &[String]) -> std::io::Result<i32> {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
+    let machine: crate::api::schema::MachineRegisterInfo = response
+        .pointer("/result/snapshot/machine_register")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string(&info).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "background_scene": info,
+                "machine_register": machine,
+            }))
+            .unwrap_or_default()
+        );
         return Ok(0);
     }
 
     print_status(&info);
+    print_machine_register(&machine);
     Ok(0)
 }
 
 /// The human readout. Every condition is printed whether or not it is the one
 /// that failed, so the answer to "what changed?" is visible in one screen
 /// rather than one condition at a time across several runs.
+/// The machine register's own readout, printed under the scene's.
+///
+/// The drawn corner is deliberately wordless — herdr's text surface is the terminal itself, and
+/// painting a private bitmap font into a wash that sits *under* real glyphs is not something this
+/// scene does — so this is where the numbers are read as numbers, and where the register says why
+/// it is empty when it is.
+fn print_machine_register(info: &crate::api::schema::MachineRegisterInfo) {
+    println!();
+    if !info.reading {
+        println!(
+            "machine register: not reading{}",
+            info.absent_because
+                .as_deref()
+                .map(|why| format!(" — {why}"))
+                .unwrap_or_default()
+        );
+        return;
+    }
+
+    println!(
+        "machine register: reading every {}s from {}",
+        info.sample_interval_ms / 1_000,
+        if info.sources.is_empty() {
+            "an unnamed source".to_string()
+        } else {
+            info.sources.join(", ")
+        }
+    );
+    for quantity in &info.quantities {
+        match quantity.value {
+            Some(value) => println!(
+                "  {:<5} {:>5.1}%   ({} samples of history)",
+                quantity.name,
+                value * 100.0,
+                quantity.history_samples
+            ),
+            None => println!("  {:<5}     —   (not measured)", quantity.name),
+        }
+    }
+    if !info.cores.is_empty() {
+        let drawn: Vec<String> = info
+            .cores
+            .iter()
+            .map(|core| match core {
+                Some(load) => format!("{:.0}", load * 100.0),
+                // A core that reported nothing is absent, never zero — the two are different
+                // statements about a machine and only one of them is true.
+                None => "—".to_string(),
+            })
+            .collect();
+        println!("  cores {}", drawn.join(" "));
+    }
+}
+
 fn print_status(info: &BackgroundSceneInfo) {
     let mark = |ok: bool| if ok { "yes" } else { "NO " };
 
@@ -110,6 +177,22 @@ fn print_status(info: &BackgroundSceneInfo) {
         "  {} host answered the Kitty Graphics probe (not a gate; other pixel surfaces need it)",
         mark(info.kitty_graphics_capability_confirmed)
     );
+
+    // A41(c): in the frame whenever it is non-zero, and absent when it is zero, because a
+    // disclosure of nothing is noise rather than population. It names the key it dropped by as
+    // well as the count — "9 dropped" and "the 9 smallest by tracked files at HEAD" are different
+    // statements, and only the second one can be argued with.
+    if info.mates_beyond_ladder > 0 {
+        println!();
+        println!(
+            "  {} of the fleet's {} second mates are seated on the orbit ring; {} beyond it\n\
+             \x20   (the ring seats {}, and the ones it drops are the smallest by tracked files at HEAD)",
+            info.mates_seated,
+            info.mates_seated + info.mates_beyond_ladder,
+            info.mates_beyond_ladder,
+            info.ladder_capacity,
+        );
+    }
 
     if info.active {
         return;
@@ -300,11 +383,49 @@ mod tests {
             host_terminal: "other".into(),
             host_draws_ambient_wash: false,
             every_viewer_draws_ambient_wash: true,
+            ladder_capacity: 8,
+            mates_seated: 8,
+            mates_beyond_ladder: 0,
+            sky_clear_fraction: 1.0,
+            sky_clear_floor: 0.60,
         };
         // The condition that is false is the terminal, and it is the one a
         // reader has to be able to pick out of the readout.
         assert!(!info.host_draws_ambient_wash);
         assert_eq!(info.host_terminal, "other");
         assert!(!info.active);
+    }
+
+    /// The overflow disclosure names the count *and* the key it dropped by, and
+    /// is absent entirely when nothing was dropped.
+    #[test]
+    fn the_ladder_overflow_is_disclosed_only_when_there_is_one() {
+        let base = BackgroundSceneInfo {
+            active: true,
+            enabled: true,
+            kitty_graphics_enabled: true,
+            kitty_graphics_capability_confirmed: true,
+            host_terminal: "kitty".into(),
+            host_draws_ambient_wash: true,
+            every_viewer_draws_ambient_wash: true,
+            ladder_capacity: 8,
+            mates_seated: 8,
+            mates_beyond_ladder: 9,
+            sky_clear_fraction: 0.975,
+            sky_clear_floor: 0.60,
+        };
+        // A fleet of 17 with a ring that seats 8: the readout has to be able to
+        // say all three numbers, and which register the nine lost on.
+        assert_eq!(base.mates_seated + base.mates_beyond_ladder, 17);
+        assert_eq!(base.mates_seated, base.ladder_capacity);
+
+        // ...and a fleet that fits discloses nothing, because a disclosure of
+        // nothing is noise rather than population.
+        let fits = BackgroundSceneInfo {
+            mates_seated: 3,
+            mates_beyond_ladder: 0,
+            ..base
+        };
+        assert_eq!(fits.mates_beyond_ladder, 0);
     }
 }

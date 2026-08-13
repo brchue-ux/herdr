@@ -6995,6 +6995,39 @@
             "kitty_graphics_enabled": {
               "description": "`[experimental] kitty_graphics` in config.toml. The scene is a Kitty\nGraphics surface, so this gates it too.",
               "type": "boolean"
+            },
+            "ladder_capacity": {
+              "default": 0,
+              "description": "How many second mates the scene's orbit ring can seat at once.\n\nA composition number rather than a limit found by measurement: the ring's\nspacing is what the whole field is built on, so its capacity is decided\nrather than discovered.\n`#[serde(default)]` on all three, matching this schema's own convention\nfor fields added after the fact: a newer CLI asking an older server for a\npurely informational readout should report zero rather than fail to parse\nthe whole response.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mates_beyond_ladder": {
+              "default": 0,
+              "description": "How many second mates the fleet has that the ring had no slot for.\n\nReported rather than dropped in silence: a scene that quietly shows fewer\nbodies than the fleet has is lying by omission. The losers are the\n*smallest* by tracked files at HEAD — the same register the scene already\ndraws each body's size from — so this number is arguable rather than\nmysterious. Zero whenever the fleet fits.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mates_seated": {
+              "default": 0,
+              "description": "How many second mates are currently seated on it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sky_clear_floor": {
+              "default": 0.0,
+              "description": "The floor [`Self::sky_clear_fraction`] is held to.",
+              "format": "float",
+              "type": "number"
+            },
+            "sky_clear_fraction": {
+              "default": 0.0,
+              "description": "How much of the main area — the frame outside the sidebar — carries no\ninterface element over it, `0.0..=1.0`.\n\nThe composition bound the whole scene exists to satisfy: if the interface\ncrowds the sky out, the scene is not worth drawing. Pane text does not\ncount against it, and that is a real distinction: the scene is an opaque\nwash placed *under* the text with no pane background of its own, so a\nterminal region is ink on the scene rather than a panel over it. What\ncounts is anything that puts a surface between the reader and the sky.",
+              "format": "float",
+              "type": "number"
             }
           },
           "required": [
@@ -8050,6 +8083,98 @@
               "type": "object"
             }
           ]
+        },
+        "MachineQuantityInfo": {
+          "description": "One quantity of [`MachineRegisterInfo`].",
+          "properties": {
+            "history_samples": {
+              "default": 0,
+              "description": "How many samples of recent past are held for it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "`cpu`, `mem`, `swap` or `load`.",
+              "type": "string"
+            },
+            "value": {
+              "description": "The newest reading, `0.0..=1.0`. Absent when nothing has been measured.",
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "MachineRegisterInfo": {
+          "description": "The host machine's own state: CPU aggregate and per core, memory, swap and\nload average, each with its recent past.\n\nA register about the **substrate** rather than about the work — the machine\nthe fleet is running on, not the fleet. Published here rather than only\ndrawn, for two reasons: it is a shared runtime fact rather than one client's\npresentation, and the drawn form is deliberately wordless (see the corner's\nown doc), so this is where the numbers can be read as numbers.\n\n**Nothing here is ever fabricated.** On a platform this build does not read,\nbefore a second sample has landed, or once the newest sample has gone stale,\nevery value is absent and [`Self::absent_because`] says which of those it is.\nA plausible number invented from nothing is worse than an empty readout that\nsays why it is empty.",
+          "properties": {
+            "absent_because": {
+              "description": "Why there is no reading, in the readout's own words. Absent when there\nis one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cores": {
+              "default": [],
+              "description": "Each logical CPU's current busy fraction, in the operating system's own\ncore order. A core that reported nothing is `null` — drawn absent rather\nthan at zero, and never dropped, since dropping it would silently\nre-number every core after it.",
+              "items": {
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "type": "array"
+            },
+            "newest_sample_age_ms": {
+              "description": "How old the newest sample is, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "quantities": {
+              "default": [],
+              "description": "Each quantity's current value and how much history is held for it.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/MachineQuantityInfo"
+              },
+              "type": "array"
+            },
+            "reading": {
+              "description": "There is a current reading. False whenever [`Self::absent_because`] is\nset, and the two are never both meaningful at once.",
+              "type": "boolean"
+            },
+            "sample_interval_ms": {
+              "default": 0,
+              "description": "How often the register samples, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sources": {
+              "default": [],
+              "description": "The files these numbers were read from. A reader who wants to check a\nnumber has to be told where to check it.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "reading"
+          ],
+          "type": "object"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10760,7 +10885,12 @@
                 "host_draws_ambient_wash": false,
                 "host_terminal": "",
                 "kitty_graphics_capability_confirmed": false,
-                "kitty_graphics_enabled": false
+                "kitty_graphics_enabled": false,
+                "ladder_capacity": 0,
+                "mates_beyond_ladder": 0,
+                "mates_seated": 0,
+                "sky_clear_floor": 0.0,
+                "sky_clear_fraction": 0.0
               },
               "description": "Whether the persistent whole-terminal background scene is drawing, and\nwhen it is not, which of its conditions is the one that is unmet."
             },
@@ -10787,6 +10917,17 @@
                 "$ref": "#/schemas/success_response/$defs/PaneLayoutSnapshot"
               },
               "type": "array"
+            },
+            "machine_register": {
+              "$ref": "#/schemas/success_response/$defs/MachineRegisterInfo",
+              "default": {
+                "cores": [],
+                "quantities": [],
+                "reading": false,
+                "sample_interval_ms": 0,
+                "sources": []
+              },
+              "description": "The host machine's own state — CPU, memory, swap and load — with its\nrecent past. See [`MachineRegisterInfo`]."
             },
             "panes": {
               "items": {

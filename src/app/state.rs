@@ -1911,6 +1911,14 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// The least of the main area the scene may be left with — the fraction of the frame outside the
+/// sidebar that has to carry no interface element over it.
+///
+/// A composition bound rather than a measured limit: if the interface crowds the sky out, the
+/// thing the scene exists for is gone and there is no point drawing it. Stated here, once, so the
+/// readout and the test that holds it cannot drift apart.
+pub(crate) const SKY_CLEAR_FLOOR: f32 = 0.60;
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -2347,6 +2355,30 @@ pub struct AppState {
     /// overlay can resolve an asteroid/comet's screen position without rebuilding the layout
     /// every tick. Index-aligned with `background_scene_identity`.
     pub(crate) background_scene_layout: Option<crate::solar_system::SceneLayout>,
+    /// The host machine's own state and its recent past — CPU aggregate and per core, memory,
+    /// swap and load average.
+    ///
+    /// A shared runtime fact about the substrate rather than TUI presentation state, so it lives
+    /// here and goes out over the session API; the background scene's corner is one client of it.
+    /// See `crate::machine_register`.
+    pub(crate) machine_register: crate::machine_register::MachineRegister,
+    /// The register's drawn corner, as its own small graphics surface.
+    ///
+    /// Separate from `background_effects_layer` because the two move on different clocks: that one
+    /// is whole-screen and regenerates per tick while an effect is live, this one is a corner box
+    /// on the register's own two-second cadence. Sharing a surface would make every machine sample
+    /// repaint the whole terminal.
+    pub(crate) machine_corner_layer: Option<GraphicsLayer>,
+    /// What the corner above was drawn for: its cell geometry and the register's own generation.
+    /// Zero whenever nothing is drawn. Redrawn only when this moves, never once per tick.
+    pub(crate) machine_corner_key: u64,
+    /// The same corner's raw RGBA, kept beside the encoded layer.
+    ///
+    /// The per-cell legibility pass has to composite this surface to decide the foreground for the
+    /// cells it covers, and it needs pixels rather than a PNG. Held rather than re-rendered: the
+    /// corner is a couple of hundred kilobytes, and re-rendering it once per legibility sample
+    /// would cost more than storing it by a wide margin.
+    pub(crate) machine_corner_rgba: Option<Vec<u8>>,
     /// Which fleet identity (`crate::anim::CardRow`) each index of
     /// `background_scene_layout` resolves to.
     pub(crate) background_scene_identity: Vec<crate::anim::CardRow>,
@@ -3667,6 +3699,10 @@ impl AppState {
             background_scene: None,
             background_scene_key: 0,
             background_scene_layout: None,
+            machine_register: crate::machine_register::MachineRegister::default(),
+            machine_corner_layer: None,
+            machine_corner_key: 0,
+            machine_corner_rgba: None,
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,

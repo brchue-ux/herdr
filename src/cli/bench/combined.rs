@@ -861,6 +861,9 @@ fn frame(
             layout,
             *phase,
             effects,
+            // No machine corner in the rig: this measures how render cost scales with body count
+            // under churn, and the corner is a fixed box that neither churns nor scales with it.
+            None,
             options.fleet.cell.width_px,
             options.fleet.cell.height_px,
             now,
