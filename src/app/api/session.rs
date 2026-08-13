@@ -148,6 +148,7 @@ impl App {
     /// the producers are standing down.
     fn background_scene_info(&self) -> crate::api::schema::BackgroundSceneInfo {
         let state = &self.state;
+        let (consumed, emitted) = state.ambient_motes.accounting();
         let (seated, beyond) = state
             .background_scene_layout
             .as_ref()
@@ -167,6 +168,8 @@ impl App {
             // point of disclosing it.
             mates_seated: seated as u32,
             mates_beyond_ladder: beyond as u32,
+            ambient_events_consumed: consumed,
+            ambient_motes_emitted: emitted,
             sky_clear_fraction: state.sky_clear_fraction(),
             sky_clear_floor: crate::app::state::SKY_CLEAR_FLOOR,
         }

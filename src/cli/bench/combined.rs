@@ -383,6 +383,9 @@ impl Fleet {
                 // and a track is a fixed annulus per body rather than something that scales with
                 // the fleet in a different way.
                 wear: 0.0,
+                // No ambient motes either: this rig measures render cost against body count.
+                motes: 0,
+                mote_share: 0.0,
             });
         }
         nodes

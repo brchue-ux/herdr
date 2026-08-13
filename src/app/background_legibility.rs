@@ -398,6 +398,8 @@ mod tests {
             size: solar_system::BodySize::Fixed,
             streak: 0.0,
             wear: 0.0,
+            motes: 0,
+            mote_share: 0.0,
         }
     }
 }

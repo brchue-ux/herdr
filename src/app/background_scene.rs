@@ -290,6 +290,143 @@ impl OrbitTracks {
     }
 }
 
+/// The ambient tier: one mote per unit of work a body's own agent actually did.
+///
+/// ## What an "event" is here, stated rather than assumed
+///
+/// The fleet orrery's ambient tier counts **shell commands per body**. herdr does not count those
+/// — libghostty-vt reports OSC 133 semantic prompt state, so the marks exist, but nothing in this
+/// codebase tallies them. What herdr *does* hold natively, per body, with no bridge and no
+/// publisher, is `crate::app::pane_activity::PaneActivity::output_bytes`: lifetime PTY output
+/// bytes. That is the real per-body work register this fork has, so it is the one the tier is fed
+/// from, quantized into discrete events by [`BYTES_PER_EVENT`].
+///
+/// The substitution is recorded rather than smuggled through: if a command counter lands later,
+/// this tier changes what it reads and nothing else — the transform, the accounting and the bound
+/// below are all about *counts*, whatever is being counted.
+///
+/// ## Every mote traces to one event
+///
+/// No mote is emitted by a timer, a loop, or a decorative oscillator. Motes emitted equals events
+/// consumed, exactly, at every cadence — which is why the counters are kept rather than derived,
+/// and why [`Self::emitted`] and [`Self::consumed`] are separate fields that a test can compare.
+#[derive(Debug, Default)]
+pub(crate) struct AmbientMotes {
+    /// Per body: events consumed, motes emitted, and the raw count the transform reads.
+    bodies: HashMap<CardRow, MoteTally>,
+    /// The byte counter each body was last seen at, so only *new* work is consumed.
+    seen_bytes: HashMap<CardRow, u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MoteTally {
+    consumed: u64,
+    emitted: u64,
+}
+
+/// How much PTY output one ambient event is.
+///
+/// 16 KiB — roughly a screenful of an agent's own output, so a mote is "this body did a thing"
+/// rather than "this body printed a character". Large enough that a chatty build does not stud its
+/// whole orbit in a second, small enough that a quiet body still earns one.
+pub(crate) const BYTES_PER_EVENT: u64 = 16 * 1024;
+
+/// The attribution transform's three constants, ported exactly.
+///
+/// `GAMMA` compresses, `FLOOR` keeps a silent body legible, and `C0` keeps a zero count finite.
+/// The worked example on the card: raw counts 400:200:60:10:2:0 — a 200x spread with two bodies
+/// that would otherwise go black — become shares spread 4.1x with every body visible.
+pub(crate) const MOTE_GAMMA: f64 = 0.45;
+pub(crate) const MOTE_FLOOR: f64 = 0.30;
+pub(crate) const MOTE_C0: f64 = 0.5;
+
+/// Each body's share of the ambient tier's light, from the real per-body counts.
+///
+/// **Order-preserving, and that is the property that makes it honest.** It is a monotone function
+/// of the real count and of nothing else, so it can compress the truth but can never reorder it:
+/// the busiest body is always the brightest.
+pub(crate) fn mote_shares(counts: &[u64]) -> Vec<f32> {
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    let n = counts.len() as f64;
+    let weights: Vec<f64> = counts
+        .iter()
+        .map(|c| (*c as f64 + MOTE_C0).powf(MOTE_GAMMA))
+        .collect();
+    let total: f64 = weights.iter().sum();
+    weights
+        .iter()
+        .map(|w| {
+            let share = if total > 0.0 {
+                MOTE_FLOOR / n + (1.0 - MOTE_FLOOR) * (w / total)
+            } else {
+                1.0 / n
+            };
+            share as f32
+        })
+        .collect()
+}
+
+impl AmbientMotes {
+    /// Consume every body's new work and emit one mote per event.
+    ///
+    /// `bodies` is each live body's identity and its lifetime output-byte counter. A body that has
+    /// left is forgotten; a body that joins starts from wherever its counter already is, so
+    /// attaching to a pane that has been running for an hour does not emit an hour of motes in one
+    /// pass.
+    pub(crate) fn consume<'a>(&mut self, bodies: impl Iterator<Item = (&'a CardRow, u64)>) -> bool {
+        let mut live: HashMap<CardRow, MoteTally> = HashMap::new();
+        let mut seen: HashMap<CardRow, u64> = HashMap::new();
+        let mut emitted_any = false;
+
+        for (row, bytes) in bodies {
+            let tally = self.bodies.get(row).copied().unwrap_or_default();
+            let mut tally = tally;
+            match self.seen_bytes.get(row).copied() {
+                // A body already being watched: everything new since last time is work it did.
+                // A counter that went backwards (a pane replaced under the same identity) is
+                // treated as a fresh start rather than as a huge negative.
+                Some(was) if bytes >= was => {
+                    let events = (bytes - was) / BYTES_PER_EVENT;
+                    if events > 0 {
+                        tally.consumed += events;
+                        // One mote per event. Not "some motes when busy" — the whole accounting
+                        // rests on this line being an equality.
+                        tally.emitted += events;
+                        emitted_any = true;
+                        // Only what was actually consumed is marked seen, so the remainder is
+                        // carried rather than discarded.
+                        seen.insert(row.clone(), was + events * BYTES_PER_EVENT);
+                    } else {
+                        seen.insert(row.clone(), was);
+                    }
+                }
+                _ => {
+                    seen.insert(row.clone(), bytes);
+                }
+            }
+            live.insert(row.clone(), tally);
+        }
+
+        self.bodies = live;
+        self.seen_bytes = seen;
+        emitted_any
+    }
+
+    /// How many motes one body carries.
+    pub(crate) fn motes(&self, row: &CardRow) -> u64 {
+        self.bodies.get(row).map(|t| t.emitted).unwrap_or(0)
+    }
+
+    /// Events consumed and motes emitted across the whole fleet. Equal, always.
+    pub(crate) fn accounting(&self) -> (u64, u64) {
+        self.bodies
+            .values()
+            .fold((0, 0), |(c, e), t| (c + t.consumed, e + t.emitted))
+    }
+}
+
 /// Every node of the whole-fleet owner tree, in the exact shape `src/solar_system.rs` wants, plus
 /// the identity each index resolves back to.
 ///
@@ -309,6 +446,15 @@ pub(crate) fn tree_nodes(
 pub(crate) fn tree_nodes_with_tracks(
     app: &crate::app::state::AppState,
     tracks: &OrbitTracks,
+) -> (Vec<solar_system::TreeNode>, Vec<CardRow>) {
+    tree_nodes_with(app, tracks, &app.ambient_motes)
+}
+
+/// [`tree_nodes`], against given track and mote layers.
+pub(crate) fn tree_nodes_with(
+    app: &crate::app::state::AppState,
+    tracks: &OrbitTracks,
+    motes: &AmbientMotes,
 ) -> (Vec<solar_system::TreeNode>, Vec<CardRow>) {
     let agents = crate::ui::sidebar::sidebar_agent_entries(app);
     let entries = crate::ui::sidebar::workspace_list_entries_whole_fleet(app);
@@ -346,9 +492,21 @@ pub(crate) fn tree_nodes_with_tracks(
             // this body has already travelled, which is accumulated across every regeneration of
             // the scene. See [`OrbitTracks`].
             wear: tracks.wear(&facts.row),
+            // One mote per unit of work this body's own agent actually did. The share is filled
+            // in below, once every body's count is known — it is a share *of the fleet*, so it
+            // cannot be resolved one body at a time.
+            motes: motes.motes(&facts.row).min(u64::from(u32::MAX)) as u32,
+            mote_share: 0.0,
         });
         identity.push(facts.row);
         path.push(nodes.len() - 1);
+    }
+
+    // The attribution transform is a share of the whole fleet's traffic, so it is applied once
+    // the roster is complete rather than per body as they are walked.
+    let counts: Vec<u64> = nodes.iter().map(|node| u64::from(node.motes)).collect();
+    for (node, share) in nodes.iter_mut().zip(mote_shares(&counts)) {
+        node.mote_share = share;
     }
 
     (nodes, identity)
@@ -937,6 +1095,96 @@ mod tests {
     fn advance(tracks: &mut OrbitTracks, app: &crate::app::state::AppState, at: Instant) -> bool {
         let rates = rates(app);
         tracks.advance(rates.iter().map(|(row, rate)| (row, *rate)), at)
+    }
+
+    #[test]
+    fn every_mote_traces_to_one_event_and_no_mote_traces_to_a_timer() {
+        // The accounting the whole tier rests on: no ambient element is emitted by a timer, a
+        // loop, or a decorative oscillator. Motes emitted equals events consumed, exactly, at
+        // every cadence — so the two are counted separately and compared rather than one being
+        // derived from the other.
+        let mut motes = AmbientMotes::default();
+        let row = CardRow::Agent(crate::layout::PaneId::alloc());
+
+        // A body arriving mid-life starts from where its counter is: a pane already an hour into a
+        // build must not stud its whole orbit for work nobody was watching.
+        motes.consume([(&row, 500 * BYTES_PER_EVENT)].into_iter());
+        assert_eq!(motes.accounting(), (0, 0));
+        assert_eq!(motes.motes(&row), 0);
+
+        // Then it does three events' worth of work.
+        motes.consume([(&row, 503 * BYTES_PER_EVENT)].into_iter());
+        assert_eq!(motes.accounting(), (3, 3));
+
+        // Ticking with nothing new emits nothing — this is the "no timer" half, and it is the one
+        // a tier like this gets wrong.
+        for _ in 0..50 {
+            assert!(!motes.consume([(&row, 503 * BYTES_PER_EVENT)].into_iter()));
+        }
+        assert_eq!(motes.accounting(), (3, 3));
+
+        // A partial event is carried, not discarded and not rounded up.
+        motes.consume([(&row, 503 * BYTES_PER_EVENT + BYTES_PER_EVENT / 2)].into_iter());
+        assert_eq!(motes.accounting(), (3, 3));
+        motes.consume([(&row, 505 * BYTES_PER_EVENT)].into_iter());
+        assert_eq!(
+            motes.accounting(),
+            (5, 5),
+            "the carried half-event was lost"
+        );
+
+        // A counter that goes backwards — a pane replaced under the same identity — is a fresh
+        // start rather than a huge negative or a wrap.
+        motes.consume([(&row, 3 * BYTES_PER_EVENT)].into_iter());
+        assert_eq!(motes.accounting(), (5, 5));
+        motes.consume([(&row, 4 * BYTES_PER_EVENT)].into_iter());
+        assert_eq!(motes.accounting(), (6, 6));
+    }
+
+    #[test]
+    fn the_attribution_transform_compresses_the_truth_but_never_reorders_it() {
+        // The property that makes it honest: it is a monotone function of the real count and of
+        // nothing else, so the busiest body is always the brightest.
+        //
+        // The card's own worked example — a 200x spread with two bodies that would go black.
+        let counts = [400u64, 200, 60, 10, 2, 0];
+        let shares = mote_shares(&counts);
+
+        // Order preserved, exactly.
+        for i in 1..shares.len() {
+            assert!(
+                shares[i - 1] > shares[i],
+                "share {} is not above share {i}: {shares:?}",
+                i - 1
+            );
+        }
+        // Compressed: a 200x spread in the counts becomes a few-fold spread in the shares.
+        let spread = shares[0] / shares[shares.len() - 1];
+        assert!(
+            (3.0..6.0).contains(&spread),
+            "a 200x count spread became a {spread:.1}x share spread"
+        );
+        // Every body visible — including the two that did nothing at all, which is what the floor
+        // is for.
+        assert!(shares.iter().all(|s| *s > 0.0));
+        assert!(
+            *shares.last().expect("a share") > 0.02,
+            "a silent body is invisible: {shares:?}"
+        );
+        // The shares are a partition of the tier's light, so they sum to one.
+        let total: f32 = shares.iter().sum();
+        assert!((total - 1.0).abs() < 1e-4, "shares sum to {total}");
+
+        // Monotone in general, not only on the worked example.
+        let rising: Vec<u64> = (0..40).map(|i| i * i * 7).collect();
+        let rising_shares = mote_shares(&rising);
+        for i in 1..rising_shares.len() {
+            assert!(rising_shares[i] >= rising_shares[i - 1]);
+        }
+        // Equal counts get equal shares, so nothing is being tie-broken by position.
+        let flat = mote_shares(&[9, 9, 9, 9]);
+        assert!(flat.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-6));
+        assert!(mote_shares(&[]).is_empty());
     }
 
     #[test]

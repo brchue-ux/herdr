@@ -6972,6 +6972,19 @@
               "description": "The scene is being drawn. True exactly when every other condition here\nthat gates it is met.",
               "type": "boolean"
             },
+            "ambient_events_consumed": {
+              "default": 0,
+              "description": "Ambient events consumed, and ambient motes emitted, since this session\nstarted.\n\n**These two are equal, always.** Every mote the scene's ambient tier\ndraws traces to one unit of work a body's own agent actually did; none\nis emitted by a timer, a loop, or a decorative oscillator. Published as\na pair rather than as one number precisely so the equality is\ninspectable on a running session rather than only in a test.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ambient_motes_emitted": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "enabled": {
               "description": "`[experimental] persistent_background` in config.toml.",
               "type": "boolean"
@@ -10880,6 +10893,8 @@
               "$ref": "#/schemas/success_response/$defs/BackgroundSceneInfo",
               "default": {
                 "active": false,
+                "ambient_events_consumed": 0,
+                "ambient_motes_emitted": 0,
                 "enabled": false,
                 "every_viewer_draws_ambient_wash": false,
                 "host_draws_ambient_wash": false,

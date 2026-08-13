@@ -194,6 +194,23 @@ fn print_status(info: &BackgroundSceneInfo) {
         );
     }
 
+    // The ambient tier's own accounting. Printed as the pair rather than as one number, because
+    // the pair *is* the statement: every mote traces to one event, and a readout that showed only
+    // a total could not be checked.
+    if info.ambient_events_consumed > 0 || info.ambient_motes_emitted > 0 {
+        println!();
+        println!(
+            "  ambient tier: {} events consumed, {} motes emitted{}",
+            info.ambient_events_consumed,
+            info.ambient_motes_emitted,
+            if info.ambient_events_consumed == info.ambient_motes_emitted {
+                ""
+            } else {
+                "  <- these must be equal"
+            }
+        );
+    }
+
     if info.active {
         return;
     }
@@ -388,6 +405,8 @@ mod tests {
             mates_beyond_ladder: 0,
             sky_clear_fraction: 1.0,
             sky_clear_floor: 0.60,
+            ambient_events_consumed: 0,
+            ambient_motes_emitted: 0,
         };
         // The condition that is false is the terminal, and it is the one a
         // reader has to be able to pick out of the readout.
@@ -413,6 +432,8 @@ mod tests {
             mates_beyond_ladder: 9,
             sky_clear_fraction: 0.975,
             sky_clear_floor: 0.60,
+            ambient_events_consumed: 41,
+            ambient_motes_emitted: 41,
         };
         // A fleet of 17 with a ring that seats 8: the readout has to be able to
         // say all three numbers, and which register the nine lost on.

@@ -295,6 +295,51 @@ two independent paths write that size — the active tab's through
 remembers a pane's size has to reconcile against the runtime rather than
 against what it last set; `pane_resize_reflow`'s own module docs carry why.
 
+### The background scene's animation loop is baked, and that constrains everything in it
+
+`src/solar_system.rs`'s ambient scene is generated as `FRAME_COUNT` frames on a topology or resize
+change and then played on repeat forever. Two consequences bite anything new added to it, and both
+have shipped as bugs here before being caught:
+
+- **Anything that moves must complete a whole number of cycles per loop.** Orbital periods, ring
+  spin, a body's own rotation, star drift, belt shear — each is an integer, or quantized to one.
+  A rate that is not leaves the thing somewhere else at the end of the loop than at the start, and
+  the seam shows on every repeat. A steady pan is therefore not available at all: the starfield
+  sways instead, because a sinusoid in the loop phase closes exactly.
+- **`value_noise` is a hash lattice and is not periodic**, so feeding it a rotating argument
+  reintroduces the seam even when the rotation itself closes. Sample it on `cos`/`sin` of that
+  argument instead. `a_rings_particles_land_back_where_they_started_after_one_loop` is the test
+  that catches both.
+
+Anything whose value changes continuously must also be **quantized before it reaches
+`background_scene_key`**, or the whole loop rebakes every tick. Orbit-track wear and the machine
+register's readout are both stepped for this reason, not for tidiness.
+
+### Isolating a faint layer in the scene means withholding it, not thresholding it
+
+Several of the scene's layers are faint by design — a trail is a tenth of its body's brightness, a
+shadow transit is a fraction off an already-shaded face, a ring shadow lands inside a lit disc.
+A test asking "is this pixel bright enough" measures the scene rather than the layer, and one
+comparing two differently-shaped fleets measures the fleet.
+
+`solar_system::Parts` is a `#[cfg(test)]` lever that renders the same frame with one layer
+withheld; the difference is then that layer and provably nothing else. Every field is a constant at
+the one non-test call site, so it costs nothing. When adding a layer, add its flag — and make sure
+withholding it withholds everything it causes (suppressing a ring has to suppress the shadow the
+ring casts, or the difference contains neither).
+
+### Look at the frame before believing the tests
+
+Every scene change in this area that shipped visibly wrong shipped with a green suite: mates
+crowded into one arc of the ring because the seating spread counted dropped bodies, a worker's
+trail drawn as a dotted line because the sample count was fixed rather than derived from the arc,
+a debris belt tangled through the worker orbits. None of those is expressible as a threshold, and
+all three were obvious in a render.
+
+The scene generator is pure, so a render needs no lab: build a `SceneLayout`, call `frame`, and
+`encode_png` the result from an `#[ignore]`d test. That is the same buffer the server encodes onto
+the wire.
+
 ### Live checks for anything that draws
 
 A PTY capture reads the bytes a client receives; it cannot see what a terminal
