@@ -1920,6 +1920,10 @@ fn pack_rgba8(buf: &[[f32; 4]], force_opaque: bool) -> Vec<u8> {
 /// target. `Fast` compression is chosen over `Best`: the loop is generated on a resize/topology
 /// change, never per tick, so encode time trades against a cache miss that is already rare rather
 /// than against steady-state cost.
+pub(crate) fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode_png(width, height, rgba)
+}
+
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut encoder = png::Encoder::new(&mut buf, width, height);
@@ -2132,6 +2136,258 @@ pub(crate) fn sample_cell_backgrounds(
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The machine corner
+// ---------------------------------------------------------------------------
+
+/// The host machine's own state, in the shape this renderer draws it — one already-resolved
+/// history per quantity plus one current load per logical CPU.
+///
+/// Plain numbers, because this module reads no clock, no `/proc` and no `AppState`. Everything
+/// about *where these came from* and *whether they are current* is settled by
+/// `crate::machine_register` before it gets here; a corner that had to decide for itself whether a
+/// sample was stale would be a second copy of that rule.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MachineCorner {
+    /// Each quantity's history, oldest sample first, in `crate::machine_register::Quantity::ALL`
+    /// order. An empty history draws no groove at all rather than a flat one — a groove with no
+    /// wear in it is a claim that the machine was idle, which is not the same statement as "not
+    /// measured".
+    pub(crate) grooves: Vec<Vec<f32>>,
+    /// Each logical CPU's current load, in the OS's own core order. A core that reported nothing
+    /// is `None` and is drawn absent rather than at zero.
+    pub(crate) cores: Vec<Option<f32>>,
+}
+
+impl MachineCorner {
+    /// Whether there is anything at all to draw. An empty corner draws nothing — never a seeded
+    /// history, never an idle trace, never a plausible number invented from nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.grooves.iter().all(|g| g.is_empty()) && self.cores.iter().all(Option::is_none)
+    }
+}
+
+/// The orbit track's own colour, `#2b6d84` — a worn groove.
+///
+/// A46(c): the corner introduces **no new material**. A metric's history *is* the orbit track,
+/// laid straight and read left to right in time, with the wear at each point the value measured at
+/// that point. That is not an analogy borrowed to justify a sparkline: a groove in this scene has
+/// always meant "how much has passed here", and a history trace is that sentence with time on the
+/// x axis.
+pub(crate) const TRACK_RGB01: (f32, f32, f32) = (43.0 / 255.0, 109.0 / 255.0, 132.0 / 255.0);
+
+/// How thick a groove is drawn where nothing has passed, and where the most has. The orrery's own
+/// 1–4px.
+const GROOVE_WIDTH_PX: (f32, f32) = (1.0, 4.0);
+
+/// How bright a groove is at no wear and at full. A groove at zero is still a groove — the track
+/// exists whether or not anything has worn it — but it is faint enough to read as unworn.
+const GROOVE_ALPHA: (f32, f32) = (0.22, 0.95);
+
+/// The largest a core body is drawn, as a fraction of **the corner surface's** own
+/// `min(width, height)`.
+///
+/// A46(c): *a core is a body* — shaded by the same [`shade_surface`] every planet is, sized at the
+/// cube root of its own load on the same law. A busy core is a heavier body.
+///
+/// Measured against the corner rather than against the scene, and that distinction is worth
+/// keeping straight: this is its own small surface placed over the scene, so the scene's own
+/// radius fractions are in a different coordinate space entirely and comparing the two would be a
+/// units error wearing the clothes of an invariant. What keeps a core from reading as a stray
+/// worker moon is [`CORE_RGB01`] — cores are the substrate, not the work, so they sit outside the
+/// lifecycle hue channel every fleet body resolves through.
+const CORE_RADIUS_FRACTION: f32 = 0.022;
+
+/// The smallest a core body is drawn, as a share of [`CORE_RADIUS_FRACTION`]. An idle core is
+/// still a core, and a core that draws at nothing is indistinguishable from one that reported
+/// nothing — which is a distinction H12 requires this corner to keep.
+const CORE_RADIUS_FLOOR: f32 = 0.34;
+
+/// Space between core bodies, as a multiple of the largest one's diameter.
+const CORE_GAP: f32 = 1.35;
+
+/// The hue a core body carries. Cores are the substrate rather than the work, so they are
+/// deliberately outside the lifecycle hue channel every fleet body resolves through — the same
+/// exemption the sun and the rings already hold, and for the same reason.
+const CORE_RGB01: (f32, f32, f32) = (0.62, 0.72, 0.80);
+
+/// Render the machine corner: one groove per quantity, and one shaded body per logical CPU.
+///
+/// Returns RGBA8 sized `width` x `height`, transparent everywhere nothing is drawn — this is its
+/// own small surface placed at the corner, not a pass over the whole scene. That is what makes it
+/// affordable: the register moves every two seconds, and re-baking the whole 36-frame ambient loop
+/// at that cadence would cost more CPU than it has.
+///
+/// Draws nothing at all when there is nothing measured. F21: no fabricated machine number, ever,
+/// and no decorative history — not a seeded trace, not an animated idle, not a zero standing in
+/// for an unknown.
+pub(crate) fn machine_corner_frame(corner: &MachineCorner, width: u32, height: u32) -> Vec<u8> {
+    let pixels = width as usize * height as usize;
+    let mut buf = vec![[0.0f32; 4]; pixels];
+    if width == 0 || height == 0 || corner.is_empty() {
+        return pack_rgba8(&buf, false);
+    }
+
+    let scale = width.min(height) as f32;
+    let pad = GROOVE_WIDTH_PX.1;
+    let inner_width = (width as f32 - pad * 2.0).max(1.0);
+
+    // A core body is sized to fit the row it is in, not to a fraction of the frame: this surface
+    // is a corner box a couple of dozen cells across, and a 64-core host has to fit the same width
+    // a 4-core one does. The cap the other way keeps a 2-core machine from drawing two moons.
+    let cores = corner.cores.len().max(1) as f32;
+    let core_radius_max = (CORE_RADIUS_FRACTION * scale)
+        .min(inner_width / (cores * 2.0 * CORE_GAP))
+        .max(1.2);
+
+    // The core row sits at the top, and the grooves fill the rest evenly. The cores identify the
+    // row below them by construction: the CPU groove is the one the cores belong to, which is what
+    // lets the four grooves be read in a fixed order without this generator needing a font. The
+    // labelled numbers go out over the session API, where they can be read as text — herdr's text
+    // surface is the terminal itself, and painting a private bitmap font into a wash that sits
+    // *under* real glyphs is exactly the thing this scene does not do.
+    let core_row_height = core_radius_max * 2.0 + pad * 2.0;
+    draw_core_row(
+        &mut buf,
+        width,
+        height,
+        &corner.cores,
+        (pad, pad + core_radius_max),
+        core_radius_max,
+    );
+
+    // Evenly over what is left, so the readout fills its box at any cell size rather than huddling
+    // at the top of one.
+    let rows = corner.grooves.len().max(1) as f32;
+    let band = ((height as f32 - core_row_height - pad) / rows).max(GROOVE_WIDTH_PX.1 * 1.5);
+    for (row, history) in corner.grooves.iter().enumerate() {
+        if history.is_empty() {
+            // No groove at all rather than a flat one: an unworn track and an unmeasured one are
+            // different statements, and only one of them is true here.
+            continue;
+        }
+        let y = core_row_height + band * (row as f32 + 0.5);
+        draw_groove(&mut buf, width, height, history, y, pad, width as f32 - pad);
+    }
+
+    pack_rgba8(&buf, false)
+}
+
+/// One quantity's history as a worn groove: a straight horizontal track whose thickness and
+/// brightness at each point is the value measured at that point, oldest at the left.
+///
+/// Deliberately *not* a sparkline — no y axis, no line rising and falling. A sparkline would be
+/// the widget-strip default this scene is refusing, and it would also introduce a second way of
+/// encoding a magnitude into a frame that already has one. Wear is the encoding this scene already
+/// uses for "how much has passed here".
+fn draw_groove(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    history: &[f32],
+    centre_y: f32,
+    x0: f32,
+    x1: f32,
+) {
+    if history.is_empty() || x1 <= x0 {
+        return;
+    }
+    let span = x1 - x0;
+    let px0 = x0.floor().max(0.0) as i32;
+    let px1 = x1.ceil().min(width as f32) as i32;
+
+    for px in px0..px1 {
+        // Time runs left to right, with the newest sample at the right-hand end. A partly-filled
+        // history draws only as far as it actually reaches rather than stretching to fill the
+        // groove: a corner that has been watching for ten seconds must not look like one that has
+        // been watching for two minutes.
+        let t = (px as f32 + 0.5 - x0) / span;
+        let position = t * HISTORY_GROOVE_SAMPLES as f32;
+        let filled_from = HISTORY_GROOVE_SAMPLES.saturating_sub(history.len()) as f32;
+        if position < filled_from {
+            continue;
+        }
+        let idx = ((position - filled_from) as usize).min(history.len() - 1);
+        let wear = clamp01(history[idx]);
+
+        let half = mix(GROOVE_WIDTH_PX.0, GROOVE_WIDTH_PX.1, wear) * 0.5;
+        let alpha = mix(GROOVE_ALPHA.0, GROOVE_ALPHA.1, wear);
+        let py0 = (centre_y - half).floor().max(0.0) as i32;
+        let py1 = (centre_y + half).ceil().min(height as f32) as i32;
+        for py in py0..py1 {
+            let dy = (py as f32 + 0.5 - centre_y).abs();
+            if dy > half {
+                continue;
+            }
+            let idx = py as usize * width as usize + px as usize;
+            // Softer at the groove's edges, so a 1px track and a 4px one are the same object at
+            // two depths rather than two different bars.
+            blend(
+                &mut buf[idx],
+                TRACK_RGB01,
+                alpha * clamp01(1.0 - (dy / half.max(0.5)) * 0.55),
+            );
+        }
+    }
+}
+
+/// How many samples a full groove is drawn as. Mirrors `crate::machine_register::HISTORY_SAMPLES`
+/// — kept as this module's own constant rather than imported, so the pure generator stays
+/// independent of the register's storage decisions and a caller handing it a shorter history gets
+/// a partly-drawn groove rather than a stretched one.
+pub(crate) const HISTORY_GROOVE_SAMPLES: usize = 60;
+
+/// The per-core row: one shaded sphere per logical CPU, sized by the cube root of its own load.
+///
+/// A core reporting nothing is drawn *absent* — no body, and no gap closed up behind it either, so
+/// core 5 does not silently become core 4. Twelve small bodies are exactly where an average would
+/// be invisible, which is why the row exists at all rather than the aggregate alone.
+fn draw_core_row(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    cores: &[Option<f32>],
+    origin: (f32, f32),
+    radius_max: f32,
+) {
+    if cores.is_empty() {
+        return;
+    }
+    let step = radius_max * 2.0 * CORE_GAP;
+    for (idx, core) in cores.iter().enumerate() {
+        let cx = origin.0 + radius_max + idx as f32 * step;
+        if cx - radius_max > width as f32 {
+            break;
+        }
+        let Some(load) = core else {
+            // Absent, and its slot is still spent — the row's positions are the OS's core order.
+            continue;
+        };
+        // Volume ~ mass, the same cube root every planet in this scene obeys: a busy core is a
+        // heavier body. Floored so an idle core is still a core.
+        let radius = radius_max * mix(CORE_RADIUS_FLOOR, 1.0, clamp01(*load).cbrt());
+        draw_body(
+            buf,
+            width,
+            height,
+            (cx, origin.1),
+            radius,
+            Surface {
+                base: CORE_RGB01,
+                seed: body_seed(idx).wrapping_add(31),
+                self_luminous: false,
+                bands: None,
+                mottle_scale: 1.0,
+            },
+            // Lit from the upper left, in the corner's own frame. The scene's real sun is off this
+            // surface entirely, so the alternative is an unlit disk — and an unshaded circle is a
+            // picture of an instrument rather than a body, which is the gauge-cluster default this
+            // corner is refusing.
+            normalize3((-0.55, -0.45, 0.70)),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3255,6 +3511,193 @@ mod tests {
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The machine corner
+    // ---------------------------------------------------------------------------
+
+    fn corner_of(grooves: &[&[f32]], cores: &[Option<f32>]) -> MachineCorner {
+        MachineCorner {
+            grooves: grooves.iter().map(|g| g.to_vec()).collect(),
+            cores: cores.to_vec(),
+        }
+    }
+
+    /// How many pixels of the corner carry anything at all.
+    fn drawn_pixels(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
+    }
+
+    #[test]
+    fn an_unmeasured_machine_draws_nothing_at_all() {
+        // F21, the whole of it: no fabricated machine number, ever, and no decorative history.
+        // Not an idle trace, not a flat groove at zero, not a row of dark cores — nothing. A
+        // plausible number invented from nothing is worse than an empty corner.
+        let empty = MachineCorner::default();
+        assert!(empty.is_empty());
+        assert_eq!(drawn_pixels(&machine_corner_frame(&empty, 260, 168)), 0);
+
+        // A register that has cores but has measured none of them is the same case, and it is the
+        // one a "draw what you have" implementation gets wrong: the cores exist, so a naive draw
+        // puts twelve bodies on screen claiming twelve idle CPUs.
+        let all_absent = corner_of(&[&[], &[], &[], &[]], &[None; 12]);
+        assert!(all_absent.is_empty());
+        assert_eq!(
+            drawn_pixels(&machine_corner_frame(&all_absent, 260, 168)),
+            0
+        );
+    }
+
+    #[test]
+    fn a_quantity_with_no_history_draws_no_groove_rather_than_a_flat_one() {
+        // An unworn track and an unmeasured one are different statements about a machine, and only
+        // one of them is true. Drawing a groove at zero says "nothing has happened here", which is
+        // a claim; drawing nothing says "this was not measured", which is the truth.
+        let measured = corner_of(&[&[0.5; 60], &[0.5; 60], &[0.5; 60], &[0.5; 60]], &[]);
+        let one_missing = corner_of(&[&[0.5; 60], &[], &[0.5; 60], &[0.5; 60]], &[]);
+        let all_missing = corner_of(&[&[], &[], &[], &[]], &[Some(0.5)]);
+
+        let four = drawn_pixels(&machine_corner_frame(&measured, 260, 168));
+        let three = drawn_pixels(&machine_corner_frame(&one_missing, 260, 168));
+        assert!(three < four, "a missing quantity still drew a groove");
+        // ...and it is a whole groove's worth that went, not a rounding difference.
+        assert!(four - three > 200, "only {} pixels went", four - three);
+
+        // A corner with no history at all but one live core still draws the core: the rules are
+        // per quantity, not per corner.
+        assert!(drawn_pixels(&machine_corner_frame(&all_missing, 260, 168)) > 0);
+    }
+
+    #[test]
+    fn a_busier_quantity_wears_its_groove_harder() {
+        // A46(c): the wear at each point is the value measured at that point. That is the whole
+        // encoding — no y axis, no line rising and falling, because a sparkline would be a second
+        // way of encoding a magnitude into a frame that already has one.
+        let wear = |value: f32| {
+            let corner = corner_of(&[&vec![value; 60]], &[]);
+            let rgba = machine_corner_frame(&corner, 260, 60);
+            // Total ink, which is thickness and brightness together — both are the encoding.
+            rgba.chunks_exact(4).map(|px| u32::from(px[3])).sum::<u32>()
+        };
+        let quiet = wear(0.05);
+        let middling = wear(0.5);
+        let hammered = wear(1.0);
+        assert!(
+            quiet < middling && middling < hammered,
+            "wear is not monotonic in the value: {quiet} / {middling} / {hammered}"
+        );
+        // A busy machine has to be *obviously* different from a quiet one, not measurably so.
+        assert!(
+            hammered > quiet * 3,
+            "a fully loaded groove ({hammered}) barely outdraws an idle one ({quiet})"
+        );
+    }
+
+    #[test]
+    fn a_short_history_draws_short_rather_than_stretched() {
+        // A corner that has been watching for ten seconds must not look like one that has been
+        // watching for two minutes. Stretching a partial history to fill the groove is the
+        // specific lie: it claims a past the register does not have.
+        let young = corner_of(&[&[1.0; 6]], &[]);
+        let old = corner_of(&[&[1.0; HISTORY_GROOVE_SAMPLES]], &[]);
+        let young_ink = drawn_pixels(&machine_corner_frame(&young, 600, 60));
+        let old_ink = drawn_pixels(&machine_corner_frame(&old, 600, 60));
+        assert!(
+            (young_ink as f32) < old_ink as f32 * 0.3,
+            "six samples drew {young_ink} against a full history's {old_ink}"
+        );
+        assert!(young_ink > 0, "six samples drew nothing");
+    }
+
+    #[test]
+    fn a_busier_core_is_a_heavier_body_and_an_absent_one_is_not_drawn() {
+        // H12's hard case: twelve small bodies are exactly where an average would be invisible.
+        // A core is sized on the same cube root every planet obeys, and a core that reported
+        // nothing is drawn *absent* rather than at zero — which is the distinction that makes the
+        // row worth having.
+        let ink = |cores: &[Option<f32>]| {
+            drawn_pixels(&machine_corner_frame(&corner_of(&[], cores), 260, 60))
+        };
+        let idle = ink(&[Some(0.0); 4]);
+        let busy = ink(&[Some(1.0); 4]);
+        assert!(
+            busy > idle,
+            "a busy core is not a heavier body: {busy} vs {idle}"
+        );
+        // An idle core is still a core: a body that draws at nothing is indistinguishable from a
+        // core that reported nothing, and those are different machine states.
+        assert!(idle > 0, "an idle core drew nothing at all");
+
+        // Absent is absent, and its slot is still spent — the row's positions are the OS's core
+        // order, so closing a gap would silently renumber every core after it.
+        let one_absent = ink(&[Some(1.0), None, Some(1.0), Some(1.0)]);
+        assert!(
+            one_absent < busy,
+            "an absent core still drew a body: {one_absent} vs {busy}"
+        );
+        let mixed = machine_corner_frame(&corner_of(&[], &[Some(1.0), None, Some(1.0)]), 260, 60);
+        let shifted = machine_corner_frame(&corner_of(&[], &[Some(1.0), Some(1.0)]), 260, 60);
+        assert_ne!(
+            mixed, shifted,
+            "an absent core's slot was closed up, renumbering every core after it"
+        );
+    }
+
+    #[test]
+    fn the_corner_fits_however_many_cores_the_host_has() {
+        // A corner box is a couple of dozen cells across, and a 64-core host has to fit the same
+        // width a 4-core one does. Nothing may be drawn outside the surface it was given.
+        for count in [1usize, 4, 12, 32, 64, 256] {
+            let cores: Vec<Option<f32>> =
+                (0..count).map(|i| Some(i as f32 / count as f32)).collect();
+            let corner = corner_of(&[&[0.5; 60], &[0.5; 60], &[0.5; 60], &[0.5; 60]], &cores);
+            let rgba = machine_corner_frame(&corner, 260, 168);
+            assert_eq!(
+                rgba.len(),
+                260 * 168 * 4,
+                "{count} cores changed the surface size"
+            );
+            assert!(drawn_pixels(&rgba) > 0, "{count} cores drew nothing");
+        }
+    }
+
+    #[test]
+    fn the_corner_is_a_transparent_overlay_not_a_second_backdrop() {
+        // It is placed over the scene, so everywhere it does not draw has to show the sky through
+        // it. An opaque corner box would punch a rectangle out of the picture.
+        let corner = corner_of(&[&[1.0; 60]], &[Some(1.0)]);
+        let rgba = machine_corner_frame(&corner, 260, 168);
+        let transparent = rgba.chunks_exact(4).filter(|px| px[3] == 0).count();
+        assert!(
+            transparent > 260 * 168 / 2,
+            "the corner is opaque over {} of its own box",
+            260 * 168 - transparent
+        );
+    }
+
+    #[test]
+    fn the_corner_introduces_no_material_the_sky_does_not_already_have() {
+        // A46(c): a groove is the orbit track's own colour and a core is a body drawn by the same
+        // shader every planet uses. Held structurally rather than by eye — the corner cannot drift
+        // into its own palette without this failing.
+        assert_eq!(TRACK_RGB01, (43.0 / 255.0, 109.0 / 255.0, 132.0 / 255.0));
+
+        // ...and what keeps a core from reading as a worker moon that wandered into the corner is
+        // its colour rather than its size: the substrate sits outside the lifecycle hue channel
+        // every fleet body resolves through. Held against the real channel, at both ends of it,
+        // rather than against a remembered pair of numbers.
+        let cool = |rgb: (f32, f32, f32)| rgb.2 > rgb.0;
+        assert!(cool(CORE_RGB01), "a core has drifted warm");
+        assert!(cool(TRACK_RGB01), "the track has drifted warm");
+        for hue in [IDLE_HUE, FAILED_HUE, 41.0] {
+            for severity in [Severity::Clear, Severity::Critical] {
+                assert!(
+                    !cool(severity_rgb01(hue, severity)),
+                    "a fleet body at hue {hue} reads as cool as the substrate does"
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------

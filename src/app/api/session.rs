@@ -107,6 +107,39 @@ impl App {
             }),
             status: self.state.session_status.clone(),
             background_scene: self.background_scene_info(),
+            machine_register: self.machine_register_info(),
+        }
+    }
+
+    /// The host machine's own state, as the register holds it.
+    ///
+    /// Read straight off `AppState::machine_register` rather than re-sampled here: a readout that
+    /// took its own sample would report a machine state the drawn corner never showed, and the
+    /// whole contract of this register is that every number traces to one sample of one file.
+    fn machine_register_info(&self) -> crate::api::schema::MachineRegisterInfo {
+        use crate::machine_register::Quantity;
+
+        let register = &self.state.machine_register;
+        let now = std::time::Instant::now();
+        let absence = register.absence(now);
+        crate::api::schema::MachineRegisterInfo {
+            reading: absence.is_none(),
+            absent_because: absence.map(|why| why.reason().to_string()),
+            sources: register.sources().iter().map(|s| s.to_string()).collect(),
+            sample_interval_ms: crate::machine_register::SAMPLE_INTERVAL.as_millis() as u64,
+            newest_sample_age_ms: register.age(now).map(|age| age.as_millis() as u64),
+            quantities: Quantity::ALL
+                .iter()
+                .map(|quantity| {
+                    let series = register.series(*quantity);
+                    crate::api::schema::MachineQuantityInfo {
+                        name: quantity.label().to_string(),
+                        value: series.current(),
+                        history_samples: series.len() as u32,
+                    }
+                })
+                .collect(),
+            cores: register.cores().iter().map(|core| core.current()).collect(),
         }
     }
 

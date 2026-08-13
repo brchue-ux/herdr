@@ -64,19 +64,86 @@ fn background_status(args: &[String]) -> std::io::Result<i32> {
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
+    let machine: crate::api::schema::MachineRegisterInfo = response
+        .pointer("/result/snapshot/machine_register")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string(&info).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "background_scene": info,
+                "machine_register": machine,
+            }))
+            .unwrap_or_default()
+        );
         return Ok(0);
     }
 
     print_status(&info);
+    print_machine_register(&machine);
     Ok(0)
 }
 
 /// The human readout. Every condition is printed whether or not it is the one
 /// that failed, so the answer to "what changed?" is visible in one screen
 /// rather than one condition at a time across several runs.
+/// The machine register's own readout, printed under the scene's.
+///
+/// The drawn corner is deliberately wordless — herdr's text surface is the terminal itself, and
+/// painting a private bitmap font into a wash that sits *under* real glyphs is not something this
+/// scene does — so this is where the numbers are read as numbers, and where the register says why
+/// it is empty when it is.
+fn print_machine_register(info: &crate::api::schema::MachineRegisterInfo) {
+    println!();
+    if !info.reading {
+        println!(
+            "machine register: not reading{}",
+            info.absent_because
+                .as_deref()
+                .map(|why| format!(" — {why}"))
+                .unwrap_or_default()
+        );
+        return;
+    }
+
+    println!(
+        "machine register: reading every {}s from {}",
+        info.sample_interval_ms / 1_000,
+        if info.sources.is_empty() {
+            "an unnamed source".to_string()
+        } else {
+            info.sources.join(", ")
+        }
+    );
+    for quantity in &info.quantities {
+        match quantity.value {
+            Some(value) => println!(
+                "  {:<5} {:>5.1}%   ({} samples of history)",
+                quantity.name,
+                value * 100.0,
+                quantity.history_samples
+            ),
+            None => println!("  {:<5}     —   (not measured)", quantity.name),
+        }
+    }
+    if !info.cores.is_empty() {
+        let drawn: Vec<String> = info
+            .cores
+            .iter()
+            .map(|core| match core {
+                Some(load) => format!("{:.0}", load * 100.0),
+                // A core that reported nothing is absent, never zero — the two are different
+                // statements about a machine and only one of them is true.
+                None => "—".to_string(),
+            })
+            .collect();
+        println!("  cores {}", drawn.join(" "));
+    }
+}
+
 fn print_status(info: &BackgroundSceneInfo) {
     let mark = |ok: bool| if ok { "yes" } else { "NO " };
 

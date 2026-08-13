@@ -2347,6 +2347,23 @@ pub struct AppState {
     /// overlay can resolve an asteroid/comet's screen position without rebuilding the layout
     /// every tick. Index-aligned with `background_scene_identity`.
     pub(crate) background_scene_layout: Option<crate::solar_system::SceneLayout>,
+    /// The host machine's own state and its recent past — CPU aggregate and per core, memory,
+    /// swap and load average.
+    ///
+    /// A shared runtime fact about the substrate rather than TUI presentation state, so it lives
+    /// here and goes out over the session API; the background scene's corner is one client of it.
+    /// See `crate::machine_register`.
+    pub(crate) machine_register: crate::machine_register::MachineRegister,
+    /// The register's drawn corner, as its own small graphics surface.
+    ///
+    /// Separate from `background_effects_layer` because the two move on different clocks: that one
+    /// is whole-screen and regenerates per tick while an effect is live, this one is a corner box
+    /// on the register's own two-second cadence. Sharing a surface would make every machine sample
+    /// repaint the whole terminal.
+    pub(crate) machine_corner_layer: Option<GraphicsLayer>,
+    /// What the corner above was drawn for: its cell geometry and the register's own generation.
+    /// Zero whenever nothing is drawn. Redrawn only when this moves, never once per tick.
+    pub(crate) machine_corner_key: u64,
     /// Which fleet identity (`crate::anim::CardRow`) each index of
     /// `background_scene_layout` resolves to.
     pub(crate) background_scene_identity: Vec<crate::anim::CardRow>,
@@ -3667,6 +3684,9 @@ impl AppState {
             background_scene: None,
             background_scene_key: 0,
             background_scene_layout: None,
+            machine_register: crate::machine_register::MachineRegister::default(),
+            machine_corner_layer: None,
+            machine_corner_key: 0,
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,

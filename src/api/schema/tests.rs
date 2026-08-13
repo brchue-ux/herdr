@@ -703,6 +703,7 @@ fn session_snapshot_request_and_response_round_trip() {
                 }),
                 status: Some("7d 62% · 5h 18%".into()),
                 background_scene: BackgroundSceneInfo::default(),
+                machine_register: MachineRegisterInfo::default(),
             }),
         },
     };

@@ -439,6 +439,9 @@ impl App {
         // client attached to it draws them instead.
         changed |= self.observe_signal_tray(now, false);
         changed |= self.observe_sidebar_particle_field();
+        // Before the scene, so a corner drawn this pass carries this pass's sample rather than
+        // the previous one's.
+        changed |= self.observe_machine_register(now);
         changed |= self.observe_background_scene();
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
         changed |= self.observe_background_effects(now, true);
@@ -1234,6 +1237,112 @@ impl App {
     /// never once per tick. See `src/app/background_scene.rs` for why the scene's *placement*
     /// (`AppState::background_scene_layout`) is cached alongside the rendered loop rather than
     /// only the encoded bytes: the effects overlay needs real body positions to draw against.
+    /// Sample the host machine's own state, on the register's own cadence.
+    ///
+    /// Gated on [`crate::machine_register::MachineRegister::is_due`] rather than run per tick:
+    /// this is three small `/proc` reads, but it is on the tick loop, and the tick loop is one of
+    /// the multiplicative paths this project's own performance rule names. At a two-second cadence
+    /// the whole register costs less than a thousandth of a percent of a core; per tick it would
+    /// be filesystem I/O in a loop that is not allowed any.
+    ///
+    /// Sampled whether or not the scene is drawing, because the register is a runtime fact the
+    /// session API publishes rather than a detail of one client's picture — and a corner that only
+    /// had history for as long as the scene had been switched on would be a worse readout than one
+    /// that is simply always current.
+    pub(crate) fn observe_machine_register(&mut self, now: Instant) -> bool {
+        if !self.state.machine_register.is_due(now) {
+            return false;
+        }
+        let counters = crate::platform::read_machine_counters();
+        self.state.machine_register.sample(counters, now);
+        // Deliberately *not* `moved || …`. A sample landing is not by itself a reason to repaint:
+        // the numbers reach a viewer only through the drawn corner, and the API reports them on
+        // demand. Returning `true` here would arm a repaint every two seconds forever, on a
+        // terminal where nothing had changed — which is what this returns `false` for.
+        self.observe_machine_corner(now)
+    }
+
+    /// (Re-)draw the machine register's corner readout.
+    ///
+    /// Its own small graphics surface rather than a pass over the ambient scene or the effects
+    /// overlay, and that is a cost decision rather than a tidiness one. The register moves every
+    /// two seconds; re-baking the scene's 36-frame ambient loop at that cadence would cost more
+    /// CPU than the whole rest of this feature, and folding it into the whole-screen effects
+    /// overlay would make every machine sample repaint the entire terminal. A corner box is a few
+    /// tens of thousands of pixels.
+    ///
+    /// Drawn whenever the scene is drawing — it is part of the same surface family and shares its
+    /// gate — and cleared the moment it is not.
+    fn observe_machine_corner(&mut self, now: Instant) -> bool {
+        let rect = self.state.machine_corner_rect();
+        let cell = self.state.shared_raster_cell_size();
+        if !self.state.background_scene_active()
+            || rect.width == 0
+            || rect.height == 0
+            || !cell.is_known()
+        {
+            self.state.machine_corner_key = 0;
+            return self.state.machine_corner_layer.take().is_some();
+        }
+
+        let register = &self.state.machine_register;
+        // F21: absent is absent. A stalled or unsupported register draws nothing at all rather
+        // than holding its last picture on screen as though it were current.
+        if register.absence(now).is_some() {
+            self.state.machine_corner_key = 0;
+            return self.state.machine_corner_layer.take().is_some();
+        }
+
+        // Everything the drawn corner depends on, folded into one number — the same shape
+        // `background_scene_key` uses, and for the same reason: rendering on a timer and diffing
+        // the PNG afterwards would pay the render either way.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (rect.width, rect.height).hash(&mut hasher);
+            (cell.width_px, cell.height_px).hash(&mut hasher);
+            register.generation().hash(&mut hasher);
+            hasher.finish().max(1)
+        };
+        if key == self.state.machine_corner_key && self.state.machine_corner_layer.is_some() {
+            return false;
+        }
+
+        let corner = crate::solar_system::MachineCorner {
+            grooves: crate::machine_register::Quantity::ALL
+                .iter()
+                .map(|q| register.series(*q).history().collect())
+                .collect(),
+            cores: register.cores().iter().map(|core| core.current()).collect(),
+        };
+
+        let width = u32::from(rect.width) * cell.width_px;
+        let height = u32::from(rect.height) * cell.height_px;
+        let rgba = crate::solar_system::machine_corner_frame(&corner, width, height);
+        let png = crate::solar_system::encode_rgba_png(width, height, &rgba);
+        if png.is_empty() {
+            return self.state.machine_corner_layer.take().is_some();
+        }
+
+        self.state.machine_corner_key = key;
+        self.state.machine_corner_layer = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            width,
+            height,
+            png,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                // Above the effects overlay: this is a readout rather than part of the scene, and
+                // a comet crossing behind it must not take it with it.
+                z: -1,
+            },
+        ));
+        true
+    }
+
     pub(crate) fn observe_background_scene(&mut self) -> bool {
         if !self.state.background_scene_active() {
             return self.clear_background_scene();

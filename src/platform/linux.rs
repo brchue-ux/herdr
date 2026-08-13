@@ -738,8 +738,262 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+/// Busy and total CPU time, in whatever unit the kernel counts in — only the ratio of two deltas
+/// is ever taken, so the unit never has to be known.
+type CpuTicks = (u64, u64);
+
+/// Used and total, in kibibytes.
+type UsedTotalKib = (u64, u64);
+
+/// `/proc` paths the machine register reads. Named as constants so the readout can publish the
+/// exact files its numbers came from — a reader who wants to check a number has to be told where
+/// to check it.
+const PROC_STAT: &str = "/proc/stat";
+const PROC_MEMINFO: &str = "/proc/meminfo";
+const PROC_LOADAVG: &str = "/proc/loadavg";
+
+/// Read the host's own CPU, memory, swap and load counters from `/proc`.
+///
+/// Three whole-file reads of small virtual files, on the register's own sampling cadence — not on
+/// a render or a pane path. Each of the three is independent: a `/proc` that gives up one of them
+/// leaves that quantity `None` and the rest intact, rather than losing the whole sample.
+pub(crate) fn read_machine_counters_platform() -> Option<super::MachineCounters> {
+    let stat = std::fs::read_to_string(PROC_STAT).ok();
+    let meminfo = std::fs::read_to_string(PROC_MEMINFO).ok();
+    let loadavg = std::fs::read_to_string(PROC_LOADAVG).ok();
+    if stat.is_none() && meminfo.is_none() && loadavg.is_none() {
+        return None;
+    }
+
+    let mut sources = Vec::new();
+    let (cpu_total, cpu_per_core) = match stat.as_deref() {
+        Some(text) => {
+            sources.push(PROC_STAT);
+            parse_proc_stat(text)
+        }
+        None => (None, Vec::new()),
+    };
+    let (memory_kib, swap_kib) = match meminfo.as_deref() {
+        Some(text) => {
+            sources.push(PROC_MEMINFO);
+            parse_proc_meminfo(text)
+        }
+        None => (None, None),
+    };
+    let load_average_1m = match loadavg.as_deref() {
+        Some(text) => {
+            sources.push(PROC_LOADAVG);
+            parse_proc_loadavg(text)
+        }
+        None => None,
+    };
+
+    Some(super::MachineCounters {
+        cpu_total,
+        cpu_per_core,
+        memory_kib,
+        swap_kib,
+        load_average_1m,
+        sources,
+    })
+}
+
+/// Busy and total jiffies from one `cpu`/`cpuN` line of `/proc/stat`.
+///
+/// Busy is total minus idle, and idle is `idle + iowait` — a CPU waiting on a disk is not doing
+/// work, and counting iowait as busy is the single most common way this reads high on a machine
+/// that is actually asleep. Fields past the ones this needs are summed into total anyway, so a
+/// kernel that grows a new column is counted rather than silently dropping it.
+fn parse_cpu_line(line: &str) -> Option<CpuTicks> {
+    let mut fields = line.split_whitespace();
+    fields.next()?;
+    let values: Vec<u64> = fields.filter_map(|f| f.parse::<u64>().ok()).collect();
+    if values.len() < 5 {
+        return None;
+    }
+    let total: u64 = values.iter().copied().sum();
+    let idle = values[3].saturating_add(values[4]);
+    Some((total.saturating_sub(idle), total))
+}
+
+fn parse_proc_stat(text: &str) -> (Option<CpuTicks>, Vec<Option<CpuTicks>>) {
+    let mut total = None;
+    let mut cores = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else {
+            // The `cpu` lines are first in `/proc/stat`, so the first non-`cpu` line ends them.
+            if total.is_some() {
+                break;
+            }
+            continue;
+        };
+        if rest.starts_with(char::is_whitespace) {
+            total = parse_cpu_line(line);
+        } else {
+            // `cpuN` — the OS's own core order, which is the order the readout keeps.
+            cores.push(parse_cpu_line(line));
+        }
+    }
+    (total, cores)
+}
+
+/// Used and total kibibytes for memory and swap, from `/proc/meminfo`.
+///
+/// Memory *used* is `MemTotal - MemAvailable`, not `MemTotal - MemFree`: free memory on a healthy
+/// Linux box is near zero because the kernel is using the rest as cache, and reporting that as
+/// pressure is the classic misreading this file exists to prevent. `MemAvailable` is the kernel's
+/// own estimate of what a new workload could actually get.
+fn parse_proc_meminfo(text: &str) -> (Option<UsedTotalKib>, Option<UsedTotalKib>) {
+    let field = |name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(name) && line[name.len()..].starts_with(':'))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let mem_total = field("MemTotal");
+    let mem_available = field("MemAvailable");
+    let swap_total = field("SwapTotal");
+    let swap_free = field("SwapFree");
+
+    let memory = match (mem_total, mem_available) {
+        (Some(total), Some(available)) => Some((total.saturating_sub(available), total)),
+        _ => None,
+    };
+    let swap = match (swap_total, swap_free) {
+        (Some(total), Some(free)) => Some((total.saturating_sub(free), total)),
+        _ => None,
+    };
+    (memory, swap)
+}
+
+fn parse_proc_loadavg(text: &str) -> Option<f32> {
+    text.split_whitespace().next()?.parse::<f32>().ok()
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A `/proc/stat` shaped exactly like the real one, with a header line and a trailing
+    /// non-`cpu` section, so the parse is exercised against the file's real structure.
+    const SAMPLE_STAT: &str = "\
+cpu  100 20 30 400 50 0 10 0 0 0
+cpu0 50 10 15 200 25 0 5 0 0 0
+cpu1 50 10 15 200 25 0 5 0 0 0
+intr 1234 5 6
+ctxt 99999
+";
+
+    #[test]
+    fn proc_stat_is_read_as_busy_over_total_with_iowait_counted_as_idle() {
+        let (total, cores) = parse_proc_stat(SAMPLE_STAT);
+        // total = 100+20+30+400+50+0+10 = 610; idle = idle(400) + iowait(50) = 450; busy = 160.
+        assert_eq!(total, Some((160, 610)));
+        assert_eq!(cores.len(), 2);
+        assert_eq!(cores[0], Some((80, 305)));
+        assert_eq!(cores[1], Some((80, 305)));
+    }
+
+    #[test]
+    fn a_cpu_waiting_on_a_disk_is_not_counted_as_busy() {
+        // The single most common way a machine readout reads high while the machine is asleep.
+        // Same total both ways; the only difference is which column the time is in.
+        let idle_bound = parse_cpu_line("cpu 10 0 0 0 990 0 0 0 0 0").expect("a cpu line");
+        let busy = parse_cpu_line("cpu 1000 0 0 0 0 0 0 0 0 0").expect("a cpu line");
+        assert_eq!(idle_bound.1, busy.1, "the two lines total the same");
+        assert!(
+            idle_bound.0 * 10 < busy.0,
+            "iowait is being counted as busy: {idle_bound:?} against {busy:?}"
+        );
+    }
+
+    #[test]
+    fn a_kernel_that_grows_a_column_is_counted_rather_than_truncated() {
+        // Fields past the ones this needs are summed into the total anyway, so a newer kernel does
+        // not silently drop time out of the denominator and make every machine read busier.
+        let short = parse_cpu_line("cpu 100 0 0 400 0").expect("the minimum field count");
+        let long = parse_cpu_line("cpu 100 0 0 400 0 7 8 9 10 11").expect("a longer line");
+        assert_eq!(short, (100, 500));
+        // The extra columns are irq, softirq, steal and the guest pair — all of them time the CPU
+        // spent doing something — so they land in *both* the total and the busy half.
+        let extra = 7 + 8 + 9 + 10 + 11;
+        assert_eq!(long, (100 + extra, 500 + extra));
+        // Below the minimum there is no line to read, and no guess is made.
+        assert_eq!(parse_cpu_line("cpu 1 2 3"), None);
+        assert_eq!(parse_cpu_line("cpu"), None);
+    }
+
+    #[test]
+    fn memory_used_is_total_minus_available_not_total_minus_free() {
+        // Free memory on a healthy Linux box is near zero because the kernel is using the rest as
+        // cache. Reporting that as pressure is the classic misreading, and it is the one this
+        // parse exists to avoid: MemAvailable is the kernel's own estimate of what a new workload
+        // could actually get.
+        let text = "\
+MemTotal:       16000000 kB
+MemFree:           40000 kB
+MemAvailable:   12000000 kB
+SwapTotal:       8000000 kB
+SwapFree:        6000000 kB
+";
+        let (memory, swap) = parse_proc_meminfo(text);
+        assert_eq!(memory, Some((4_000_000, 16_000_000)));
+        assert_eq!(swap, Some((2_000_000, 8_000_000)));
+
+        // A kernel without MemAvailable gives no memory reading rather than the wrong one.
+        let older = "MemTotal: 16000000 kB\nMemFree: 40000 kB\n";
+        assert_eq!(parse_proc_meminfo(older).0, None);
+    }
+
+    #[test]
+    fn a_prefix_match_does_not_pick_up_a_different_field() {
+        // `MemTotal` and `MemAvailable` both start with `Mem`, and `SwapTotal`/`SwapFree`/
+        // `SwapCached` all start with `Swap` — a naive `starts_with` reads whichever comes first.
+        let text = "\
+SwapCached:         1234 kB
+MemTotal:        1000 kB
+MemAvailable:     400 kB
+SwapTotal:        500 kB
+SwapFree:         100 kB
+";
+        let (memory, swap) = parse_proc_meminfo(text);
+        assert_eq!(memory, Some((600, 1_000)));
+        assert_eq!(swap, Some((400, 500)), "SwapCached was read as SwapTotal");
+    }
+
+    #[test]
+    fn loadavg_reads_the_one_minute_figure() {
+        assert_eq!(parse_proc_loadavg("0.52 0.31 0.27 2/1234 5678"), Some(0.52));
+        assert_eq!(parse_proc_loadavg(""), None);
+        assert_eq!(parse_proc_loadavg("not-a-number 1 2"), None);
+    }
+
+    /// The whole path on the machine this is running on. Not a fixture: the point of a register
+    /// about the substrate is that it reads the real substrate, and a parse that is correct
+    /// against a hand-written sample and wrong against this kernel is the failure that matters.
+    #[test]
+    fn this_machine_reads_its_own_state() {
+        let counters = read_machine_counters_platform().expect("Linux publishes /proc");
+
+        let (busy, total) = counters.cpu_total.expect("/proc/stat has a cpu line");
+        assert!(busy <= total, "busy {busy} exceeds total {total}");
+        assert!(total > 0);
+        assert!(
+            !counters.cpu_per_core.is_empty(),
+            "no per-core lines were read"
+        );
+        assert_eq!(
+            counters.cpu_per_core.len(),
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+            "the core count disagrees with the machine's own"
+        );
+
+        let (used, mem_total) = counters.memory_kib.expect("/proc/meminfo has MemTotal");
+        assert!(used <= mem_total && mem_total > 0);
+        assert!(counters.load_average_1m.is_some_and(|l| l >= 0.0));
+        assert!(counters.sources.contains(&PROC_STAT));
+    }
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};

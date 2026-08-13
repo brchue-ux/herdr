@@ -32,6 +32,10 @@ pub struct SessionSnapshot {
     /// when it is not, which of its conditions is the one that is unmet.
     #[serde(default)]
     pub background_scene: BackgroundSceneInfo,
+    /// The host machine's own state — CPU, memory, swap and load — with its
+    /// recent past. See [`MachineRegisterInfo`].
+    #[serde(default)]
+    pub machine_register: MachineRegisterInfo,
 }
 
 /// The persistent whole-terminal background scene's live state, condition by
@@ -92,6 +96,63 @@ pub struct BackgroundSceneInfo {
     /// mysterious. Zero whenever the fleet fits.
     #[serde(default)]
     pub mates_beyond_ladder: u32,
+}
+
+/// The host machine's own state: CPU aggregate and per core, memory, swap and
+/// load average, each with its recent past.
+///
+/// A register about the **substrate** rather than about the work — the machine
+/// the fleet is running on, not the fleet. Published here rather than only
+/// drawn, for two reasons: it is a shared runtime fact rather than one client's
+/// presentation, and the drawn form is deliberately wordless (see the corner's
+/// own doc), so this is where the numbers can be read as numbers.
+///
+/// **Nothing here is ever fabricated.** On a platform this build does not read,
+/// before a second sample has landed, or once the newest sample has gone stale,
+/// every value is absent and [`Self::absent_because`] says which of those it is.
+/// A plausible number invented from nothing is worse than an empty readout that
+/// says why it is empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MachineRegisterInfo {
+    /// There is a current reading. False whenever [`Self::absent_because`] is
+    /// set, and the two are never both meaningful at once.
+    pub reading: bool,
+    /// Why there is no reading, in the readout's own words. Absent when there
+    /// is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_because: Option<String>,
+    /// The files these numbers were read from. A reader who wants to check a
+    /// number has to be told where to check it.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// How often the register samples, in milliseconds.
+    #[serde(default)]
+    pub sample_interval_ms: u64,
+    /// How old the newest sample is, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_sample_age_ms: Option<u64>,
+    /// Each quantity's current value and how much history is held for it.
+    #[serde(default)]
+    pub quantities: Vec<MachineQuantityInfo>,
+    /// Each logical CPU's current busy fraction, in the operating system's own
+    /// core order. A core that reported nothing is `null` — drawn absent rather
+    /// than at zero, and never dropped, since dropping it would silently
+    /// re-number every core after it.
+    #[serde(default)]
+    pub cores: Vec<Option<f32>>,
+}
+
+/// One quantity of [`MachineRegisterInfo`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MachineQuantityInfo {
+    /// `cpu`, `mem`, `swap` or `load`.
+    pub name: String,
+    /// The newest reading, `0.0..=1.0`. Absent when nothing has been measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f32>,
+    /// How many samples of recent past are held for it.
+    #[serde(default)]
+    pub history_samples: u32,
 }
 
 /// Params for `session.status.set`.

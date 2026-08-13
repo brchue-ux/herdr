@@ -1198,6 +1198,33 @@ impl AppState {
         Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
     }
 
+    /// Where the machine register's readout is drawn, in cells.
+    ///
+    /// The top-right of the terminal area, inset by one cell. Top-right rather than anywhere else
+    /// because that is the corner a reader's eye is *least* often in — this is a readout about the
+    /// substrate, glanced at, never worked in — and because the sidebar owns the left edge.
+    ///
+    /// Returns an empty rect when the screen is too small to hold it, which is what stops the
+    /// readout from covering a terminal somebody is actually using on a narrow window. A corner
+    /// that will not fit is not drawn at all; it is not shrunk until it is unreadable.
+    pub(crate) fn machine_corner_rect(&self) -> Rect {
+        const COLS: u16 = 26;
+        const ROWS: u16 = 8;
+        const INSET: u16 = 1;
+
+        let screen = self.screen_rect();
+        // Twice the readout's own width, so it can never take more than half of a narrow screen.
+        if screen.width < COLS * 2 + INSET * 2 || screen.height < ROWS + INSET * 2 {
+            return Rect::new(screen.x, screen.y, 0, 0);
+        }
+        Rect::new(
+            screen.x + screen.width - COLS - INSET,
+            screen.y + INSET,
+            COLS,
+            ROWS,
+        )
+    }
+
     pub(crate) fn context_menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         let screen = self.screen_rect();
@@ -1870,6 +1897,48 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    /// An `AppState` whose screen is exactly `cols` x `rows`.
+    fn state_sized(cols: u16, rows: u16) -> crate::app::state::AppState {
+        let mut state = crate::app::state::AppState::test_new();
+        state.view.sidebar_rect = Rect::new(0, 0, 0, rows);
+        state.view.terminal_area = Rect::new(0, 0, cols, rows);
+        state
+    }
+
+    #[test]
+    fn the_machine_corner_sits_top_right_inside_the_screen() {
+        let state = state_sized(120, 40);
+        let corner = state.machine_corner_rect();
+        let screen = state.screen_rect();
+
+        assert!(corner.width > 0 && corner.height > 0);
+        // Top-right, inset — the corner a reader's eye is least often in, and the edge the sidebar
+        // does not own.
+        assert_eq!(corner.x + corner.width, screen.x + screen.width - 1);
+        assert_eq!(corner.y, screen.y + 1);
+        // Wholly inside the screen, which is what stops the readout being clipped into nonsense.
+        assert!(corner.x >= screen.x);
+        assert!(corner.y + corner.height <= screen.y + screen.height);
+    }
+
+    #[test]
+    fn a_screen_too_small_for_the_machine_corner_does_not_get_a_shrunken_one() {
+        // A readout that will not fit is not drawn at all; it is not squeezed until it is
+        // unreadable, and it never takes more than half of a narrow screen. Somebody working in a
+        // 60-column terminal has not asked for a third of it to become a diagnostic.
+        for (cols, rows) in [(40u16, 40u16), (120, 6), (10, 10), (0, 0)] {
+            let corner = state_sized(cols, rows).machine_corner_rect();
+            assert_eq!(
+                (corner.width, corner.height),
+                (0, 0),
+                "a {cols}x{rows} screen was given a corner anyway"
+            );
+        }
+        // ...and the first size that does fit gets the whole thing rather than a partial one.
+        let fits = state_sized(54, 10).machine_corner_rect();
+        assert_eq!((fits.width, fits.height), (26, 8));
+    }
 
     fn mark_worktree_space_member(workspace: &mut Workspace, ws_idx: usize, key: &str) {
         workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

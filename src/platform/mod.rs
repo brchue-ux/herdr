@@ -514,3 +514,50 @@ mod tests {
         );
     }
 }
+
+/// One raw read of the host machine's own state, exactly as the operating system reports it.
+///
+/// **Counters, not percentages.** A CPU fraction needs two samples of a cumulative counter to
+/// exist at all, so computing one here would put a stateful arithmetic problem inside the platform
+/// layer and give every OS its own chance to get it wrong. The layer's job is to read the numbers
+/// the machine publishes; `crate::machine_register` does the arithmetic once, for every platform,
+/// and is testable without a machine.
+///
+/// Every field is optional because a platform may publish some of these and not others, and
+/// because *"a plausible number invented from nothing is worse than an empty corner that says why
+/// it is empty"* — F21. Nothing here is ever defaulted to zero to fill a gap.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MachineCounters {
+    /// Cumulative busy and total time across all CPUs, in whatever unit the OS counts in — only
+    /// the ratio of two deltas is ever used, so the unit does not have to be known.
+    pub(crate) cpu_total: Option<(u64, u64)>,
+    /// The same pair per logical CPU, in the OS's own core order. A core the OS did not report is
+    /// `None` and is drawn absent rather than at zero.
+    pub(crate) cpu_per_core: Vec<Option<(u64, u64)>>,
+    /// Memory in use and total, in kibibytes.
+    pub(crate) memory_kib: Option<(u64, u64)>,
+    /// Swap in use and total, in kibibytes. A machine with no swap reports a total of zero, which
+    /// is a real answer and not a missing one.
+    pub(crate) swap_kib: Option<(u64, u64)>,
+    /// The one-minute load average.
+    pub(crate) load_average_1m: Option<f32>,
+    /// The files these numbers were read from, for the readout to name its own sources.
+    pub(crate) sources: Vec<&'static str>,
+}
+
+/// Read the host machine's own state, or `None` on a platform this build does not read it on.
+///
+/// `None` is a real answer and the readout says so rather than drawing something: F21 forbids a
+/// fabricated machine number under every circumstance, including the one where a plausible number
+/// would be easy.
+pub(crate) fn read_machine_counters() -> Option<MachineCounters> {
+    read_machine_counters_platform()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_machine_counters_platform() -> Option<MachineCounters> {
+    // macOS and Windows both publish all of this, through `host_processor_info`/`sysctl` and
+    // through the performance-counter API respectively — neither is a `/proc` read, and neither is
+    // in this change. Until one is written the honest answer is that this build does not read it.
+    None
+}

@@ -202,6 +202,13 @@ enum HostSurfaceId {
     /// itself so the (rarely regenerated) ambient loop and the (regenerated only while something
     /// is live) overlay never have to share one upload/caching lifecycle.
     BackgroundEffects,
+    /// The host machine's own readout — CPU aggregate and per core, memory, swap and load. Its own
+    /// identity rather than a share of [`Self::BackgroundEffects`] because the two move on
+    /// completely different clocks: the effects overlay is regenerated per tick while something is
+    /// live and is a whole-screen surface, while this is a small corner box that changes on the
+    /// register's own two-second cadence. Folding one into the other would make every machine
+    /// sample repaint the whole screen.
+    MachineCorner,
     /// A pane's own character grid, rasterised by Herdr and composited back
     /// over the pane at `z = 0` (`src/grid_raster/`).
     ///
@@ -231,6 +238,7 @@ impl HostSurfaceId {
             Self::SidebarParticleField => "surface.sidebar.particle-field".hash(hasher),
             Self::BackgroundScene => "surface.background.scene".hash(hasher),
             Self::BackgroundEffects => "surface.background.effects".hash(hasher),
+            Self::MachineCorner => "surface.machine.corner".hash(hasher),
             Self::PaneText(pane_id) => {
                 "surface.pane.text".hash(hasher);
                 pane_id.raw().hash(hasher);
@@ -1525,6 +1533,13 @@ fn surface_layer_placement_targets(
                 .as_ref()
                 .map(|layer| (HostSurfaceId::BackgroundEffects, app.screen_rect(), layer)),
         )
+        .chain(app.machine_corner_layer.as_ref().map(|layer| {
+            (
+                HostSurfaceId::MachineCorner,
+                app.machine_corner_rect(),
+                layer,
+            )
+        }))
         // The TUI's own sidebar cards join here rather than through the API
         // map, so they travel the same clipping, dedup, signature and
         // delete-by-id path as a client's layer without being reachable — or
