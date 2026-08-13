@@ -890,6 +890,22 @@ fn mix(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * clamp01(t)
 }
 
+/// A body falling toward something accelerates into it.
+///
+/// Every travelling thing in this scene moved at a constant speed: an asteroid crossed the last
+/// tenth of its approach as slowly as the first, and a comet arriving at a mate coasted in.
+/// Nothing falls like that. A quadratic ease-in is the standard accelerate — position goes as
+/// `t^2`, so speed goes as `2t` and rises linearly through the travel, which is what constant
+/// acceleration actually is rather than a curve chosen because it looked right.
+///
+/// Both endpoints are exact: `ease_in(0) == 0` and `ease_in(1) == 1`, so an effect still starts
+/// where it started and lands where it landed, and the caller's own `progress` stays the thing
+/// that says how far through it is.
+fn ease_in(t: f32) -> f32 {
+    let t = clamp01(t);
+    t * t
+}
+
 /// `signal_ink` as `0.0..=1.0` floats rather than `u8` triples, since shading multiplies it by a
 /// per-pixel lighting factor before quantizing back down once at the end.
 fn severity_rgb01(hue: f32, severity: Severity) -> (f32, f32, f32) {
@@ -1608,9 +1624,12 @@ fn draw_asteroid(
 /// live position of an orbiting body, which only [`effects_frame`] can resolve — see
 /// [`Comet::target`]. For a crossing comet it is exactly `comet.end`.
 fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet, end: (f32, f32)) {
+    // Comets accelerate too, and an arriving one most visibly: it is falling toward the body the
+    // work landed on. See [`ease_in`].
+    let travel = ease_in(comet.progress);
     let pos = (
-        mix(comet.start.0, end.0, comet.progress) * width as f32,
-        mix(comet.start.1, end.1, comet.progress) * height as f32,
+        mix(comet.start.0, end.0, travel) * width as f32,
+        mix(comet.start.1, end.1, travel) * height as f32,
     );
     let dir = (end.0 - comet.start.0, end.1 - comet.start.1);
     let dir_len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(0.0001);
@@ -1835,9 +1854,11 @@ pub(crate) fn effects_frame(layout: &SceneLayout, effects: &SceneEffects, phase:
                 target_pos.0 + approach_radius * asteroid.approach_angle.cos(),
                 target_pos.1 + approach_radius * asteroid.approach_angle.sin(),
             );
+            // A rock falling onto a body accelerates into it — see [`ease_in`].
+            let travel = ease_in(asteroid.progress);
             let pos = (
-                mix(start.0, target_pos.0, asteroid.progress),
-                mix(start.1, target_pos.1, asteroid.progress),
+                mix(start.0, target_pos.0, travel),
+                mix(start.1, target_pos.1, travel),
             );
             draw_asteroid(&mut buf, width, height, pos, asteroid.severity);
         }
@@ -3559,6 +3580,157 @@ mod tests {
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Travel accelerates
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_falling_thing_speeds_up_instead_of_coasting() {
+        // Both ends exact, so nothing starts or lands anywhere new.
+        assert_eq!(ease_in(0.0), 0.0);
+        assert_eq!(ease_in(1.0), 1.0);
+        // Behind linear the whole way through — it is accelerating *into* the target, so it is
+        // still short of halfway when half the time has gone.
+        assert!(ease_in(0.5) < 0.5 - 0.2, "{}", ease_in(0.5));
+        for i in 1..10 {
+            let t = i as f32 / 10.0;
+            assert!(ease_in(t) < t, "ease_in({t}) is not behind linear");
+        }
+        // Monotonic, and its *speed* rises: each successive tenth of the travel covers more ground
+        // than the one before it, which is what constant acceleration means.
+        let step = |t: f32| ease_in(t + 0.1) - ease_in(t);
+        let mut previous = 0.0;
+        for i in 0..9 {
+            let covered = step(i as f32 / 10.0);
+            assert!(
+                covered > previous,
+                "the {i}th tenth was not faster than the one before"
+            );
+            previous = covered;
+        }
+        // Clamped, so a caller's progress running past its own bounds cannot overshoot the target.
+        assert_eq!(ease_in(1.4), 1.0);
+        assert_eq!(ease_in(-0.3), 0.0);
+    }
+
+    #[test]
+    fn an_asteroid_covers_less_ground_early_and_still_lands_on_its_target() {
+        // A second mate rather than a worker: the approach distance scales off the struck body's
+        // own radius, and on a worker moon it is only a few times the rock's own size — too close
+        // together for "where a linear one would be" and "where an eased one is" to be separate
+        // places on screen at all. The eased travel is the same either way; this fixture is what
+        // lets the difference be *measured* rather than only computed.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(FILES_CEIL)),
+        ];
+        let layout = build_layout(&nodes, 1600, 900);
+        let moon = 1;
+        let phase = 0.4;
+        let target = layout.position(moon, phase);
+        let approach = layout.bodies[moon].body_radius_px * 6.0;
+        let angle = 0.7f32;
+        let start = (
+            target.0 + approach * angle.cos(),
+            target.1 + approach * angle.sin(),
+        );
+
+        let at = |progress: f32| {
+            let travel = ease_in(progress);
+            (
+                mix(start.0, target.0, travel),
+                mix(start.1, target.1, travel),
+            )
+        };
+        let distance = |p: (f32, f32)| ((p.0 - target.0).powi(2) + (p.1 - target.1).powi(2)).sqrt();
+
+        // Still most of the way out at the halfway point, where a linear approach would be exactly
+        // half way in.
+        assert!(
+            distance(at(0.5)) > approach * 0.7,
+            "halfway through the flight it is already {:.0}px from a {approach:.0}px approach",
+            distance(at(0.5))
+        );
+        // And it still starts where it started and lands where it lands — the acceleration changes
+        // the pacing, never the geometry.
+        assert!((distance(at(0.0)) - approach).abs() < 0.01);
+        assert!(distance(at(1.0)) < 0.01);
+
+        // Measured on the rendered buffer rather than only on the formula: the rock really is
+        // further out at the halfway point than a linear one would be.
+        let rendered = |progress: f32| {
+            let effects = SceneEffects {
+                asteroids: vec![AsteroidInFlight {
+                    target: moon,
+                    severity: Severity::Critical,
+                    progress,
+                    approach_angle: angle,
+                }],
+                ..Default::default()
+            };
+            effects_frame(&layout, &effects, phase)
+        };
+        let half = rendered(0.5);
+        // Where a *linear* asteroid would be at half-way: the midpoint of the approach.
+        let midpoint = (mix(start.0, target.0, 0.5), mix(start.1, target.1, 0.5));
+        assert_eq!(
+            peak_alpha(&half, layout.width, midpoint, 2.0),
+            0.0,
+            "the rock is sitting where a linear one would be"
+        );
+        assert!(
+            peak_alpha(&half, layout.width, at(0.5), 4.0) > 0.5,
+            "the rock is not where the eased travel puts it"
+        );
+    }
+
+    #[test]
+    fn an_arriving_comet_accelerates_into_the_body_it_lands_on() {
+        let nodes = [
+            node(None, BodyKind::Sun),
+            sized(Some(0), BodyKind::Planet, BodySize::Files(900)),
+        ];
+        let layout = build_layout(&nodes, 800, 600);
+        let phase = 0.3;
+        let comet = Comet {
+            start: (0.05, 0.05),
+            end: (0.5, 0.5),
+            target: Some(1),
+            magnitude: 1.0,
+            progress: 0.5,
+        };
+        let target = layout.position(1, phase);
+        let start_px = (comet.start.0 * 800.0, comet.start.1 * 600.0);
+        let travelled =
+            |p: (f32, f32)| ((p.0 - start_px.0).powi(2) + (p.1 - start_px.1).powi(2)).sqrt();
+
+        let rgba = effects_frame(
+            &layout,
+            &SceneEffects {
+                comets: vec![comet],
+                ..Default::default()
+            },
+            phase,
+        );
+        // The comet's core is the brightest thing it draws, so the furthest-along lit pixel along
+        // its own line is where its head is. Read off the buffer rather than recomputed.
+        let mut head = start_px;
+        for step in 0..=200 {
+            let t = step as f32 / 200.0;
+            let p = (mix(start_px.0, target.0, t), mix(start_px.1, target.1, t));
+            if peak_alpha(&rgba, layout.width, p, 1.5) > 0.5 {
+                head = p;
+            }
+        }
+        let whole = travelled(target);
+        assert!(
+            travelled(head) < whole * 0.45,
+            "halfway through its flight the comet has covered {:.0}px of {whole:.0}px",
+            travelled(head)
+        );
+        assert!(travelled(head) > 0.0, "the comet has not moved at all");
     }
 
     // ---------------------------------------------------------------------------
