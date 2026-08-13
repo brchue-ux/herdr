@@ -506,8 +506,49 @@ fn severity_rgb01(hue: f32, severity: Severity) -> (f32, f32, f32) {
     (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
-/// Lambertian shading with limb darkening and a mottled texture, for one pixel `(dx, dy)` offset
-/// from a body's centre, `dist` away, inside a body of `radius` pixels.
+/// Half-width of the terminator's transition, in the same cosine units the Lambert term is in.
+///
+/// A body whose day/night line is `lam.max(0.0)` has a hard edge no real body has. Inside this
+/// band the term is remapped by a quadratic that is C1 at both joins — it meets the raw Lambert
+/// at `+WIDTH` with slope 1 and reaches zero at `-WIDTH` with slope 0 — so nothing kinks where
+/// the remap takes over and it is the identity everywhere outside the band. The orrery's own
+/// `TERM_W`.
+const TERMINATOR_WIDTH: f32 = 0.13;
+
+/// How far the terminator's transition goes warm, red against blue. Grazing light travels a
+/// longer path through an atmosphere and comes out red — which is why a terminator is warm and
+/// why a sunset is. Applies only inside [`TERMINATOR_WIDTH`].
+const TERMINATOR_WARMTH: f32 = 0.32;
+
+/// Per-channel share of [`TERMINATOR_WARMTH`]: red up, green barely, blue down.
+const TERMINATOR_WARM_TINT: (f32, f32, f32) = (1.0, -0.15, -0.55);
+
+/// Peak brightness the atmospheric rim adds at the grazing sunlit limb, as a multiple of the
+/// body's own colour.
+///
+/// The orrery's `RIM_A` of `0.62` against its 0–255 accumulator, carried into this module's
+/// `0.0..=1.0` one — the same crescent, in the units this renderer shades in.
+const RIM_GAIN: f32 = 0.62 * (150.0 / 255.0);
+
+/// Per-channel tint of the rim: very slightly cool, because it is scattered light rather than the
+/// surface's own colour.
+const RIM_TINT: (f32, f32, f32) = (1.0, 0.985, 0.94);
+
+/// Peak brightness planetshine adds on the night side, as a multiple of the body's own colour.
+/// Light returned to a body from the rest of the system: small, and the only thing lighting the
+/// night side that is not a flat fill. The orrery's `SHINE`.
+const PLANETSHINE: f32 = 0.075;
+
+/// Lambertian shading with a soft warm terminator, an atmospheric rim, planetshine, limb
+/// darkening and a mottled texture, for one pixel `(dx, dy)` offset from a body's centre, `dist`
+/// away, inside a body of `radius` pixels.
+///
+/// The rim, the terminator's softness and the night side's rim of returned light are the three
+/// optical facts a real body has that a diffuse-shaded disk does not, and each is a function of
+/// the same light vector everything else here already obeys rather than a garnish laid over it.
+/// They are the fleet orrery's own A51(a)–(c), ported into this renderer's per-pixel shading —
+/// there is no sprite bake here to hang them off, so they are computed where the Lambert term
+/// already is, at no extra pass and inside the same bounding box.
 ///
 /// `light_dir` is normalised and points *from the surface toward the light* (i.e. toward the
 /// sun's on-screen position for a planet/moon; straight out of the screen for the sun itself,
@@ -541,16 +582,51 @@ fn shade_surface(
         );
     }
 
-    let diffuse = (nx * light_dir.0 + ny * light_dir.1 + nz * light_dir.2).max(0.0);
+    let lambert = nx * light_dir.0 + ny * light_dir.1 + nz * light_dir.2;
+
+    // A soft terminator, rather than `lambert.max(0.0)`'s hard day/night edge.
+    let diffuse = if lambert >= TERMINATOR_WIDTH {
+        lambert
+    } else if lambert <= -TERMINATOR_WIDTH {
+        0.0
+    } else {
+        let u = lambert + TERMINATOR_WIDTH;
+        u * u / (4.0 * TERMINATOR_WIDTH)
+    };
+
     let ambient = 0.10;
     let lit = ambient + diffuse * (1.0 - ambient);
     let limb_darkening = mix(0.55, 1.0, nz);
     let lit = lit * limb_darkening * mottle;
 
+    // How far out toward the limb this pixel is, `0.0` at the centre and `1.0` at the edge —
+    // squared, since that is what both terms below actually want.
+    let radial_sq = nx * nx + ny * ny;
+
+    // The atmospheric rim: a thin bright crescent where the line of sight grazes the atmosphere
+    // and the surface normal is still lit. `radial_sq^5` is the limb falloff by repeated
+    // multiply, which is the same curve without paying for a `powf` per pixel.
+    let graze = radial_sq * radial_sq * radial_sq * radial_sq * radial_sq;
+    let still_lit = (lambert * 0.72 + 0.28).max(0.0);
+    let rim = RIM_GAIN * graze * still_lit * still_lit;
+
+    // Planetshine: the night side is no longer just `ambient`. It carries a faint rim of light
+    // returned to it from the rest of the system, strongest where the night side grazes the limb.
+    let night = (-lambert).max(0.0);
+    let shine = PLANETSHINE * night.sqrt() * (0.30 + 0.70 * radial_sq);
+
+    // ...and the transition itself goes warm, which is only ever inside the terminator band.
+    let warmth = if lambert.abs() < TERMINATOR_WIDTH {
+        TERMINATOR_WARMTH * (1.0 - lambert.abs() / TERMINATOR_WIDTH)
+    } else {
+        0.0
+    };
+    let warm = |channel: f32| 1.0 + warmth * channel;
+
     (
-        clamp01(base.0 * lit),
-        clamp01(base.1 * lit),
-        clamp01(base.2 * lit),
+        clamp01(base.0 * (lit * warm(TERMINATOR_WARM_TINT.0) + rim * RIM_TINT.0 + shine)),
+        clamp01(base.1 * (lit * warm(TERMINATOR_WARM_TINT.1) + rim * RIM_TINT.1 + shine)),
+        clamp01(base.2 * (lit * warm(TERMINATOR_WARM_TINT.2) + rim * RIM_TINT.2 + shine)),
     )
 }
 
@@ -574,6 +650,39 @@ fn blend(dst: &mut [f32; 4], src: (f32, f32, f32), alpha: f32) {
 /// Deterministic starfield: a fixed number of point stars, positioned and dimmed from a fixed
 /// seed rather than `width`/`height`, so the field does not visibly re-shuffle on every resize.
 const STAR_COUNT: usize = 260;
+
+/// Stellar colour-temperature classes, hottest first — the spread every star's colour is drawn
+/// from.
+///
+/// The same six classes the fleet orrery's own `STAR_CLASS` table holds, ported rather than
+/// re-derived so the two skies are the same sky. A real starfield carries a genuine spread of
+/// colour temperature; one flat white at a few sizes is the lazy default both are refusing.
+const STAR_CLASS: [(f32, f32, f32); 6] = [
+    (0.745, 0.808, 1.000),
+    (0.894, 0.922, 1.000),
+    (0.980, 0.980, 0.988),
+    (1.000, 0.965, 0.878),
+    (1.000, 0.839, 0.667),
+    (1.000, 0.737, 0.612),
+];
+
+/// How steeply a star's magnitude is skewed toward faint: `u^STAR_MAGNITUDE_SKEW` over a uniform
+/// `u`, so the field is many faint stars and very few bright ones rather than an even scatter.
+/// The orrery's own exponent.
+const STAR_MAGNITUDE_SKEW: f32 = 3.4;
+
+/// The floor and span a magnitude maps onto as drawn alpha — the faintest star is still a star,
+/// and the brightest reaches its class colour whole.
+const STAR_ALPHA: (f32, f32) = (0.16, 0.84);
+
+/// The magnitude above which a star is one of "the brightest few" that scintillate. A sky where
+/// every star twinkles is a screensaver, so this names a handful and leaves the rest steady.
+///
+/// The orrery cuts at `0.93` over roughly a thousand stars; [`STAR_COUNT`] is a quarter of that,
+/// so the same *count* needs a lower cut. Measured against this field's own magnitudes, `0.80`
+/// names eight of the two hundred and sixty — see this module's
+/// `only_the_brightest_few_stars_scintillate` test, which holds the "few" rather than the number.
+const STAR_SCINTILLATION_MAGNITUDE: f32 = 0.80;
 
 /// Draw one body (disk, shading, and soft glow fringe) into `buf`, restricted to its own
 /// bounding box rather than the whole frame — the cost lever that keeps a handful of shaded
@@ -1156,24 +1265,44 @@ fn splat_starfield_band(
     phase: f32,
 ) {
     for i in 0..STAR_COUNT {
-        let seed = i as u32;
-        let sx = value_noise(seed as f32 * 0.123, 0.0, 11);
-        let sy = value_noise(seed as f32 * 0.123, 100.0, 11);
+        let lattice = i as f32 * 0.123;
+        let sx = value_noise(lattice, 0.0, 11);
+        let sy = value_noise(lattice, 100.0, 11);
         let py = (sy * height as f32) as usize;
         if py < y0 || py >= y1 {
             continue;
         }
-        let brightness = 0.25 + 0.75 * value_noise(seed as f32 * 0.123, 200.0, 11);
-        let twinkle_offset = value_noise(seed as f32 * 0.123, 300.0, 11) * 2.0 * PI;
-        let twinkle = 0.75 + 0.25 * (phase + twinkle_offset).sin();
         let px = (sx * width as f32) as usize;
         if px >= width as usize {
             continue;
         }
+
+        let magnitude = star_magnitude(i);
+        // Only the brightest few scintillate; everything else holds steady, which is what makes
+        // the twinkle read as a property of those stars rather than as a shimmer over the sky.
+        let twinkle = if magnitude > STAR_SCINTILLATION_MAGNITUDE {
+            let offset = value_noise(lattice, 300.0, 11) * 2.0 * PI;
+            0.75 + 0.25 * (phase + offset).sin()
+        } else {
+            1.0
+        };
+        let alpha = (STAR_ALPHA.0 + STAR_ALPHA.1 * magnitude) * twinkle;
+
+        let class = value_noise(lattice, 400.0, 11) * STAR_CLASS.len() as f32;
+        let class = STAR_CLASS[(class as usize).min(STAR_CLASS.len() - 1)];
+
         let local_idx = (py - y0) * width as usize + px;
-        let value = brightness * twinkle;
-        buf[local_idx] = [value, value, value, 1.0];
+        blend(&mut buf[local_idx], class, alpha);
     }
+}
+
+/// One star's magnitude, `0.0..=1.0` with `1.0` the brightest — a genuine distribution rather
+/// than an even scatter, so most of the field is faint and a handful stand out.
+///
+/// A pure function of the star's index and this module's fixed seeds, exactly like its position:
+/// nothing about the fleet reaches the star layer, and nothing about the frame size does either.
+fn star_magnitude(index: usize) -> f32 {
+    value_noise(index as f32 * 0.123, 200.0, 11).powf(STAR_MAGNITUDE_SKEW)
 }
 
 /// Sample one full ambient-scene animation loop, [`FRAME_COUNT`] frames, phase evenly spaced over
@@ -1574,6 +1703,173 @@ mod tests {
         let mut single = vec![[0.0f32; 4]; 200 * 150];
         render_band(&mut single, 200, 150, 0, 150, 0.9);
         assert_eq!(threaded, single);
+    }
+
+    #[test]
+    fn the_starfield_is_many_faint_stars_and_a_few_bright_ones() {
+        let magnitudes: Vec<f32> = (0..STAR_COUNT).map(star_magnitude).collect();
+        let faint = magnitudes.iter().filter(|m| **m < 0.25).count();
+        let bright = magnitudes.iter().filter(|m| **m > 0.8).count();
+
+        // A real magnitude distribution, not an even scatter: the great majority of the field is
+        // faint and only a handful stand out. An even scatter would put ~75% above 0.25.
+        assert!(
+            faint > STAR_COUNT / 2,
+            "{faint} of {STAR_COUNT} stars are faint — the field is an even scatter, not a distribution"
+        );
+        assert!(
+            (1..STAR_COUNT / 20).contains(&bright),
+            "{bright} of {STAR_COUNT} stars are bright — 'very few' has to be some, and few"
+        );
+    }
+
+    #[test]
+    fn only_the_brightest_few_stars_scintillate() {
+        let mut magnitudes: Vec<f32> = (0..STAR_COUNT).map(star_magnitude).collect();
+        let scintillating = magnitudes
+            .iter()
+            .filter(|m| **m > STAR_SCINTILLATION_MAGNITUDE)
+            .count();
+        magnitudes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // The bar is the *few*, not the constant: a threshold that names none loses the twinkle
+        // entirely, and one that names most of the sky is a shimmer over everything.
+        assert!(
+            (3..=20).contains(&scintillating),
+            "{scintillating} of {STAR_COUNT} stars scintillate"
+        );
+        // And they really are the brightest ones — nothing below the top decile qualifies.
+        let top_decile = magnitudes[STAR_COUNT - STAR_COUNT / 10];
+        assert!(
+            STAR_SCINTILLATION_MAGNITUDE >= top_decile,
+            "the cut at {STAR_SCINTILLATION_MAGNITUDE} reaches below the top decile at {top_decile}"
+        );
+    }
+
+    #[test]
+    fn the_rendered_starfield_is_not_one_flat_white() {
+        // Nothing but the void and the stars, so every pixel above the background is a star.
+        let (width, height) = (600u32, 400u32);
+        let layout = build_layout(&[], width, height);
+        let rgba = frame(&layout, 0.0);
+
+        let mut coloured = 0usize;
+        let mut brightest = 0u8;
+        let mut faintest = u8::MAX;
+        for px in rgba.chunks_exact(4) {
+            let (r, g, b) = (px[0], px[1], px[2]);
+            let peak = r.max(g).max(b);
+            // Comfortably above the void and its faint centre-row lift.
+            if peak < 60 {
+                continue;
+            }
+            brightest = brightest.max(peak);
+            faintest = faintest.min(peak);
+            if peak - r.min(g).min(b) >= 10 {
+                coloured += 1;
+            }
+        }
+
+        assert!(
+            coloured >= 8,
+            "only {coloured} star pixels carry any colour temperature at all"
+        );
+        assert!(
+            brightest as u16 > faintest as u16 * 2,
+            "every star drew at about the same brightness ({faintest}..{brightest})"
+        );
+    }
+
+    /// Mean shaded colour across a short vertical run at horizontal position `nx` (in normalised
+    /// body-radius units), so the surface texture's own mottling averages out and the shading
+    /// term under test is what is left.
+    ///
+    /// Lit from `(1, 0, 0)` — straight along +x and in the screen plane. `light_dir_toward` always
+    /// tilts a real body's light toward the eye, which puts the terminator off-centre; a purely
+    /// in-plane light instead puts `lambert == nx` exactly, so a sample position names the point
+    /// on the day/night curve it is testing.
+    fn shaded_mean(nx: f32) -> (f32, f32, f32) {
+        const RADIUS: f32 = 100.0;
+        const BASE: (f32, f32, f32) = (0.8, 0.8, 0.8);
+        let mut sum = (0.0, 0.0, 0.0);
+        let samples = 9;
+        for i in 0..samples {
+            let ny = (i as f32 / (samples - 1) as f32 - 0.5) * 0.16;
+            let (r, g, b) = shade_surface(
+                nx * RADIUS,
+                ny * RADIUS,
+                RADIUS,
+                (1.0, 0.0, 0.0),
+                BASE,
+                17,
+                false,
+            );
+            sum = (sum.0 + r, sum.1 + g, sum.2 + b);
+        }
+        let n = samples as f32;
+        (sum.0 / n, sum.1 / n, sum.2 / n)
+    }
+
+    fn luminance(rgb: (f32, f32, f32)) -> f32 {
+        rgb.0 * 0.299 + rgb.1 * 0.587 + rgb.2 * 0.114
+    }
+
+    #[test]
+    fn the_sunlit_limb_carries_an_atmospheric_rim() {
+        let limb = luminance(shaded_mean(0.97));
+        let inside = luminance(shaded_mean(0.75));
+
+        // Limb darkening alone makes the very edge of a body the *dimmest* part of its lit face.
+        // The rim is what turns that edge into the brightest crescent on the body, which is the
+        // single most photographic detail a planet carries.
+        assert!(
+            limb > inside * 1.25,
+            "the sunlit limb ({limb:.3}) barely outdraws the face inside it ({inside:.3})"
+        );
+    }
+
+    #[test]
+    fn the_night_side_carries_returned_light_rather_than_a_flat_fill() {
+        let night_limb = luminance(shaded_mean(-0.97));
+        let deep_night = luminance(shaded_mean(-0.45));
+
+        // Under a flat ambient fill this comparison runs the other way: limb darkening makes the
+        // night limb the darkest place on the body. Planetshine reverses it, which is the whole
+        // difference between a body in a system and a body in a lit box.
+        assert!(
+            night_limb > deep_night * 1.08,
+            "the night limb ({night_limb:.3}) is no brighter than the night face ({deep_night:.3})"
+        );
+    }
+
+    #[test]
+    fn the_terminator_is_a_soft_warm_transition() {
+        let terminator = shaded_mean(0.0);
+        let day = shaded_mean(0.6);
+        let night = luminance(shaded_mean(-0.35));
+
+        // Soft: at the day/night line itself the surface is still measurably lit. A hard
+        // `lambert.max(0.0)` puts it exactly on the night floor instead.
+        assert!(
+            luminance(terminator) > night * 1.15,
+            "the terminator ({:.3}) sits on the night floor ({night:.3})",
+            luminance(terminator)
+        );
+        // Warm: grazing light travels a longer path through an atmosphere and comes out red, and
+        // the transition is the only place on the body that happens.
+        let warm_ratio = |rgb: (f32, f32, f32)| rgb.0 / rgb.2;
+        assert!(
+            warm_ratio(terminator) > warm_ratio(day) * 1.3,
+            "the terminator is no warmer than the day side: {:.3} against {:.3}",
+            warm_ratio(terminator),
+            warm_ratio(day)
+        );
+        // And the warmth stays inside the band — the day face keeps the body's own colour.
+        assert!(
+            (warm_ratio(day) - 1.0).abs() < 0.02,
+            "the day side has been tinted too: {:.3}",
+            warm_ratio(day)
+        );
     }
 
     #[test]
