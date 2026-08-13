@@ -512,25 +512,36 @@ impl WorkspaceListEntry {
     /// Deliberately not [`Self::depth`]. Depth says where a row *hangs* — it is
     /// the ownership edge, and it is what the connectors are measured from.
     /// Rank says what the row *is*, and it is what the card's size is measured
-    /// from. The two agree for a Space, and they come apart for exactly one
-    /// row: a worker the first mate opened directly.
+    /// from. They come apart in both directions, and for the same reason: a
+    /// row's kind is the honest answer about what it is, and the depth of the
+    /// chain that opened it is not.
     ///
-    /// That row hangs off the first mate, because that is genuinely who owns
-    /// it, so its connector is a branch off the trunk at depth 1 — the same
-    /// column a second mate's is. Reading its rank off that depth would then
-    /// promote it to second mate purely because of who spawned it, which is the
-    /// one outcome the captain ruled out: *"sub agent size card, not secondmate
-    /// or first mate ssize."* A mate is a Space; an agent pane is a worker or a
-    /// sub agent wherever it hangs, so the row's *kind* is the honest answer and
-    /// its depth is not.
+    /// A worker the first mate opened directly hangs off the first mate,
+    /// because that is genuinely who owns it, so its connector is a branch off
+    /// the trunk at depth 1 — the same column a second mate's is. Reading its
+    /// rank off that depth would promote it to second mate purely because of
+    /// who spawned it, which is the one outcome the captain ruled out: *"sub
+    /// agent size card, not secondmate or first mate ssize."*
+    ///
+    /// A mate nested under another mate is the mirror of it. A Space is what a
+    /// mate *is*, so a second mate that has itself dispatched a second mate
+    /// leaves a Space at depth 2 — and reading its rank off that depth would
+    /// demote it to a worker purely because of who spawned it, drawing a
+    /// persistent mate at exactly a one-off task's size. A mate is a Space
+    /// wherever it hangs, which is what
+    /// [`crate::app::agent_tree::AgentRelation::for_space`] says and
+    /// [`crate::app::agent_tree::AgentRelation::from_depth`], which answers for
+    /// panes, cannot.
     ///
     /// See [`rank_width_inset`] for what a rank is actually worth on screen,
-    /// and [`tie_workers_to_a_second_mate`] for the re-parenting that runs
-    /// before this and keeps the fallback rare.
+    /// [`rank_residual_spans`] for how the rails reach a card whose rank and
+    /// level disagree in either direction, and
+    /// [`tie_workers_to_a_second_mate`] for the re-parenting that runs before
+    /// this and keeps the worker fallback rare.
     pub(crate) fn rank(&self) -> crate::app::agent_tree::AgentRelation {
         match self {
             Self::Workspace { depth, .. } => {
-                crate::app::agent_tree::AgentRelation::from_depth(*depth)
+                crate::app::agent_tree::AgentRelation::for_space(*depth)
             }
             Self::Agent { .. } => crate::app::agent_tree::AgentRelation::Worker,
         }
@@ -1602,11 +1613,11 @@ fn rank_step(fold_width: u16) -> u16 {
 /// included — widens together and the cards' right edges come out flush.
 ///
 /// Read off the *level*, not off a row's rank, because a column is shared by
-/// every row standing in it and a rank is one row's own. The two agree for every
-/// Space and every worker under a mate; where they come apart —
-/// [`WorkspaceListEntry::rank`]'s one case, a worker the first mate opened — the
-/// row's card is narrower than its column, and the leftover is drawn as branch
-/// by [`rank_residual_spans`].
+/// every row standing in it and a rank is one row's own. The two agree for
+/// every worker under a mate, and they come apart both ways — a worker the
+/// first mate opened is drawn narrower than its column, a mate nested under a
+/// mate wider than its own. [`fit_rails_to_card`] is where a row's rails are
+/// reconciled with the card they point at, whichever way round the two fell.
 ///
 /// [`tree_prefix_columns`] is the same number per *row*, which is what the
 /// renderer actually draws and the layout actually budgets against.
@@ -1647,12 +1658,16 @@ fn card_left_offset(
 /// actually begins.
 ///
 /// Zero for every row whose rank is the one its level implies, which is every
-/// Space and every worker under a mate. It is non-zero for exactly the row
-/// [`WorkspaceListEntry::rank`] exists for — a worker the first mate opened,
-/// which hangs at a second mate's level and is drawn a sub agent's width — and
-/// there it is the last stretch of that row's own branch, running on to the
-/// border it points at. Blank on any other row of the same card, because
-/// nothing is travelling there.
+/// worker under a mate. It is non-zero for the row that is drawn *narrower*
+/// than its level — a worker the first mate opened, which hangs at a second
+/// mate's level and is drawn a sub agent's width — and there it is the last
+/// stretch of that row's own branch, running on to the border it points at.
+/// Blank on any other row of the same card, because nothing is travelling
+/// there.
+///
+/// Zero as well for a row drawn *wider* than its level, which cannot be
+/// expressed as columns to add: see [`fit_rails_to_card`], which is what every
+/// row is actually measured with.
 fn rank_residual_spans(
     depth: u8,
     rank: crate::app::agent_tree::AgentRelation,
@@ -1674,6 +1689,71 @@ fn rank_residual_spans(
         "─".repeat(residual),
         Style::default().fg(p.overlay0),
     )]
+}
+
+/// Run a row's rails to the column its card actually begins in.
+///
+/// The one place a rank is reconciled with the level it hangs at, so no caller
+/// has to know which way the two came apart. [`card_rail_prefix`] and
+/// [`agent_row_prefix`] measure a row's rails to [`tree_column`] — the column
+/// its *level* stands in — because a column is shared by every row standing in
+/// it. A row's card begins at [`card_left_offset`], which is its own, and the
+/// two disagree in both directions:
+///
+/// - Card further **right** than the column — a worker the first mate opened.
+///   The branch carries on across the gap, which is [`rank_residual_spans`].
+/// - Card further **left** than the column — a mate nested under a mate, drawn
+///   a mate's width in a level whose ladder rung is a worker's. There are no
+///   columns to add; the rails have to give back the ones the level claimed, or
+///   they would be drawn *inside* the card they are pointing at.
+///
+/// Giving them back is a trim rather than a narrower prefix so that
+/// `card_rail_prefix` stays a pure function of the level, which is what keeps
+/// every row standing in a column aligned with every other.
+fn fit_rails_to_card(
+    spans: &mut Vec<Span<'static>>,
+    depth: u8,
+    rank: crate::app::agent_tree::AgentRelation,
+    fold_width: u16,
+    meets_a_card: bool,
+    p: &Palette,
+) {
+    let column = tree_column(depth, fold_width);
+    let card = card_left_offset(depth, rank, fold_width);
+    if card >= column {
+        spans.extend(rank_residual_spans(
+            depth,
+            rank,
+            fold_width,
+            meets_a_card,
+            p,
+        ));
+    } else {
+        trim_spans_right(spans, usize::from(column - card));
+    }
+}
+
+/// Drop `columns` off the right-hand end of an already-built row prefix.
+///
+/// Rails are single-column glyphs and padding, so a span that has to be cut
+/// part-way is cut by characters. Anything wider than one column per character
+/// is dropped whole rather than split, because half of a wide glyph is not a
+/// column of anything.
+fn trim_spans_right(spans: &mut Vec<Span<'static>>, columns: usize) {
+    let mut left = columns;
+    while left > 0 {
+        let Some(last) = spans.last_mut() else { return };
+        let width = display_width(&last.content);
+        let chars = last.content.chars().count();
+        if width <= left || width != chars {
+            left = left.saturating_sub(width);
+            spans.pop();
+            continue;
+        }
+        let kept: String = last.content.chars().take(chars - left).collect();
+        last.content = kept.into();
+        return;
+    }
 }
 
 /// Columns reserved at the right edge of a Space row's first line for the
@@ -3370,31 +3450,15 @@ fn render_agent_row(
             trunk.as_ref(),
             fold_width,
         );
-        // Right-alignment moved the card away from its connector by the rank's
-        // inset. The branch carries on across that gap; the rails above and
-        // below it are blank, because nothing is travelling there.
+        // The rails are measured to the row's level; the card is placed by the
+        // row's rank. Fit one to the other — the branch carries on across a gap
+        // right-alignment opened, and gives columns back where the card starts
+        // ahead of them. The rails above and below the connector are blank
+        // either way, because nothing is travelling there.
         let rank = entry.rank();
-        connector.extend(rank_residual_spans(
-            entry.depth(),
-            rank,
-            fold_width,
-            true,
-            p,
-        ));
-        above.extend(rank_residual_spans(
-            entry.depth(),
-            rank,
-            fold_width,
-            false,
-            p,
-        ));
-        below.extend(rank_residual_spans(
-            entry.depth(),
-            rank,
-            fold_width,
-            false,
-            p,
-        ));
+        fit_rails_to_card(&mut connector, entry.depth(), rank, fold_width, true, p);
+        fit_rails_to_card(&mut above, entry.depth(), rank, fold_width, false, p);
+        fit_rails_to_card(&mut below, entry.depth(), rank, fold_width, false, p);
         if entry.depth() > 0 {
             connector.push(connector_joint_span(p));
         }
@@ -3495,16 +3559,17 @@ fn render_agent_row(
                         fold_width,
                     )
                 };
-                // The columns right-alignment opened up between the connector
-                // and the card, before the border's own column below.
+                // The columns between where the rails stop and where the card
+                // begins, before the border's own column below.
                 let on_connector_row = row_index as u16 == connector_row;
-                spans.extend(rank_residual_spans(
+                fit_rails_to_card(
+                    &mut spans,
                     entry.depth(),
                     entry.rank(),
                     fold_width,
                     on_connector_row,
                     p,
-                ));
+                );
                 // The frame's own column and the pad inside it. Blank, so the
                 // border can be laid over the first of them once the row has
                 // had its say — except on the connector row of a nested card,
@@ -3532,9 +3597,15 @@ fn render_agent_row(
                 // A bare row is right-aligned by the same offset its card would
                 // have been, so a panel that folds mid-fleet does not restripe
                 // the tree's left edges as it crosses the threshold.
-                let gap = rank_residual_spans(entry.depth(), entry.rank(), fold_width, false, p);
                 let gap_width = usize::from(rank_width_inset(entry.rank(), fold_width));
-                spans.extend(gap);
+                fit_rails_to_card(
+                    &mut spans,
+                    entry.depth(),
+                    entry.rank(),
+                    fold_width,
+                    false,
+                    p,
+                );
                 (
                     spans,
                     (card.rect.width as usize)
@@ -5209,7 +5280,7 @@ fn render_workspace_list(
                 row_content_width(
                     fold_width,
                     own_depth,
-                    crate::app::agent_tree::AgentRelation::from_depth(own_depth),
+                    crate::app::agent_tree::AgentRelation::for_space(own_depth),
                     0,
                 )
             });
@@ -5259,17 +5330,13 @@ fn render_workspace_list(
                     fold_width,
                 );
                 connector.append(&mut owned);
-                // The branch runs on across the columns right-alignment opened
-                // between it and the card's border.
-                connector.extend(rank_residual_spans(
-                    own_depth, own_rank, fold_width, true, p,
-                ));
+                // The branch runs on to the card's border, or stops short of
+                // the column its level claimed when the card starts first.
+                fit_rails_to_card(&mut connector, own_depth, own_rank, fold_width, true, p);
                 connector.push(connector_joint_span(p));
             } else {
                 connector.push(Span::raw(" "));
-                connector.extend(rank_residual_spans(
-                    own_depth, own_rank, fold_width, true, p,
-                ));
+                fit_rails_to_card(&mut connector, own_depth, own_rank, fold_width, true, p);
             }
             let (mut above, _) = card_rail_prefix(
                 own_depth,
@@ -5289,12 +5356,8 @@ fn render_workspace_list(
                 trunk.as_ref(),
                 fold_width,
             );
-            above.extend(rank_residual_spans(
-                own_depth, own_rank, fold_width, false, p,
-            ));
-            below.extend(rank_residual_spans(
-                own_depth, own_rank, fold_width, false, p,
-            ));
+            fit_rails_to_card(&mut above, own_depth, own_rank, fold_width, false, p);
+            fit_rails_to_card(&mut below, own_depth, own_rank, fold_width, false, p);
             render_card_border_rails(
                 frame,
                 card,
@@ -5380,16 +5443,17 @@ fn render_workspace_list(
                         )
                     };
                     spans.append(&mut prefix);
-                    // The columns right-alignment opened up between the
-                    // connector and the card, before the border's own column.
+                    // The columns between where the rails stop and where the
+                    // card begins, before the border's own column.
                     let on_connector_row = row_index as u16 == connector_row;
-                    spans.extend(rank_residual_spans(
+                    fit_rails_to_card(
+                        &mut spans,
                         own_depth,
                         own_rank,
                         fold_width,
                         on_connector_row,
                         p,
-                    ));
+                    );
                     // The frame's own column and the pad inside it. Blank, so
                     // the border can be laid over the first of them once the
                     // row has had its say — except on the connector row of a
@@ -5442,9 +5506,7 @@ fn render_workspace_list(
                     };
                     // Same right-alignment offset a card would have taken, so a
                     // panel folding mid-fleet keeps one set of left edges.
-                    spans.extend(rank_residual_spans(
-                        own_depth, own_rank, fold_width, false, p,
-                    ));
+                    fit_rails_to_card(&mut spans, own_depth, own_rank, fold_width, false, p);
                     (card.rect.width as usize)
                         .saturating_sub(prefix_width)
                         .saturating_sub(usize::from(rank_width_inset(own_rank, fold_width)))
@@ -11208,6 +11270,184 @@ mod ownership_is_drawn_as_written {
             assert_eq!(frame.x, 1);
             assert_eq!(frame.width, fold - 1);
         }
+    }
+
+    // ------------------------------------------------------- nested mates
+
+    /// A second mate that has itself dispatched a second mate, with a worker
+    /// under the deeper of the two.
+    ///
+    /// No home has run this shape yet, so it is built here rather than
+    /// captured: nesting a Space is nothing more than pointing its `owner`
+    /// token at another Space's tree name, which is the same edge
+    /// [`mate_fleet`] uses one level up.
+    fn nested_mate_fleet() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut nested = Workspace::test_new("3rdmate");
+        let worker = nested.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![
+            Workspace::test_new("firstmate"),
+            Workspace::test_new("2ndmate-a"),
+            nested,
+        ];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        for (ws_idx, owner) in [(1usize, "firstmate"), (2, "2ndmate-a")] {
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+
+        let owner_id = app.workspaces[2].id.clone();
+        let terminal_id = app.workspaces[2].tabs[0].panes[&worker]
+            .attached_terminal_id
+            .clone();
+        if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+            terminal.set_agent_name("deep-worker".to_string());
+            terminal.state = AgentState::Idle;
+            terminal.created_by = Some(crate::api::schema::PaneOrigin {
+                pane_id: "deep-worker".to_string(),
+                workspace_id: owner_id,
+            });
+        }
+        app
+    }
+
+    /// Every row the panel actually draws, as text, at the captain's width.
+    fn drawn_panel(mut app: crate::app::state::AppState, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, CAPTAIN_SIDEBAR_WIDTH, height);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("a test backend");
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .expect("the panel draws");
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|col| buffer[(col, area.y + row)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A mate is a mate wherever it hangs. Nested under another mate it sits at
+    /// depth 2, which is a *worker's* rung of the ladder — and reading its rank
+    /// off that depth drew a persistent mate at exactly the size of the one-off
+    /// tasks running underneath it.
+    #[test]
+    fn a_mate_nested_under_a_mate_is_still_a_mate() {
+        let app = nested_mate_fleet();
+        let (nested, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "3rdmate");
+        assert_eq!(depth, 2, "the fixture did not nest the second mate at all");
+        assert_eq!(
+            rank,
+            AgentRelation::SecondMate,
+            "a mate two levels down was demoted to a worker by its depth"
+        );
+
+        // The worker in its Space hangs deeper still, and is the row the mate
+        // must not be mistaken for.
+        let (worker, worker_depth, worker_rank) =
+            frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "deep-worker");
+        assert!(worker_depth > depth, "the fixture lost the worker's edge");
+        assert_eq!(worker_rank, AgentRelation::Worker);
+        assert!(
+            nested.width > worker.width,
+            "a nested mate drew a worker's card: {} vs {} cols",
+            nested.width,
+            worker.width
+        );
+
+        // And it is still nested: a mate under a mate is not drawn as its
+        // parent's peer.
+        let (parent, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "2ndmate-a");
+        assert!(
+            nested.width < parent.width,
+            "a nested mate drew its parent's card: {} vs {} cols",
+            nested.width,
+            parent.width
+        );
+        assert_eq!(
+            nested.x + nested.width,
+            parent.x + parent.width,
+            "the cards stopped being right-aligned"
+        );
+    }
+
+    /// The rails of a nested mate stop where its card starts.
+    ///
+    /// Its card is wider than its level's column, which is the one direction
+    /// [`rank_residual_spans`] cannot express: without [`fit_rails_to_card`]
+    /// the columns the level claimed are still drawn, and the branch runs on
+    /// *inside* the card it is pointing at.
+    #[test]
+    fn a_nested_mates_branch_stops_at_its_border() {
+        let app = nested_mate_fleet();
+        let rows = drawn_panel(app, 24);
+        let screen = rows.join("\n");
+        let row = rows
+            .iter()
+            .find(|row| row.contains("3rdmate"))
+            .unwrap_or_else(|| panic!("the nested mate drew no row:\n{screen}"));
+
+        let cells: Vec<char> = row.chars().collect();
+        let name = row
+            .find("3rdmate")
+            .and_then(|byte| row[..byte].chars().count().into())
+            .expect("the row holds the name");
+        let border = cells[..name]
+            .iter()
+            .rposition(|glyph| *glyph == '\u{2502}')
+            .unwrap_or_else(|| panic!("the nested mate drew no left border:\n{screen}"));
+
+        assert!(
+            cells[border + 1..name].iter().all(|glyph| *glyph == ' '),
+            "the branch was drawn inside the card it points at:\n{screen}"
+        );
+        assert!(
+            cells[..border]
+                .iter()
+                .any(|glyph| *glyph == '\u{251c}' || *glyph == '\u{2514}'),
+            "the nested mate lost the connector it hangs off:\n{screen}"
+        );
+        assert_eq!(
+            cells[border - 1],
+            '\u{2500}',
+            "the branch stops short of the border it points at:\n{screen}"
+        );
+    }
+
+    /// The rows that were already drawn are drawn the same way.
+    ///
+    /// [`fit_rails_to_card`] only takes columns back from a row whose card is
+    /// wider than its level, which no row in the captain's own fleet is, so the
+    /// whole panel it renders today must be byte-for-byte what it was.
+    #[test]
+    fn a_fleet_with_no_nested_mate_draws_exactly_as_it_did() {
+        let rows = drawn_panel(mate_fleet(), 32);
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                !row.contains("\u{2502}\u{2500}"),
+                "row {index} ran a rail into a card border:\n{}",
+                rows.join("\n")
+            );
+        }
+        // The ladder itself is unchanged: three ranks, three widths.
+        let widths: Vec<u16> = ["firstmate", "2ndmate-a", "a-one"]
+            .into_iter()
+            .map(|name| frame_of(&mate_fleet(), CAPTAIN_SIDEBAR_WIDTH, name).0.width)
+            .collect();
+        assert_eq!(widths, vec![39, 33, 27]);
     }
 }
 

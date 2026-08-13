@@ -124,6 +124,23 @@ impl AgentRelation {
         }
     }
 
+    /// The relation a **Space** at `depth` has.
+    ///
+    /// A Space is a mate's own entry in the tree, and a mate is some tier of
+    /// mate wherever it hangs. [`Self::from_depth`] cannot say that on its own:
+    /// it answers for a pane, where past the second mate there is nothing left
+    /// to be but a worker, so a mate that has itself been dispatched by another
+    /// mate would come back `Worker` purely because of how deep the chain that
+    /// opened it ran.
+    ///
+    /// So the depth is saturated before it is read, and the
+    /// `FirstMate`/`SecondMate` boundary is still [`Self::from_depth`]'s alone —
+    /// there is one place that decides where a root stops being a root, and
+    /// this is not a second copy of it.
+    pub(crate) fn for_space(depth: u8) -> Self {
+        Self::from_depth(depth.min(1))
+    }
+
     /// Stable wire/config name. Matched by the Agents view grammar, so these
     /// strings are part of the API surface.
     pub(crate) fn as_str(self) -> &'static str {
@@ -845,6 +862,36 @@ mod tests {
             );
         }
         assert!(RELATION_VALUES.contains(&SUB_AGENT_RELATION));
+    }
+
+    /// A Space is a mate, and a mate is some tier of mate however deep the
+    /// chain that dispatched it ran. The tail of `from_depth` is a worker
+    /// because it answers for panes; reading a Space off it would demote a
+    /// second mate that has itself spawned a second mate.
+    #[test]
+    fn a_space_is_never_a_worker_however_deeply_it_is_nested() {
+        // Where the two agree, they agree exactly: `for_space` adds saturation
+        // and nothing else, so the FirstMate/SecondMate boundary has not been
+        // written down twice.
+        for depth in [0u8, 1] {
+            assert_eq!(
+                AgentRelation::for_space(depth),
+                AgentRelation::from_depth(depth),
+                "a Space at depth {depth} moved the boundary from_depth already sets"
+            );
+        }
+        for depth in 2u8..=u8::MAX {
+            assert_eq!(
+                AgentRelation::for_space(depth),
+                AgentRelation::SecondMate,
+                "a Space at depth {depth} is not a mate"
+            );
+            assert_eq!(
+                AgentRelation::from_depth(depth),
+                AgentRelation::Worker,
+                "the pane rule stopped being the thing a Space has to diverge from"
+            );
+        }
     }
 
     #[test]
