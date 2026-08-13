@@ -4313,6 +4313,17 @@ impl HeadlessServer {
                         self.app.state.tab_scroll,
                         self.app.state.mobile_switcher_scroll,
                     ));
+                    // This client draws pane rects its own size around grids
+                    // the foreground client sized, so any difference is real
+                    // wrongness on screen for as long as both stay attached.
+                    // Say so on the client it happens to; the foreground one's
+                    // panes are correct and gets nothing.
+                    self.app.state.pane_size_pin = (!is_foreground
+                        && (cols, rows) != self.effective_size)
+                        .then_some(crate::app::state::PaneSizePin {
+                            shared: self.effective_size,
+                            client: (cols, rows),
+                        });
                     let cursor = renderer.render_app(
                         &mut self.app.state,
                         &self.app.terminal_runtimes,
@@ -4320,6 +4331,7 @@ impl HeadlessServer {
                         is_foreground,
                         render_cell_size,
                     );
+                    self.app.state.pane_size_pin = None;
                     if let Some((workspace, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
                         self.app.state.tab_scroll = tab;
@@ -9505,13 +9517,20 @@ next_tab = ""
         let active_pane = workspace.tabs[0].root_pane;
         let background_tab = workspace.test_add_tab(Some("background"));
         let background_pane = workspace.tabs[background_tab].root_pane;
+        // Two rows each, because the smaller client's first terminal-area row
+        // is spent on the pane-size-pin banner below; the pane content this
+        // test is actually about has to survive it.
         workspace.tabs[0].runtimes.insert(
             active_pane,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"active"),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"active\r\nactive"),
         );
         workspace.tabs[background_tab].runtimes.insert(
             background_pane,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"background"),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                80,
+                24,
+                b"background\r\nbackground",
+            ),
         );
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
@@ -9559,8 +9578,18 @@ next_tab = ""
         let mobile_text = frame_text(&mobile_frame);
         let mut mobile_rows = mobile_text.lines();
         let mobile_header = mobile_rows.by_ref().take(2).collect::<String>();
+        // This client is a different size from the one that owns the shared
+        // pane runtimes, so the first row of its terminal area is spent saying
+        // so — see `AppState::pane_size_pin`. It is the same top-of-area banner
+        // the config diagnostic uses, and it lands over pane content here for
+        // the same reason that one does.
+        let mobile_pin_notice = mobile_rows.next().unwrap_or_default().to_string();
         let mobile_surface = mobile_rows.collect::<String>();
         assert!(mobile_header.contains("test"), "header: {mobile_header:?}");
+        assert!(
+            mobile_pin_notice.contains("panes pinned to 120x40"),
+            "pin notice: {mobile_pin_notice:?}"
+        );
         assert!(
             mobile_surface.contains("active"),
             "surface: {mobile_surface:?}"
@@ -9956,6 +9985,126 @@ next_tab = ""
         let passes =
             collect_delegated_passes(&mut server, &client_rx, 24, Duration::from_millis(40));
         assert_changed_scenes_ship_carrier_frames(&passes, "sidebar cards");
+    }
+
+    /// A server with one client per size, foreground set to `foreground`, and
+    /// the shared runtime size synced from it.
+    ///
+    /// The returned receivers are the clients' writer ends: dropping them marks
+    /// the clients broken, so they are handed back to be kept alive for the
+    /// life of the test.
+    #[allow(clippy::type_complexity)] // The receivers exist only to be kept alive.
+    fn pane_size_pin_test_server(
+        sizes: &[(u16, u16)],
+        foreground: u64,
+    ) -> (
+        HeadlessServer,
+        Vec<(
+            std::sync::mpsc::Receiver<Vec<u8>>,
+            std::sync::mpsc::Receiver<Vec<u8>>,
+        )>,
+    ) {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let mut keepalive = Vec::new();
+        for (index, &terminal_size) in sizes.iter().enumerate() {
+            let client_id = index as u64 + 1;
+            let (client_tx, client_control_rx, client_rx) = test_client_writer();
+            keepalive.push((client_control_rx, client_rx));
+            server.clients.insert(
+                client_id,
+                ClientConnection::new(
+                    terminal_size,
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    client_id,
+                    RenderEncoding::SemanticFrame,
+                    Some(client_tx),
+                ),
+            );
+        }
+        server.foreground_client_id = Some(foreground);
+        server.sync_foreground_client_state();
+
+        (server, keepalive)
+    }
+
+    fn client_frame_contains(server: &HeadlessServer, client_id: u64, needle: &str) -> bool {
+        let client = server.clients.get(&client_id).expect("client should exist");
+        let buffer = client
+            .renderer
+            .rendered_buffer()
+            .expect("client should have rendered");
+        let area = buffer.area;
+        (area.y..area.y + area.height).any(|row| {
+            (area.x..area.x + area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect::<String>()
+                .contains(needle)
+        })
+    }
+
+    #[test]
+    fn differently_sized_secondary_client_is_told_its_panes_are_pinned() {
+        let (mut server, _keepalive) = pane_size_pin_test_server(&[(160, 50), (100, 30)], 2);
+
+        server.render_and_stream();
+
+        assert!(
+            client_frame_contains(&server, 1, "panes pinned to 100x30 by another client"),
+            "the reshaped client should say why its panes do not fit"
+        );
+        assert!(
+            !client_frame_contains(&server, 2, "panes pinned to"),
+            "the foreground client's panes are correct and it should be told nothing"
+        );
+        assert!(
+            server.app.state.pane_size_pin.is_none(),
+            "the notice is one client's, and must not survive that client's draw"
+        );
+    }
+
+    #[test]
+    fn same_size_secondary_client_gets_no_pin_warning() {
+        let (mut server, _keepalive) = pane_size_pin_test_server(&[(120, 40), (120, 40)], 2);
+
+        server.render_and_stream();
+
+        // Same size means the shared runtimes are already this client's size,
+        // which is the whole reason the non-resizing path is safe.
+        assert!(!client_frame_contains(&server, 1, "panes pinned to"));
+        assert!(!client_frame_contains(&server, 2, "panes pinned to"));
+    }
+
+    #[test]
+    fn single_client_gets_no_pin_warning() {
+        let (mut server, _keepalive) = pane_size_pin_test_server(&[(120, 40)], 1);
+
+        server.render_and_stream();
+
+        assert!(!client_frame_contains(&server, 1, "panes pinned to"));
+    }
+
+    #[test]
+    fn pin_warning_clears_when_the_other_client_detaches() {
+        let (mut server, _keepalive) = pane_size_pin_test_server(&[(160, 50), (100, 30)], 2);
+        server.render_and_stream();
+        assert!(client_frame_contains(&server, 1, "panes pinned to 100x30"));
+
+        server.clients.remove(&2);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.render_and_stream();
+
+        assert!(
+            !client_frame_contains(&server, 1, "panes pinned to"),
+            "the notice should go away on its own when the size mismatch does"
+        );
     }
 
     #[test]

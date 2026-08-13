@@ -13,6 +13,8 @@ Detach the client with `ctrl+b q`; panes and agents keep running. Reattach by ru
 
 When Herdr starts again after a full server stop, it restores the saved session shape. For what survives detach, server restart, screen history replay, native agent session restore, and live handoff, see [Session state and restore](/docs/session-state/).
 
+Several clients can be attached to one session at the same time, and they share the panes rather than each getting their own layout. The panes are sized for whichever client was active most recently, so if another client of a different terminal size attaches and takes over, your panes keep the other client's size: content fills only part of each pane, or runs off the bottom. Herdr says so — a client in that state shows `panes pinned to <cols>x<rows> by another client` at the top right, naming the size that currently owns the panes. It clears by itself once the other client detaches or both terminals are the same size.
+
 ## Named sessions
 
 Use named sessions when you want independent Herdr servers.
