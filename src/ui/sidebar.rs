@@ -1184,6 +1184,24 @@ fn tie_workers_to_a_second_mate(
     }
 }
 
+/// Which band of a parent's children a worker pane draws in, and which one a
+/// Space draws in. Workers first: a mate's own directly-dispatched workers are
+/// the rows that belong immediately beneath it.
+///
+/// Without this the order was decided by node index, and the node list is
+/// Spaces then panes purely because that is how [`arrange_space_tree`] builds
+/// it. So a first mate's own workers sorted below *every* second mate — and
+/// because the walk is depth-first, below each of those mates' own workers too,
+/// which put the first mate's most immediate rows at the very bottom of the
+/// panel with three levels of somebody else's tree in between.
+///
+/// Stated as two bands rather than by reordering the node list, because the
+/// node list's order is also its identity: [`arrange_space_tree`] maps a
+/// placement back to a Space or a pane by comparing its index against the Space
+/// count. Order and identity should not be the same fact.
+const WORKER_SIBLING_GROUP: u8 = 0;
+const SPACE_SIBLING_GROUP: u8 = 1;
+
 /// Arrange `blocks` and the owned agent panes into one tree, then flatten it.
 ///
 /// Every Space and every owned pane goes through
@@ -1191,6 +1209,9 @@ fn tie_workers_to_a_second_mate(
 /// under its second mate's Space by exactly the same rule that nests a second
 /// mate under the first mate — including when that second mate is a linked
 /// worktree, which is the shape a fleet run out of one repo actually has.
+///
+/// Within one parent, its worker panes draw before its Spaces — see
+/// [`WORKER_SIBLING_GROUP`].
 fn arrange_space_tree(
     app: &AppState,
     blocks: &[SpaceBlock],
@@ -1221,6 +1242,7 @@ fn arrange_space_tree(
             name: name.as_deref(),
             owner: owner.as_deref(),
             parent: row.structural_parent,
+            sibling_group: SPACE_SIBLING_GROUP,
         })
         .collect();
     nodes.extend(
@@ -1230,6 +1252,7 @@ fn arrange_space_tree(
                 name: entry.agent_name.as_deref(),
                 owner: entry.owner.as_deref(),
                 parent: None,
+                sibling_group: WORKER_SIBLING_GROUP,
             }),
     );
     tie_workers_to_a_second_mate(&rows, &names, agents, &mut nodes);
@@ -5618,6 +5641,110 @@ mod tests {
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
+
+    /// The captain's fleet in miniature: a first mate Space owning a second
+    /// mate Space, with a worker pane under each of them. The first mate's
+    /// worker is *directly* dispatched — it runs in the first mate's own Space
+    /// and names the first mate as its owner, which is the row the report is
+    /// about.
+    fn direct_worker_fleet() -> AppState {
+        let mut app = AppState::test_new();
+        let mut first_mate = Workspace::test_new("firstmate");
+        let direct_pane = first_mate.test_split(ratatui::layout::Direction::Vertical);
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let nested_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![first_mate, second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+
+        let now = std::time::Instant::now();
+        let own = |app: &mut AppState, owner: &str, ws_idx: usize| {
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        };
+        own(&mut app, "firstmate", 1);
+
+        let worker = |app: &mut AppState, ws_idx: usize, pane, name: &str, owner: &str| {
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("test terminal present");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        };
+        worker(&mut app, 0, direct_pane, "direct-worker", "firstmate");
+        worker(&mut app, 1, nested_pane, "nested-worker", "2ndmate-explore");
+        app
+    }
+
+    /// The captain's report: a worker the first mate dispatched itself draws
+    /// immediately under the first mate's own row, with nothing above it but
+    /// the first mate.
+    ///
+    /// It used to draw last. Node index decided sibling order, and every Space
+    /// is appended to the node list before every pane, so the direct worker
+    /// sorted below the second mate — and the depth-first walk then drew that
+    /// mate's own worker in between, putting the first mate's most immediate
+    /// row at the bottom of the panel.
+    #[test]
+    fn a_first_mates_own_worker_draws_directly_under_it() {
+        let app = direct_worker_fleet();
+
+        assert_eq!(
+            tree_shape(&app),
+            vec![
+                (0, "firstmate".to_string()),
+                (1, "direct-worker".to_string()),
+                (1, "2ndmate-explore".to_string()),
+                (2, "nested-worker".to_string()),
+            ]
+        );
+    }
+
+    /// Reordering siblings has to move their connectors with them: the row that
+    /// is now last in the first mate's column is the one that closes it, and
+    /// the direct worker above it must keep an open `├`.
+    #[test]
+    fn reordered_siblings_carry_their_connectors() {
+        let app = direct_worker_fleet();
+        let agents = sidebar_agent_entries(&app);
+        let closes: Vec<(String, bool)> = workspace_list_entries_whole_fleet(&app)
+            .into_iter()
+            .map(|row| {
+                let label = match row {
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => app.workspaces[ws_idx]
+                        .display_name_from(&app.terminals, &TerminalRuntimeRegistry::new()),
+                    WorkspaceListEntry::Agent { entry_idx, .. } => {
+                        agents[entry_idx].agent_name.clone().unwrap_or_default()
+                    }
+                };
+                (label, row.is_last_child())
+            })
+            .collect();
+
+        assert_eq!(
+            closes,
+            vec![
+                ("firstmate".to_string(), true),
+                // No longer the last row in the first mate's column...
+                ("direct-worker".to_string(), false),
+                // ...the second mate is.
+                ("2ndmate-explore".to_string(), true),
+                ("nested-worker".to_string(), true),
+            ]
+        );
+    }
 
     /// A first mate owning a second mate owning a worker, rendered at the
     /// width the captain actually runs.
