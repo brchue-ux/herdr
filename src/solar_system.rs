@@ -577,6 +577,46 @@ const RING_OUTER_PER_STREAK: f32 = 0.070 * STREAK_UNITS;
 /// read as a plane the body sits *in* rather than a halo drawn round it.
 const RING_SQUASH: f32 = 0.34;
 
+/// How far the sun's corona reaches, as a multiple of its own radius.
+///
+/// Far further than a planet's atmospheric fringe, because a corona *is* far further — and it is
+/// what separates the one self-luminous body in the scene from a bright disc with a halo drawn
+/// round it.
+const CORONA_REACH: f32 = 3.4;
+
+/// How many streamers the corona carries around the disc, and how deeply they cut.
+///
+/// Structure rather than an even halo: a real corona is streamers at stated angular widths, and an
+/// evenly falling glow is exactly the "light source" default a scene of real bodies is refusing.
+const CORONA_STREAMERS: f32 = 5.0;
+const CORONA_STREAMER_DEPTH: f32 = 0.55;
+
+/// How far a streamer curls as it leaves the star, in noise units over the whole corona. Small,
+/// because a streamer that wanders is a blob: the structure has to stay recognisably the same
+/// direction all the way out or it stops reading as something leaving the star.
+const CORONA_CURL: f32 = 0.35;
+
+/// How far a prominence reaches past the limb, as a fraction of the corona's own reach, how many
+/// there are around the disc, and how bright they get.
+///
+/// Short, so they read as arcs *off the edge* rather than as a second, lumpier corona.
+const PROMINENCE_REACH: f32 = 0.28;
+const PROMINENCE_COUNT: f32 = 9.0;
+const PROMINENCE_GAIN: f32 = 0.45;
+
+/// How far a ring shadow's edge is feathered, in units of the planet's radius.
+const RING_SHADOW_FEATHER: f32 = 0.06;
+
+/// How much of the direct light a ring shadow removes at its darkest. Not all of it: a ring is
+/// translucent, and a black band across a planet reads as a hole rather than a shadow.
+const RING_SHADOW_DEPTH: f32 = 0.82;
+
+/// How far the *planet's* own shadow reaches across its rings, as a multiple of its radius, and
+/// how deep it goes. The other half of the pair, and the one the ring's particle stream makes
+/// available for the cost of one dot product.
+const PLANET_SHADOW_REACH: f32 = 1.10;
+const PLANET_SHADOW_DEPTH: f32 = 0.88;
+
 /// Ice and dust, straight off the orrery's own palette. Deliberately not severity-coded: a ring is
 /// material, and the body's own colour already carries what state the mate is in — the same
 /// exemption, and for the same reason, as [`SUN_STAR_RGB01`].
@@ -1015,6 +1055,18 @@ const BAND_BELT_LATITUDE: f32 = 0.26;
 const BAND_BELT_HALF_WIDTH: f32 = 0.075;
 const BAND_BELT_DARKEN: f32 = 0.90;
 
+/// Whole turns per animation loop at the equator and at the pole.
+///
+/// Differential rotation: the zonal rate falls toward the poles, so belts travel *past* each other
+/// rather than together — the difference between a banded body and a striped one. Whole numbers
+/// because the loop is baked once and played forever, and a rate that is not a whole number of
+/// turns leaves the belts somewhere else at the end of the loop than at the start.
+const BAND_TURNS: (f32, f32) = (4.0, 2.0);
+
+/// How far the domain warp displaces the band coordinate, at two octaves. The orrery's own
+/// `0.085` / `0.034`.
+const BAND_WARP: (f32, f32) = (0.085, 0.034);
+
 /// Everything about *what a body is made of* that per-pixel shading needs, resolved once per body
 /// rather than threaded through as five more positional arguments.
 ///
@@ -1031,6 +1083,12 @@ struct Surface {
     bands: Option<f32>,
     /// How much of the rocky surface mottling this body keeps, `0.0..=1.0`.
     mottle_scale: f32,
+    /// This body's own rotation, in radians. Bands are advected by it, so a gas giant's belts
+    /// travel past each other instead of being a still image slid around the frame.
+    spin: f32,
+    /// This body's ring, inner and outer radius in units of its own radius, or `None`. Only used
+    /// to cast the ring's shadow back onto the surface.
+    ring: Option<(f32, f32)>,
 }
 
 /// Lambertian shading with a soft warm terminator, an atmospheric rim, planetshine, limb
@@ -1060,6 +1118,8 @@ fn shade_surface(
         self_luminous,
         bands,
         mottle_scale,
+        spin,
+        ring,
     } = surface;
     let nx = dx / radius;
     let ny = dy / radius;
@@ -1081,10 +1141,45 @@ fn shade_surface(
         Some(count) => {
             let seed_phase = (seed & 0xFFFF) as f32 * (2.0 * PI / 65_536.0);
             let latitude = ny;
+
+            // Two harmonics plus a darker belt is a still image being slid around the frame. What
+            // a gas giant actually has is turbulence sheared by **differential rotation**: the
+            // zonal rate falls with latitude, so belts travel past each other and the boundaries
+            // between them curl.
+            //
+            // The longitude of the visible hemisphere is recovered from `nx` and the latitude's
+            // own cosine; the zonal rate is a function of latitude alone; and the band coordinate
+            // is the latitude *warped* by noise in (advected longitude, latitude) — a domain warp,
+            // so the band edges wander instead of tracing a clean sine. Two octaves: one reads as
+            // a wobble and three cost more than they show at these radii.
+            let cos_lat = (1.0 - latitude * latitude).max(1e-3).sqrt();
+            let longitude = (nx / cos_lat).clamp(-1.0, 1.0).asin();
+            // **Whole turns per loop, per latitude.** The zonal rate falls toward the poles, which
+            // is what differential rotation is — but the loop is baked once and played forever, so
+            // a rate that is not a whole number of turns leaves the belts somewhere else at the
+            // end of the loop than at the start. Quantizing the rate is the same answer the
+            // orbital periods needed, for the same reason, and it costs nothing here: what makes a
+            // belt read as sheared is that its neighbour moves at a *different* rate, not that the
+            // difference is smooth.
+            let turns = mix(BAND_TURNS.0, BAND_TURNS.1, latitude * latitude).round();
+            let advected = longitude + seed_phase + spin * turns;
+            // The warp is sampled on the *circle* of the advected longitude rather than on its raw
+            // value, because value noise is a hash lattice and is not periodic: fed the raw
+            // longitude, a belt would land on a different lattice cell after a whole turn and the
+            // seam would show. `cos`/`sin` make the sample exactly periodic in it.
+            let (adv_s, adv_c) = advected.sin_cos();
+            let warp = value_noise(adv_c * 2.3, adv_s * 2.3 + latitude * 5.1, seed) - 0.5;
+            let warp2 = value_noise(
+                adv_c * 5.7,
+                adv_s * 5.7 + latitude * 11.3,
+                seed.wrapping_add(31),
+            ) - 0.5;
+            let warped = latitude + BAND_WARP.0 * warp + BAND_WARP.1 * warp2;
+
             let mut band = 1.0
-                + BAND_PRIMARY * (latitude * count * PI + seed_phase).sin()
-                + BAND_SECONDARY * (latitude * count * 2.7 * PI + seed_phase * 1.7).sin();
-            if (latitude.abs() - BAND_BELT_LATITUDE).abs() < BAND_BELT_HALF_WIDTH {
+                + BAND_PRIMARY * (warped * count * PI + seed_phase).sin()
+                + BAND_SECONDARY * (warped * count * 2.7 * PI + seed_phase * 1.7).sin();
+            if (warped.abs() - BAND_BELT_LATITUDE).abs() < BAND_BELT_HALF_WIDTH {
                 band *= BAND_BELT_DARKEN;
             }
             band
@@ -1116,8 +1211,51 @@ fn shade_surface(
         u * u / (4.0 * TERMINATOR_WIDTH)
     };
 
+    // The rings cast on the planet. Project this surface point back along the light vector to the
+    // ring's own plane and ask whether it lands between the inner and outer radii — that is the
+    // geometry, not a drawn band: the shadow narrows, widens and crosses the disc as the body goes
+    // round, because the light vector does.
+    //
+    // **The ring plane is not `y = 0`.** The ring is drawn as a horizontal ellipse squashed by
+    // [`RING_SQUASH`], so its plane is tilted about the horizontal axis and its normal is
+    // `(0, sqrt(1 - k^2), k)` rather than `(0, 1, 0)`. Solving against the wrong plane puts every
+    // intersection inside the ring's inner radius and the shadow never fires at all.
+    let ring_shadow = match ring {
+        Some((inner, outer)) => {
+            let k = RING_SQUASH;
+            let normal = (0.0, (1.0 - k * k).max(0.0).sqrt(), k);
+            let l_dot_n = light_dir.0 * normal.0 + light_dir.1 * normal.1 + light_dir.2 * normal.2;
+            if l_dot_n.abs() < 0.05 {
+                0.0
+            } else {
+                let p_dot_n = nx * normal.0 + ny * normal.1 + nz * normal.2;
+                let t = -p_dot_n / l_dot_n;
+                if t <= 0.0 {
+                    0.0
+                } else {
+                    let hit = (
+                        nx + t * light_dir.0,
+                        ny + t * light_dir.1,
+                        nz + t * light_dir.2,
+                    );
+                    let rho = (hit.0 * hit.0 + hit.1 * hit.1 + hit.2 * hit.2).sqrt();
+                    // A soft edge, because a hard-edged shadow crossing a disc a few dozen pixels
+                    // across stutters as the body turns.
+                    let edge_in = clamp01(
+                        (rho - (inner - RING_SHADOW_FEATHER)) / (RING_SHADOW_FEATHER * 2.0),
+                    );
+                    let edge_out = clamp01(
+                        ((outer + RING_SHADOW_FEATHER) - rho) / (RING_SHADOW_FEATHER * 2.0),
+                    );
+                    edge_in.min(edge_out) * RING_SHADOW_DEPTH
+                }
+            }
+        }
+        None => 0.0,
+    };
+
     let ambient = 0.10;
-    let lit = ambient + diffuse * (1.0 - ambient);
+    let lit = (ambient + diffuse * (1.0 - ambient)) * (1.0 - ring_shadow);
     let limb_darkening = mix(0.55, 1.0, nz);
     let lit = lit * limb_darkening * mottle;
 
@@ -1237,7 +1375,9 @@ fn draw_body(
 ) {
     let self_luminous = surface.self_luminous;
     let base = surface.base;
-    let glow = radius * if self_luminous { 2.6 } else { 1.4 };
+    // A star's corona reaches far further than a planet's atmospheric fringe, and it is not a
+    // round glow: it has structure. See [`draw_corona`].
+    let glow = radius * if self_luminous { CORONA_REACH } else { 1.4 };
 
     let x0 = (center.0 - glow).floor().max(0.0) as i32;
     let x1 = (center.0 + glow).ceil().min(width as f32) as i32;
@@ -1257,8 +1397,39 @@ fn draw_body(
                 blend(&mut buf[idx], color, aa.max(0.85));
             } else if dist <= glow {
                 let t = 1.0 - (dist - radius) / (glow - radius).max(0.001);
-                let alpha = t * t * if self_luminous { 0.55 } else { 0.22 };
-                blend(&mut buf[idx], base, alpha);
+                if self_luminous {
+                    // The corona: streamers at real angular widths rather than an even halo, and
+                    // prominences arching off the limb. A star with a round glow around it is the
+                    // one body in this scene drawn as a light source rather than as a thing.
+                    let angle = dy.atan2(dx);
+                    let out = (dist - radius) / (glow - radius).max(0.001);
+                    let streamer = mix(
+                        1.0 - CORONA_STREAMER_DEPTH,
+                        1.0,
+                        // Sampled on the *angle*, with only a slight radial curl: a streamer is a
+                        // radial structure — it leaves the star and keeps going — so letting the
+                        // pattern vary freely with distance makes blobs at radii rather than rays
+                        // from a star.
+                        value_noise(angle * CORONA_STREAMERS, out * CORONA_CURL, surface.seed),
+                    );
+                    // Prominences live at the limb and reach only a little way out, so they read
+                    // as arcs off the edge rather than as a second, lumpier corona.
+                    let limbward = clamp01(1.0 - out / PROMINENCE_REACH);
+                    let prominence = PROMINENCE_GAIN
+                        * limbward
+                        * limbward
+                        * clamp01(
+                            value_noise(angle * PROMINENCE_COUNT, 3.0, surface.seed ^ 0x9E37) * 1.8
+                                - 0.9,
+                        );
+                    blend(
+                        &mut buf[idx],
+                        base,
+                        (t * t * 0.55 * streamer + prominence).min(1.0),
+                    );
+                } else {
+                    blend(&mut buf[idx], base, t * t * 0.22);
+                }
             }
         }
     }
@@ -1744,6 +1915,7 @@ const RING_REVOLUTIONS_PER_LOOP: f32 = 2.0;
 /// particle stream is also what lets the ring be occluded correctly by the body it circles for the
 /// cost of one sign test. It is the cheaper of the two as well — a couple of hundred small dots
 /// against an elliptical annulus's whole bounding box.
+#[allow(clippy::too_many_arguments)]
 fn draw_ring(
     buf: &mut [[f32; 4]],
     width: u32,
@@ -1753,6 +1925,7 @@ fn draw_ring(
     half: RingHalf,
     phase: f32,
     seed: u32,
+    sun_pos: (f32, f32),
 ) {
     let Some((inner, outer)) = body.ring_radii_px() else {
         return;
@@ -1765,6 +1938,20 @@ fn draw_ring(
         .clamp(RING_PARTICLE_BOUNDS.0, RING_PARTICLE_BOUNDS.1);
     let bright = RING_BRIGHT + RING_BRIGHT_PER_STREAK * body.streak;
     let spin = phase * RING_REVOLUTIONS_PER_LOOP + body.base_angle;
+
+    // The planet casts on its rings — the other half of the pair, and the one the particle stream
+    // makes available for the cost of a dot product. The test is the shadow cylinder, done in the
+    // *ring's own plane*: a particle is in shadow if it lies anti-sunward of the body and its
+    // perpendicular offset from the body–sun line is inside the body's radius. The ring is drawn
+    // squashed, so the sun direction is un-squashed into the same frame first, or the shadow sits
+    // at the wrong angle by exactly that factor.
+    let (mut sun_x, mut sun_y) = (
+        sun_pos.0 - position.0,
+        (sun_pos.1 - position.1) / RING_SQUASH,
+    );
+    let sun_len = (sun_x * sun_x + sun_y * sun_y).sqrt().max(0.0001);
+    sun_x /= sun_len;
+    sun_y /= sun_len;
     // A particle is drawn about a pixel across at the sizes this scene works at; below that it
     // stops being a particle and starts being noise.
     let dot = (outer * 0.028).max(0.9);
@@ -1788,7 +1975,23 @@ fn draw_ring(
 
         // Brighter where the ring is denser and toward its outer edge, which is what a real ring's
         // brightest arcs look like — a flat-alpha ring reads as a drawn outline.
-        let alpha = (bright * (0.55 + 0.75 * spread)).min(0.92);
+        // In the planet's shadow? Ring-plane offsets, not screen ones.
+        let (qx, qy) = (cos_a * radius, sin_a * radius);
+        let shadow = if qx * sun_x + qy * sun_y < 0.0 {
+            let perp = (qx * sun_y - qy * sun_x).abs();
+            let reach = body.body_radius_px * PLANET_SHADOW_REACH;
+            if perp < reach {
+                // A real umbra has a penumbra, and a hard-edged shadow on a 3px particle stream
+                // stutters as the ring turns.
+                clamp01((reach - perp) / (body.body_radius_px * 0.22)) * PLANET_SHADOW_DEPTH
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let alpha = (bright * (0.55 + 0.75 * spread)).min(0.92) * (1.0 - shadow);
         if alpha <= 0.004 {
             continue;
         }
@@ -2237,6 +2440,7 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
                 RingHalf::Back,
                 phase,
                 seed,
+                sun_pos,
             );
         }
         draw_body(
@@ -2245,7 +2449,7 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
             height,
             pos,
             body.body_radius_px,
-            surface_of(body, seed),
+            surface_of(body, seed, phase, parts.rings),
             normalize3(light_dir_toward(sun_pos, pos, body.kind)),
         );
         // ...and any worker currently between this mate and the sun drops a real shadow on the
@@ -2265,6 +2469,7 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
                 RingHalf::Front,
                 phase,
                 seed,
+                sun_pos,
             );
         }
     }
@@ -2278,7 +2483,7 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
 /// fleet state, while every other body still resolves through the shared hue/severity channel —
 /// see [`SUN_STAR_RGB01`]. Bands and mottle depth come from the body's [`BodyType`], which is a
 /// second mate's own binding fact and nothing a worker or a star has.
-fn surface_of(body: &BodyLayout, seed: u32) -> Surface {
+fn surface_of(body: &BodyLayout, seed: u32, phase: f32, rings: bool) -> Surface {
     let self_luminous = body.kind == BodyKind::Sun;
     Surface {
         base: if self_luminous {
@@ -2290,6 +2495,18 @@ fn surface_of(body: &BodyLayout, seed: u32) -> Surface {
         self_luminous,
         bands: body.body_type.band_count(),
         mottle_scale: body.body_type.mottle_scale(),
+        // The loop phase itself. Each latitude turns a whole number of times within it — see
+        // [`BAND_TURNS`] — so a gas giant's day is far shorter than its year and the belts still
+        // land back where they started.
+        spin: phase,
+        // In units of the body's own radius, which is the frame `shade_surface` solves in.
+        // Withheld along with the ring itself, so a caller that suppresses rings suppresses the
+        // shadow they cast as well — a ring that is not drawn casting a shadow that is would be
+        // a picture of nothing.
+        ring: body
+            .ring_radii_px()
+            .filter(|_| rings && body.body_radius_px > 0.0)
+            .map(|(inner, outer)| (inner / body.body_radius_px, outer / body.body_radius_px)),
     }
 }
 
@@ -2971,6 +3188,9 @@ fn draw_core_row(
                 self_luminous: false,
                 bands: None,
                 mottle_scale: 1.0,
+                // A core is a body, not a world: nothing about it turns, and it carries no ring.
+                spin: 0.0,
+                ring: None,
             },
             // Lit from the upper left, in the corner's own frame. The scene's real sun is off this
             // surface entirely, so the alternative is an unlit disk — and an unshaded circle is a
@@ -3474,6 +3694,8 @@ mod tests {
                     self_luminous: false,
                     bands: None,
                     mottle_scale: 1.0,
+                    spin: 0.0,
+                    ring: None,
                 },
             );
             sum = (sum.0 + r, sum.1 + g, sum.2 + b);
@@ -4105,6 +4327,252 @@ mod tests {
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Corona, band shear, and ring shadows
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn the_sun_carries_a_structured_corona_rather_than_a_round_glow() {
+        // A star with an evenly-falling halo round it is drawn as a *light source*; a star with
+        // streamers and prominences is drawn as a thing. This is the difference.
+        let layout = build_layout(&[node(None, BodyKind::Sun)], 900, 900);
+        let rgba = frame(&layout, 0.0);
+        let (cx, cy) = (450.0f32, 450.0f32);
+        let radius = layout.bodies[0].body_radius_px;
+
+        // Sampled all the way round at a fixed distance outside the disc, so the only thing that
+        // can vary is the corona's own structure.
+        let ring_of = |out: f32| {
+            let at = radius * out;
+            let samples: Vec<f32> = (0..180)
+                .map(|i| {
+                    let a = i as f32 / 180.0 * 2.0 * PI;
+                    luminance8(
+                        &rgba,
+                        layout.width,
+                        (cx + a.cos() * at) as i32,
+                        (cy + a.sin() * at) as i32,
+                    )
+                })
+                .collect();
+            let peak = samples.iter().copied().fold(0.0f32, f32::max);
+            let floor = samples.iter().copied().fold(f32::INFINITY, f32::min);
+            (peak, floor)
+        };
+
+        // Sampled out where the streamers have separated rather than right at the limb, where
+        // every corona is nearly even by construction. The bar is 1.3 rather than something
+        // larger because the streamers ride on the same smooth radial falloff the glow already
+        // has, which damps the ratio at any one radius — an even halo scores exactly 1.0, so this
+        // is a wide margin over the thing being ruled out, not a narrow one under a nicer number.
+        let (peak, floor) = ring_of(2.0);
+        assert!(
+            peak > floor * 1.3,
+            "the corona is an even halo: {peak:.1} against {floor:.1} around the same circle"
+        );
+
+        // And the structure is *radial* — streamers rather than blobs — so the whole angular
+        // profile at one distance still resembles the profile further out. Correlated rather than
+        // compared at their peaks: with several streamers of nearly equal brightness, which one
+        // happens to be highest can swap between radii without the structure having moved at all.
+        let profile = |out: f32| {
+            let at = radius * out;
+            let raw: Vec<f32> = (0..180)
+                .map(|i| {
+                    let a = i as f32 / 180.0 * 2.0 * PI;
+                    luminance8(
+                        &rgba,
+                        layout.width,
+                        (cx + a.cos() * at) as i32,
+                        (cy + a.sin() * at) as i32,
+                    )
+                })
+                .collect();
+            let mean = raw.iter().sum::<f32>() / raw.len() as f32;
+            raw.into_iter().map(|v| v - mean).collect::<Vec<f32>>()
+        };
+        let near = profile(1.7);
+        let far = profile(2.2);
+        let dot: f32 = near.iter().zip(&far).map(|(a, b)| a * b).sum();
+        let norm = (near.iter().map(|a| a * a).sum::<f32>()
+            * far.iter().map(|b| b * b).sum::<f32>())
+        .sqrt()
+        .max(1e-6);
+        let correlation = dot / norm;
+        assert!(
+            correlation > 0.5,
+            "the corona's angular structure correlates only {correlation:.2} between radii — \
+             those are blobs, not streamers"
+        );
+
+        // ...and it reaches far further than a planet's atmospheric fringe, which is what a corona
+        // actually does and what the fringe constant does not.
+        const { assert!(CORONA_REACH > 2.5) };
+        assert!(ring_of(2.6).0 > 12.0, "nothing is drawn out at 2.6 radii");
+    }
+
+    #[test]
+    fn a_gas_giants_belts_are_sheared_rather_than_striped() {
+        // Two harmonics plus a darker belt is a still image slid around the frame. What a gas
+        // giant has is turbulence sheared by differential rotation: the zonal rate falls with
+        // latitude, so belts travel past each other and their boundaries curl.
+        let surface = |spin: f32| Surface {
+            base: (0.8, 0.8, 0.8),
+            seed: 17,
+            self_luminous: false,
+            bands: BodyType::Gas.band_count(),
+            mottle_scale: 0.0,
+            spin,
+            ring: None,
+        };
+        const R: f32 = 120.0;
+        let at = |nx: f32, ny: f32, spin: f32| {
+            luminance(shade_surface(
+                nx * R,
+                ny * R,
+                R,
+                (0.0, 0.0, 1.0),
+                surface(spin),
+            ))
+        };
+
+        // A stripe is constant along a line of latitude. A sheared, domain-warped band is not:
+        // walking round the visible hemisphere at one latitude has to change what is there.
+        let along: Vec<f32> = (0..24)
+            .map(|i| at((i as f32 / 23.0 - 0.5) * 1.3, 0.22, 0.0))
+            .collect();
+        let peak = along.iter().copied().fold(0.0f32, f32::max);
+        let floor = along.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            peak - floor > 0.02,
+            "the belts are flat along a latitude — they are stripes, not turbulence \
+             ({floor:.4}..{peak:.4})"
+        );
+
+        // Differential rotation: the belts move *past each other*, so the same rotation does not
+        // shift every latitude by the same amount. Two latitudes, one turn.
+        let shift_at = |ny: f32| {
+            let before = at(0.0, ny, 0.0);
+            let after = at(0.0, ny, 0.7);
+            (after - before).abs()
+        };
+        let equator = shift_at(0.02);
+        let midlatitude = shift_at(0.62);
+        assert!(equator > 0.0 && midlatitude > 0.0, "nothing rotated at all");
+        assert!(
+            (equator - midlatitude).abs() > 1e-4,
+            "every latitude moved by the same amount — that is rotation, not shear"
+        );
+        // ...and every latitude turns a whole number of times per loop, which is what lets the
+        // shear exist at all inside a baked loop.
+        assert_ne!(BAND_TURNS.0, BAND_TURNS.1);
+        assert_eq!(BAND_TURNS.0, BAND_TURNS.0.round());
+        assert_eq!(BAND_TURNS.1, BAND_TURNS.1.round());
+    }
+
+    #[test]
+    fn a_ring_casts_a_shadow_on_its_own_planet() {
+        // The geometry, not a drawn band: the shadow narrows, widens and crosses the disc as the
+        // body goes round, because the light vector does. Measured *inside* the planet's own disc,
+        // which is the half of the pair that has nothing to do with the ring's own pixels.
+        let ringed = one_mate_scene(BodyType::Ringed, 0.5);
+        let radius = ringed.bodies[MATE].body_radius_px;
+
+        let mut ever_shadowed = false;
+        for step in 0..16 {
+            let phase = step as f32 / 16.0 * 2.0 * PI;
+            let pos = ringed.position(MATE, phase);
+            let with = frame(&ringed, phase);
+            let without = frame_without(
+                &ringed,
+                phase,
+                Parts {
+                    rings: false,
+                    ..Parts::ALL
+                },
+            );
+            // Well inside the disc, so no ring particle can be over it — a ring particle drawn on
+            // the near arc would show up in the same difference and prove nothing.
+            let reach = (radius * 0.55) as i32;
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    if ((dx * dx + dy * dy) as f32).sqrt() > radius * 0.55 {
+                        continue;
+                    }
+                    let (x, y) = (pos.0 as i32 + dx, pos.1 as i32 + dy);
+                    let lit = luminance8(&without, ringed.width, x, y);
+                    let shaded = luminance8(&with, ringed.width, x, y);
+                    if lit > 8.0 && shaded < lit * 0.85 {
+                        ever_shadowed = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            ever_shadowed,
+            "the rings never darkened their own planet at any phase of its orbit"
+        );
+        // ...and it is a shadow rather than a band painted black.
+        const { assert!(RING_SHADOW_DEPTH < 1.0) };
+    }
+
+    #[test]
+    fn a_planet_casts_a_shadow_on_its_own_ring() {
+        // The other half of the pair, and the one the ring's particle stream makes available for
+        // the cost of a dot product: a particle anti-sunward of the body, inside the body's own
+        // radius perpendicular to the body–sun line, is in shadow.
+        let phase = 0.0;
+        let layout = one_mate_scene(BodyType::Ringed, 1.0);
+        let with = frame(&layout, phase);
+        let without = frame_without(
+            &layout,
+            phase,
+            Parts {
+                rings: false,
+                ..Parts::ALL
+            },
+        );
+        let pos = layout.position(MATE, phase);
+        let sun = sun_position(&layout, phase);
+        let (sx, sy) = {
+            let (dx, dy) = (sun.0 - pos.0, (sun.1 - pos.1) / RING_SQUASH);
+            let len = (dx * dx + dy * dy).sqrt().max(0.001);
+            (dx / len, dy / len)
+        };
+
+        // Ring material drawn on each side, counted in the ring plane rather than on screen.
+        let (mut sunward, mut anti) = (0usize, 0usize);
+        let radius = layout.bodies[MATE].body_radius_px;
+        let reach = (radius * 3.0) as i32;
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let (x, y) = (pos.0 as i32 + dx, pos.1 as i32 + dy);
+                let i = (y.max(0) as usize * layout.width as usize + x.max(0) as usize) * 4;
+                if i + 2 >= with.len() {
+                    continue;
+                }
+                if !(0..3).any(|c| with[i + c].abs_diff(without[i + c]) > 1) {
+                    continue;
+                }
+                // Outside the planet's own disc, so this is ring and not surface.
+                if ((dx * dx + dy * dy) as f32).sqrt() < radius * 1.2 {
+                    continue;
+                }
+                let (qx, qy) = (dx as f32, dy as f32 / RING_SQUASH);
+                if qx * sx + qy * sy < 0.0 {
+                    anti += 1;
+                } else {
+                    sunward += 1;
+                }
+            }
+        }
+        assert!(
+            sunward > 0 && anti < sunward,
+            "the ring is unshadowed: {sunward} lit against {anti} anti-sunward"
+        );
+        const { assert!(PLANET_SHADOW_DEPTH < 1.0) };
     }
 
     // ---------------------------------------------------------------------------
@@ -5827,6 +6295,8 @@ mod tests {
             self_luminous: false,
             bands,
             mottle_scale: 1.0,
+            spin: 0.0,
+            ring: None,
         };
         // Straight down the lit centre of the disk, so the only thing varying is latitude.
         let sample = |bands, ny: f32| {
