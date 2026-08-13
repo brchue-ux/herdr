@@ -1206,6 +1206,23 @@ const STAR_ALPHA: (f32, f32) = (0.16, 0.84);
 /// `only_the_brightest_few_stars_scintillate` test, which holds the "few" rather than the number.
 const STAR_SCINTILLATION_MAGNITUDE: f32 = 0.80;
 
+/// How many depths the starfield is split across.
+///
+/// Three, the orrery's own count. Stars are assigned to a layer by index, so each layer inherits
+/// the same magnitude distribution and colour-temperature spread the whole field has — the depths
+/// are a motion fact, not a second population.
+const STAR_LAYERS: usize = 3;
+
+/// How far each layer sways across the frame, as a fraction of the width.
+///
+/// A **sway** rather than a pan, and that is forced rather than chosen: the ambient loop is baked
+/// once and played forever, so a layer panning steadily would be somewhere else at the end of the
+/// loop than at the start and the seam would show on every repeat. A sinusoid in the loop phase
+/// closes exactly, and it is still the observer's own slow motion — integrated and never constant,
+/// which is what the drift is supposed to be. The rates differ by depth, so the near layer swims
+/// against the far one.
+const STAR_LAYER_DRIFT: [f32; STAR_LAYERS] = [0.030, 0.018, 0.008];
+
 /// Draw one body (disk, shading, and soft glow fringe) into `buf`, restricted to its own
 /// bounding box rather than the whole frame — the cost lever that keeps a handful of shaded
 /// spheres cheap even at 1440p, unlike `src/particle_field.rs`'s necessarily full-frame passes.
@@ -1309,6 +1326,267 @@ fn draw_orbit_track(
         }
     }
 }
+
+/// How dark the centre of a transiting worker's shadow is, as a multiple of the light it removes.
+///
+/// Not opaque: a worker is small against its mate, so the umbra it casts is partial by geometry
+/// rather than by choice, and a black disc would read as a hole rather than a shadow.
+const TRANSIT_UMBRA: f32 = 0.62;
+
+/// How much wider the penumbra is than the umbra. A real shadow has a soft edge, and a hard-edged
+/// one on a body a few dozen pixels across stutters as it crosses.
+const TRANSIT_PENUMBRA: f32 = 1.75;
+
+/// Draw the shadow of every worker currently passing between its mate and the sun.
+///
+/// **The umbral geometry, from positions the frame already computes in order to draw.** A worker
+/// is in transit when it lies on the sunward side of its mate and its offset perpendicular to the
+/// mate–sun line is inside the mate's own disc; where it lands is that same perpendicular offset,
+/// projected onto the face. It is free, it is true, and it is the one mechanism here that makes a
+/// worker legible by making the *planet* change — which is why it works at sizes where the worker
+/// itself is a handful of pixels.
+#[allow(clippy::too_many_arguments)]
+fn draw_shadow_transits(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    layout: &SceneLayout,
+    parent_idx: usize,
+    parent: &BodyLayout,
+    parent_pos: (f32, f32),
+    sun_pos: (f32, f32),
+    phase: f32,
+) {
+    if parent.kind != BodyKind::Planet || parent.body_radius_px <= 0.0 {
+        return;
+    }
+    // The direction the sun is in, from this mate.
+    let to_sun = (sun_pos.0 - parent_pos.0, sun_pos.1 - parent_pos.1);
+    let len = (to_sun.0 * to_sun.0 + to_sun.1 * to_sun.1).sqrt();
+    if len <= 0.001 {
+        return;
+    }
+    let (sx, sy) = (to_sun.0 / len, to_sun.1 / len);
+
+    for (idx, moon) in layout.bodies.iter().enumerate() {
+        if moon.parent != Some(parent_idx) || !moon.seated || moon.kind != BodyKind::Moon {
+            continue;
+        }
+        let moon_pos = layout.position(idx, phase);
+        let (dx, dy) = (moon_pos.0 - parent_pos.0, moon_pos.1 - parent_pos.1);
+        // Sunward of its mate, or it is behind the planet and casting nothing onto it.
+        let along = dx * sx + dy * sy;
+        if along <= 0.0 {
+            continue;
+        }
+        // Perpendicular offset from the mate–sun line: where on the face the shadow lands, and
+        // whether it lands on the face at all.
+        let perp = dx * -sy + dy * sx;
+        let umbra = moon.body_radius_px;
+        let reach = umbra * TRANSIT_PENUMBRA;
+        if perp.abs() > parent.body_radius_px + reach {
+            continue;
+        }
+        // Projected back onto the disc along the same perpendicular, which is what an umbra
+        // landing on a sphere from a distant light actually does.
+        let cx = parent_pos.0 + -sy * perp;
+        let cy = parent_pos.1 + sx * perp;
+
+        let x0 = (cx - reach).floor().max(0.0) as i32;
+        let x1 = (cx + reach).ceil().min(width as f32) as i32;
+        let y0 = (cy - reach).floor().max(0.0) as i32;
+        let y1 = (cy + reach).ceil().min(height as f32) as i32;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let ox = px as f32 + 0.5 - cx;
+                let oy = py as f32 + 0.5 - cy;
+                let dist = (ox * ox + oy * oy).sqrt();
+                if dist > reach {
+                    continue;
+                }
+                // Only on the mate's own face — a shadow does not hang in the space beside it.
+                let fx = px as f32 + 0.5 - parent_pos.0;
+                let fy = py as f32 + 0.5 - parent_pos.1;
+                if (fx * fx + fy * fy).sqrt() > parent.body_radius_px {
+                    continue;
+                }
+                // Full umbra in the middle, softening through the penumbra to nothing.
+                let strength = if dist <= umbra {
+                    1.0
+                } else {
+                    clamp01(1.0 - (dist - umbra) / (reach - umbra).max(0.001))
+                };
+                let idx_px = py as usize * width as usize + px as usize;
+                let under = buf[idx_px];
+                let shade = 1.0 - TRANSIT_UMBRA * strength;
+                buf[idx_px] = [
+                    under[0] * shade,
+                    under[1] * shade,
+                    under[2] * shade,
+                    under[3],
+                ];
+            }
+        }
+    }
+}
+
+/// How far back a body's trail reaches, as a fraction of one full animation loop.
+///
+/// Short: a trail is *where the body was a moment ago* and reads speed, which is a different
+/// reading from the groove's permanent wear underneath it. Two readings, two lifetimes, one path —
+/// so a trail that reached far enough to overlap its own groove's meaning would collapse them.
+const TRAIL_LOOKBACK: f32 = 0.055;
+
+/// Bounds on how many samples one trail is drawn from.
+///
+/// The count itself is derived from the arc the body actually sweeps, not fixed: a worker doing
+/// four revolutions a loop covers several times the ground a heavy mate doing one does, so a fixed
+/// count draws the mate a smooth line and the worker a dotted one — which is precisely backwards,
+/// since the fast body is the one whose motion is worth stating. Solved against the drawn dot
+/// size, so consecutive samples always overlap.
+const TRAIL_SAMPLE_BOUNDS: (usize, usize) = (10, 72);
+
+/// How far apart consecutive trail samples may be, in pixels of arc.
+const TRAIL_SAMPLE_SPACING_PX: f32 = 1.4;
+
+/// Alpha at the trail's root, where it leaves the body. It fades to nothing at the far end.
+const TRAIL_ALPHA: f32 = 0.34;
+
+/// Draw one body's trail: a short fading wake of where it has just been.
+///
+/// The cheapest possible statement that the frame is alive, and — for a worker moon — one of the
+/// two mechanisms that make it findable without hunting, because motion is the strongest pop-out
+/// cue available and this one costs almost no static light.
+fn draw_trail(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    layout: &SceneLayout,
+    idx: usize,
+    body: &BodyLayout,
+    phase: f32,
+) {
+    if body.orbit_radius_px <= 0.0 || body.revolutions_per_loop <= 0.0 {
+        return;
+    }
+    let radius = (body.body_radius_px * 0.7).max(0.9);
+    let base = severity_rgb01(body.hue, body.severity);
+    let span = TRAIL_LOOKBACK * 2.0 * PI;
+
+    // The arc this body sweeps over the lookback, in pixels — the whole point of deriving the
+    // sample count rather than fixing it.
+    let arc = body.orbit_radius_px * span * body.revolutions_per_loop;
+    let samples = ((arc / TRAIL_SAMPLE_SPACING_PX) as usize)
+        .clamp(TRAIL_SAMPLE_BOUNDS.0, TRAIL_SAMPLE_BOUNDS.1);
+
+    for step in 1..=samples {
+        let back = step as f32 / samples as f32;
+        let pos = layout.position(idx, phase - span * back);
+        // Thinning and fading as it recedes, so the wake has a direction without needing an arrow.
+        let width_here = radius * mix(0.85, 0.15, back);
+        let alpha = TRAIL_ALPHA * (1.0 - back) * (1.0 - back);
+        if alpha <= 0.004 {
+            continue;
+        }
+        let x0 = (pos.0 - width_here).floor().max(0.0) as i32;
+        let x1 = (pos.0 + width_here).ceil().min(width as f32) as i32;
+        let y0 = (pos.1 - width_here).floor().max(0.0) as i32;
+        let y1 = (pos.1 + width_here).ceil().min(height as f32) as i32;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let dx = px as f32 + 0.5 - pos.0;
+                let dy = py as f32 + 0.5 - pos.1;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > width_here {
+                    continue;
+                }
+                let idx_px = py as usize * width as usize + px as usize;
+                blend(
+                    &mut buf[idx_px],
+                    base,
+                    alpha * clamp01(1.0 - dist / width_here.max(0.5)),
+                );
+            }
+        }
+    }
+}
+
+/// Where the debris belt sits, as a fraction of `min(width, height)`.
+///
+/// A stated band **between two of the scene's own orbits**, not a scatter: outside the sun's own
+/// glow, which reaches `0.13`, and inside the nearest a worker moon ever comes to the middle,
+/// which is the mate ring at `0.34` less a worker's orbit and radius — about `0.28`. Sitting the
+/// belt in that gap is what keeps it a belt rather than debris tangled through the bodies, and it
+/// is where a real one sits too.
+const DEBRIS_BAND: (f32, f32) = (0.200, 0.240);
+
+/// How many fragments the belt carries.
+const DEBRIS_COUNT: usize = 340;
+
+/// Whole revolutions a fragment makes per loop. Integer, so the belt closes with everything else.
+/// Slower than the mates it sits outside, which is what a wider orbit means.
+const DEBRIS_REVOLUTIONS: f32 = 1.0;
+
+/// A fragment's drawn radius and alpha. Tiny and dim: the belt is texture, not population.
+const DEBRIS_PX: f32 = 0.9;
+const DEBRIS_ALPHA: (f32, f32) = (0.06, 0.17);
+
+/// Draw the debris belt: many tiny dim fragments, permanently in motion, on real orbits.
+///
+/// **It is not fleet data and carries none.** Nothing here is keyed to a project, a pane or an
+/// event — it is scene furniture, on the same footing as the starfield, and reading it as a
+/// register would be reading something that was never written.
+fn draw_debris_belt(buf: &mut [[f32; 4]], width: u32, height: u32, phase: f32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let scale = width.min(height) as f32;
+    let centre = (width as f32 / 2.0, height as f32 / 2.0);
+
+    for i in 0..DEBRIS_COUNT {
+        let lattice = i as f32 * 0.311;
+        // Its own orbit inside the band, and its own starting angle — fixed per fragment, so the
+        // belt is one object in motion rather than a fresh scatter each frame.
+        let band = value_noise(lattice, 7.0, 23);
+        let radius = mix(DEBRIS_BAND.0, DEBRIS_BAND.1, band) * scale;
+        let start = value_noise(lattice, 19.0, 23) * 2.0 * PI;
+        // A fragment further out goes round more slowly, on the same law the bodies obey.
+        let rate = DEBRIS_REVOLUTIONS;
+        let angle = start + phase * rate;
+        let (sin_a, cos_a) = angle.sin_cos();
+        let px = centre.0 + cos_a * radius;
+        let py = centre.1 + sin_a * radius;
+
+        let alpha = mix(
+            DEBRIS_ALPHA.0,
+            DEBRIS_ALPHA.1,
+            value_noise(lattice, 31.0, 23),
+        );
+        let x0 = (px - DEBRIS_PX).floor().max(0.0) as i32;
+        let x1 = (px + DEBRIS_PX).ceil().min(width as f32) as i32;
+        let y0 = (py - DEBRIS_PX).floor().max(0.0) as i32;
+        let y1 = (py + DEBRIS_PX).ceil().min(height as f32) as i32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let dx = xx as f32 + 0.5 - px;
+                let dy = yy as f32 + 0.5 - py;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > DEBRIS_PX {
+                    continue;
+                }
+                let idx = yy as usize * width as usize + xx as usize;
+                blend(
+                    &mut buf[idx],
+                    DEBRIS_RGB01,
+                    alpha * clamp01(1.0 - dist / DEBRIS_PX),
+                );
+            }
+        }
+    }
+}
+
+/// Debris is rock, so it is the asteroid's own neutral tone rather than anything severity-coded.
+const DEBRIS_RGB01: (f32, f32, f32) = (0.55, 0.51, 0.46);
 
 /// Every distinct orbit in the scene: `(parent, radius, deepest wear on it, seed)`.
 ///
@@ -1836,7 +2114,40 @@ pub(crate) const FRAME_COUNT: usize = 36;
 /// model means transient effects cannot live in a loop that is only regenerated on a fleet/resize
 /// change). See [`effects_frame`] for the asteroid/crater/comet overlay.
 pub(crate) fn frame(layout: &SceneLayout, phase: f32) -> Vec<u8> {
-    frame_inner(layout, phase, true)
+    frame_inner(layout, phase, Parts::ALL)
+}
+
+/// Which of the ambient scene's own layers a pass draws.
+///
+/// A `#[cfg(test)]`-only lever, and it earns its keep: several of these layers are faint by design
+/// — a trail is a tenth of its body's brightness, a shadow transit is a fraction off an already
+/// shaded face — so a threshold test against "is this pixel bright enough" measures the *scene*
+/// rather than the layer, and a comparison against a differently-shaped fleet measures the fleet.
+/// Differenced against the same frame with one layer withheld, the answer is that layer and
+/// provably nothing else.
+///
+/// Free in production: every field is a constant at the one call site that is not a test.
+#[derive(Debug, Clone, Copy)]
+struct Parts {
+    rings: bool,
+    trails: bool,
+    transits: bool,
+    debris: bool,
+}
+
+impl Parts {
+    const ALL: Self = Self {
+        rings: true,
+        trails: true,
+        transits: true,
+        debris: true,
+    };
+}
+
+/// [`frame`] with the named layers withheld and nothing else changed.
+#[cfg(test)]
+fn frame_without(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
+    frame_inner(layout, phase, parts)
 }
 
 /// [`frame`] with every ring suppressed and nothing else changed.
@@ -1848,13 +2159,20 @@ pub(crate) fn frame(layout: &SceneLayout, phase: f32) -> Vec<u8> {
 /// provably nothing else, including inside the body's own disk, which is where the interesting
 /// half of the question lives (does the near arc draw over the planet, and does the far arc not).
 ///
-/// Free in production: `rings` is a constant at both call sites.
 #[cfg(test)]
 fn frame_without_rings(layout: &SceneLayout, phase: f32) -> Vec<u8> {
-    frame_inner(layout, phase, false)
+    frame_inner(
+        layout,
+        phase,
+        Parts {
+            rings: false,
+            ..Parts::ALL
+        },
+    )
 }
 
-fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
+fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
+    let rings = parts.rings;
     let (width, height) = (layout.width, layout.height);
     let pixels = width as usize * height as usize;
     let mut buf = vec![[0.0f32; 4]; pixels];
@@ -1883,6 +2201,19 @@ fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
         );
     }
 
+    // Above the grooves and below the bodies: a trail is where a body *was*, so it passes over
+    // the permanent wear and under the thing casting it.
+    if parts.trails {
+        for (idx, body) in layout.bodies.iter().enumerate() {
+            if body.seated {
+                draw_trail(&mut buf, width, height, layout, idx, body, phase);
+            }
+        }
+    }
+
+    if parts.debris {
+        draw_debris_belt(&mut buf, width, height, phase);
+    }
     draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
 
     let sun_pos = sun_position(layout, phase);
@@ -1917,6 +2248,13 @@ fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
             surface_of(body, seed),
             normalize3(light_dir_toward(sun_pos, pos, body.kind)),
         );
+        // ...and any worker currently between this mate and the sun drops a real shadow on the
+        // face just drawn. After the body, because it lands *on* the surface.
+        if parts.transits {
+            draw_shadow_transits(
+                &mut buf, width, height, layout, idx, body, pos, sun_pos, phase,
+            );
+        }
         if rings {
             draw_ring(
                 &mut buf,
@@ -2198,6 +2536,15 @@ fn splat_starfield_band(
         let lattice = i as f32 * 0.123;
         let sx = value_noise(lattice, 0.0, 11);
         let sy = value_noise(lattice, 100.0, 11);
+
+        // Which depth this star sits at, and therefore how fast it drifts. The field used to be
+        // baked once and completely static — a photograph behind a moving system. The drift is the
+        // observer's own slow motion, so the near layer swims against the far one and the sky
+        // stops being a backdrop. Whole cycles per loop, like everything else that moves here, so
+        // the seam still closes.
+        let drift = STAR_LAYER_DRIFT[i % STAR_LAYERS] * phase.sin();
+        let sx = (sx + drift).rem_euclid(1.0);
+
         let py = (sy * height as f32) as usize;
         if py < y0 || py >= y1 {
             continue;
@@ -3757,6 +4104,318 @@ mod tests {
             fifteen_mates.len(),
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The rest of the sky
+    // ---------------------------------------------------------------------------
+
+    /// A fleet with workers, at a size worth measuring on.
+    fn sky_fleet() -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for files in [2_470u32, 860, 430] {
+            nodes.push(sized(Some(0), BodyKind::Planet, BodySize::Files(files)));
+            let planet = nodes.len() - 1;
+            for _ in 0..4 {
+                nodes.push(node(Some(planet), BodyKind::Moon));
+            }
+        }
+        nodes
+    }
+
+    fn luminance8(rgba: &[u8], width: u32, x: i32, y: i32) -> f32 {
+        if x < 0 || y < 0 {
+            return 0.0;
+        }
+        let i = (y as usize * width as usize + x as usize) * 4;
+        if i + 2 >= rgba.len() {
+            return 0.0;
+        }
+        f32::from(rgba[i]) * 0.299 + f32::from(rgba[i + 1]) * 0.587 + f32::from(rgba[i + 2]) * 0.114
+    }
+
+    #[test]
+    fn the_starfield_drifts_at_three_depths_and_still_closes_its_loop() {
+        // The field used to be baked once and completely static — a photograph behind a moving
+        // system. The drift is the observer's own slow motion, and the near layer has to swim
+        // against the far one or the "three depths" is a comment rather than a mechanism.
+        assert_eq!(STAR_LAYER_DRIFT.len(), STAR_LAYERS);
+        let distinct: std::collections::BTreeSet<u32> =
+            STAR_LAYER_DRIFT.iter().map(|d| d.to_bits()).collect();
+        assert_eq!(
+            distinct.len(),
+            STAR_LAYERS,
+            "two layers drift at the same rate"
+        );
+
+        // The field really moves, on a frame with nothing in it but sky.
+        let empty = build_layout(&[], 600, 400);
+        assert_ne!(frame(&empty, 0.0), frame(&empty, PI));
+        // ...and it still closes: every drift is a whole fraction of the width per loop.
+        let start = frame(&empty, 0.0);
+        let looped = frame(&empty, 2.0 * PI);
+        let moved = start
+            .chunks_exact(4)
+            .zip(looped.chunks_exact(4))
+            .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 1))
+            .count();
+        assert!(
+            moved * 500 < start.len() / 4,
+            "{moved} pixels moved across the loop seam"
+        );
+    }
+
+    #[test]
+    fn every_body_leaves_a_trail_behind_where_it_has_just_been() {
+        // The cheapest possible statement that the frame is alive, and distinct from the groove
+        // underneath it: a groove is permanent wear and reads revolutions completed, a trail is
+        // where the body was a moment ago and reads speed.
+        let nodes = sky_fleet();
+        let layout = build_layout(&nodes, 1_200, 800);
+        let phase = 0.9;
+        let rgba = frame(&layout, phase);
+        let bare = frame_without(
+            &layout,
+            phase,
+            Parts {
+                trails: false,
+                ..Parts::ALL
+            },
+        );
+
+        for (idx, body) in layout.bodies.iter().enumerate() {
+            if body.kind == BodyKind::Sun {
+                continue;
+            }
+            // A little way back along this body's own path — inside the trail's reach, and clear
+            // of the body itself.
+            // The nearest point on this body's own past path that is clear of the body itself —
+            // walked outward rather than picked, because how far back that is depends on how fast
+            // the body moves, which is exactly what varies across a fleet. The fade is quadratic,
+            // so the far end of a trail is nearly gone by design and asserting on it would be
+            // asserting that the fade does not work.
+            let here = layout.position(idx, phase);
+            let mut behind = here;
+            for step in 1..=40 {
+                let back = step as f32 / 40.0 * TRAIL_LOOKBACK * 2.0 * PI;
+                let at = layout.position(idx, phase - back);
+                let gap = ((at.0 - here.0).powi(2) + (at.1 - here.1).powi(2)).sqrt();
+                if gap > body.body_radius_px * 1.6 {
+                    behind = at;
+                    break;
+                }
+            }
+            assert_ne!(behind, here, "body {idx} barely moved");
+
+            // Differenced against the identical frame with trails withheld, so what is measured
+            // is the trail rather than whatever the sky happens to be doing there.
+            let with = luminance8(&rgba, layout.width, behind.0 as i32, behind.1 as i32);
+            let without = luminance8(&bare, layout.width, behind.0 as i32, behind.1 as i32);
+            assert!(
+                with > without + 4.0,
+                "body {idx} left nothing behind it at {behind:?}: {with:.1} against {without:.1}"
+            );
+        }
+        // And a trail is *short* — it is a different reading from the groove, so it must not reach
+        // far enough round the orbit to become one.
+        const { assert!(TRAIL_LOOKBACK < 0.15) };
+    }
+
+    #[test]
+    fn the_debris_belt_is_on_real_orbits_and_carries_no_fleet_data() {
+        // Many, tiny, dim, permanently in motion — and explicitly *not* a register: nothing here is
+        // keyed to a project, a pane or an event, so it must be identical for any fleet at all.
+        let big = build_layout(&sky_fleet(), 900, 900);
+        let empty = build_layout(&[], 900, 900);
+        // The belt alone: the same frame with the belt withheld, differenced. Sampling a radius
+        // band instead would catch whatever else happens to reach into it.
+        let belt_ink = |layout: &SceneLayout, phase: f32| {
+            let with = frame(layout, phase);
+            let without = frame_without(
+                layout,
+                phase,
+                Parts {
+                    debris: false,
+                    ..Parts::ALL
+                },
+            );
+            let rgba: Vec<u8> = with
+                .iter()
+                .zip(&without)
+                .map(|(a, b)| a.abs_diff(*b))
+                .collect();
+            let centre = (450.0f32, 450.0f32);
+            let mut ink = 0u64;
+            for y in 0..900usize {
+                for x in 0..900usize {
+                    let d = ((x as f32 - centre.0).powi(2) + (y as f32 - centre.1).powi(2)).sqrt();
+                    let _ = d;
+                    ink += u64::from(rgba[(y * 900 + x) * 4]);
+                }
+            }
+            ink
+        };
+        assert_eq!(
+            belt_ink(&big, 0.0),
+            belt_ink(&empty, 0.0),
+            "the belt changed with the fleet — it is carrying data it must not carry"
+        );
+        // It is permanently in motion, on real orbits rather than a fixed scatter...
+        assert_ne!(belt_ink(&empty, 0.0), belt_ink(&empty, PI * 0.5));
+        // ...and it closes, like everything else that moves here.
+        assert_eq!(DEBRIS_REVOLUTIONS, DEBRIS_REVOLUTIONS.round());
+        // ...and it is dim: the belt is texture, not population.
+        assert!(DEBRIS_ALPHA.1 < 0.2);
+    }
+
+    #[test]
+    fn a_worker_between_its_mate_and_the_sun_lands_a_real_shadow_on_it() {
+        // The one mechanism here that makes a worker legible by making the *planet* change, which
+        // is why it works at sizes where the worker itself is a handful of pixels.
+        let nodes = sky_fleet();
+        let layout = build_layout(&nodes, 1_400, 900);
+
+        // Find a phase where some worker is genuinely in transit, using the same geometry the
+        // renderer uses rather than a hand-picked frame.
+        let mut found = None;
+        for step in 0..240 {
+            let phase = step as f32 / 240.0 * 2.0 * PI;
+            let sun = sun_position(&layout, phase);
+            for (idx, moon) in layout.bodies.iter().enumerate() {
+                let Some(parent_idx) = moon.parent else {
+                    continue;
+                };
+                if moon.kind != BodyKind::Moon {
+                    continue;
+                }
+                let parent = &layout.bodies[parent_idx];
+                let ppos = layout.position(parent_idx, phase);
+                let mpos = layout.position(idx, phase);
+                let to_sun = (sun.0 - ppos.0, sun.1 - ppos.1);
+                let len = (to_sun.0 * to_sun.0 + to_sun.1 * to_sun.1).sqrt();
+                let (sx, sy) = (to_sun.0 / len, to_sun.1 / len);
+                let (dx, dy) = (mpos.0 - ppos.0, mpos.1 - ppos.1);
+                let along = dx * sx + dy * sy;
+                let perp = dx * -sy + dy * sx;
+                if along > 0.0 && perp.abs() < parent.body_radius_px * 0.4 {
+                    found = Some((phase, parent_idx, ppos, (-sy * perp, sx * perp)));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (phase, parent_idx, ppos, offset) = found.expect("some worker transits its mate");
+        let rgba = frame(&layout, phase);
+        // The identical frame with transits withheld. Differencing is the only exact instrument
+        // here: a transit lands on an already-shaded face, so "is this pixel dark" measures the
+        // terminator, and the mirror point across the mate's centre coincides with the shadow
+        // itself whenever the worker is dead on the sun line — which is exactly the case this
+        // search is looking for.
+        let unshadowed = frame_without(
+            &layout,
+            phase,
+            Parts {
+                transits: false,
+                ..Parts::ALL
+            },
+        );
+
+        let shadow = (ppos.0 + offset.0, ppos.1 + offset.1);
+        let in_shadow = luminance8(&rgba, layout.width, shadow.0 as i32, shadow.1 as i32);
+        let unshaded = luminance8(&unshadowed, layout.width, shadow.0 as i32, shadow.1 as i32);
+        assert!(
+            in_shadow < unshaded * 0.85,
+            "the transit left no mark: {in_shadow:.1} against an unshadowed {unshaded:.1}"
+        );
+        // ...and it is a shadow rather than a hole punched in the planet.
+        assert!(in_shadow > 0.5, "the shadow is opaque black");
+        // The rest of the mate's face is untouched: a transit is a mark where the worker is, not a
+        // dimming of the whole body.
+        let far = (
+            ppos.0 - offset.0 * 3.0 - layout.bodies[parent_idx].body_radius_px * 0.6,
+            ppos.1 - offset.1 * 3.0,
+        );
+        assert_eq!(
+            luminance8(&rgba, layout.width, far.0 as i32, far.1 as i32),
+            luminance8(&unshadowed, layout.width, far.0 as i32, far.1 as i32),
+            "the transit dimmed the whole face rather than a spot on it"
+        );
+    }
+
+    #[test]
+    fn a_worker_moon_is_found_without_hunting_for_it() {
+        // H13, end to end. Weber |Lt - Lb| / max(Lb, Lt, 8) >= 0.55 on the *peak* pixel of the
+        // moon's disc — a five-pixel body is found by its brightest pixel, not by its average —
+        // against whatever is actually behind it in the composited frame, at the worst backdrop
+        // each moon actually sees rather than a flattering one.
+        //
+        // The mechanism is four things and none of them is a glow: the body's own albedo, the
+        // atmospheric rim and terminator pair (#148), the trail, and the shadow transit. The last
+        // two are what this PR adds, so this is the first point at which the whole bar can be
+        // asked end to end.
+        let nodes = sky_fleet();
+        let layout = build_layout(&nodes, 1_400, 900);
+
+        let mut worst = f32::INFINITY;
+        let mut worst_at = (0usize, 0.0f32);
+        for step in 0..24 {
+            let phase = step as f32 / 24.0 * 2.0 * PI;
+            let rgba = frame(&layout, phase);
+            let backdrop_frame = frame_without(
+                &layout,
+                phase,
+                Parts {
+                    trails: false,
+                    ..Parts::ALL
+                },
+            );
+            for (idx, body) in layout.bodies.iter().enumerate() {
+                if body.kind != BodyKind::Moon {
+                    continue;
+                }
+                let pos = layout.position(idx, phase);
+                let radius = body.body_radius_px;
+
+                // The moon's own peak, and the backdrop it actually sits on — sampled in a ring
+                // just outside its disc, which is what "actually behind it" means for a body this
+                // renderer never draws over anything.
+                let mut peak = 0.0f32;
+                let mut backdrop = 0.0f32;
+                let mut backdrop_n = 0.0f32;
+                let reach = (radius * 2.6).ceil() as i32;
+                for dy in -reach..=reach {
+                    for dx in -reach..=reach {
+                        let d = ((dx * dx + dy * dy) as f32).sqrt();
+                        let (x, y) = (pos.0 as i32 + dx, pos.1 as i32 + dy);
+                        if d <= radius {
+                            peak = peak.max(luminance8(&rgba, layout.width, x, y));
+                        } else if d > radius * 1.8 && d <= radius * 2.6 {
+                            backdrop += luminance8(&backdrop_frame, layout.width, x, y);
+                            backdrop_n += 1.0;
+                        }
+                    }
+                }
+                if backdrop_n == 0.0 {
+                    continue;
+                }
+                let back = backdrop / backdrop_n;
+                let weber = (peak - back).abs() / peak.max(back).max(8.0);
+                if weber < worst {
+                    worst = weber;
+                    worst_at = (idx, phase);
+                }
+            }
+        }
+
+        assert!(
+            worst >= 0.55,
+            "the hardest worker moon to find holds only Weber {worst:.3} \
+             (body {}, phase {:.2}) against a bar of 0.55",
+            worst_at.0,
+            worst_at.1
         );
     }
 
