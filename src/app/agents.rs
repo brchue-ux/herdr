@@ -362,14 +362,24 @@ impl App {
     ///
     /// [`crate::api::schema::PaneInfo::owner`] already resolves a pane's own
     /// `owner` token or structural fallback in isolation, but answering
-    /// `first_mate` / `second_mate` / `worker` needs the depth of the whole
-    /// walk — how many owners deep that chain runs once Spaces are woven in —
-    /// which only the tree arrangement knows. This reuses exactly that
-    /// arrangement, the same one the sidebar and the persistent background
-    /// scene already draw, rather than adding a second grouping rule for this
-    /// API surface. Only panes the tree draws a row for on their own appear
-    /// here; a mate's own driving pane is absent for the same reason it draws
-    /// no row in the sidebar.
+    /// `first_mate` / `second_mate` / `worker` needs the whole walk — where
+    /// that chain lands once Spaces are woven in — which only the tree
+    /// arrangement knows. This reuses exactly that arrangement, the same one
+    /// the sidebar and the persistent background scene already draw, rather
+    /// than adding a second grouping rule for this API surface. Only panes the
+    /// tree draws a row for on their own appear here; a mate's own driving pane
+    /// is absent for the same reason it draws no row in the sidebar.
+    ///
+    /// The tag is [`crate::ui::sidebar::WorkspaceListEntry::rank`] — what the
+    /// row **is** — and deliberately not its depth. The two come apart for
+    /// exactly the row this exists to describe: a worker the first mate
+    /// dispatched directly hangs off the first mate, so it sits at depth 1, in
+    /// the same column a second mate's Space sits in. Reading the tag off that
+    /// depth promoted it to `second_mate` purely because of who spawned it,
+    /// which put an ordinary one-off task in the same tier as a persistent
+    /// mate and made the two indistinguishable to every caller of `agent.list`.
+    /// A mate is a Space; an agent pane is a worker or a sub agent wherever it
+    /// hangs, and `rank` is the one place that already knows it.
     fn agent_relations(
         &self,
     ) -> std::collections::HashMap<crate::layout::PaneId, crate::app::agent_tree::AgentRelation>
@@ -377,16 +387,14 @@ impl App {
         let entries = crate::ui::sidebar::sidebar_agent_entries(&self.state);
         crate::ui::sidebar::workspace_list_entries_whole_fleet(&self.state)
             .into_iter()
-            .filter_map(|row| match row {
-                crate::ui::sidebar::WorkspaceListEntry::Agent {
-                    entry_idx, depth, ..
-                } => entries.get(entry_idx).map(|entry| {
-                    (
-                        entry.pane_id,
-                        crate::app::agent_tree::AgentRelation::from_depth(depth),
-                    )
-                }),
-                crate::ui::sidebar::WorkspaceListEntry::Workspace { .. } => None,
+            .filter_map(|row| {
+                let rank = row.rank();
+                match row {
+                    crate::ui::sidebar::WorkspaceListEntry::Agent { entry_idx, .. } => {
+                        entries.get(entry_idx).map(|entry| (entry.pane_id, rank))
+                    }
+                    crate::ui::sidebar::WorkspaceListEntry::Workspace { .. } => None,
+                }
             })
             .collect()
     }
@@ -596,5 +604,75 @@ mod tests {
         // -> worker (2), so the worker is tagged a worker, not a second mate.
         assert_eq!(worker_info.relation.as_deref(), Some("worker"));
         assert_eq!(worker_info.owner.as_deref(), Some("second-mate"));
+    }
+
+    /// A worker the first mate dispatched *directly* is a worker, not a second
+    /// mate.
+    ///
+    /// It runs in the first mate's own Space and names the first mate as its
+    /// owner, so it hangs at depth 1 — the same depth a persistent second
+    /// mate's Space hangs at. Tagging it off that depth reported `second_mate`
+    /// for an ordinary one-off task, which made a script reading `agent.list`
+    /// unable to tell a one-off task from a real mate. A mate is a Space; a
+    /// pane is a worker wherever it hangs.
+    #[test]
+    fn collect_agent_infos_tags_a_directly_dispatched_worker_as_a_worker() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let mut first_mate = crate::workspace::Workspace::test_new("first-mate");
+        // The one thing that makes this a *direct* dispatch: the worker's pane
+        // is inside the first mate's own Space.
+        let direct_pane = first_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.state.workspaces = vec![
+            first_mate,
+            crate::workspace::Workspace::test_new("second-mate"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+
+        let now = std::time::Instant::now();
+        app.state.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("first-mate".to_string()),
+            )]),
+            None,
+            now,
+        );
+
+        let direct_terminal = app.state.workspaces[0].tabs[0].panes[&direct_pane]
+            .attached_terminal_id
+            .clone();
+        let direct = app
+            .state
+            .terminals
+            .get_mut(&direct_terminal)
+            .expect("test terminal present");
+        direct.set_agent_name("direct-worker".to_string());
+        direct.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "owner".to_string(),
+                Some("first-mate".to_string()),
+            )]),
+            None,
+            now,
+        );
+
+        let infos = app.collect_agent_infos();
+        let direct_info = infos
+            .iter()
+            .find(|info| info.name.as_deref() == Some("direct-worker"))
+            .expect("the directly-dispatched worker is listed");
+        assert_eq!(direct_info.owner.as_deref(), Some("first-mate"));
+        assert_eq!(direct_info.relation.as_deref(), Some("worker"));
     }
 }

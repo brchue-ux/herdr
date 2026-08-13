@@ -160,6 +160,24 @@ pub(crate) struct OwnedNode<'a> {
     /// still goes through the same cycle-breaking, so a structural edge can no
     /// more strand a node than a published one can.
     pub parent: Option<usize>,
+    /// Which band of its parent's children this node draws in; lower first.
+    ///
+    /// Sibling order is otherwise the caller's own, and stays the caller's own
+    /// *inside* a band: the sort is stable, so a band is a coarse grouping laid
+    /// over whatever order was handed in, never a replacement for it. Leaving
+    /// every node on the default `0` is exactly the old behaviour.
+    ///
+    /// This module still knows nothing about what a node *is* — it is handed a
+    /// number and sorts by it. What that number means is the caller's business,
+    /// and the caller is the only layer that can say: the Spaces tree composes
+    /// two kinds of entity into one walk, and their node indices are what used
+    /// to decide the order between them. Indices are an artifact of how the
+    /// list was built — every Space is appended before every pane, so a first
+    /// mate's own directly-dispatched workers landed after *all* of its second
+    /// mates, and the depth-first walk then drew each of those mates' own
+    /// workers in between. A band lets the caller state the order it means
+    /// instead of inheriting the one its `Vec` layout happened to imply.
+    pub sibling_group: u8,
 }
 
 /// Where one node landed once the tree was walked.
@@ -187,7 +205,13 @@ pub(crate) struct Placement {
 /// This is the whole tree contract in one call: cycles, self-ownership,
 /// duplicate names and owners nobody answers to all degrade to roots rather
 /// than dropping a node, because an unreachable entity is one the user cannot
-/// rescue. Sibling order is whatever order the caller established.
+/// rescue. Sibling order is whatever order the caller established, grouped by
+/// [`OwnedNode::sibling_group`].
+///
+/// The grouping is applied to *children* and not to the root list. A band says
+/// how a parent's own children are laid out beneath it, and a root has no
+/// parent whose children they are — the top level is a list of separate trees,
+/// and its order is the caller's alone.
 pub(crate) fn arrange_owner_tree(nodes: &[OwnedNode<'_>]) -> Vec<Placement> {
     let parents = resolve_parents(nodes);
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
@@ -197,6 +221,10 @@ pub(crate) fn arrange_owner_tree(nodes: &[OwnedNode<'_>]) -> Vec<Placement> {
             Some(parent_idx) => children[*parent_idx].push(idx),
             None => roots.push(idx),
         }
+    }
+    // Stable, so the caller's own order survives untouched inside each band.
+    for kids in children.iter_mut() {
+        kids.sort_by_key(|idx| nodes[*idx].sibling_group);
     }
     walk_tree(&children, &roots)
 }
@@ -275,6 +303,9 @@ fn agent_nodes(entries: &[AgentPanelEntry]) -> Vec<OwnedNode<'_>> {
             // about its owner it published, including the `created_by` edge,
             // which `resolve_owner` has already turned into a name by here.
             parent: None,
+            // One kind of entity in this walk, so there is nothing to band:
+            // every node here is a pane and they all sort together.
+            sibling_group: 0,
         })
         .collect()
 }
@@ -901,5 +932,115 @@ mod tests {
         let mut entries: Vec<AgentPanelEntry> = Vec::new();
         arrange_agent_tree(&mut entries);
         assert!(entries.is_empty());
+    }
+
+    fn node<'a>(name: &'a str, owner: Option<&'a str>, sibling_group: u8) -> OwnedNode<'a> {
+        OwnedNode {
+            name: Some(name),
+            owner,
+            parent: None,
+            sibling_group,
+        }
+    }
+
+    /// A parent's children draw in band order whatever order they were handed
+    /// in, which is what lets the Spaces tree put a mate's own workers above
+    /// the Spaces hanging off it without reordering the node list itself.
+    #[test]
+    fn a_lower_band_draws_before_a_higher_one() {
+        let nodes = vec![
+            node("root", None, 1),
+            node("space", Some("root"), 1),
+            node("space_child", Some("space"), 0),
+            node("worker", Some("root"), 0),
+        ];
+
+        let order: Vec<usize> = arrange_owner_tree(&nodes)
+            .into_iter()
+            .map(|placement| placement.index)
+            .collect();
+
+        // `worker` is band 0, so it precedes `space` and the whole subtree that
+        // the depth-first walk drags along behind it.
+        assert_eq!(order, vec![0, 3, 1, 2]);
+    }
+
+    /// Inside one band the caller's order is untouched: banding is a grouping
+    /// laid over the caller's sort, never a replacement for it.
+    #[test]
+    fn a_band_keeps_the_order_it_was_handed() {
+        let nodes = vec![
+            node("root", None, 0),
+            node("b", Some("root"), 0),
+            node("a", Some("root"), 0),
+            node("c", Some("root"), 0),
+        ];
+
+        let order: Vec<usize> = arrange_owner_tree(&nodes)
+            .into_iter()
+            .map(|placement| placement.index)
+            .collect();
+
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    /// The default band is what every node not opting in gets, so a caller that
+    /// says nothing about bands gets exactly the tree it always did.
+    #[test]
+    fn one_band_everywhere_is_the_old_order() {
+        let banded = vec![
+            node("root", None, 0),
+            node("space", Some("root"), 0),
+            node("worker", Some("root"), 0),
+        ];
+        let defaulted: Vec<OwnedNode<'_>> = banded
+            .iter()
+            .map(|node| OwnedNode {
+                sibling_group: OwnedNode::default().sibling_group,
+                ..*node
+            })
+            .collect();
+
+        assert_eq!(
+            arrange_owner_tree(&banded),
+            arrange_owner_tree(&defaulted),
+            "the default band changed the shape a caller who ignores bands gets"
+        );
+    }
+
+    /// Bands order siblings; they must not re-home anybody. A node in a
+    /// different band from its parent still hangs off that parent.
+    #[test]
+    fn a_band_does_not_change_who_owns_whom() {
+        let nodes = vec![
+            node("root", None, 1),
+            node("space", Some("root"), 1),
+            node("worker_of_space", Some("space"), 0),
+            node("worker_of_root", Some("root"), 0),
+        ];
+
+        let depths: Vec<u8> = arrange_owner_tree(&nodes)
+            .into_iter()
+            .map(|placement| placement.depth)
+            .collect();
+
+        // Emitted order is root, worker_of_root, space, worker_of_space — and
+        // the worker under the Space is still a level deeper than the one under
+        // the root, however the two bands moved them.
+        assert_eq!(depths, vec![0, 1, 1, 2]);
+    }
+
+    /// Root order is the caller's alone: the top level is a list of separate
+    /// trees, not one parent's children, so a band must not reshuffle it.
+    #[test]
+    fn bands_leave_the_root_list_alone() {
+        let nodes = vec![node("first_root", None, 1), node("second_root", None, 0)];
+
+        let order: Vec<usize> = arrange_owner_tree(&nodes)
+            .into_iter()
+            .map(|placement| placement.index)
+            .collect();
+
+        assert_eq!(order, vec![0, 1]);
     }
 }
