@@ -296,7 +296,7 @@ impl BodyKind {
     /// also the artifact's own conclusion — *"distance from the sun stays what it has always been:
     /// the ladder's fixed spacing, which is the field's composition. Mass is read off radius and
     /// period."*
-    fn revolutions_per_loop(self, size: BodySize) -> f32 {
+    pub(crate) fn revolutions_per_loop(self, size: BodySize) -> f32 {
         let (slowest, fastest) = self.revolution_band();
         match (self, size) {
             // The sun does not orbit, and a body with no mass to read keeps its tier's own rate.
@@ -468,7 +468,65 @@ pub(crate) struct TreeNode {
     ///
     /// `0.0` for anything with no streak to read, which is every worker and the sun.
     pub(crate) streak: f32,
+    /// How worn this body's own orbit is, `0.0..=1.0` — see [`OrbitWear`]. Already quantized by
+    /// `src/app/background_scene.rs`, which owns the accumulation and the clock.
+    pub(crate) wear: f32,
 }
+
+/// How deep a body's orbit track is worn, in whole steps.
+///
+/// **Density is revolutions completed** — a groove in this scene means "how much has passed here",
+/// and an orbit that has been travelled a thousand times has a deeper one than an orbit that has
+/// been travelled twice.
+///
+/// Quantized to a small number of steps rather than carried as a continuous number, and that is
+/// the load-bearing decision rather than a tidy one: the ambient scene is *baked* into a cached
+/// loop and regenerated only when its key moves, so a continuously-varying wear value would
+/// re-bake all [`FRAME_COUNT`] frames on every tick. In steps, a re-bake happens exactly when a
+/// track visibly deepens — which at real orbital rates is a few times an hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OrbitWear(pub(crate) u8);
+
+impl OrbitWear {
+    /// How many steps of wear a track has, above bare. Four, matching the track material's own
+    /// 1–4px width: the material is what the steps are steps *of*.
+    pub(crate) const STEPS: u8 = 4;
+
+    /// The wear a body's own revolution count has earned, as a step.
+    ///
+    /// Saturating rather than running away: a groove that keeps deepening forever would end up the
+    /// loudest thing in the frame, and a readout that shouts over its own subject is a composition
+    /// defect rather than a data one.
+    pub(crate) fn of(revolutions: f32) -> Self {
+        let fraction = clamp01(revolutions / REVOLUTIONS_TO_FULL_WEAR);
+        // `sqrt` rather than linear: the first hundred revolutions of a fresh orbit are the ones
+        // that say "this body has been here a while", and the ten-thousandth says very little the
+        // nine-thousandth did not.
+        Self((fraction.sqrt() * Self::STEPS as f32).round() as u8)
+    }
+
+    /// This step as a `0.0..=1.0` fraction, for the renderer.
+    pub(crate) fn fraction(self) -> f32 {
+        f32::from(self.0.min(Self::STEPS)) / f32::from(Self::STEPS)
+    }
+}
+
+/// Revolutions at which a track is fully worn.
+///
+/// A second mate completes one to three per animation loop, and a loop is about five seconds — so
+/// full wear is a few hours of a body sitting in the fleet. Long enough that the deepest groove
+/// means something, short enough that a working day reaches it.
+const REVOLUTIONS_TO_FULL_WEAR: f32 = 2_400.0;
+
+/// How wide a track is drawn at bare and at full wear, in pixels. The orrery's own 1–4px.
+const TRACK_WIDTH_PX: (f32, f32) = (1.0, 4.0);
+
+/// How bright a track is at bare and at full wear.
+///
+/// The top is deliberately low. The grooves are a real readout, and they are also the loudest
+/// thing in the field after the bodies themselves — A33's single stated gain, applied at the one
+/// place marks are written, and held above the level where a groove stops reading as a path.
+const TRACK_ALPHA: (f32, f32) = (0.045, 0.30);
 
 /// One body's static placement facts, resolved once per topology change (mirrors
 /// `App::observe_sidebar_particle_field`'s "regenerate on resize, not per tick" cadence — a body
@@ -482,6 +540,8 @@ struct BodyLayout {
     severity: Severity,
     /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
     streak: f32,
+    /// How worn this body's own orbit is, `0.0..=1.0` — see [`OrbitWear`].
+    wear: f32,
     /// Whether this body is drawn at all. `false` for a second mate the ring had no slot for, and
     /// for everything under it — see [`seat_the_ladder`].
     seated: bool,
@@ -688,6 +748,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             hue: node.hue,
             severity: node.severity,
             streak,
+            wear: clamp01(node.wear),
             seated: seated.get(idx).copied().unwrap_or(true),
             revolutions_per_loop: node.kind.revolutions_per_loop(node.size),
             base_angle,
@@ -1184,6 +1245,101 @@ fn draw_body(
             }
         }
     }
+}
+
+/// Draw one body's orbit track: the ring it has worn into the scene, about its own parent.
+///
+/// Centred on the parent's *current* position rather than a fixed point, because a worker's orbit
+/// is around a mate that is itself moving — the track travels with the body it belongs to, which
+/// is what makes it that body's own path rather than a decoration at a fixed radius.
+fn draw_orbit_track(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    centre: (f32, f32),
+    radius: f32,
+    wear: f32,
+    seed: u32,
+) {
+    if wear <= 0.0 || radius <= 0.0 {
+        return;
+    }
+    let half = mix(TRACK_WIDTH_PX.0, TRACK_WIDTH_PX.1, wear) * 0.5;
+    let alpha = mix(TRACK_ALPHA.0, TRACK_ALPHA.1, wear);
+
+    // Only the annulus, not the whole disk the orbit encloses — the cost lever that keeps a track
+    // around a 490px orbit to a few thousand pixels rather than three quarters of a million.
+    let outer = radius + half + 1.0;
+    let inner = (radius - half - 1.0).max(0.0);
+    let x0 = (centre.0 - outer).floor().max(0.0) as i32;
+    let x1 = (centre.0 + outer).ceil().min(width as f32) as i32;
+    let y0 = (centre.1 - outer).floor().max(0.0) as i32;
+    let y1 = (centre.1 + outer).ceil().min(height as f32) as i32;
+
+    for py in y0..y1 {
+        let dy = py as f32 + 0.5 - centre.1;
+        // Skip whole rows that cannot touch the annulus, which is most of them.
+        if dy.abs() > outer {
+            continue;
+        }
+        for px in x0..x1 {
+            let dx = px as f32 + 0.5 - centre.0;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < inner || dist > outer {
+                continue;
+            }
+            let offset = (dist - radius).abs();
+            if offset > half {
+                continue;
+            }
+            // Wear varies along the groove, so it reads as a worn path rather than a drawn circle.
+            let along = dy.atan2(dx);
+            let variation = mix(
+                0.62,
+                1.0,
+                value_noise(along * 3.1, 0.0, seed) * 0.6
+                    + value_noise(along * 11.7, 4.0, seed) * 0.4,
+            );
+            let idx_px = py as usize * width as usize + px as usize;
+            blend(
+                &mut buf[idx_px],
+                TRACK_RGB01,
+                alpha * variation * clamp01(1.0 - offset / half.max(0.5)),
+            );
+        }
+    }
+}
+
+/// Every distinct orbit in the scene: `(parent, radius, deepest wear on it, seed)`.
+///
+/// Distinct by parent and radius rather than by body, because herdr's ladder is one ring per tier
+/// and a whole tier of mates therefore shares a single path. The seed is taken from the parent so
+/// one shared groove has one shape rather than a different scatter depending on which body was
+/// drawn last.
+fn distinct_orbits(layout: &SceneLayout) -> Vec<(usize, f32, f32, u32)> {
+    let mut orbits: Vec<(usize, f32, f32, u32)> = Vec::new();
+    for body in layout.bodies.iter().filter(|body| body.seated) {
+        if body.wear <= 0.0 || body.orbit_radius_px <= 0.0 {
+            continue;
+        }
+        let Some(parent) = body.parent.filter(|p| layout.is_seated(*p)) else {
+            continue;
+        };
+        match orbits.iter_mut().find(|(existing_parent, radius, _, _)| {
+            *existing_parent == parent && (*radius - body.orbit_radius_px).abs() < 0.5
+        }) {
+            // "How much has passed here" is the deepest wear on the path, not the sum of every
+            // body's separately: two bodies each half-worn have not worn one groove fully.
+            Some((_, _, wear, _)) => *wear = wear.max(body.wear),
+            None => orbits.push((
+                parent,
+                body.orbit_radius_px,
+                body.wear,
+                body_seed(parent).wrapping_add(4_099),
+            )),
+        }
+    }
+    orbits
 }
 
 /// Where the unseated mates are marked, as a fraction of `min(width, height)` from the scene's
@@ -1705,6 +1861,26 @@ fn frame_inner(layout: &SceneLayout, phase: f32, rings: bool) -> Vec<u8> {
 
     if width > 0 && height > 0 {
         render_bands(&mut buf, width, height, phase);
+    }
+
+    // Under every body and every effect: a groove is wear in the ground, not something laid over
+    // what stands on it.
+    //
+    // One track per *orbit*, not per body. herdr's ladder is a single ring per tier, so every
+    // second mate shares one path — five bodies each drawing the whole circle composites five
+    // copies of it and saturates the groove long before any of them is actually worn, which loses
+    // exactly the reading the layer exists for. The shared groove carries the deepest wear on it,
+    // because that is what "how much has passed here" means when several things pass here.
+    for (parent, radius, wear, seed) in distinct_orbits(layout) {
+        draw_orbit_track(
+            &mut buf,
+            width,
+            height,
+            layout.position(parent, phase),
+            radius,
+            wear,
+            seed,
+        );
     }
 
     draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
@@ -2470,6 +2646,7 @@ mod tests {
             severity: Severity::Clear,
             size: BodySize::Fixed,
             streak: 0.0,
+            wear: 0.0,
         }
     }
 
@@ -2495,6 +2672,7 @@ mod tests {
             severity,
             size: BodySize::Fixed,
             streak: 0.0,
+            wear: 0.0,
         }
     }
 
@@ -3580,6 +3758,132 @@ mod tests {
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Orbit tracks
+    // ---------------------------------------------------------------------------
+
+    fn worn_fleet(wear: &[f32]) -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for (i, w) in wear.iter().enumerate() {
+            nodes.push(TreeNode {
+                wear: *w,
+                ..sized(
+                    Some(0),
+                    BodyKind::Planet,
+                    BodySize::Files((i as u32 + 1) * 400),
+                )
+            });
+        }
+        nodes
+    }
+
+    /// Total ink in a rendered frame. Only ever compared between two fleets of the **same shape**
+    /// — same bodies, same sizes, same positions — with nothing differing but the wear, so what is
+    /// left in the difference is the groove. Comparing fleets of different sizes would measure
+    /// body count instead, which is the mistake this comment exists to stop.
+    fn frame_ink(nodes: &[TreeNode]) -> u64 {
+        let layout = build_layout(nodes, 900, 900);
+        frame(&layout, 0.0)
+            .chunks_exact(4)
+            .map(|px| u64::from(px[0]) + u64::from(px[1]) + u64::from(px[2]))
+            .sum()
+    }
+
+    #[test]
+    fn a_worn_orbit_draws_a_deeper_groove_than_a_fresh_one() {
+        // Density is revolutions completed, measured on the rendered frame against the identical
+        // fleet at a different wear — same bodies in the same places, so the difference is the
+        // groove and nothing else.
+        let bare = frame_ink(&worn_fleet(&[0.0]));
+        let half = frame_ink(&worn_fleet(&[0.5]));
+        let full = frame_ink(&worn_fleet(&[1.0]));
+        assert!(
+            half > bare,
+            "a half-worn orbit drew no more than a bare one"
+        );
+        assert!(full > half, "wear stopped deepening the groove");
+
+        // An untravelled path is not a path yet: at zero wear there is no groove at all, rather
+        // than a faint ring waiting to be deepened.
+        assert!(distinct_orbits(&build_layout(&worn_fleet(&[0.0]), 900, 900)).is_empty());
+        assert_eq!(bare, frame_ink(&worn_fleet(&[0.0])));
+    }
+
+    #[test]
+    fn a_shared_orbit_is_one_groove_carrying_the_deepest_wear_on_it() {
+        // herdr's ladder is a single ring per tier, so a whole tier of mates shares one path. Five
+        // bodies each drawing the whole circle composites five copies and saturates the groove
+        // long before any of them is worn — which loses exactly the reading the layer is for.
+        //
+        // Same five bodies both times: in one, all five are quarter-worn; in the other, only one
+        // is and the rest are bare. If the shared orbit is drawn once at the deepest wear on it,
+        // those are the same picture. If it is drawn per body, the first is four copies deeper.
+        let all_worn = worn_fleet(&[0.25, 0.25, 0.25, 0.25, 0.25]);
+        let one_worn = worn_fleet(&[0.25, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            frame(&build_layout(&all_worn, 900, 900), 0.0),
+            frame(&build_layout(&one_worn, 900, 900), 0.0),
+            "the shared orbit is being composited once per body"
+        );
+
+        // ...and it carries the deepest wear on it rather than the first or the last body's.
+        let layout = build_layout(&worn_fleet(&[0.25, 1.0, 0.25]), 900, 900);
+        let orbits = distinct_orbits(&layout);
+        assert_eq!(
+            orbits.len(),
+            1,
+            "three mates on one ring drew {} grooves",
+            orbits.len()
+        );
+        assert_eq!(orbits[0].2, 1.0);
+    }
+
+    #[test]
+    fn a_track_belongs_to_the_body_it_is_under() {
+        // A worker's orbit is around a mate that is itself moving, so its groove has to travel
+        // with it — a track drawn at a fixed point would be a decoration at a radius rather than
+        // that body's own path.
+        let nodes = [
+            node(None, BodyKind::Sun),
+            TreeNode {
+                wear: 1.0,
+                ..sized(Some(0), BodyKind::Planet, BodySize::Files(2_000))
+            },
+            TreeNode {
+                wear: 1.0,
+                ..node(Some(1), BodyKind::Moon)
+            },
+        ];
+        let layout = build_layout(&nodes, 900, 900);
+        let moon_orbit = distinct_orbits(&layout)
+            .into_iter()
+            .find(|(parent, _, _, _)| *parent == 1)
+            .expect("the worker's own orbit");
+        for phase in [0.0f32, 1.0, 2.5] {
+            let planet = layout.position(1, phase);
+            let centre = layout.position(moon_orbit.0, phase);
+            assert_eq!(
+                centre, planet,
+                "the worker's groove is not centred on its mate"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unseated_bodys_orbit_is_not_drawn() {
+        // A mate the ring had no slot for is not in the picture, and neither is the path it wore.
+        let mut wear = vec![1.0f32; ORBIT_LADDER_SLOTS + 4];
+        wear[0] = 1.0;
+        let nodes = worn_fleet(&wear);
+        let layout = build_layout(&nodes, 900, 900);
+        for (parent, _, _, _) in distinct_orbits(&layout) {
+            assert!(layout.bodies[parent].seated);
+        }
+        // Every body here shares one orbit, so an unseated one contributes nothing new either way
+        // — what has to hold is that nothing is drawn about a parent that is not on screen.
+        assert!(distinct_orbits(&layout).len() <= 1);
     }
 
     // ---------------------------------------------------------------------------

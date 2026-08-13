@@ -43,6 +43,10 @@ fn background_scene_key(
         // streak that climbed a band has to reach the picture, so it belongs in the key even
         // though it is quantized to the nearest expression step rather than a raw score.
         node.streak.to_bits().hash(&mut hasher);
+        // The drawn wear step, not the raw revolution count: the count advances every tick and the
+        // step does not, so hashing the count would rebake the whole loop on every pass forever.
+        // This is exactly why `OrbitWear` is quantized at all.
+        node.wear.to_bits().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -442,6 +446,8 @@ impl App {
         // Before the scene, so a corner drawn this pass carries this pass's sample rather than
         // the previous one's.
         changed |= self.observe_machine_register(now);
+        // Before the scene, so a rebake this pass draws this pass's wear.
+        changed |= self.observe_orbit_tracks(now);
         changed |= self.observe_background_scene();
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
         changed |= self.observe_background_effects(now, true);
@@ -1347,6 +1353,30 @@ impl App {
             },
         ));
         true
+    }
+
+    /// Advance every body's orbit-track wear, and forget the bodies that have left.
+    ///
+    /// Runs every tick, and is cheap enough to: it is one multiply and one comparison per body.
+    /// What it deliberately does *not* do is report a change every tick — the revolution counts
+    /// advance continuously and the drawn wear steps do not, so it returns `true` only when a
+    /// track has actually deepened enough to look different. Returning the former would rebake
+    /// the whole ambient loop on every pass forever.
+    ///
+    /// Sampled whether or not the scene is currently drawing, because a track is a fact about how
+    /// long a body has been in the fleet rather than about how long it has been *looked at*: a
+    /// scene switched on after an hour's work should show the hour.
+    pub(crate) fn observe_orbit_tracks(&mut self, now: Instant) -> bool {
+        let (nodes, identity) = crate::app::background_scene::tree_nodes(&self.state);
+        let rates: Vec<(&crate::anim::CardRow, f32)> = identity
+            .iter()
+            .zip(&nodes)
+            .map(|(row, node)| (row, node.kind.revolutions_per_loop(node.size)))
+            .collect();
+        let mut tracks = std::mem::take(&mut self.state.orbit_tracks);
+        let moved = tracks.advance(rates.into_iter(), now);
+        self.state.orbit_tracks = tracks;
+        moved
     }
 
     pub(crate) fn observe_background_scene(&mut self) -> bool {

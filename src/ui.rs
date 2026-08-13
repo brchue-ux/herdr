@@ -2118,6 +2118,7 @@ switch_workspace = "ctrl+1..9"
             severity: crate::anim::cell::Severity::Critical,
             size: crate::solar_system::BodySize::Fixed,
             streak: 0.0,
+            wear: 0.0,
         }];
         let layout = crate::solar_system::build_layout(&nodes, width_px, height_px);
 

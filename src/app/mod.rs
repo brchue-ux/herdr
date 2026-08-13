@@ -882,6 +882,7 @@ impl App {
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,
+            orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,
