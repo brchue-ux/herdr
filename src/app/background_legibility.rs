@@ -183,11 +183,18 @@ impl LegibilityGrid {
 /// for 'resample this tick,' gated per 3c": this function gates its own heavier work internally
 /// instead of the once-per-tick caller doing so. Returns whether a fresh sample actually ran, so
 /// the caller's own `changed` bookkeeping schedules a repaint that reflects the new colours.
+///
+/// `corner` is the machine register's own readout, which is a *third* surface placed over the same
+/// cells (`crate::machine_register`). It has to be composited in here or the decision for the
+/// cells it covers is made against a background that is not what is behind them — and it is
+/// exactly the cells carrying a readout somebody is reading that would be wrong. Only its own box
+/// is affected: every cell outside it samples precisely what it sampled before.
 pub(crate) fn observe(
     grid: &mut Option<LegibilityGrid>,
     layout: &SceneLayout,
     phase: f32,
     effects: &SceneEffects,
+    corner: Option<solar_system::CornerLayer<'_>>,
     cell_width_px: u32,
     cell_height_px: u32,
     now: Instant,
@@ -217,6 +224,7 @@ pub(crate) fn observe(
     let sampled = solar_system::sample_cell_backgrounds(
         &ambient,
         &effects_rgba,
+        corner,
         layout.width(),
         layout.height(),
         cell_width_px,
@@ -328,7 +336,7 @@ mod tests {
         let mut grid = None;
         let now = Instant::now();
 
-        let changed = observe(&mut grid, &layout, 0.0, &effects, 8, 8, now);
+        let changed = observe(&mut grid, &layout, 0.0, &effects, None, 8, 8, now);
         assert!(changed, "the first observe call must bootstrap the grid");
         assert!(grid.is_some());
 
@@ -337,6 +345,7 @@ mod tests {
             &layout,
             0.0,
             &effects,
+            None,
             8,
             8,
             now + Duration::from_millis(10),
@@ -351,6 +360,7 @@ mod tests {
             &layout,
             0.0,
             &effects,
+            None,
             8,
             8,
             now + SAMPLE_INTERVAL + Duration::from_millis(1),
@@ -368,12 +378,12 @@ mod tests {
         let effects = SceneEffects::default();
         let mut grid = None;
         let now = Instant::now();
-        observe(&mut grid, &layout, 0.0, &effects, 8, 8, now);
+        observe(&mut grid, &layout, 0.0, &effects, None, 8, 8, now);
         assert_eq!(grid.as_ref().unwrap().cols, 4);
         assert_eq!(grid.as_ref().unwrap().rows, 2);
 
         // A finer host cell size resizes the grid even though SAMPLE_INTERVAL has not elapsed.
-        let changed = observe(&mut grid, &layout, 0.0, &effects, 4, 4, now);
+        let changed = observe(&mut grid, &layout, 0.0, &effects, None, 4, 4, now);
         assert!(changed);
         assert_eq!(grid.as_ref().unwrap().cols, 8);
         assert_eq!(grid.as_ref().unwrap().rows, 4);

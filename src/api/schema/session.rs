@@ -47,7 +47,7 @@ pub struct SessionSnapshot {
 /// terminal that no amount of reading the config can reveal. A caller that
 /// wants the one-line answer reads [`Self::active`]; a caller asking why it is
 /// false reads the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BackgroundSceneInfo {
     /// The scene is being drawn. True exactly when every other condition here
     /// that gates it is met.
@@ -96,6 +96,20 @@ pub struct BackgroundSceneInfo {
     /// mysterious. Zero whenever the fleet fits.
     #[serde(default)]
     pub mates_beyond_ladder: u32,
+    /// How much of the main area — the frame outside the sidebar — carries no
+    /// interface element over it, `0.0..=1.0`.
+    ///
+    /// The composition bound the whole scene exists to satisfy: if the interface
+    /// crowds the sky out, the scene is not worth drawing. Pane text does not
+    /// count against it, and that is a real distinction: the scene is an opaque
+    /// wash placed *under* the text with no pane background of its own, so a
+    /// terminal region is ink on the scene rather than a panel over it. What
+    /// counts is anything that puts a surface between the reader and the sky.
+    #[serde(default)]
+    pub sky_clear_fraction: f32,
+    /// The floor [`Self::sky_clear_fraction`] is held to.
+    #[serde(default)]
+    pub sky_clear_floor: f32,
 }
 
 /// The host machine's own state: CPU aggregate and per core, memory, swap and

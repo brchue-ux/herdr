@@ -167,6 +167,8 @@ impl App {
             // point of disclosing it.
             mates_seated: seated as u32,
             mates_beyond_ladder: beyond as u32,
+            sky_clear_fraction: state.sky_clear_fraction(),
+            sky_clear_floor: crate::app::state::SKY_CLEAR_FLOOR,
         }
     }
 }

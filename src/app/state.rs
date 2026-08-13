@@ -1911,6 +1911,14 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// The least of the main area the scene may be left with — the fraction of the frame outside the
+/// sidebar that has to carry no interface element over it.
+///
+/// A composition bound rather than a measured limit: if the interface crowds the sky out, the
+/// thing the scene exists for is gone and there is no point drawing it. Stated here, once, so the
+/// readout and the test that holds it cannot drift apart.
+pub(crate) const SKY_CLEAR_FLOOR: f32 = 0.60;
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -2364,6 +2372,13 @@ pub struct AppState {
     /// What the corner above was drawn for: its cell geometry and the register's own generation.
     /// Zero whenever nothing is drawn. Redrawn only when this moves, never once per tick.
     pub(crate) machine_corner_key: u64,
+    /// The same corner's raw RGBA, kept beside the encoded layer.
+    ///
+    /// The per-cell legibility pass has to composite this surface to decide the foreground for the
+    /// cells it covers, and it needs pixels rather than a PNG. Held rather than re-rendered: the
+    /// corner is a couple of hundred kilobytes, and re-rendering it once per legibility sample
+    /// would cost more than storing it by a wide margin.
+    pub(crate) machine_corner_rgba: Option<Vec<u8>>,
     /// Which fleet identity (`crate::anim::CardRow`) each index of
     /// `background_scene_layout` resolves to.
     pub(crate) background_scene_identity: Vec<crate::anim::CardRow>,
@@ -3687,6 +3702,7 @@ impl AppState {
             machine_register: crate::machine_register::MachineRegister::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
+            machine_corner_rgba: None,
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,

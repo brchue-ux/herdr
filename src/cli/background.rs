@@ -386,6 +386,8 @@ mod tests {
             ladder_capacity: 8,
             mates_seated: 8,
             mates_beyond_ladder: 0,
+            sky_clear_fraction: 1.0,
+            sky_clear_floor: 0.60,
         };
         // The condition that is false is the terminal, and it is the one a
         // reader has to be able to pick out of the readout.
@@ -409,6 +411,8 @@ mod tests {
             ladder_capacity: 8,
             mates_seated: 8,
             mates_beyond_ladder: 9,
+            sky_clear_fraction: 0.975,
+            sky_clear_floor: 0.60,
         };
         // A fleet of 17 with a ring that seats 8: the readout has to be able to
         // say all three numbers, and which register the nine lost on.

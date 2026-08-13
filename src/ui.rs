@@ -2126,6 +2126,7 @@ switch_workspace = "ctrl+1..9"
             &layout,
             0.0,
             &crate::solar_system::SceneEffects::default(),
+            None,
             8,
             16,
             std::time::Instant::now(),

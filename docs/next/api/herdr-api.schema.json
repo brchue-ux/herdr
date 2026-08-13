@@ -7016,6 +7016,18 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "sky_clear_floor": {
+              "default": 0.0,
+              "description": "The floor [`Self::sky_clear_fraction`] is held to.",
+              "format": "float",
+              "type": "number"
+            },
+            "sky_clear_fraction": {
+              "default": 0.0,
+              "description": "How much of the main area — the frame outside the sidebar — carries no\ninterface element over it, `0.0..=1.0`.\n\nThe composition bound the whole scene exists to satisfy: if the interface\ncrowds the sky out, the scene is not worth drawing. Pane text does not\ncount against it, and that is a real distinction: the scene is an opaque\nwash placed *under* the text with no pane background of its own, so a\nterminal region is ink on the scene rather than a panel over it. What\ncounts is anything that puts a surface between the reader and the sky.",
+              "format": "float",
+              "type": "number"
             }
           },
           "required": [
@@ -10876,7 +10888,9 @@
                 "kitty_graphics_enabled": false,
                 "ladder_capacity": 0,
                 "mates_beyond_ladder": 0,
-                "mates_seated": 0
+                "mates_seated": 0,
+                "sky_clear_floor": 0.0,
+                "sky_clear_fraction": 0.0
               },
               "description": "Whether the persistent whole-terminal background scene is drawing, and\nwhen it is not, which of its conditions is the one that is unmet."
             },

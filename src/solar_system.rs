@@ -2080,9 +2080,24 @@ pub(crate) fn effects_frame_png(
 /// cell's sampled colour the same way it changes what's actually on screen. `cols`x`rows` is the
 /// terminal-cell grid `width`x`height` divides into (the background scene canvas is always built
 /// as an exact multiple of the host cell size, `App::observe_background_scene`).
+/// A layer drawn over part of the scene rather than all of it, for
+/// [`sample_cell_backgrounds`] to composite in — the machine corner.
+///
+/// Carries its own origin **in cells** because that is what it is placed by, and its own pixel
+/// size because it is its own surface rather than a crop of the scene's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CornerLayer<'a> {
+    pub(crate) rgba: &'a [u8],
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) col: u32,
+    pub(crate) row: u32,
+}
+
 pub(crate) fn sample_cell_backgrounds(
     ambient: &[u8],
     effects: &[u8],
+    corner: Option<CornerLayer<'_>>,
     width: u32,
     height: u32,
     cell_width_px: u32,
@@ -2098,6 +2113,16 @@ pub(crate) fn sample_cell_backgrounds(
     let mut sums = vec![[0u32; 3]; cell_count];
     let mut counts = vec![0u32; cell_count];
 
+    // The corner's own pixel box in scene coordinates. Everything outside it is untouched, which
+    // is the whole shape of the rule: the reservation is the panel's own box and nothing else. A
+    // full-width band across the frame — the obvious implementation — would move the legibility
+    // decision for every cell on those rows, most of which have nothing over them at all.
+    let corner_box = corner.map(|layer| {
+        let x0 = layer.col * cell_width_px;
+        let y0 = layer.row * cell_height_px;
+        (layer, x0, y0, x0 + layer.width, y0 + layer.height)
+    });
+
     for y in 0..height as usize {
         let row = ((y as u32 / cell_height_px).min(rows - 1)) as usize;
         for x in 0..width as usize {
@@ -2105,10 +2130,32 @@ pub(crate) fn sample_cell_backgrounds(
             let px_idx = (y * width as usize + x) * 4;
 
             let effects_alpha = f32::from(effects[px_idx + 3]) / 255.0;
+            // The machine corner is a third surface placed over the same cells, so text sitting on
+            // it has to be measured against what is actually behind it. Sampling only the scene
+            // would read the void under a lit groove, commit the wrong foreground, and be wrong
+            // exactly where a readout the reader is looking at happens to be.
+            let over_corner = corner_box.and_then(|(layer, x0, y0, x1, y1)| {
+                let (px, py) = (x as u32, y as u32);
+                if px < x0 || px >= x1 || py < y0 || py >= y1 {
+                    return None;
+                }
+                let idx = ((py - y0) as usize * layer.width as usize + (px - x0) as usize) * 4;
+                (idx + 3 < layer.rgba.len()).then_some((layer.rgba, idx))
+            });
+            let corner_alpha = over_corner
+                .map(|(rgba, idx)| f32::from(rgba[idx + 3]) / 255.0)
+                .unwrap_or(0.0);
+
             let composite = |channel: usize| {
                 let ambient_c = f32::from(ambient[px_idx + channel]);
                 let effects_c = f32::from(effects[px_idx + channel]);
-                effects_c * effects_alpha + ambient_c * (1.0 - effects_alpha)
+                let scene = effects_c * effects_alpha + ambient_c * (1.0 - effects_alpha);
+                match over_corner {
+                    Some((rgba, idx)) => {
+                        f32::from(rgba[idx + channel]) * corner_alpha + scene * (1.0 - corner_alpha)
+                    }
+                    None => scene,
+                }
             };
 
             let cell_idx = row * cols as usize + col;
@@ -3111,7 +3158,8 @@ mod tests {
         let effects = vec![0u8; (width * height * 4) as usize]; // fully transparent: no overlay
         let cols = 4;
         let rows = 2;
-        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, cols, rows);
+        let samples =
+            sample_cell_backgrounds(&ambient, &effects, None, width, height, 2, 2, cols, rows);
         assert_eq!(samples.len(), (cols * rows) as usize);
         for sample in samples {
             assert_eq!(sample, (40, 60, 80));
@@ -3126,7 +3174,7 @@ mod tests {
         // One fully-opaque bright pixel in the top-left cell, transparent everywhere else.
         let mut effects = vec![0u8; (width * height * 4) as usize];
         effects[0..4].copy_from_slice(&[255, 255, 255, 255]);
-        let samples = sample_cell_backgrounds(&ambient, &effects, width, height, 2, 2, 2, 2);
+        let samples = sample_cell_backgrounds(&ambient, &effects, None, width, height, 2, 2, 2, 2);
         // The top-left cell's 4 pixels average 3 dark ambient pixels and 1 bright effect pixel.
         assert_eq!(samples[0], (71, 71, 71));
         // Every other cell is untouched ambient.
@@ -3510,6 +3558,122 @@ mod tests {
             fifteen_mates.len(),
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // What sits over the scene, and where
+    // ---------------------------------------------------------------------------
+
+    /// A corner-sized surface filled with one opaque colour, for the sampler to composite.
+    fn opaque_corner(width: u32, height: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = rgb.0;
+            px[1] = rgb.1;
+            px[2] = rgb.2;
+            px[3] = 255;
+        }
+        rgba
+    }
+
+    #[test]
+    fn a_surface_over_the_scene_is_sampled_where_it_is_and_nowhere_else() {
+        // The whole of it: a third surface placed over the same cells has to reach the legibility
+        // decision for the cells it covers — text sitting on a lit groove read against the void
+        // behind it commits the wrong foreground, and it does so exactly where a readout somebody
+        // is looking at happens to be — while every cell outside its box samples precisely what it
+        // sampled before. A full-width band across those rows, which is the obvious
+        // implementation, fails the second half.
+        let (cols, rows) = (8u32, 4u32);
+        let (cell_w, cell_h) = (4u32, 4u32);
+        let (width, height) = (cols * cell_w, rows * cell_h);
+        let layout = build_layout(&[], width, height);
+        let ambient = frame(&layout, 0.0);
+        let effects = effects_frame(&layout, &SceneEffects::default(), 0.0);
+
+        let without = sample_cell_backgrounds(
+            &ambient, &effects, None, width, height, cell_w, cell_h, cols, rows,
+        );
+
+        // Two cells wide, one tall, at the top right — the corner's own shape in miniature.
+        let (corner_cols, corner_rows) = (2u32, 1u32);
+        let corner_rgba = opaque_corner(corner_cols * cell_w, corner_rows * cell_h, (255, 0, 0));
+        let with = sample_cell_backgrounds(
+            &ambient,
+            &effects,
+            Some(CornerLayer {
+                rgba: &corner_rgba,
+                width: corner_cols * cell_w,
+                height: corner_rows * cell_h,
+                col: cols - corner_cols,
+                row: 0,
+            }),
+            width,
+            height,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+        );
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let idx = (row * cols + col) as usize;
+                let covered = row < corner_rows && col >= cols - corner_cols;
+                if covered {
+                    assert_eq!(
+                        with[idx],
+                        (255, 0, 0),
+                        "cell ({col}, {row}) is under the surface and did not sample it"
+                    );
+                } else {
+                    assert_eq!(
+                        with[idx], without[idx],
+                        "cell ({col}, {row}) is outside the surface's box and moved anyway"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_transparent_part_of_that_surface_shows_the_scene_through_it() {
+        // The corner is mostly transparent — it is a few grooves and a row of small bodies on
+        // nothing — so a cell it nominally covers is usually still reading the sky. Compositing it
+        // as an opaque box would darken text decisions across its whole rectangle for no reason.
+        let (cols, rows) = (4u32, 2u32);
+        let (cell_w, cell_h) = (4u32, 4u32);
+        let (width, height) = (cols * cell_w, rows * cell_h);
+        let layout = build_layout(&[node(None, BodyKind::Sun)], width, height);
+        let ambient = frame(&layout, 0.0);
+        let effects = effects_frame(&layout, &SceneEffects::default(), 0.0);
+
+        let without = sample_cell_backgrounds(
+            &ambient, &effects, None, width, height, cell_w, cell_h, cols, rows,
+        );
+        // Fully transparent: alpha zero everywhere.
+        let clear = vec![0u8; (width * height * 4) as usize];
+        let with = sample_cell_backgrounds(
+            &ambient,
+            &effects,
+            Some(CornerLayer {
+                rgba: &clear,
+                width,
+                height,
+                col: 0,
+                row: 0,
+            }),
+            width,
+            height,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+        );
+        assert_eq!(
+            with, without,
+            "a fully transparent overlay changed what is behind it"
         );
     }
 

@@ -1282,6 +1282,7 @@ impl App {
             || !cell.is_known()
         {
             self.state.machine_corner_key = 0;
+            self.state.machine_corner_rgba = None;
             return self.state.machine_corner_layer.take().is_some();
         }
 
@@ -1290,6 +1291,7 @@ impl App {
         // than holding its last picture on screen as though it were current.
         if register.absence(now).is_some() {
             self.state.machine_corner_key = 0;
+            self.state.machine_corner_rgba = None;
             return self.state.machine_corner_layer.take().is_some();
         }
 
@@ -1321,10 +1323,14 @@ impl App {
         let rgba = crate::solar_system::machine_corner_frame(&corner, width, height);
         let png = crate::solar_system::encode_rgba_png(width, height, &rgba);
         if png.is_empty() {
+            self.state.machine_corner_rgba = None;
             return self.state.machine_corner_layer.take().is_some();
         }
 
         self.state.machine_corner_key = key;
+        // Kept for the legibility pass, which needs pixels rather than a PNG to decide the
+        // foreground for the cells this surface covers.
+        self.state.machine_corner_rgba = Some(rgba);
         self.state.machine_corner_layer = Some(crate::app::state::GraphicsLayer::new(
             crate::api::schema::PaneGraphicsFormat::Png,
             width,
@@ -1477,11 +1483,28 @@ impl App {
         // not the foreground client's, or the samples would be read out of a
         // grid the layout was never built for.
         let cell = self.state.shared_raster_cell_size();
+        // The machine corner is a third surface over the same cells, so the legibility decision
+        // for the cells it covers has to be made against it — and only for those cells. Its origin
+        // is relative to the scene's own grid, which starts at the screen rect's origin.
+        let screen = self.state.screen_rect();
+        let corner_rect = self.state.machine_corner_rect();
+        let corner = self.state.machine_corner_rgba.as_ref().and_then(|rgba| {
+            (corner_rect.width > 0 && corner_rect.height > 0).then(|| {
+                crate::solar_system::CornerLayer {
+                    rgba,
+                    width: u32::from(corner_rect.width) * cell.width_px,
+                    height: u32::from(corner_rect.height) * cell.height_px,
+                    col: u32::from(corner_rect.x.saturating_sub(screen.x)),
+                    row: u32::from(corner_rect.y.saturating_sub(screen.y)),
+                }
+            })
+        });
         let legibility_changed = crate::app::background_legibility::observe(
             &mut self.state.background_legibility,
             &layout,
             phase,
             &effects,
+            corner,
             cell.width_px,
             cell.height_px,
             now,

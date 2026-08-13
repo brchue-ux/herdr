@@ -881,6 +881,7 @@ impl App {
             machine_register: crate::machine_register::MachineRegister::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
+            machine_corner_rgba: None,
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,
