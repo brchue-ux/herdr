@@ -47,6 +47,11 @@ fn background_scene_key(
         // step does not, so hashing the count would rebake the whole loop on every pass forever.
         // This is exactly why `OrbitWear` is quantized at all.
         node.wear.to_bits().hash(&mut hasher);
+        // A mote is a permanent mark on the track, so a new one is a new picture. The count is
+        // already bounded by what the scene draws, and each one costs a rebake by construction —
+        // which is the honest price of "every mote traces to one event".
+        node.motes.hash(&mut hasher);
+        node.mote_share.to_bits().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -446,8 +451,9 @@ impl App {
         // Before the scene, so a corner drawn this pass carries this pass's sample rather than
         // the previous one's.
         changed |= self.observe_machine_register(now);
-        // Before the scene, so a rebake this pass draws this pass's wear.
+        // Before the scene, so a rebake this pass draws this pass's wear and this pass's motes.
         changed |= self.observe_orbit_tracks(now);
+        changed |= self.observe_ambient_motes();
         changed |= self.observe_background_scene();
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
         changed |= self.observe_background_effects(now, true);
@@ -1377,6 +1383,40 @@ impl App {
         let moved = tracks.advance(rates.into_iter(), now);
         self.state.orbit_tracks = tracks;
         moved
+    }
+
+    /// Consume every body's new work and emit its ambient motes.
+    ///
+    /// Fed from `AppState::pane_activity`'s lifetime output-byte counters, which is the per-body
+    /// work register herdr actually holds — see `AmbientMotes` for why that is what the tier
+    /// counts and what it would count instead if a command counter ever landed.
+    ///
+    /// A body only earns motes for work done *while it was being watched*: a pane already an hour
+    /// into a build when the scene first sees it starts from wherever its counter is, rather than
+    /// studding its whole orbit in one pass for work nobody was watching.
+    pub(crate) fn observe_ambient_motes(&mut self) -> bool {
+        let (_, identity) = crate::app::background_scene::tree_nodes(&self.state);
+        let counts: Vec<(crate::anim::CardRow, u64)> = identity
+            .into_iter()
+            .map(|row| {
+                let bytes = match &row {
+                    crate::anim::CardRow::Agent(pane_id) => (0..self.state.workspaces.len())
+                        .find_map(|ws_idx| self.state.terminal_id_for_pane(ws_idx, *pane_id))
+                        .and_then(|id| self.state.pane_activity.get(&id))
+                        .map(|activity| activity.output_bytes)
+                        .unwrap_or(0),
+                    // A Space is not a terminal: its own traffic is the sum of the workers under
+                    // it, and those already have their own bodies. Counting it again here would
+                    // put the same work in the frame twice.
+                    crate::anim::CardRow::Space(_) => 0,
+                };
+                (row, bytes)
+            })
+            .collect();
+        let mut motes = std::mem::take(&mut self.state.ambient_motes);
+        let emitted = motes.consume(counts.iter().map(|(row, bytes)| (row, *bytes)));
+        self.state.ambient_motes = motes;
+        emitted
     }
 
     pub(crate) fn observe_background_scene(&mut self) -> bool {

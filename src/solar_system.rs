@@ -471,6 +471,13 @@ pub(crate) struct TreeNode {
     /// How worn this body's own orbit is, `0.0..=1.0` — see [`OrbitWear`]. Already quantized by
     /// `src/app/background_scene.rs`, which owns the accumulation and the clock.
     pub(crate) wear: f32,
+    /// How many ambient motes this body has earned, and how bright each of them draws.
+    ///
+    /// One mote per unit of work the body's own agent actually did, and a share resolved through
+    /// the attribution transform in `src/app/background_scene.rs` — this module draws them and
+    /// counts nothing.
+    pub(crate) motes: u32,
+    pub(crate) mote_share: f32,
 }
 
 /// How deep a body's orbit track is worn, in whole steps.
@@ -542,6 +549,8 @@ struct BodyLayout {
     streak: f32,
     /// How worn this body's own orbit is, `0.0..=1.0` — see [`OrbitWear`].
     wear: f32,
+    motes: u32,
+    mote_share: f32,
     /// Whether this body is drawn at all. `false` for a second mate the ring had no slot for, and
     /// for everything under it — see [`seat_the_ladder`].
     seated: bool,
@@ -789,6 +798,8 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             severity: node.severity,
             streak,
             wear: clamp01(node.wear),
+            motes: node.motes,
+            mote_share: clamp01(node.mote_share),
             seated: seated.get(idx).copied().unwrap_or(true),
             revolutions_per_loop: node.kind.revolutions_per_loop(node.size),
             base_angle,
@@ -1601,6 +1612,85 @@ fn draw_shadow_transits(
     }
 }
 
+/// The most motes one body ever draws.
+///
+/// A cap on the *drawn* count, not on the counted one: the accounting is exact and unbounded, and
+/// this is only how many marks fit round an orbit before they stop being marks and become a
+/// second groove. A body past the cap draws the cap.
+const MOTE_DRAW_CAP: u32 = 64;
+
+/// A mote's drawn radius, and the alpha range its attribution share maps onto.
+///
+/// The top is low by design. The ambient tier is the more frequent thing, and the failure mode a
+/// tier beneath an existing one has is that it quietly becomes the loudest thing in the frame and
+/// the ceremony stops reading as ceremony.
+const MOTE_PX: f32 = 1.15;
+const MOTE_ALPHA: (f32, f32) = (0.10, 0.34);
+
+/// A mote is light, not material: the same warm neutral a comet's core carries, because both are
+/// work arriving rather than a thing in the sky.
+const MOTE_RGB01: (f32, f32, f32) = (1.0, 0.97, 0.86);
+
+/// Draw one body's ambient motes: one small mark on its own orbit track per unit of work its agent
+/// actually did.
+///
+/// Placed at angles derived from the mote's own index rather than from a clock, so a mote is a
+/// permanent record of an event that happened rather than a decoration that moves — and so the
+/// same fleet always draws the same picture.
+fn draw_motes(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    layout: &SceneLayout,
+    idx: usize,
+    body: &BodyLayout,
+    phase: f32,
+) {
+    if body.motes == 0 || body.orbit_radius_px <= 0.0 {
+        return;
+    }
+    let Some(parent) = body.parent.filter(|p| layout.is_seated(*p)) else {
+        return;
+    };
+    let centre = layout.position(parent, phase);
+    let radius = body.orbit_radius_px;
+    let alpha = mix(MOTE_ALPHA.0, MOTE_ALPHA.1, body.mote_share);
+    let seed = body_seed(idx).wrapping_add(7_717);
+    let drawn = body.motes.min(MOTE_DRAW_CAP);
+
+    for i in 0..drawn {
+        // Spread round the orbit by index, with a per-body jitter so two bodies with the same
+        // count do not stud their orbits identically.
+        let angle = (i as f32 / MOTE_DRAW_CAP as f32) * 2.0 * PI
+            + value_noise(i as f32 * 1.9, 0.0, seed) * 0.4
+            + body.base_angle;
+        let (sin_a, cos_a) = angle.sin_cos();
+        let px = centre.0 + cos_a * radius;
+        let py = centre.1 + sin_a * radius;
+
+        let x0 = (px - MOTE_PX).floor().max(0.0) as i32;
+        let x1 = (px + MOTE_PX).ceil().min(width as f32) as i32;
+        let y0 = (py - MOTE_PX).floor().max(0.0) as i32;
+        let y1 = (py + MOTE_PX).ceil().min(height as f32) as i32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let dx = xx as f32 + 0.5 - px;
+                let dy = yy as f32 + 0.5 - py;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist > MOTE_PX {
+                    continue;
+                }
+                let idx_px = yy as usize * width as usize + xx as usize;
+                blend(
+                    &mut buf[idx_px],
+                    MOTE_RGB01,
+                    alpha * clamp01(1.0 - dist / MOTE_PX),
+                );
+            }
+        }
+    }
+}
+
 /// How far back a body's trail reaches, as a fraction of one full animation loop.
 ///
 /// Short: a trail is *where the body was a moment ago* and reads speed, which is a different
@@ -2336,6 +2426,7 @@ struct Parts {
     trails: bool,
     transits: bool,
     debris: bool,
+    motes: bool,
 }
 
 impl Parts {
@@ -2344,6 +2435,7 @@ impl Parts {
         trails: true,
         transits: true,
         debris: true,
+        motes: true,
     };
 }
 
@@ -2417,6 +2509,16 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
     if parts.debris {
         draw_debris_belt(&mut buf, width, height, phase);
     }
+    // Studding the grooves, and only the grooves: the ambient tier rides the track layer rather
+    // than floating beside it, so a mote is always somewhere the body has actually been.
+    if parts.motes {
+        for (idx, body) in layout.bodies.iter().enumerate() {
+            if body.seated {
+                draw_motes(&mut buf, width, height, layout, idx, body, phase);
+            }
+        }
+    }
+
     draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
 
     let sun_pos = sun_position(layout, phase);
@@ -3214,6 +3316,8 @@ mod tests {
             size: BodySize::Fixed,
             streak: 0.0,
             wear: 0.0,
+            motes: 0,
+            mote_share: 0.0,
         }
     }
 
@@ -3240,6 +3344,8 @@ mod tests {
             size: BodySize::Fixed,
             streak: 0.0,
             wear: 0.0,
+            motes: 0,
+            mote_share: 0.0,
         }
     }
 
@@ -4326,6 +4432,160 @@ mod tests {
             fifteen_mates.len(),
             fifteen_median - one_median,
             (fifteen_median - one_median) / (fifteen_mates.len() - one_mate.len()) as f64,
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // The ambient tier
+    // ---------------------------------------------------------------------------
+
+    /// A fleet where every body carries motes, at shares spread across the transform's range.
+    fn moted_fleet() -> Vec<TreeNode> {
+        let counts = [64u32, 24, 8, 2, 0];
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for (i, motes) in counts.iter().enumerate() {
+            nodes.push(TreeNode {
+                wear: 0.6,
+                motes: *motes,
+                mote_share: 1.0 - i as f32 * 0.18,
+                ..sized(
+                    Some(0),
+                    BodyKind::Planet,
+                    BodySize::Files((i as u32 + 1) * 500),
+                )
+            });
+        }
+        nodes
+    }
+
+    /// Total light one layer puts into the composited frame, by render difference — the measure
+    /// with no free parameter in it. Asking "how bright is one element" instead depends entirely
+    /// on what gets called one element, which is the trap this measure exists to avoid.
+    fn light_added(layout: &SceneLayout, phase: f32, without: Parts) -> u64 {
+        let with = frame(layout, phase);
+        let bare = frame_without(layout, phase, without);
+        with.chunks_exact(4)
+            .zip(bare.chunks_exact(4))
+            .map(|(a, b)| {
+                (0..3)
+                    .map(|c| u64::from(a[c].saturating_sub(b[c])))
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_busier_body_draws_a_brighter_ambient_tier() {
+        // The transform reaches the picture: the share is not just computed, it is what the motes
+        // are drawn at. Same count both times, so the only thing differing is the share.
+        let ink = |share: f32| {
+            let nodes = [
+                node(None, BodyKind::Sun),
+                TreeNode {
+                    wear: 0.5,
+                    motes: 40,
+                    mote_share: share,
+                    ..sized(Some(0), BodyKind::Planet, BodySize::Files(900))
+                },
+            ];
+            let layout = build_layout(&nodes, 900, 900);
+            light_added(
+                &layout,
+                0.0,
+                Parts {
+                    motes: false,
+                    ..Parts::ALL
+                },
+            )
+        };
+        assert!(
+            ink(1.0) > ink(0.1),
+            "the attribution share never reached the picture"
+        );
+        // A body with no motes draws none — the tier is events, not decoration.
+        let none = [
+            node(None, BodyKind::Sun),
+            TreeNode {
+                wear: 0.5,
+                motes: 0,
+                mote_share: 1.0,
+                ..sized(Some(0), BodyKind::Planet, BodySize::Files(900))
+            },
+        ];
+        let layout = build_layout(&none, 900, 900);
+        assert_eq!(
+            light_added(
+                &layout,
+                0.0,
+                Parts {
+                    motes: false,
+                    ..Parts::ALL
+                }
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn the_ambient_tier_never_outranks_the_ceremonial_one() {
+        // The refusal that matters when a tier is added *beneath* an existing one: the new, more
+        // frequent thing quietly becomes the loudest thing in the frame and the ceremony stops
+        // reading as ceremony.
+        //
+        // Measured as **light added to the composited frame by render difference**, which has no
+        // free parameter in it — "peak drawn presence of one element" cannot be applied honestly
+        // when one tier is small-and-bright and the other is many-and-faint, because the answer
+        // depends entirely on what gets called one element.
+        let nodes = moted_fleet();
+        let layout = build_layout(&nodes, 1_200, 800);
+        let phase = 0.4;
+
+        // Everything the ambient tier puts in the frame, at its fullest: every body moted.
+        let ambient = light_added(
+            &layout,
+            phase,
+            Parts {
+                motes: false,
+                ..Parts::ALL
+            },
+        );
+
+        // One ceremonial event at its peak — a landed large task, the loudest single thing the
+        // scene draws.
+        let ceremony = SceneEffects {
+            comets: vec![Comet {
+                start: (0.0, 0.15),
+                end: (1.0, 0.85),
+                target: None,
+                magnitude: 1.0,
+                progress: 0.5,
+            }],
+            ..Default::default()
+        };
+        let lit = effects_frame(&layout, &ceremony, phase);
+        let dark = effects_frame(&layout, &SceneEffects::default(), phase);
+        let ceremonial: u64 = lit
+            .chunks_exact(4)
+            .zip(dark.chunks_exact(4))
+            .map(|(a, b)| {
+                // Weighted by the overlay's own alpha, because that is the light it actually adds
+                // to the composite rather than the colour it would add at full opacity.
+                let alpha = u64::from(a[3]);
+                (0..3)
+                    .map(|c| u64::from(a[c].saturating_sub(b[c])) * alpha / 255)
+                    .sum::<u64>()
+            })
+            .sum();
+
+        assert!(
+            ceremonial > 0,
+            "the ceremonial event drew nothing to compare against"
+        );
+        assert!(
+            ambient * 4 <= ceremonial,
+            "the ambient tier puts {ambient} into the frame against one ceremonial event's \
+             {ceremonial} — the bar is a quarter, so it may put at most {}",
+            ceremonial / 4
         );
     }
 

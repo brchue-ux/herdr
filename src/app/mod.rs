@@ -883,6 +883,7 @@ impl App {
             machine_corner_key: 0,
             machine_corner_rgba: None,
             orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
+            ambient_motes: crate::app::background_scene::AmbientMotes::default(),
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,

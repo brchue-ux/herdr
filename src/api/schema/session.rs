@@ -110,6 +110,18 @@ pub struct BackgroundSceneInfo {
     /// The floor [`Self::sky_clear_fraction`] is held to.
     #[serde(default)]
     pub sky_clear_floor: f32,
+    /// Ambient events consumed, and ambient motes emitted, since this session
+    /// started.
+    ///
+    /// **These two are equal, always.** Every mote the scene's ambient tier
+    /// draws traces to one unit of work a body's own agent actually did; none
+    /// is emitted by a timer, a loop, or a decorative oscillator. Published as
+    /// a pair rather than as one number precisely so the equality is
+    /// inspectable on a running session rather than only in a test.
+    #[serde(default)]
+    pub ambient_events_consumed: u64,
+    #[serde(default)]
+    pub ambient_motes_emitted: u64,
 }
 
 /// The host machine's own state: CPU aggregate and per core, memory, swap and
