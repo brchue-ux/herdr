@@ -226,7 +226,7 @@ pub(crate) fn tree_nodes(
         path.truncate(depth);
         let parent = path.last().copied();
 
-        let Some((row, hue, severity, size)) = row_for_entry(app, entry, &agents) else {
+        let Some(facts) = row_for_entry(app, entry, &agents) else {
             // A row this module cannot resolve to a colour (a dangling index between a pane
             // closing and the next tree rebuild) is skipped rather than drawn wrong — the next
             // pass, once the tree has settled, draws it correctly instead.
@@ -242,11 +242,12 @@ pub(crate) fn tree_nodes(
         nodes.push(solar_system::TreeNode {
             parent,
             kind,
-            hue,
-            severity,
-            size,
+            hue: facts.hue,
+            severity: facts.severity,
+            size: facts.size,
+            streak: facts.streak,
         });
-        identity.push(row);
+        identity.push(facts.row);
         path.push(nodes.len() - 1);
     }
 
@@ -272,11 +273,62 @@ fn work_size(workspace: &crate::workspace::Workspace) -> solar_system::BodySize 
         })
 }
 
+/// The already-resolved fleet facts one sidebar row contributes to the scene: what it is, and the
+/// four registers the renderer draws it from.
+///
+/// A struct rather than a tuple because the last two members are both plain numbers with no
+/// natural order between them, and a five-tuple of `(CardRow, f32, Severity, BodySize, f32)` is
+/// where a caller silently swaps two of them.
+struct RowFacts {
+    row: CardRow,
+    hue: f32,
+    severity: Severity,
+    size: solar_system::BodySize,
+    /// The quality-streak expression, `0.0..=1.0` — see [`streak_expression`].
+    streak: f32,
+}
+
+/// How hot a Space's published quality streak is reading, as the `0.0..=1.0` expression
+/// `src/solar_system.rs` draws rings and gas swell from.
+///
+/// Measured against `crate::quality_streak`'s **own** published bands rather than against the
+/// artifact's integer counter, because herdr's register is a different quantity: a decayed score
+/// in five named bands, not a count of consecutive wins. The mapping is the one the bands already
+/// state — nothing shows below the `Low` threshold, because `Ember` is documented as "barely
+/// alight" and a body that expresses a streak nobody would call alight is lying about the fleet;
+/// full expression at the `Hot` threshold, which the bands describe as reached by sustained work
+/// with no ceiling above it.
+///
+/// This is the same shape as the artifact's A20 floor (*"visible accumulation begins only at 4"*),
+/// stated in herdr's units instead of imported in the orrery's.
+fn streak_expression(workspace: &crate::workspace::Workspace) -> f32 {
+    const FLOOR: f64 = 8.0;
+    const CEILING: f64 = 38.0;
+
+    // Narrow `get`s rather than `values()`: this runs per workspace on every topology change, and
+    // materialising the whole token map to read two keys is exactly the aggregate-state collection
+    // the scene's hot paths are not allowed to do — same reasoning as `work_size`.
+    let Some(readout) = workspace
+        .metadata_tokens
+        .get(crate::quality_streak::STREAK_TOKEN)
+        .and_then(crate::quality_streak::parse)
+    else {
+        return 0.0;
+    };
+    let half_lives = crate::quality_streak::half_lives(
+        workspace
+            .metadata_tokens
+            .get(crate::quality_streak::HALF_LIFE_TOKEN),
+    );
+    let value = crate::quality_streak::decayed(readout, half_lives, std::time::SystemTime::now());
+    (((value - FLOOR) / (CEILING - FLOOR)) as f32).clamp(0.0, 1.0)
+}
+
 fn row_for_entry(
     app: &crate::app::state::AppState,
     entry: &crate::ui::sidebar::WorkspaceListEntry,
     agents: &[crate::ui::AgentPanelEntry],
-) -> Option<(CardRow, f32, Severity, solar_system::BodySize)> {
+) -> Option<RowFacts> {
     match entry {
         crate::ui::sidebar::WorkspaceListEntry::Workspace { ws_idx, .. } => {
             let workspace = app.workspaces.get(*ws_idx)?;
@@ -294,12 +346,13 @@ fn row_for_entry(
                     .map(String::as_str),
             );
             let hue = stage.hue(&app.palette, &app.host_terminal_theme);
-            Some((
-                CardRow::Space(workspace.id.clone()),
+            Some(RowFacts {
+                row: CardRow::Space(workspace.id.clone()),
                 hue,
                 severity,
-                work_size(workspace),
-            ))
+                size: work_size(workspace),
+                streak: streak_expression(workspace),
+            })
         }
         crate::ui::sidebar::WorkspaceListEntry::Agent { entry_idx, .. } => {
             let detail = agents.get(*entry_idx)?;
@@ -318,13 +371,17 @@ fn row_for_entry(
             );
             let hue = stage.hue(&app.palette, &app.host_terminal_theme);
             // A worker is not a project, so it stays out of the size register entirely and keeps
-            // its tier's fixed radius — the same reason the sun is out of it.
-            Some((
-                CardRow::Agent(detail.pane_id),
+            // its tier's fixed radius — the same reason the sun is out of it. It is out of the
+            // streak register for the same reason: the captain's correction puts the streak
+            // expression on second mates, and worker streak stays on the left panel's
+            // wire-border glow where it already lives.
+            Some(RowFacts {
+                row: CardRow::Agent(detail.pane_id),
                 hue,
                 severity,
-                solar_system::BodySize::Fixed,
-            ))
+                size: solar_system::BodySize::Fixed,
+                streak: 0.0,
+            })
         }
     }
 }
@@ -741,6 +798,135 @@ mod tests {
             None,
             Instant::now(),
         );
+    }
+
+    #[test]
+    fn a_published_quality_streak_reaches_the_body_the_scene_draws() {
+        // The whole path, end to end: the `streak` token `fm-quality-event.sh` already publishes,
+        // through `crate::quality_streak`'s own decay and bands, into a mate's ring and gas swell.
+        // Nothing about the body types is a fixture — the fleet's real file counts rank them.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        for name in ["fleet", "cold", "warm", "hot"] {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(name));
+        }
+        for ws_idx in 1..=3 {
+            publish(
+                &mut app,
+                ws_idx,
+                crate::app::agent_tree::OWNER_TOKEN,
+                "fleet",
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Published *now*, so read-time decay is nil and the score under test is the score.
+        publish(
+            &mut app,
+            1,
+            crate::quality_streak::STREAK_TOKEN,
+            &format!("2.0@{now}"),
+        );
+        publish(
+            &mut app,
+            2,
+            crate::quality_streak::STREAK_TOKEN,
+            &format!("23.0@{now}"),
+        );
+        publish(
+            &mut app,
+            3,
+            crate::quality_streak::STREAK_TOKEN,
+            &format!("60.0@{now}"),
+        );
+
+        let (nodes, identity) = tree_nodes(&app);
+        let streak_of = |name: &str| {
+            let id = &app
+                .workspaces
+                .iter()
+                .find(|ws| ws.custom_name.as_deref() == Some(name))
+                .expect("workspace")
+                .id;
+            let idx = identity
+                .iter()
+                .position(|row| row == &CardRow::Space(id.clone()))
+                .expect("the scene draws a body for every Space in the tree");
+            nodes[idx].streak
+        };
+
+        // An `Ember` streak is documented as "barely alight", so it expresses nothing: a body that
+        // showed a streak nobody would call alight would be lying about the fleet.
+        assert_eq!(streak_of("cold"), 0.0);
+        // A `Steady` one sits partway up, and a score past `Hot` saturates rather than running on.
+        assert!(
+            (0.1..0.9).contains(&streak_of("warm")),
+            "a steady streak expressed {}",
+            streak_of("warm")
+        );
+        assert_eq!(streak_of("hot"), 1.0);
+
+        // A worker is out of the register entirely — the captain's correction puts the streak
+        // expression on second mates, and worker streak stays on the sidebar's wire-border glow.
+        assert!(nodes
+            .iter()
+            .all(|node| node.kind != solar_system::BodyKind::Moon || node.streak == 0.0));
+    }
+
+    #[test]
+    fn a_decayed_streak_expresses_less_than_the_score_it_was_published_at() {
+        // The token is durable and carries the instant it was true, so a fleet that stopped
+        // winning a fortnight ago must not still be drawing a full ring. Read through the same
+        // decay every other surface reads it through, rather than a second copy of the rule.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        for name in ["fleet", "fresh", "stale"] {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(name));
+        }
+        for ws_idx in 1..=2 {
+            publish(
+                &mut app,
+                ws_idx,
+                crate::app::agent_tree::OWNER_TOKEN,
+                "fleet",
+            );
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let a_fortnight_ago = now.saturating_sub(14 * 86_400);
+        publish(
+            &mut app,
+            1,
+            crate::quality_streak::STREAK_TOKEN,
+            &format!("30.0@{now}"),
+        );
+        publish(
+            &mut app,
+            2,
+            crate::quality_streak::STREAK_TOKEN,
+            &format!("30.0@{a_fortnight_ago}"),
+        );
+
+        let (nodes, _) = tree_nodes(&app);
+        let mates: Vec<f32> = nodes
+            .iter()
+            .filter(|node| node.kind == solar_system::BodyKind::Planet)
+            .map(|node| node.streak)
+            .collect();
+        assert_eq!(mates.len(), 2);
+        assert!(
+            mates[0] > mates[1],
+            "a fortnight-old streak still expresses as much as a fresh one: {mates:?}"
+        );
+        // Two win half-lives at the default 5 days is well under the floor, so it reads as nothing
+        // rather than as a little — which is the honest answer for a fleet that stopped.
+        assert_eq!(mates[1], 0.0);
     }
 
     #[test]
