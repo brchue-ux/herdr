@@ -391,6 +391,7 @@ mod tests {
 
     fn solar_system_test_node() -> solar_system::TreeNode {
         solar_system::TreeNode {
+            label: solar_system::SceneLabel::EMPTY,
             parent: None,
             kind: solar_system::BodyKind::Sun,
             hue: 41.0,

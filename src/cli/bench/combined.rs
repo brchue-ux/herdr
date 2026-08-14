@@ -362,6 +362,9 @@ impl Fleet {
             nodes.push(crate::solar_system::TreeNode {
                 parent,
                 kind,
+                // Named, because a caption is drawn work like any other and a rig that measured a
+                // scene without one would under-report what the real scene costs.
+                label: crate::solar_system::SceneLabel::new(&format!("bench-{}", row.seed)),
                 // Spread over the wheel by seed rather than all one colour: hue
                 // is what the body's whole palette is resolved from.
                 hue: (row.seed % 360) as f32,

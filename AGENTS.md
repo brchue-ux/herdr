@@ -336,9 +336,26 @@ trail drawn as a dotted line because the sample count was fixed rather than deri
 a debris belt tangled through the worker orbits. None of those is expressible as a threshold, and
 all three were obvious in a render.
 
-The scene generator is pure, so a render needs no lab: build a `SceneLayout`, call `frame`, and
-`encode_png` the result from an `#[ignore]`d test. That is the same buffer the server encodes onto
-the wire.
+The scene generator is pure, so a render needs no lab, and both halves of the check are in the tree
+already. `write_the_scene_to_a_png` is the `#[ignore]`d dump —
+`HERDR_SCENE_PNG=/tmp/scene.png cargo test -- --ignored write_the_scene_to_a_png` — writing the same
+buffer the server encodes onto the wire. `the_scenes_light_budget_is_spent_on_objects_rather_than_on_a_wash`
+is the numeric half, and it runs in CI: void level, the fraction of the frame at or below luminance
+8, the corona's lift over the frame's own void ring, and the typical point source's peak, each
+against the reference artifact's published measurement. Compare a render against
+`Skill_and_Direction_v1`'s `examples/fleet-orrery/bodies-1920.png` — the canonical capture; note that
+`honed-1920.png` is nine amendment sets stale and shows a scene that no longer exists.
+
+Two measurement traps in that area, both of which have already produced a green-but-wrong reading:
+
+- **The corona's median is blind to its brightness.** Five lobes leave three quarters of the annulus
+  outside the limb at exactly the void whatever their peak is, so a median there checks that the
+  corona has *structure* and passes a `COR_A` seven times the artifact's unchanged. The mean carries
+  the amplitude. (The reference *capture* has to be read by its median instead, because that frame
+  has prose crossing the disc by design — herdr's scene has none, so the mean is available here.)
+- **A star's typical brightness has to be measured off the galactic band.** On the band a star draws
+  at its full magnitude alpha and off it at a little over half, so a whole-frame median measures the
+  mix rather than the typical star either published figure is about.
 
 ### Live checks for anything that draws
 
