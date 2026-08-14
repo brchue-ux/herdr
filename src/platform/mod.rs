@@ -190,6 +190,17 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+/// Creates the directory tree that holds Herdr's private runtime state.
+///
+/// On Unix this is a plain `create_dir_all`: the socket inside is a file, and
+/// [`crate::ipc::restrict_socket_permissions`] narrows it to its owner once it
+/// exists. A Windows named pipe is not a file and has no mode to narrow, so the
+/// Windows implementation stamps a protected DACL on every level it creates.
+#[cfg(unix)]
+pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

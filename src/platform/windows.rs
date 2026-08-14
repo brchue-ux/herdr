@@ -20,6 +20,8 @@ use windows_sys::{
             NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::CreateDirectoryW,
         System::{
             Console::GetConsoleWindow,
             DataExchange::{
@@ -69,6 +71,91 @@ use windows_sys::{
 };
 
 use super::{ClipboardImage, ForegroundJob, Signal};
+
+/// Protected DACL granting full access to SYSTEM and the creating owner only.
+/// `D:P` blocks inherited ACEs, so nothing an ancestor directory grants leaks in.
+const PRIVATE_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+/// The same access, with `OICI` so files and subdirectories created underneath
+/// inherit it rather than falling back to the volume's defaults.
+const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;OW)";
+
+/// The security descriptor Herdr's private named pipes are created with.
+///
+/// A named pipe has no file mode to narrow after the fact, so this is the only
+/// point at which the control socket's reachability can be decided.
+pub(crate) fn private_security_descriptor(
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    security_descriptor_from_sddl(PRIVATE_PIPE_SDDL)
+}
+
+fn security_descriptor_from_sddl(
+    sddl: &str,
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::U16CString;
+
+    let sddl = U16CString::from_str(sddl)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
+
+/// `std::fs::create_dir_all` with a protected DACL on every level Herdr creates.
+///
+/// Levels that already exist are left exactly as they are: this hardens the
+/// directories Herdr owns, and never rewrites the ACL of somebody else's.
+pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    match create_private_dir(path) {
+        Ok(()) => Ok(()),
+        // Lost the race with another Herdr process creating the same level.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt as _;
+
+    let security_descriptor = security_descriptor_from_sddl(PRIVATE_DIR_SDDL)?;
+    let mut security_attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    security_descriptor.write_to_security_attributes(&mut security_attributes);
+    let path = extended_length_path(path)?;
+    if unsafe { CreateDirectoryW(path.as_ptr(), &security_attributes) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn extended_length_path(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let path = std::path::absolute(path)?;
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut extended = if wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        || wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        wide
+    } else if wide.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        "\\\\?\\UNC\\"
+            .encode_utf16()
+            .chain(wide.into_iter().skip(2))
+            .collect()
+    } else {
+        "\\\\?\\".encode_utf16().chain(wide).collect()
+    };
+    extended.push(0);
+    Ok(extended)
+}
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
