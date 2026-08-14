@@ -49,9 +49,11 @@ jobs:
           - os: ubuntu-latest
             kind: unix
             nextest_filter: all()
-          - os: macos-latest
-            kind: unix
-            nextest_filter: not binary(live_handoff)
+          # The macos-latest leg was dropped: this fork has no macOS user or
+          # contributor, and it ran on every PR and push. Only re-add it if the
+          # captain explicitly says he has bought a Mac - no other reason
+          # (a contributor asking, macOS-specific code changing, etc) qualifies.
+          # Full record: firstmate data/decisions/2026-08-13-herdr-ci-macos-leg-dropped.md
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
