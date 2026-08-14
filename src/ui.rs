@@ -2107,6 +2107,7 @@ switch_workspace = "ctrl+1..9"
         let (cols, rows) = (40u32, 20u32);
         let (width_px, height_px) = (cols * 8, rows * 16);
         let nodes = [crate::solar_system::TreeNode {
+            label: crate::solar_system::SceneLabel::EMPTY,
             parent: None,
             kind: crate::solar_system::BodyKind::Sun,
             hue: 41.0,
@@ -2139,9 +2140,11 @@ switch_workspace = "ctrl+1..9"
             "the first observe call must bootstrap the grid"
         );
 
-        // The sun sits at the canvas centre (`solar_system::position` for a parent-less body) —
-        // `(width_px/2, height_px/2)` divides exactly onto this cell grid for these dimensions.
-        let (sun_col, sun_row) = (cols as u16 / 2, rows as u16 / 2);
+        // The sun sits at the scene's own origin — off-centre, right of the panel strip the
+        // composition reserves — so the cell it lands in is read off the layout rather than assumed
+        // to be the middle one.
+        let sun_px = layout.body_position(0, 0.0);
+        let (sun_col, sun_row) = (sun_px.0 as u16 / 8, sun_px.1 as u16 / 16);
         let (space_col, space_row) = (0u16, 0u16);
 
         let area = Rect::new(0, 0, cols as u16, rows as u16);

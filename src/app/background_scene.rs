@@ -462,6 +462,8 @@ pub(crate) fn tree_nodes_with(
     let mut nodes = Vec::with_capacity(entries.len());
     let mut identity = Vec::with_capacity(entries.len());
     let mut path: Vec<usize> = Vec::new();
+    // The one node that is the sun, once the walk has found it.
+    let mut sun: Option<usize> = None;
 
     for entry in &entries {
         let depth = entry.depth() as usize;
@@ -475,15 +477,26 @@ pub(crate) fn tree_nodes_with(
             continue;
         };
 
-        let kind = match depth {
-            0 => solar_system::BodyKind::Sun,
-            1 => solar_system::BodyKind::Planet,
+        // **There is exactly one sun, whatever the tree's shape.** Depth alone used to decide this,
+        // so *every* root drew as a star at orbit radius zero — and a second mate working in its own
+        // checkout is a root. Two suns stacked on the frame's centre is not a second star; it is one
+        // star with a hole punched through it, and the mate that owns the second one loses its place
+        // in the register entirely. The first root the walk reaches is the first mate and is the sun;
+        // every later root is a second mate like any other, orbiting it.
+        let kind = match (depth, sun) {
+            (0, None) => solar_system::BodyKind::Sun,
+            (0, Some(_)) | (1, _) => solar_system::BodyKind::Planet,
             _ => solar_system::BodyKind::Moon,
+        };
+        let parent = match (depth, sun) {
+            (0, Some(sun)) => Some(sun),
+            _ => parent,
         };
 
         nodes.push(solar_system::TreeNode {
             parent,
             kind,
+            label: facts.label,
             hue: facts.hue,
             severity: facts.severity,
             size: facts.size,
@@ -499,6 +512,9 @@ pub(crate) fn tree_nodes_with(
             mote_share: 0.0,
         });
         identity.push(facts.row);
+        if kind == solar_system::BodyKind::Sun {
+            sun = Some(nodes.len() - 1);
+        }
         path.push(nodes.len() - 1);
     }
 
@@ -539,6 +555,9 @@ fn work_size(workspace: &crate::workspace::Workspace) -> solar_system::BodySize 
 /// where a caller silently swaps two of them.
 struct RowFacts {
     row: CardRow,
+    /// What this body is called in the sky — the Space's own display name. Empty for a worker,
+    /// which the reference does not caption.
+    label: solar_system::SceneLabel,
     hue: f32,
     severity: Severity,
     size: solar_system::BodySize,
@@ -606,6 +625,11 @@ fn row_for_entry(
             let hue = stage.hue(&app.palette, &app.host_terminal_theme);
             Some(RowFacts {
                 row: CardRow::Space(workspace.id.clone()),
+                // The same name the sidebar's own row prints, so the sky and the tree name the same
+                // project the same way.
+                label: solar_system::SceneLabel::new(
+                    &workspace.display_name_from_terminals(&app.terminals),
+                ),
                 hue,
                 severity,
                 size: work_size(workspace),
@@ -635,6 +659,10 @@ fn row_for_entry(
             // wire-border glow where it already lives.
             Some(RowFacts {
                 row: CardRow::Agent(detail.pane_id),
+                // A worker carries no caption: the reference labels its mates and its sun and
+                // leaves the workers bare, and at a worker's drawn size the caption would be longer
+                // than the body it names.
+                label: solar_system::SceneLabel::EMPTY,
                 hue,
                 severity,
                 size: solar_system::BodySize::Fixed,
@@ -1429,6 +1457,80 @@ mod tests {
         // Two win half-lives at the default 5 days is well under the floor, so it reads as nothing
         // rather than as a little — which is the honest answer for a fleet that stopped.
         assert_eq!(mates[1], 0.0);
+    }
+
+    #[test]
+    fn a_second_root_is_a_second_mate_rather_than_a_second_sun() {
+        // A second mate working in its own checkout publishes no `owner`, so the fleet tree draws it
+        // as a **root** — and every root used to map to the star tier at orbit radius zero, which
+        // put two suns on the same pixel and took the second mate out of the size and period
+        // registers entirely. There is one sun, and it is the first root the walk reaches.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        for name in ["fleet", "owned", "standalone"] {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(name));
+        }
+        publish(&mut app, 1, crate::app::agent_tree::OWNER_TOKEN, "fleet");
+        publish(&mut app, 1, FILES_TOKEN, "900");
+        // ...and nothing at all on the third, which is what makes it a root.
+        publish(&mut app, 2, FILES_TOKEN, "400");
+
+        let (nodes, _) = tree_nodes(&app);
+        let suns = nodes
+            .iter()
+            .filter(|node| node.kind == solar_system::BodyKind::Sun)
+            .count();
+        assert_eq!(suns, 1, "{suns} suns in a fleet that has one first mate");
+
+        let sun = nodes
+            .iter()
+            .position(|node| node.kind == solar_system::BodyKind::Sun)
+            .expect("a sun");
+        // The standalone mate is a planet, and it orbits the sun rather than sitting on it — which
+        // is also what puts it back on the ladder, in the register, and under a groove.
+        let standalone = nodes
+            .iter()
+            .rposition(|node| node.kind == solar_system::BodyKind::Planet)
+            .expect("a second planet");
+        assert_eq!(nodes[standalone].parent, Some(sun));
+        assert_eq!(nodes[standalone].size, solar_system::BodySize::Files(400));
+
+        // And the picture agrees: no two bodies share the sun's own position.
+        let layout = solar_system::build_layout(&nodes, 1_600, 900);
+        let at_the_sun = (0..nodes.len())
+            .filter(|idx| layout.body_position(*idx, 0.0) == layout.body_position(sun, 0.0))
+            .count();
+        assert_eq!(
+            at_the_sun, 1,
+            "{at_the_sun} bodies are drawn on the sun's own centre"
+        );
+    }
+
+    #[test]
+    fn a_spaces_own_name_reaches_its_caption_in_the_sky() {
+        // The caption is drawn into the baked scene, so the name has to arrive as a fleet fact on
+        // the node rather than being read back out of a renderer. A worker carries none: the
+        // reference captions its mates and its sun and leaves the workers bare.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        for name in ["fleet", "no-mistakes"] {
+            app.workspaces
+                .push(crate::workspace::Workspace::test_new(name));
+        }
+        publish(&mut app, 1, crate::app::agent_tree::OWNER_TOKEN, "fleet");
+
+        let (nodes, _) = tree_nodes(&app);
+        let mate = nodes
+            .iter()
+            .find(|node| node.kind == solar_system::BodyKind::Planet)
+            .expect("a mate");
+        assert_eq!(mate.label.as_str(), "no-mistakes");
+        let sun = nodes
+            .iter()
+            .find(|node| node.kind == solar_system::BodyKind::Sun)
+            .expect("a sun");
+        assert_eq!(sun.label.as_str(), "fleet");
     }
 
     #[test]

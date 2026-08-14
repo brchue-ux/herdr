@@ -52,6 +52,9 @@ fn background_scene_key(
         // which is the honest price of "every mote traces to one event".
         node.motes.hash(&mut hasher);
         node.mote_share.to_bits().hash(&mut hasher);
+        // The caption is drawn into the baked frames, so a renamed Space is a new picture. Left out
+        // of the key, a rename would keep showing the old name until something else moved.
+        node.label.as_str().hash(&mut hasher);
     }
     hasher.finish()
 }
