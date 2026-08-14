@@ -2896,9 +2896,22 @@ const OVERFLOW_RGB01: (f32, f32, f32) = RING_RGB01;
 ///
 /// Absent at zero, because a disclosure of nothing is noise rather than population (A41(c)).
 ///
-/// One mote per mate rather than a bar or a gauge: at these counts the marks are countable, which
-/// makes the reading exact without this generator needing a font.
-fn draw_overflow_mark(buf: &mut [[f32; 4]], width: u32, height: u32, beyond: usize, phase: f32) {
+/// One mote per mate, **and the key named in words beside them**.
+///
+/// A41(c)/A42(e) require the disclosure to say what was dropped and by what rule, not only that
+/// something was: the reference prints `8 of 16 mates dropped - smallest by files at HEAD`. This
+/// module could not, having no font by construction, and a fan of countable dots is an exact count
+/// of an unstated quantity — a viewer can see that eight are missing and not which eight, or why.
+/// The captain's sky-label ruling put a face in this module, so the sentence the marks were standing
+/// in for is now simply written.
+fn draw_overflow_mark(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    seated: usize,
+    beyond: usize,
+    phase: f32,
+) {
     if beyond == 0 || width == 0 || height == 0 {
         return;
     }
@@ -2941,6 +2954,34 @@ fn draw_overflow_mark(buf: &mut [[f32; 4]], width: u32, height: u32, beyond: usi
             }
         }
     }
+
+    // The key, under the fan. Not a label on a body — nothing here *is* a body — so it is placed
+    // against the fan's own arc rather than against a radius, and it fades against the panel like
+    // every other caption.
+    let text_scale = label_scale(width, height);
+    let (sin_a, cos_a) = OVERFLOW_ANGLE.sin_cos();
+    let anchor = (
+        centre.0 + cos_a * radius,
+        centre.1 + sin_a * radius * ORBIT_PLANE_SQUASH,
+    );
+    let key = format!(
+        "{beyond} of {} mates dropped \u{b7} smallest by files at HEAD",
+        seated + beyond
+    );
+    let tx = anchor.0 - (key.chars().count() * GLYPH_ADVANCE * text_scale) as f32 / 2.0;
+    let ty = anchor.1 + (OVERFLOW_MARK_PX + LABEL_GAP_PX.0 * text_scale as f32).ceil();
+    let clear = clamp01((tx - (panel_width(width) + 4.0)) / LABEL_FADE_PX);
+    draw_text(
+        buf,
+        width,
+        height,
+        tx,
+        ty,
+        &key,
+        LABEL_READOUT_RGB01,
+        LABEL_READOUT_ALPHA * clear,
+        text_scale,
+    );
 }
 
 /// Which half of a ring is being drawn — the half behind the planet, or the half in front of it.
@@ -3510,7 +3551,14 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
     }
 
     if parts.overflow {
-        draw_overflow_mark(&mut buf, width, height, layout.mates_beyond_ladder, phase);
+        draw_overflow_mark(
+            &mut buf,
+            width,
+            height,
+            layout.mates_seated,
+            layout.mates_beyond_ladder,
+            phase,
+        );
     }
 
     let sun_pos = sun_position(layout, phase);
@@ -7214,6 +7262,34 @@ mod tests {
         assert_eq!(
             when_it_fits, 0,
             "a fleet the ring seats whole still drew a disclosure"
+        );
+
+        // **And it names its key.** A41(c)/A42(e): a countable fan of dots is an exact count of an
+        // unstated quantity — a viewer can see that nine are missing and not which nine, or why. The
+        // sentence is `N of M mates dropped - smallest by files at HEAD`, so the disclosure spans a
+        // horizontal run far wider than the fan's own arc, which is what tells the two apart without
+        // reading pixels back as glyphs.
+        let with = frame(&overflowing, 0.0);
+        let without = frame_without(
+            &overflowing,
+            0.0,
+            Parts {
+                overflow: false,
+                ..Parts::ALL
+            },
+        );
+        let columns: Vec<usize> = with
+            .chunks_exact(4)
+            .zip(without.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (a, b))| (0..3).any(|c| a[c].abs_diff(b[c]) > 1))
+            .map(|(i, _)| i % 900)
+            .collect();
+        let span = columns.iter().max().unwrap_or(&0) - columns.iter().min().unwrap_or(&0);
+        let fan_arc = (OVERFLOW_ORBIT_FRACTION * 900.0 * OVERFLOW_FAN) as usize;
+        assert!(
+            span > fan_arc + 120,
+            "the disclosure spans {span}px against a fan of {fan_arc}px — it is dots and no key"
         );
     }
 
