@@ -36,6 +36,11 @@ pub struct SessionSnapshot {
     /// recent past. See [`MachineRegisterInfo`].
     #[serde(default)]
     pub machine_register: MachineRegisterInfo,
+    /// The last few things herdr has said about this session, oldest first. A
+    /// session fact rather than one client's picture of it: where the stream is
+    /// drawn and how wide it is are the TUI's, and stay there.
+    #[serde(default)]
+    pub status_feed: Vec<StatusFeedLineInfo>,
 }
 
 /// The persistent whole-terminal background scene's live state, condition by
@@ -190,4 +195,17 @@ pub struct MachineQuantityInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionStatusSetParams {
     pub status: String,
+}
+
+/// One line of herdr's own status stream. See
+/// [`crate::app::status_feed::StatusFeed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct StatusFeedLineInfo {
+    /// What herdr said, already joined into one line.
+    pub text: String,
+    /// Which kind of event it was: `needs_attention`, `finished`,
+    /// `update_installed` or `process_failed`.
+    pub kind: String,
+    /// How long ago it was said, in milliseconds.
+    pub age_ms: u64,
 }

@@ -108,7 +108,33 @@ impl App {
             status: self.state.session_status.clone(),
             background_scene: self.background_scene_info(),
             machine_register: self.machine_register_info(),
+            status_feed: self.status_feed_info(),
         }
+    }
+
+    /// herdr's own status stream, as the session holds it.
+    ///
+    /// Read straight off `AppState::status_feed` for the same reason
+    /// [`Self::machine_register_info`] is read off the register: what the API
+    /// reports and what the stream drew have to be one list, not two derivations
+    /// of one event source.
+    fn status_feed_info(&self) -> Vec<crate::api::schema::StatusFeedLineInfo> {
+        let now = std::time::Instant::now();
+        self.state
+            .status_feed
+            .lines()
+            .map(|line| crate::api::schema::StatusFeedLineInfo {
+                text: line.text.clone(),
+                kind: match line.kind {
+                    crate::app::state::ToastKind::NeedsAttention => "needs_attention",
+                    crate::app::state::ToastKind::Finished => "finished",
+                    crate::app::state::ToastKind::UpdateInstalled => "update_installed",
+                    crate::app::state::ToastKind::ProcessFailed => "process_failed",
+                }
+                .to_string(),
+                age_ms: now.saturating_duration_since(line.at).as_millis() as u64,
+            })
+            .collect()
     }
 
     /// The host machine's own state, as the register holds it.

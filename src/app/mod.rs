@@ -37,6 +37,7 @@ mod runtime_mutations;
 mod session;
 pub(crate) mod signal_tray;
 pub mod state;
+pub(crate) mod status_feed;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
@@ -879,6 +880,7 @@ impl App {
             background_scene_key: 0,
             background_scene_layout: None,
             machine_register: crate::machine_register::MachineRegister::default(),
+            status_feed: crate::app::status_feed::StatusFeed::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,

@@ -18,7 +18,7 @@ mod scrollbar;
 mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod signal_tray_popup;
-mod status;
+pub(crate) mod status;
 mod tab_surface;
 mod tabs;
 mod text;
@@ -362,6 +362,11 @@ fn update_sidebar_card_layers(
     );
     for (card, offset) in cards.iter_mut().zip(build.motion) {
         card.motion_cells = offset;
+        // Read here rather than threaded out of `build_cards`, because it is a
+        // pure read of the animation engine and the one place a card's whole
+        // transition state is resolved must be the same place its offset is.
+        card.arriving =
+            sidebar::image_card::row_arrival(app, card) != sidebar::motion::ArrivalBeat::Settled;
     }
     match build.update {
         sidebar::image_card::CardsUpdate::Unchanged => {}
@@ -724,6 +729,18 @@ fn warning_banner_present(app: &AppState) -> bool {
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
+    // herdr's own status stream, under everything else it says. Drawn first so a
+    // toast raised in the same frame stands over it rather than under it: the
+    // toast is what herdr is saying *now*, and the stream is what it has said.
+    if app.background_scene_active() {
+        crate::ui::status::render_status_feed(
+            frame,
+            app.status_feed_rect(),
+            &app.status_feed,
+            app.machine_corner_rect(),
+            &app.palette,
+        );
+    }
     let diagnostic_area = if app.view.layout == ViewLayout::Mobile {
         terminal_area
     } else {
@@ -1571,6 +1588,20 @@ mod tests {
         app.terminals.get_mut(&root_terminal_id).unwrap().cwd = repo.clone();
         app.selected = 0;
         app.mode = Mode::Navigate;
+        // The branch on the row, explicitly. The shipped default rows are the
+        // body registers now (`crate::ui::sidebar::body_register`), and this
+        // test is about the *name* and the fold — not about which readout the
+        // fleet ships on line two.
+        app.sidebar_spaces.rows = vec![
+            vec![
+                crate::config::SpaceSidebarToken::StateIcon,
+                crate::config::SpaceSidebarToken::Workspace,
+            ],
+            vec![
+                crate::config::SpaceSidebarToken::Branch,
+                crate::config::SpaceSidebarToken::GitStatus,
+            ],
+        ];
 
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
 
@@ -1900,6 +1931,95 @@ mod tests {
         let grab = scrollbar_thumb_grab_offset(metrics, track, row).expect("grab");
 
         assert_eq!(scrollbar_offset_from_drag_row(metrics, track, row, grab), 7);
+    }
+
+    /// **Herdr's own status stream reaches the screen**, in the bottom third,
+    /// and holds no more than [`crate::app::status_feed::TERM_MAX`] lines.
+    ///
+    /// A48 and A24 through the real render path rather than through the
+    /// geometry: the rect is one question and whether anything is drawn in it is
+    /// another, and the stream is gated on the background scene exactly as the
+    /// machine register's corner is.
+    #[test]
+    fn the_status_stream_is_drawn_in_the_bottom_third_and_holds_six_lines() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.mode = Mode::Navigate;
+        // The scene's own gate, which the stream shares.
+        app.kitty_graphics_enabled = true;
+        app.persistent_background_enabled = true;
+        app.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+        app.every_app_viewer_draws_ambient_wash = true;
+        assert!(
+            app.background_scene_active(),
+            "the fixture's scene is not on"
+        );
+
+        let now = std::time::Instant::now();
+        for index in 0..10 {
+            app.status_feed.observe(
+                Some(&crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::Finished,
+                    title: format!("herdr-line-{index:02}"),
+                    context: String::new(),
+                    position: None,
+                    target: None,
+                }),
+                now,
+            );
+        }
+
+        let area = Rect::new(0, 0, 140, 40);
+        compute_view(&mut app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let rows: Vec<String> = (0..area.height)
+            .map(|row| buffer_row_text(buffer, area, row))
+            .collect();
+        let carrying: Vec<u16> = (0..area.height)
+            .filter(|row| rows[usize::from(*row)].contains("herdr-line-"))
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            crate::app::status_feed::TERM_MAX,
+            "the stream drew {} lines, not the six it holds:\n{}",
+            carrying.len(),
+            rows.join("\n")
+        );
+        // The six most recent, and the oldest four dropped.
+        assert!(
+            rows.iter().any(|row| row.contains("herdr-line-09")),
+            "the newest line is not on screen"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("herdr-line-03")),
+            "a line past the cap is still on screen"
+        );
+        // In the bottom third.
+        for row in &carrying {
+            assert!(
+                *row >= area.height * 2 / 3,
+                "the stream drew at row {row} on a {}-row frame, not in the bottom third",
+                area.height
+            );
+        }
+
+        // And with the scene off it is not drawn at all: it is part of that
+        // surface family and shares its gate, exactly as the machine corner does.
+        app.persistent_background_enabled = false;
+        compute_view(&mut app, area);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (0..area.height)
+                .map(|row| buffer_row_text(buffer, area, row))
+                .all(|row| !row.contains("herdr-line-")),
+            "the stream drew with the scene off"
+        );
     }
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {

@@ -4834,6 +4834,23 @@ impl HeadlessServer {
         self.app.state.every_app_viewer_draws_ambient_wash =
             self.every_app_viewer_draws_ambient_wash();
         changed |= self.app.observe_sidebar_particle_field();
+        // The host machine's own state, and herdr's own status stream.
+        //
+        // **These have to be here and not only in `App::handle_scheduled_tasks`,
+        // for the reason the tray's own line above gives: the two loops own
+        // different clocks and the headless one is the only path a real Herdr
+        // takes.** The register was in that other loop alone, so on every
+        // server-backed session — which is every session — it was never sampled
+        // at all, and the corner reported *"the host's own state is not read on
+        // this platform"* on a perfectly ordinary Linux host. The `/proc` reader
+        // was never the problem and neither was the installed binary; nothing
+        // ever called it. Reproduced live on a freshly built server through the
+        // session API, with `history_samples: 0` on all four quantities.
+        //
+        // Before the scene, so a corner drawn this pass carries this pass's
+        // sample rather than the previous one's.
+        changed |= self.app.observe_machine_register(now);
+        changed |= self.app.observe_status_feed(now);
         changed |= self.app.observe_background_scene();
         changed |= self.app.observe_background_effects(now, has_viewers);
         self.app.sync_state_age_timer(now, has_viewers);
@@ -6981,8 +6998,82 @@ next_tab = ""
         });
     }
 
+    /// The machine register is sampled by the *server's* tick, not only by a
+    /// Herdr that owns its own terminal.
+    ///
+    /// The captain, on a real Linux host: the machine corner said *"the host's
+    /// own state is not read on this platform"*. It was not the `/proc` reader —
+    /// that is correct and `cfg`-gated in — and it was not a stale installed
+    /// binary or the client/server transport, which were the two theories on
+    /// record. `observe_machine_register` lived only in
+    /// `App::handle_scheduled_tasks`, which is the loop a Herdr with its own
+    /// terminal runs, and every session is server-backed. Nothing ever sampled
+    /// it, on any platform.
+    #[test]
+    fn the_headless_tick_samples_the_machine_register() {
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        server.handle_scheduled_tasks_headless(now, false);
+
+        // Either it sampled, or this platform genuinely does not read the host's
+        // state — and the two must not be spelled the same way, which is the
+        // other half of the same defect.
+        let absence = server.app.state.machine_register.absence(now);
+        assert_ne!(
+            absence,
+            Some(crate::machine_register::Absence::NeverSampled),
+            "the headless tick did not sample the register at all"
+        );
+        if crate::platform::read_machine_counters().is_some() {
+            // One sample is already a reading: memory, swap and load are
+            // absolute and readable from one, and only the CPU fraction needs a
+            // second. So a host that reads its own state has no absence at all
+            // after a single tick.
+            assert_eq!(
+                absence, None,
+                "a host that reads its own state still had nothing to show after \
+                 a tick"
+            );
+            assert!(
+                !server.app.state.machine_register.sources().is_empty(),
+                "the register sampled without naming a file it read"
+            );
+        }
+    }
+
+    /// And it records herdr's own status stream, for the same reason.
+    #[test]
+    fn the_headless_tick_records_the_status_stream() {
+        let mut server = test_headless_server();
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "a worker finished".into(),
+            context: String::new(),
+            position: None,
+            target: None,
+        });
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert_eq!(
+            server
+                .app
+                .state
+                .status_feed
+                .lines()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a worker finished"],
+            "the headless tick did not record what herdr just said"
+        );
+    }
+
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {
         let mut server = test_headless_server();
+        // A git consumer on the Space rows. The default rows are the body
+        // registers now (`crate::ui::sidebar::body_register`), and a fleet with
+        // no git token demands no git refresh at all — which is
+        // `due_git_refresh_does_not_start_without_sidebar_consumer`'s subject,
+        // not this one's.
+        server.app.state.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Branch]];
         server
             .app
             .state

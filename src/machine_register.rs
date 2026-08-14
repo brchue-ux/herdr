@@ -126,6 +126,13 @@ impl Series {
 pub(crate) enum Absence {
     /// This build does not read the host's state on this platform.
     Unsupported,
+    /// Nobody has asked the platform yet. Distinct from [`Self::Unsupported`] on purpose: the two
+    /// are indistinguishable from the register's own fields — both leave it empty — and reporting
+    /// the first as the second is a readout blaming the operating system for a call its own host
+    /// process never made. That is not hypothetical; it cost a round of investigation, which
+    /// chased a stale binary and the client/server transport before the missing call in the
+    /// headless tick was found. Resolves on its own once a sample lands.
+    NeverSampled,
     /// Read, but not yet twice — a CPU fraction is a ratio of two deltas, so the first sample
     /// produces no reading at all. Resolves on its own one interval later.
     AwaitingSecondSample,
@@ -140,6 +147,7 @@ impl Absence {
     pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Unsupported => "the host's own state is not read on this platform",
+            Self::NeverSampled => "the host's own state has not been sampled yet",
             Self::AwaitingSecondSample => "waiting for a second sample",
             Self::Stalled => "the machine feed has stalled",
         }
@@ -272,8 +280,12 @@ impl MachineRegister {
     /// Checked in the order the causes actually occur, so the reason a reader is given is the one
     /// that is true rather than the first one that happens to match.
     pub(crate) fn absence(&self, now: Instant) -> Option<Absence> {
-        if self.unsupported || self.last_sample.is_none() {
-            return Some(Absence::Unsupported).filter(|_| self.unsupported || self.is_empty());
+        if self.unsupported {
+            return Some(Absence::Unsupported);
+        }
+        if self.last_sample.is_none() {
+            // Never asked, which is a different fact from "asked and the platform said no".
+            return self.is_empty().then_some(Absence::NeverSampled);
         }
         if let Some(age) = self.age(now) {
             if age > SAMPLE_INTERVAL * STALE_AFTER_INTERVALS {

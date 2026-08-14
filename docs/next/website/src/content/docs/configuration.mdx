@@ -346,6 +346,8 @@ Space rows accept these built-in tokens:
 - `quota_session` — the published 5-hour quota window: `session 42%, resets in 2h`.
 - `quota_weekly` — the published 7-day quota window: `week 15%, resets in 2d`.
 - `streak` — the published quality streak, decayed to now: `streak 23.8 steady`.
+- `body_register` — what this Space *is*, in the register the background scene draws it in: `gas giant · 99 files · 2 moons`.
+- `orbit_register` — what it has *done*, in the same register: `streak 5 · T 13.4s · 23 revs`.
 - `terminal_title` — latest OSC 0/2 terminal title after safety normalization, rolled up from one pane.
 - `terminal_title_stripped` — the same rolled-up title with one recognized leading activity or spinner glyph and its following whitespace removed.
 - `$name` — custom workspace metadata named `name`.
@@ -385,6 +387,27 @@ two separate tokens rather than one, so a layout can put each on its own row:
 that, plus the different label word each one draws (`session` vs. `week`),
 is what keeps the 5-hour and 7-day windows reading as two different facts
 rather than two similar percentages side by side.
+
+`body_register` and `orbit_register` are the sidebar and the background scene
+reading the same fleet. They are the default second and third Space rows, in
+place of `branch` and `git_status` — a fleet that wants those back names them on
+a row and has them exactly as before.
+
+Every number in the two lines is one Herdr already computes for the scene, read
+rather than re-derived: the body's kind and its size register come from the same
+call the scene is built from, its type (`gas giant`, `ringed planet`, `planet`,
+`moon`, `star`) from the same ranking rule, its period `T` from the same orbital
+law, and its completed revolutions from the accumulator the orbit-track layer
+keeps. `N moons` is how many children the row has in the ownership tree. The
+streak is the same decayed reading the `streak` token draws, printed as a whole
+number. Any part with nothing published behind it is dropped rather than printed
+as a zero: an unmeasured project and an empty one are different things, and a
+worker has no file count, no streak and no moons of its own.
+
+Neither token costs anything a fleet was not already paying. The file count is
+the `files` workspace metadata token the scene's size register already reads; a
+Space with no `files` token published draws its type and its moon count and says
+nothing about a size nobody measured.
 
 Herdr scores nothing itself either. `streak` reads the `streak` workspace
 metadata token a fleet publisher writes, `<score>@<unix seconds>` — the score

@@ -49,6 +49,11 @@ pub(super) enum ResolvedTokenKind {
         band: crate::quality_streak::FlameBand,
         text: String,
     },
+    /// What this row's body *is*, in the sky's own register:
+    /// `gas giant · 99 files · 2 moons`.
+    BodyRegister(String),
+    /// What it has *done*: `streak 5 · T 13.4s · 23 revs`.
+    OrbitRegister(String),
     Custom(String),
 }
 
@@ -136,6 +141,11 @@ pub(super) struct SpaceTokenContext<'a> {
     pub terminal_title: Option<&'a str>,
     pub terminal_title_stripped: Option<&'a str>,
     pub tokens: &'a std::collections::HashMap<String, String>,
+    /// This Space's body facts, resolved once for the whole panel by
+    /// [`super::body_register::BodyRegister`]. `None` for a row the register
+    /// could not resolve — a roster mid-rebuild — and the two register tokens
+    /// then elide exactly as a missing custom token does.
+    pub body: Option<&'a super::body_register::BodyFacts>,
     pub suppress_git_details: bool,
     /// The clock `quota_session`/`quota_weekly` reset countdowns are rendered
     /// against — [`crate::app::state::AppState::wall_now`], threaded through
@@ -242,6 +252,14 @@ pub(super) fn space_rows(
                                     text: crate::quality_streak::format_readout(value, band),
                                 }
                             }),
+                        SpaceSidebarToken::BodyRegister => context
+                            .body
+                            .and_then(super::body_register::BodyFacts::body_line)
+                            .map(ResolvedTokenKind::BodyRegister),
+                        SpaceSidebarToken::OrbitRegister => context
+                            .body
+                            .and_then(super::body_register::BodyFacts::orbit_line)
+                            .map(ResolvedTokenKind::OrbitRegister),
                         SpaceSidebarToken::TerminalTitle => context
                             .terminal_title
                             .map(|title| ResolvedTokenKind::TerminalTitle(title.to_string())),
@@ -433,6 +451,7 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             tokens: &tokens,
+            body: None,
             suppress_git_details: false,
             wall_now: std::time::SystemTime::UNIX_EPOCH,
         };
@@ -469,6 +488,7 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             tokens,
+            body: None,
             suppress_git_details,
             wall_now: std::time::SystemTime::UNIX_EPOCH,
         }
@@ -779,6 +799,7 @@ mod tests {
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
+                    body: None,
                     suppress_git_details: true,
                     wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
@@ -817,6 +838,7 @@ mod tests {
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
+                    body: None,
                     suppress_git_details: false,
                     wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
@@ -861,6 +883,7 @@ mod tests {
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &std::collections::HashMap::new(),
+                    body: None,
                     suppress_git_details: false,
                     wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
@@ -896,6 +919,7 @@ mod tests {
                     terminal_title: Some("⠋ running tests"),
                     terminal_title_stripped: Some("running tests"),
                     tokens: &std::collections::HashMap::new(),
+                    body: None,
                     suppress_git_details: true,
                     wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
@@ -929,6 +953,7 @@ mod tests {
                     terminal_title: None,
                     terminal_title_stripped: None,
                     tokens: &tokens,
+                    body: None,
                     suppress_git_details: false,
                     wall_now: std::time::SystemTime::UNIX_EPOCH,
                 },
@@ -961,6 +986,7 @@ mod tests {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 tokens,
+                body: None,
                 suppress_git_details: false,
                 wall_now: std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_secs(WALL_NOW_SECS),
@@ -1088,6 +1114,7 @@ mod tests {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 tokens: &tokens,
+                body: None,
                 suppress_git_details: false,
                 wall_now,
             },
@@ -1136,6 +1163,7 @@ mod tests {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 tokens: &tokens,
+                body: None,
                 suppress_git_details: false,
                 wall_now: std::time::SystemTime::UNIX_EPOCH,
             },

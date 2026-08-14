@@ -10962,6 +10962,14 @@
                 "null"
               ]
             },
+            "status_feed": {
+              "default": [],
+              "description": "The last few things herdr has said about this session, oldest first. A\nsession fact rather than one client's picture of it: where the stream is\ndrawn and how wide it is are the TUI's, and stay there.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/StatusFeedLineInfo"
+              },
+              "type": "array"
+            },
             "tabs": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/TabInfo"
@@ -10995,6 +11003,31 @@
             "down"
           ],
           "type": "string"
+        },
+        "StatusFeedLineInfo": {
+          "description": "One line of herdr's own status stream. See\n[`crate::app::status_feed::StatusFeed`].",
+          "properties": {
+            "age_ms": {
+              "description": "How long ago it was said, in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "description": "Which kind of event it was: `needs_attention`, `finished`,\n`update_installed` or `process_failed`.",
+              "type": "string"
+            },
+            "text": {
+              "description": "What herdr said, already joined into one line.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "kind",
+            "age_ms"
+          ],
+          "type": "object"
         },
         "TabInfo": {
           "properties": {

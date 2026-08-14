@@ -1522,3 +1522,33 @@ SwapFree:         100 kB
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
     }
 }
+
+#[cfg(test)]
+mod machine_register_reads_this_host {
+    /// The `/proc` reader answers on the machine the tests are running on.
+    ///
+    /// The register was reported live as *"the host's own state is not read on
+    /// this platform"* on a real Linux host, and the scout's own note said the
+    /// reader looked correct and the cause was more likely a stale installed
+    /// binary or the client/server path. This is the half of that which can be
+    /// settled in a test: on Linux, with `/proc` mounted, the reader returns a
+    /// sample and names the files it came from.
+    #[test]
+    fn the_proc_reader_reads_this_host() {
+        if !std::path::Path::new("/proc/stat").exists() {
+            return; // A container with no /proc is not this test's subject.
+        }
+        let counters = super::read_machine_counters_platform()
+            .expect("a Linux host with /proc gives the register a sample");
+        assert!(
+            !counters.sources.is_empty(),
+            "the reader answered without naming a single file it read"
+        );
+        assert!(
+            counters.memory_kib.is_some()
+                || counters.load_average_1m.is_some()
+                || counters.cpu_total.is_some(),
+            "the reader answered with no quantity at all: {counters:?}"
+        );
+    }
+}

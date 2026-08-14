@@ -481,10 +481,10 @@ fn scene_origin(width: u32, height: u32) -> (f32, f32) {
 ///
 /// Which rung of [`ORBIT_LADDER`] each node sits on, whether it is drawn at all, and the seated and
 /// overflow counts.
-struct Ladder {
+pub(crate) struct Ladder {
     /// Whether this node is drawn — `false` for a mate the ring had no slot for, and everything
     /// under it.
-    seated: Vec<bool>,
+    pub(crate) seated: Vec<bool>,
     /// The ladder rung a seated second mate sits on, `None` for everything that is not one.
     ///
     /// A42(d): the selected set is seated **in roster order**, never sorted by the register that
@@ -497,7 +497,7 @@ struct Ladder {
 }
 
 /// Returns one flag per node — whether it is drawn — alongside the seated and overflow counts.
-fn seat_the_ladder(nodes: &[TreeNode]) -> Ladder {
+pub(crate) fn seat_the_ladder(nodes: &[TreeNode]) -> Ladder {
     let mut mates: Vec<(usize, f32)> = nodes
         .iter()
         .enumerate()
@@ -563,7 +563,7 @@ fn seat_the_ladder(nodes: &[TreeNode]) -> Ladder {
 /// exist at bake time is not a rule, and this fleet's roster changes under it. [`build_layout`] is
 /// that recompute — it already runs on every topology change, which is exactly the event that can
 /// move a rank.
-fn assign_body_types(nodes: &[TreeNode], seated: &[bool]) -> Vec<BodyType> {
+pub(crate) fn assign_body_types(nodes: &[TreeNode], seated: &[bool]) -> Vec<BodyType> {
     let mut ranked: Vec<(usize, f32)> = nodes
         .iter()
         .enumerate()

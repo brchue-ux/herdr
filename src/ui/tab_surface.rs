@@ -312,14 +312,18 @@ mod tests {
         // It moved once more when the sidebar divider grew an at-rest grip:
         // three rows in the middle of the bar now carry a lighter foreground.
         // The glyphs are untouched, so this is purely a style move.
-        // It moved a final time when the state alphabet became ASCII
-        // (`state_mark`): every state glyph on this frame is a different
-        // character, and a pane that is not an agent now draws a blank where
-        // it used to draw `·`. Geometry is untouched — the mark still occupies
-        // exactly one cell.
+        // It moved again when the state alphabet became ASCII (`state_mark`):
+        // every state glyph on this frame is a different character, and a pane
+        // that is not an agent now draws a blank where it used to draw `·`.
+        // Geometry is untouched — the mark still occupies exactly one cell.
+        // It moved a final time when a Space's default rows became the body
+        // registers (`crate::ui::sidebar::body_register`): line two of every
+        // Space row is now `<body type> · <N> files · <N> moons` where it was
+        // the branch and its ahead/behind counts, and line three is the orbit
+        // register where there was no line three.
         assert_eq!(
             frame_digest(&frame),
-            "d4ec348c0c198695455e0a27c85fdc9823d9fad4941133931af890bb6c47bf60"
+            "4517627a4666195d6af36e7a5efda57d287d9f6fecf253ae595be996a08c0224"
         );
     }
 

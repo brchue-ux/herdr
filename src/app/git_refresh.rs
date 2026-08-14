@@ -428,7 +428,14 @@ mod tests {
 
     #[test]
     fn headless_deadline_can_suppress_git_refresh_timer() {
-        let mut app = test_app(&crate::config::Config::default());
+        // Explicitly configured with a git consumer. The default Space rows are
+        // the body registers now — see `crate::ui::sidebar::body_register` — so
+        // a default fleet demands no git refresh at all, which is
+        // `due_git_refresh_does_not_start_without_sidebar_consumer`'s subject
+        // rather than this one's.
+        let mut config = crate::config::Config::default();
+        config.ui.sidebar.spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Branch]];
+        let mut app = test_app(&config);
         app.state.workspaces.push(Workspace::test_new("test"));
         let now = Instant::now();
         app.last_git_remote_status_refresh = now - GIT_REMOTE_STATUS_REFRESH_INTERVAL;
@@ -464,7 +471,11 @@ mod tests {
 
     #[test]
     fn git_refresh_due_request_survives_in_flight_refresh() {
-        let mut app = test_app(&crate::config::Config::default());
+        // A git consumer on the rows, for the reason
+        // `headless_deadline_can_suppress_git_refresh_timer` gives.
+        let mut config = crate::config::Config::default();
+        config.ui.sidebar.spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Branch]];
+        let mut app = test_app(&config);
         let now = Instant::now();
         app.git_refresh_in_flight = true;
 
