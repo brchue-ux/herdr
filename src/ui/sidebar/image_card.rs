@@ -96,39 +96,69 @@ use crate::ui::sidebar::AgentPanelEntry;
 /// > symmetry and truncates titles. herdr will just need to be better about
 /// > what it chooses to display as current working summary."*
 ///
-/// 68 × 0.8 = 54.4, and it is one number rather than a per-rank cut precisely
-/// because of the second sentence: the ladder is still width and only width
-/// (`super::rank_width_inset` is untouched), so every card shrinks by the same
-/// fifth and the rank steps between them are exactly the ones that were there
-/// before.
+/// It is one number rather than a per-rank cut precisely because of the second
+/// sentence: the ladder is still width and only width
+/// (`super::rank_width_inset` is untouched), so every card keeps the same air
+/// and the rank steps between them are exactly the ones that were there before.
 ///
-/// **The trim comes out of the card's air, not out of its type.** The type is
-/// fixed by legibility ([`TITLE_PX`]) and the block it sets is the same 45.1 px
-/// on every face this runs on — `ab_glyph` normalises a face's line height to
-/// the scale it is asked for, so two 14 px lines at [`TITLE_LEADING`] plus a
-/// tidbit at [`TIDBIT_GAP`] is a constant, not a per-face measurement. So:
+/// **The trim came out of the card's air, not out of its type**, and that is
+/// what survives as [`CARD_AIR_PER_SIDE_PX`] — the air the captain left, 4.65 px
+/// a side against the 11.45 the card had before him. The type is fixed by
+/// legibility ([`TITLE_PX`]) and the block it sets is a constant on every face
+/// this runs on: `ab_glyph` normalises a face's line height to the scale it is
+/// asked for, so the block is arithmetic rather than a per-face measurement.
+///
+/// # Why the number moved from 54.4 to 64.5
+///
+/// The block underneath it grew, and the air did not. A card used to carry two
+/// title lines and one caption; it now carries two title lines and
+/// [`CAPTION_LINES`] — what the body **is** and what it has **done** on a mate,
+/// what it is **doing** and what state it is **in** on a worker — because that
+/// is what the reference's rows say. One more caption line at
+/// [`measured::TIDBIT_SIZE_MUL`] of the title's 14 px is 10.08 px, and the card
+/// is exactly that much taller:
 ///
 /// ```text
 ///                 nominal   content block   air per side   min pad
 ///   before          68.0        45.11           11.45         3.0
-///   after           54.4        45.11            4.65         3.0
+///   trimmed         54.4        45.11            4.65         3.0
+///   two captions    64.5        55.19            4.65         3.0
 /// ```
 ///
-/// That is the whole reason the trim is a single constant and composes with
-/// [`content_floor_px`] instead of fighting it: the floor is 51.11 px, the
-/// trimmed nominal is 54.4 px, so the floor stays a *floor* — it does not
-/// engage, the card is not pushed back up, and [`MIN_VERTICAL_PAD_PX`] is still
-/// not reached. Trim any further and the floor starts clamping, at which point
-/// the number here stops meaning anything; `the_trim_is_air_and_not_the_floor`
-/// holds that boundary.
+/// So the captain's trim is intact — the air per side is still his 4.65 — and
+/// the growth is entirely lines of type that were not there before.
+/// `the_trim_is_air_and_not_the_floor` is what holds that apart.
+///
+/// It composes with [`content_floor_px`] the same way it always did: the floor
+/// is 61.19 px against a nominal of 64.5, so the floor stays a *floor* — it does
+/// not engage, the card is not pushed back up, and [`MIN_VERTICAL_PAD_PX`] is
+/// still not reached.
 ///
 /// Nothing about the title's capacity moved, which is the answer to *"truncates
-/// titles"*: a title's room is lines × column width, the line count is
-/// unchanged at [`TITLE_LINES`], and the column is measured in from a nominal
-/// that just got smaller — [`measured::PAD`] and [`measured::PAD_RIGHT`] are
-/// fractions of it — so every card came out of this trim about 6 px *wider* in
-/// the text. See `the_trim_did_not_cost_the_title_a_single_pixel`.
-const BASE_HEIGHT_PX: f32 = 54.4;
+/// titles"*: a title's room is lines × column width, and the line count is
+/// unchanged at [`TITLE_LINES`].
+const BASE_HEIGHT_PX: f32 = 64.5;
+
+/// The air a card keeps above and below its content block, in pixels.
+///
+/// **The captain's own number**, and the thing his 20% trim actually decided:
+/// 4.65 px a side, down from the 11.45 the card had before him. It is stated
+/// here rather than left implicit inside [`BASE_HEIGHT_PX`] so that a change to
+/// what the card *says* moves the card's height and leaves his decision about
+/// its air alone — which is exactly what happened when the row grew its two
+/// register captions.
+///
+/// Test-only, because it is the number [`BASE_HEIGHT_PX`] was *written from*
+/// rather than a second input to it: the drawn card reads one constant, and this
+/// is what `the_trim_is_air_and_not_the_floor` holds that constant to.
+#[cfg(test)]
+const CARD_AIR_PER_SIDE_PX: f32 = 4.65;
+
+/// The card height the measured table's *chrome* ratios are fractions of.
+///
+/// The captain's trimmed 54.4, held still on purpose. See [`nominal_height_px`]
+/// for why this stopped tracking [`BASE_HEIGHT_PX`].
+const CHROME_NOMINAL_PX: f32 = 54.4;
 
 /// The title's type size, on every card.
 ///
@@ -161,6 +191,46 @@ const TITLE_LINES: usize = 2;
 /// wrap point stops being visible. This is the prototype's `lead = th * 1.30`
 /// measured against the line box instead of against the bounding box of `Hxg`.
 const TITLE_LEADING: f32 = 1.25;
+
+/// Caption lines reserved under the title on every card, whatever this card
+/// carries.
+///
+/// **Two, and the number is the reference's own.** Its mate pane sets three
+/// lines — the project's name, `gas giant · 99 files · 2 moons`, and
+/// `streak 5 · T 13.4s · 23 revs` — and its worker pane sets three: the lane's
+/// name, the task, and the state as a bare lowercase word. So a row is a name
+/// and *two* things said about it, and which two depends on what the row is:
+///
+/// | row | caption one | caption two |
+/// |---|---|---|
+/// | a mate (a star or a planet) | what its body **is** | what it has **done** |
+/// | a worker (a moon) | what it is **doing** | what state it is **in** |
+///
+/// herdr reserves [`TITLE_LINES`] for the name rather than the reference's one,
+/// because a herdr title is a published `doing` summary and not a project slug —
+/// so a card is four lines of type where the reference is three.
+///
+/// It is not three. Three was tried and the arithmetic refused it: a third
+/// caption puts the drawn card at 82 px, which is four 21 px cells with 1.6 px
+/// of gutter left between siblings — against the 0.19 h the material was
+/// measured at — and the row would have to grow to five cells to get its air
+/// back. The captain's standing instruction on card size is the opposite
+/// direction (see [`BASE_HEIGHT_PX`]), and at two captions the gutter lands on
+/// **13.4 px against a 70.6 px card: 0.19 h exactly**.
+///
+/// Reserved rather than measured for the reason [`TITLE_LINES`] is: a row whose
+/// height tracked its text would reflow the whole tree below it every time any
+/// agent said anything.
+const CAPTION_LINES: usize = 2;
+
+/// How far the state word sits below the other captions' ink.
+///
+/// The card's colour and its breath already say what state it is in; this word
+/// is the name of that state for a reader who wants it spelled, not a second
+/// signal competing with the two lines carrying numbers. Applied on top of
+/// [`measured::TIDBIT_INK_MIX`], so it is a rung below caption weight rather
+/// than a second scale.
+const STATE_INK_MIX: f32 = 0.62;
 
 /// Gap between the title block and the tidbit line, as a multiple of the
 /// tidbit's line height.
@@ -256,18 +326,27 @@ const BLOOM_REACH_SIGMAS: f32 = 3.7;
 /// A sigma under a pixel or two is not a gradient, it is a stroke with a fringe.
 const BLOOM_SIGMA_MIN_PX: f32 = 1.6;
 
-/// The height a card gets *nominally*, before its content pushes it taller.
+/// The height every ratio in the measured table is a fraction of.
 ///
-/// Every ratio in the measured table is a fraction of this and not of the drawn
-/// height — see [`CardGeometry::new`]. Named because the bloom needs it in two
-/// places that must agree exactly: the field [`lay_bloom`] paints, and the image
-/// [`card_image_rect`] sizes to hold it.
+/// # Why this is not [`BASE_HEIGHT_PX`] any more
 ///
-/// The same on every rank since the tiers were retired ([`BASE_HEIGHT_PX`]);
-/// still a function because the cell height is a floor on it, and a host with
-/// tall cells is a host where one cell is already more than the base.
+/// It was, and the two were the same number for as long as the card carried one
+/// caption. They came apart when it started carrying [`CAPTION_LINES`]: the
+/// card's *height* is block plus air and grows with what the row says, but its
+/// *chrome* — the pad, the right pad, the stroke, the corner and the icon plate
+/// — is not a function of how many lines are inside it. Left tied together, two
+/// extra lines of caption made the pad wider and the title's column **narrower**,
+/// which is the captain's own *"truncates titles"* arriving by the back door.
+///
+/// So the chrome stays measured against the card the captain trimmed —
+/// [`CHROME_NOMINAL_PX`] — and the height is free to follow the content. The
+/// horizontal budget a title is set in is byte-identical to what it was after
+/// his trim, on every face and at every rank.
+///
+/// Still a function because the cell height is a floor on it, and a host with
+/// tall cells is a host where one cell is already more than the nominal.
 fn nominal_height_px(cell_height: f32) -> f32 {
-    BASE_HEIGHT_PX.max(cell_height)
+    CHROME_NOMINAL_PX.max(cell_height)
 }
 
 /// The sigma of the near lobe of a card's bloom, in pixels.
@@ -275,8 +354,32 @@ fn bloom_sigma_px(cell_height: f32) -> f32 {
     (measured::BLOOM_SIGMA * nominal_height_px(cell_height)).max(BLOOM_SIGMA_MIN_PX)
 }
 
+/// Whether a card paints a bloom at all.
+///
+/// **No, and this is the reference's rule rather than a taste call.** F1 refuses
+/// `box-shadow` and `blur()` outright: the reference has *no drop shadow
+/// anywhere* and its panes float by being brighter than the ground rather than
+/// by casting onto it. herdr's bloom ran a measured 26–28 px past a card's own
+/// stroke, which over a tree of stacked rows is a continuous haze — and the
+/// glass material replacing the filled plate has nothing to lift, because a face
+/// at a tenth of an alpha is not standing off the panel in the first place.
+///
+/// A constant rather than a deletion because the bloom is a whole measured,
+/// tested subsystem with a GPU path behind it, and the two places it is
+/// consulted — [`bloom_reach_px`], which decides how much image is reserved, and
+/// [`plan_bloom`], which decides whether any is painted — are the entire gate.
+/// Flipping it back is one word and restores exactly the artwork the measured
+/// table describes.
+const CARD_BLOOM: bool = false;
+
 /// How far a card's bloom is carried past its stroke, in pixels.
+///
+/// Zero while [`CARD_BLOOM`] is off, which is what stops every card's image from
+/// reserving a margin nothing is drawn in.
 fn bloom_reach_px(cell_height: f32) -> f32 {
+    if !CARD_BLOOM {
+        return 0.0;
+    }
     bloom_sigma_px(cell_height) * BLOOM_REACH_SIGMAS
 }
 
@@ -314,20 +417,6 @@ fn bloom_reach_px(cell_height: f32) -> f32 {
 /// cannot query the host's glyph outlines in any case, and a half-column error
 /// is exactly the error being removed here.
 const RAIL_INK_COLUMN_FRACTION: f32 = 0.5;
-
-/// How thick a tree rail's ink is, as a fraction of a cell's width.
-///
-/// The joins in [`Rasteriser::draw_tree_joins`] continue a line a *font* drew,
-/// and Herdr cannot measure the host's glyph outlines — the same limit
-/// [`RAIL_INK_COLUMN_FRACTION`] runs into. A box-drawing stem is a hairline: a
-/// tenth of the cell is what that comes to at the sizes a sidebar is read at,
-/// and never less than the one pixel a terminal cannot draw under. Drawn at the
-/// *card's* stroke instead — the obvious alternative — the join arrives at the
-/// rail twice its weight and reads as a blob at the joint rather than as the
-/// line continuing.
-fn rail_stroke_px(cell_w: f32) -> f32 {
-    (cell_w * 0.1).max(1.0)
-}
 
 /// How far a card's ink sits from the middle of its own cells, so that it is
 /// centred on the row the tree's branch line meets it on.
@@ -494,12 +583,15 @@ pub(crate) fn card_face_available(override_path: Option<&str>) -> bool {
 /// Whether a transparent shape will be drawn over this row's frame, so the
 /// character card standing under it must not be drawn at all.
 ///
-/// The sheet answers `false` and keeps drawing the character card underneath,
-/// because the sheet is opaque over every cell a row owns and covers it. A shape
-/// is transparent everywhere outside its own glow, so anything drawn beneath it
-/// would show *through* it — the character card's border, its chip and its
-/// title, doubled a few pixels off the pixel card's own. Not drawing them is
-/// what makes the transparency mean "the panel is behind this card".
+/// **Both pixel models answer `true` now.** The sheet used to answer `false`
+/// and keep the character card underneath, because it painted an opaque
+/// backdrop over every cell a row owned and covered it. It no longer paints one:
+/// a card is glass, and a glass pane standing on an opaque plate is not glass —
+/// the whole point of the material is that the panel, and on a terminal drawing
+/// the whole-screen scene the sky itself, is measurably visible *through* the
+/// card. So neither model covers what is beneath it, and anything drawn there
+/// would show through — the character card's border and its title, doubled a
+/// few pixels off the pixel card's own.
 ///
 /// The row's connectors and rails are outside the card's frame and are left
 /// alone: they are the tree, not the card, and the card was never covering them.
@@ -530,7 +622,7 @@ pub(crate) fn card_face_available(override_path: Option<&str>) -> bool {
 ///
 /// [`MAX_IMAGE_PIXELS`]: Rasteriser::rasterise
 pub(crate) fn shape_covers_row(app: &AppState, fold_width: u16) -> bool {
-    app.sidebar_card_shapes && card_covers_row(app, fold_width)
+    card_covers_row(app, fold_width)
 }
 
 /// Whether a pixel card is going to be drawn over this row at all, by either
@@ -579,11 +671,15 @@ fn content_floor_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
     content_block_px(metrics, tidbit_metrics) + MIN_VERTICAL_PAD_PX * 2.0
 }
 
-/// The ink a D-MID card carries: two title lines and the tidbit under them.
+/// The ink a card carries: two title lines and [`CAPTION_LINES`] under them.
+///
+/// The caption run is set solid — one line height each, no extra leading —
+/// because the three of them are one block of caption and not three separate
+/// statements. Only the gap between the title and the first of them is a gap.
 fn content_block_px(metrics: FontMetrics, tidbit_metrics: FontMetrics) -> f32 {
     let title = metrics.line_height * (TITLE_LEADING * (TITLE_LINES as f32 - 1.0) + 1.0);
-    let tidbit = tidbit_metrics.line_height * (1.0 + TIDBIT_GAP);
-    title + tidbit
+    let captions = tidbit_metrics.line_height * (CAPTION_LINES as f32 + TIDBIT_GAP);
+    title + captions
 }
 
 /// The least air a card keeps above and below its content.
@@ -739,7 +835,19 @@ impl StageHues {
 /// What one card says, and how it is lit while it says it.
 struct CardContent {
     title: String,
+    /// The card's second line: what this body **is** on a mate
+    /// (`gas giant · 99 files · 2 moons`), and what this worker is *doing* on a
+    /// moon. See [`super::body_register`].
     tidbit: Option<String>,
+    /// The card's third line, and what kind of thing it says.
+    ///
+    /// A mate's is its orbit register — `streak 5 · T 13.4s · 23 revs`. A
+    /// worker's is **its state, as a bare dim lowercase word**: no chip, no
+    /// pill, no capsule, no uppercase, which is how the reference draws it and
+    /// the only place the reference draws it at all. See [`CaptionTone`].
+    register: Option<Caption>,
+    /// The state in words. Still carried on every card even where no caption
+    /// draws it, because the spider, the breath and the wash all name it.
     state_label: String,
     state: AgentState,
     /// Which stage this card's work is at. **The hue channel, and only that.**
@@ -778,6 +886,19 @@ struct CardContent {
     /// The failure spider riding this card, if the fleet says it owns an open
     /// defect. See [`spider`].
     spider: Option<spider::CardSpider>,
+    /// How much of this card is drawn, from its left edge, `0.0..=1.0`.
+    ///
+    /// Beat three of [`super::motion::ArrivalBeat`]: a card **generates** left
+    /// to right from where the light landed on its edge. `0.0` is a card that
+    /// does not exist yet and `1.0` is every card at rest, which is every card
+    /// on a settled panel.
+    generate: f32,
+    /// How hard this row's work is running, `0.0..=1.0` — a share of the
+    /// fleet's own traffic, and zero on anything that is not working.
+    ///
+    /// Drawn as filaments *behind* the face, so it cannot make the pane read as
+    /// opaque. See [`draw_discharge`].
+    discharge: f32,
     /// This frame of the card's breath, quantized to [`CARD_BREATH_STEPS`].
     /// `0.0` is the card at its own settled light, which is what a host with no
     /// card animation draws, and `1.0` is a full breath — but a snapping
@@ -792,6 +913,10 @@ impl CardContent {
     fn hash_into(&self, hasher: &mut DefaultHasher) {
         self.title.hash(hasher);
         self.tidbit.hash(hasher);
+        // The orbit line moves on its own — a revolution completes without
+        // anything else about the row changing — so a signature blind to it
+        // would carry a stale `N revs` forward forever.
+        self.register.hash(hasher);
         self.state_label.hash(hasher);
         (self.state as u8).hash(hasher);
         self.stage.hash(hasher);
@@ -830,6 +955,11 @@ impl CardContent {
         // forward without being redrawn. This is the whole of what keeps a tree
         // of breathing cards from rasterising on every frame.
         ((self.breath * CARD_BREATH_STEPS).round() as u16).hash(hasher);
+        // Both quantized for the same reason the breath is: a card mid-arrival
+        // or mid-discharge whose picture has not moved by a step anyone could
+        // see is carried forward rather than redrawn.
+        ((self.generate * GENERATE_STEPS).round() as u16).hash(hasher);
+        ((self.discharge * DISCHARGE_STEPS).round() as u16).hash(hasher);
         self.wash.map(CardWashFrame::step).hash(hasher);
     }
 
@@ -892,6 +1022,30 @@ impl CardContent {
     fn light_at(&self, state: AgentState) -> CardLight {
         self.light_of(crate::app::lifecycle::stage(None, state))
     }
+}
+
+/// One caption line, and the weight it is set at.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct Caption {
+    text: String,
+    tone: CaptionTone,
+}
+
+/// How loudly a caption is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+enum CaptionTone {
+    /// A readout — a register line, a task, a project. Caption weight.
+    Register,
+    /// The row's state, as a bare lowercase word.
+    ///
+    /// A rung quieter than a register, and lowercased on the way to the canvas.
+    /// The card's own colour and breath already say what state it is in; this is
+    /// the *name* of that state for a reader who wants it spelled, not a second
+    /// signal competing with the line carrying numbers. It was a chip on the
+    /// first content row and a capitalised pill on the last until the reference
+    /// settled it — a word in capitals is a badge whether or not it has a box
+    /// drawn round it.
+    State,
 }
 
 /// The ground the cards float on.
@@ -1087,9 +1241,24 @@ impl CardLight {
     fn inks(self) -> CardInk {
         let (h, s, l) = self.ink.to_hsl();
         let l = l * self.lum;
-        let stroke_a = Rgb::from_hsl(h - measured::HUE_TRAVEL / 2.0, s, l);
+        // **The travel is clamped into H1's band rather than running out of it.**
+        //
+        // The gradient is half the travel either side of the card's own hue, so
+        // a card at the cold end of the measured family — 181°, the queued
+        // stage — would put its left edge at 165.7° and its whole left border a
+        // green-cyan the reference's tree column does not contain. Measured
+        // over the reference's own column, 99.94% of chromatic ink above L25 is
+        // inside 175-265° and 99.7% of that is in one 15° bucket: the band is
+        // the finding, not the travel. So the travel gives way at the edges of
+        // the band and keeps its full 30.6° everywhere inside it, which is every
+        // hue the family actually uses but its two ends.
+        //
+        // `the_trees_ink_is_one_hue_family_and_a_fifth_of_its_area` is what
+        // holds this on the published pixels.
+        let band = |hue: f32| hue.clamp(measured::HUE_BAND.0, measured::HUE_BAND.1);
+        let stroke_a = Rgb::from_hsl(band(h - measured::HUE_TRAVEL / 2.0), s, l);
         let stroke_b = Rgb::from_hsl(
-            h + measured::HUE_TRAVEL / 2.0,
+            band(h + measured::HUE_TRAVEL / 2.0),
             s * measured::STROKE_B_SAT_RATIO,
             l,
         );
@@ -1216,6 +1385,22 @@ const BREATH_BLOOM_DIP: f32 = 0.36;
 /// the frame interval.
 const CARD_BREATH_STEPS: f32 = 48.0;
 
+/// Steps of a card's generation the artwork is rebuilt at.
+///
+/// The same ladder the wash uses and for the same reason: a generation front is
+/// a *position*, and a coarse ladder reads as the edge stepping rather than as
+/// the card being drawn.
+const GENERATE_STEPS: f32 = 24.0;
+
+/// Steps of the discharge the artwork is rebuilt at.
+///
+/// Much coarser than either. A discharge is an *amplitude*, not a position, and
+/// its whole range is a few levels of alpha on filaments already at the bottom
+/// of the ink ladder — eight steps is finer than the difference anyone can see
+/// and eight times cheaper than tracking a worker's byte counter into the
+/// signature.
+const DISCHARGE_STEPS: f32 = 8.0;
+
 /// Steps of the wash's sweep the artwork is rebuilt at.
 ///
 /// Finer than the breath, because a *front* crossing a card is the one thing
@@ -1263,7 +1448,10 @@ impl CardGeometry {
     fn new(cell_height: f32, has_mark: bool) -> Self {
         let nominal = nominal_height_px(cell_height);
         Self {
-            radius: (measured::RADIUS * nominal).max(2.0),
+            // Capped, not scaled: F6 is an absolute — *no radius above 3 px* —
+            // and a ratio of the card's height is a rounded plate at every
+            // height a card is ever drawn at.
+            radius: (measured::RADIUS * nominal).clamp(1.0, measured::RADIUS_MAX_PX),
             stroke: (measured::STROKE_W * nominal).max(1.2),
             pad: measured::PAD * nominal,
             pad_right: measured::PAD_RIGHT * nominal,
@@ -1478,6 +1666,9 @@ const PROFILE_STEPS_PER_PX: f32 = 8.0;
 /// Resolve `card`'s bloom against a `width x height` field, or `None` when it
 /// lays down no light at all.
 fn plan_bloom(card: &PlacedCard<'_>, width: u32, height: u32) -> Option<BloomSplat> {
+    if !CARD_BLOOM {
+        return None;
+    }
     let inks = card.inks();
     if inks.peak_bloom() <= 0.0 {
         return None;
@@ -1674,14 +1865,6 @@ impl BloomField {
     }
 }
 
-/// Padding inside the state chip, each side, as a multiple of its type size.
-///
-/// Trimmed from 0.75 in the reality pass. The chip is the single widest thing
-/// competing with the title for a narrow card's one horizontal budget — wider
-/// than both pads and the gap put together — so its own air is the first place
-/// to look when a real title will not fit.
-const CHIP_SIDE_PAD: f32 = 0.55;
-
 /// The summary mark's side, as a multiple of the control rail's type size.
 ///
 /// Four fifths of an em. The mark stands in for a character the row would
@@ -1730,10 +1913,6 @@ const CHEVRON_NOSE: f32 = 0.86;
 /// this is that separation expressed in the card's own units.
 const CONTROL_GAP_MUL: f32 = 0.45;
 
-/// The least air between the control rail and the state chip under it, as a
-/// multiple of the card's own pad.
-const RAIL_CHIP_GAP: f32 = 0.45;
-
 /// Gap between the chip and the text column, as a multiple of the card's pad.
 const CHIP_GAP_MUL: f32 = 0.5;
 
@@ -1747,40 +1926,35 @@ const CHIP_GAP_MUL: f32 = 0.5;
 /// this, so a change to any of the three has to face the real titles.
 struct TextColumn {
     left: f32,
-    /// The card's right pad, before the chip has taken its share.
+    /// The card's right pad. Nothing takes a share of it any more: the state
+    /// chip that used to stand in the middle of every card is gone — see
+    /// [`CardContent::state_label`] — so the text runs the card's whole width
+    /// on every line but the first.
     right: f32,
-    chip_px: f32,
-    chip_width: f32,
-    chip_height: f32,
-    chip_fits: bool,
-    chip_gap: f32,
-    /// What the control rail takes off the same margin, or `0.0` for a card
+    /// The type size the caption lines and the control rail are set at.
+    caption_px: f32,
+    /// What the control rail takes off the right margin, or `0.0` for a card
     /// carrying neither control. See [`ControlRail`].
     rail_width: f32,
+    /// The air a reserved right margin keeps off the text.
+    rail_gap: f32,
 }
 
 impl TextColumn {
-    /// Where the text has to stop, once the chip has taken its share.
-    ///
-    /// The chip is centred in the card's height, so it stands over every line
-    /// the card sets — the second title line and the tidbit as much as the
-    /// first. This is their column.
+    /// Where the text has to stop.
     fn text_right(&self) -> f32 {
-        if !self.chip_fits {
-            return self.right;
-        }
-        self.right - self.chip_width - self.chip_gap
+        self.right
     }
 
     /// Where the *first* title line has to stop.
     ///
-    /// The control rail sits in the band above the chip, which is the band the
+    /// The control rail sits in the card's top band, which is the band the
     /// first title line occupies and no other — so it is the one line that has
     /// to clear it, exactly as the character row reserves its badge and its
     /// chevron on its first content row and no other.
     fn first_line_right(&self) -> f32 {
         self.text_right()
-            .min(self.right - reserved_margin(self.rail_width, self.chip_gap))
+            .min(self.right - reserved_margin(self.rail_width, self.rail_gap))
     }
 
     /// The width the second title line and the tidbit are set in.
@@ -1957,20 +2131,11 @@ struct FittedTitle {
     /// Which rung of [`summary::candidates`] set whole, or `None` when none
     /// did and the lines below are a greedy wrap of the lossless rung.
     ///
-    /// Ordered, and compared rather than merely tested: rung 0 is the
-    /// publisher's own words untouched and every rung after it has given
-    /// something up, so "which rung" is how much of the summary this width
-    /// cost. [`text_column`] reads exactly that to decide whether the state
-    /// chip is affordable.
+    /// Ordered rather than merely tested: rung 0 is the publisher's own words
+    /// untouched and every rung after it has given something up, so "which
+    /// rung" is how much of the summary this width cost.
+    #[allow(dead_code)] // read by `title_sets_whole`, which is test-only
     rung: Option<usize>,
-}
-
-impl FittedTitle {
-    /// A total order over "how well did this fit", worst last, so two widths
-    /// can be compared with `<`. Not fitting at all is worse than any rung.
-    fn cost(&self) -> usize {
-        self.rung.unwrap_or(usize::MAX)
-    }
 }
 
 /// Set `title` in `avail`, condensing only as far as it has to.
@@ -2012,75 +2177,47 @@ fn title_sets_whole(font: &CardFont, title: &str, avail: (f32, f32)) -> bool {
     fit_title(font, title, avail).rung.is_some()
 }
 
-/// The chip yields to the title, never the other way round.
+/// Where a card's text runs, and what the right margin still owes the rail.
 ///
-/// The card's one absolute is that a title is never shortened and never shrunk.
-/// The chip is the widest thing competing with it — about a quarter of a narrow
-/// card — so on a card that cannot hold both, the chip is what goes. It is
-/// dropped only when dropping it actually buys something: on a card too narrow
-/// for the title either way there is nothing to buy, and the state is worth
-/// more than one extra word.
+/// # The chip is gone
 ///
-/// The control rail does **not** yield, and that is the one asymmetry here. The
-/// chip is a *restatement* — the card's own colour already carries its state,
-/// so a dropped chip costs a word that was said twice. A chevron is the only
-/// thing on screen saying rows are hidden under this one, and a summary badge
-/// the only thing saying workers finished; drop either and the card is wrong
-/// rather than terse. The rail is also the narrower of the two by a wide margin
-/// — a badge and a chevron together run about half a state chip — so on a card
-/// where the chip stays, it costs the title nothing.
+/// A state chip used to stand in the middle of every card's right margin, and
+/// the state label was repeated as an uppercase capsule under it. Both are
+/// retired: the reference the card is drawn against carries state as **a bare
+/// dim lowercase word on its own line** and nothing else — no chip, no pill, no
+/// capsule, no uppercase — so the word is now one of the card's caption lines
+/// and the margin it used to cost is the title's.
 ///
-/// # Why this compares rungs and no longer compares a boolean
-///
-/// It used to ask "does the title set whole with the chip, and whole without
-/// it", which was the only question available when the alternative to whole was
-/// a silent drop. [`fit_title`] made the answer graded: a width the chip costs
-/// is now a width the summary is condensed *further* at, and both sides of that
-/// trade can be "whole". So the trade is stated where it actually happens —
-/// the chip stands down exactly when standing down lets the card say more of
-/// what the fleet published, and the old rule is the special case of this one
-/// where the two rungs are `Some(0)` and `None`.
+/// The control rail stays, and that is the one thing still reserved here. The
+/// chip was a *restatement* — the card's own colour already carries its state —
+/// so retiring it costs the reader nothing. A chevron is the only thing on
+/// screen saying rows are hidden under this one, and a summary badge the only
+/// thing saying workers finished; drop either and the card is wrong rather than
+/// terse. The rail is also narrow — a badge and a chevron together ran about
+/// half a state chip — so it costs the title very little.
 fn text_column(
     font: &CardFont,
     geometry: &CardGeometry,
     width: f32,
-    height: f32,
-    state_label: &str,
+    _height: f32,
     title: &str,
     rail: ControlRail,
 ) -> TextColumn {
-    let chip_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
-    let chip_metrics = font.metrics(chip_px);
-    let label = state_label.to_uppercase();
-    let chip_width = font.width(&label, chip_px) + chip_px * CHIP_SIDE_PAD * 2.0;
-    let chip_height = (chip_metrics.line_height * 1.25).max(chip_px * 1.55);
+    let _ = title;
+    let caption_px = (TITLE_PX * measured::TIDBIT_SIZE_MUL).max(9.0);
     let left = geometry.text_inset();
     let right = width - geometry.pad_right;
-    let chip_gap = geometry.pad * CHIP_GAP_MUL;
-    // The rail is set at the chip's own type size, so the card carries two
+    let rail_gap = geometry.pad * CHIP_GAP_MUL;
+    // The rail is set at the caption's own type size, so the card carries two
     // sizes of type and not three.
-    let rail_width = rail.layout(font, chip_px).width;
-    let rail_right = right - reserved_margin(rail_width, chip_gap);
-
-    // Both measured as the ragged pair the title is really set in: the rail
-    // takes the first line either way, and only the chip's own share is what
-    // dropping it gives back.
-    let chip_right = right - chip_width - chip_gap;
-    let with_chip = (chip_right.min(rail_right) - left, chip_right - left);
-    let without_chip = (rail_right - left, right - left);
-    let room_for_chip = chip_height < height - 2.0 && with_chip.0 > 0.0;
-    let chip_costs_a_word = room_for_chip
-        && fit_title(font, title, without_chip).cost() < fit_title(font, title, with_chip).cost();
+    let rail_width = rail.layout(font, caption_px).width;
 
     TextColumn {
         left,
         right,
-        chip_px,
-        chip_width,
-        chip_height,
-        chip_fits: room_for_chip && !chip_costs_a_word,
-        chip_gap,
+        caption_px,
         rail_width,
+        rail_gap,
     }
 }
 
@@ -2173,6 +2310,83 @@ impl RingStack {
     }
 }
 
+/// How many filaments a discharging card carries.
+///
+/// Few, and vertical. The reference's working panes carry *filaments* rather
+/// than a wash — a small number of distinct lines is what reads as a discharge
+/// inside glass, and a fill at the same total ink reads as the card simply
+/// being brighter, which is the state channel and already taken.
+const DISCHARGE_FILAMENTS: usize = 7;
+
+/// The most ink one filament carries at a fully-loaded worker.
+///
+/// Deliberately under half the face's own alpha. H10's constraint is not a
+/// suggestion: the discharge must not move the pane's translucency, so the
+/// worst case — every filament at full over the face at full — still has to
+/// leave the scene behind measurably visible.
+const DISCHARGE_PEAK_ALPHA: f32 = 0.040;
+
+/// The filaments a working pane carries behind its face.
+///
+/// Drawn **before** the face and the edge, which is the whole of H10's rule:
+/// behind the glass, so no amount of discharge can make the pane opaque. Their
+/// positions are a deterministic function of the card's own rect, so a card
+/// carries the same filaments frame to frame and two cards do not share a
+/// pattern — there is no clock and no random number generator here, and the
+/// picture is a pure function of the card exactly as everything else drawn in
+/// this module is.
+fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, front: f32) {
+    let amount = card.content.discharge.clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    let rect = card.rect;
+    // Inside the edge, never under it: a filament crossing the boundary would
+    // read as the edge fraying rather than as light inside the pane.
+    let inset = card.geometry.stroke * 2.0;
+    let top = rect.y + inset;
+    let bottom = rect.y + rect.h - inset;
+    if bottom <= top || rect.w <= inset * 2.0 {
+        return;
+    }
+    let seed = (rect.x * 7.0) as i32 as u32 ^ ((rect.y * 13.0) as i32 as u32).rotate_left(11);
+    for index in 0..DISCHARGE_FILAMENTS {
+        // One multiply-shift per filament rather than a hash: this is inside
+        // the per-card render loop and the only property the placement needs is
+        // that it is stable and spread.
+        let noise = seed
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add((index as u32).wrapping_mul(0x85EB_CA6B));
+        let across = ((noise >> 8) & 0xFFFF) as f32 / 65_535.0;
+        // Each filament carries its own share of the amplitude, so a card at
+        // half load is half its filaments lit rather than all of them at half —
+        // which is what makes the traffic legible as a *count* of lines.
+        let lit = (amount * DISCHARGE_FILAMENTS as f32) - index as f32;
+        let alpha = DISCHARGE_PEAK_ALPHA * lit.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
+        let x = rect.x + inset + across * (rect.w - inset * 2.0);
+        // A filament the generation front has not reached yet is not drawn: the
+        // discharge is inside the card, and the card is not there yet.
+        if x >= front {
+            continue;
+        }
+        let px = x.floor().max(0.0) as u32;
+        if px >= sheet.width() {
+            continue;
+        }
+        for y in top.floor().max(0.0) as u32..(bottom.ceil() as u32).min(sheet.height()) {
+            // Brightest in the middle of its run and gone at both ends, so a
+            // filament is a discharge arcing inside the pane rather than a rule
+            // drawn on it.
+            let t = ((y as f32 + 0.5) - top) / (bottom - top);
+            let fade = (t * std::f32::consts::PI).sin().max(0.0);
+            sheet.blend(px, y, ink, alpha * fade);
+        }
+    }
+}
+
 fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // The card's chrome and its type are drawn at the settled light; only the
     // body — stroke, fill and inner glow — sweeps with the wash and swings with
@@ -2184,13 +2398,29 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let (ox, oy, width, height) = (rect.x, rect.y, rect.w, rect.h);
     let half_stroke = geometry.stroke / 2.0;
 
-    // One pass over the card, reading the same distance for the fill, the inner
-    // glow and the stroke. The bloom is already down; the body is opaque, so it
-    // masks itself out of it exactly as the measured build does.
+    // **The generation front.** Beat three of the arrival: every pixel of this
+    // card right of it has not been drawn yet. It is a *clip on a card being
+    // drawn*, which is F22's whole point — the card is generated in place from
+    // its left edge, never translated home from off the panel. A settled card's
+    // front is its own right edge, which is every card on a settled panel and
+    // therefore the branch that costs nothing.
+    let generate = content.generate.clamp(0.0, 1.0);
+    if generate <= 0.0 {
+        return;
+    }
+    let front = ox + width * generate;
+
+    // One pass over the card, reading the same distance for the face, the inner
+    // glow and the edge.
     let x0 = ox.floor().max(0.0) as u32;
     let y0 = oy.floor().max(0.0) as u32;
-    let x1 = ((ox + width).ceil() as u32).min(sheet.width());
+    let x1 = ((ox + width).ceil() as u32)
+        .min(sheet.width())
+        .min(front.ceil().max(0.0) as u32);
     let y1 = ((oy + height).ceil() as u32).min(sheet.height());
+    if x1 <= x0 {
+        return;
+    }
     let inner_sigma = (measured::FILL_INNER_SIGMA * height).max(1.0);
     // Past this far inside the edge the inner glow is below the alpha the
     // canvas can represent, so the exponential is not worth evaluating — which
@@ -2212,30 +2442,98 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // existed and is still the branch most cards take.
     let rings = RingStack::new(content.residue, height);
     let inks = card.inks();
-    let columns: Vec<(Rgb, Rgb)> = (x0..x1)
+    let columns: Vec<Rgb> = (x0..x1)
         .map(|x| {
             let t = card.column_t(x);
             let ink = inks.at(t);
-            (
-                measured::FILL_MID
-                    .mix(measured::FILL_TRAVEL_A.mix(measured::FILL_TRAVEL_B, t), 0.5),
-                ink.stroke_a.mix(ink.stroke_b, t),
-            )
+            ink.stroke_a.mix(ink.stroke_b, t)
         })
         .collect();
 
+    // ---- the back face ---------------------------------------------------
+    //
+    // The card's thickness. A second copy of the same boundary, offset down and
+    // right by [`measured::GLASS_THICKNESS_PX`] and drawn at a fraction of the
+    // front's alpha, so the pane reads as an object with a front rather than as
+    // a rectangle painted on the panel. Drawn first, so the front face and its
+    // edge stand over it.
+    let back = RoundRect {
+        x: rect.x + measured::GLASS_THICKNESS_PX,
+        y: rect.y + measured::GLASS_THICKNESS_PX,
+        w: rect.w,
+        h: rect.h,
+        r: rect.r,
+    };
+    let back_x1 = ((ox + width + measured::GLASS_THICKNESS_PX).ceil() as u32)
+        .min(sheet.width())
+        .min((front + measured::GLASS_THICKNESS_PX).ceil().max(0.0) as u32);
+    let back_y1 = ((oy + height + measured::GLASS_THICKNESS_PX).ceil() as u32).min(sheet.height());
+    for y in y0..back_y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..back_x1 {
+            let px = x as f32 + 0.5;
+            // Only where the back is *not* under the front: a second face
+            // showing through the front would double the face's alpha and the
+            // pane would stop being see-through in the middle.
+            if coverage(rect.distance(px, py)) > 0.0 {
+                continue;
+            }
+            let d = back.distance(px, py);
+            // The back face reaches a few pixels past the front's last column,
+            // so it borrows that column's own edge colour rather than running
+            // off the end of the gradient.
+            let column = (x.saturating_sub(x0) as usize).min(columns.len().saturating_sub(1));
+            let gradient = columns[column];
+            let inside = coverage(d);
+            if inside > 0.0 {
+                sheet.blend(
+                    x,
+                    y,
+                    measured::GLASS_FACE,
+                    measured::GLASS_BACK_ALPHA * inside,
+                );
+            }
+            let edge = coverage(d.abs() - half_stroke);
+            if edge > 0.0 {
+                sheet.blend(x, y, gradient, measured::GLASS_BACK_EDGE_ALPHA * edge);
+            }
+        }
+    }
+
+    // ---- the discharge ---------------------------------------------------
+    //
+    // Behind the face and behind the edge, so no amount of it can make the pane
+    // read as opaque. See [`draw_discharge`].
+    draw_discharge(sheet, card, stroke_a, front);
+
+    // ---- the front face --------------------------------------------------
+    //
+    // One pass over the card, reading the same distance for the face, the inner
+    // glow and the edge.
     for y in y0..y1 {
         let py = y as f32 + 0.5;
         for (column, x) in (x0..x1).enumerate() {
             let px = x as f32 + 0.5;
             let d = rect.distance(px, py);
-            let (fill, gradient) = columns[column];
+            let gradient = columns[column];
 
             let body = coverage(d);
             if body > 0.0 {
-                sheet.blend(x, y, fill, body);
-                // The fill is not a vertical ramp: it is a symmetric inner glow
-                // from both strokes in the local stroke hue.
+                // **The face is glass, not a plate.** A tenth of an alpha of a
+                // cool tint, so whatever the card is standing on — the panel,
+                // and on a terminal drawing the whole-screen scene the sky
+                // itself — is measurably visible through it. This is the one
+                // number that decides whether the tree hangs *in front of* the
+                // system or covers it.
+                sheet.blend(
+                    x,
+                    y,
+                    measured::GLASS_FACE,
+                    measured::GLASS_FACE_ALPHA * body,
+                );
+                // The face is not a vertical ramp: it is a symmetric inner glow
+                // from both edges in the local edge hue, and it is what gives
+                // the pane the internal light a flat wash of alpha does not.
                 if d > -inner_reach {
                     let inner = (-(d * d) / (2.0 * inner_sigma * inner_sigma)).exp()
                         * measured::FILL_EDGE_ALPHA;
@@ -2256,6 +2554,9 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                 }
             }
 
+            // The edge, at full alpha and measurably brighter than the face it
+            // encloses — which with the face at a tenth of an alpha it now is by
+            // construction rather than by tuning.
             let stroke = coverage(d.abs() - half_stroke);
             if stroke > 0.0 {
                 sheet.blend(x, y, gradient, stroke);
@@ -2300,122 +2601,93 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         }
     }
 
-    // ---- the chip --------------------------------------------------------
+    // ---- the text column -------------------------------------------------
     let column = text_column(
         font,
         geometry,
         width,
         height,
-        &content.state_label,
         &content.title,
         content.controls,
     );
-    let text_right = ox + column.text_right();
-    let chip_px = column.chip_px;
-    let chip_metrics = font.metrics(chip_px);
-    let label = content.state_label.to_uppercase();
-    let chip_w = column.chip_width;
-    let chip_h = column.chip_height;
-    let chip_y = oy + (height - chip_h) / 2.0;
+    // Every text bound is cut at the generation front as well as at its own
+    // margin, so a half-generated card is a half-drawn card rather than a whole
+    // one behind a clipped box.
+    let text_right = (ox + column.text_right()).min(front);
+    let caption_px = column.caption_px;
     let text_left = ox + column.left;
-    if column.chip_fits {
-        let ink = chip_ink(content);
-        let fill = measured::FILL_MID.mix(ink, 0.16);
-        let edge = fill.mix(ink, 0.50);
-        let chip_x = ox + column.right - chip_w;
-        let chip_rect = RoundRect {
-            x: chip_x,
-            y: chip_y,
-            w: chip_w,
-            h: chip_h,
-            r: chip_h / 2.0,
-        };
-        let hairline = (geometry.stroke * 0.6).max(0.8) / 2.0;
-        for y in chip_y.floor().max(0.0) as u32..((chip_y + chip_h).ceil() as u32) {
-            let py = y as f32 + 0.5;
-            for x in chip_x.floor().max(0.0) as u32..((chip_x + chip_w).ceil() as u32) {
-                let px = x as f32 + 0.5;
-                let d = chip_rect.distance(px, py);
-                let inside = coverage(d);
-                if inside > 0.0 {
-                    sheet.blend(x, y, fill, inside);
-                }
-                let line = coverage(d.abs() - hairline);
-                if line > 0.0 {
-                    sheet.blend(x, y, edge, line);
-                }
-            }
-        }
-        let baseline = chip_y + (chip_h - chip_metrics.line_height) / 2.0 + chip_metrics.ascent;
-        let label_x = chip_x + (chip_w - font.width(&label, chip_px)) / 2.0;
-        draw_text(
-            sheet,
-            font,
-            &label,
-            chip_px,
-            label_x,
-            baseline,
-            ink,
-            chip_x,
-            chip_x + chip_w,
-        );
-    }
 
     // ---- the control rail ------------------------------------------------
-    // Right-aligned to the same margin the chip is, in the band above it. The
-    // character row puts these two on its *first* content row and its status
-    // pill on its last, so this is that row's own vertical order kept: controls
-    // at the top, state through the middle.
-    if !content.controls.is_empty() {
-        let rail = content.controls.layout(font, chip_px);
-        // Anchored under the card's top pad rather than centred in whatever band
-        // the chip leaves it, so the rail does not move when a chip is dropped
-        // for a long title or when a state's label changes width. It only gives
-        // way on a card too short to hold both, and then only as far as its own
-        // stroke.
-        let ceiling = chip_y - geometry.pad * RAIL_CHIP_GAP - rail.height;
+    // Right-aligned to the card's own right margin, in its top band. The
+    // character row puts these two on its *first* content row, so this is that
+    // row's own vertical order kept: controls at the top, over the title's
+    // first line and nothing else.
+    if !content.controls.is_empty() && ox + column.right - geometry.pad < front {
+        let rail = content.controls.layout(font, caption_px);
+        // Anchored under the card's top pad. It only gives way on a card too
+        // short to hold it there, and then only as far as its own stroke.
+        let ceiling = oy + height - geometry.pad - rail.height;
         let rail_y = (oy + geometry.pad).min(ceiling).max(oy + geometry.stroke);
         draw_control_rail(
             sheet,
             font,
             &rail,
             chip_ink(content),
-            chip_px,
+            caption_px,
             geometry,
             (ox + column.right - rail.width, rail_y),
         );
     }
 
-    // ---- title and tidbit ------------------------------------------------
+    // ---- title and captions ----------------------------------------------
+    //
+    // Three caption lines under the title, in the register the reference sets
+    // them in: what this body *is*, what it has *done*, and — as a bare dim
+    // lowercase word and nothing else — what state it is in. A card carrying
+    // fewer simply leaves the slot empty; the block is reserved on every card so
+    // a row's height does not move when the fleet republishes.
+    //
     // The same numbers the fit tests measure, not a second pair derived here.
     let widths = column.title_widths();
     if widths.0 <= 1.0 || widths.1 <= 1.0 {
         return;
     }
     let title_metrics = font.metrics(TITLE_PX);
-    let tidbit_px = TITLE_PX * measured::TIDBIT_SIZE_MUL;
-    let tidbit_metrics = font.metrics(tidbit_px);
-    // The same fit `text_column` just decided the chip against, so the card
-    // cannot be laid out for one rendering of the summary and painted with
-    // another.
+    let caption_metrics = font.metrics(caption_px);
     let lines = fit_title(font, &content.title, widths).lines;
     let leading = title_metrics.line_height * TITLE_LEADING;
 
     let title_block = leading * (lines.len().max(1) as f32 - 1.0) + title_metrics.line_height;
-    let tidbit_block = content
-        .tidbit
-        .as_ref()
-        .map(|_| tidbit_metrics.line_height * (1.0 + TIDBIT_GAP))
-        .unwrap_or(0.0);
-    let block_top = oy + (height - title_block - tidbit_block) / 2.0;
+    // The state word is always drawn, so the caption run is never empty and the
+    // block below is never the title alone.
+    let captions: [Option<(&str, CaptionTone)>; CAPTION_LINES] = [
+        content
+            .tidbit
+            .as_deref()
+            .map(|text| (text, CaptionTone::Register)),
+        content
+            .register
+            .as_ref()
+            .map(|caption| (caption.text.as_str(), caption.tone)),
+    ];
+    let drawn_captions = captions
+        .iter()
+        .rposition(Option::is_some)
+        .map_or(0, |last| last + 1);
+    let caption_block = if drawn_captions == 0 {
+        0.0
+    } else {
+        caption_metrics.line_height * (drawn_captions as f32 + TIDBIT_GAP)
+    };
+    let block_top = oy + (height - title_block - caption_block) / 2.0;
 
     let ink = measured::INK.restate(1.0, (0.55 + 0.45 * lum).min(1.0));
-    let first_line_right = ox + column.first_line_right();
+    let first_line_right = (ox + column.first_line_right()).min(front);
     for (index, line) in lines.iter().enumerate() {
         let baseline = block_top + leading * index as f32 + title_metrics.ascent;
-        // The first line is clipped short of the rail, every line after it only
-        // short of the chip. A word too wide to break is cut at its own line's
-        // edge, which for line one is the edge the rail stands on.
+        // The first line is clipped short of the rail, every line after it runs
+        // the card's full width. A word too wide to break is cut at its own
+        // line's edge, which for line one is the edge the rail stands on.
         let right = if index == 0 {
             first_line_right
         } else {
@@ -2426,14 +2698,25 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         );
     }
 
-    if let Some(tidbit) = &content.tidbit {
-        let baseline = block_top
-            + title_block
-            + tidbit_metrics.line_height * TIDBIT_GAP
-            + tidbit_metrics.ascent;
-        let tidbit_ink = measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX);
+    let caption_ink = measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX);
+    // The state word is quieter still. It is the one caption a reader is not
+    // meant to *read* so much as recognise, and the card's own colour and breath
+    // already say it — so it sits at the bottom of the ink ladder rather than
+    // competing with the two lines that carry numbers.
+    let state_ink = measured::FILL_MID.mix(caption_ink, STATE_INK_MIX);
+    let caption_top = block_top + title_block + caption_metrics.line_height * TIDBIT_GAP;
+    for (index, caption) in captions.iter().enumerate() {
+        let Some((text, tone)) = caption else {
+            continue;
+        };
+        let baseline =
+            caption_top + caption_metrics.line_height * index as f32 + caption_metrics.ascent;
+        let (ink, text) = match tone {
+            CaptionTone::Register => (caption_ink, (*text).to_string()),
+            CaptionTone::State => (state_ink, text.to_lowercase()),
+        };
         draw_text(
-            sheet, font, tidbit, tidbit_px, text_left, baseline, tidbit_ink, text_left, text_right,
+            sheet, font, &text, caption_px, text_left, baseline, ink, text_left, text_right,
         );
     }
 }
@@ -2783,6 +3066,22 @@ fn quantize(value: f32, steps: f32) -> f32 {
     (value.max(0.0) * steps).round() / steps
 }
 
+/// How hard a row's discharge runs.
+///
+/// **Only a working pane carries one.** H10 is specific about that: the
+/// discharge is the pane saying its work is *live*, and a card that carried it
+/// while idle would be saying the opposite of what it means. The amplitude is
+/// that worker's own share of the fleet's traffic rather than a constant, so a
+/// pane grinding and a pane ticking over are visibly different — and a row the
+/// register cannot resolve draws none rather than a made-up one.
+fn discharge_of(state: AgentState, body: Option<&super::body_register::BodyFacts>) -> f32 {
+    if state != AgentState::Working {
+        return 0.0;
+    }
+    body.map(super::body_register::BodyFacts::traffic)
+        .unwrap_or(0.0)
+}
+
 /// The card for one tree row, whichever kind of row it is.
 ///
 /// A mate is a Space and a worker is a pane, and both are rows in the one tree
@@ -2793,6 +3092,7 @@ fn content_for(
     app: &AppState,
     entry: &super::WorkspaceListEntry,
     agents: &[AgentPanelEntry],
+    bodies: &super::body_register::BodyRegister,
 ) -> Option<CardContent> {
     match entry {
         super::WorkspaceListEntry::Workspace {
@@ -2801,6 +3101,7 @@ fn content_for(
             ..
         } => {
             let workspace = app.workspaces.get(*ws_idx)?;
+            let body = bodies.get(&crate::anim::CardRow::Space(workspace.id.clone()));
             let (state, seen) = workspace.aggregate_state(&app.terminals);
             let tokens = workspace.metadata_tokens.values();
             let label = if *worktree_child {
@@ -2830,7 +3131,24 @@ fn content_for(
             let breath = breath(app, &row, state, severity);
             Some(CardContent {
                 title: display_summary(tokens.get("doing").cloned().unwrap_or(label)),
-                tidbit: tidbit_parts(tokens.get("project"), tokens.get("context"), age),
+                // A Space is a mate, and a mate is a body in the sky: its two
+                // caption lines are that body's own registers, so the tree and
+                // the system in front of it finally read the same quantities.
+                // A Space the register cannot resolve — a roster mid-rebuild —
+                // keeps the caption it always had rather than losing its line.
+                tidbit: body
+                    .and_then(super::body_register::BodyFacts::body_line)
+                    .or_else(|| tidbit_parts(tokens.get("project"), tokens.get("context"), age)),
+                // A mate's third line is its orbit register — what its body has
+                // done. It carries no state word, and neither does the
+                // reference's mate pane: the card's own colour, its breath and
+                // its spider all say what state it is in.
+                register: body
+                    .and_then(super::body_register::BodyFacts::orbit_line)
+                    .map(|text| Caption {
+                        text,
+                        tone: CaptionTone::Register,
+                    }),
                 state_label: crate::ui::status::state_label(state, seen).to_string(),
                 state,
                 stage,
@@ -2847,6 +3165,10 @@ fn content_for(
                 // inside a cell — so a cursor that only lifted the active Space
                 // would leave the keyboard cursor with nothing to stand on.
                 lifted: super::workspace_row_highlighted(app, *ws_idx),
+                // Filled in by `compute_card_placement`, the pass that knows
+                // how far through its own arrival this row is.
+                generate: 1.0,
+                discharge: discharge_of(state, body),
                 mark: None,
                 // Keyed by the Space's own tree handle, which is exactly what
                 // a worker's `owner` token names and what the credit in
@@ -2871,6 +3193,7 @@ fn content_for(
         }
         super::WorkspaceListEntry::Agent { entry_idx, .. } => {
             let detail = agents.get(*entry_idx)?;
+            let body = bodies.get(&crate::anim::CardRow::Agent(detail.pane_id));
             let age = detail
                 .last_agent_state_change_at
                 .map(|at| app.state_age_now.saturating_duration_since(at));
@@ -2887,7 +3210,17 @@ fn content_for(
             let breath = breath(app, &row, detail.state, severity);
             Some(CardContent {
                 title: title_text(detail),
+                // A worker is a moon, and the reference's worker pane sets its
+                // task on line two and **its state as a bare lowercase word** on
+                // line three. It carries no register line: a pane is not a
+                // checkout, so it has no mass, no streak and nothing the sky
+                // reads off it — which is exactly why the reference gives that
+                // line to the state instead.
                 tidbit: tidbit_line(detail, age),
+                register: Some(Caption {
+                    text: super::agent_status_label(detail).to_string(),
+                    tone: CaptionTone::State,
+                }),
                 state_label: super::agent_status_label(detail).to_string(),
                 state: detail.state,
                 stage,
@@ -2898,6 +3231,8 @@ fn content_for(
                 seen: detail.seen,
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
+                generate: 1.0,
+                discharge: discharge_of(detail.state, body),
                 mark: None,
                 // A mate can be a pane rather than a Space, and it is named
                 // the same way: `agent_name` is "this pane's own handle, the
@@ -3102,6 +3437,11 @@ fn compute_card_placement(
 
     let entries = super::workspace_list_entries(app);
     let agents = super::sidebar_agent_entries(app);
+    // Ranked once for the whole pass, never once per card: the ranking is
+    // `O(n log n)` over the roster, and resolving it inside the loop below would
+    // make the panel `O(n^2 log n)` in the rows on screen. See
+    // [`super::body_register`].
+    let bodies = super::body_register::BodyRegister::resolve(app);
     let bounds = super::sidebar_content_rect(sidebar_area);
     // How far down the panel the sheet may reach. Everything but the tray is
     // the panel's own floor: blooming over the footer row the `new` button sits
@@ -3145,10 +3485,15 @@ fn compute_card_placement(
         let Some(entry) = entries.get(card.entry_idx) else {
             continue;
         };
-        let Some(mut content) = content_for(app, entry, &agents) else {
+        let Some(mut content) = content_for(app, entry, &agents, &bodies) else {
             continue;
         };
         content.controls = control_rail(app, entry, &agents, card);
+        // Beat three, resolved where the row's own life is known. A panel with
+        // motion off leaves every card whole, which is what it has always done.
+        if moving {
+            content.generate = super::motion::arrival_beat(row_settle(app, card)).generated();
+        }
         if moving {
             lives.push(super::motion::RowLife {
                 // The distance to the next row's own top, so the span a row
@@ -3291,6 +3636,10 @@ fn build_cards_inner(
 pub(crate) struct CardContentWire {
     title: String,
     tidbit: Option<String>,
+    /// The third caption line. Carried like every other resolved string on this
+    /// wire, because a client that rasterises its own cards has no fleet to rank
+    /// and could not derive it.
+    register: Option<Caption>,
     state_label: String,
     state: AgentState,
     stage: LifecycleStage,
@@ -3304,6 +3653,10 @@ pub(crate) struct CardContentWire {
     mark: Option<CardMark>,
     residue: u8,
     controls: ControlRail,
+    /// Both carried, because a client that rasterises its own cards has no
+    /// animation engine of the server's and no fleet traffic counter.
+    generate: f32,
+    discharge: f32,
     breath: f32,
     /// Carried, unlike `wash`: the spider is four resolved numbers with no
     /// borrowed catalogue entry behind them, so a client that rasterises its own
@@ -3316,6 +3669,7 @@ impl From<&CardContent> for CardContentWire {
         Self {
             title: content.title.clone(),
             tidbit: content.tidbit.clone(),
+            register: content.register.clone(),
             state_label: content.state_label.clone(),
             state: content.state,
             stage: content.stage,
@@ -3329,6 +3683,8 @@ impl From<&CardContent> for CardContentWire {
             mark: content.mark,
             residue: content.residue,
             controls: content.controls,
+            generate: content.generate,
+            discharge: content.discharge,
             breath: content.breath,
             spider: content.spider,
         }
@@ -3340,6 +3696,7 @@ impl From<CardContentWire> for CardContent {
         Self {
             title: wire.title,
             tidbit: wire.tidbit,
+            register: wire.register,
             state_label: wire.state_label,
             state: wire.state,
             stage: wire.stage,
@@ -3352,6 +3709,8 @@ impl From<CardContentWire> for CardContent {
             lifted: wire.lifted,
             mark: wire.mark,
             residue: wire.residue,
+            generate: wire.generate,
+            discharge: wire.discharge,
             controls: wire.controls,
             breath: wire.breath,
             spider: wire.spider,
@@ -3508,6 +3867,22 @@ fn row_span_cells(cards: &[crate::app::state::WorkspaceCardArea], index: usize) 
 /// The row's element is the same one [`crate::app::runtime`] publishes the
 /// membership for, keyed the same way, so motion cannot end up watching a
 /// different clock from the one the row's own arrival runs on.
+/// Which beat of its arrival this row is on, or
+/// [`super::motion::ArrivalBeat::Settled`] on a host where rows do not move.
+///
+/// The character renderer's half of the gesture: beats one and two are the light
+/// travelling the tree's own rails and connector, and those are characters. See
+/// [`super::render_card_border_rails`].
+pub(crate) fn row_arrival(
+    app: &AppState,
+    card: &crate::app::state::WorkspaceCardArea,
+) -> super::motion::ArrivalBeat {
+    if !app.sidebar_rows_move() {
+        return super::motion::ArrivalBeat::Settled;
+    }
+    super::motion::arrival_beat(row_settle(app, card))
+}
+
 fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f32 {
     let id = match card.agent.as_ref() {
         Some(target) => crate::anim::ElementId::agent_row(target.pane_id),
@@ -3687,7 +4062,7 @@ impl Rasteriser<'_> {
             // The sheet is the server's own path and stays on the CPU: see
             // `Rasteriser::gpu_prebloom` for why the GPU is offered to the
             // shapes path only.
-            || self.rasterise(placed, sheet_rect, true, None),
+            || self.rasterise(placed, sheet_rect, None),
         )?;
         // The sheet never moves: it is one image spanning every row, so there is
         // no "one row" in it to slide. It is aimed anyway, at zero offset, so
@@ -3997,7 +4372,7 @@ impl Rasteriser<'_> {
             // Positional: what the terminal is showing under this card's own
             // host image id is whichever layer stood at this index.
             previous.get(index),
-            || self.rasterise(one, planned.rect, false, prebloom),
+            || self.rasterise(one, planned.rect, prebloom),
         )
     }
 
@@ -4270,7 +4645,6 @@ impl Rasteriser<'_> {
         &self,
         placed: &[(Rect, CardContent)],
         rect: Rect,
-        paint_backdrop: bool,
         prebloom: Option<Canvas>,
     ) -> Result<Canvas, ()> {
         let (width_px, height_px) = self.image_size_px(rect).ok_or(())?;
@@ -4280,35 +4654,24 @@ impl Rasteriser<'_> {
             .map(|(frame, content)| self.place(*frame, content, rect))
             .collect();
 
-        // A canvas already holding this image's bloom, computed for the whole
-        // frame in one GPU dispatch by [`Self::gpu_prebloom`]. Only ever offered
-        // to the shapes path, which paints no backdrop — so there is nothing the
-        // bloom had to be laid *over*, and skipping straight to it is the same
-        // pixels.
-        let mut canvas = match prebloom.filter(|canvas| {
-            !paint_backdrop && canvas.width() == width_px && canvas.height() == height_px
-        }) {
+        // **Nothing paints a backdrop any more, on either model.** The sheet
+        // used to fill every cell a row owned with the panel's own colour, to
+        // cover the character card standing under it. A card is glass now: an
+        // opaque plate under a face at a tenth of an alpha is not a see-through
+        // pane, it is a plate with a tint on it, and what the material exists to
+        // show through is exactly what that fill was hiding. The character card
+        // stands down instead — see [`shape_covers_row`] — so there is nothing
+        // left underneath to cover.
+        //
+        // The tree's own rails and connectors are characters, and they now show
+        // through the image where it is transparent rather than being painted
+        // over and repaired.
+        let mut canvas = match prebloom
+            .filter(|canvas| canvas.width() == width_px && canvas.height() == height_px)
+        {
             Some(canvas) => canvas,
             None => {
                 let mut canvas = Canvas::new(width_px, height_px);
-                if paint_backdrop {
-                    // Over exactly the cells each row owns. The sheet is
-                    // otherwise transparent, so this is what covers the
-                    // character card standing underneath — including in the
-                    // gutter, where the card itself does not reach — while
-                    // leaving the tree's connectors and everything outside a row
-                    // showing through.
-                    for (frame, _) in placed {
-                        fill_row_backdrop(
-                            &mut canvas,
-                            frame,
-                            rect,
-                            self.cell_w,
-                            self.cell_h,
-                            self.backdrop,
-                        );
-                    }
-                }
                 let mut bloom = BloomField::new(width_px, height_px);
                 for card in &cards {
                     lay_bloom(&mut bloom, card);
@@ -4317,15 +4680,6 @@ impl Rasteriser<'_> {
                 canvas
             }
         };
-
-        // Under the cards, so a join that runs a hair into the border it meets
-        // is covered by that border rather than drawn over it. `paint_backdrop`
-        // is the same condition as `self.rail` being `Some` and is repeated here
-        // because it is the *reason*: this image only owes the tree a join where
-        // it has painted over the tree's own line.
-        if let Some(rail) = self.rail.filter(|_| paint_backdrop) {
-            self.draw_tree_joins(&mut canvas, placed, &cards, rect, rail);
-        }
 
         for card in &cards {
             draw_card(&mut canvas, card, self.font);
@@ -4346,81 +4700,6 @@ impl Rasteriser<'_> {
         Ok(canvas)
     }
 
-    /// Carry the tree's own lines across the cells this image has claimed.
-    ///
-    /// # The bug this exists to fix
-    ///
-    /// The captain: *"the trunk line from firstmate does not visually touch the
-    /// firstmate root node"*, and the same gap at every second mate's connector.
-    ///
-    /// [`RAIL_INK_COLUMN_FRACTION`] put the card's border in the rail's *column*.
-    /// What is left is the two places the line and the card meet along that
-    /// column, and both are inside cells this image is opaque over:
-    ///
-    /// * **Down.** A card's children hang off its own border column, and the
-    ///   drawn card is shorter than the cells it was given — the leftover is the
-    ///   gutter that separates it from its neighbour. So between the card's last
-    ///   pixel row and the first cell the character rail can occupy there is a
-    ///   gutter of backdrop, and the trunk starts that far below the first mate.
-    /// * **Left.** A child's `├──` ends at the boundary of its card's first
-    ///   cell, and the border ink stands half a cell further in. The character
-    ///   renderer already draws a joint glyph in that cell, but the card's own
-    ///   character border is drawn over it and this backdrop is painted over
-    ///   that, so it has never reached a screen.
-    ///
-    /// Both are painted in the tree's own ink rather than the card's, because
-    /// what they continue is the line and not the card.
-    fn draw_tree_joins(
-        &self,
-        canvas: &mut Canvas,
-        placed: &[(Rect, CardContent)],
-        cards: &[PlacedCard<'_>],
-        rect: Rect,
-        rail: Rgb,
-    ) {
-        for (index, card) in cards.iter().enumerate() {
-            let Some((frame, content)) = placed.get(index) else {
-                continue;
-            };
-            let stroke = rail_stroke_px(self.cell_w);
-            let cell_left = f32::from(frame.x.saturating_sub(rect.x)) * self.cell_w;
-            let cell_bottom =
-                f32::from(frame.y.saturating_sub(rect.y).saturating_add(frame.height))
-                    * self.cell_h;
-            // The card is centred on the row its branch line lands on — see
-            // `connector_row_offset_px` — so its own middle *is* that row's
-            // middle, and the joint needs no second opinion about which row it
-            // is on.
-            let middle = card.rect.y + card.rect.h / 2.0;
-
-            if content.depth > 0 {
-                fill_px_rect(
-                    canvas,
-                    (cell_left, middle - stroke / 2.0),
-                    (card.rect.x + stroke, middle + stroke / 2.0),
-                    rail,
-                );
-            }
-            // Something hangs off this card exactly when the next row is drawn
-            // further in, which is how the walk emits a subtree — the pixel twin
-            // of `super::row_opens_a_branch`.
-            if placed
-                .get(index.saturating_add(1))
-                .is_some_and(|(next, _)| next.x > frame.x)
-            {
-                fill_px_rect(
-                    canvas,
-                    (
-                        card.rect.x - stroke / 2.0,
-                        card.rect.y + card.rect.h - stroke,
-                    ),
-                    (card.rect.x + stroke / 2.0, cell_bottom),
-                    rail,
-                );
-            }
-        }
-    }
-
     /// One card's rounded rect, in the coordinates of an image covering `rect`.
     fn place<'c>(&self, frame: Rect, content: &'c CardContent, rect: Rect) -> PlacedCard<'c> {
         let geometry = CardGeometry::new(self.cell_h, content.mark.is_some());
@@ -4435,7 +4714,25 @@ impl Rasteriser<'_> {
         let cell_top = f32::from(frame.y.saturating_sub(rect.y)) * self.cell_h;
         let cell_height = f32::from(frame.height) * self.cell_h;
         let wanted = card_height_px(self.title_metrics, self.tidbit_metrics).min(cell_height);
-        let connector_offset = connector_row_offset_px(frame.height, self.cell_h);
+        // Clamped into the gutter the card actually has.
+        //
+        // The offset is half a cell on an even-cell row, and a row whose card
+        // fills most of its cells has less than half a cell of gutter to give.
+        // Moving the card the whole way would carry its ink out of the cells the
+        // layout reserved for it — into its neighbour's, and on the first row
+        // straight off the top of the image — and this module's whole
+        // integration is that *"every card here is drawn into exactly the cells
+        // `card_frame_for` gave that row"*. So the card travels as far onto the
+        // connector's row as its own gutter allows and no further.
+        //
+        // The residual is bounded by half a cell by construction, and in
+        // practice much less: at the captain's 10x21 it is 0.75 px.
+        // `a_cards_ink_is_centred_on_the_row_its_branch_line_meets_it_on`
+        // measures both halves — how close the line lands, and that the card
+        // never leaves its cells to get there.
+        let gutter = (cell_height - wanted).max(0.0);
+        let connector_offset =
+            connector_row_offset_px(frame.height, self.cell_h).clamp(-gutter / 2.0, gutter / 2.0);
         // The left border stands where the tree's rails have their ink, not
         // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
         let left =
@@ -4658,57 +4955,6 @@ fn card_layer(
             z: 0,
         },
     )
-}
-
-/// Fill the cells one row owns with the ground its card floats on.
-///
-/// Opaque, and over the whole row rather than only under the card, because this
-/// is the one thing standing between the pixel card and the character card
-/// drawn beneath it: a gutter left transparent would show a sliver of the
-/// character card's closing rule between every pair of pixel cards.
-fn fill_row_backdrop(
-    sheet: &mut Canvas,
-    frame: &Rect,
-    sheet_rect: Rect,
-    cell_w: f32,
-    cell_h: f32,
-    backdrop: Rgb,
-) {
-    let x0 = (f32::from(frame.x.saturating_sub(sheet_rect.x)) * cell_w) as u32;
-    let y0 = (f32::from(frame.y.saturating_sub(sheet_rect.y)) * cell_h) as u32;
-    let x1 = (x0 + (f32::from(frame.width) * cell_w) as u32).min(sheet.width());
-    let y1 = (y0 + (f32::from(frame.height) * cell_h) as u32).min(sheet.height());
-    for y in y0..y1 {
-        for x in x0..x1 {
-            sheet.blend(x, y, backdrop, 1.0);
-        }
-    }
-}
-
-/// Paint an axis-aligned rectangle given in pixels, edges included at whatever
-/// fraction of a pixel they cover.
-///
-/// The tree's joins are fractions of a cell wide and land on sub-pixel bounds,
-/// so a whole-pixel fill would make one of them a pixel thicker than the rail it
-/// continues on some cell sizes and a pixel thinner on others.
-fn fill_px_rect(canvas: &mut Canvas, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ink: Rgb) {
-    if !(x1 > x0 && y1 > y0) {
-        return;
-    }
-    let first = |v: f32| v.floor().max(0.0) as u32;
-    let last = |v: f32, limit: u32| (v.ceil().max(0.0) as u32).min(limit);
-    for y in first(y0)..last(y1, canvas.height()) {
-        let cover_y = ((y as f32 + 1.0).min(y1) - (y as f32).max(y0)).clamp(0.0, 1.0);
-        if cover_y <= 0.0 {
-            continue;
-        }
-        for x in first(x0)..last(x1, canvas.width()) {
-            let cover_x = ((x as f32 + 1.0).min(x1) - (x as f32).max(x0)).clamp(0.0, 1.0);
-            if cover_x > 0.0 {
-                canvas.blend(x, y, ink, cover_x * cover_y);
-            }
-        }
-    }
 }
 
 /// Lift the selected card, without recolouring it.
@@ -5471,7 +5717,15 @@ mod tests {
             .iter()
             .filter(|card| card.card_frame.is_some())
             .filter_map(|card| entries.get(card.entry_idx))
-            .filter(|entry| content_for(&app, entry, &agents).is_some())
+            .filter(|entry| {
+                content_for(
+                    &app,
+                    entry,
+                    &agents,
+                    &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+                )
+                .is_some()
+            })
             .count();
         assert!(framed > 0, "the fixture drew no framed rows");
         assert_eq!(framed, drawable, "a framed row had no card content");
@@ -5582,40 +5836,36 @@ mod tests {
             (sheet.y + sheet.height).saturating_sub(tray.y)
         );
 
-        // The tray is the only thing that moves the floor. With it off the
-        // sheet still blooms past its last card, which is what shipped: the
-        // footer the `new` button sits on is characters, not a placement.
+        // The tray is the only thing that *can* move the floor, and with no bloom
+        // to reach past its last card the sheet no longer asks it to.
+        //
+        // This half of the test used to assert the clamp engaging: a card's
+        // bloom ran 26–28 px past its own stroke, so the sheet wanted rows past
+        // its last row and the tray took them back. There is no bloom now
+        // ([`CARD_BLOOM`] — F1 refuses it and a glass card has nothing to lift
+        // off the panel), so the sheet is exactly its rows and the clamp is a
+        // no-op. Stated rather than deleted, because the clamp itself must stay:
+        // it is what stands between the tray's own placements and any future
+        // surface that does reach past a card, and a silently unreachable clamp
+        // is one nobody notices has stopped working.
         let Some((sheet_off, tray_off, last_card_off)) = sheet_for(false) else {
             return;
         };
         assert_eq!(tray_off, Rect::default(), "the tray drew while disabled");
+        // One row of slack, and only one: the field is a *pixel* rect rounded out
+        // to whole cells, so a card whose last row does not end on a cell
+        // boundary costs the sheet the cell it lands in. Anything more than that
+        // is something painting outside a card again.
         assert!(
-            sheet_off.y + sheet_off.height > last_card_off,
-            "turning the tray off clamped the bloom to the last card anyway"
+            sheet_off.y + sheet_off.height <= last_card_off + 1,
+            "the sheet reached {} rows past its own last card, so something is \
+             painting outside a card again",
+            (sheet_off.y + sheet_off.height).saturating_sub(last_card_off)
         );
-        // And the clamp costs the tray-on sheet only the bloom it cannot have:
-        // it still reaches every row up to the tray's edge.
-        //
-        // Stated against the *unclamped* sheet rather than against a fixture
-        // height that happens to line up. The old form asserted the tree ended
-        // exactly on the tray, which was true of one panel height and one card
-        // height and stopped being true the moment either moved — it broke on
-        // the 2026-08-06 uniform-height change and again on the 20% trim,
-        // both times as a fixture arithmetic failure that said nothing about
-        // the clamp. What matters is that the clamp takes the floor down to the
-        // tray and not one row further, whatever the sheet wanted.
-        let wanted = sheet_off.y + sheet_off.height;
-        assert!(
-            wanted > tray.y,
-            "the tree wants only {wanted} rows and the tray starts at {}, so the clamp \
-             never engaged and this test is asserting nothing",
-            tray.y
-        );
-        assert_eq!(
-            sheet.y + sheet.height,
-            tray.y,
-            "the sheet stopped short of the tray rather than at it"
-        );
+        // Deliberately nothing comparing the two sheets' floors to each other:
+        // the tray does not only clamp, it takes rows off the *tree*, so the two
+        // runs do not draw the same cards and their last rows are different
+        // rows. What each has to hold, it holds above.
     }
 
     fn metrics(line_height: f32) -> FontMetrics {
@@ -5690,9 +5940,13 @@ mod tests {
             assert_eq!(card_height_px(title, tidbit), height);
         }
         // The real face's numbers at 14 px land exactly on the settled base:
-        // two 14 px lines, a tidbit and the measured padding, which is why
-        // that is the number.
+        // two 14 px lines, three caption lines and the captain's own air, which
+        // is why that is the number. See [`BASE_HEIGHT_PX`]'s own table.
         assert_eq!(height, BASE_HEIGHT_PX);
+        assert!(
+            (height - (content_block_px(title, tidbit) + CARD_AIR_PER_SIDE_PX * 2.0)).abs() < 0.05,
+            "the base has drifted off the block it is supposed to be the block plus air of"
+        );
     }
 
     /// [`BASE_HEIGHT_PX`] is a floor and not a ceiling: on a face whose line
@@ -5714,11 +5968,20 @@ mod tests {
         );
     }
 
-    /// The height the card was drawn at before the captain's 2026-08-09 trim.
+    /// The air a card had per side before the captain's 2026-08-09 trim.
     ///
-    /// Kept as a number so the two tests below can state the trim as a ratio
-    /// against what it actually replaced, rather than restating 54.4 and
+    /// Kept as a number so the tests below can state the trim against what it
+    /// actually replaced, rather than restating [`CARD_AIR_PER_SIDE_PX`] and
     /// proving only that a constant equals itself.
+    ///
+    /// Stated as *air* and not as a total height, because the total is the one
+    /// thing that legitimately moves: the block the card sets grew by two
+    /// caption lines when the row started saying what its body is, and a ratio
+    /// of two totals would have called that a trim being undone.
+    const PRE_TRIM_AIR_PER_SIDE_PX: f32 = 11.45;
+
+    /// The height the card was drawn at before the trim, for the fixtures that
+    /// want a "how big it used to be" number rather than a contract.
     const PRE_TRIM_HEIGHT_PX: f32 = 68.0;
 
     /// The card really is a fifth shorter, on every face and at every rank.
@@ -5749,19 +6012,20 @@ mod tests {
                 drawn, BASE_HEIGHT_PX,
                 "the trim did not reach the drawn card in {face}"
             );
-            let ratio = drawn / PRE_TRIM_HEIGHT_PX;
-            assert!(
-                (0.78..=0.82).contains(&ratio),
-                "the card is at {:.1}% of what it was in {face}, not the fifth off the \
-                 captain asked for",
-                ratio * 100.0
-            );
-            // And what the fifth came out of is the air, which is still air:
-            // the block of type is untouched and the minimum is not reached.
+            // The captain's trim, stated where it actually landed: the air.
+            // A card is `block + 2 * air`, so the air is what is left after the
+            // type — and it is his 4.65 a side, not the 11.45 the card had
+            // before him, whatever the block has since grown to.
             let air = (drawn - content_block_px(title, tidbit)) / 2.0;
             assert!(
-                air > MIN_VERTICAL_PAD_PX,
-                "the trim ate into the minimum padding in {face}: {air:.2}px a side"
+                (air - CARD_AIR_PER_SIDE_PX).abs() < 0.05,
+                "the card keeps {air:.2}px of air a side in {face}, not the \
+                 {CARD_AIR_PER_SIDE_PX}px the trim left it"
+            );
+            assert!(
+                air < PRE_TRIM_AIR_PER_SIDE_PX * 0.5,
+                "the trim came back in {face}: {air:.2}px a side against the \
+                 {PRE_TRIM_AIR_PER_SIDE_PX}px it replaced"
             );
         }
     }
@@ -5860,7 +6124,6 @@ mod tests {
             &geometry,
             f32::from(frame_cells) * cell_w,
             PRE_TRIM_HEIGHT_PX,
-            WIDEST_STATE_LABEL,
             title,
             widest_rail(),
         )
@@ -5884,7 +6147,15 @@ mod tests {
                 ((height / f32::from(cell_h)).ceil() as u16)
                     .max(super::super::card::CHROME_ROWS + 1)
             };
-            let before = cells(PRE_TRIM_HEIGHT_PX);
+            // The same card with the air it had before the captain's trim
+            // against the air it has now. Stated this way rather than against a
+            // fixed pre-trim *height* because the block between the air has
+            // since grown a caption line — see [`CAPTION_LINES`] — and a
+            // comparison of two totals would score that growth as the trim
+            // being undone.
+            let pre_trim =
+                BASE_HEIGHT_PX - CARD_AIR_PER_SIDE_PX * 2.0 + PRE_TRIM_AIR_PER_SIDE_PX * 2.0;
+            let before = cells(pre_trim);
             let after = cells(BASE_HEIGHT_PX);
             assert!(
                 after <= before,
@@ -5898,12 +6169,22 @@ mod tests {
             "the trim only bought a row back at {shrank} of the fifteen cell heights \
              swept; it is not reaching the layout"
         );
-        // The captain's own terminal, which is the one this was asked for.
+        // The captain's own terminal, which is the one this was asked for. Four
+        // cells rather than the three it was: the card grew a caption line when
+        // the row started saying what its body is, and 64.5 px does not fit in
+        // three 21 px cells. The trim is still in it — the same card with the
+        // pre-trim air needs five.
         let his = 21.0f32;
         assert_eq!(
             (BASE_HEIGHT_PX / his).ceil() as u16,
-            3,
-            "the trimmed card no longer fits three of his cells"
+            4,
+            "the card no longer fits four of his cells"
+        );
+        let pre_trim = BASE_HEIGHT_PX - CARD_AIR_PER_SIDE_PX * 2.0 + PRE_TRIM_AIR_PER_SIDE_PX * 2.0;
+        assert_eq!(
+            (pre_trim / his).ceil() as u16,
+            4,
+            "the pre-trim air no longer costs a row at his own cell"
         );
         assert_eq!(
             (PRE_TRIM_HEIGHT_PX / his).ceil() as u16,
@@ -5956,10 +6237,6 @@ mod tests {
         "Validating FM_HOME anchor fix and ship PR",
     ];
 
-    /// The widest state label a chip ever carries, which is the one that leaves
-    /// the title the least room.
-    const WIDEST_STATE_LABEL: &str = "BLOCKED";
-
     /// The heaviest control rail a card can carry: a two-glyph count and a
     /// chevron.
     ///
@@ -6007,7 +6284,6 @@ mod tests {
             &geometry,
             f32::from(frame_cells) * cell_w,
             height,
-            WIDEST_STATE_LABEL,
             title,
             rail,
         )
@@ -6177,14 +6453,16 @@ mod tests {
         }
     }
 
-    /// A rail narrower than the chip costs the title nothing at all.
+    /// The rail is taken off the first line and no other.
     ///
-    /// The two share the card's right margin — one centred, one in the band
-    /// above it — so on every card where the state's own label is the wider of
-    /// the two, adding both controls does not move a single word. That is the
-    /// common card, and it is why the rail is affordable.
+    /// The card's right margin used to be shared with a state chip standing
+    /// over every line; with the chip retired the rail is the only thing
+    /// reserved there, and it stands in the card's top band — which is the
+    /// first title line's band and no other's. So a card carrying both controls
+    /// loses width on line one and none anywhere else, exactly as the character
+    /// row reserves its badge and its chevron on its first content row only.
     #[test]
-    fn a_rail_the_chip_already_covers_costs_the_title_nothing() {
+    fn the_control_rail_is_taken_off_the_first_line_only() {
         for (face, font) in font::all_available_faces() {
             for title in REAL_FLEET_TITLES {
                 let bare = real_text_column(
@@ -6203,15 +6481,14 @@ mod tests {
                     title,
                     widest_rail(),
                 );
-                assert!(
-                    railed.rail_width < railed.chip_width,
-                    "the rail is wider than a {WIDEST_STATE_LABEL} chip in {face}, which is \
-                     not the card this test is about"
-                );
                 assert_eq!(
-                    (bare.available(), bare.first_line_available()),
-                    (railed.available(), railed.first_line_available()),
-                    "the rail took width the chip had already reserved, in {face}"
+                    bare.available(),
+                    railed.available(),
+                    "the rail narrowed a line it does not stand over, in {face}"
+                );
+                assert!(
+                    railed.first_line_available() < bare.first_line_available(),
+                    "the rail cost the first line nothing in {face}"
                 );
             }
         }
@@ -6480,118 +6757,6 @@ mod tests {
         }
     }
 
-    /// And a rail *wider* than the chip is what the first line clears — and
-    /// only the first line, exactly as the character row reserves its two
-    /// controls on its first content row and no other.
-    #[test]
-    fn a_rail_wider_than_the_chip_is_taken_off_the_first_line_only() {
-        let Some(font) = font::card_font(None) else {
-            return;
-        };
-        let geometry = CardGeometry::new(21.0, false);
-        let height = card_height_px(
-            font.metrics(TITLE_PX),
-            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
-        );
-        let column = |rail| {
-            text_column(
-                font,
-                &geometry,
-                420.0,
-                height,
-                // The shortest label there is, so the chip is narrow enough for
-                // the rail to be the wider of the two.
-                "IDLE",
-                REAL_FLEET_TITLES[0],
-                rail,
-            )
-        };
-        let bare = column(ControlRail::default());
-        let railed = column(widest_rail());
-        assert!(
-            railed.rail_width > railed.chip_width,
-            "this fixture is meant to have a rail wider than its chip"
-        );
-        assert!(
-            railed.first_line_available() < bare.first_line_available(),
-            "the wider rail was not taken off the first line"
-        );
-        assert_eq!(
-            railed.available(),
-            bare.available(),
-            "the rail narrowed a line it does not stand over"
-        );
-    }
-
-    /// And that guarantee is bought by the chip, not by the title.
-    ///
-    /// On a card too narrow for both, the chip is what goes — the title is the
-    /// one thing on the card that is never shortened and never shrunk. This
-    /// pins the direction of that trade so a later change cannot quietly
-    /// reverse it and start clipping words again.
-    #[test]
-    fn the_chip_yields_to_the_title_and_never_the_other_way_round() {
-        let mut ever_yielded = false;
-        for (face, font) in font::all_available_faces() {
-            for (sidebar_width, cell_w, depth) in card_widths() {
-                for title in REAL_FLEET_TITLES {
-                    let column =
-                        real_text_column(&font, sidebar_width, cell_w, depth, title, widest_rail());
-                    // The ragged pair each way, so this measures the title the
-                    // card really sets: the rail takes the first line whether
-                    // the chip stays or goes, and only the chip's own share
-                    // moves between the two.
-                    let rail_right =
-                        column.right - reserved_margin(column.rail_width, column.chip_gap);
-                    let chip_right = column.right - column.chip_width - column.chip_gap;
-                    let with_chip = (
-                        chip_right.min(rail_right) - column.left,
-                        chip_right - column.left,
-                    );
-                    let without_chip = (rail_right - column.left, column.right - column.left);
-                    let where_ = format!(
-                        "{face} at sidebar {sidebar_width}, cell {cell_w}, depth {depth}, \
-                         {title:?}"
-                    );
-
-                    // How far down the ladder each side of the trade forces the
-                    // summary. Lower is more of what the fleet published.
-                    let cost_with = fit_title(&font, title, with_chip).cost();
-                    let cost_without = fit_title(&font, title, without_chip).cost();
-
-                    if column.chip_fits {
-                        // A chip is only kept when keeping it costs the summary
-                        // nothing — not merely when the summary survives it.
-                        assert!(
-                            cost_with <= cost_without,
-                            "the chip was kept at the title's expense in {where_}: rung \
-                             {cost_with} with it against {cost_without} without"
-                        );
-                    } else {
-                        ever_yielded = true;
-                        // And is only given up when giving it up buys the title
-                        // — otherwise the card simply had no room for one.
-                        let bought_the_title = cost_without < cost_with;
-                        let never_had_room = with_chip.0 <= 0.0
-                            || column.chip_height
-                                >= card_height_px(
-                                    font.metrics(TITLE_PX),
-                                    font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
-                                ) - 2.0;
-                        assert!(
-                            bought_the_title || never_had_room,
-                            "the chip vanished for nothing in {where_}"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(
-            ever_yielded,
-            "no width in the sweep exercised the chip standing down, so the trade is untested"
-        );
-    }
-
     /// The empty icon plate was taking this much of the title's column.
     ///
     /// Kept as a number rather than a description because "far larger than it
@@ -6614,7 +6779,6 @@ mod tests {
             &CardGeometry::new(16.0, true),
             width,
             height,
-            WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
             ControlRail::default(),
         );
@@ -6623,7 +6787,6 @@ mod tests {
             &CardGeometry::new(16.0, false),
             width,
             height,
-            WIDEST_STATE_LABEL,
             REAL_FLEET_TITLES[0],
             ControlRail::default(),
         );
@@ -6643,12 +6806,15 @@ mod tests {
     const FLEET_SIDEBAR_COLUMNS: u16 = 42;
     const FLEET_CELL_WIDTH_PX: f32 = 9.0;
 
-    /// The chip is at the card's right edge, so it is the first thing a card
-    /// too narrow for its content stops drawing. On his 3440-wide window every
-    /// chip vanished, because the card was being laid out in a two-pixel cell.
-    /// On the fleet's real geometry none may, in any face and at any tier.
+    /// Every real title still sets whole on the fleet's own geometry.
+    ///
+    /// This was the chip's own test — the chip was the first thing a card too
+    /// narrow for its content stopped drawing, so it was the canary. The chip is
+    /// retired and the state is a caption line now, which cannot be dropped for
+    /// width; what is left worth pinning is the thing the chip was competing
+    /// with, and it is the more important half.
     #[test]
-    fn the_state_chip_is_drawn_on_the_fleets_own_geometry() {
+    fn every_real_title_sets_whole_on_the_fleets_own_geometry() {
         for (face, font) in font::all_available_faces() {
             for depth in 0..3u8 {
                 for title in REAL_FLEET_TITLES {
@@ -6660,11 +6826,6 @@ mod tests {
                         title,
                         widest_rail(),
                     );
-                    assert!(
-                        column.chip_fits,
-                        "no chip in {face} at the fleet's own geometry, depth {depth}, {title:?}"
-                    );
-                    // And it is not bought with a word.
                     assert!(
                         title_sets_whole(&font, title, column.title_widths()),
                         "{title:?} is not whole in {face} at the fleet's own geometry, \
@@ -7804,7 +7965,12 @@ mod a_card_is_its_own_shape {
             if rail.is_empty() {
                 continue;
             }
-            let Some(content) = content_for(&app, entry, &agents) else {
+            let Some(content) = content_for(
+                &app,
+                entry,
+                &agents,
+                &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+            ) else {
                 continue;
             };
             let geometry = CardGeometry::new(cell_h, content.mark.is_some());
@@ -7816,11 +7982,10 @@ mod a_card_is_its_own_shape {
                     font.metrics(TITLE_PX),
                     font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
                 ),
-                &content.state_label,
                 &content.title,
                 rail,
             );
-            let layout = rail.layout(font, column.chip_px);
+            let layout = rail.layout(font, column.caption_px);
 
             // The card's own left edge stands half a column inside its first
             // cell, so the rail's pixels are measured back to that same origin.
@@ -8017,11 +8182,27 @@ mod a_card_is_its_own_shape {
             let Some(entry) = entries.get(card.entry_idx) else {
                 continue;
             };
-            if content_for(&app, entry, &agents).is_none() {
+            if content_for(
+                &app,
+                entry,
+                &agents,
+                &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+            )
+            .is_none()
+            {
                 continue;
             }
-            // The pixel band this row owns inside the sheet.
-            let y0 = (u32::from(frame.y.saturating_sub(sheet.rect.y)) as f32 * cell_h) as u32;
+            // The pixel band this row's card is *drawn* in, which is its own
+            // cells shifted by [`connector_row_offset_px`]: on an even-cell row
+            // the card moves half a cell up onto the row its branch line lands
+            // on, so its top edge falls on the last pixel row of the band above.
+            // Measured against the unshifted cells, this row's band would catch
+            // the *next* row's top edge and report every card but the last one
+            // as a full band tall.
+            let offset = connector_row_offset_px(frame.height, cell_h);
+            let band_top =
+                (u32::from(frame.y.saturating_sub(sheet.rect.y)) as f32 * cell_h) + offset;
+            let y0 = band_top.max(0.0) as u32;
             let y1 = y0 + (u32::from(frame.height) as f32 * cell_h) as u32;
             let x0 = (u32::from(frame.x.saturating_sub(sheet.rect.x)) as f32 * cell_w) as u32;
             let x1 = (x0 + (u32::from(frame.width) as f32 * cell_w) as u32).min(img_w);
@@ -8091,7 +8272,14 @@ mod a_card_is_its_own_shape {
             let Some(entry) = entries.get(card.entry_idx) else {
                 continue;
             };
-            if content_for(&app, entry, &agents).is_none() {
+            if content_for(
+                &app,
+                entry,
+                &agents,
+                &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+            )
+            .is_none()
+            {
                 continue;
             }
             widths_by_rank.insert(entry.rank(), frame.width);
@@ -8267,11 +8455,29 @@ mod a_card_is_its_own_shape {
                 };
                 let ink_centre = f32::from(layer.rect.y) * cell_h + (top + bottom) as f32 / 2.0;
                 let line_centre = (f32::from(card.connector_y()) + 0.5) * cell_h;
+                // Within half a cell, which is the bound `Rasteriser::place`'s
+                // clamp guarantees: a card travels onto the connector's row as
+                // far as its own gutter allows, and a card that fills most of
+                // its cells has less gutter than the offset wants. Half a cell
+                // is the worst case and it is a quarter of that at the
+                // captain's own 10x21.
                 assert!(
-                    (ink_centre - line_centre).abs() <= 1.5,
+                    (ink_centre - line_centre).abs() <= cell_h / 2.0 + 1.5,
                     "at a {cell_height} px cell a {}-cell card put its middle at \
-                     {ink_centre} px, not on the {line_centre} px middle of the row \
-                     its branch line lands on",
+                     {ink_centre} px, more than half a cell off the {line_centre} px \
+                     middle of the row its branch line lands on",
+                    frame.height,
+                );
+                // And it did not leave its own cells to get there, which is what
+                // the clamp is actually for: a card whose ink reaches above its
+                // frame is a card drawn over the row above it, and on the first
+                // row it is a card with its top edge cut off by the image.
+                let frame_top = f32::from(frame.y.saturating_sub(layer.rect.y)) * cell_h;
+                let frame_bottom = frame_top + f32::from(frame.height) * cell_h;
+                assert!(
+                    top as f32 >= frame_top - 0.5 && (bottom as f32) < frame_bottom + 0.5,
+                    "at a {cell_height} px cell a {}-cell card's ink runs {top}..{bottom} \
+                     px, outside the {frame_top}..{frame_bottom} px its row was given",
                     frame.height,
                 );
                 checked += 1;
@@ -8559,7 +8765,7 @@ mod a_card_is_its_own_shape {
     /// goes red if any of the bloom's shape constants move without the reach
     /// being re-derived with them.
     #[test]
-    fn a_card_glow_falls_to_nothing_before_it_is_cut() {
+    fn a_card_carries_no_glow_past_its_own_edge() {
         let app = shape_fleet_app();
         let Some(layers) = built(&app) else {
             return; // No face on this machine.
@@ -8592,21 +8798,34 @@ mod a_card_is_its_own_shape {
                 if is_clipped(layer, side) {
                     continue;
                 }
+                // **The inverse of what this used to assert, and deliberately.**
+                // It used to require the outermost lit pixel to be alpha 2 or
+                // less: a card was a lit plate with a bloom running 26–28 px
+                // past its stroke, and the question was whether that glow had
+                // faded to nothing by the point the reach truncated it.
+                //
+                // There is no bloom now ([`CARD_BLOOM`]) — F1 refuses
+                // `box-shadow` and `blur()`, the reference has no drop shadow
+                // anywhere, and its panes float by being brighter than the
+                // ground rather than by casting onto it. So the outermost lit
+                // pixel is the card's own edge, and what is worth pinning is
+                // that it is an *edge*: a hard boundary at real alpha, with no
+                // low-alpha tail outside it. A bloom coming back would put a
+                // fringe here and this would catch it.
                 assert!(
-                    outermost <= 2,
-                    "a card's glow was still worth alpha {outermost} where it was \
-                     truncated — that is a step in open panel, not a falloff. The \
-                     reach has to be re-derived whenever the bloom's sigma, its far \
-                     lobe or its weights move",
+                    outermost >= 64,
+                    "a card's outermost lit pixel is alpha {outermost} — that is the \
+                     tail of a glow rather than the card's own edge, so something is \
+                     painting past the boundary again",
                 );
                 checked += 1;
             }
         }
-        assert!(checked > 0, "no glow edge was checked");
+        assert!(checked > 0, "no card edge was checked");
     }
 
     /// Whether this layer runs into the panel's own boundary on `side`, in the
-    /// order [`a_card_glow_falls_to_nothing_before_it_is_cut`] scans them.
+    /// order [`a_card_carries_no_glow_past_its_own_edge`] scans them.
     fn is_clipped(layer: &SidebarCardLayer, side: usize) -> bool {
         let bounds = super::super::sidebar_content_rect(sidebar_rect());
         let r = layer.rect;
@@ -8675,14 +8894,384 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// The sheet's corners *are* opaque, which is what makes the test above
-    /// worth running.
+    /// **The tree is measured, not asserted.**
     ///
-    /// A check both models satisfied would be checking nothing. The sheet paints
-    /// its backdrop over every cell of every row, so the rectangle reaches the
-    /// corner at full alpha and the glow terminates against it.
+    /// Two numbers off the pixels the panel actually publishes.
+    ///
+    /// **H1, the hue band.** The scout measured the reference's whole tree
+    /// column: *99.94% of chromatic pixels above L25 sit inside 175–265°, and
+    /// 99.7% of those in a single 15° bucket at 195°.* One hue family;
+    /// everything else in the panel is brightness. Held here at 99%.
+    ///
+    /// **The density, restated.** The scout's other pair — *84% of its area is
+    /// lit ink against the reference's 20%, a 4.1x density* — is **not
+    /// reproduced literally here, and that is stated rather than smoothed
+    /// over.** The two crops it compared had different denominators (the
+    /// reference's whole 352x1060 column against a card-tight crop of herdr's),
+    /// and over a near-black canvas the reference's own sampled face —
+    /// `rgba(122, 196, 222, .10)` — composites to L32.7, which is *above* the
+    /// L25 floor the count used. So "lit ink above L25" cannot tell a glass face
+    /// from a filled plate at all, and a number tuned until it passed would be a
+    /// number that measured the fixture's panel height.
+    ///
+    /// What the pair was reaching for is measurable exactly, and is the physical
+    /// quantity rather than a proxy for it: **how much of what is behind the
+    /// tree the tree replaces.** A filled, bloomed plate covers its own rect at
+    /// alpha 1 and hazes 26–28 px past it; a glass pane at
+    /// [`measured::GLASS_FACE_ALPHA`] with a thin bright edge and no bloom
+    /// covers a small fraction of it. That is the number gated below, and it is
+    /// the one H7 is about.
     #[test]
-    fn the_sheet_is_an_opaque_rectangle_and_that_is_the_bug() {
+    fn the_trees_ink_is_one_hue_family_and_replaces_little_of_what_is_behind_it() {
+        let app = pixel_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let ground = backdrop_rgb(&app);
+        let mut chromatic = 0u64;
+        let mut in_band = 0u64;
+        let mut alpha_sum = 0f64;
+        let mut pixels = 0u64;
+        for layer in &layers {
+            let (w, h, px) = decode(layer);
+            pixels += u64::from(w) * u64::from(h);
+            for chunk in px.chunks_exact(4) {
+                let alpha = f32::from(chunk[3]) / 255.0;
+                alpha_sum += f64::from(alpha);
+                // Source-over onto the panel, which is what the terminal does
+                // with this image.
+                let over = |channel: usize, ground: u8| {
+                    f32::from(chunk[channel]) * alpha + f32::from(ground) * (1.0 - alpha)
+                };
+                let (r, g, b) = (over(0, ground.0), over(1, ground.1), over(2, ground.2));
+                let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                if luminance < 25.0 {
+                    continue;
+                }
+                let rgb = Rgb(r.round() as u8, g.round() as u8, b.round() as u8);
+                let (hue, saturation, _) = rgb.to_hsl();
+                // "Chromatic" is a real distinction: a near-grey pixel has a hue
+                // that is arithmetic rather than colour, and counting it either
+                // way would be counting noise.
+                if saturation < 0.12 {
+                    continue;
+                }
+                chromatic += 1;
+                if (measured::HUE_BAND.0..=measured::HUE_BAND.1).contains(&hue) {
+                    in_band += 1;
+                }
+            }
+        }
+        assert!(chromatic > 0, "the tree drew no chromatic ink at all");
+        let band = in_band as f64 / chromatic as f64;
+        assert!(
+            band >= 0.99,
+            "only {:.2}% of the tree's chromatic ink is inside H1's 175-265 band, \
+             against the reference's 99.94%",
+            band * 100.0
+        );
+
+        assert!(pixels > 0, "the tree published no pixels");
+        let covered = alpha_sum / pixels as f64;
+        assert!(
+            covered <= 0.30,
+            "the tree replaces {:.1}% of what is behind it — a glass pane at a tenth \
+             of an alpha with a thin edge and no bloom cannot, so the card is a \
+             filled plate again",
+            covered * 100.0
+        );
+    }
+
+    /// **A card is generated left to right, never translated home.**
+    ///
+    /// Beat three of [`super::motion::ArrivalBeat`], on the pixels. A card
+    /// part-way through its arrival is drawn from its own left edge up to the
+    /// generation front and not one pixel past it — which is what makes the
+    /// arrival read as the tree growing a branch rather than as a finished
+    /// object sliding in from off the panel.
+    #[test]
+    fn a_generating_card_is_drawn_up_to_its_front_and_no_further() {
+        let Some(font) = font::card_font(None) else {
+            return; // No face on this machine.
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 64.0,
+            r: geometry.radius,
+        };
+        let base = CardContent {
+            title: "2ndmate-explore".into(),
+            tidbit: Some("gas giant · 99 files · 2 moons".into()),
+            register: Some(Caption {
+                text: "streak 5 · T 13.4s · 23 revs".into(),
+                tone: CaptionTone::Register,
+            }),
+            state_label: "working".into(),
+            state: AgentState::Working,
+            stage: LifecycleStage::Running,
+            severity: Severity::Clear,
+            hues: StageHues([196.0; 5]),
+            ground: measured::CANVAS,
+            split_channels: false,
+            seen: true,
+            depth: 1,
+            lifted: false,
+            mark: None,
+            residue: 0,
+            controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
+            spider: None,
+            breath: 0.0,
+            wash: None,
+        };
+
+        // Nothing at all through beats one and two: the light is still
+        // travelling the tree and the card does not exist yet.
+        let mut empty = Canvas::new(240, 90);
+        let none = CardContent {
+            generate: 0.0,
+            title: base.title.clone(),
+            tidbit: base.tidbit.clone(),
+            register: base.register.clone(),
+            state_label: base.state_label.clone(),
+            ..base
+        };
+        draw_card(
+            &mut empty,
+            &PlacedCard {
+                rect,
+                content: &none,
+                geometry: CardGeometry::new(21.0, false),
+            },
+            font,
+        );
+        assert!(
+            empty.rgba8().chunks_exact(4).all(|px| px[3] == 0),
+            "a card whose light has not landed yet drew something"
+        );
+
+        // Half way: ink up to the front, nothing past it.
+        let mut half_canvas = Canvas::new(240, 90);
+        let half = CardContent {
+            generate: 0.5,
+            title: base.title.clone(),
+            tidbit: base.tidbit.clone(),
+            register: base.register.clone(),
+            state_label: base.state_label.clone(),
+            ..base
+        };
+        draw_card(
+            &mut half_canvas,
+            &PlacedCard {
+                rect,
+                content: &half,
+                geometry: CardGeometry::new(21.0, false),
+            },
+            font,
+        );
+        let front = (rect.x + rect.w * 0.5).ceil() as u32 + measured::GLASS_THICKNESS_PX as u32;
+        let mut before_front = 0;
+        for y in 0..90u32 {
+            for x in 0..240u32 {
+                let alpha = half_canvas.rgba8()[((y * 240 + x) * 4 + 3) as usize];
+                if alpha == 0 {
+                    continue;
+                }
+                assert!(
+                    x <= front,
+                    "a half-generated card painted at column {x}, past its own front \
+                     at {front}"
+                );
+                before_front += 1;
+            }
+        }
+        assert!(
+            before_front > 0,
+            "a half-generated card drew nothing at all on its own side of the front"
+        );
+    }
+
+    /// **A working pane's discharge cannot make it read as opaque.**
+    ///
+    /// H10's own constraint, and it is why the filaments are drawn *behind* the
+    /// face rather than on it: the discharge is a working row saying its work is
+    /// live, and a row that stopped being see-through to say so would have
+    /// traded the material for the signal. Measured at full load, against the
+    /// same card with no traffic at all.
+    #[test]
+    fn a_full_discharge_leaves_the_pane_see_through() {
+        let Some(font) = font::card_font(None) else {
+            return; // No face on this machine.
+        };
+        let mut canvas_quiet = Canvas::new(240, 90);
+        let mut canvas_loud = Canvas::new(240, 90);
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 64.0,
+            r: geometry.radius,
+        };
+        // No type on it: a glyph is opaque by necessity — it has to be legible —
+        // so a card carrying words would report its own title's alpha rather
+        // than its face's. What is under test is the material.
+        let content = CardContent {
+            title: String::new(),
+            tidbit: None,
+            register: None,
+            state_label: String::new(),
+            state: AgentState::Working,
+            stage: LifecycleStage::Running,
+            severity: Severity::Clear,
+            hues: StageHues([196.0; 5]),
+            ground: measured::CANVAS,
+            split_channels: false,
+            seen: true,
+            depth: 1,
+            lifted: false,
+            mark: None,
+            residue: 0,
+            controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
+            spider: None,
+            breath: 0.0,
+            wash: None,
+        };
+        let quiet = PlacedCard {
+            rect,
+            content: &content,
+            geometry: CardGeometry::new(21.0, false),
+        };
+        draw_card(&mut canvas_quiet, &quiet, font);
+
+        let loud_content = CardContent {
+            discharge: 1.0,
+            title: content.title.clone(),
+            tidbit: None,
+            register: None,
+            state_label: content.state_label.clone(),
+            ..content
+        };
+        let loud = PlacedCard {
+            rect,
+            content: &loud_content,
+            geometry: CardGeometry::new(21.0, false),
+        };
+        draw_card(&mut canvas_loud, &loud, font);
+
+        // Somewhere inside the face, clear of the edges and of the type.
+        let mut moved = 0;
+        let mut worst_alpha = 0u8;
+        for y in 20..64u32 {
+            for x in 20..200u32 {
+                let at = ((y * 240 + x) * 4) as usize;
+                let quiet_alpha = canvas_quiet.rgba8()[at + 3];
+                let loud_alpha = canvas_loud.rgba8()[at + 3];
+                if loud_alpha != quiet_alpha {
+                    moved += 1;
+                }
+                worst_alpha = worst_alpha.max(loud_alpha);
+            }
+        }
+        assert!(
+            moved > 0,
+            "a card at full traffic is byte-identical to one at none, so the \
+             discharge is not drawn at all"
+        );
+        // And the loudest pixel of the face is still glass. 200/255 leaves the
+        // scene behind measurably present at every point of it; the card's own
+        // edge is opaque and is deliberately outside the sampled band.
+        assert!(
+            worst_alpha < 200,
+            "a working pane's face reaches alpha {worst_alpha}, which is a plate \
+             rather than glass"
+        );
+    }
+
+    /// **H7: the scene is measurably visible through a card's face.**
+    ///
+    /// The clause's own test, and it is a difference rather than a threshold:
+    /// sample the face with something behind it and with nothing behind it, and
+    /// require the two to differ. A card that occludes what it stands on gives
+    /// the same answer both times whatever its alpha says.
+    #[test]
+    fn what_is_behind_a_card_reaches_through_its_face() {
+        let app = pixel_fleet_app();
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine.
+        };
+        let mut checked = 0;
+        for (layer, frame) in layers.iter().zip(framed(&app)) {
+            let (w, h, px) = decode(layer);
+            // The middle of the card's own face, clear of its edges, its text
+            // and its control rail: a quarter of the way in from the left, on
+            // the row its own centre falls on.
+            let x = u32::from(frame.x.saturating_sub(layer.rect.x)) * app.host_cell_size.width_px
+                + u32::from(frame.width) * app.host_cell_size.width_px / 4;
+            let y = u32::from(frame.y.saturating_sub(layer.rect.y)) * app.host_cell_size.height_px
+                + u32::from(frame.height) * app.host_cell_size.height_px / 2;
+            if x >= w || y >= h {
+                continue;
+            }
+            let at = ((y * w + x) * 4) as usize;
+            let alpha = f32::from(px[at + 3]) / 255.0;
+            let face = (px[at], px[at + 1], px[at + 2]);
+            // Two very different things behind the same pixel of face.
+            let composite = |ground: (u8, u8, u8)| {
+                (
+                    f32::from(face.0) * alpha + f32::from(ground.0) * (1.0 - alpha),
+                    f32::from(face.1) * alpha + f32::from(ground.1) * (1.0 - alpha),
+                    f32::from(face.2) * alpha + f32::from(ground.2) * (1.0 - alpha),
+                )
+            };
+            let over_void = composite((6, 9, 16));
+            let over_star = composite((240, 236, 220));
+            let difference = (over_void.0 - over_star.0)
+                .abs()
+                .max((over_void.1 - over_star.1).abs())
+                .max((over_void.2 - over_star.2).abs());
+            assert!(
+                difference > 40.0,
+                "a card's face changed by only {difference:.1} between empty sky and a \
+                 star behind it (alpha {alpha:.2}), so nothing is showing through it"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no card face was sampled");
+    }
+
+    /// **The sheet's corners are transparent too, and that is the fix.**
+    ///
+    /// This test used to be called `the_sheet_is_an_opaque_rectangle_and_that_is
+    /// _the_bug`, and it required the opposite: the sheet painted its backdrop
+    /// over every cell of every row, so the rectangle reached the corner at full
+    /// alpha. Its own failure message said what to do if that ever became
+    /// deliberate, and it has:
+    ///
+    /// > *the sheet stopped painting a background — if that is deliberate, it
+    /// > has converged with the shapes path and one of the two should go*
+    ///
+    /// A card is glass now (H7): its face is a tenth of an alpha, the panel and
+    /// the whole-terminal scene are measurably visible *through* it, and an
+    /// opaque plate underneath would make that a lie. So both models are
+    /// transparent, and the character card stands down under both — see
+    /// [`shape_covers_row`].
+    ///
+    /// **The two paths have not converged, and neither should go.** What they
+    /// differ in is *packaging*, not material: the sheet is one image and one
+    /// placement covering the whole tree, and shapes are one image and one
+    /// placement per card. That is what buys a per-card arrival, a per-card
+    /// carry-forward on an unchanged signature, and a moved card costing one
+    /// placement rather than the tree's artwork — and it is what costs a host
+    /// one upload per card instead of one. The choice is still real.
+    #[test]
+    fn the_sheet_paints_no_background_behind_its_cards_either() {
         let app = pixel_fleet_app();
         let Some(layers) = built(&app) else {
             return; // No face on this machine.
@@ -8691,9 +9280,9 @@ mod a_card_is_its_own_shape {
             .into_iter()
             .any(|frame| frame_corner_alphas(&layers[0], frame, app.host_cell_size).contains(&255));
         assert!(
-            opaque_corner,
-            "the sheet stopped painting a background — if that is deliberate, it \
-             has converged with the shapes path and one of the two should go"
+            !opaque_corner,
+            "the sheet is painting an opaque rectangle behind its cards again, so \
+             nothing shows through the glass"
         );
     }
 
@@ -9285,7 +9874,13 @@ mod a_card_is_its_own_shape {
             .iter()
             .find(|entry| matches!(entry, super::super::WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == 1))
             .expect("the second Space is a row of the tree");
-        let content = content_for(&selected, entry, &[]).expect("the row has a card");
+        let content = content_for(
+            &selected,
+            entry,
+            &[],
+            &crate::ui::sidebar::body_register::BodyRegister::resolve(&selected),
+        )
+        .expect("the row has a card");
         assert!(
             content.lifted,
             "the cursor's row drew an unlifted card, so nothing at all says \
@@ -9940,19 +10535,37 @@ mod rows_make_room_for_each_other {
         }
     }
 
+    /// **F22 on the real render path: no row's placement ever carries a
+    /// horizontal offset.**
+    ///
+    /// This test used to require the opposite. It was called
+    /// `the_arriving_row_itself_starts_clear_of_the_panel_and_ends_home`, and it
+    /// asserted an arriving row began a whole panel width off to the right and
+    /// travelled home. That is exactly what F22 refuses, and the refusal is not
+    /// stylistic: a card sliding across the panel is a *finished object being
+    /// moved*, and the reference's card is **generated** from the point a light
+    /// travelling the tree's rail landed on its edge. See
+    /// [`super::motion::ArrivalBeat`].
+    ///
+    /// `super::motion`'s own `no_row_ever_carries_a_horizontal_entry_offset`
+    /// sweeps the arithmetic; this reads the placement the pipeline actually
+    /// publishes, mid-arrival and settled.
     #[test]
-    fn the_arriving_row_itself_starts_clear_of_the_panel_and_ends_home() {
+    fn no_row_is_ever_placed_off_the_column_the_layout_gave_it() {
         let Some((mid, settled, index, _)) = mid_and_settled() else {
             return;
         };
-        let panel = i32::from(super::super::sidebar_content_rect(sidebar_rect()).width);
-        assert!(
-            mid[index].viewport().0 >= panel,
-            "an arrival that starts on screen reads as a jump: {:?} against a \
-             {panel}-column panel",
-            mid[index].viewport()
-        );
-        assert_eq!(settled[index].viewport().0, mid[index].rect.x as i32);
+        for (label, strip) in [("mid-arrival", &mid), ("settled", &settled)] {
+            for (slot, layer) in strip.iter().enumerate() {
+                assert_eq!(
+                    layer.viewport().0,
+                    layer.rect.x as i32,
+                    "row {slot} is placed {} columns off its own rect {label}",
+                    layer.viewport().0 - layer.rect.x as i32
+                );
+            }
+        }
+        let _ = index;
     }
 
     /// The cost claim, and the reason motion is affordable at all.
@@ -10215,17 +10828,22 @@ mod rows_make_room_for_each_other {
         let mid = strip(&app);
 
         let arriving = mid_cards[index];
-        assert_ne!(
-            arriving.motion_cells.0, 0,
-            "the arriving row is not travelling, so this is not its first frame"
-        );
+        // A row's own arrival no longer moves it sideways (F22 — see
+        // `no_row_is_ever_placed_off_the_column_the_layout_gave_it`), so "is
+        // this the first frame" is read off the thing that *does* move: the row
+        // below it, still standing where it was before the slot existed.
         let span = mid_cards
             .get(index + 1)
             .map(|card| -card.motion_cells.1)
             .expect("nothing below the arriving row");
         assert!(
             span > 0,
-            "the row below the arrival did not hold its ground"
+            "the row below the arrival did not hold its ground, so this is not \
+             the arrival's first frame"
+        );
+        assert_eq!(
+            arriving.motion_cells.0, 0,
+            "the arriving row travelled sideways"
         );
 
         app.anim.advance(settled_at + Duration::from_secs(2));
@@ -10794,7 +11412,14 @@ mod cards_breathe_and_wash {
             .iter()
             .filter(|card| card.card_frame.is_some())
             .filter_map(|card| entries.get(card.entry_idx))
-            .filter_map(|entry| content_for(app, entry, &agents))
+            .filter_map(|entry| {
+                content_for(
+                    app,
+                    entry,
+                    &agents,
+                    &crate::ui::sidebar::body_register::BodyRegister::resolve(app),
+                )
+            })
             .collect()
     }
 
@@ -11843,6 +12468,7 @@ mod cards_breathe_and_wash {
         CardContent {
             title: "2ndmate-explore".into(),
             tidbit: None,
+            register: None,
             state_label: "idle".into(),
             state: AgentState::Idle,
             stage: LifecycleStage::Done,
@@ -11856,6 +12482,8 @@ mod cards_breathe_and_wash {
             mark: None,
             residue,
             controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
             // This fixture isolates the residue rings, so it carries no spider.
             spider: None,
             breath: 0.0,
@@ -11936,25 +12564,26 @@ mod cards_breathe_and_wash {
 // sidebar_rect, 10x21 px cell) and the real build_cards() path, so what they
 // measure is the actual PNG bytes the server puts on the wire.
 
-/// **The tree's lines reach the cards they join.**
+/// **The sheet paints nothing over the tree's own lines.**
 ///
-/// The captain, on the fleet he actually runs: *"the trunk line from firstmate
+/// The captain, on the fleet he actually ran: *"the trunk line from firstmate
 /// does not visually touch the firstmate root node"*, and the same gap where
-/// every second mate's connector arrives at its card.
+/// every second mate's connector arrived at its card. Both were the sheet's
+/// doing rather than the tree's. The character renderer drew the whole line —
+/// [`RAIL_INK_COLUMN_FRACTION`] already put it in the right column — but the
+/// sheet painted an opaque backdrop over every cell a row owned, so the two
+/// stretches of that line which crossed a card's own cells were covered.
+/// `Rasteriser::draw_tree_joins` put them back in pixels.
 ///
-/// Both are the sheet's doing rather than the tree's. The character renderer
-/// draws the whole line — [`RAIL_INK_COLUMN_FRACTION`] already put it in the
-/// right column — but the sheet is opaque over every cell a row owns, so the
-/// two stretches of that line which cross a card's own cells are painted over:
-/// the branch leaving a parent, which runs down the parent's own border column,
-/// and the last half column of a child's connector, which runs into the border
-/// it points at. [`Rasteriser::draw_tree_joins`] is what puts them back, and
-/// this is read off the published pixels rather than off that function.
+/// **Both the damage and the repair are gone.** A card is glass (H7) and the
+/// sheet paints no backdrop at all, so the character rails are simply on screen
+/// where the renderer drew them. What is worth pinning now is the *absence*: the
+/// sheet must not paint in the rail's own column outside a card, or it is
+/// covering the tree's line again by a different route.
 #[cfg(test)]
-mod the_tree_lines_reach_the_cards_they_join {
+mod the_sheet_leaves_the_trees_lines_alone {
     use super::tests::{sidebar_rect, three_rank_pixel_app};
     use super::*;
-
     /// The captain's own cell, and the one every geometry constant here was
     /// measured against.
     const CELL: (u32, u32) = (10, 21);
@@ -12000,14 +12629,6 @@ mod the_tree_lines_reach_the_cards_they_join {
             let ink = left + (CELL.0 as f32 * RAIL_INK_COLUMN_FRACTION) as u32;
             (left, ink, top, top + u32::from(frame.height) * CELL.1)
         }
-
-        /// The pixel row the branch line lands on: the middle of the card, which
-        /// is the middle of the row its connector is drawn on. Mirrors
-        /// `WorkspaceCardArea::connector_y`.
-        fn connector_row(&self, frame: Rect) -> u32 {
-            let top = u32::from(frame.y.saturating_sub(self.origin.y)) * CELL.1;
-            top + u32::from((frame.height.saturating_sub(1)) / 2) * CELL.1 + CELL.1 / 2
-        }
     }
 
     /// The sheet a fleet of three ranks publishes, and the frames it was drawn
@@ -12047,49 +12668,35 @@ mod the_tree_lines_reach_the_cards_they_join {
         ))
     }
 
-    /// **The trunk touches the first mate.** From the row the first mate's own
-    /// branch line lands on, straight down to the foot of the cells it was
-    /// given, its border column is inked with nothing missing — so the character
-    /// rail that picks the line up on the next row starts where the card ends
-    /// and not a gutter below it.
+    /// **Nothing the sheet draws lands in the tree's rail column** outside the
+    /// cards themselves.
     ///
-    /// Every pixel row, not the endpoints: the bug was a run of six clear pixels
-    /// between two inked ones, which an endpoint check passes.
+    /// Swept over the gutter under every card — the rows between one card's
+    /// bottom edge and the next row's top — which is exactly where the tree's
+    /// trunk runs and exactly where the old backdrop used to reach. A sheet
+    /// painting there is a sheet covering the line again.
     #[test]
-    fn the_trunk_leaves_the_first_mates_card_with_no_gap_under_it() {
+    fn the_sheet_paints_nothing_in_the_rail_column_under_a_card() {
         let Some((sheet, frames)) = sheet() else {
             return;
         };
-        let first_mate = frames[0];
-        let (_, ink, _, bottom) = sheet.rail(first_mate);
-        for y in sheet.connector_row(first_mate)..bottom {
-            assert!(
-                sheet.inked(ink, y) || sheet.inked(ink.saturating_sub(1), y),
-                "the trunk is broken at pixel row {y} of the first mate's own cells"
-            );
-        }
-    }
-
-    /// **A connector arrives at the border it points at.** The `├──` ends at the
-    /// boundary of the card's first cell and the border ink stands half a cell
-    /// further in; the half column between them is inside the sheet, and it was
-    /// backdrop.
-    #[test]
-    fn a_connector_crosses_the_half_column_to_the_border_it_points_at() {
-        let Some((sheet, frames)) = sheet() else {
-            return;
-        };
-        for frame in frames.iter().skip(1) {
-            let (left, ink, ..) = sheet.rail(*frame);
-            let row = sheet.connector_row(*frame);
-            for x in left..ink {
-                assert!(
-                    sheet.inked(x, row),
-                    "the connector stops at pixel column {x} instead of reaching \
-                     the card's border at {ink}"
-                );
+        let mut checked = 0;
+        for frame in &frames {
+            let (left, ink, _, bottom) = sheet.rail(*frame);
+            // The gutter under this card: from its own drawn bottom to the foot
+            // of the cells it was given.
+            for y in bottom.saturating_sub(2)..bottom {
+                for x in left..=ink {
+                    assert!(
+                        !sheet.inked(x, y),
+                        "the sheet painted at ({x}, {y}), in the column the tree's \
+                         own trunk runs down"
+                    );
+                    checked += 1;
+                }
             }
         }
+        assert!(checked > 0, "no gutter was swept");
     }
 
     /// And nothing is drawn where no line goes. A card with nothing under it
@@ -12409,10 +13016,10 @@ mod the_gpu_draws_what_the_cpu_draws {
             .expect("the first card has an image");
 
         let honest = rasteriser
-            .rasterise(one, rect, false, None)
+            .rasterise(one, rect, None)
             .expect("the CPU drew the first card");
         let with_junk = rasteriser
-            .rasterise(one, rect, false, Canvas::from_rgba8(4, 4, vec![9; 64]))
+            .rasterise(one, rect, Canvas::from_rgba8(4, 4, vec![9; 64]))
             .expect("a mismatched prebloom still draws the card");
 
         assert_eq!(

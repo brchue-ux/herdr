@@ -380,6 +380,18 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         // text, which is real work the card either does or does not do.
         tidbit: (!index.is_multiple_of(3))
             .then(|| format!("src/ui/sidebar/image_card.rs:{}", 1000 + index)),
+        // The orbit line, on the same two-in-three cadence and for the same
+        // reason: it is a third line of shaped text the card either sets or
+        // does not.
+        register: (!index.is_multiple_of(3)).then(|| super::Caption {
+            text: format!("streak {} · T 13.4s · {} revs", index % 40, index),
+            tone: super::CaptionTone::Register,
+        }),
+        // Whole, as a settled panel's cards all are.
+        generate: 1.0,
+        // A quarter of the cards are working, and a working card's filaments
+        // are real per-pixel work the rest do not do.
+        discharge: if index.is_multiple_of(4) { 0.6 } else { 0.0 },
         state_label: match state {
             AgentState::Working => "working".to_string(),
             AgentState::Idle => "idle".to_string(),

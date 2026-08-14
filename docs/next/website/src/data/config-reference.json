@@ -980,8 +980,8 @@
         {
           "key": "ui.sidebar.cards.stage_hue",
           "type": "boolean",
-          "default": "true",
-          "description": "Whether a card's colour says two things at once: its hue carries which stage its work is at (queued, running, waiting, done, failed) and its intensity carries how bad the problem on it is, independently of the stage. The hues come from the active theme's own roles, so they follow whatever theme is in force. false draws every card in the one hue family the card style was sampled from, with its intensity following the detected state, which is what shipped before the two were split apart. Severity still escalates the card's breath either way. Needs the graphics path and experimental.sidebar_card_shapes."
+          "default": "false",
+          "description": "Whether a card's colour says two things at once: its hue carries which stage its work is at (queued, running, waiting, done, failed) and its intensity carries how bad the problem on it is, independently of the stage. The hues come from the active theme's own roles, so they follow whatever theme is in force. Off by default: the card style was sampled from a reference whose whole tree column measures one hue family, so the default draws every card in that family with its intensity following the detected state. true turns the five-hue lifecycle channel back on. Severity still escalates the card's breath either way. Needs the graphics path and experimental.sidebar_card_shapes."
         },
         {
           "key": "ui.accent",

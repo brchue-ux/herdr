@@ -454,6 +454,10 @@ impl App {
         // Before the scene, so a corner drawn this pass carries this pass's sample rather than
         // the previous one's.
         changed |= self.observe_machine_register(now);
+        // After the toast has been raised or cleared by this pass's events, so
+        // the stream records what herdr actually said rather than what it said
+        // last time round.
+        changed |= self.observe_status_feed(now);
         // Before the scene, so a rebake this pass draws this pass's wear and this pass's motes.
         changed |= self.observe_orbit_tracks(now);
         changed |= self.observe_ambient_motes();
@@ -1275,6 +1279,23 @@ impl App {
         // demand. Returning `true` here would arm a repaint every two seconds forever, on a
         // terminal where nothing had changed — which is what this returns `false` for.
         self.observe_machine_corner(now)
+    }
+
+    /// Record whatever herdr is currently saying into its own status stream.
+    ///
+    /// One hook rather than twenty. There are twenty places in this codebase
+    /// that raise a toast, and a stream appended to at each of them would be
+    /// nineteen places to forget; this watches the one field they all write. See
+    /// [`crate::app::status_feed`].
+    ///
+    /// Runs on every tick rather than on the register's cadence, because a toast
+    /// can be raised and replaced between two two-second samples and the stream
+    /// exists precisely so that neither of them is lost. The work is one
+    /// equality check against the toast already held, which is what makes that
+    /// affordable on the tick loop.
+    pub(crate) fn observe_status_feed(&mut self, now: Instant) -> bool {
+        let toast = self.state.toast.clone();
+        self.state.status_feed.observe(toast.as_ref(), now)
     }
 
     /// (Re-)draw the machine register's corner readout.
@@ -2421,6 +2442,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }];
     }

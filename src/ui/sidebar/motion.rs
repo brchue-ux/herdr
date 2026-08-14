@@ -27,8 +27,9 @@
 //! - **A row's own slot never moves the row itself.** The accumulator is over
 //!   rows *above*, so an arriving card sits at its final resting row from the
 //!   first frame and the tree opens underneath it. Its own arrival is expressed
-//!   sideways instead, which is what makes an arrival read as a thing coming in
-//!   rather than as the whole panel stretching.
+//!   as [`ArrivalBeat`] — a light down the rail, the elbow, and the card
+//!   generating left to right — and **never as a horizontal translation**. See
+//!   [`row_offsets`], whose `dx` is now always exactly zero.
 //! - **Motion is the placement's, never the artwork's.** Everything here is an
 //!   offset applied to where an already-rasterised card is *placed*. Nothing in
 //!   it can change a card's pixels, which is what keeps a slide at the cost of
@@ -73,15 +74,82 @@
 use crate::anim::{ElementId, Phase};
 use crate::app::state::AppState;
 
-/// How far a row travels sideways as it arrives, as a fraction of the panel's
-/// own width.
+/// Where a row is in the four-beat gesture its arrival is.
 ///
-/// A whole panel width and a little over. It has to clear the panel's right
-/// edge completely at progress zero — a card that starts half on screen reads
-/// as one that was already there and then jumped — and the excess is what makes
-/// the first frames of the arrival empty rather than showing a sliver crawling
-/// in. Past the edge the placement is simply not drawn, which costs nothing.
-const SLIDE_REACH: f32 = 1.15;
+/// # Why a row does not slide in sideways any more
+///
+/// It used to: an arriving row was translated a panel width and a little over
+/// to the right and travelled home. That is exactly what F22 refuses — *no
+/// row's transform ever carries a horizontal offset* — and the refusal is not
+/// stylistic. A card sliding across the panel is a finished object being moved;
+/// the reference's card is **generated**, left to right, from the point a light
+/// travelling the tree's own rail landed on its edge. One reads as a thing
+/// arriving from off-screen, the other as the tree growing a branch, and the
+/// second is what the picture is about.
+///
+/// The four beats, and what draws each:
+///
+/// 1. [`Self::Rail`] — light runs **down** the parent's rail toward this row's
+///    elbow. Drawn by the character renderer, on the rail cells above the
+///    connector row.
+/// 2. [`Self::Elbow`] — it turns the corner and runs **right**, into the row's
+///    own left edge. Drawn by the same renderer, on the `├──` cells.
+/// 3. [`Self::Generate`] — the card is drawn from its left edge rightward, from
+///    where the light landed. A **clip on a card being drawn**, never a
+///    translation of a finished one.
+/// 4. The column below is pushed down. That is [`row_offsets`]'s `dy`, and it
+///    runs across all three of the above rather than after them, because the
+///    space has to be open by the time the card fills it.
+///
+/// A departure is the same reading counted down, because the engine hands a
+/// dismount back as its mount reversed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ArrivalBeat {
+    /// Beat one, `0.0..=1.0` down the rail.
+    Rail(f32),
+    /// Beat two, `0.0..=1.0` along the elbow.
+    Elbow(f32),
+    /// Beat three, `0.0..=1.0` of the card generated from its left edge.
+    Generate(f32),
+    /// The row is at rest and everything about it is drawn.
+    Settled,
+}
+
+/// Where beat one ends, as a fraction of the row's whole arrival.
+const BEAT_RAIL_END: f32 = 0.20;
+/// Where beat two ends. The two travel beats together take under half the
+/// arrival: the light is the *announcement*, and an announcement that outlasts
+/// the thing it announces is a delay rather than a gesture.
+const BEAT_ELBOW_END: f32 = 0.40;
+
+/// Which beat a row at this settle is on.
+pub(crate) fn arrival_beat(settle: f32) -> ArrivalBeat {
+    let settle = settle.clamp(0.0, 1.0);
+    if settle >= 1.0 {
+        return ArrivalBeat::Settled;
+    }
+    if settle < BEAT_RAIL_END {
+        return ArrivalBeat::Rail(settle / BEAT_RAIL_END);
+    }
+    if settle < BEAT_ELBOW_END {
+        return ArrivalBeat::Elbow((settle - BEAT_RAIL_END) / (BEAT_ELBOW_END - BEAT_RAIL_END));
+    }
+    ArrivalBeat::Generate((settle - BEAT_ELBOW_END) / (1.0 - BEAT_ELBOW_END))
+}
+
+impl ArrivalBeat {
+    /// How much of the card is drawn, from its left edge, `0.0..=1.0`.
+    ///
+    /// Zero through both travel beats: the card does not exist yet, the light
+    /// running toward it is the whole of what is on screen.
+    pub(crate) fn generated(self) -> f32 {
+        match self {
+            Self::Rail(_) | Self::Elbow(_) => 0.0,
+            Self::Generate(t) => t.clamp(0.0, 1.0),
+            Self::Settled => 1.0,
+        }
+    }
+}
 
 /// One row's vertical extent and how far through its own arrival it is.
 ///
@@ -113,14 +181,21 @@ pub(crate) struct RowLife {
 ///
 /// `panel_width_px` is how far an arriving row starts off to the right.
 pub(crate) fn row_offsets(rows: &[RowLife], panel_width_px: f32) -> Vec<(f32, f32)> {
-    let reach = panel_width_px * SLIDE_REACH;
+    // Taken and ignored. The signature keeps it because the panel's width is
+    // what a slide was measured against and the caller still has it to hand,
+    // and dropping the parameter would make "we no longer slide" invisible at
+    // every call site instead of stated at exactly one.
+    let _ = panel_width_px;
     let mut opening = 0.0f32;
     let mut offsets = Vec::with_capacity(rows.len());
     for row in rows {
         let absent = (1.0 - row.settle).clamp(0.0, 1.0);
         // Its own slot is deliberately not in `opening` yet: a row does not
         // make room for itself.
-        offsets.push((absent * reach, -opening));
+        //
+        // **`dx` is exactly zero and always will be.** F22, and
+        // `no_row_ever_carries_a_horizontal_entry_offset` is the gate.
+        offsets.push((0.0, -opening));
         opening += absent * row.height_px.max(0.0);
     }
     offsets
@@ -229,19 +304,59 @@ mod tests {
         assert_eq!(row_offsets(&done, PANEL)[2], (0.0, 0.0));
     }
 
+    /// F22's gate, stated as the artifact states it: **the largest horizontal
+    /// entry offset any row's transform ever carries is exactly 0.** Swept over
+    /// the whole of an arrival rather than sampled at the ends, because the old
+    /// slide was zero at both of those and a panel width across in the middle.
     #[test]
-    fn the_arriving_row_itself_starts_clear_of_the_panel() {
-        let rows = [arriving(60.0, 0.0)];
-        let (dx, _) = row_offsets(&rows, PANEL)[0];
-        assert!(
-            dx > PANEL,
-            "an arrival that starts on screen reads as a jump, not an entrance: {dx}"
-        );
+    fn no_row_ever_carries_a_horizontal_entry_offset() {
+        let mut worst = 0.0f32;
+        for step in 0..=100 {
+            let settle = step as f32 / 100.0;
+            let rows = [
+                arriving(60.0, settle),
+                settled(80.0),
+                arriving(40.0, 1.0 - settle),
+            ];
+            for (dx, _) in row_offsets(&rows, PANEL) {
+                worst = worst.max(dx.abs());
+            }
+        }
+        assert_eq!(worst, 0.0, "a row travelled sideways by {worst} px");
+    }
 
-        // Half way in it is half way across, and settled it is home.
-        let half = row_offsets(&[arriving(60.0, 0.5)], PANEL)[0].0;
-        assert!((half - dx / 2.0).abs() < 0.01, "{half} against {dx}");
-        assert_eq!(row_offsets(&[arriving(60.0, 1.0)], PANEL)[0].0, 0.0);
+    /// The gesture, in order: the light travels the tree first, and only then
+    /// is any of the card drawn.
+    #[test]
+    fn the_arrival_runs_rail_then_elbow_then_generation() {
+        assert_eq!(arrival_beat(0.0), ArrivalBeat::Rail(0.0));
+        assert!(matches!(arrival_beat(0.1), ArrivalBeat::Rail(_)));
+        assert!(matches!(arrival_beat(0.3), ArrivalBeat::Elbow(_)));
+        assert!(matches!(arrival_beat(0.7), ArrivalBeat::Generate(_)));
+        assert_eq!(arrival_beat(1.0), ArrivalBeat::Settled);
+
+        // Nothing of the card exists until the light has landed on its edge.
+        assert_eq!(arrival_beat(0.0).generated(), 0.0);
+        assert_eq!(arrival_beat(0.39).generated(), 0.0);
+        assert!(arrival_beat(0.41).generated() > 0.0);
+        assert_eq!(arrival_beat(1.0).generated(), 1.0);
+
+        // And it grows monotonically from there, so a card is never seen to
+        // un-generate part of itself.
+        let mut last = 0.0;
+        for step in 40..=100 {
+            let now = arrival_beat(step as f32 / 100.0).generated();
+            assert!(now >= last, "{now} after {last}");
+            last = now;
+        }
+    }
+
+    /// A progress the engine hands back outside the unit range cannot put a
+    /// card at a negative width or past whole.
+    #[test]
+    fn a_beat_outside_the_unit_range_is_clamped() {
+        assert_eq!(arrival_beat(-4.0), ArrivalBeat::Rail(0.0));
+        assert_eq!(arrival_beat(4.0), ArrivalBeat::Settled);
     }
 
     /// A departure is the same arithmetic read the other way, because the

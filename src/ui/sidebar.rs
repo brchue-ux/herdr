@@ -1,3 +1,4 @@
+mod body_register;
 mod card;
 pub(crate) mod image_card;
 pub(crate) mod motion;
@@ -312,6 +313,7 @@ fn workspace_row_height(
     worktree_child: bool,
     content_width: usize,
     shell: RowShell,
+    body: Option<&body_register::BodyFacts>,
 ) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if worktree_child {
@@ -338,6 +340,7 @@ fn workspace_row_height(
             terminal_title: terminal_title.raw.as_deref(),
             terminal_title_stripped: terminal_title.stripped.as_deref(),
             tokens: &token_values,
+            body,
             suppress_git_details: worktree_child,
             wall_now: app.wall_now,
         },
@@ -355,8 +358,10 @@ fn workspace_row_height_in_body(
     body_height: u16,
     content_width: usize,
     shell: RowShell,
+    body: Option<&body_register::BodyFacts>,
 ) -> u16 {
-    workspace_row_height(app, workspace, worktree_child, content_width, shell).min(body_height)
+    workspace_row_height(app, workspace, worktree_child, content_width, shell, body)
+        .min(body_height)
 }
 
 fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
@@ -2054,6 +2059,7 @@ fn list_entry_height(
     entry: &WorkspaceListEntry,
     body_height: u16,
     fold_width: u16,
+    bodies: &body_register::BodyRegister,
 ) -> u16 {
     // The pixel card is a skin over this row's cells, so it does not get to
     // move the row — but it does get to say how many cells the row is, because
@@ -2087,6 +2093,7 @@ fn list_entry_height(
                     body_height,
                     content_width,
                     shell,
+                    bodies.get(&crate::anim::CardRow::Space(ws.id.clone())),
                 )
             })
             .unwrap_or(0),
@@ -2118,8 +2125,10 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
     let mut visible = 0usize;
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
+    // Ranked once for the whole walk. See [`body_register`].
+    let bodies = body_register::BodyRegister::resolve(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
         if row_height == 0 {
             continue;
         }
@@ -2140,10 +2149,11 @@ fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let fold_width = row_fold_width(app, area);
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
+    let bodies = body_register::BodyRegister::resolve(app);
     let mut used_rows = 0u16;
     let mut start = entries.len();
     for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
         if row_height == 0 {
             continue;
         }
@@ -2243,8 +2253,10 @@ pub(crate) fn compute_workspace_list_areas(
 
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
+    // Ranked once for the whole walk. See [`body_register`].
+    let bodies = body_register::BodyRegister::resolve(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width);
+        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
         if row_height == 0 {
             continue;
         }
@@ -2280,6 +2292,7 @@ pub(crate) fn compute_workspace_list_areas(
             agent,
             card_frame: card_frame_for(rect, entry, fold_width),
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card,
         });
         row_y = row_y
@@ -2837,6 +2850,8 @@ fn flexible_token_width(token: &ResolvedToken) -> usize {
         | ResolvedTokenKind::QuotaSession(text)
         | ResolvedTokenKind::QuotaWeekly(text)
         | ResolvedTokenKind::Streak { text, .. }
+        | ResolvedTokenKind::BodyRegister(text)
+        | ResolvedTokenKind::OrbitRegister(text)
         | ResolvedTokenKind::Custom(text) => display_width(text),
         _ => 0,
     }
@@ -3269,6 +3284,20 @@ fn resolved_token_spans(
                     anim,
                 );
             }
+            // Both register lines are drawn as plain caption text in the
+            // panel's own dim ink, and deliberately so: the reference's tree
+            // column is **one hue and everything else is brightness**, and a
+            // line saying what a body is has no business introducing a second
+            // colour to say it. See `body_register`.
+            ResolvedTokenKind::BodyRegister(text) | ResolvedTokenKind::OrbitRegister(text) => {
+                push_token_span(
+                    &mut spans,
+                    truncate_end(text, budgets[index]),
+                    Style::default().fg(p.overlay1),
+                    token.style,
+                    anim,
+                );
+            }
             // The flame heats up through the palette's own warm run rather
             // than through the `anim::cell` intensity ramp the defect marker
             // uses: a token span is resolved with a palette and no knowledge
@@ -3476,6 +3505,7 @@ fn render_agent_row(
             list_top,
             list_bottom,
             motion,
+            image_card::row_arrival(app, card),
         );
         if !covered {
             shell.render_glow(frame, list_bottom);
@@ -3759,12 +3789,13 @@ fn render_card_border_rails(
     card: &crate::app::state::WorkspaceCardArea,
     connector: Vec<Span<'static>>,
     above: Vec<Span<'static>>,
-    mut below: Vec<Span<'static>>,
+    below: Vec<Span<'static>>,
     branch_rail: Option<Span<'static>>,
     trailing_gap: u16,
     list_top: u16,
     list_bottom: u16,
     motion: (i32, i32),
+    beat: motion::ArrivalBeat,
 ) {
     let Some(shell_frame) = card.card_frame else {
         return;
@@ -3778,9 +3809,22 @@ fn render_card_border_rails(
     // under the sheet, where the card's border and the sheet's backdrop are both
     // drawn over it afterwards; it is the shape shell — which draws no character
     // border at all — that would otherwise leave the line missing.
+    // The rail that leaves this card downward, drawn **only below the card's own
+    // bottom edge**.
+    //
+    // A18/A32: *a thin vertical rail drops from the parent pane's bottom edge —
+    // never inside it, at any alpha*. It used to be pushed onto every row below
+    // the connector, which put it in the card's own border column on the card's
+    // own rows: a rail crossing the pane it is leaving. Below the bottom edge it
+    // is in the gutter, where the tree's line belongs, and the child's own
+    // prefix picks it up from the child's first row — so the line is continuous
+    // with no gap even at `row_gap = 0`, and its overlap with every pane box is
+    // exactly zero. See `no_rail_cell_lands_inside_a_pane_box`.
+    let card_bottom = shell_frame.y.saturating_add(shell_frame.height);
     let below_width = width.saturating_add(u16::from(branch_rail.is_some()));
+    let mut below_the_card = below.clone();
     if let Some(rail) = branch_rail {
-        below.push(rail);
+        below_the_card.push(rail);
     }
     // Where the branch line meets this card. On a character card that is its
     // *name* — its first content row, not the corner of its box, because a rail
@@ -3801,12 +3845,46 @@ fn render_card_border_rails(
         let Some(drawn_y) = moved_row(y, motion.1, list_top, list_bottom) else {
             continue;
         };
+        // Beats one and two of the arrival, drawn as the light travelling: the
+        // rail grows *down* to the elbow, then the elbow's run grows *right*
+        // into the edge the card will be generated from. Nothing of the card is
+        // drawn through either — see [`super::motion::ArrivalBeat`].
         let (spans, cols) = if y == connector_y {
-            (connector.clone(), width)
+            match beat {
+                motion::ArrivalBeat::Rail(_) => continue,
+                motion::ArrivalBeat::Elbow(t) => {
+                    let lit = ((connector.len() as f32) * t.clamp(0.0, 1.0)).round() as usize;
+                    if lit == 0 {
+                        continue;
+                    }
+                    (connector[..lit.min(connector.len())].to_vec(), width)
+                }
+                _ => (connector.clone(), width),
+            }
         } else if y < connector_y {
+            if let motion::ArrivalBeat::Rail(t) = beat {
+                // Measured from the card's top edge down to the elbow, so the
+                // light's speed does not depend on how tall the card is.
+                let run = f32::from(connector_y.saturating_sub(shell_frame.y));
+                let reached = shell_frame.y + (run * t.clamp(0.0, 1.0)).round() as u16;
+                if y > reached {
+                    continue;
+                }
+            }
             (above.clone(), width)
+        } else if matches!(
+            beat,
+            motion::ArrivalBeat::Rail(_) | motion::ArrivalBeat::Elbow(_)
+        ) {
+            // Nothing below the elbow while the light is still travelling to
+            // it: what runs below a card is the rail leaving it toward its own
+            // children, and a card that does not exist yet has none. Drawing it
+            // would be a line hanging under nothing.
+            continue;
+        } else if y >= card_bottom {
+            (below_the_card.clone(), below_width)
         } else {
-            (below.clone(), below_width)
+            (below.clone(), width)
         };
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
@@ -4649,6 +4727,7 @@ mod failure_spider_geometry {
             agent: None,
             card_frame: Some(frame),
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }
     }
@@ -5100,6 +5179,8 @@ fn render_workspace_list(
     let cards = &app.view.workspace_card_areas;
     let entries = workspace_list_entries(app);
     let agents = sidebar_agent_entries(app);
+    // Ranked once for the whole panel, not once per row. See [`body_register`].
+    let bodies = body_register::BodyRegister::resolve(app);
 
     for card in cards {
         if card.agent.is_some() {
@@ -5264,6 +5345,7 @@ fn render_workspace_list(
                 terminal_title: terminal_title.raw.as_deref(),
                 terminal_title_stripped: terminal_title.stripped.as_deref(),
                 tokens: &token_values,
+                body: bodies.get(&crate::anim::CardRow::Space(ws.id.clone())),
                 suppress_git_details: card.worktree_child,
                 wall_now: app.wall_now,
             },
@@ -5369,6 +5451,7 @@ fn render_workspace_list(
                 area.y,
                 list_bottom,
                 motion,
+                image_card::row_arrival(app, card),
             );
             if !covered {
                 shell.render_glow(frame, list_bottom);
@@ -6645,6 +6728,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
@@ -6813,6 +6897,24 @@ mod tests {
         ];
         app.ensure_test_terminals();
         app.active = Some(0);
+
+        // The Space rows are pinned to the two-line branch layout these fold
+        // tests were written against, for exactly the reason the branch below is
+        // pinned: they measure the *fold machinery*, and a fixture whose line
+        // count came from the shipped default would re-measure the default every
+        // time it changed. The shipped default is now three lines — the name and
+        // the two body registers, see `body_register` — and it is checked where
+        // it belongs, in `config::sidebar`'s own defaults test.
+        app.sidebar_spaces.rows = vec![
+            vec![
+                crate::config::SpaceSidebarToken::StateIcon,
+                crate::config::SpaceSidebarToken::Workspace,
+            ],
+            vec![
+                crate::config::SpaceSidebarToken::Branch,
+                crate::config::SpaceSidebarToken::GitStatus,
+            ],
+        ];
 
         // `Workspace::test_new` resolves `cached_git_branch` from the real
         // checkout, so an unpinned fixture inherits whatever branch the tree
@@ -7078,6 +7180,7 @@ mod tests {
             agent: None,
             card_frame: Some(frame),
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         };
         let chevron = workspace_group_chevron_rect(&card);
@@ -7105,6 +7208,7 @@ mod tests {
         let line = crate::app::state::WorkspaceCardArea {
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             ..card
         };
         assert_eq!(workspace_group_chevron_rect(&line).y, rect.y);
@@ -8624,6 +8728,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             worktree_child: false,
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }];
 
@@ -11475,6 +11580,7 @@ mod a_branch_line_meets_its_card_in_the_middle {
             agent: None,
             card_frame: Some(Rect::new(4, 4, 30, frame_height)),
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card,
         }
     }
@@ -11557,12 +11663,18 @@ mod a_branch_line_meets_its_card_in_the_middle {
         app.kitty_graphics_capability_confirmed = true;
         app.sidebar_card_shapes = true;
         app.view.sidebar_card_layers_published = true;
+        // A cell short enough that a card needs an *odd* number of them, which
+        // is the case this fixture exists to exercise: an even count puts the
+        // frame's middle on a cell boundary and there is no middle row for the
+        // branch line to land on. 13 px is that cell for the card's current
+        // height; it was 11 px when the card carried one caption line rather
+        // than `image_card::CAPTION_LINES`.
         app.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 10,
-            height_px: 11,
+            height_px: 13,
         };
 
-        let area = Rect::new(0, 0, 42, 24);
+        let area = Rect::new(0, 0, 42, 30);
         app.sidebar_width = area.width;
         app.view.sidebar_rect = area;
         app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
@@ -11581,7 +11693,7 @@ mod a_branch_line_meets_its_card_in_the_middle {
         let frame = card.card_frame.expect("a card at 42 columns");
         assert!(
             frame.height >= 5 && frame.height % 2 == 1,
-            "an 11 px cell must give an odd row of five cells or more, not {}",
+            "a 13 px cell must give an odd row of five cells or more, not {}",
             frame.height
         );
         assert_ne!(
@@ -11668,31 +11780,137 @@ mod a_branch_leaves_its_parents_own_border_column {
             .unwrap_or_default()
     }
 
-    /// The first mate's own rows carry the trunk in the column the second mates
-    /// point at, from its connector row down to its last row.
+    /// **No rail cell lands inside any pane box.**
     ///
-    /// The first mate is the case that cannot be got at any other way: every
-    /// other rail in the tree runs *beside* the cards it passes, and this one
-    /// runs through the root card's own frame because the root card starts in
-    /// the trunk's column.
+    /// A18/A32, and the artifact's own gate: *a thin vertical rail drops from
+    /// the parent pane's **bottom edge** — never inside it, at any alpha* — turns
+    /// one hard right angle, and runs into the child's left edge. The overlap
+    /// between any rail and any pane box has to be exactly zero.
+    ///
+    /// This test used to assert the opposite. It was called
+    /// `the_trunk_is_drawn_inside_the_first_mates_own_frame`, and it required
+    /// the root card's own rows to carry the trunk through the card's border
+    /// column — because the pixel sheet painted an opaque backdrop over those
+    /// cells and the line had nowhere else to be. The sheet paints no backdrop
+    /// now (a card is glass; see `image_card`), so the tree's line is free to
+    /// run in the gutter where it belongs and the rail starts at the card's
+    /// bottom edge.
+    ///
+    /// The one cell deliberately not counted is the connector's own terminating
+    /// tick — the `─` in the child card's first column, drawn by
+    /// [`connector_joint_span`]. The reference's elbow *"runs right into the
+    /// worker's left edge, terminating in a small tick"*, and under a drawn card
+    /// that column's ink and the card's own stroke are the same line: the stroke
+    /// stands at the column's centre ([`super::image_card::RAIL_INK_COLUMN_FRACTION`]),
+    /// so the tick abuts the edge rather than crossing it.
     #[test]
-    fn the_trunk_is_drawn_inside_the_first_mates_own_frame() {
+    fn no_rail_cell_lands_inside_a_pane_box() {
+        let (frames, rows) = shaped_fleet_screen();
+        assert!(!frames.is_empty(), "the fixture drew no cards");
+        let screen = rows.join("\n");
+        let mut checked = 0;
+        for frame in &frames {
+            for y in frame.y..frame.y + frame.height {
+                // The border column itself is where the terminating tick lands,
+                // so the sweep starts inside it and runs to the card's right
+                // edge — every cell the card's own box owns.
+                for x in frame.x..frame.x + frame.width {
+                    let glyph = glyph(&rows, x, y);
+                    if x == frame.x && glyph == "─" {
+                        // The tick. See this test's own doc.
+                        continue;
+                    }
+                    assert!(
+                        !matches!(glyph.as_str(), "│" | "├" | "└" | "┃"),
+                        "a tree rail ({glyph}) is drawn at ({x}, {y}), inside the pane \
+                         box at {frame:?}:\n{screen}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no pane box was swept");
+    }
+
+    /// **The light travels the tree before the card exists.**
+    ///
+    /// Beats one and two of [`image_card::row_arrival`]'s gesture, on the
+    /// characters that carry them: the rail grows *down* to the elbow, and only
+    /// then does the elbow's own run grow *right* into the edge the card will be
+    /// generated from. A rail fully drawn at beat one, or an elbow drawn before
+    /// the rail has reached it, is the gesture played out of order.
+    #[test]
+    fn the_light_runs_down_the_rail_before_it_turns_the_elbow() {
+        use crate::ui::sidebar::motion::ArrivalBeat;
+
+        // Only the rows the renderer actually draws, per beat, over one card
+        // four cells tall whose connector lands on its second row.
+        let frame = Rect::new(7, 10, 33, 4);
+        let connector_y = frame.y + (frame.height - 1) / 2;
+        let drawn = |beat: ArrivalBeat| {
+            let mut rows = Vec::new();
+            for y in frame.y..frame.y + frame.height {
+                let carried = if y == connector_y {
+                    match beat {
+                        ArrivalBeat::Rail(_) => false,
+                        ArrivalBeat::Elbow(t) => t > 0.0,
+                        _ => true,
+                    }
+                } else if y < connector_y {
+                    match beat {
+                        ArrivalBeat::Rail(t) => {
+                            let run = f32::from(connector_y - frame.y);
+                            y <= frame.y + (run * t.clamp(0.0, 1.0)).round() as u16
+                        }
+                        _ => true,
+                    }
+                } else {
+                    !matches!(beat, ArrivalBeat::Rail(_) | ArrivalBeat::Elbow(_))
+                };
+                if carried {
+                    rows.push(y);
+                }
+            }
+            rows
+        };
+
+        // Beat one at its start lights the card's own top row and nothing else,
+        // and never the elbow.
+        let opening = drawn(ArrivalBeat::Rail(0.0));
+        assert_eq!(opening, vec![frame.y], "the light did not start at the top");
+        assert!(
+            !drawn(ArrivalBeat::Rail(0.9)).contains(&connector_y),
+            "the elbow lit while the light was still coming down the rail"
+        );
+        // And it does reach the elbow's own row by the end of the beat.
+        assert!(drawn(ArrivalBeat::Rail(1.0)).contains(&(connector_y - 1)));
+
+        // Beat two lights the elbow, and beat three has the whole tree line.
+        assert!(drawn(ArrivalBeat::Elbow(0.5)).contains(&connector_y));
+        assert_eq!(
+            drawn(ArrivalBeat::Settled).len(),
+            usize::from(frame.height),
+            "a settled row is missing part of its own rail"
+        );
+    }
+
+    /// And the rail is still there, in the gutter, so the tree is still a tree.
+    ///
+    /// The other half of [`no_rail_cell_lands_inside_a_pane_box`]: moving the
+    /// line out of the card must not delete it. A mate with children carries the
+    /// trunk on every row between its own bottom edge and its first child's
+    /// first row.
+    #[test]
+    fn the_rail_runs_in_the_gutter_under_the_card_it_leaves() {
         let (frames, rows) = shaped_fleet_screen();
         let first_mate = frames.first().copied().expect("the fixture drew no cards");
-        let connector = first_mate.y + (first_mate.height.saturating_sub(1)) / 2;
         let screen = rows.join("\n");
-        assert!(
-            first_mate.y + first_mate.height > connector + 1,
-            "the fixture has no row below the connector to carry the trunk:\n{screen}"
+        let below = first_mate.y + first_mate.height;
+        assert_eq!(
+            glyph(&rows, first_mate.x, below),
+            "│",
+            "the trunk does not leave the first mate's bottom edge at row {below}:\n{screen}"
         );
-        for y in connector + 1..first_mate.y + first_mate.height {
-            assert_eq!(
-                glyph(&rows, first_mate.x, y),
-                "│",
-                "row {y} of the first mate's card does not carry the trunk in \
-                 its own border column:\n{screen}"
-            );
-        }
     }
 
     /// And a row nothing hangs off does not grow one. A rail leaving a card with

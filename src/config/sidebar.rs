@@ -217,6 +217,13 @@ pub enum SpaceSidebarToken {
     /// This Space's quality streak, decayed to now and banded: from the
     /// `streak`/`streak_hl` metadata tokens. See [`crate::quality_streak`].
     Streak,
+    /// What this Space *is*, in the register the background scene draws it in:
+    /// `gas giant · 99 files · 2 moons`. See
+    /// [`crate::ui::sidebar::body_register`].
+    BodyRegister,
+    /// What this Space has *done*, in the same register:
+    /// `streak 5 · T 13.4s · 23 revs`.
+    OrbitRegister,
     TerminalTitle,
     TerminalTitleStripped,
     Custom(String),
@@ -420,6 +427,8 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::QuotaSession => "quota_session".into(),
         SpaceSidebarToken::QuotaWeekly => "quota_weekly".into(),
         SpaceSidebarToken::Streak => "streak".into(),
+        SpaceSidebarToken::BodyRegister => "body_register".into(),
+        SpaceSidebarToken::OrbitRegister => "orbit_register".into(),
         SpaceSidebarToken::TerminalTitle => "terminal_title".into(),
         SpaceSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
@@ -515,6 +524,8 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("quota_session", Self::QuotaSession),
                 ("quota_weekly", Self::QuotaWeekly),
                 ("streak", Self::Streak),
+                ("body_register", Self::BodyRegister),
+                ("orbit_register", Self::OrbitRegister),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],
@@ -820,9 +831,16 @@ impl SpacesSidebarConfig {
 impl Default for SpacesSidebarConfig {
     fn default() -> Self {
         Self {
+            // The reference's own three lines: the Space's name, what its body
+            // is, and what that body has done. Branch and ahead/behind used to
+            // be line two — they are still available as tokens and a fleet that
+            // wants them back can configure them, but the default row is now a
+            // readout of the body in the sky rather than of the checkout, which
+            // is the whole point of the tree hanging in front of the system.
             rows: vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
+                vec![SpaceSidebarToken::BodyRegister],
+                vec![SpaceSidebarToken::OrbitRegister],
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }
@@ -894,14 +912,27 @@ pub struct SidebarCardsConfig {
     /// Whether a card's hue carries which lifecycle stage its work is at and its
     /// intensity carries how bad the problem on it is.
     ///
-    /// On. Off draws every card in the one measured hue family the reference was
-    /// sampled from, with its intensity following the detected state — which is
-    /// exactly what shipped before the two channels were split apart, and is the
-    /// honest setting for anyone who does not want five hues in the panel.
+    /// **Off.** Off draws every card in the one measured hue family the
+    /// reference was sampled from, with its intensity following the detected
+    /// state — which is exactly what shipped before the two channels were split
+    /// apart, and it is what the captain's reference artifact actually shows.
+    ///
+    /// The measurement that settled it: over the reference's whole tree column
+    /// **99.94% of chromatic pixels above L25 sit inside the 175–265° band, and
+    /// 99.7% of those in a single 15° bucket at 195°**. One hue; everything else
+    /// is brightness. With this on, an idle fleet draws bright green and a
+    /// waiting one draws purple, which is five hue families in a panel measured
+    /// to have one. Settled by the captain on 2026-08-13 (`orrery colors, sky
+    /// labels, sidebar material, and the tab-bar question`, decision D-c) under
+    /// the standing rule *match the reference artifact literally*.
+    ///
+    /// Turning it back on is still supported and still says exactly what it
+    /// always said — the five-hue lifecycle channel — for anyone who wants the
+    /// stage legible as colour rather than as intensity.
     ///
     /// Only the *colour* is switched. The escalated breath a serious problem
     /// puts a card on is on the behaviour side and answers to `pulse`, so
-    /// turning this off leaves severity legible in rhythm rather than removing
+    /// leaving this off leaves severity legible in rhythm rather than removing
     /// it — see [`crate::anim::behaviour::names::CARD_ALERT`].
     pub stage_hue: bool,
 }
@@ -912,7 +943,7 @@ impl Default for SidebarCardsConfig {
             pulse: true,
             wash: true,
             wash_ms: DEFAULT_CARD_WASH_MS,
-            stage_hue: true,
+            stage_hue: false,
         }
     }
 }
@@ -1569,7 +1600,7 @@ enter = "none"
     }
 
     #[test]
-    fn defaults_match_the_compact_agent_and_existing_space_layouts() {
+    fn defaults_match_the_compact_agent_and_body_register_space_layouts() {
         let config = SidebarConfig::default();
         assert_eq!(
             config.agents.rows,
@@ -1588,10 +1619,23 @@ enter = "none"
             config.spaces.rows,
             vec![
                 vec![SpaceSidebarToken::StateIcon, SpaceSidebarToken::Workspace],
-                vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
-            ]
+                vec![SpaceSidebarToken::BodyRegister],
+                vec![SpaceSidebarToken::OrbitRegister],
+            ],
+            "a Space's default rows are the reference's own three: its name, \
+             what its body is, and what that body has done"
         );
         assert_eq!(config.spaces.row_gap, 0);
+
+        // Both register tokens round-trip under the names the config file uses.
+        assert_eq!(
+            space_token_name(&SpaceSidebarToken::BodyRegister),
+            "body_register"
+        );
+        assert_eq!(
+            space_token_name(&SpaceSidebarToken::OrbitRegister),
+            "orbit_register"
+        );
     }
 
     #[test]

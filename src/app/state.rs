@@ -963,6 +963,22 @@ pub struct WorkspaceCardArea {
     /// one place the offset is resolved — see
     /// [`crate::ui::sidebar::motion::cell_offsets`].
     pub motion_cells: (i32, i32),
+    /// True while this row's card is mid-transition — arriving or leaving — and
+    /// therefore not yet (or no longer) standing on the cells the layout gave
+    /// it.
+    ///
+    /// # Why this exists at all
+    ///
+    /// It used to be spelled `motion_cells.0 != 0`: a row arrived by travelling
+    /// in from off the panel's right edge, so "is it mid-transition" and "is it
+    /// off to the side" were the same question. F22 retired the slide — a card
+    /// is **generated** in place now, see
+    /// [`crate::ui::sidebar::motion::ArrivalBeat`] — and with it that proxy. The
+    /// question it was really answering is this one, and it has to keep being
+    /// asked: without it a departing row goes on owning its slot in the layout
+    /// while the row contracting over it is drawn there, and every click aimed
+    /// at the visible row is swallowed by the invisible one.
+    pub arriving: bool,
     /// True when this row is as tall as it is because a *drawn* card set its
     /// height ([`crate::ui::sidebar::image_card::row_height_cells`]) rather
     /// than because its text lines did.
@@ -982,18 +998,18 @@ impl WorkspaceCardArea {
     /// on the panel at all right now, which is true in two cases and both of
     /// them matter:
     ///
-    /// - It is travelling *sideways* (`motion_cells.0 != 0`), so it is mid-slide
-    ///   across the panel's right margin and has not landed. The character
-    ///   renderer already declines to draw its rails for exactly this reason
-    ///   (see `render_card_border_rails`), and a hit test must decline for the
-    ///   same one — otherwise a departing row keeps swallowing clicks aimed at
+    /// - It is mid-transition ([`Self::arriving`]): its card is being generated
+    ///   in, or degenerated out, and has not landed. The character renderer
+    ///   already declines to draw its rails for exactly this reason (see
+    ///   `render_card_border_rails`), and a hit test must decline for the same
+    ///   one — otherwise a departing row keeps swallowing clicks aimed at
     ///   whatever row has moved up over its vacated slot.
     /// - The offset would put it off the top of the screen.
     ///
     /// This is the one place [`Self::rect`] and [`Self::motion_cells`] are
     /// combined, so a renderer and a hit test cannot end up a row apart.
     pub fn drawn(&self, rect: Rect) -> Option<Rect> {
-        if self.motion_cells.0 != 0 {
+        if self.motion_cells.0 != 0 || self.arriving {
             return None;
         }
         let y = i32::from(rect.y).checked_add(self.motion_cells.1)?;
@@ -2362,6 +2378,10 @@ pub struct AppState {
     /// here and goes out over the session API; the background scene's corner is one client of it.
     /// See `crate::machine_register`.
     pub(crate) machine_register: crate::machine_register::MachineRegister,
+    /// The last few things herdr has said about this session — A48's six-line
+    /// stream. A session fact, not a picture: see
+    /// [`crate::app::status_feed::StatusFeed`].
+    pub(crate) status_feed: crate::app::status_feed::StatusFeed,
     /// The register's drawn corner, as its own small graphics surface.
     ///
     /// Separate from `background_effects_layer` because the two move on different clocks: that one
@@ -3706,6 +3726,7 @@ impl AppState {
             background_scene_key: 0,
             background_scene_layout: None,
             machine_register: crate::machine_register::MachineRegister::default(),
+            status_feed: crate::app::status_feed::StatusFeed::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,
@@ -4615,6 +4636,7 @@ mod tests {
             }),
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }];
 
@@ -4650,6 +4672,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }];
         assert!(
@@ -4672,6 +4695,7 @@ mod tests {
             agent: None,
             card_frame: None,
             motion_cells: (0, 0),
+            arriving: false,
             drawn_card: true,
         }];
         assert!(!state.relation_signal_damage());

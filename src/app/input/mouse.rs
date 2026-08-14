@@ -1198,6 +1198,30 @@ impl AppState {
         Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
     }
 
+    /// Where the scene stops being void and starts being a body.
+    ///
+    /// Rec.709 luminance, on the scale a channel is measured in. The scene's own
+    /// void floor and its starfield sit well under this; a body's disc and the
+    /// sun's corona sit well over it. Deliberately a *luminance* threshold
+    /// rather than a list of body rects: what A29 is protecting is the light,
+    /// and the light is what can be measured without asking the renderer where
+    /// it put anything.
+    #[cfg(test)]
+    const BRIGHT_SCENE_FLOOR: f32 = 48.0;
+
+    /// The widest the status stream is ever drawn, in columns.
+    ///
+    /// A cap on top of the third, so the narrow half of A24's contrast stays
+    /// narrow on a very wide window. Enough for a short herdr sentence and no
+    /// more — the stream says *what happened*, and anything that needs a
+    /// paragraph is a toast's job or a pane's.
+    const STATUS_FEED_MAX_COLS: u16 = 44;
+
+    /// The narrowest it is worth drawing at. Below this every line is elided to
+    /// a stub, which says less than drawing nothing and costs the scene a
+    /// rectangle.
+    const STATUS_FEED_MIN_COLS: u16 = 20;
+
     /// Where the machine register's readout is drawn, in cells.
     ///
     /// The top-right of the terminal area, inset by one cell. Top-right rather than anywhere else
@@ -1232,6 +1256,52 @@ impl AppState {
         )
     }
 
+    /// Where herdr's own status stream is drawn, in cells.
+    ///
+    /// **The bottom third of the main area, and narrow** — A24, and its reason
+    /// is functional rather than compositional. The card states it plainly:
+    /// *assistant output is long, and a narrow column makes it scroll past too
+    /// fast to read*. So the two halves of the contrast are not a taste: the
+    /// **prose** — which in herdr is the pane text, real PTY output — spans the
+    /// whole frame outside the sidebar, and the **stream**, which is six short
+    /// lines herdr wrote itself and nobody scrolls, stays narrow underneath it.
+    ///
+    /// Bottom-left rather than bottom-right because the machine register already
+    /// owns a corner and two readouts sharing an edge would read as one panel.
+    ///
+    /// Empty when the stream has nothing to say, when the scene is not drawing,
+    /// or when the main area is too small to give it a third — the same rule
+    /// [`Self::machine_corner_rect`] follows, and for the same reason: a readout
+    /// that will not fit is not drawn at all.
+    pub(crate) fn status_feed_rect(&self) -> Rect {
+        const INSET: u16 = 1;
+
+        let screen = self.screen_rect();
+        let lines = self.status_feed.len() as u16;
+        if lines == 0 {
+            return Rect::new(screen.x, screen.y, 0, 0);
+        }
+        let main_width = screen.width.saturating_sub(self.view.sidebar_rect.width);
+        // A third of the main area, and never more: the stream is the narrow
+        // half of A24's contrast, and a stream that grew with the window would
+        // stop being the narrow half on a wide one.
+        let width = (main_width / 3).min(Self::STATUS_FEED_MAX_COLS);
+        let height = lines.min(crate::app::status_feed::TERM_MAX as u16);
+        if width < Self::STATUS_FEED_MIN_COLS || screen.height < (height + INSET * 2) * 3 {
+            return Rect::new(screen.x, screen.y, 0, 0);
+        }
+        // Sat on the floor of the main area rather than centred in its bottom
+        // third: the stream is a margin note, and a margin note floating in the
+        // middle of a third is a panel.
+        let y = screen.y + screen.height - height - INSET;
+        Rect::new(
+            screen.x + screen.width.saturating_sub(main_width) + INSET,
+            y,
+            width,
+            height,
+        )
+    }
+
     /// How much of the main area the scene still has to itself, in cells.
     ///
     /// H8, in herdr's own terms: *"of the frame outside the worker-tree panel, at least 60% of the
@@ -1255,13 +1325,63 @@ impl AppState {
         let main_width = screen.width.saturating_sub(sidebar.width);
         let main = u32::from(main_width) * u32::from(screen.height);
 
-        let corner = self.machine_corner_rect();
-        // Clipped to the main area rather than counted whole: a corner that hung off the screen
+        // Clipped to the main area rather than counted whole: a surface that hung off the screen
         // would otherwise be able to report more coverage than there is area to cover.
-        let corner_covered =
-            u32::from(corner.width.min(main_width)) * u32::from(corner.height.min(screen.height));
+        let clipped = |rect: Rect| {
+            u32::from(rect.width.min(main_width)) * u32::from(rect.height.min(screen.height))
+        };
+        let covered = clipped(self.machine_corner_rect()) + clipped(self.status_feed_rect());
 
-        (corner_covered.min(main), main)
+        (covered.min(main), main)
+    }
+
+    /// How much of the scene's *bright* half is under terminal ink.
+    ///
+    /// # Why this exists beside [`Self::sky_clear_fraction`]
+    ///
+    /// A29's second clause, and it is there to stop a false pass. The clear-area
+    /// number counts *surfaces* — panels put between the reader and the sky —
+    /// and it improves the moment one is removed. But the sky is not uniformly
+    /// interesting: almost all of its light is in a few discs, and a frame whose
+    /// clear-area number is excellent can still have every one of those discs
+    /// under a line of text. Un-boxing something improves the first number
+    /// without one pixel of sky actually becoming visible, and this is what
+    /// catches that.
+    ///
+    /// `scene` is the scene's own colour per cell, in row-major order, as
+    /// `crate::solar_system::sample_cell_backgrounds` returns it. `inked` is one
+    /// flag per cell, in the same order: whether that cell carries a glyph that
+    /// is not a space. Returns `(inked_bright_cells, bright_cells)`.
+    ///
+    /// **Bright** is Rec.709 luminance above [`BRIGHT_SCENE_FLOOR`], which is
+    /// this repo's own standing measurement apparatus — the same
+    /// `0.2126 R + 0.7152 G + 0.0722 B` the scene comparisons are reported in.
+    /// A disc is where the light is; the floor is what separates it from the
+    /// void and the starfield.
+    ///
+    /// **Test-only for now, and deliberately.** It needs a rendered frame's
+    /// glyphs, which is a render-time artefact and not something `AppState`
+    /// holds; publishing it to production code before something needs it would
+    /// be an API with no caller. What it exists for is to keep A29's second
+    /// clause honest against
+    /// [`Self::sky_clear_fraction`] — the pair is the measurement, not one
+    /// number on its own.
+    #[cfg(test)]
+    pub(crate) fn ink_over_bright_scene(scene: &[(u8, u8, u8)], inked: &[bool]) -> (u32, u32) {
+        let mut bright = 0u32;
+        let mut over = 0u32;
+        for (index, (r, g, b)) in scene.iter().enumerate() {
+            let luminance =
+                0.2126 * f32::from(*r) + 0.7152 * f32::from(*g) + 0.0722 * f32::from(*b);
+            if luminance < Self::BRIGHT_SCENE_FLOOR {
+                continue;
+            }
+            bright += 1;
+            if inked.get(index).copied().unwrap_or(false) {
+                over += 1;
+            }
+        }
+        (over, bright)
     }
 
     /// The fraction of the main area carrying no interface element, `0.0..=1.0`. See
@@ -2041,6 +2161,191 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The status stream is counted against the clear-area floor too, and the
+    /// floor still holds with it there.
+    ///
+    /// A48's six lines are a surface between the reader and the sky exactly as
+    /// the machine corner is, and a clause that counted one and not the other
+    /// would be a clause that could be satisfied by moving a panel rather than
+    /// by removing one.
+    #[test]
+    fn the_status_stream_is_counted_against_the_clear_floor() {
+        let mut with_stream = state_with_sidebar(160, 50, 34);
+        let bare = with_stream.sky_coverage().0;
+        let now = std::time::Instant::now();
+        for index in 0..crate::app::status_feed::TERM_MAX {
+            with_stream.status_feed.observe(
+                Some(&crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::Finished,
+                    title: format!("line {index}"),
+                    context: "ctx".into(),
+                    position: None,
+                    target: None,
+                }),
+                now,
+            );
+        }
+        let covered = with_stream.sky_coverage().0;
+        assert!(
+            covered > bare,
+            "the stream drew six lines and cost the sky nothing, so it is not \
+             being counted"
+        );
+        assert!(
+            with_stream.sky_clear_fraction() >= crate::app::state::SKY_CLEAR_FLOOR,
+            "the stream took the main area under the clear floor: {:.1}%",
+            with_stream.sky_clear_fraction() * 100.0
+        );
+
+        // And it holds at every size, with the stream full, exactly as the
+        // corner's own sweep does.
+        for cols in [20u16, 40, 60, 80, 120, 200, 400] {
+            for rows in [4u16, 10, 20, 40, 80] {
+                for sidebar in [0u16, 26, 44, 60] {
+                    if sidebar >= cols {
+                        continue;
+                    }
+                    let mut state = state_with_sidebar(cols, rows, sidebar);
+                    for index in 0..crate::app::status_feed::TERM_MAX {
+                        state.status_feed.observe(
+                            Some(&crate::app::state::ToastNotification {
+                                kind: crate::app::state::ToastKind::Finished,
+                                title: format!("line {index}"),
+                                context: "ctx".into(),
+                                position: None,
+                                target: None,
+                            }),
+                            now,
+                        );
+                    }
+                    let clear = state.sky_clear_fraction();
+                    assert!(
+                        clear >= crate::app::state::SKY_CLEAR_FLOOR,
+                        "{cols}x{rows} with a {sidebar}-wide sidebar and a full stream \
+                         leaves the scene only {:.1}% of the main area",
+                        clear * 100.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// A24's contrast, as geometry: **the stream is narrow and the prose is
+    /// not.**
+    ///
+    /// The card's reason is functional and is not open to being re-narrowed for
+    /// taste: *assistant output is long, and a narrow column makes it scroll
+    /// past too fast to read*. In herdr the prose is the pane text — real PTY
+    /// output, which spans the whole frame outside the sidebar — and the stream
+    /// is six short lines nobody scrolls. So the two have to differ in width by
+    /// construction, and the stream has to be in the bottom third.
+    #[test]
+    fn the_stream_is_narrow_and_the_prose_is_not() {
+        let now = std::time::Instant::now();
+        let mut drawn = 0;
+        for cols in [80u16, 120, 200, 400] {
+            for sidebar in [26u16, 44] {
+                let mut state = state_with_sidebar(cols, 50, sidebar);
+                for index in 0..crate::app::status_feed::TERM_MAX {
+                    state.status_feed.observe(
+                        Some(&crate::app::state::ToastNotification {
+                            kind: crate::app::state::ToastKind::Finished,
+                            title: format!("line {index}"),
+                            context: "ctx".into(),
+                            position: None,
+                            target: None,
+                        }),
+                        now,
+                    );
+                }
+                let stream = state.status_feed_rect();
+                let prose = state.view.terminal_area;
+                if stream.width == 0 {
+                    // A main area too small to give the stream a readable third
+                    // draws none at all, the same rule the machine corner
+                    // follows. There is no contrast to measure there.
+                    continue;
+                }
+                drawn += 1;
+                assert!(
+                    stream.width * 2 < prose.width,
+                    "the stream is {} columns against {} of prose at {cols} columns, \
+                     which is not a contrast",
+                    stream.width,
+                    prose.width
+                );
+                // In the bottom third, and at the sidebar's own edge.
+                assert!(
+                    stream.y >= state.screen_rect().y + state.screen_rect().height * 2 / 3,
+                    "the stream is at row {} on a {}-row screen, not in the bottom third",
+                    stream.y,
+                    state.screen_rect().height
+                );
+                assert_eq!(
+                    stream.x,
+                    prose.x + 1,
+                    "the stream did not start at the sidebar's edge"
+                );
+            }
+        }
+        assert!(
+            drawn > 0,
+            "no size in the sweep drew a stream, so the contrast is untested"
+        );
+    }
+
+    /// A49: only the lines the corner actually stands over give width back.
+    #[test]
+    fn only_a_line_the_corner_stands_over_reserves_anything() {
+        use crate::ui::status::corner_reservation;
+        let corner = Rect::new(70, 1, 26, 8);
+
+        // A line on a row the corner does not occupy reserves nothing, however
+        // far right it reaches.
+        let below = Rect::new(0, 20, 100, 1);
+        assert_eq!(corner_reservation(below, corner), 0);
+        let above = Rect::new(0, 0, 100, 1);
+        assert_eq!(corner_reservation(above, corner), 0);
+
+        // A line inside its rows, but stopping short of it, reserves nothing
+        // either — *"a block that does not reach the panel reserves nothing"*.
+        let short = Rect::new(0, 3, 70, 1);
+        assert_eq!(corner_reservation(short, corner), 0);
+
+        // And a line that does reach it gives back exactly what it overlaps
+        // plus one gutter, so its last glyph is clear of the corner's edge.
+        let through = Rect::new(0, 3, 100, 1);
+        let reserved = corner_reservation(through, corner);
+        assert_eq!(reserved, 100 - 70 + 1);
+        assert!(
+            through.x + (through.width - reserved) < corner.x,
+            "the shortened line still runs under the corner"
+        );
+
+        // A corner that is not drawn costs nothing at all.
+        assert_eq!(corner_reservation(through, Rect::new(70, 1, 0, 0)), 0);
+    }
+
+    #[test]
+    fn the_ink_over_the_bright_scene_is_measured_over_the_light_and_not_the_void() {
+        // Three cells of void, three of a body's disc. Two of the bright ones
+        // carry a glyph.
+        let void = (6u8, 9u8, 16u8);
+        let disc = (210u8, 190u8, 140u8);
+        let scene = vec![void, void, disc, disc, disc, void];
+        let inked = vec![true, true, true, true, false, false];
+        let (over, bright) = crate::app::state::AppState::ink_over_bright_scene(&scene, &inked);
+        assert_eq!(bright, 3, "the void was counted as light");
+        assert_eq!(over, 2);
+
+        // A frame with nothing on it reports no ink and the same bright area,
+        // which is what makes the number a fraction of the *light* rather than
+        // of the frame.
+        let (over, bright) =
+            crate::app::state::AppState::ink_over_bright_scene(&scene, &[false; 6]);
+        assert_eq!((over, bright), (0, 3));
     }
 
     #[test]

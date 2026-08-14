@@ -277,9 +277,10 @@ impl OrbitTracks {
 
     /// Revolutions completed by one body — the raw count behind the drawn step.
     ///
-    /// Test-only for now: the drawn scene reads the quantized step and nothing else, so publishing
-    /// the raw count to production code before something needs it would be an API with no caller.
-    #[cfg(test)]
+    /// The caller its own doc was waiting for arrived: `crate::ui::sidebar::body_register` prints
+    /// `N revs` on a row's orbit line, and the *drawn* step is four quantized rungs under a square
+    /// root — a readout derived from it would say `2 revs` for anything between one and a few
+    /// hundred. The scene still reads the step and nothing else.
     pub(crate) fn revolutions(&self, row: &CardRow) -> f32 {
         self.revolutions.get(row).copied().unwrap_or(0.0)
     }

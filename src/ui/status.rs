@@ -352,6 +352,127 @@ pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> C
     }
 }
 
+/// The columns a block of herdr's own text must give back to the machine
+/// register's corner, on one line.
+///
+/// # A49, in herdr's terms
+///
+/// The artifact's clause: *only the lines whose own box overlaps the panel's
+/// vertical extent are shortened, by exactly the panel's width plus one gutter;
+/// a block that does not reach the panel reserves nothing.* The corner is a
+/// surface with a hard edge sitting over the frame, and text running under it is
+/// unreadable — but text on a line the corner does not occupy is not, and
+/// shortening it costs the reader words for nothing.
+///
+/// **It is per line and not per block, and that is the load-bearing part.** The
+/// card's own gate says why:
+///
+/// > a float shortens LINE boxes and the block beside it is still full width,
+/// > so an element-box reading reports a collision where every glyph is clear.
+///
+/// So this takes the line's own row, not the block's rect, and answers zero for
+/// every row above or below the corner — and zero as well for a line that stops
+/// short of the corner's left edge horizontally, which is the *"a block that
+/// does not reach the panel reserves nothing"* half.
+///
+/// `line` is the line's own box: where it starts, how wide it is, and which row
+/// it is on. Returns the columns to take off its right edge.
+pub(crate) fn corner_reservation(line: Rect, corner: Rect) -> u16 {
+    /// One column of air between the last glyph and the corner's edge. The
+    /// clause's *"plus one gutter"*.
+    const GUTTER: u16 = 1;
+
+    if corner.width == 0 || corner.height == 0 || line.width == 0 {
+        return 0;
+    }
+    // Only a line whose own row is inside the corner's vertical extent.
+    if line.y < corner.y || line.y >= corner.y.saturating_add(corner.height) {
+        return 0;
+    }
+    // And only a line that actually reaches it. A line ending left of the
+    // corner's first column is already clear, and the clause reserves nothing
+    // for it.
+    let line_right = line.x.saturating_add(line.width);
+    if line_right <= corner.x {
+        return 0;
+    }
+    // Exactly the corner's width plus one gutter — measured from the corner's
+    // own left edge, so a line reaching only part way in still ends up clear of
+    // it rather than being cut by a fixed amount that assumed it reached the
+    // far side.
+    let reserved = line_right.saturating_sub(corner.x).saturating_add(GUTTER);
+    reserved.min(line.width)
+}
+
+/// Draw herdr's own status stream: the last few things it said about this
+/// session.
+///
+/// A48's six lines and A24's narrow column. Where it goes and how wide it is are
+/// [`crate::app::state::AppState::status_feed_rect`]'s; what it says is
+/// [`crate::app::status_feed::StatusFeed`]'s. This is only the drawing.
+///
+/// Unboxed on purpose. The artifact retired its own boxes for exactly this
+/// reason — *"the terminal is unboxed... they are ink on the scene"* — and a
+/// bordered panel here would be a second surface between the reader and the sky,
+/// counted against H8's clear-area floor for no gain.
+pub(super) fn render_status_feed(
+    frame: &mut Frame,
+    rect: Rect,
+    feed: &crate::app::status_feed::StatusFeed,
+    corner: Rect,
+    p: &Palette,
+) {
+    if rect.width == 0 || rect.height == 0 || feed.is_empty() {
+        return;
+    }
+    let lines: Vec<&crate::app::status_feed::StatusLine> = feed.lines().collect();
+    // Oldest at the top, newest at the bottom, and the whole run right-aligned
+    // to the rect's floor so a stream shorter than its rect grows downward from
+    // where the last line already was rather than sliding the newest line about.
+    let first_row = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_sub(lines.len().min(usize::from(rect.height)) as u16);
+    for (index, line) in lines.iter().enumerate() {
+        let y = first_row.saturating_add(index as u16);
+        if y >= rect.y.saturating_add(rect.height) {
+            break;
+        }
+        let box_ = Rect::new(rect.x, y, rect.width, 1);
+        let width = box_.width.saturating_sub(corner_reservation(box_, corner));
+        if width == 0 {
+            continue;
+        }
+        // The newest line at full caption weight and every line above it a rung
+        // dimmer, so the stream reads in the order it happened without anything
+        // moving. The oldest never goes to nothing: it is still one of the six
+        // herdr is holding, and a line faded out is a line the reader has to
+        // wonder whether they missed.
+        let age = lines.len().saturating_sub(index + 1);
+        let style = if age == 0 {
+            Style::default().fg(p.subtext0)
+        } else if age < 3 {
+            Style::default().fg(p.overlay1)
+        } else {
+            Style::default().fg(p.overlay0)
+        };
+        let mark_color = match line.kind {
+            ToastKind::NeedsAttention | ToastKind::ProcessFailed => p.red,
+            ToastKind::Finished => p.blue,
+            ToastKind::UpdateInstalled => p.accent,
+        };
+        let text = super::text::truncate_end(&line.text, usize::from(width.saturating_sub(2)));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("·", Style::default().fg(mark_color)),
+                Span::raw(" "),
+                Span::styled(text, style),
+            ])),
+            Rect::new(box_.x, y, width, 1),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

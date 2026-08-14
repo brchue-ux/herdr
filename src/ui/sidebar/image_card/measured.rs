@@ -44,6 +44,20 @@ pub(super) const STROKE_B: Rgb = Rgb(126, 165, 209);
 /// card's *shape*, not a statement about which stage it is at.
 pub(super) const HUE_TRAVEL: f32 = 30.6;
 
+/// The hue band the whole tree column's ink stays inside, in degrees.
+///
+/// H1, measured off the reference rather than chosen: over its entire tree
+/// column, **99.94% of chromatic pixels above L25 sit inside 175–265°, and
+/// 99.7% of those in a single 15° bucket at 195°**. One hue family; everything
+/// else in the panel is brightness.
+///
+/// It is a *clamp* on [`HUE_TRAVEL`] and not a replacement for it — see
+/// `CardLight::inks`. The travel is a property of a card's shape and runs its
+/// full width everywhere inside the band; it gives way only at the band's two
+/// edges, which is where a card at the cold end of the measured family would
+/// otherwise put its left border outside the tree's own colour.
+pub(super) const HUE_BAND: (f32, f32) = (175.0, 265.0);
+
 /// How saturated the card's right edge is against its left.
 ///
 /// Only this ratio is carried from the pair, because their lightness is within
@@ -59,7 +73,54 @@ pub(super) const STROKE_B_SAT_RATIO: f32 = 0.73;
 pub(super) const STROKE_W: f32 = 0.033;
 
 /// Corner radius: an 8 px arc on a 61 px card.
+///
+/// **Capped by [`RADIUS_MAX_PX`], which is what actually decides it now.** The
+/// 0.13 h here was measured off an earlier sampling pass; the reference the card
+/// is drawn against has sharp corners — F6, *no radius above 3 px* — and 0.13 h
+/// is an 8 px arc, which is a rounded card. The ratio stays on record because it
+/// is a measurement, and the cap stays over it because the reference is.
 pub(super) const RADIUS: f32 = 0.13;
+
+/// The largest corner arc the card ever draws, in pixels.
+///
+/// F6's own number. A pane in the reference is a sharp-cornered rectangle with
+/// at most a hairline break at the corner; anything above this reads as a
+/// rounded plate, which is the material the glass treatment replaces.
+pub(super) const RADIUS_MAX_PX: f32 = 3.0;
+
+/// The card's face, as glass rather than as a plate.
+///
+/// `rgba(122, 196, 222, .10)` — sampled off the reference's own mate pane. It is
+/// a *tint over what is behind it*, not a fill: at [`GLASS_FACE_ALPHA`] the
+/// starfield, and in herdr the whole-terminal scene, is measurably visible
+/// through the card. That is H7, and it is the load-bearing quality of the
+/// material — a card that occludes the sky is the tree covering the system
+/// rather than hanging in front of it.
+pub(super) const GLASS_FACE: Rgb = Rgb(122, 196, 222);
+
+/// How much of the face's tint reaches the pixel. The reference's own `.10`.
+pub(super) const GLASS_FACE_ALPHA: f32 = 0.10;
+
+/// How far down and right the second face sits, in pixels.
+///
+/// The reference's own 3 px. It is what makes the pane read as an object with a
+/// front — a single boundary at any alpha reads as a painted rectangle, and no
+/// amount of edge brightness fixes that.
+pub(super) const GLASS_THICKNESS_PX: f32 = 3.0;
+
+/// The back face's share of the front's own alpha.
+///
+/// Under half, so the thickness is a shadow of the pane's own material rather
+/// than a second pane. Any higher and the offset copy competes with the card it
+/// is behind; any lower and it disappears against the panel.
+pub(super) const GLASS_BACK_ALPHA: f32 = 0.45;
+
+/// The back face's edge, as a share of the front edge's alpha.
+///
+/// The one line that actually draws the thickness, so it is the strongest part
+/// of the back face — but still well under the front's, which is what keeps the
+/// front reading as the front.
+pub(super) const GLASS_BACK_EDGE_ALPHA: f32 = 0.35;
 
 /// Card fill at the centre: `#1E323E`, lum 46.6 — **2.9× the canvas**, which is
 /// the number that killed "near-black with a subtle gradient".
@@ -216,11 +277,6 @@ pub(super) const TIDBIT_SIZE_MUL: f32 = 0.72;
 /// signal anything, which is the reference answering the state question itself.
 pub(super) const MUTED_SAT: f32 = 0.145 / 0.596;
 pub(super) const MUTED_LUM: f32 = 111.5 / 196.5;
-
-/// Fill hue travel across the card: the same 180→212 the stroke runs, at about
-/// a quarter of the amplitude. Left (30,60,71) → right (35,61,86).
-pub(super) const FILL_TRAVEL_A: Rgb = Rgb(30, 60, 71);
-pub(super) const FILL_TRAVEL_B: Rgb = Rgb(35, 61, 86);
 
 #[cfg(test)]
 mod tests {

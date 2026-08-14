@@ -448,6 +448,7 @@ mod tests {
         CardContent {
             title: String::new(),
             tidbit: None,
+            register: None,
             state_label: String::new(),
             state: AgentState::Idle,
             stage,
@@ -462,6 +463,8 @@ mod tests {
             // Nothing on this card but the creature: no absorbed workers either.
             residue: 0,
             controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
             breath: 0.0,
             spider,
             wash: None,
