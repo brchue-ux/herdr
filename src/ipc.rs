@@ -46,6 +46,12 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
+/// Binds the listener for Herdr's private control traffic.
+///
+/// Anything that reaches this listener can start processes in panes, so it must
+/// not be reachable by another account. Unix callers restrict the socket file
+/// after binding (see [`restrict_socket_permissions`]); a Windows named pipe has
+/// no file mode, so its DACL has to be set at creation time.
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
@@ -61,12 +67,14 @@ pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
 
         let name = path.to_string_lossy().to_string();
         let name = name.to_ns_name::<GenericNamespaced>()?;
         let listener = ListenerOptions::new()
             .name(name)
             .reclaim_name(false)
+            .security_descriptor(crate::platform::private_security_descriptor()?)
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
@@ -78,7 +86,7 @@ pub(crate) fn prepare_socket_path(
     busy_message: impl FnOnce(&Path) -> String,
 ) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::platform::create_private_dir_all(parent)?;
     }
 
     if !path.exists() {

@@ -961,6 +961,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "wgpu",
+ "widestring",
  "windows-sys 0.61.2",
  "wmi",
 ]
