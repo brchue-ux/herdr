@@ -21,7 +21,7 @@ pub use self::{
     },
     locate::LocatedDiagnostic,
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
+        validated_sidebar_bounds, AgentPanelSortConfig, CometsConfig, Config, ConfigReloadReport,
         ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
         SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         TabDecorationConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,

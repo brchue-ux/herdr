@@ -2119,6 +2119,8 @@ pub struct AppState {
     /// `src/solar_system.rs`, `src/app/background_scene.rs`). Only read while
     /// `kitty_graphics_enabled` is also true.
     pub persistent_background_enabled: bool,
+    /// `[experimental.comets]`: the win-comet effect's switch and governed ask rate.
+    pub background_comets: crate::config::CometsConfig,
     /// `[experimental] sidebar_card_font`: an explicit face for the sidebar's
     /// pixel cards, for a machine whose fonts are not where the search looks.
     /// `None` means search.
@@ -3656,6 +3658,7 @@ impl AppState {
             kitty_graphics_enabled: false,
             sidebar_particle_field_enabled: false,
             persistent_background_enabled: false,
+            background_comets: crate::config::CometsConfig::default(),
             sidebar_card_font: None,
             sidebar_card_shapes: false,
             pixel_text_panes_enabled: false,

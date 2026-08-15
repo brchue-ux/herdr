@@ -23,11 +23,10 @@
 //!
 //! ## What actually drives each trigger today
 //!
-//! - **Asteroid (bug/failure) impacts** read `AppState::pending_effects`
-//!   (`crate::app::pending_effects`), which is real, live plumbing — but its only current
-//!   producer is test-only (see that module's own doc); a screen-detection producer that decides
-//!   "this pane's output is a failure" is separate, not-yet-built work. This module is ready the
-//!   moment that producer lands.
+//! - **Asteroid (bug/failure) impacts** read `AppState::pending_effects`; their failure producer
+//!   remains separate work.
+//! - **Ask-win comets** read that same pane-identity path. Claude's bottom-buffer detector emits
+//!   one when it observes a newly-visible green success circle, behind a fleet-wide governor.
 //! - **PR-merge / clean-landing comets** read the `outcome` workspace metadata token
 //!   (`herdr-outcome-publisher`, live today) via a value-transition check, since the token is
 //!   durable rather than momentary and carries no publish timestamp of its own.
@@ -77,16 +76,10 @@ const CRATER_FADE: Duration = Duration::from_secs(45);
 /// How long the rays an impact throws off stay visible. A flash, not a scar: a small fraction of
 /// [`CRATER_FADE`], so the burst is over long before the mark it leaves has begun to fade.
 const EJECTA_FADE: Duration = Duration::from_millis(1100);
-/// How long a comet takes to cross the scene. The middle tier — a landing arrival takes
-/// [`COMET_ARRIVAL_FLIGHT`], a quiet green pass takes [`COMET_PASS_FLIGHT`].
+/// How long a non-win streak-shower comet takes to cross the scene.
 const COMET_FLIGHT: Duration = Duration::from_millis(2200);
-/// How long a quiet green-test-pass comet takes to cross. Deliberately the quickest tier: this is
-/// the highest-frequency trigger of the three, and a small, fast streak reads as a passing detail
-/// rather than as an event demanding the eye.
+/// The ask tier's life. CI and merge scale upward from this exact pre-tier comet lifetime.
 const COMET_PASS_FLIGHT: Duration = Duration::from_millis(1250);
-/// How long a landing comet takes to reach the body it landed on. The slowest tier — it is the
-/// only one with a destination, and the arrival is the thing worth watching.
-const COMET_ARRIVAL_FLIGHT: Duration = Duration::from_millis(2600);
 /// How long a streak-milestone shower's comets stay staggered across, so they read as a burst
 /// rather than one simultaneous flash.
 const SHOWER_STAGGER: Duration = Duration::from_millis(260);
@@ -134,7 +127,7 @@ enum AsteroidLifecycle {
 /// [`spawn_comet`].
 #[derive(Debug, Clone)]
 enum CometMotion {
-    /// A quiet green-test pass: small and fast, straight across the scene, no destination.
+    /// An ask completion or green CI pass: straight across the scene, no destination.
     Pass,
     /// A PR merge / clean landing: flies in from the edge and straight into the body the work
     /// landed on. Carried as a [`CardRow`] rather than a body index because the tree is rebuilt
@@ -155,6 +148,9 @@ struct ActiveComet {
     /// Set only for [`CometMotion::Arrival`]; a crossing comet flies to `end` unchanged.
     target: Option<CardRow>,
     magnitude: f32,
+    tier: solar_system::WinTier,
+    trail: std::sync::Arc<Vec<(f32, f32)>>,
+    last_trail_sample_at: Option<Instant>,
 }
 
 /// Everything the background scene's event-driven overlay needs to remember between frames.
@@ -168,6 +164,7 @@ pub(crate) struct BackgroundEffectsState {
     seen_outcome: HashMap<String, String>,
     seen_streak_band: HashMap<String, crate::quality_streak::FlameBand>,
     seen_checks_clear: HashMap<String, bool>,
+    seen_success: HashMap<PaneId, Instant>,
 }
 
 impl BackgroundEffectsState {
@@ -186,6 +183,13 @@ impl BackgroundEffectsState {
         // Transition markers are *not* cleared: forgetting them would replay every already-seen
         // outcome/streak/checks state as a fresh transition the next time this module runs,
         // which is exactly the double-fire this state exists to prevent.
+        had_any
+    }
+
+    /// Drop only the comet layer, leaving independent impact effects and transition latches.
+    pub(crate) fn forget_comets(&mut self) -> bool {
+        let had_any = !self.comets.is_empty();
+        self.comets.clear();
         had_any
     }
 }
@@ -703,23 +707,49 @@ pub(crate) fn spawn_new_effects(
     now: Instant,
 ) {
     for effect in app.pending_effects.live(now) {
-        let crate::app::pending_effects::EffectKind::PaneIssue = effect.kind;
-        if state.asteroids.contains_key(&effect.pane_id) {
-            continue;
+        match effect.kind {
+            crate::app::pending_effects::EffectKind::PaneIssue => {
+                if state.asteroids.contains_key(&effect.pane_id)
+                    || !identity.contains(&CardRow::Agent(effect.pane_id))
+                {
+                    continue;
+                }
+                let severity = pane_severity(app, effect.pane_id);
+                let seed = effect.pane_id.raw() as u64;
+                state.asteroids.insert(
+                    effect.pane_id,
+                    AsteroidLifecycle::Flying {
+                        started_at: now,
+                        severity,
+                        approach_angle: pseudo_angle(seed),
+                    },
+                );
+            }
+            crate::app::pending_effects::EffectKind::PaneSuccess => {
+                let already_seen = state
+                    .seen_success
+                    .get(&effect.pane_id)
+                    .is_some_and(|seen| *seen >= effect.spawned_at);
+                state.seen_success.insert(effect.pane_id, effect.spawned_at);
+                if already_seen || !app.background_comets.enabled {
+                    continue;
+                }
+                if let Some(ws_idx) = app
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.pane_state(effect.pane_id).is_some())
+                {
+                    spawn_comet(
+                        state,
+                        ws_idx,
+                        now,
+                        0.15,
+                        solar_system::WinTier::Ask,
+                        CometMotion::Pass,
+                    );
+                }
+            }
         }
-        if !identity.contains(&CardRow::Agent(effect.pane_id)) {
-            continue;
-        }
-        let severity = pane_severity(app, effect.pane_id);
-        let seed = effect.pane_id.raw() as u64;
-        state.asteroids.insert(
-            effect.pane_id,
-            AsteroidLifecycle::Flying {
-                started_at: now,
-                severity,
-                approach_angle: pseudo_angle(seed),
-            },
-        );
     }
 
     for (ws_idx, workspace) in app.workspaces.iter().enumerate() {
@@ -728,7 +758,7 @@ pub(crate) fn spawn_new_effects(
         if let Some(outcome) = workspace.metadata_tokens.get("outcome") {
             let is_landing = outcome == "pr_merged" || outcome == "landed";
             let already_seen = state.seen_outcome.get(ws_id).map(String::as_str) == Some(outcome);
-            if is_landing && !already_seen {
+            if app.background_comets.enabled && is_landing && !already_seen {
                 // A landing has a *place* it landed, so this tier alone flies into it rather than
                 // past it — the workspace's own body in the scene.
                 spawn_comet(
@@ -736,6 +766,7 @@ pub(crate) fn spawn_new_effects(
                     ws_idx,
                     now,
                     work_size_magnitude(workspace),
+                    solar_system::WinTier::Merge,
                     CometMotion::Arrival {
                         target: CardRow::Space(ws_id.clone()),
                     },
@@ -749,12 +780,19 @@ pub(crate) fn spawn_new_effects(
         if let Some(counts) = workspace.cached_pull_requests {
             let all_clear = counts.checks_failing == 0 && counts.checks_pending == 0;
             let had_outstanding = state.seen_checks_clear.get(ws_id) == Some(&false);
-            if all_clear && had_outstanding {
+            if app.background_comets.enabled && all_clear && had_outstanding {
                 // The quiet, high-frequency tier: every green pass gets a star, kept small, dim
                 // and quick so it never competes with a landing or a streak shower.
-                spawn_comet(state, ws_idx, now, 0.15, CometMotion::Pass);
+                spawn_comet(
+                    state,
+                    ws_idx,
+                    now,
+                    0.15,
+                    solar_system::WinTier::Ci,
+                    CometMotion::Pass,
+                );
             }
-            state.seen_checks_clear.insert(ws_id.clone(), !all_clear);
+            state.seen_checks_clear.insert(ws_id.clone(), all_clear);
         }
 
         // The band is read from the *decayed* score, through the one module that owns that
@@ -777,7 +815,7 @@ pub(crate) fn spawn_new_effects(
                     app.wall_now,
                 ));
                 let previous = state.seen_streak_band.get(ws_id).copied();
-                if previous.is_some_and(|prev| band > prev) {
+                if app.background_comets.enabled && previous.is_some_and(|prev| band > prev) {
                     // A milestone is an accumulated streak, not one landed thing, so it reads as
                     // a shower of several comets rather than one bigger one — fanned wide, since
                     // six comets all crossing through the middle would converge on the sun.
@@ -788,6 +826,7 @@ pub(crate) fn spawn_new_effects(
                             ws_idx,
                             now + stagger,
                             0.9,
+                            solar_system::WinTier::Ask,
                             CometMotion::Shower { index: i },
                         );
                     }
@@ -829,6 +868,7 @@ fn spawn_comet(
     ws_idx: usize,
     started_at: Instant,
     magnitude: f32,
+    tier: solar_system::WinTier,
     motion: CometMotion,
 ) {
     // Varies with how many comets are already in flight this pass, so a shower's own several
@@ -842,12 +882,16 @@ fn spawn_comet(
     // to get there. See [`CometMotion`].
     let (flight, target, exit_angle) = match &motion {
         CometMotion::Pass => (
-            COMET_PASS_FLIGHT,
+            COMET_PASS_FLIGHT.mul_f32(tier.life_scale()),
             None,
             opposite
                 + (pseudo_angle(seed ^ 7) / std::f32::consts::TAU - 0.5) * 2.0 * CROSS_CHORD_JITTER,
         ),
-        CometMotion::Arrival { target } => (COMET_ARRIVAL_FLIGHT, Some(target.clone()), opposite),
+        CometMotion::Arrival { target } => (
+            COMET_PASS_FLIGHT.mul_f32(tier.life_scale()),
+            Some(target.clone()),
+            opposite,
+        ),
         CometMotion::Shower { index } => {
             // Alternating sides, each already deflected clear of the middle, is what turns six
             // chords into a fan rather than six near-copies of the same line through the sun.
@@ -870,6 +914,9 @@ fn spawn_comet(
         end: edge_point(exit_angle),
         target,
         magnitude: magnitude.clamp(0.05, 1.0),
+        tier,
+        trail: std::sync::Arc::new(Vec::new()),
+        last_trail_sample_at: None,
     });
 }
 
@@ -889,6 +936,7 @@ fn edge_point(angle: f32) -> (f32, f32) {
 pub(crate) fn advance_and_build_effects(
     state: &mut BackgroundEffectsState,
     identity: &[CardRow],
+    scene: Option<(&solar_system::SceneLayout, f32)>,
     now: Instant,
 ) -> solar_system::SceneEffects {
     let mut effects = solar_system::SceneEffects::default();
@@ -954,23 +1002,47 @@ pub(crate) fn advance_and_build_effects(
     // `BodyLayout::parent` (which this module, working from a flat `identity` list, does not
     // have), scaled by `RIPPLE_FADE_RATIO` against the same age fraction already computed above.
 
-    state.comets.retain(|comet| {
+    state.comets.retain_mut(|comet| {
         let elapsed = now.saturating_duration_since(comet.started_at);
         if elapsed >= comet.flight {
             return false;
         }
         let progress = elapsed.as_secs_f32() / comet.flight.as_secs_f32();
+        let target = comet
+            .target
+            .as_ref()
+            .and_then(|row| identity.iter().position(|candidate| candidate == row));
+        let end = target
+            .and_then(|idx| {
+                scene.and_then(|(layout, phase)| layout.body_position_normalized(idx, phase))
+            })
+            .unwrap_or(comet.end);
+        if comet.last_trail_sample_at.is_none_or(|last| now > last) {
+            let trail = std::sync::Arc::make_mut(&mut comet.trail);
+            trail.push(solar_system::comet_position_normalized(
+                comet.tier,
+                comet.start,
+                end,
+                progress,
+            ));
+            // The longest tier lives for about 196 frames at 60 Hz. This is deliberately a fixed
+            // safety ceiling, not a visual tail length; the renderer measures the real recorded
+            // path backward until the tier's pixel-length cap is reached.
+            if trail.len() > 256 {
+                trail.remove(0);
+            }
+            comet.last_trail_sample_at = Some(now);
+        }
         effects.comets.push(solar_system::Comet {
             start: comet.start,
             end: comet.end,
             // Re-resolved every pass against the *current* tree, exactly like an asteroid's
             // target: a landing whose workspace has since gone finishes its flight as a plain
             // crossing rather than vanishing or aiming at whatever now holds that index.
-            target: comet
-                .target
-                .as_ref()
-                .and_then(|row| identity.iter().position(|candidate| candidate == row)),
+            target,
             magnitude: comet.magnitude,
+            tier: comet.tier,
+            trail: std::sync::Arc::clone(&comet.trail),
             progress: progress.clamp(0.0, 1.0),
         });
         true
@@ -1075,6 +1147,144 @@ mod tests {
         // unmeasured project's landing is a real comet rather than a vanishing one.
         assert!(unmeasured > 0.0 && unmeasured <= tiny);
         assert!(big <= 1.0);
+    }
+
+    #[test]
+    fn ci_green_transition_is_edge_triggered_once() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("fleet"));
+        let mut state = BackgroundEffectsState::default();
+        let now = Instant::now();
+        let (_, identity) = tree_nodes(&app);
+        let green = crate::forge::PullRequestCounts::default();
+        let red = crate::forge::PullRequestCounts {
+            checks_failing: 1,
+            ..Default::default()
+        };
+
+        // Discovering an already-green fleet establishes the baseline. It is not a transition,
+        // and continuing to observe the same green fact must stay silent forever.
+        app.workspaces[0].cached_pull_requests = Some(green);
+        spawn_new_effects(&app, &mut state, &identity, now);
+        assert_eq!(state.comets.len(), 0);
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(16));
+        assert_eq!(state.comets.len(), 0, "steady green re-fired the CI comet");
+
+        // One outstanding reading followed by green is the edge. Exactly one comet is admitted,
+        // and later green readings do not turn that one transition into a timer.
+        app.workspaces[0].cached_pull_requests = Some(red);
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(32));
+        assert_eq!(state.comets.len(), 0);
+        app.workspaces[0].cached_pull_requests = Some(green);
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(48));
+        assert_eq!(state.comets.len(), 1, "red-to-green did not fire once");
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(64));
+        assert_eq!(
+            state.comets.len(),
+            1,
+            "the same red-to-green transition fired more than once"
+        );
+    }
+
+    #[test]
+    fn a_pending_pane_success_emits_one_ask_comet() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("fleet"));
+        let pane_id = app.workspaces[0].focused_pane_id().expect("root pane");
+        let now = Instant::now();
+        app.pending_effects.record_ask(pane_id, now, 1.0);
+        let (_, identity) = tree_nodes(&app);
+        let mut state = BackgroundEffectsState::default();
+
+        spawn_new_effects(&app, &mut state, &identity, now);
+        assert_eq!(state.comets.len(), 1);
+        assert_eq!(state.comets[0].tier, solar_system::WinTier::Ask);
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(16));
+        assert_eq!(
+            state.comets.len(),
+            1,
+            "one pending success replayed every tick"
+        );
+    }
+
+    #[test]
+    fn measure_fixed_comet_count_at_captain_fleet_shape() {
+        let mut app = fleet_app(11);
+        let green = crate::forge::PullRequestCounts::default();
+        let red = crate::forge::PullRequestCounts {
+            checks_failing: 1,
+            ..Default::default()
+        };
+        for workspace in &mut app.workspaces {
+            workspace.cached_pull_requests = Some(green);
+        }
+        let (_, identity) = tree_nodes(&app);
+        let mut state = BackgroundEffectsState::default();
+        let start = Instant::now();
+
+        for tick in 0..300 {
+            let now = start + Duration::from_millis(16 * tick);
+            spawn_new_effects(&app, &mut state, &identity, now);
+            advance_and_build_effects(&mut state, &identity, None, now);
+        }
+        let steady_green = state.comets.len();
+
+        for workspace in &mut app.workspaces {
+            workspace.cached_pull_requests = Some(red);
+        }
+        spawn_new_effects(&app, &mut state, &identity, start + Duration::from_secs(5));
+        for workspace in &mut app.workspaces {
+            workspace.cached_pull_requests = Some(green);
+        }
+        spawn_new_effects(
+            &app,
+            &mut state,
+            &identity,
+            start + Duration::from_secs(5) + Duration::from_millis(16),
+        );
+        let on_transition = state.comets.len();
+
+        for tick in 1..300 {
+            let now = start + Duration::from_secs(5) + Duration::from_millis(16 * (tick + 1));
+            spawn_new_effects(&app, &mut state, &identity, now);
+            advance_and_build_effects(&mut state, &identity, None, now);
+        }
+        let settled_green = state.comets.len();
+        eprintln!(
+            "MEASURE captain fleet (sun + 11 mates, 300 ticks): before=948 live; fixed steady={steady_green}; red-to-green={on_transition}; settled={settled_green}"
+        );
+
+        assert_eq!(steady_green, 0);
+        assert_eq!(on_transition, 12);
+        assert_eq!(settled_green, 0);
+    }
+
+    #[test]
+    fn comet_switch_suppresses_wins_without_replaying_them_when_reenabled() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("fleet"));
+        app.background_comets.enabled = false;
+        let mut state = BackgroundEffectsState::default();
+        let (_, identity) = tree_nodes(&app);
+        let now = Instant::now();
+        app.workspaces[0].cached_pull_requests = Some(crate::forge::PullRequestCounts {
+            checks_failing: 1,
+            ..Default::default()
+        });
+        spawn_new_effects(&app, &mut state, &identity, now);
+        app.workspaces[0].cached_pull_requests = Some(Default::default());
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(16));
+        assert!(state.comets.is_empty());
+
+        app.background_comets.enabled = true;
+        spawn_new_effects(&app, &mut state, &identity, now + Duration::from_millis(32));
+        assert!(
+            state.comets.is_empty(),
+            "re-enabling replayed a transition seen while off"
+        );
     }
 
     /// Nest `ws_idx` under `owner`, the way `workspace report-metadata --token owner=...` does —
@@ -1639,7 +1849,14 @@ mod tests {
         let mut state = BackgroundEffectsState::default();
         let now = Instant::now();
         for index in 0..SHOWER_SIZE {
-            spawn_comet(&mut state, 3, now, 0.9, CometMotion::Shower { index });
+            spawn_comet(
+                &mut state,
+                3,
+                now,
+                0.9,
+                solar_system::WinTier::Ask,
+                CometMotion::Shower { index },
+            );
         }
         assert_eq!(state.comets.len(), SHOWER_SIZE);
 
@@ -1680,19 +1897,34 @@ mod tests {
         let landed_on = CardRow::Space("ws-landed".to_string());
 
         let mut pass = BackgroundEffectsState::default();
-        spawn_comet(&mut pass, 1, now, 0.15, CometMotion::Pass);
+        spawn_comet(
+            &mut pass,
+            1,
+            now,
+            0.15,
+            solar_system::WinTier::Ask,
+            CometMotion::Pass,
+        );
         let mut arrival = BackgroundEffectsState::default();
         spawn_comet(
             &mut arrival,
             1,
             now,
             0.6,
+            solar_system::WinTier::Merge,
             CometMotion::Arrival {
                 target: landed_on.clone(),
             },
         );
         let mut shower = BackgroundEffectsState::default();
-        spawn_comet(&mut shower, 1, now, 0.9, CometMotion::Shower { index: 0 });
+        spawn_comet(
+            &mut shower,
+            1,
+            now,
+            0.9,
+            solar_system::WinTier::Ask,
+            CometMotion::Shower { index: 0 },
+        );
 
         // A green pass has no destination and is the quickest of the three.
         assert!(pass.comets[0].target.is_none());
@@ -1722,17 +1954,18 @@ mod tests {
             1,
             now,
             0.6,
+            solar_system::WinTier::Merge,
             CometMotion::Arrival {
                 target: target.clone(),
             },
         );
 
         let present = [CardRow::Space("other".to_string()), target.clone()];
-        let effects = advance_and_build_effects(&mut state.clone(), &present, now);
+        let effects = advance_and_build_effects(&mut state.clone(), &present, None, now);
         assert_eq!(effects.comets[0].target, Some(1));
 
         let gone = [CardRow::Space("other".to_string())];
-        let effects = advance_and_build_effects(&mut state.clone(), &gone, now);
+        let effects = advance_and_build_effects(&mut state.clone(), &gone, None, now);
         assert_eq!(effects.comets[0].target, None);
         // The crossing endpoint it was spawned with is still there to fall back on.
         assert!(effects.comets[0].end.0.is_finite());
@@ -1755,14 +1988,15 @@ mod tests {
             },
         );
 
-        let at_impact = advance_and_build_effects(&mut state.clone(), &identity, now);
+        let at_impact = advance_and_build_effects(&mut state.clone(), &identity, None, now);
         assert_eq!(at_impact.craters.len(), 1);
         assert_eq!(at_impact.ejecta.len(), 1);
         assert_eq!(at_impact.ejecta[0].angle_on_surface, 0.9);
         assert_eq!(at_impact.ejecta[0].body, at_impact.craters[0].body);
 
         // Halfway through the burst: both live, the rays already well into their own fade.
-        let mid = advance_and_build_effects(&mut state.clone(), &identity, now + EJECTA_FADE / 2);
+        let mid =
+            advance_and_build_effects(&mut state.clone(), &identity, None, now + EJECTA_FADE / 2);
         assert_eq!(mid.ejecta.len(), 1);
         assert!(mid.ejecta[0].age > 0.4 && mid.ejecta[0].age < 0.6);
         assert!(
@@ -1771,8 +2005,12 @@ mod tests {
         );
 
         // A strike from ten seconds ago still shows its scar and no dust at all.
-        let later =
-            advance_and_build_effects(&mut state.clone(), &identity, now + Duration::from_secs(10));
+        let later = advance_and_build_effects(
+            &mut state.clone(),
+            &identity,
+            None,
+            now + Duration::from_secs(10),
+        );
         assert_eq!(later.craters.len(), 1);
         assert!(later.ejecta.is_empty());
     }

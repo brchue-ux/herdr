@@ -1555,17 +1555,17 @@ impl App {
             &identity,
             now,
         );
+        let generated_at = self.state.background_scene_generated_at.unwrap_or(now);
+        let phase = crate::app::background_scene::phase_at(generated_at, now);
         let live_before = effects_state.is_live();
         let effects = crate::app::background_scene::advance_and_build_effects(
             &mut effects_state,
             &identity,
+            Some((&layout, phase)),
             now,
         );
         let live_after = effects_state.is_live();
         self.state.background_effects = effects_state;
-
-        let generated_at = self.state.background_scene_generated_at.unwrap_or(now);
-        let phase = crate::app::background_scene::phase_at(generated_at, now);
 
         // Resample per-cell text legibility every pass too — not gated on `live_after`, since an
         // ambient body alone (the sun, an orbiting planet) can sit under static text with no

@@ -1381,6 +1381,18 @@
           "description": "Draw a persistent whole-terminal background scene: firstmate as the sun, second mates as planets, workers as moons, mirroring the same owner tree the sidebar draws. Whole-terminal, not sidebar-confined. Generated as a looping animation the same way sidebar_particle_field is, so steady-state cost is near zero once armed; a bug/failure impact or a win comet regenerates only the small overlay layer, and only while at least one is live. Drawn only on a host terminal Herdr has positively identified as kitty: the scene is a full-surface opaque image placed under the text, and a terminal with partial Kitty-graphics support draws that same image over every glyph on screen instead, so an unrecognised terminal is refused rather than risked. Only read while kitty_graphics is on."
         },
         {
+          "key": "experimental.comets.enabled",
+          "type": "boolean",
+          "default": "true",
+          "description": "Emit win comets in the persistent background. Turning this off clears comets without disabling the rest of the scene."
+        },
+        {
+          "key": "experimental.comets.rate",
+          "type": "number",
+          "default": "1.0",
+          "description": "Multiply the fleet-wide governed ask-comet rate. At 1.0, Claude green success circles can emit at most one ask comet per minute; CI-green and merge comets are not rate-scaled. Values are clamped to 0.05 through 8.0."
+        },
+        {
           "key": "experimental.kitty_graphics_local_transport",
           "type": "boolean",
           "default": "false",
