@@ -365,9 +365,7 @@ impl Fleet {
                 // Named, because a caption is drawn work like any other and a rig that measured a
                 // scene without one would under-report what the real scene costs.
                 label: crate::solar_system::SceneLabel::new(&format!("bench-{}", row.seed)),
-                // Spread over the wheel by seed rather than all one colour: hue
-                // is what the body's whole palette is resolved from.
-                hue: (row.seed % 360) as f32,
+                stage: crate::anim::cell::LifecycleStage::Running,
                 severity: match row.seed % 4 {
                     0 => crate::anim::cell::Severity::Clear,
                     1 => crate::anim::cell::Severity::Mild,
@@ -895,7 +893,7 @@ fn scene_key(nodes: &[crate::solar_system::TreeNode], size: (u32, u32)) -> u64 {
     for node in nodes {
         node.parent.hash(&mut hasher);
         (node.kind as u8).hash(&mut hasher);
-        node.hue.to_bits().hash(&mut hasher);
+        node.stage.hash(&mut hasher);
         node.severity.hash(&mut hasher);
     }
     hasher.finish()

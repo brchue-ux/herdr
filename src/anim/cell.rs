@@ -203,12 +203,11 @@ pub(crate) enum Ink {
 
 /// Which stage of its own life the work behind an element is at.
 ///
-/// **This carries hue and nothing else.** The five are the stages a unit of work
-/// passes through, not five degrees of anything: a card at any one of them can
-/// be perfectly healthy or in serious trouble, and saying which is
-/// [`Severity`]'s job. Keeping them on separate channels is what makes "running,
-/// but badly" expressible at all — with one channel it collapses into either a
-/// stage that is really a warning or a warning that is really a stage.
+/// The five are categorical stages a unit of work passes through, not five degrees of anything:
+/// a card at any one of them can be perfectly healthy or in serious trouble, and saying which is
+/// [`Severity`]'s job. A surface may express this category as a palette hue or, through
+/// [`one_hue_stage_mix`], as saturation and brightness inside one hue family. Severity stays on
+/// its independent intensity channel either way, which keeps "running, but badly" expressible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum LifecycleStage {
     /// Accepted, nothing running yet.
@@ -284,6 +283,41 @@ impl LifecycleStage {
         Self::Done,
         Self::Failed,
     ];
+}
+
+/// Restate one fixed-hue ink so lifecycle stage remains legible without becoming colour.
+///
+/// These ratios are measured from the reference behind the pixel sidebar cards: an inactive
+/// card holds the active hue while saturation falls from 59.6% to 14.5% and luminance from
+/// 196.5 to 111.5. `Done` sits halfway back to full strength; active, waiting, and failed work
+/// stay at full strength. Keeping the transform here lets every one-hue surface use the same
+/// lifecycle vocabulary without importing a UI-specific palette.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OneHueStageMix {
+    pub(crate) saturation: f32,
+    pub(crate) luminance: f32,
+}
+
+pub(crate) fn one_hue_stage_mix(stage: LifecycleStage) -> OneHueStageMix {
+    const MUTED_SATURATION: f32 = 0.145 / 0.596;
+    const MUTED_LUMINANCE: f32 = 111.5 / 196.5;
+
+    match stage {
+        LifecycleStage::Running | LifecycleStage::Waiting | LifecycleStage::Failed => {
+            OneHueStageMix {
+                saturation: 1.0,
+                luminance: 1.0,
+            }
+        }
+        LifecycleStage::Done => OneHueStageMix {
+            saturation: (1.0 + MUTED_SATURATION) / 2.0,
+            luminance: (1.0 + MUTED_LUMINANCE) / 2.0,
+        },
+        LifecycleStage::Queued => OneHueStageMix {
+            saturation: MUTED_SATURATION,
+            luminance: MUTED_LUMINANCE,
+        },
+    }
 }
 
 /// How bad the problem on an element is, whatever stage it is at.
@@ -432,6 +466,21 @@ pub(crate) fn signal_ink(hue: f32, severity: Severity, surface: Rgb) -> Rgb {
 /// should be able to ask for it without going through a hue.
 pub(crate) fn signal_light(severity: Severity, surface: Rgb) -> f32 {
     signal_light_at_reach(severity.light_reach(), surface)
+}
+
+/// Lift a material's own lightness through the shared severity ladder.
+///
+/// [`signal_light`] places a freshly chosen ink between a panel and the end of
+/// the scale. A material already has a meaningful clear-state lightness, so its
+/// additional severity reach starts at [`Severity::Clear`] and consumes the
+/// remaining headroom toward white. This relative transform keeps bright
+/// materials such as ice from clamping Mild, Serious, and Critical onto the
+/// same value.
+pub(crate) fn signal_light_over_material(material_lightness: f32, severity: Severity) -> f32 {
+    let clear_reach = Severity::Clear.light_reach();
+    let additional_reach =
+        (severity.light_reach() - clear_reach) / (1.0 - clear_reach).max(f32::EPSILON);
+    material_lightness + (1.0 - material_lightness) * additional_reach
 }
 
 /// How far off the surface the defect marker at full intensity stands.

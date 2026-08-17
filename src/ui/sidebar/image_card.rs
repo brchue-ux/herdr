@@ -1178,17 +1178,8 @@ impl CardLight {
         } else {
             // The reference's own answer to "what carries state without a
             // rainbow": one hue, with saturation and light muted by stage.
-            let (sat, lum) = match stage {
-                LifecycleStage::Running | LifecycleStage::Waiting | LifecycleStage::Failed => {
-                    (1.0, 1.0)
-                }
-                LifecycleStage::Done => (
-                    (1.0 + measured::MUTED_SAT) / 2.0,
-                    (1.0 + measured::MUTED_LUM) / 2.0,
-                ),
-                LifecycleStage::Queued => (measured::MUTED_SAT, measured::MUTED_LUM),
-            };
-            measured::STROKE_A.restate(sat, lum)
+            let mix = crate::anim::cell::one_hue_stage_mix(stage);
+            measured::STROKE_A.restate(mix.saturation, mix.luminance)
         };
         Self {
             ink,

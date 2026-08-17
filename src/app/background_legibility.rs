@@ -394,7 +394,7 @@ mod tests {
             label: solar_system::SceneLabel::EMPTY,
             parent: None,
             kind: solar_system::BodyKind::Sun,
-            hue: 41.0,
+            stage: crate::anim::cell::LifecycleStage::Running,
             severity: crate::anim::cell::Severity::Clear,
             size: solar_system::BodySize::Fixed,
             streak: 0.0,

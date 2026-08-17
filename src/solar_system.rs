@@ -13,14 +13,11 @@
 //! high-fidelity realism, not abstract glowing nodes — each planet/moon is a Lambertian-shaded
 //! sphere lit from the sun's own on-screen position (so a body's terminator always points away
 //! from the sun, which is free realism this scene's own geometry supplies), with limb darkening
-//! and a cheap procedural surface texture. Colour is unchanged from the rest of the fork: hue
-//! carries lifecycle stage, intensity carries severity
-//! (`data/decisions/2026-08-04-scaling-and-storyboard-answers.md` section 5), resolved through
-//! the exact same [`crate::anim::cell::signal_ink`] every sidebar card already uses. This module
-//! only chooses the surface those channels render onto. The one exemption is the sun, which
-//! holds a fixed warm star colour ([`SUN_STAR_RGB01`]) instead of resolving through that channel
-//! — see `data/decisions/2026-08-10-sun-fixed-star-color.md` (firstmate home) for why a star is
-//! not severity-coded. Planets and moons are unaffected.
+//! and a cheap procedural surface texture. The scene carries one measured warm hue family;
+//! lifecycle stage changes saturation and brightness, while severity keeps its independent
+//! intensity ramp. The sun holds its own fixed warm star colour ([`SUN_STAR_RGB01`]) — see
+//! `data/decisions/2026-08-10-sun-fixed-star-color.md` (firstmate home) for why a star is not
+//! severity-coded.
 //!
 //! An impact is a solid asteroid, not a glowing meteor — no tail, realistic rock-coloured, sized
 //! by severity — that leaves a crater on the struck moon fading gradually over
@@ -39,12 +36,10 @@
 
 use std::f32::consts::PI;
 
-use crate::anim::cell::{signal_ink, Severity};
+use crate::anim::cell::{one_hue_stage_mix, signal_light_over_material, LifecycleStage, Severity};
 
 /// Deep-space canvas colour bodies and glow are composited onto. Not the terminal theme's own
-/// backdrop — this scene is its own place, not a wash behind the sidebar's panel colour, so it
-/// gets its own fixed surface for [`signal_ink`] to measure severity's lightness distance
-/// against.
+/// backdrop — this scene is its own place, not a wash behind the sidebar's panel colour.
 /// The fleet orrery's own void constant `#03060b`, ported exactly. Rec.709 luminance **5.72**,
 /// which is the *median pixel* of the reference frame: the median pixel of that picture is bare
 /// void, and that is what makes the few bright things in it read as bright.
@@ -61,15 +56,39 @@ const SPACE_SURFACE: (u8, u8, u8) = (3, 6, 11);
 /// colour a G-type star reads as in the realistic space photography this scene is styled after
 /// (`data/decisions/2026-08-07-terminal-background-visual-execution-round1.md`, firstmate home).
 ///
-/// Deliberately *not* [`severity_rgb01`]: the captain's ruling in
+/// Deliberately *not* [`body_rgb01`]: the captain's ruling in
 /// `data/decisions/2026-08-10-sun-fixed-star-color.md` is that a star does not change colour to
 /// match whatever a planet near it is doing, so tying the sun to the shared hue=stage channel
-/// made an idle fleet render a green sun beside an identically green planet. This is a sun-only
-/// exemption — planets and moons keep hue=stage/intensity=severity exactly as before.
+/// made an idle fleet render a green sun beside an identically green planet.
 ///
 /// Kept slightly under pure white so [`shade_surface`]'s self-luminous limb brightening (up to
 /// `1.05`) still has headroom to lift the core rather than clipping the whole disk flat.
 const SUN_STAR_RGB01: (f32, f32, f32) = (1.0, 0.945, 0.835);
+
+/// The celestial body's warm material family, measured from the captain's two target renders.
+///
+/// With the same chromatic/L25 selection in both captures, their median body hues are 28.7° and
+/// 28.8°, and more than 97% of selected pixels sit in 15–45°. These are the artifact's exact six
+/// planet albedos, not a colour reconstructed from the median: the family includes several real
+/// materials and H5 requires at least four distinct body hues. Lifecycle stage changes brightness
+/// and saturation through [`one_hue_stage_mix`]; severity keeps its independent intensity ramp.
+const PLANET_ALBEDO: [(u8, u8, u8); 6] = [
+    (201, 182, 148),
+    (188, 143, 101),
+    (206, 197, 171),
+    (172, 134, 95),
+    (193, 183, 161),
+    (163, 116, 86),
+];
+
+/// The artifact's exact icy moon albedos. Near-neutral by design: H5 exempts saturation below
+/// 0.06, and the hard bright/dark edge of ice is what keeps a worker findable against a tan planet.
+const MOON_ALBEDO: [(u8, u8, u8); 4] = [
+    (236, 234, 228),
+    (248, 246, 241),
+    (214, 212, 206),
+    (242, 236, 226),
+];
 
 /// Cap on how many row bands a frame's background pass splits across.
 ///
@@ -656,8 +675,9 @@ pub(crate) struct TreeNode {
     /// Index into the same slice, or `None` for a root (the sun tier).
     pub(crate) parent: Option<usize>,
     pub(crate) kind: BodyKind,
-    /// Lifecycle-stage hue in degrees, from `crate::app::lifecycle::stage(...).hue(...)`.
-    pub(crate) hue: f32,
+    /// Lifecycle stage, carried independently so a one-hue body can express it through
+    /// brightness instead of rotating its colour.
+    pub(crate) stage: LifecycleStage,
     pub(crate) severity: Severity,
     /// Where this body sits in the project-size register — [`BodySize::Fixed`] for anything that
     /// is not a project.
@@ -747,7 +767,7 @@ struct BodyLayout {
     label: SceneLabel,
     size: BodySize,
     body_type: BodyType,
-    hue: f32,
+    stage: LifecycleStage,
     severity: Severity,
     /// This mate's already-resolved streak expression, `0.0..=1.0` — see [`TreeNode::streak`].
     streak: f32,
@@ -1172,7 +1192,7 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             },
             size: node.size,
             body_type,
-            hue: node.hue,
+            stage: node.stage,
             severity: node.severity,
             streak,
             wear: clamp01(node.wear),
@@ -1498,11 +1518,29 @@ fn ease_in(t: f32) -> f32 {
     t * t
 }
 
-/// `signal_ink` as `0.0..=1.0` floats rather than `u8` triples, since shading multiplies it by a
-/// per-pixel lighting factor before quantizing back down once at the end.
-fn severity_rgb01(hue: f32, severity: Severity) -> (f32, f32, f32) {
-    let (r, g, b) = signal_ink(hue, severity, SPACE_SURFACE);
-    (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+fn body_rgb01(
+    kind: BodyKind,
+    seed: u32,
+    stage: LifecycleStage,
+    severity: Severity,
+) -> (f32, f32, f32) {
+    let material = match kind {
+        BodyKind::Moon => MOON_ALBEDO[seed as usize % MOON_ALBEDO.len()],
+        BodyKind::Planet => PLANET_ALBEDO[seed as usize % PLANET_ALBEDO.len()],
+        BodyKind::Sun => (255, 241, 213),
+    };
+    let (hue, saturation, luminance) = crate::ui::color::to_hsl(material);
+    let mix = one_hue_stage_mix(stage);
+    let ink = crate::ui::color::from_hsl(
+        hue,
+        saturation * mix.saturation,
+        signal_light_over_material(luminance * mix.luminance, severity),
+    );
+    (
+        f32::from(ink.0) / 255.0,
+        f32::from(ink.1) / 255.0,
+        f32::from(ink.2) / 255.0,
+    )
 }
 
 /// Half-width of the terminator's transition, in the same cosine units the Lambert term is in.
@@ -2690,7 +2728,7 @@ fn draw_trail(
             BodyKind::Moon => TRAIL_WIDTH_MOON,
             _ => TRAIL_WIDTH_MATE,
         };
-    let base = severity_rgb01(body.hue, body.severity);
+    let base = body_rgb01(body.kind, body_seed(idx), body.stage, body.severity);
     let span = TRAIL_LOOKBACK * 2.0 * PI;
 
     // The arc this body sweeps over the lookback, in pixels — the whole point of deriving the
@@ -3656,9 +3694,10 @@ fn frame_inner(layout: &SceneLayout, phase: f32, parts: Parts) -> Vec<u8> {
 /// What one laid-out body's surface is made of, for [`shade_surface`].
 ///
 /// The sun is a star, not a severity-coded body: it holds one fixed warm colour regardless of
-/// fleet state, while every other body still resolves through the shared hue/severity channel —
-/// see [`SUN_STAR_RGB01`]. Bands and mottle depth come from the body's [`BodyType`], which is a
-/// second mate's own binding fact and nothing a worker or a star has.
+/// fleet state. Every planet and moon uses its artifact material albedo, with stage restating
+/// saturation/light and severity controlling intensity — see [`body_rgb01`]. Bands and mottle depth come from the
+/// body's [`BodyType`], which is a second mate's own binding fact and nothing a worker or a star
+/// has.
 fn surface_of(
     body: &BodyLayout,
     seed: u32,
@@ -3671,7 +3710,7 @@ fn surface_of(
         base: if self_luminous {
             SUN_STAR_RGB01
         } else {
-            severity_rgb01(body.hue, body.severity)
+            body_rgb01(body.kind, seed, body.stage, body.severity)
         },
         seed,
         self_luminous,
@@ -4203,7 +4242,7 @@ const GROOVE_ALPHA: (f32, f32) = (0.22, 0.95);
 /// radius fractions are in a different coordinate space entirely and comparing the two would be a
 /// units error wearing the clothes of an invariant. What keeps a core from reading as a stray
 /// worker moon is [`CORE_RGB01`] — cores are the substrate, not the work, so they sit outside the
-/// lifecycle hue channel every fleet body resolves through.
+/// warm body family every fleet body resolves through.
 const CORE_RADIUS_FRACTION: f32 = 0.022;
 
 /// The smallest a core body is drawn, as a share of [`CORE_RADIUS_FRACTION`]. An idle core is
@@ -4215,8 +4254,8 @@ const CORE_RADIUS_FLOOR: f32 = 0.34;
 const CORE_GAP: f32 = 1.35;
 
 /// The hue a core body carries. Cores are the substrate rather than the work, so they are
-/// deliberately outside the lifecycle hue channel every fleet body resolves through — the same
-/// exemption the sun and the rings already hold, and for the same reason.
+/// deliberately outside the warm family every fleet body resolves through — the same exemption
+/// the sun and the rings already hold, and for the same reason.
 const CORE_RGB01: (f32, f32, f32) = (0.62, 0.72, 0.80);
 
 /// Render the machine corner: one groove per quantity, and one shaded body per logical CPU.
@@ -4408,7 +4447,7 @@ mod tests {
             label: SceneLabel::EMPTY,
             parent,
             kind,
-            hue: 41.0,
+            stage: LifecycleStage::Running,
             severity: Severity::Clear,
             size: BodySize::Fixed,
             streak: 0.0,
@@ -4426,18 +4465,17 @@ mod tests {
         }
     }
 
-    /// Hue of the `Done`/idle lifecycle stage — the green every body in a quiet fleet resolves
-    /// to, and the case that exposed the green-sun-beside-a-green-planet bug.
-    const IDLE_HUE: f32 = 115.0;
-    /// Hue of the `Failed` stage, used to prove the sun ignores stage entirely.
-    const FAILED_HUE: f32 = 343.0;
-
-    fn body(parent: Option<usize>, kind: BodyKind, hue: f32, severity: Severity) -> TreeNode {
+    fn body_at_stage(
+        parent: Option<usize>,
+        kind: BodyKind,
+        stage: LifecycleStage,
+        severity: Severity,
+    ) -> TreeNode {
         TreeNode {
             label: SceneLabel::EMPTY,
             parent,
             kind,
-            hue,
+            stage,
             severity,
             size: BodySize::Fixed,
             streak: 0.0,
@@ -4445,6 +4483,10 @@ mod tests {
             motes: 0,
             mote_share: 0.0,
         }
+    }
+
+    fn body(parent: Option<usize>, kind: BodyKind, severity: Severity) -> TreeNode {
+        body_at_stage(parent, kind, LifecycleStage::Running, severity)
     }
 
     /// A real spread of checkouts, as measured on the box this register was designed against: a
@@ -4629,12 +4671,105 @@ mod tests {
     }
 
     #[test]
-    fn the_sun_holds_a_warm_star_colour_while_an_idle_planet_stays_green() {
+    fn planets_and_moons_do_not_change_hue_with_lifecycle_stage() {
+        let (width, height) = (400u32, 300u32);
+        let phase = 0.0;
+        let idle = [
+            body(None, BodyKind::Sun, Severity::Clear),
+            body_at_stage(
+                Some(0),
+                BodyKind::Planet,
+                LifecycleStage::Done,
+                Severity::Clear,
+            ),
+            body_at_stage(
+                Some(1),
+                BodyKind::Moon,
+                LifecycleStage::Done,
+                Severity::Clear,
+            ),
+        ];
+        let failed = [
+            body(None, BodyKind::Sun, Severity::Clear),
+            body_at_stage(
+                Some(0),
+                BodyKind::Planet,
+                LifecycleStage::Failed,
+                Severity::Clear,
+            ),
+            body_at_stage(
+                Some(1),
+                BodyKind::Moon,
+                LifecycleStage::Failed,
+                Severity::Clear,
+            ),
+        ];
+        let idle_layout = build_layout(&idle, width, height);
+        let failed_layout = build_layout(&failed, width, height);
+        let idle_rgba = frame(&idle_layout, phase);
+        let failed_rgba = frame(&failed_layout, phase);
+
+        for idx in [1, 2] {
+            let idle = pixel_at(&idle_rgba, width, idle_layout.position(idx, phase));
+            let failed = pixel_at(&failed_rgba, width, failed_layout.position(idx, phase));
+            let idle_hue = crate::ui::color::to_hsl(idle).0;
+            let failed_hue = crate::ui::color::to_hsl(failed).0;
+            assert!(
+                (15.0..=45.0).contains(&idle_hue)
+                    && (15.0..=45.0).contains(&failed_hue)
+                    && (idle_hue - failed_hue).abs() < 5.0,
+                "lifecycle stage rotated body {idx} from {idle_hue:.1}° to {failed_hue:.1}°"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_stage_and_severity_remain_legible_as_body_intensity() {
+        let (width, height) = (400u32, 300u32);
+        let phase = 0.0;
+        let rendered_luminance = |kind, stage, severity| {
+            let nodes = [
+                body(None, BodyKind::Sun, Severity::Clear),
+                body_at_stage(Some(0), kind, stage, severity),
+            ];
+            let layout = build_layout(&nodes, width, height);
+            let rgb = pixel_at(&frame(&layout, phase), width, layout.position(1, phase));
+            crate::ui::color::to_hsl(rgb).2
+        };
+
+        let queued = rendered_luminance(BodyKind::Planet, LifecycleStage::Queued, Severity::Clear);
+        let done = rendered_luminance(BodyKind::Planet, LifecycleStage::Done, Severity::Clear);
+        let running =
+            rendered_luminance(BodyKind::Planet, LifecycleStage::Running, Severity::Clear);
+        assert!(
+            queued < done && done < running,
+            "{queued} < {done} < {running}"
+        );
+
+        for kind in [BodyKind::Planet, BodyKind::Moon] {
+            for stage in LifecycleStage::ALL {
+                let levels =
+                    Severity::ALL.map(|severity| rendered_luminance(kind, stage, severity));
+                assert!(
+                    levels.windows(2).all(|pair| pair[0] < pair[1]),
+                    "severity stopped lifting {kind:?}/{stage:?} intensity: {levels:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sun_holds_a_warm_star_colour_while_an_idle_planet_stays_dim_amber() {
         // The exact fleet that exposed the bug: everything idle, so every body resolved to the
         // same lifecycle green and the sun rendered as just another green disk.
         let nodes = [
-            body(None, BodyKind::Sun, IDLE_HUE, Severity::Clear),
-            body(Some(0), BodyKind::Planet, IDLE_HUE, Severity::Clear),
+            body(None, BodyKind::Sun, Severity::Clear),
+            body_at_stage(
+                Some(0),
+                BodyKind::Planet,
+                LifecycleStage::Done,
+                Severity::Clear,
+            ),
         ];
         let (width, height) = (400u32, 300u32);
         let layout = build_layout(&nodes, width, height);
@@ -4651,10 +4786,10 @@ mod tests {
         );
         assert!(sun.0 > 180, "sun should read as a bright star, got {sun:?}");
 
-        // The planet is untouched by this change: still green-dominant for the idle stage.
+        // The planet stays in the warm scene family; idleness is its lower intensity, not green.
         assert!(
-            planet.1 > planet.0 && planet.1 > planet.2,
-            "idle planet should still be green-dominant, got {planet:?}"
+            planet.0 > planet.1 && planet.1 > planet.2,
+            "idle planet should be warm (r > g > b), got {planet:?}"
         );
 
         // And the two no longer collapse onto the same colour.
@@ -4673,12 +4808,22 @@ mod tests {
         let phase = 0.0;
 
         let idle = [
-            body(None, BodyKind::Sun, IDLE_HUE, Severity::Clear),
-            body(Some(0), BodyKind::Planet, IDLE_HUE, Severity::Clear),
+            body(None, BodyKind::Sun, Severity::Clear),
+            body_at_stage(
+                Some(0),
+                BodyKind::Planet,
+                LifecycleStage::Done,
+                Severity::Clear,
+            ),
         ];
         let failing = [
-            body(None, BodyKind::Sun, FAILED_HUE, Severity::Critical),
-            body(Some(0), BodyKind::Planet, FAILED_HUE, Severity::Critical),
+            body(None, BodyKind::Sun, Severity::Critical),
+            body_at_stage(
+                Some(0),
+                BodyKind::Planet,
+                LifecycleStage::Failed,
+                Severity::Critical,
+            ),
         ];
 
         let idle_layout = build_layout(&idle, width, height);
@@ -6183,7 +6328,7 @@ mod tests {
     fn write_the_scene_to_a_png() {
         let path = std::env::var("HERDR_SCENE_PNG").unwrap_or_else(|_| "scene.png".into());
         let (w, h) = (1_920u32, 1_080u32);
-        let layout = build_layout(&sky_fleet(), w, h);
+        let layout = build_layout(&artifact_sky_fleet(), w, h);
         std::fs::write(&path, encode_rgba_png(w, h, &frame(&layout, 0.0))).expect("write the png");
         eprintln!("wrote {path} at {w}x{h}");
     }
@@ -6192,6 +6337,21 @@ mod tests {
     fn sky_fleet() -> Vec<TreeNode> {
         let mut nodes = vec![node(None, BodyKind::Sun)];
         for files in [2_470u32, 860, 430] {
+            nodes.push(sized(Some(0), BodyKind::Planet, BodySize::Files(files)));
+            let planet = nodes.len() - 1;
+            for _ in 0..4 {
+                nodes.push(node(Some(planet), BodyKind::Moon));
+            }
+        }
+        nodes
+    }
+
+    /// The captain's artifact roster order and measured file counts, for the ignored PNG writer.
+    /// The order walks the six artifact albedos once each; the largest project therefore wears
+    /// the same `herdr` material that dominates the target captures' body distribution.
+    fn artifact_sky_fleet() -> Vec<TreeNode> {
+        let mut nodes = vec![node(None, BodyKind::Sun)];
+        for files in [99u32, 2_470, 314, 860, 430, 2] {
             nodes.push(sized(Some(0), BodyKind::Planet, BodySize::Files(files)));
             let planet = nodes.len() - 1;
             for _ in 0..4 {
@@ -7078,17 +7238,17 @@ mod tests {
         assert_eq!(TRACK_RGB01, (43.0 / 255.0, 109.0 / 255.0, 132.0 / 255.0));
 
         // ...and what keeps a core from reading as a worker moon that wandered into the corner is
-        // its colour rather than its size: the substrate sits outside the lifecycle hue channel
-        // every fleet body resolves through. Held against the real channel, at both ends of it,
-        // rather than against a remembered pair of numbers.
+        // its colour rather than its size: the substrate sits outside the warm family every fleet
+        // body resolves through. Held against every lifecycle/intensity combination rather than
+        // against one remembered colour.
         let cool = |rgb: (f32, f32, f32)| rgb.2 > rgb.0;
         assert!(cool(CORE_RGB01), "a core has drifted warm");
         assert!(cool(TRACK_RGB01), "the track has drifted warm");
-        for hue in [IDLE_HUE, FAILED_HUE, 41.0] {
+        for stage in LifecycleStage::ALL {
             for severity in [Severity::Clear, Severity::Critical] {
                 assert!(
-                    !cool(severity_rgb01(hue, severity)),
-                    "a fleet body at hue {hue} reads as cool as the substrate does"
+                    !cool(body_rgb01(BodyKind::Planet, 1, stage, severity)),
+                    "a fleet body at {stage:?} reads as cool as the substrate does"
                 );
             }
         }
