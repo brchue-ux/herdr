@@ -442,6 +442,34 @@ pub(crate) fn tree_nodes(
     tree_nodes_with_tracks(app, &app.orbit_tracks)
 }
 
+/// Lifetime output bytes for the exact rows the whole-fleet scene walks.
+///
+/// Agent pane numbers are scoped to a workspace in the public API (`wA:p2`, `wB:p2`, ...), so the
+/// terminal lookup must use the workspace carried by the sidebar entry that produced the row.
+/// Walking the same `entries`/`agents` pair as [`tree_nodes`] also avoids a fleet-wide workspace
+/// search for every body on every server tick.
+pub(crate) fn ambient_mote_inputs(app: &crate::app::state::AppState) -> Vec<(CardRow, u64)> {
+    let agents = crate::ui::sidebar::sidebar_agent_entries(app);
+    crate::ui::sidebar::workspace_list_entries_whole_fleet(app)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            crate::ui::sidebar::WorkspaceListEntry::Workspace { ws_idx, .. } => app
+                .workspaces
+                .get(ws_idx)
+                .map(|workspace| (CardRow::Space(workspace.id.clone()), 0)),
+            crate::ui::sidebar::WorkspaceListEntry::Agent { entry_idx, .. } => {
+                let detail = agents.get(entry_idx)?;
+                let bytes = app
+                    .terminal_id_for_pane(detail.ws_idx, detail.pane_id)
+                    .and_then(|id| app.pane_activity.get(&id))
+                    .map(|activity| activity.output_bytes)
+                    .unwrap_or(0);
+                Some((CardRow::Agent(detail.pane_id), bytes))
+            }
+        })
+        .collect()
+}
+
 /// [`tree_nodes`], against a given track layer — so a test can hand one in and a caller that has
 /// borrowed the tracks mutably does not have to give them back first.
 pub(crate) fn tree_nodes_with_tracks(
@@ -1085,6 +1113,67 @@ mod tests {
             None,
             Instant::now(),
         );
+    }
+
+    #[test]
+    fn ambient_inputs_resolve_each_public_pane_number_through_its_own_workspace() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("left"),
+            crate::workspace::Workspace::test_new("right"),
+        ];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let roots: Vec<_> = app
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.tabs[0].root_pane)
+            .collect();
+        assert_eq!(app.workspaces[0].public_pane_number(roots[0]), Some(1));
+        assert_eq!(app.workspaces[1].public_pane_number(roots[1]), Some(1));
+
+        let terminal_ids: Vec<_> = app
+            .workspaces
+            .iter()
+            .zip(&roots)
+            .map(|(workspace, pane)| {
+                workspace
+                    .terminal_id(*pane)
+                    .cloned()
+                    .expect("root terminal")
+            })
+            .collect();
+        let now = Instant::now();
+        for (index, terminal_id) in terminal_ids.iter().enumerate() {
+            let terminal = app.terminals.get_mut(terminal_id).expect("terminal state");
+            terminal.set_agent_name(format!("worker-{index}"));
+            terminal.metadata_tokens.patch(
+                HashMap::from([(
+                    crate::app::agent_tree::OWNER_TOKEN.to_string(),
+                    Some("fleet-owner".to_string()),
+                )]),
+                None,
+                now,
+            );
+        }
+        app.pane_activity.observe(
+            now,
+            [
+                (&terminal_ids[0], 0),
+                (&terminal_ids[1], 3 * BYTES_PER_EVENT),
+            ],
+        );
+
+        let inputs = ambient_mote_inputs(&app);
+        let bytes_for = |pane| {
+            inputs
+                .iter()
+                .find_map(|(row, bytes)| (row == &CardRow::Agent(pane)).then_some(*bytes))
+                .expect("agent row has an activity input")
+        };
+        assert_eq!(bytes_for(roots[0]), 0);
+        assert_eq!(bytes_for(roots[1]), 3 * BYTES_PER_EVENT);
     }
 
     /// A fleet of `count` Spaces under one root, all measured, so every body has a real rate.

@@ -59,6 +59,34 @@ fn background_scene_key(
     hasher.finish()
 }
 
+/// One coherent whole-scene snapshot being rendered away from the loop that owns every pane.
+///
+/// Frames, layout, and row identity travel together so the effects overlay never targets body
+/// positions from a different bake. The receiver is polled; the app/server loop never waits for
+/// the worker.
+pub(crate) struct BackgroundSceneBake {
+    input: BackgroundSceneBakeInput,
+    result_rx: std::sync::mpsc::Receiver<Result<Vec<Vec<u8>>, ()>>,
+}
+
+struct BackgroundSceneBakeInput {
+    key: u64,
+    width: u32,
+    height: u32,
+    identity: Vec<crate::anim::CardRow>,
+    layout: crate::solar_system::SceneLayout,
+}
+
+/// Replacing the root frame re-arms terminal playback at phase zero. A replacement therefore
+/// gets at least one complete animation loop before another bake may replace it.
+const BACKGROUND_SCENE_REBAKE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(crate::app::background_scene::LOOP_DURATION_MS);
+
+struct FinishedBackgroundSceneBake {
+    input: BackgroundSceneBakeInput,
+    frames: Vec<Vec<u8>>,
+}
+
 /// `pub(crate)` so the pixel card's own tests mount the *real* lifecycle
 /// rather than a copy of it: a spider whose test fixture had its own stage
 /// table would keep passing after this one changed shape.
@@ -461,7 +489,7 @@ impl App {
         // Before the scene, so a rebake this pass draws this pass's wear and this pass's motes.
         changed |= self.observe_orbit_tracks(now);
         changed |= self.observe_ambient_motes();
-        changed |= self.observe_background_scene();
+        changed |= self.observe_background_scene(now);
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
         changed |= self.observe_background_effects(now, true);
 
@@ -1419,32 +1447,18 @@ impl App {
     /// into a build when the scene first sees it starts from wherever its counter is, rather than
     /// studding its whole orbit in one pass for work nobody was watching.
     pub(crate) fn observe_ambient_motes(&mut self) -> bool {
-        let (_, identity) = crate::app::background_scene::tree_nodes(&self.state);
-        let counts: Vec<(crate::anim::CardRow, u64)> = identity
-            .into_iter()
-            .map(|row| {
-                let bytes = match &row {
-                    crate::anim::CardRow::Agent(pane_id) => (0..self.state.workspaces.len())
-                        .find_map(|ws_idx| self.state.terminal_id_for_pane(ws_idx, *pane_id))
-                        .and_then(|id| self.state.pane_activity.get(&id))
-                        .map(|activity| activity.output_bytes)
-                        .unwrap_or(0),
-                    // A Space is not a terminal: its own traffic is the sum of the workers under
-                    // it, and those already have their own bodies. Counting it again here would
-                    // put the same work in the frame twice.
-                    crate::anim::CardRow::Space(_) => 0,
-                };
-                (row, bytes)
-            })
-            .collect();
+        let counts = crate::app::background_scene::ambient_mote_inputs(&self.state);
         let mut motes = std::mem::take(&mut self.state.ambient_motes);
         let emitted = motes.consume(counts.iter().map(|(row, bytes)| (row, *bytes)));
         self.state.ambient_motes = motes;
         emitted
     }
 
-    pub(crate) fn observe_background_scene(&mut self) -> bool {
+    pub(crate) fn observe_background_scene(&mut self, now: Instant) -> bool {
+        let finished = self.take_finished_background_scene_bake();
+
         if !self.state.background_scene_active() {
+            self.background_scene_deferred_bake_at = None;
             return self.clear_background_scene();
         }
 
@@ -1453,40 +1467,149 @@ impl App {
         // the foreground client's — see `AppState::shared_raster_cell_size`.
         let cell = self.state.shared_raster_cell_size();
         if area.width == 0 || area.height == 0 || !cell.is_known() {
+            self.background_scene_deferred_bake_at = None;
             return self.clear_background_scene();
         }
 
         let (nodes, identity) = crate::app::background_scene::tree_nodes(&self.state);
         let key = background_scene_key(&nodes, area, cell);
-        if key == self.state.background_scene_key && self.state.background_scene.is_some() {
-            return false;
-        }
-
         let width = u32::from(area.width) * cell.width_px;
         let height = u32::from(area.height) * cell.height_px;
         let layout = crate::solar_system::build_layout(&nodes, width, height);
         if layout.is_empty() {
             // No fleet to mirror yet — nothing ambient to draw.
+            self.background_scene_deferred_bake_at = None;
             return self.clear_background_scene();
         }
-        // Whole-terminal frames are far too large for raw RGBA to fit the wire once multiplied
-        // across a whole animation loop — see `solar_system::encode_png`'s own doc for the
-        // measured numbers that forced this.
-        let frames =
-            crate::solar_system::loop_frames_png(&layout, crate::solar_system::FRAME_COUNT);
-        let mut frames = frames.into_iter();
+
+        let mut changed = false;
+        if let Some(finished) = finished {
+            // Content may advance while 36 frames are rendering. Installing that coherent
+            // snapshot gives the terminal a usable loop; the key mismatch below queues the latest
+            // snapshot behind the rate floor. Pixel geometry is different: installing old-sized
+            // frames after a resize would place the entire layer incorrectly, so those are
+            // discarded.
+            if finished.input.width == width && finished.input.height == height {
+                changed |= self.adopt_baked_background_scene(finished, now);
+            }
+        }
+
+        if key == self.state.background_scene_key && self.state.background_scene.is_some() {
+            self.background_scene_deferred_bake_at = None;
+            return changed;
+        }
+
+        // The current layer remains live while its replacement renders. There is only ever one
+        // worker owned by this App, including across disable/resize churn.
+        if self.background_scene_bake.is_some() {
+            self.background_scene_deferred_bake_at = None;
+            return changed;
+        }
+
+        if let Some(next) = self
+            .background_scene_next_bake_at
+            .filter(|next| now < *next)
+        {
+            self.background_scene_deferred_bake_at = Some(next);
+            return changed;
+        }
+
+        self.background_scene_deferred_bake_at = None;
+        self.spawn_background_scene_bake(key, width, height, identity, layout, now);
+        changed
+    }
+
+    fn spawn_background_scene_bake(
+        &mut self,
+        key: u64,
+        width: u32,
+        height: u32,
+        identity: Vec<crate::anim::CardRow>,
+        layout: crate::solar_system::SceneLayout,
+        now: Instant,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let bake_layout = layout.clone();
+        let notify = std::sync::Arc::clone(&self.render_notify);
+        let worker = std::thread::Builder::new()
+            .name("herdr-scene-bake".into())
+            .spawn(move || {
+                let frames = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::solar_system::loop_frames_png(
+                        &bake_layout,
+                        crate::solar_system::FRAME_COUNT,
+                    )
+                }))
+                .map_err(|_| ());
+                let _ = tx.send(frames);
+                // `Notify` retains a permit, so finishing between select passes is not a lost
+                // wake. Failure wakes too, allowing the loop to retire the broken request.
+                notify.notify_one();
+            });
+
+        self.background_scene_next_bake_at = Some(now + BACKGROUND_SCENE_REBAKE_INTERVAL);
+        match worker {
+            Ok(_) => {
+                self.background_scene_bake = Some(BackgroundSceneBake {
+                    input: BackgroundSceneBakeInput {
+                        key,
+                        width,
+                        height,
+                        identity,
+                        layout,
+                    },
+                    result_rx: rx,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not spawn background scene bake");
+                self.background_scene_deferred_bake_at = self.background_scene_next_bake_at;
+            }
+        }
+    }
+
+    fn take_finished_background_scene_bake(&mut self) -> Option<FinishedBackgroundSceneBake> {
+        let received = match self.background_scene_bake.as_ref() {
+            Some(bake) => bake.result_rx.try_recv(),
+            None => return None,
+        };
+        let result = match received {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(()),
+        };
+        let bake = self.background_scene_bake.take()?;
+        match result {
+            Ok(frames) => Some(FinishedBackgroundSceneBake {
+                input: bake.input,
+                frames,
+            }),
+            Err(()) => {
+                tracing::warn!("background scene bake ended without frames");
+                None
+            }
+        }
+    }
+
+    fn adopt_baked_background_scene(
+        &mut self,
+        bake: FinishedBackgroundSceneBake,
+        now: Instant,
+    ) -> bool {
+        let mut frames = bake.frames.into_iter();
         let Some(root) = frames.next() else {
-            return self.clear_background_scene();
+            tracing::warn!("background scene bake produced no frames");
+            return false;
         };
 
-        self.state.background_scene_key = key;
-        self.state.background_scene_generated_at = Some(Instant::now());
-        self.state.background_scene_identity = identity;
+        self.state.background_scene_key = bake.input.key;
+        self.state.background_scene_generated_at = Some(now);
+        self.state.background_scene_identity = bake.input.identity;
         self.state.background_scene = Some(
             crate::app::state::GraphicsLayer::new(
                 crate::api::schema::PaneGraphicsFormat::Png,
-                width,
-                height,
+                bake.input.width,
+                bake.input.height,
                 root,
                 crate::api::schema::PaneGraphicsPlacementParams {
                     viewport_col: 0,
@@ -1506,7 +1629,10 @@ impl App {
                 frames: frames.collect(),
             }),
         );
-        self.state.background_scene_layout = Some(layout);
+        self.state.background_scene_layout = Some(bake.input.layout);
+        // A successful swap restarts phase zero, so it owns a fresh whole-loop floor even if the
+        // worker itself took longer than the floor established when it started.
+        self.background_scene_next_bake_at = Some(now + BACKGROUND_SCENE_REBAKE_INTERVAL);
         true
     }
 
@@ -1517,6 +1643,39 @@ impl App {
         self.state.background_scene_identity.clear();
         self.state.background_scene_generated_at = None;
         had
+    }
+
+    fn next_background_scene_bake_deadline(&self) -> Option<Instant> {
+        if self.background_scene_bake.is_some() {
+            return None;
+        }
+        self.background_scene_deferred_bake_at
+    }
+
+    /// Wait for a queued bake only in tests that need the finished pixels. Production never calls
+    /// this path; its app/server loop keeps servicing panes until the worker notifies it.
+    #[cfg(test)]
+    pub(crate) fn settle_background_scene(&mut self, now: Instant) -> bool {
+        let mut changed = self.observe_background_scene(now);
+        let Some(bake) = self.background_scene_bake.take() else {
+            return changed;
+        };
+        let result = bake
+            .result_rx
+            .recv_timeout(std::time::Duration::from_secs(60));
+        match result {
+            Ok(Ok(frames)) => {
+                changed |= self.adopt_baked_background_scene(
+                    FinishedBackgroundSceneBake {
+                        input: bake.input,
+                        frames,
+                    },
+                    now,
+                );
+            }
+            Ok(Err(())) | Err(_) => panic!("background scene bake did not finish"),
+        }
+        changed
     }
 
     /// (Re-)generate the background scene's event-driven overlay: in-flight asteroids, fading
@@ -1914,6 +2073,7 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            self.next_background_scene_bake_deadline(),
             render_deadline,
         ]
         .into_iter()
@@ -2863,8 +3023,9 @@ mod tests {
         let kind = crate::kitty_graphics::HostTerminalKind::Other;
         let mut app = background_scene_app();
         app.state.host_terminal_kind = kind;
+        let now = Instant::now();
         assert!(
-            !app.observe_background_scene(),
+            !app.observe_background_scene(now),
             "{kind:?} was handed a scene it has not been measured to draw below text"
         );
         assert!(app.state.background_scene.is_none());
@@ -2876,7 +3037,7 @@ mod tests {
     #[test]
     fn the_background_scene_is_generated_below_text_on_a_host_that_draws_it() {
         let mut app = background_scene_app();
-        assert!(app.observe_background_scene());
+        assert!(app.settle_background_scene(Instant::now()));
         let layer = app
             .state
             .background_scene
@@ -2895,6 +3056,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_background_scene_bake_is_submitted_without_blocking_for_frames() {
+        let mut app = background_scene_app();
+        let now = Instant::now();
+
+        assert!(
+            !app.observe_background_scene(now),
+            "submitting work must not claim that pixels already changed"
+        );
+        assert!(app.background_scene_bake.is_some());
+        assert!(app.state.background_scene.is_none());
+        assert!(app.state.background_scene_layout.is_none());
+    }
+
+    #[test]
+    fn a_changed_scene_waits_one_loop_without_arming_an_idle_spin() {
+        let mut app = background_scene_app();
+        let now = Instant::now();
+        assert!(app.settle_background_scene(now));
+        assert_eq!(app.next_background_scene_bake_deadline(), None);
+
+        app.state.workspaces[0].custom_name = Some("changed-scene-key".to_string());
+        let before_floor = now + std::time::Duration::from_millis(1);
+        assert!(!app.observe_background_scene(before_floor));
+        assert!(app.background_scene_bake.is_none());
+        assert_eq!(
+            app.next_background_scene_bake_deadline(),
+            Some(now + BACKGROUND_SCENE_REBAKE_INTERVAL)
+        );
+
+        assert!(!app.observe_background_scene(now + BACKGROUND_SCENE_REBAKE_INTERVAL));
+        assert!(app.background_scene_bake.is_some());
+        assert_eq!(app.next_background_scene_bake_deadline(), None);
+    }
+
+    #[test]
+    fn disabling_a_scene_does_not_orphan_its_worker_and_start_another() {
+        let mut app = background_scene_app();
+        let now = Instant::now();
+        assert!(!app.observe_background_scene(now));
+        assert!(app.background_scene_bake.is_some());
+
+        app.state.persistent_background_enabled = false;
+        assert!(!app.observe_background_scene(now));
+        assert!(
+            app.background_scene_bake.is_some(),
+            "the owned worker must remain tracked until its result can be discarded"
+        );
+
+        app.state.persistent_background_enabled = true;
+        assert!(!app.observe_background_scene(now));
+        assert!(app.background_scene_bake.is_some());
+    }
+
     /// A client attaching from a different terminal replaces
     /// `host_terminal_kind` (`sync_foreground_client_state`), so a scene
     /// generated for one host has to be retired when the next one cannot draw
@@ -2903,12 +3118,13 @@ mod tests {
     #[test]
     fn a_generated_scene_is_retired_when_the_host_stops_being_one_that_draws_it() {
         let mut app = background_scene_app();
-        assert!(app.observe_background_scene());
+        let now = Instant::now();
+        assert!(app.settle_background_scene(now));
         assert!(app.state.background_scene.is_some());
 
         app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Other;
         assert!(
-            app.observe_background_scene(),
+            app.observe_background_scene(now + std::time::Duration::from_millis(1)),
             "retiring the scene did not report a change to redraw"
         );
         assert!(app.state.background_scene.is_none());
