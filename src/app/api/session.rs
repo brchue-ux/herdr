@@ -126,10 +126,19 @@ impl App {
             .map(|line| crate::api::schema::StatusFeedLineInfo {
                 text: line.text.clone(),
                 kind: match line.kind {
-                    crate::app::state::ToastKind::NeedsAttention => "needs_attention",
-                    crate::app::state::ToastKind::Finished => "finished",
-                    crate::app::state::ToastKind::UpdateInstalled => "update_installed",
-                    crate::app::state::ToastKind::ProcessFailed => "process_failed",
+                    crate::app::status_feed::StatusLineKind::Toast(
+                        crate::app::state::ToastKind::NeedsAttention,
+                    ) => "needs_attention",
+                    crate::app::status_feed::StatusLineKind::Toast(
+                        crate::app::state::ToastKind::Finished,
+                    ) => "finished",
+                    crate::app::status_feed::StatusLineKind::Toast(
+                        crate::app::state::ToastKind::UpdateInstalled,
+                    ) => "update_installed",
+                    crate::app::status_feed::StatusLineKind::Toast(
+                        crate::app::state::ToastKind::ProcessFailed,
+                    ) => "process_failed",
+                    crate::app::status_feed::StatusLineKind::AgentCommand => "agent_command",
                 }
                 .to_string(),
                 age_ms: now.saturating_duration_since(line.at).as_millis() as u64,

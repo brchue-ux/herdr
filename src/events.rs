@@ -230,9 +230,22 @@ pub enum AppEvent {
     /// Carries no command text and no tool name on purpose: the marker draws
     /// a glyph, never the command, so there is nothing here for a renderer to
     /// want. `observed_at` is when the detection task's own scan saw it,
-    /// which is what the marker's visible lifetime is measured from.
+    /// which is what the marker's visible lifetime is measured from. A caller
+    /// that *does* want the command text reads [`Self::AgentCommandObserved`]
+    /// instead, published alongside this one from the same detection pass.
     CommandAcknowledged {
         pane_id: PaneId,
+        observed_at: Instant,
+    },
+    /// The same detection as [`Self::CommandAcknowledged`], carrying the
+    /// command text so `crate::app::status_feed::StatusFeed` can hold a real
+    /// line for it. Kept separate from `CommandAcknowledged` rather than
+    /// adding a field to it: that event's whole point was carrying nothing a
+    /// renderer could want, and this is the event for the one caller that
+    /// now does.
+    AgentCommandObserved {
+        pane_id: PaneId,
+        command: String,
         observed_at: Instant,
     },
     /// Claude displayed a green success circle for a completed ask in this pane.

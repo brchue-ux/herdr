@@ -222,6 +222,28 @@ async fn publish_command_acknowledged_event(
     }
 }
 
+async fn publish_agent_command_observed_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    command: String,
+    observed_at: std::time::Instant,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::AgentCommandObserved {
+            pane_id,
+            command,
+            observed_at,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver AgentCommandObserved event"
+        );
+    }
+}
+
 async fn publish_pane_success_event(
     state_events: mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -1024,8 +1046,15 @@ fn spawn_basic_detection_task(
                 let markers = crate::detect::command_markers(agent, &content);
                 let fresh =
                     crate::detect::diff_new_markers(markers, &mut acknowledged_command_markers);
-                for _ in &fresh {
+                for marker in &fresh {
                     publish_command_acknowledged_event(state_events.clone(), pane_id, now).await;
+                    publish_agent_command_observed_event(
+                        state_events.clone(),
+                        pane_id,
+                        crate::detect::bash_command_text(marker),
+                        now,
+                    )
+                    .await;
                 }
                 if agent == Some(crate::detect::Agent::Claude) {
                     // The normal Claude path paired both forms under one terminal lock. A screen-
@@ -2693,10 +2722,17 @@ impl PaneRuntime {
                                 markers,
                                 &mut acknowledged_command_markers,
                             );
-                            for _ in &fresh {
+                            for marker in &fresh {
                                 publish_command_acknowledged_event(
                                     state_events.clone(),
                                     pane_id,
+                                    now,
+                                )
+                                .await;
+                                publish_agent_command_observed_event(
+                                    state_events.clone(),
+                                    pane_id,
+                                    detect::bash_command_text(marker),
                                     now,
                                 )
                                 .await;

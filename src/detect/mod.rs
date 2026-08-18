@@ -8,7 +8,7 @@ pub mod manifest;
 pub mod manifest_update;
 pub(crate) mod success_marker;
 
-pub(crate) use command_marker::{command_markers, diff_new_markers};
+pub(crate) use command_marker::{bash_command_text, command_markers, diff_new_markers};
 pub(crate) use success_marker::{diff_new_success_markers, success_markers};
 
 /// The detected state of a terminal pane.

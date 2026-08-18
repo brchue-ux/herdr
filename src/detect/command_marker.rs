@@ -52,6 +52,25 @@ pub(crate) fn command_markers(agent: Option<Agent>, screen: &str) -> Vec<String>
         .collect()
 }
 
+/// Pulls the command text out of one `⏺ Bash(...)` marker line, for a caller
+/// that wants to show the command itself rather than the raw bullet.
+///
+/// Takes everything between the first `Bash(` and the last `)`, so a command
+/// that itself contains parentheses is not truncated at the first one. Falls
+/// back to the whole trimmed line if the shape does not match — this is a
+/// display helper, not a second parser with its own failure mode.
+pub(crate) fn bash_command_text(marker_line: &str) -> String {
+    let trimmed = marker_line.trim();
+    let Some(start) = trimmed.find("Bash(") else {
+        return trimmed.to_string();
+    };
+    let after = &trimmed[start + "Bash(".len()..];
+    match after.rfind(')') {
+        Some(end) => after[..end].trim().to_string(),
+        None => after.trim().to_string(),
+    }
+}
+
 /// Diffs one scan's markers against what a caller has already acknowledged,
 /// and reports only the ones genuinely new since the last scan.
 ///
@@ -141,6 +160,21 @@ mod tests {
             command_markers(Some(Agent::Claude), screen),
             vec!["⏺ Bash(npm test)".to_string()]
         );
+    }
+
+    #[test]
+    fn bash_command_text_extracts_the_command() {
+        assert_eq!(bash_command_text("⏺ Bash(npm test)"), "npm test");
+    }
+
+    #[test]
+    fn bash_command_text_keeps_inner_parens() {
+        assert_eq!(bash_command_text("⏺ Bash(echo $(date))"), "echo $(date)");
+    }
+
+    #[test]
+    fn bash_command_text_falls_back_to_the_whole_line_when_unshaped() {
+        assert_eq!(bash_command_text("not a bash bullet"), "not a bash bullet");
     }
 
     #[test]
