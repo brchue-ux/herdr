@@ -17,8 +17,9 @@ use super::{
 /// a spider that has climbed to a card it is still sitting on has to leave the
 /// same way it arrived, not vanish.
 /// Everything the background scene's ambient loop depends on, folded into one number: the
-/// screen's pixel dimensions and the fleet tree's own shape (which bodies exist, their kind, hue
-/// and severity — a `Vec<TreeNode>`'s field values, since the type itself has no `Hash`).
+/// screen's pixel dimensions and the fleet tree's own shape (which bodies exist, their kind,
+/// lifecycle stage and severity — a `Vec<TreeNode>`'s field values, since the type itself has no
+/// `Hash`).
 fn background_scene_key(
     nodes: &[crate::solar_system::TreeNode],
     area: ratatui::layout::Rect,
@@ -33,7 +34,7 @@ fn background_scene_key(
     for node in nodes {
         node.parent.hash(&mut hasher);
         (node.kind as u8).hash(&mut hasher);
-        node.hue.to_bits().hash(&mut hasher);
+        node.stage.hash(&mut hasher);
         node.severity.hash(&mut hasher);
         // A project that grew is a body that has to be redrawn at its new radius; leaving `size`
         // out of the key would cache the scene at whatever size it first saw.

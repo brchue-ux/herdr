@@ -5,8 +5,8 @@
 //! `src/particle_field.rs` — `src/solar_system.rs` is the pure `(layout, effects, phase) ->
 //! RGBA8` generator, this module is everything that depends on live `AppState`: deriving the
 //! scene's shape from the same owner tree the sidebar draws
-//! (`crate::ui::sidebar::workspace_list_entries_whole_fleet`), resolving colour from the existing
-//! `crate::app::lifecycle` hue/severity channel, and turning real triggers — a pane's own
+//! (`crate::ui::sidebar::workspace_list_entries_whole_fleet`), resolving lifecycle stage and
+//! severity onto the scene's one warm body family, and turning real triggers — a pane's own
 //! `PendingEffects` entry, a fleet-published `outcome`/`streak` token, a workspace's PR checks
 //! going green — into the asteroid/crater/comet effects `solar_system::SceneEffects` describes.
 //!
@@ -530,7 +530,7 @@ pub(crate) fn tree_nodes_with(
             parent,
             kind,
             label: facts.label,
-            hue: facts.hue,
+            stage: facts.stage,
             severity: facts.severity,
             size: facts.size,
             streak: facts.streak,
@@ -591,7 +591,7 @@ struct RowFacts {
     /// What this body is called in the sky — the Space's own display name. Empty for a worker,
     /// which the reference does not caption.
     label: solar_system::SceneLabel,
-    hue: f32,
+    stage: crate::anim::cell::LifecycleStage,
     severity: Severity,
     size: solar_system::BodySize,
     /// The quality-streak expression, `0.0..=1.0` — see [`streak_expression`].
@@ -655,7 +655,6 @@ fn row_for_entry(
                     .get(crate::app::lifecycle::SEVERITY_TOKEN)
                     .map(String::as_str),
             );
-            let hue = stage.hue(&app.palette, &app.host_terminal_theme);
             Some(RowFacts {
                 row: CardRow::Space(workspace.id.clone()),
                 // The same name the sidebar's own row prints, so the sky and the tree name the same
@@ -663,7 +662,7 @@ fn row_for_entry(
                 label: solar_system::SceneLabel::new(
                     &workspace.display_name_from_terminals(&app.terminals),
                 ),
-                hue,
+                stage,
                 severity,
                 size: work_size(workspace),
                 streak: streak_expression(workspace),
@@ -684,7 +683,6 @@ fn row_for_entry(
                     .get(crate::app::lifecycle::SEVERITY_TOKEN)
                     .map(String::as_str),
             );
-            let hue = stage.hue(&app.palette, &app.host_terminal_theme);
             // A worker is not a project, so it stays out of the size register entirely and keeps
             // its tier's fixed radius — the same reason the sun is out of it. It is out of the
             // streak register for the same reason: the captain's correction puts the streak
@@ -696,7 +694,7 @@ fn row_for_entry(
                 // leaves the workers bare, and at a worker's drawn size the caption would be longer
                 // than the body it names.
                 label: solar_system::SceneLabel::EMPTY,
-                hue,
+                stage,
                 severity,
                 size: solar_system::BodySize::Fixed,
                 streak: 0.0,

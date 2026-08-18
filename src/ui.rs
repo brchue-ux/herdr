@@ -2230,7 +2230,7 @@ switch_workspace = "ctrl+1..9"
             label: crate::solar_system::SceneLabel::EMPTY,
             parent: None,
             kind: crate::solar_system::BodyKind::Sun,
-            hue: 41.0,
+            stage: crate::anim::cell::LifecycleStage::Running,
             // `Severity::Critical` sits at `signal_light`'s brightest step (`SEVERITY_LIGHT_REACH`
             // tops out at 0.92, near `SIGNAL_LIGHT_BOUNDS`'s own ceiling) — `Clear`'s far dimmer
             // ink measured well under the WCAG black/white crossover luminance (~0.179) once

@@ -271,13 +271,6 @@ pub(super) const TIDBIT_INK_MIX: f32 = 0.52;
 /// The tidbit's type size, as a fraction of the title's.
 pub(super) const TIDBIT_SIZE_MUL: f32 = 0.72;
 
-/// An inactive card in the reference is the same hue as an active one and
-/// differs only by saturation and bloom — S 14.5% where an active card is
-/// 59.6%, lum 111 against 196, and no bloom at all. It never moves hue to
-/// signal anything, which is the reference answering the state question itself.
-pub(super) const MUTED_SAT: f32 = 0.145 / 0.596;
-pub(super) const MUTED_LUM: f32 = 111.5 / 196.5;
-
 #[cfg(test)]
 mod tests {
     use super::*;
