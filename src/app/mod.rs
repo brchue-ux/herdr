@@ -177,6 +177,12 @@ pub struct App {
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    /// Whole-frame scene rendering currently running outside the app/server loop.
+    pub(crate) background_scene_bake: Option<runtime::BackgroundSceneBake>,
+    /// Earliest time another whole scene may begin baking.
+    pub(crate) background_scene_next_bake_at: Option<Instant>,
+    /// Wake owed because a changed scene was held behind the rebake floor.
+    pub(crate) background_scene_deferred_bake_at: Option<Instant>,
     pub(crate) detached_custom_command_children: Vec<std::process::Child>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
@@ -997,6 +1003,9 @@ impl App {
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
+            background_scene_bake: None,
+            background_scene_next_bake_at: None,
+            background_scene_deferred_bake_at: None,
             detached_custom_command_children: Vec::new(),
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,

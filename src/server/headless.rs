@@ -4851,7 +4851,13 @@ impl HeadlessServer {
         // sample rather than the previous one's.
         changed |= self.app.observe_machine_register(now);
         changed |= self.app.observe_status_feed(now);
-        changed |= self.app.observe_background_scene();
+        // These are runtime registers, not client presentation state. They used to be sampled
+        // only by the monolithic `--no-session` loop, leaving every real server-backed session at
+        // zero traffic, zero revolutions, and zero orbit wear. Before the scene so a replacement
+        // bake sees this pass's register values.
+        changed |= self.app.observe_orbit_tracks(now);
+        changed |= self.app.observe_ambient_motes();
+        changed |= self.app.observe_background_scene(now);
         changed |= self.app.observe_background_effects(now, has_viewers);
         self.app.sync_state_age_timer(now, has_viewers);
         changed
@@ -7039,6 +7045,39 @@ next_tab = ""
                 "the register sampled without naming a file it read"
             );
         }
+    }
+
+    #[test]
+    fn the_headless_tick_advances_orbit_revolutions() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("fleet"),
+            crate::workspace::Workspace::test_new("mate"),
+        ];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+        let now = Instant::now();
+        server.app.state.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::app::agent_tree::OWNER_TOKEN.to_string(),
+                Some("fleet".to_string()),
+            )]),
+            None,
+            now,
+        );
+        let row = crate::anim::CardRow::Space(server.app.state.workspaces[1].id.clone());
+
+        server.handle_scheduled_tasks_headless(now, false);
+        assert_eq!(server.app.state.orbit_tracks.revolutions(&row), 0.0);
+
+        server.handle_scheduled_tasks_headless(
+            now + Duration::from_millis(crate::app::background_scene::LOOP_DURATION_MS),
+            false,
+        );
+        assert!(
+            server.app.state.orbit_tracks.revolutions(&row) > 0.0,
+            "the server-backed loop left the orbit observer at zero"
+        );
     }
 
     /// And it records herdr's own status stream, for the same reason.
