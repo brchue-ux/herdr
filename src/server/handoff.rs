@@ -525,6 +525,7 @@ mod tests {
                 token_sequences: std::collections::HashMap::from([("claude-ctx".into(), 100)]),
             }],
             panes: Vec::new(),
+            ask_comet_last_emitted_age: None,
         };
 
         let encoded = serde_json::to_string(&metadata).expect("encode");

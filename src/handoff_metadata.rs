@@ -1,7 +1,7 @@
-//! Durable API-published metadata carried across a live server handoff.
+//! Runtime metadata carried across a live server handoff.
 //!
 //! Handoff replaces the server process while the fleet keeps running, and it
-//! documents pane PTYs, agent identity and durable metadata as preserved. The
+//! documents pane PTYs, agent identity, durable metadata, and live rate guards as preserved. The
 //! session snapshot alone cannot deliver that: `persist::SessionSnapshot` is
 //! the cold-start format, and it deliberately holds no metadata tokens and no
 //! reported agent metadata, because a session file outlives its process and
@@ -21,18 +21,23 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Everything the exporting server knows that the session snapshot does not.
+/// Everything the exporting server must preserve that the cold session snapshot does not.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct HandoffMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceHandoffMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panes: Vec<PaneHandoffMetadata>,
+    /// Age of the most recently admitted ask comet, preserving the fleet-wide rate bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_comet_last_emitted_age: Option<Duration>,
 }
 
 impl HandoffMetadata {
     pub fn is_empty(&self) -> bool {
-        self.workspaces.is_empty() && self.panes.is_empty()
+        self.workspaces.is_empty()
+            && self.panes.is_empty()
+            && self.ask_comet_last_emitted_age.is_none()
     }
 }
 

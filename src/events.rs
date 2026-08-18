@@ -235,6 +235,12 @@ pub enum AppEvent {
         pane_id: PaneId,
         observed_at: Instant,
     },
+    /// Claude displayed a green success circle for a completed ask in this pane.
+    /// This is TUI presentation evidence; it is not part of the runtime wire protocol.
+    PaneSuccessDetected {
+        pane_id: PaneId,
+        observed_at: Instant,
+    },
     /// A bug or failure was detected in a pane's own output or state — the
     /// "meteor" visual-effect trigger candidate.
     ///

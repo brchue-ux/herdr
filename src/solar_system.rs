@@ -1263,6 +1263,17 @@ impl SceneLayout {
         self.height
     }
 
+    /// One seated body's current position in the normalised coordinates transient effects store.
+    pub(crate) fn body_position_normalized(&self, idx: usize, phase: f32) -> Option<(f32, f32)> {
+        self.is_seated(idx).then(|| {
+            let position = self.position(idx, phase);
+            (
+                position.0 / self.width.max(1) as f32,
+                position.1 / self.height.max(1) as f32,
+            )
+        })
+    }
+
     /// This body's on-screen centre at `phase` (`0.0..=2*PI` covering one full animation loop).
     fn position(&self, idx: usize, phase: f32) -> (f32, f32) {
         let placed = self.place(idx, phase);
@@ -1407,10 +1418,53 @@ pub(crate) struct Ejecta {
     pub(crate) age: f32,
 }
 
+/// The three magnitudes of a win. The producer names the tier; this renderer owns its visual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WinTier {
+    Ask,
+    Ci,
+    Merge,
+}
+
+impl WinTier {
+    pub(crate) fn head_scale(self) -> f32 {
+        match self {
+            Self::Ask => 1.0,
+            Self::Ci => 2.0,
+            Self::Merge => 4.0,
+        }
+    }
+
+    pub(crate) fn trail_scale(self) -> f32 {
+        match self {
+            Self::Ask => 1.0,
+            Self::Ci => 230.0 / 150.0,
+            Self::Merge => 330.0 / 150.0,
+        }
+    }
+
+    /// Ballast: larger wins leave more slowly, matching the captain's reference artifact.
+    pub(crate) fn ejection_scale(self) -> f32 {
+        match self {
+            Self::Ask => 1.0,
+            Self::Ci => 0.81,
+            Self::Merge => 0.62,
+        }
+    }
+
+    pub(crate) fn life_scale(self) -> f32 {
+        match self {
+            Self::Ask => 1.0,
+            Self::Ci => 21.0 / 13.0,
+            Self::Merge => 34.0 / 13.0,
+        }
+    }
+}
+
 /// A comet crossing the whole scene. `start`/`end` are normalised `0.0..=1.0` scene coordinates;
 /// `magnitude` is the already-resolved work-size intensity (`0.0..=1.0`, quiet green-test tier at
 /// the bottom, a landed large task at the top) driving both brightness and tail length.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Comet {
     pub(crate) start: (f32, f32),
     pub(crate) end: (f32, f32),
@@ -1420,6 +1474,9 @@ pub(crate) struct Comet {
     /// `None` (a crossing) uses `end` exactly as given, which is the round-1 behaviour unchanged.
     pub(crate) target: Option<usize>,
     pub(crate) magnitude: f32,
+    pub(crate) tier: WinTier,
+    /// Actual earlier normalised positions observed while this comet was live, oldest first.
+    pub(crate) trail: std::sync::Arc<Vec<(f32, f32)>>,
     /// `0.0` = just launched, `1.0` = crossed off-scene.
     pub(crate) progress: f32,
 }
@@ -3377,50 +3434,90 @@ fn draw_asteroid(
 /// `end` is passed in rather than read off `comet` because an arrival comet's endpoint is the
 /// live position of an orbiting body, which only [`effects_frame`] can resolve — see
 /// [`Comet::target`]. For a crossing comet it is exactly `comet.end`.
-fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet, end: (f32, f32)) {
-    // Comets accelerate too, and an arriving one most visibly: it is falling toward the body the
-    // work landed on. See [`ease_in`].
-    let travel = ease_in(comet.progress);
-    let pos = (
-        mix(comet.start.0, end.0, travel) * width as f32,
-        mix(comet.start.1, end.1, travel) * height as f32,
-    );
-    let dir = (end.0 - comet.start.0, end.1 - comet.start.1);
-    let dir_len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(0.0001);
-    let dir = (dir.0 / dir_len, dir.1 / dir_len);
+fn comet_travel(tier: WinTier, progress: f32) -> f32 {
+    // Ask is the pre-tier p² motion exactly. Heavier wins eject more slowly but still arrive at
+    // precisely the endpoint when their longer life closes.
+    clamp01(progress).powf(1.0 + 1.0 / tier.ejection_scale())
+}
 
-    let core_radius = mix(1.4, 4.0, comet.magnitude);
-    let tail_len = mix(18.0, 140.0, comet.magnitude) * (width.min(height) as f32 / 1440.0);
-    let color = (1.0, 0.97, 0.86);
+pub(crate) fn comet_position_normalized(
+    tier: WinTier,
+    start: (f32, f32),
+    end: (f32, f32),
+    progress: f32,
+) -> (f32, f32) {
+    let travel = comet_travel(tier, progress);
+    (mix(start.0, end.0, travel), mix(start.1, end.1, travel))
+}
 
-    let steps = (tail_len as i32).max(1);
-    for step in 0..steps {
-        let t = step as f32 / steps as f32;
-        let px = pos.0 - dir.0 * t * tail_len;
-        let py = pos.1 - dir.1 * t * tail_len;
-        let radius = mix(core_radius, core_radius * 0.15, t);
-        let alpha = mix(1.0, 0.0, t * t);
-        let x0 = (px - radius).floor().max(0.0) as i32;
-        let x1 = (px + radius).ceil().min(width as f32) as i32;
-        let y0 = (py - radius).floor().max(0.0) as i32;
-        let y1 = (py + radius).ceil().min(height as f32) as i32;
-        for yy in y0..y1 {
-            for xx in x0..x1 {
-                let dx = xx as f32 + 0.5 - px;
-                let dy = yy as f32 + 0.5 - py;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist > radius.max(0.5) {
-                    continue;
-                }
-                let idx = yy as usize * width as usize + xx as usize;
+fn comet_position(
+    comet: &Comet,
+    end: (f32, f32),
+    progress: f32,
+    width: u32,
+    height: u32,
+) -> (f32, f32) {
+    let point = comet_position_normalized(comet.tier, comet.start, end, progress);
+    (point.0 * width as f32, point.1 * height as f32)
+}
+
+fn draw_comet_dot(
+    buf: &mut [[f32; 4]],
+    width: u32,
+    height: u32,
+    center: (f32, f32),
+    radius: f32,
+    alpha: f32,
+) {
+    const COLOR: (f32, f32, f32) = (184.0 / 255.0, 216.0 / 255.0, 230.0 / 255.0);
+    let x0 = (center.0 - radius).floor().max(0.0) as i32;
+    let x1 = (center.0 + radius).ceil().min(width as f32) as i32;
+    let y0 = (center.1 - radius).floor().max(0.0) as i32;
+    let y1 = (center.1 + radius).ceil().min(height as f32) as i32;
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let dx = xx as f32 + 0.5 - center.0;
+            let dy = yy as f32 + 0.5 - center.1;
+            if dx * dx + dy * dy <= radius * radius {
                 blend(
-                    &mut buf[idx],
-                    color,
-                    alpha * clamp01(1.0 - dist / radius.max(0.5)),
+                    &mut buf[yy as usize * width as usize + xx as usize],
+                    COLOR,
+                    alpha,
                 );
             }
         }
     }
+}
+
+fn draw_comet(buf: &mut [[f32; 4]], width: u32, height: u32, comet: &Comet, end: (f32, f32)) {
+    let pos = comet_position(comet, end, comet.progress, width, height);
+
+    let core_radius = mix(1.4, 4.0, comet.magnitude) * comet.tier.head_scale();
+    let tail_cap = mix(18.0, 140.0, comet.magnitude)
+        * comet.tier.trail_scale()
+        * (width.min(height) as f32 / 1440.0);
+
+    // A tail is a series of actual earlier trajectory samples. Every mark has the same solid
+    // #b8d8e6 colour; there is no line fill and no synthetic gradient between head and tail.
+    let mut previous = pos;
+    let mut trail_length = 0.0;
+    for normalised in comet.trail.iter().rev().skip(1) {
+        if trail_length >= tail_cap {
+            break;
+        }
+        let point = (normalised.0 * width as f32, normalised.1 * height as f32);
+        trail_length += ((point.0 - previous.0).powi(2) + (point.1 - previous.1).powi(2)).sqrt();
+        draw_comet_dot(
+            buf,
+            width,
+            height,
+            point,
+            (core_radius * 0.28).max(0.6),
+            0.58,
+        );
+        previous = point;
+    }
+    draw_comet_dot(buf, width, height, pos, core_radius, 1.0);
 }
 
 /// Samples per full animation loop. See [`BodyKind::revolutions_per_loop`] for why every body
@@ -4403,6 +4500,90 @@ fn draw_core_row(
 mod tests {
     use super::*;
 
+    #[test]
+    fn drawn_win_heads_read_back_at_one_two_four() {
+        let layout = build_layout(&[], 256, 256);
+        let drawn_width = |tier| {
+            let rgba = effects_frame(
+                &layout,
+                &SceneEffects {
+                    comets: vec![Comet {
+                        start: (0.5, 0.5),
+                        end: (1.0, 0.5),
+                        target: None,
+                        magnitude: 1.0,
+                        tier,
+                        trail: std::sync::Arc::new(Vec::new()),
+                        progress: 0.0,
+                    }],
+                    ..Default::default()
+                },
+                0.0,
+            );
+            let xs: Vec<_> = rgba
+                .chunks_exact(4)
+                .enumerate()
+                .filter(|(_, pixel)| pixel[3] > 0)
+                .map(|(index, _)| index % 256)
+                .collect();
+            let width =
+                xs.iter().max().expect("drawn head") - xs.iter().min().expect("drawn head") + 1;
+            let center = &rgba[(128 * 256 + 128) * 4..(128 * 256 + 128) * 4 + 4];
+            assert_eq!(
+                &center[..3],
+                &[184, 216, 230],
+                "comet must be solid #b8d8e6"
+            );
+            width
+        };
+
+        let widths = [
+            drawn_width(WinTier::Ask),
+            drawn_width(WinTier::Ci),
+            drawn_width(WinTier::Merge),
+        ];
+        eprintln!("MEASURE drawn comet head widths: ask/ci/merge = {widths:?} px");
+        assert_eq!(widths, [8, 16, 32]);
+    }
+
+    #[test]
+    fn every_visual_dimension_changes_with_the_win_tier() {
+        assert!(WinTier::Ask.trail_scale() < WinTier::Ci.trail_scale());
+        assert!(WinTier::Ci.trail_scale() < WinTier::Merge.trail_scale());
+        assert!(WinTier::Ask.ejection_scale() > WinTier::Ci.ejection_scale());
+        assert!(WinTier::Ci.ejection_scale() > WinTier::Merge.ejection_scale());
+        assert!(WinTier::Ask.life_scale() < WinTier::Ci.life_scale());
+        assert!(WinTier::Ci.life_scale() < WinTier::Merge.life_scale());
+        assert!(comet_travel(WinTier::Ask, 0.5) > comet_travel(WinTier::Ci, 0.5));
+        assert!(comet_travel(WinTier::Ci, 0.5) > comet_travel(WinTier::Merge, 0.5));
+    }
+
+    #[test]
+    fn comet_tail_draws_the_supplied_past_positions() {
+        let layout = build_layout(&[], 256, 256);
+        let rgba = effects_frame(
+            &layout,
+            &SceneEffects {
+                comets: vec![Comet {
+                    start: (0.5, 0.5),
+                    end: (1.0, 0.5),
+                    target: None,
+                    magnitude: 1.0,
+                    tier: WinTier::Ask,
+                    // A deliberately kinked earlier position. Reconstructing a straight gradient
+                    // behind the head cannot put a mark here.
+                    trail: std::sync::Arc::new(vec![(0.2, 0.8), (0.5, 0.5)]),
+                    progress: 0.0,
+                }],
+                ..Default::default()
+            },
+            0.0,
+        );
+        let past = &rgba[(205 * 256 + 51) * 4..(205 * 256 + 51) * 4 + 4];
+        assert!(past[3] > 0, "the recorded past position was not drawn");
+        assert_eq!(&past[..3], &[184, 216, 230]);
+    }
+
     fn node(parent: Option<usize>, kind: BodyKind) -> TreeNode {
         TreeNode {
             label: SceneLabel::EMPTY,
@@ -5139,6 +5320,8 @@ mod tests {
                 end: (1.0, 1.0),
                 target: None,
                 magnitude: 0.8,
+                tier: WinTier::Ask,
+                trail: std::sync::Arc::new(Vec::new()),
                 progress: 0.5,
             }],
             ..Default::default()
@@ -5425,6 +5608,8 @@ mod tests {
                 end: (1.0, 1.0),
                 target: Some(planet),
                 magnitude: 0.8,
+                tier: WinTier::Merge,
+                trail: std::sync::Arc::new(Vec::new()),
                 progress: 1.0,
             }],
             ..Default::default()
@@ -5450,7 +5635,7 @@ mod tests {
         let crossing = SceneEffects {
             comets: vec![Comet {
                 target: None,
-                ..arriving.comets[0]
+                ..arriving.comets[0].clone()
             }],
             ..Default::default()
         };
@@ -5529,6 +5714,8 @@ mod tests {
                 end: (1.0, 0.8),
                 target: None,
                 magnitude: 0.9,
+                tier: WinTier::Ask,
+                trail: std::sync::Arc::new(Vec::new()),
                 progress: 0.4,
             }],
         };
@@ -5714,6 +5901,8 @@ mod tests {
                 end: (1.0, 0.85),
                 target: None,
                 magnitude: 1.0,
+                tier: WinTier::Merge,
+                trail: std::sync::Arc::new(Vec::new()),
                 progress: 0.5,
             }],
             ..Default::default()
@@ -6757,6 +6946,8 @@ mod tests {
             end: (0.5, 0.5),
             target: Some(1),
             magnitude: 1.0,
+            tier: WinTier::Ask,
+            trail: std::sync::Arc::new(Vec::new()),
             progress: 0.5,
         };
         let target = layout.position(1, phase);
@@ -7334,6 +7525,8 @@ mod tests {
                 end: (0.9, 0.9),
                 target: Some(dropped),
                 magnitude: 1.0,
+                tier: WinTier::Ask,
+                trail: std::sync::Arc::new(Vec::new()),
                 progress: 0.5,
             }],
         };

@@ -1088,6 +1088,8 @@ pub struct ExperimentalConfig {
     ///
     /// Only read while `kitty_graphics` is on.
     pub persistent_background: bool,
+    /// The background scene's win-comet effect, on its own switch and rate.
+    pub comets: CometsConfig,
     /// Hand Kitty graphics pixels to the host terminal as a local temp file
     /// (`t=f`) instead of base64 inside the escape stream (`t=d`), and pick a
     /// raw pixel format the detected terminal is fast at, when both the host
@@ -1174,6 +1176,40 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+}
+
+/// `[experimental.comets]` — independently controls the background scene's win comets.
+///
+/// This narrows an already-enabled persistent background; it does not turn that scene on.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct CometsConfig {
+    /// Whether win comets are emitted. Default: true.
+    pub enabled: bool,
+    /// Multiplier for the governed ask-tier rate. Default: 1.0.
+    pub rate: f32,
+}
+
+impl Default for CometsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rate: 1.0,
+        }
+    }
+}
+
+impl CometsConfig {
+    pub const RATE_MIN: f32 = 0.05;
+    pub const RATE_MAX: f32 = 8.0;
+
+    pub fn effective_rate(self) -> f32 {
+        if self.rate.is_finite() {
+            self.rate.clamp(Self::RATE_MIN, Self::RATE_MAX)
+        } else {
+            1.0
+        }
+    }
 }
 
 impl Default for KeysConfig {
@@ -1617,6 +1653,27 @@ switch_ascii_input_source_in_prefix = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.switch_ascii_input_source_in_prefix);
+    }
+
+    #[test]
+    fn comets_have_an_independent_default_on_switch_and_bounded_rate() {
+        let default_config = Config::default();
+        assert!(default_config.experimental.comets.enabled);
+        assert_eq!(default_config.experimental.comets.effective_rate(), 1.0);
+
+        let config: Config = toml::from_str(
+            r#"
+[experimental.comets]
+enabled = false
+rate = 99.0
+"#,
+        )
+        .unwrap();
+        assert!(!config.experimental.comets.enabled);
+        assert_eq!(
+            config.experimental.comets.effective_rate(),
+            CometsConfig::RATE_MAX
+        );
     }
 
     #[test]

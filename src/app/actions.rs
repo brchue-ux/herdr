@@ -3007,6 +3007,19 @@ impl AppState {
             AppEvent::ClipboardRead { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
             AppEvent::CommandAcknowledged { .. } => Vec::new(),
+            AppEvent::PaneSuccessDetected {
+                pane_id,
+                observed_at,
+            } => {
+                if self.background_comets.enabled {
+                    self.pending_effects.record_ask(
+                        pane_id,
+                        observed_at,
+                        self.background_comets.effective_rate(),
+                    );
+                }
+                Vec::new()
+            }
             AppEvent::PaneIssueDetected {
                 pane_id,
                 observed_at,
@@ -5213,6 +5226,34 @@ mod tests {
             crate::app::pending_effects::EffectKind::PaneIssue
         );
         assert_eq!(live[0].spawned_at, observed_at);
+    }
+
+    #[test]
+    fn pane_success_event_reaches_the_governed_pending_effect_path() {
+        let mut state = app_with_workspaces(&["test"]);
+        state.background_comets.enabled = true;
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let observed_at = std::time::Instant::now();
+
+        state.handle_app_event(AppEvent::PaneSuccessDetected {
+            pane_id,
+            observed_at,
+        });
+        state.handle_app_event(AppEvent::PaneSuccessDetected {
+            pane_id,
+            observed_at: observed_at + std::time::Duration::from_secs(1),
+        });
+
+        let live = state.pending_effects.live(observed_at);
+        assert_eq!(
+            live.len(),
+            1,
+            "the second success bypassed the ask governor"
+        );
+        assert_eq!(
+            live[0].kind,
+            crate::app::pending_effects::EffectKind::PaneSuccess
+        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
-//! Identity-scoped triggers for a bounded-lifetime visual effect, waiting for
-//! a renderer that does not exist yet.
+//! Identity-scoped triggers for bounded-lifetime visual effects.
 //!
 //! This is deliberately the smallest possible slice of a much larger feature:
 //! an arbitrary internal event ("a bug was detected in this pane") spawning a
@@ -14,15 +13,14 @@
 //! missing spawn-driven piece, built as a sibling to `Animator` rather than a
 //! new variant inside it: it follows the same single-writer/many-reader
 //! discipline ([`Self::live`] is a pure `&self` read, exactly like
-//! [`crate::anim::Animator::frame`]; only [`Self::record`] mutates), but
+//! [`crate::anim::Animator::frame`]; writes stay in this module), but
 //! holds identity only — never a screen coordinate. Resolving an identity to
 //! an on-screen position is client-side, at render time, same as every other
 //! visual element in this app; see this repo's own runtime/client boundary
 //! rule in `CLAUDE.md`.
 //!
-//! Nothing reads [`PendingEffects::live`] yet. That is intentional: this is
-//! plumbing for a captain-designed rendering layer that lands as its own,
-//! later task.
+//! The background scene reads [`PendingEffects::live`] and resolves pane identity to its current
+//! on-screen body when drawing an impact or ask-win comet.
 
 use std::time::{Duration, Instant};
 
@@ -30,28 +28,26 @@ use crate::layout::PaneId;
 
 /// Which kind of transient visual trigger fired.
 ///
-/// Exactly one variant exists today because it is the only trigger kind this
-/// task's brief asks to wire: a bug or failure detected in a pane's own
-/// output or state. Adding a new trigger kind later is a new variant here
-/// plus a new [`crate::events::AppEvent`] producer — this module has no
+/// Adding a trigger kind is an explicit variant here plus a matching
+/// [`crate::events::AppEvent`] producer — this module has no
 /// generic registration API, deliberately mirroring how `AppEvent` itself
 /// works (see this module's own doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EffectKind {
     /// A bug or failure was detected in a pane's own output or state.
     PaneIssue,
+    /// Claude displayed a green success circle for a completed ask.
+    PaneSuccess,
 }
 
 impl EffectKind {
     /// How long an entry stays live after it is recorded, before it is
     /// treated as expired.
     ///
-    /// One fixed constant per kind, not a caller-supplied duration: nothing
-    /// outside this module reads this list yet, so there is no consumer with
-    /// an opinion on the number to plumb through.
+    /// One fixed constant per kind, not a caller-supplied duration.
     fn ttl(self) -> Duration {
         match self {
-            Self::PaneIssue => Duration::from_millis(2_000),
+            Self::PaneIssue | Self::PaneSuccess => Duration::from_millis(2_000),
         }
     }
 }
@@ -81,9 +77,23 @@ impl PendingEffect {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingEffects {
     entries: Vec<PendingEffect>,
+    /// Fleet-wide ask governor. It outlives the short pending-entry TTL so a busy pane cannot
+    /// defeat the limit merely by waiting for the renderer to consume an entry.
+    last_ask_at: Option<Instant>,
 }
 
 impl PendingEffects {
+    #[cfg(unix)]
+    pub(crate) fn ask_governor_age(&self, now: Instant) -> Option<Duration> {
+        self.last_ask_at
+            .map(|last| now.saturating_duration_since(last))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_ask_governor_age(&mut self, age: Option<Duration>, now: Instant) {
+        self.last_ask_at = age.map(|age| now.checked_sub(age).unwrap_or(now));
+    }
+
     /// Record a freshly fired trigger.
     ///
     /// Prunes anything already expired first, so this module's own memory
@@ -97,6 +107,31 @@ impl PendingEffects {
         });
     }
 
+    /// Record an ask win when the fleet-wide governor permits it.
+    ///
+    /// At the default scalar, no more than one ask comet is admitted per minute across every
+    /// pane (60/hour). The scalar multiplies that rate by dividing the minimum interval.
+    pub(crate) fn record_ask(&mut self, pane_id: PaneId, now: Instant, rate: f32) -> bool {
+        let rate = if rate.is_finite() {
+            rate.clamp(
+                crate::config::CometsConfig::RATE_MIN,
+                crate::config::CometsConfig::RATE_MAX,
+            )
+        } else {
+            1.0
+        };
+        let interval = Duration::from_secs_f32(60.0 / rate);
+        if self
+            .last_ask_at
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return false;
+        }
+        self.last_ask_at = Some(now);
+        self.record(pane_id, EffectKind::PaneSuccess, now);
+        true
+    }
+
     /// Every entry still within its TTL, oldest first.
     ///
     /// A pure `&self` read, deliberately: this is the same multi-client
@@ -106,9 +141,6 @@ impl PendingEffects {
     /// slower asker still needed. This filters defensively by TTL on every
     /// call rather than trusting an entry was already pruned, since nothing
     /// guarantees `Self::prune_expired` ran between two reads.
-    // Next step: a renderer reading this list lands as its own, later task —
-    // see this module's doc. Exercised by tests only until then.
-    #[allow(dead_code)]
     pub(crate) fn live(&self, now: Instant) -> Vec<PendingEffect> {
         self.entries
             .iter()
@@ -227,5 +259,76 @@ mod tests {
     fn no_triggers_is_no_live_entries() {
         let effects = PendingEffects::default();
         assert!(effects.live(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn ask_governor_caps_a_busy_fleet_at_sixty_per_hour() {
+        let mut effects = PendingEffects::default();
+        let panes: Vec<_> = (0..13).map(|_| pane()).collect();
+        let start = Instant::now();
+        let mut admitted = 0;
+
+        for second in 0..3_600 {
+            let now = start + Duration::from_secs(second);
+            for &pane_id in &panes {
+                admitted += usize::from(effects.record_ask(pane_id, now, 1.0));
+            }
+        }
+
+        eprintln!(
+            "MEASURE ask governor: 46,800 markers/hour across 13 panes -> {admitted} comets/hour"
+        );
+        assert_eq!(admitted, 60);
+    }
+
+    #[test]
+    fn ask_rate_scalar_changes_frequency_not_the_off_switch() {
+        let start = Instant::now();
+        let pane_id = pane();
+        let mut half = PendingEffects::default();
+        let mut double = PendingEffects::default();
+
+        assert!(half.record_ask(pane_id, start, 0.5));
+        assert!(!half.record_ask(pane_id, start + Duration::from_secs(119), 0.5));
+        assert!(half.record_ask(pane_id, start + Duration::from_secs(120), 0.5));
+        assert!(double.record_ask(pane_id, start, 2.0));
+        assert!(double.record_ask(pane_id, start + Duration::from_secs(30), 2.0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ask_governor_age_survives_a_process_clock_handoff() {
+        let source_now = Instant::now();
+        let mut source = PendingEffects::default();
+        assert!(source.record_ask(pane(), source_now - Duration::from_secs(20), 1.0));
+
+        let age = source.ask_governor_age(source_now);
+        let imported_now = source_now + Duration::from_secs(5);
+        let mut imported = PendingEffects::default();
+        imported.restore_ask_governor_age(age, imported_now);
+        assert!(!imported.record_ask(pane(), imported_now + Duration::from_secs(39), 1.0));
+        assert!(imported.record_ask(pane(), imported_now + Duration::from_secs(40), 1.0));
+    }
+
+    #[test]
+    fn identical_success_text_can_emit_again_after_the_governor_interval() {
+        let mut visible = None;
+        assert_eq!(
+            crate::detect::diff_new_success_markers(Vec::new(), &mut visible),
+            0
+        );
+        let first =
+            crate::detect::diff_new_success_markers(vec!["● Done".to_string()], &mut visible);
+        let mut effects = PendingEffects::default();
+        let start = Instant::now();
+        assert_eq!(first, 1);
+        assert!(effects.record_ask(pane(), start, 1.0));
+
+        let second = crate::detect::diff_new_success_markers(
+            vec!["● Done".to_string(), "● Done".to_string()],
+            &mut visible,
+        );
+        assert_eq!(second, 1);
+        assert!(effects.record_ask(pane(), start + Duration::from_secs(60), 1.0));
     }
 }

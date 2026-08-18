@@ -421,6 +421,10 @@ impl PaneTerminal {
         self.ghostty.detection_text()
     }
 
+    pub fn detection_snapshot(&self) -> (String, String) {
+        self.ghostty.detection_snapshot()
+    }
+
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.ghostty.recent_text_snapshot(lines)
     }
@@ -1860,6 +1864,15 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    /// Plain and ANSI forms of one bottom-buffer state, captured under one terminal-core lock.
+    pub fn detection_snapshot(&self) -> (String, String) {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| ghostty_detection_snapshot(&core).ok())
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn recent_text(&self, lines: usize) -> String {
         self.recent_text_snapshot(lines).text
@@ -2469,6 +2482,21 @@ fn ghostty_detection_text(core: &GhosttyPaneCore) -> Result<String, crate::ghost
         .map(|rows| usize::from(rows).max(1))
         .unwrap_or(DEFAULT_DETECTION_ROWS);
     ghostty_recent_text(core, lines)
+}
+
+fn ghostty_detection_snapshot(
+    core: &GhosttyPaneCore,
+) -> Result<(String, String), crate::ghostty::Error> {
+    let lines = core
+        .terminal
+        .rows()
+        .ok()
+        .map(|rows| usize::from(rows).max(1))
+        .unwrap_or(DEFAULT_DETECTION_ROWS);
+    Ok((
+        ghostty_recent_text(core, lines)?,
+        ghostty_recent_ansi(core, lines, false)?,
+    ))
 }
 
 #[cfg(windows)]
@@ -4867,6 +4895,19 @@ mod tests {
         assert!(ansi.contains("red"));
         assert!(ansi.contains("plain"));
         assert!(ansi.contains("\x1b["));
+    }
+
+    #[test]
+    fn detection_ansi_preserves_bottom_buffer_colour_evidence() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(40, 3, 100).unwrap();
+        terminal.write(b"\x1b[38;2;86;180;112m\xe2\x97\x8f\x1b[0m Completed\n");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let (plain, ansi) = pane.detection_snapshot();
+        assert!(plain.contains('●'));
+        assert!(ansi.contains('●'));
+        assert!(ansi.contains("\x1b["), "the success colour was stripped");
     }
 
     #[test]

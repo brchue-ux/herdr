@@ -222,6 +222,22 @@ async fn publish_command_acknowledged_event(
     }
 }
 
+async fn publish_pane_success_event(
+    state_events: mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    observed_at: std::time::Instant,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::PaneSuccessDetected {
+            pane_id,
+            observed_at,
+        })
+        .await
+    {
+        warn!(pane = pane_id.raw(), err = %e, "failed to deliver PaneSuccessDetected event");
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPublishUpdate {
     state: AgentState,
@@ -748,6 +764,8 @@ fn spawn_basic_detection_task(
         // was watching, not a command that just ran. See
         // `crate::detect::diff_new_markers`.
         let mut acknowledged_command_markers: Option<std::collections::HashSet<String>> = None;
+        let mut acknowledged_success_markers: Option<std::collections::HashMap<String, usize>> =
+            None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -782,6 +800,7 @@ fn spawn_basic_detection_task(
                     last_detection_text.clear();
                     last_screen_scan_detection_content_seq = None;
                     acknowledged_command_markers = None;
+                    acknowledged_success_markers = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                     screen_identity.clear();
@@ -959,7 +978,12 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
-            let content = terminal.detection_text();
+            let (content, success_ansi) = if agent == Some(Agent::Claude) {
+                let (plain, ansi) = terminal.detection_snapshot();
+                (plain, Some(ansi))
+            } else {
+                (terminal.detection_text(), None)
+            };
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let content_changed = content != last_detection_text;
             last_detection_text.clone_from(&content);
@@ -994,6 +1018,7 @@ fn spawn_basic_detection_task(
                 // something this task watched happen — the next scan re-seeds
                 // rather than acknowledging what is already on screen.
                 acknowledged_command_markers = None;
+                acknowledged_success_markers = None;
             }
             if !process_exited && (content_changed || agent_changed) {
                 let markers = crate::detect::command_markers(agent, &content);
@@ -1001,6 +1026,24 @@ fn spawn_basic_detection_task(
                     crate::detect::diff_new_markers(markers, &mut acknowledged_command_markers);
                 for _ in &fresh {
                     publish_command_acknowledged_event(state_events.clone(), pane_id, now).await;
+                }
+                if agent == Some(crate::detect::Agent::Claude) {
+                    // The normal Claude path paired both forms under one terminal lock. A screen-
+                    // identified transition takes one extra atomic snapshot only to seed history;
+                    // `diff_new_success_markers` never emits from that first scan.
+                    let markers = if let Some(ansi_content) = success_ansi.as_deref() {
+                        crate::detect::success_markers(agent, &content, ansi_content)
+                    } else {
+                        let (plain, ansi) = terminal.detection_snapshot();
+                        crate::detect::success_markers(agent, &plain, &ansi)
+                    };
+                    let fresh = crate::detect::diff_new_success_markers(
+                        markers,
+                        &mut acknowledged_success_markers,
+                    );
+                    for _ in 0..fresh {
+                        publish_pane_success_event(state_events.clone(), pane_id, now).await;
+                    }
                 }
             }
             if !process_exited && crate::detect::should_skip_state_update(agent, &content) {
@@ -2331,6 +2374,9 @@ impl PaneRuntime {
                     let mut acknowledged_command_markers: Option<
                         std::collections::HashSet<String>,
                     > = None;
+                    let mut acknowledged_success_markers: Option<
+                        std::collections::HashMap<String, usize>,
+                    > = None;
 
                     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2377,6 +2423,7 @@ impl PaneRuntime {
                                 last_detection_text.clear();
                                 last_screen_scan_detection_content_seq = None;
                                 acknowledged_command_markers = None;
+                                acknowledged_success_markers = None;
                                 agent_startup_grace_until = None;
                                 pending_idle.clear();
                                 screen_identity.clear();
@@ -2597,7 +2644,12 @@ impl PaneRuntime {
                             DetectionScreenReadDecision::Skip => continue,
                         }
 
-                        let content = terminal.detection_text();
+                        let (content, success_ansi) = if agent == Some(Agent::Claude) {
+                            let (plain, ansi) = terminal.detection_snapshot();
+                            (plain, Some(ansi))
+                        } else {
+                            (terminal.detection_text(), None)
+                        };
                         last_screen_scan_detection_content_seq = current_detection_content_seq;
                         let content_changed = content != last_detection_text;
                         last_detection_text.clone_from(&content);
@@ -2633,6 +2685,7 @@ impl PaneRuntime {
                             // happen — the next scan re-seeds rather than
                             // acknowledging what is already on screen.
                             acknowledged_command_markers = None;
+                            acknowledged_success_markers = None;
                         }
                         if !process_exited && (content_changed || agent_changed) {
                             let markers = detect::command_markers(agent, &content);
@@ -2647,6 +2700,22 @@ impl PaneRuntime {
                                     now,
                                 )
                                 .await;
+                            }
+                            if agent == Some(detect::Agent::Claude) {
+                                let markers = if let Some(ansi_content) = success_ansi.as_deref() {
+                                    detect::success_markers(agent, &content, ansi_content)
+                                } else {
+                                    let (plain, ansi) = terminal.detection_snapshot();
+                                    detect::success_markers(agent, &plain, &ansi)
+                                };
+                                let fresh = detect::diff_new_success_markers(
+                                    markers,
+                                    &mut acknowledged_success_markers,
+                                );
+                                for _ in 0..fresh {
+                                    publish_pane_success_event(state_events.clone(), pane_id, now)
+                                        .await;
+                                }
                             }
                         }
                         if detect::should_skip_state_update(agent, &content) {

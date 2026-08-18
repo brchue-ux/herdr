@@ -824,6 +824,7 @@ impl App {
             kitty_graphics_capability_confirmed: false,
             sidebar_particle_field_enabled: config.experimental.sidebar_particle_field,
             persistent_background_enabled: config.experimental.persistent_background,
+            background_comets: config.experimental.comets,
             sidebar_card_font: configured_font_path(&config.experimental.sidebar_card_font),
             sidebar_card_shapes: config.experimental.sidebar_card_shapes,
             pixel_text_panes_enabled: config.experimental.pixel_text_panes,
@@ -1090,11 +1091,11 @@ impl App {
         Ok(app)
     }
 
-    /// Collect the durable API-published metadata a live handoff has to carry.
+    /// Collect runtime metadata and rate guards a live handoff has to carry.
     ///
     /// The session snapshot is a cold-start format and holds none of this, so
     /// without it a handoff silently blanks every sidebar row whose value came
-    /// from `workspace.report_metadata` or `pane.report_metadata`.
+    /// from `workspace.report_metadata` or `pane.report_metadata`, and resets the ask governor.
     #[cfg(unix)]
     pub(crate) fn capture_handoff_metadata(
         &self,
@@ -1130,10 +1131,14 @@ impl App {
             })
             .collect();
 
-        crate::handoff_metadata::HandoffMetadata { workspaces, panes }
+        crate::handoff_metadata::HandoffMetadata {
+            workspaces,
+            panes,
+            ask_comet_last_emitted_age: self.state.pending_effects.ask_governor_age(now),
+        }
     }
 
-    /// Reapply handoff-carried metadata after the session itself is restored.
+    /// Reapply handoff-carried metadata and rate guards after the session itself is restored.
     ///
     /// Workspaces are matched by their stable id and panes by pane id, so a
     /// restore that drops a pane or reorders workspaces just leaves that entry
@@ -1144,6 +1149,9 @@ impl App {
         metadata: crate::handoff_metadata::HandoffMetadata,
         now: Instant,
     ) {
+        self.state
+            .pending_effects
+            .restore_ask_governor_age(metadata.ask_comet_last_emitted_age, now);
         for carried in metadata.workspaces {
             let Some(ws) = self
                 .state
@@ -1889,6 +1897,11 @@ impl App {
                 self.state.background_effects_layer = None;
                 self.state.background_effects.forget_all();
             }
+            if self.state.background_comets.enabled != config.experimental.comets.enabled {
+                self.state.background_effects.forget_comets();
+                self.state.background_effects_layer = None;
+            }
+            self.state.background_comets = config.experimental.comets;
             self.state.sidebar_card_font =
                 configured_font_path(&config.experimental.sidebar_card_font);
             self.state.pixel_text_panes_enabled = config.experimental.pixel_text_panes;

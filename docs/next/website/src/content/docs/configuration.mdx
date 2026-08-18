@@ -912,6 +912,24 @@ that overlap have their glows blended by the terminal rather than one clipping t
 other. The layout is unchanged: same rows, same tiers, same titles. The character
 fallback is unchanged too, and applies to both.
 
+The persistent background's win comets have their own control, independent of the bodies and
+other effects in the scene:
+
+```toml
+[experimental]
+kitty_graphics = true
+persistent_background = true
+
+[experimental.comets]
+enabled = true
+rate = 1.0
+```
+
+`enabled = false` stops and clears comets without turning off the orrery. `rate` multiplies the
+governed ask-comet rate: at `1.0`, green success circles across the whole Claude fleet can emit at
+most one small ask comet per minute. CI-green and merge comets remain edge-triggered and are not
+rate-scaled.
+
 ## Agent session restore
 
 Herdr resumes supported Agent conversations after a server restart by default:
