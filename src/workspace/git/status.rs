@@ -742,11 +742,12 @@ mod tests {
             "{:?}",
             diff.lines
         );
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Removed
-                && line.text == "-unchanged content"));
+        assert!(
+            diff.lines
+                .iter()
+                .any(|line| line.kind == GitDiffLineKind::Removed
+                    && line.text == "-unchanged content")
+        );
         // ...plus a full add of the new one.
         assert!(
             diff.lines
@@ -758,8 +759,7 @@ mod tests {
         assert!(diff
             .lines
             .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added
-                && line.text == "+unchanged content"));
+            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+unchanged content"));
 
         std::fs::remove_dir_all(root).unwrap();
     }
