@@ -10,6 +10,7 @@ use super::text::display_width_u16;
 use super::widgets::panel_contrast_fg;
 use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
+    app::status_feed::StatusLineKind,
     config::{StatusIndicatorStyle, ToastClipboardPosition, ToastHerdrPosition},
     detect::AgentState,
 };
@@ -457,9 +458,10 @@ pub(super) fn render_status_feed(
             Style::default().fg(p.overlay0)
         };
         let mark_color = match line.kind {
-            ToastKind::NeedsAttention | ToastKind::ProcessFailed => p.red,
-            ToastKind::Finished => p.blue,
-            ToastKind::UpdateInstalled => p.accent,
+            StatusLineKind::Toast(ToastKind::NeedsAttention | ToastKind::ProcessFailed) => p.red,
+            StatusLineKind::Toast(ToastKind::Finished) => p.blue,
+            StatusLineKind::Toast(ToastKind::UpdateInstalled) => p.accent,
+            StatusLineKind::AgentCommand => p.green,
         };
         let text = super::text::truncate_end(&line.text, usize::from(width.saturating_sub(2)));
         frame.render_widget(

@@ -3007,6 +3007,18 @@ impl AppState {
             AppEvent::ClipboardRead { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
             AppEvent::CommandAcknowledged { .. } => Vec::new(),
+            AppEvent::AgentCommandObserved {
+                pane_id,
+                command,
+                observed_at,
+            } => {
+                let text = match self.pane_label_for_status_feed(pane_id) {
+                    Some(label) => format!("{label}: {command}"),
+                    None => command,
+                };
+                self.status_feed.record_command(text, observed_at);
+                Vec::new()
+            }
             AppEvent::PaneSuccessDetected {
                 pane_id,
                 observed_at,
@@ -3066,6 +3078,37 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
         }
+    }
+
+    /// A short, human-readable label for `pane_id`, for attributing a status
+    /// feed line to the pane it came from — the same handle/manual-label/title
+    /// preference order [`crate::app::signal_tray::pane_label`] uses for a
+    /// tray item, minus that function's fallback to a Space name, which this
+    /// caller has no reason to look up. `None` when the pane has none of
+    /// those set or is no longer in any live workspace, in which case the
+    /// caller falls back to the bare command text.
+    fn pane_label_for_status_feed(&self, pane_id: PaneId) -> Option<String> {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.pane_state(pane_id).is_some())?;
+        let terminal_id = self
+            .workspaces
+            .get(ws_idx)?
+            .pane_state(pane_id)?
+            .attached_terminal_id
+            .clone();
+        let terminal = self.terminals.get(&terminal_id)?;
+        [
+            terminal.agent_name.as_deref(),
+            terminal.manual_label.as_deref(),
+            terminal.terminal_title.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .map(str::to_string)
     }
 
     fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
@@ -5280,6 +5323,52 @@ mod tests {
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+    }
+
+    #[test]
+    fn agent_command_observed_appends_a_status_feed_line() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::AgentCommandObserved {
+            pane_id,
+            command: "git status".to_string(),
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(state.status_feed.len(), 1);
+        let line = state.status_feed.lines().next().unwrap();
+        assert_eq!(
+            line.kind,
+            crate::app::status_feed::StatusLineKind::AgentCommand
+        );
+        assert!(
+            line.text.ends_with("git status"),
+            "unlabeled pane keeps the bare command: {}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn agent_command_observed_is_attributed_to_a_named_pane() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state.terminals.get_mut(&terminal_id).unwrap().manual_label = Some("build".to_string());
+
+        state.handle_app_event(AppEvent::AgentCommandObserved {
+            pane_id,
+            command: "npm test".to_string(),
+            observed_at: std::time::Instant::now(),
+        });
+
+        let line = state.status_feed.lines().next().unwrap();
+        assert_eq!(line.text, "build: npm test");
     }
 
     /// The timestamp is a sibling of `last_agent_state_change_seq` and shares

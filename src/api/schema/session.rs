@@ -204,7 +204,8 @@ pub struct StatusFeedLineInfo {
     /// What herdr said, already joined into one line.
     pub text: String,
     /// Which kind of event it was: `needs_attention`, `finished`,
-    /// `update_installed` or `process_failed`.
+    /// `update_installed`, `process_failed`, or `agent_command` for a shell
+    /// command herdr saw a Claude Code pane run.
     pub kind: String,
     /// How long ago it was said, in milliseconds.
     pub age_ms: u64,

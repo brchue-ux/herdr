@@ -11014,7 +11014,7 @@
               "type": "integer"
             },
             "kind": {
-              "description": "Which kind of event it was: `needs_attention`, `finished`,\n`update_installed` or `process_failed`.",
+              "description": "Which kind of event it was: `needs_attention`, `finished`,\n`update_installed`, `process_failed`, or `agent_command` for a shell\ncommand herdr saw a Claude Code pane run.",
               "type": "string"
             },
             "text": {

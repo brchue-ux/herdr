@@ -1941,7 +1941,7 @@ mod tests {
     /// another, and the stream is gated on the background scene exactly as the
     /// machine register's corner is.
     #[test]
-    fn the_status_stream_is_drawn_in_the_bottom_third_and_holds_six_lines() {
+    fn the_status_stream_is_drawn_in_the_bottom_third_and_holds_eight_lines() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.ensure_test_terminals();
@@ -1986,17 +1986,17 @@ mod tests {
         assert_eq!(
             carrying.len(),
             crate::app::status_feed::TERM_MAX,
-            "the stream drew {} lines, not the six it holds:\n{}",
+            "the stream drew {} lines, not the eight it holds:\n{}",
             carrying.len(),
             rows.join("\n")
         );
-        // The six most recent, and the oldest four dropped.
+        // The eight most recent, and the oldest two dropped.
         assert!(
             rows.iter().any(|row| row.contains("herdr-line-09")),
             "the newest line is not on screen"
         );
         assert!(
-            !rows.iter().any(|row| row.contains("herdr-line-03")),
+            !rows.iter().any(|row| row.contains("herdr-line-01")),
             "a line past the cap is still on screen"
         );
         // In the bottom third.
