@@ -237,6 +237,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # zoom = "prefix+z"       # legacy alias: fullscreen
 # resize_mode = "prefix+r"
 # toggle_sidebar = "prefix+b"
+# toggle_diff_pane = "prefix+d"
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
@@ -289,6 +290,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Terminal width at or below which Herdr uses the mobile single-column layout.
 # Increase this for foldables, tablets, or wide phone terminals.
 # mobile_width_threshold = 64
+
+# Remaining content width (after the sidebar) at or above which the diff pane
+# shows as a fixed third zone. Below it, the diff zone folds and is reachable
+# via toggle_diff_pane's popup-overlay fallback instead.
+# diff_zone_width_threshold = 300
 
 # Capture mouse input for Herdr's mouse UI.
 # Set false to let the terminal handle normal clicks, such as Cmd-clicking URLs.

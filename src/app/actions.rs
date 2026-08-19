@@ -2744,6 +2744,10 @@ impl AppState {
                 ws.cached_git_dirty = result.dirty;
                 changed = true;
             }
+            if result.demand.diff && ws.cached_git_diff != result.diff {
+                ws.cached_git_diff = result.diff;
+                changed = true;
+            }
             if ws.cached_git_space != result.space {
                 ws.cached_git_space = result.space;
                 changed = true;
@@ -4375,6 +4379,70 @@ mod tests {
     }
 
     #[test]
+    fn apply_workspace_git_statuses_updates_diff_only_when_demanded() {
+        let diff_text = crate::workspace::GitDiffText {
+            lines: vec![crate::workspace::GitDiffLine {
+                kind: crate::workspace::GitDiffLineKind::Added,
+                text: "+new line".into(),
+            }],
+            truncated: false,
+        };
+
+        let mut state = app_with_workspaces(&["one"]);
+        let workspace_id = state.workspaces[0].id.clone();
+        let cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        // Not demanded: the diff must not be applied even though it's present.
+        let changed = state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id: workspace_id.clone(),
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd.clone(),
+                demand: crate::workspace::GitStatusRefreshDemand {
+                    branch: false,
+                    ahead_behind: false,
+                    dirty: false,
+                    diff: false,
+                },
+                auto_label: "one".into(),
+                branch: None,
+                ahead_behind: None,
+                dirty: None,
+                diff: Some(diff_text.clone()),
+                space: None,
+            }],
+        );
+        assert!(!changed);
+        assert_eq!(state.workspaces[0].git_diff(), None);
+
+        // Demanded: the diff is applied and reported as a change.
+        let changed = state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand {
+                    branch: false,
+                    ahead_behind: false,
+                    dirty: false,
+                    diff: true,
+                },
+                auto_label: "one".into(),
+                branch: None,
+                ahead_behind: None,
+                dirty: None,
+                diff: Some(diff_text.clone()),
+                space: None,
+            }],
+        );
+        assert!(changed);
+        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
+    }
+
+    #[test]
     fn apply_workspace_git_statuses_updates_matching_workspace() {
         let mut state = app_with_workspaces(&["one", "two"]);
         let first_id = state.workspaces[0].id.clone();
@@ -4393,6 +4461,7 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 dirty: None,
+                diff: None,
                 space: None,
             }],
         );
@@ -4423,6 +4492,7 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
                 dirty: None,
+                diff: None,
                 space: None,
             }],
         );
@@ -4451,11 +4521,13 @@ mod tests {
                     branch: false,
                     ahead_behind: true,
                     dirty: false,
+                    diff: false,
                 },
                 auto_label: "one".into(),
                 branch: Some("new".into()),
                 ahead_behind: None,
                 dirty: None,
+                diff: None,
                 space: None,
             }],
         );
@@ -4484,6 +4556,7 @@ mod tests {
                 branch: None,
                 ahead_behind: None,
                 dirty: None,
+                diff: None,
                 space: None,
             }],
         );
@@ -4513,6 +4586,7 @@ mod tests {
                 branch: Some("scratch".into()),
                 ahead_behind: None,
                 dirty: None,
+                diff: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),

@@ -7,6 +7,7 @@ use ratatui::{
 
 pub(crate) mod color;
 mod dialogs;
+mod diff_pane;
 mod keybind_help;
 mod menus;
 mod mobile;
@@ -29,6 +30,7 @@ use self::dialogs::{
     render_confirm_close_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
+use self::diff_pane::{render_diff_popup_overlay, render_diff_zone};
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
     render_context_menu, render_copy_mode_overlay, render_global_launcher_menu,
@@ -151,6 +153,11 @@ use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
+
+/// The diff zone's own width when shown. Fixed rather than user-tunable for
+/// v1 — `AppState::diff_zone_width_threshold` is the tunable knob (whether the
+/// zone shows at all); see `data/herdr-diff-pane-scoping-20260818/report.md` §D.
+const DIFF_ZONE_WIDTH: u16 = 100;
 
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
@@ -389,6 +396,26 @@ fn update_sidebar_card_layers(
     !app.sidebar_card_layers.is_empty()
 }
 
+/// Splits `main_area` (the frame minus the sidebar) into the terminal zone's
+/// content area and the diff zone, or leaves it whole with an empty diff
+/// area when there is not enough remaining width for a real third zone.
+///
+/// Mirrors `is_mobile_width`'s shape (compare a live width to a config
+/// threshold every pass) but tests `main_area.width`, not the pre-split frame
+/// width: the diff fold is about whether three zones fit side by side, so it
+/// must account for however much the sidebar is currently taking rather than
+/// assume a fixed sidebar cost — see
+/// `data/herdr-diff-pane-scoping-20260818/report.md` §D.
+fn split_diff_zone(app: &AppState, main_area: Rect) -> (Rect, Rect) {
+    if main_area.width < app.diff_zone_width_threshold {
+        return (main_area, Rect::default());
+    }
+    let [content_area, diff_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(DIFF_ZONE_WIDTH)])
+            .areas(main_area);
+    (content_area, diff_area)
+}
+
 fn compute_view_internal(
     app: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -416,11 +443,13 @@ fn compute_view_internal(
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
 
+    let (content_area, diff_area) = split_diff_zone(app, main_area);
+
     let (tab_bar_rect, terminal_area) = app
         .active
         .and_then(|i| app.workspaces.get(i))
-        .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, main_area))
-        .unwrap_or((Rect::default(), main_area));
+        .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, content_area))
+        .unwrap_or((Rect::default(), content_area));
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
@@ -478,7 +507,7 @@ fn compute_view_internal(
         cell_size,
     );
     if resize_panes {
-        resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
+        resize_background_tab_panes_for_desktop(app, terminal_runtimes, content_area, cell_size);
         resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
     }
 
@@ -507,6 +536,7 @@ fn compute_view_internal(
         tab_scroll_right_hit_area: tab_bar_view.scroll_right_hit_area,
         new_tab_hit_area: tab_bar_view.new_tab_hit_area,
         terminal_area,
+        diff_area,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
@@ -572,6 +602,7 @@ fn compute_mobile_view(
         tab_scroll_right_hit_area: Rect::default(),
         new_tab_hit_area: Rect::default(),
         terminal_area,
+        diff_area: Rect::default(),
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
@@ -613,6 +644,14 @@ pub fn render_with_runtime_registry(
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
     render_popup_pane(app, terminal_runtimes, frame, terminal_area);
+
+    if app.view.layout == ViewLayout::Desktop {
+        if !app.view.diff_area.is_empty() {
+            render_diff_zone(app, frame, app.view.diff_area);
+        } else if app.diff_popup_open {
+            render_diff_popup_overlay(app, frame, terminal_area);
+        }
+    }
 
     let mode_bar_area = if app.view.layout == ViewLayout::Desktop
         && app.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
@@ -1305,6 +1344,277 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         assert_eq!(app.view.mobile_header_rect, Rect::new(0, 0, 80, 2));
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 80, 18));
+    }
+
+    #[test]
+    fn diff_zone_folds_below_threshold_leaving_the_sidebar_and_terminal_untouched() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        // main_area.width = 80 - 26 (default sidebar) = 54, well under the
+        // default 300-column threshold.
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+
+        assert!(app.view.diff_area.is_empty());
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 54, 19));
+    }
+
+    #[test]
+    fn diff_zone_shows_as_a_third_zone_above_threshold_and_shrinks_only_the_terminal() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.diff_zone_width_threshold = 150;
+
+        // main_area.width = 200 - 26 (default sidebar) = 174 >= 150.
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
+        assert_eq!(app.view.diff_area, Rect::new(100, 0, 100, 20));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 74, 19));
+    }
+
+    #[test]
+    fn diff_zone_width_threshold_is_configurable_and_never_moves_the_sidebar() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        // main_area.width = 200 - 26 = 174, under the default 300 threshold.
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+        let sidebar_before = app.view.sidebar_rect;
+        assert!(
+            app.view.diff_area.is_empty(),
+            "default threshold (300) must fold at 174 remaining columns"
+        );
+
+        app.diff_zone_width_threshold = 174;
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+
+        assert!(
+            !app.view.diff_area.is_empty(),
+            "lowering the configured threshold to exactly the remaining width must show the zone"
+        );
+        assert_eq!(
+            app.view.sidebar_rect, sidebar_before,
+            "the sidebar's own geometry must never move when the diff zone folds or unfolds"
+        );
+    }
+
+    #[test]
+    fn diff_zone_never_shows_in_mobile_layout_regardless_of_threshold() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.mobile_width_threshold = 250;
+        app.diff_zone_width_threshold = 1;
+
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+
+        assert_eq!(app.view.layout, ViewLayout::Mobile);
+        assert!(app.view.diff_area.is_empty());
+    }
+
+    /// Render-cost evidence for this project's multiplicative-performance-paths
+    /// rule: `compute_view_internal` now does one extra `split_diff_zone` check
+    /// per render pass, and the resulting narrower `content_area` feeds
+    /// `resize_background_tab_panes_for_desktop`, which loops every workspace.
+    /// `#[ignore]`d per this project's own "prefer deterministic tests over
+    /// wall-clock CI limits" rule — run with `--ignored` and read the printed
+    /// per-call durations; this is supporting evidence, not a pass/fail gate.
+    #[test]
+    #[ignore]
+    fn diff_zone_render_cost_at_workspace_scale() {
+        fn bench(workspace_count: usize, diff_zone_width_threshold: u16) -> std::time::Duration {
+            let mut app = crate::app::state::AppState::test_new();
+            app.workspaces = (0..workspace_count)
+                .map(|i| Workspace::test_new(&format!("ws{i}")))
+                .collect();
+            app.active = Some(0);
+            app.selected = 0;
+            app.mode = Mode::Terminal;
+            app.diff_zone_width_threshold = diff_zone_width_threshold;
+
+            let area = Rect::new(0, 0, 220, 50);
+            for _ in 0..10 {
+                compute_view(&mut app, area);
+            }
+            const ITERS: u32 = 200;
+            let start = std::time::Instant::now();
+            for _ in 0..ITERS {
+                compute_view(&mut app, area);
+            }
+            start.elapsed() / ITERS
+        }
+
+        // Threshold u16::MAX always folds; 1 always shows the zone (main_area
+        // is always >= 1 column wide once a sidebar leaves any room at all).
+        let folded_1 = bench(1, u16::MAX);
+        let shown_1 = bench(1, 1);
+        let folded_15 = bench(15, u16::MAX);
+        let shown_15 = bench(15, 1);
+
+        eprintln!(
+            "compute_view_internal per-call cost — \
+             1 workspace: folded={folded_1:?} shown={shown_1:?} (delta={:?}) | \
+             15 workspaces: folded={folded_15:?} shown={shown_15:?} (delta={:?})",
+            shown_1.saturating_sub(folded_1),
+            shown_15.saturating_sub(folded_15),
+        );
+    }
+
+    fn diff_pane_test_workspace(diff: Option<crate::workspace::GitDiffText>) -> Workspace {
+        let mut ws = Workspace::test_new("one");
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "/repo".into(),
+            repo_name: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        ws.cached_git_diff = diff;
+        ws
+    }
+
+    fn sample_diff() -> crate::workspace::GitDiffText {
+        use crate::workspace::{GitDiffLine, GitDiffLineKind};
+        crate::workspace::GitDiffText {
+            lines: vec![
+                GitDiffLine {
+                    kind: GitDiffLineKind::FileHeader,
+                    text: "diff --git a/file.txt b/file.txt".into(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Hunk,
+                    text: "@@ -1,2 +1,2 @@".into(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Removed,
+                    text: "-old line".into(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    text: "+new line".into(),
+                },
+            ],
+            truncated: false,
+        }
+    }
+
+    /// The captain's own hard constraint: adding the diff pane must not touch
+    /// the sidebar's rendered pixels at any width, folded or shown.
+    #[test]
+    fn sidebar_pixels_are_byte_identical_whether_the_diff_zone_shows_or_folds() {
+        let render_sidebar = |diff_zone_width_threshold: u16| -> Vec<String> {
+            let mut app = crate::app::state::AppState::test_new();
+            app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
+            app.active = Some(0);
+            app.selected = 0;
+            app.mode = Mode::Terminal;
+            app.diff_zone_width_threshold = diff_zone_width_threshold;
+
+            compute_view(&mut app, Rect::new(0, 0, 200, 20));
+            let sidebar_rect = app.view.sidebar_rect;
+
+            let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+            terminal.draw(|frame| render(&app, frame)).unwrap();
+            (sidebar_rect.y..sidebar_rect.y + sidebar_rect.height)
+                .map(|row| buffer_row_text(terminal.backend().buffer(), sidebar_rect, row))
+                .collect()
+        };
+
+        // 1 folds the zone (nothing is ever narrower than that), 150 shows it
+        // (main_area.width is 174 at this frame size).
+        let folded = render_sidebar(u16::MAX);
+        let shown = render_sidebar(150);
+
+        assert_eq!(
+            folded, shown,
+            "the sidebar's rendered cells must be identical whether the diff zone is folded or shown"
+        );
+    }
+
+    #[test]
+    fn diff_zone_renders_added_and_removed_lines_in_green_and_red() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.diff_zone_width_threshold = 150;
+
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+        let diff_area = app.view.diff_area;
+        assert!(!diff_area.is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let text = (diff_area.y..diff_area.y + diff_area.height)
+            .map(|row| buffer_row_text(buffer, diff_area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("old line"), "{text}");
+        assert!(text.contains("new line"), "{text}");
+
+        let removed_row = diff_area.y + 3; // panel border (1) + header (2) + hunk (1) = row index 3 has "-old line"
+        let added_row = diff_area.y + 4;
+        let removed_fg = buffer[(diff_area.x + 2, removed_row)].fg;
+        let added_fg = buffer[(diff_area.x + 2, added_row)].fg;
+        assert_eq!(removed_fg, app.palette.red, "removed line must be red");
+        assert_eq!(added_fg, app.palette.green, "added line must be green");
+    }
+
+    #[test]
+    fn folded_diff_pane_is_reachable_via_the_popup_overlay_toggle() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        // Default threshold (300) folds at this frame size.
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        assert!(app.view.diff_area.is_empty());
+
+        // Before toggling, nothing but the terminal is drawn where the popup
+        // would go.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let before = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!before.contains("new line"));
+
+        app.diff_popup_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let after = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            after.contains("new line"),
+            "the popup overlay must show the diff once toggled open while folded: {after}"
+        );
     }
 
     #[test]

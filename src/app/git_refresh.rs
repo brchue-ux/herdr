@@ -60,13 +60,18 @@ impl App {
         if self.git_identity_refresh_requested {
             demand.branch = true;
         }
+        let diff_target = self.diff_pane_demand_target();
         self.git_identity_refresh_requested = false;
         if refresh_repo_discovery {
             self.last_git_repo_discovery_refresh = now;
         }
         std::thread::spawn(move || {
-            let output =
-                refresh_workspace_git_statuses_with_cache_and_demand(workspaces, &cache, demand);
+            let output = refresh_workspace_git_statuses_with_cache_and_demand(
+                workspaces,
+                &cache,
+                demand,
+                diff_target.as_deref(),
+            );
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
                 results: output.results,
                 cache_updates: output.cache_updates,
@@ -95,8 +100,33 @@ impl App {
     pub(crate) fn git_refresh_deadline(&self) -> Option<Instant> {
         (!self.git_refresh_in_flight
             && !self.state.workspaces.is_empty()
-            && (self.git_identity_refresh_requested || !self.git_refresh_demand().is_empty()))
+            && (self.git_identity_refresh_requested
+                || !self.git_refresh_demand().is_empty()
+                || self.diff_pane_demand_target().is_some()))
         .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
+    }
+
+    /// The workspace whose diff text the diff pane is currently asking for, if
+    /// any — the active Space's, and only while the pane is actually visible
+    /// (the fixed three-zone layout, or the folded popup fallback).
+    ///
+    /// Scoped to one workspace, not folded into the shared [`GitStatusRefreshDemand`]
+    /// the rest of this module computes: that demand is applied uniformly across
+    /// every distinct repo among *all* open workspaces (see
+    /// `refresh_workspace_git_statuses_with_cache_and_demand`), which is correct
+    /// for `dirty`/`branch`/`ahead_behind` (every Space's sidebar row wants its
+    /// own), but would make every open Space in the fleet pay for a `git diff`
+    /// invocation whenever only one Space's diff pane is open. Kept separate so
+    /// only the active Space's job ever demands `diff`.
+    pub(crate) fn diff_pane_demand_target(&self) -> Option<String> {
+        let visible = !self.state.view.diff_area.is_empty() || self.state.diff_popup_open;
+        if !visible {
+            return None;
+        }
+        self.state
+            .active
+            .and_then(|idx| self.state.workspaces.get(idx))
+            .map(|ws| ws.id.clone())
     }
 
     fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
@@ -187,15 +217,27 @@ fn refresh_workspace_git_statuses_with_cache_and_demand(
     items: Vec<WorkspaceGitRefreshItem>,
     cache: &HashMap<PathBuf, GitStatusCacheEntry>,
     demand: GitStatusRefreshDemand,
+    diff_target_workspace_id: Option<&str>,
 ) -> WorkspaceGitRefreshOutput {
     let mut results = Vec::new();
     let mut cache_updates = Vec::new();
 
     for job in deduplicate_git_refresh_items(items, cache) {
+        // `diff` is the one demand bit decided per job rather than shared:
+        // every other bit is wanted for every open Space's sidebar row, but a
+        // diff pane shows only the active Space's diff, so only the job that
+        // actually contains that workspace ever pays for `git diff` — see
+        // `App::diff_pane_demand_target`.
+        let job_demand = GitStatusRefreshDemand {
+            diff: demand.diff
+                || diff_target_workspace_id
+                    .is_some_and(|id| job.targets.iter().any(|target| target.workspace_id == id)),
+            ..demand
+        };
         let (snapshot, cache_entry) = crate::workspace::git_status_snapshot_for_cwd_with_demand(
             &job.cache_key,
             job.cached.as_ref(),
-            demand,
+            job_demand,
         );
         if let Some(cache_entry) = cache_entry {
             cache_updates.push((job.cache_key.clone(), cache_entry));
@@ -205,7 +247,7 @@ fn refresh_workspace_git_statuses_with_cache_and_demand(
                 target.workspace_id,
                 target.resolved_identity_cwd,
                 job.cache_key.clone(),
-                demand,
+                job_demand,
             )
         }));
     }
@@ -251,6 +293,7 @@ mod tests {
             ],
             &HashMap::new(),
             GitStatusRefreshDemand::ALL,
+            None,
         );
 
         assert_eq!(output.cache_updates.len(), 1);
@@ -362,6 +405,7 @@ mod tests {
                     branch: true,
                     ahead_behind: false,
                     dirty: false,
+                    diff: false,
                 },
             ),
             (
@@ -370,6 +414,7 @@ mod tests {
                     branch: false,
                     ahead_behind: true,
                     dirty: false,
+                    diff: false,
                 },
             ),
         ];
@@ -496,6 +541,97 @@ mod tests {
             .git_refresh_deadline()
             .expect("refresh should be due once a workspace exists");
         assert!(deadline <= Instant::now());
+    }
+
+    #[test]
+    fn diff_pane_demand_target_is_none_when_the_pane_is_neither_shown_nor_popped_open() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.active = Some(0);
+
+        assert_eq!(app.diff_pane_demand_target(), None);
+    }
+
+    #[test]
+    fn diff_pane_demand_target_is_the_active_workspace_when_the_zone_is_shown() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.workspaces.push(Workspace::test_new("two"));
+        app.state.active = Some(1);
+        app.state.view.diff_area = ratatui::layout::Rect::new(100, 0, 100, 20);
+
+        let target = app.diff_pane_demand_target();
+        assert_eq!(target.as_deref(), Some(app.state.workspaces[1].id.as_str()));
+    }
+
+    #[test]
+    fn diff_pane_demand_target_is_the_active_workspace_when_the_popup_is_open_while_folded() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.state.workspaces.push(Workspace::test_new("one"));
+        app.state.active = Some(0);
+        app.state.view.diff_area = ratatui::layout::Rect::default();
+        app.state.diff_popup_open = true;
+
+        let target = app.diff_pane_demand_target();
+        assert_eq!(target.as_deref(), Some(app.state.workspaces[0].id.as_str()));
+    }
+
+    /// A diff pane shows only the active Space's diff, so `git diff` must run
+    /// for that Space's job and no other — never for every open Space in the
+    /// fleet just because one diff pane happens to be visible somewhere.
+    #[test]
+    fn diff_demand_is_scoped_to_only_the_targeted_workspaces_job() {
+        let repo_one = std::env::temp_dir().join(format!(
+            "herdr-git-refresh-diff-scope-one-{}",
+            std::process::id()
+        ));
+        let repo_two = std::env::temp_dir().join(format!(
+            "herdr-git-refresh-diff-scope-two-{}",
+            std::process::id()
+        ));
+        for repo in [&repo_one, &repo_two] {
+            std::fs::create_dir_all(repo).expect("create repo dir");
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .arg("init")
+                .output()
+                .expect("git init");
+        }
+
+        let output = refresh_workspace_git_statuses_with_cache_and_demand(
+            vec![
+                WorkspaceGitRefreshItem {
+                    workspace_id: "one".into(),
+                    resolved_identity_cwd: repo_one.clone(),
+                    cache_key_hint: None,
+                },
+                WorkspaceGitRefreshItem {
+                    workspace_id: "two".into(),
+                    resolved_identity_cwd: repo_two.clone(),
+                    cache_key_hint: None,
+                },
+            ],
+            &HashMap::new(),
+            GitStatusRefreshDemand::default(),
+            Some("two"),
+        );
+
+        let one = output
+            .results
+            .iter()
+            .find(|r| r.workspace_id == "one")
+            .unwrap();
+        let two = output
+            .results
+            .iter()
+            .find(|r| r.workspace_id == "two")
+            .unwrap();
+        assert!(!one.demand.diff, "workspace one was not the diff target");
+        assert!(two.demand.diff, "workspace two was the diff target");
+
+        let _ = std::fs::remove_dir_all(repo_one);
+        let _ = std::fs::remove_dir_all(repo_two);
     }
 
     fn test_app(config: &crate::config::Config) -> super::super::App {

@@ -1275,6 +1275,13 @@ pub struct ViewState {
     pub tab_scroll_right_hit_area: Rect,
     pub new_tab_hit_area: Rect,
     pub terminal_area: Rect,
+    /// The diff pane's zone, sibling to `terminal_area` inside `main_area`.
+    ///
+    /// Empty when folded (below `AppState::diff_zone_width_threshold`) — same
+    /// pattern as `mobile_header_rect` and `toast_hit_area`: a region that is
+    /// present sometimes, `Rect::default()` otherwise, rather than a third
+    /// `ViewLayout` variant.
+    pub diff_area: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
@@ -2036,10 +2043,19 @@ pub struct AppState {
     pub sidebar_min_width: u16,
     pub sidebar_max_width: u16,
     pub mobile_width_threshold: u16,
+    /// Remaining content width (after the sidebar) below which the diff zone
+    /// folds out of the fixed three-zone layout. See `crate::ui::is_mobile_width`
+    /// for the sibling mechanism this mirrors.
+    pub diff_zone_width_threshold: u16,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
+    /// Whether the diff pane's popup-overlay fallback is open. Only rendered
+    /// while the diff zone is folded (`view.diff_area` empty); toggled by the
+    /// `toggle_diff_pane` keybinding. Pure client presentation state — never
+    /// shared with the server/API surface.
+    pub diff_popup_open: bool,
     /// Order agent rows take within their owner in the sidebar tree.
     pub agent_panel_sort: AgentPanelSort,
     /// Every source that currently wants to own the built-in Agents view. It
@@ -3583,6 +3599,7 @@ impl AppState {
                 tab_scroll_right_hit_area: Rect::default(),
                 new_tab_hit_area: Rect::default(),
                 terminal_area: Rect::default(),
+                diff_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
@@ -3614,10 +3631,12 @@ impl AppState {
             sidebar_min_width: crate::config::DEFAULT_SIDEBAR_BOUNDS.0,
             sidebar_max_width: crate::config::DEFAULT_SIDEBAR_BOUNDS.1,
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
+            diff_zone_width_threshold: crate::config::DEFAULT_DIFF_ZONE_WIDTH_THRESHOLD,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
+            diff_popup_open: false,
             agent_panel_sort: AgentPanelSort::Spaces,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             session_status: None,

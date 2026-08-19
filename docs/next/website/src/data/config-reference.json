@@ -542,6 +542,12 @@
           "description": "Toggle sidebar collapse."
         },
         {
+          "key": "keys.toggle_diff_pane",
+          "type": "keybinding",
+          "default": "\"prefix+d\"",
+          "description": "Toggle the diff pane: folds/unfolds the fixed three-zone layout when wide enough to show it, otherwise opens/closes its popup-overlay fallback."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",
@@ -604,6 +610,12 @@
           "type": "integer",
           "default": "64",
           "description": "Terminal width at or below which Herdr uses the mobile single-column layout."
+        },
+        {
+          "key": "ui.diff_zone_width_threshold",
+          "type": "integer",
+          "default": "300",
+          "description": "Remaining content width (after the sidebar) at or above which the diff pane's fixed three-zone layout shows all three zones side by side."
         },
         {
           "key": "ui.mouse_capture",
