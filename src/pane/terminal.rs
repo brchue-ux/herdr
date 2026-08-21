@@ -45,6 +45,26 @@ const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
 /// redraw, so a child that raises the mode and then stalls or dies cannot leave
 /// its pane frozen.
 const SYNCHRONIZED_UPDATE_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long a pane keeps drawing its pre-resize frame after a resize that
+/// found it with real content on screen.
+///
+/// Measured against a real `claude` session: a resize-triggered full-screen
+/// redraw lands in full within ~20ms even when it spans several PTY reads.
+/// This timeout is a wide margin over that, so it only bounds how long a
+/// child that never redraws (or is unusually slow to) leaves the pane frozen —
+/// there is no explicit "redraw finished" signal to release on early, the way
+/// [`SYNCHRONIZED_UPDATE_HOLD_TIMEOUT`] releases on the child's own DEC 2026
+/// close.
+const RESIZE_RECOVERY_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long after a resize a full-screen clear is still treated as that
+/// resize's own redraw, arming [`RESIZE_RECOVERY_HOLD_TIMEOUT`].
+///
+/// Wide margin over the ~20ms a real `claude` session's resize-triggered
+/// redraw took to land in the measurement above. Most resizes never see a
+/// clear inside this window at all — an initial attach, a pane that stays
+/// quiet after being resized — and those pay nothing: the watch this arms
+/// expires unconsumed with no hold ever engaged.
+const RESIZE_REDRAW_WATCH_WINDOW: Duration = Duration::from_millis(400);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
@@ -203,6 +223,32 @@ pub(crate) struct GhosttyPaneCore {
     /// still until the read completes and the app is scrolled back to where it
     /// started.
     alt_screen_read_hold: bool,
+    /// Armed by a resize that found this pane with real content on screen;
+    /// consumed by the first write inside [`RESIZE_REDRAW_WATCH_WINDOW`] that
+    /// looks like the child clearing its screen to redraw for the new size, at
+    /// which point it engages [`resize_recovery_started_at`].
+    ///
+    /// A resized pane's own child is very likely about to redraw for its new
+    /// size on its own — any live full-screen TUI does — but most resizes
+    /// (initial attach, a pane that stays quiet after being resized) never see
+    /// that redraw at all, so holding the frame on every resize regardless
+    /// would add a real, needless stall to the overwhelmingly common case.
+    /// Watching for the clear that actually starts a redraw, rather than
+    /// assuming one is coming, is what keeps this pay-for-what-you-use.
+    awaiting_resize_redraw_since: Option<Instant>,
+    /// When a full-screen clear inside a resize's redraw watch last engaged
+    /// the hold on painting this pane, so it can be bounded by
+    /// [`RESIZE_RECOVERY_HOLD_TIMEOUT`].
+    ///
+    /// A redraw large enough to span more than one PTY read (which any pane
+    /// with real content easily is) can land as several separate writes with
+    /// a render notified after each one. Painting in between them shows a
+    /// torn intermediate frame: a blank clear, or a partially-drawn screen —
+    /// the resize-recovery replay a genuinely blank bottom triggers is one
+    /// possible shape of that torn content, but not the only one. Holding the
+    /// pre-resize frame here keeps every shape of it off screen until either
+    /// this timeout elapses or the child settles.
+    resize_recovery_started_at: Option<Instant>,
 }
 
 pub(crate) struct PaneTerminal {
@@ -988,6 +1034,8 @@ impl GhosttyPaneTerminal {
                 render_state_populated: false,
                 windows_powershell_prompt_cwd_reporting: false,
                 alt_screen_read_hold: false,
+                awaiting_resize_redraw_since: None,
+                resize_recovery_started_at: None,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1160,6 +1208,16 @@ impl GhosttyPaneTerminal {
                 terminal_responses: Vec::new(),
             };
         };
+
+        if let Some(started) = core.awaiting_resize_redraw_since {
+            let now = Instant::now();
+            if now.duration_since(started) >= RESIZE_REDRAW_WATCH_WINDOW {
+                core.awaiting_resize_redraw_since = None;
+            } else if contains_full_screen_clear_sequence(bytes) {
+                core.resize_recovery_started_at = Some(now);
+                core.awaiting_resize_redraw_since = None;
+            }
+        }
 
         let _ = core.terminal.take_pwd_changes();
         // Restored history may have exercised terminal callbacks before this live PTY write.
@@ -1506,6 +1564,12 @@ impl GhosttyPaneTerminal {
             let bottom_before_resize = ghostty_detection_text(&core)
                 .map(|text| !text.trim().is_empty())
                 .unwrap_or(false);
+            // Captured before the resize call below, which itself clears this
+            // mode as a side effect of reflowing the grid.
+            let was_in_synchronized_update = core
+                .terminal
+                .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+                .unwrap_or(false);
             let resize_recovery_probe_lines = usize::from(rows)
                 .saturating_mul(8)
                 .max(DEFAULT_DETECTION_ROWS);
@@ -1545,6 +1609,18 @@ impl GhosttyPaneTerminal {
                     core.terminal.scroll_viewport_delta(1);
                     remaining -= 1;
                 }
+            }
+            // A child already mid an open synchronized update at the moment of
+            // resize is the case `resize_releases_the_synchronized_update_hold`
+            // protects: that batch's own hold must be forced to release rather
+            // than extended, since the retained frame it was guarding no
+            // longer matches the new geometry either way.
+            if bottom_before_resize && !was_in_synchronized_update {
+                // Most resizes (initial attach, a pane that stays quiet after
+                // being resized) have nothing to protect against and must not
+                // pay for a hold that never triggers — see
+                // `awaiting_resize_redraw_since` for what this arms and why.
+                core.awaiting_resize_redraw_since = Some(Instant::now());
             }
             terminal_responses
         } else {
@@ -1728,6 +1804,27 @@ impl GhosttyPaneTerminal {
                 }
             }
         }
+    }
+
+    /// Ages an in-flight resize recovery hold by `elapsed`, so tests can reach
+    /// its timeout without sleeping.
+    #[cfg(test)]
+    fn age_resize_recovery_hold_for_test(&self, elapsed: Duration) {
+        if let Ok(mut core) = self.core.lock() {
+            if let Some(started) = core.resize_recovery_started_at.as_mut() {
+                if let Some(earlier) = started.checked_sub(elapsed) {
+                    *started = earlier;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn resize_recovery_hold_active_for_test(&self) -> bool {
+        self.core
+            .lock()
+            .ok()
+            .is_some_and(|core| core.resize_recovery_started_at.is_some())
     }
 
     pub fn encode_terminal_key(
@@ -2188,6 +2285,17 @@ fn synchronized_update_holds_frame(core: &mut GhosttyPaneCore, now: Instant) -> 
     now.duration_since(started) < SYNCHRONIZED_UPDATE_HOLD_TIMEOUT
 }
 
+/// Whether this pane must draw its pre-resize frame instead of the live grid,
+/// because it was resized while it had real content on screen and its child's
+/// own resize-triggered redraw may still be landing.
+///
+/// Bounded by [`RESIZE_RECOVERY_HOLD_TIMEOUT`] so a child that never redraws
+/// still eventually shows its post-resize content.
+fn resize_recovery_holds_frame(core: &GhosttyPaneCore, now: Instant) -> bool {
+    core.resize_recovery_started_at
+        .is_some_and(|started| now.duration_since(started) < RESIZE_RECOVERY_HOLD_TIMEOUT)
+}
+
 /// Outcome of bringing `render_state` up to date before a pane is drawn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RenderStateRefresh {
@@ -2203,7 +2311,10 @@ enum RenderStateRefresh {
 /// Reads the live grid into `render_state` unless the child is inside a
 /// synchronized update, where the retained snapshot *is* the last complete frame.
 fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderStateRefresh {
-    if core.alt_screen_read_hold || synchronized_update_holds_frame(core, now) {
+    if core.alt_screen_read_hold
+        || synchronized_update_holds_frame(core, now)
+        || resize_recovery_holds_frame(core, now)
+    {
         return RenderStateRefresh::Held;
     }
     let GhosttyPaneCore {
@@ -3226,6 +3337,15 @@ fn recent_text_from_rows(rows: &[String], lines: usize) -> String {
 
 fn contains_kitty_graphics_sequence(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|window| window == b"\x1b_G")
+}
+
+/// Whether `bytes` contains an ED sequence erasing the entire visible
+/// display (`\x1b[2J` or the xterm-extended `\x1b[3J`, which also erases
+/// scrollback) — the shape of a full-screen TUI clearing its display to
+/// redraw for a new size.
+fn contains_full_screen_clear_sequence(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"\x1b[2J")
+        || bytes.windows(4).any(|window| window == b"\x1b[3J")
 }
 
 fn should_probe_host_terminal_theme_restore(core: &GhosttyPaneCore) -> bool {
@@ -5067,6 +5187,197 @@ mod tests {
 
         assert!(pane.detection_text().trim().is_empty());
         assert!(pane.recent_text(3).trim().is_empty());
+    }
+
+    #[test]
+    fn resize_recovery_hold_prevents_a_torn_frame_from_a_multi_write_redraw() {
+        // Regression coverage for the real live-pane bug behind the
+        // scroll-then-snap-back symptom, reproduced against a real `claude`
+        // session's own measured behaviour: on a resize it clears the whole
+        // screen and redraws unconditionally (`\x1b[2J\x1b[H` plus content),
+        // it is on the alternate screen once past onboarding (so #169's
+        // `alt_screen_read_hold` never engages here — that hold is
+        // alt-screen-harvest-only), it never wraps that redraw in DEC 2026
+        // synchronized output, and content large enough to exceed one PTY
+        // read (any pane with real content on screen easily is; a live
+        // capture of a resized `claude` session split into 3 separate reads)
+        // arrives as multiple `process_pty_bytes` calls. A render landing
+        // between the clear and the rest of the redraw shows a blank/torn
+        // frame — this is the actual bug, and it has nothing to do with any
+        // scroll primitive.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        // A real geometry change (e.g. a sibling pane or the diff pane
+        // closing/opening) only arms a watch — most resizes never see a
+        // redraw at all, so nothing is held yet.
+        pane.resize(6, 20, 0, 0);
+        assert!(!pane.resize_recovery_hold_active_for_test());
+
+        // The child's own resize-triggered redraw arrives split across two
+        // PTY reads, exactly like the real capture: a clear first, which is
+        // what actually engages the hold...
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "a full-screen clear inside the watch window must engage the hold"
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "ONE",
+            "the clear alone must never be presented as a blank/torn frame"
+        );
+
+        // ...then the actual content in a second read.
+        pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "the hold must not be released early by the first chunk of a multi-write redraw"
+        );
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FRESH",
+            "once the hold elapses the child's real, complete redraw must be drawn"
+        );
+    }
+
+    #[test]
+    fn resize_recovery_watch_expires_without_a_clear_so_ordinary_resizes_are_never_held() {
+        // The overwhelmingly common case — initial attach, a pane that simply
+        // stays quiet after being resized — must never pay for a hold that
+        // never triggers.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"ONE\r\nTWO\r\nTHREE", &tx);
+        pane.resize(6, 20, 0, 0);
+        assert!(!pane.resize_recovery_hold_active_for_test());
+
+        // Ordinary output with no full-screen clear must never arm the hold,
+        // even inside the watch window.
+        pane.process_pty_bytes(pane_id, 0, b"\r\nno redraw here", &tx);
+        assert!(!pane.resize_recovery_hold_active_for_test());
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+    }
+
+    #[test]
+    fn resize_recovery_dirty_patch_is_clean_while_the_hold_is_active() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"ONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        pane.resize(6, 20, 0, 0);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(pane.resize_recovery_hold_active_for_test());
+        assert!(
+            matches!(
+                pane.collect_dirty_patch(20, 3),
+                TerminalDirtyPatchOutcome::Clean
+            ),
+            "the retained frame path must not patch a pane held after a resize"
+        );
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
+        // The resize itself already marks the whole area dirty (a geometry
+        // change, independent of this hold), so the first patch after release
+        // is a `Fallback` telling the caller to do a full render — not the
+        // `Clean` a still-active hold would incorrectly report. A second call
+        // establishes the retained-diff baseline that fallback exists for.
+        assert!(!matches!(
+            pane.collect_dirty_patch(20, 3),
+            TerminalDirtyPatchOutcome::Clean
+        ));
+        let _ = rendered_top_row(&pane, 20, 3);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[Kfresher", &tx);
+        let patch = match pane.collect_dirty_patch(20, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected the released hold to patch, got {other:?}"),
+        };
+        let (row, cells) = &patch.rows[0];
+        assert_eq!(*row, 0);
+        let text = cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert_eq!(text.trim_end(), "fresher");
+    }
+
+    #[test]
+    fn resize_recovery_hold_expires_so_a_child_that_never_redraws_still_settles() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"ONE\r\nTWO\r\nTHREE", &tx);
+        pane.resize(6, 20, 0, 0);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(pane.resize_recovery_hold_active_for_test());
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "",
+            "a child that clears and never redraws further must still settle on its real (blank) content"
+        );
+    }
+
+    #[test]
+    fn resize_recovery_hold_does_not_engage_without_prior_content() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.resize(6, 20, 0, 0);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+
+        assert!(
+            !pane.resize_recovery_hold_active_for_test(),
+            "a pane resized before it ever had content has nothing worth holding a frame for"
+        );
+    }
+
+    #[test]
+    fn resize_recovery_watch_is_not_armed_over_a_stalled_synchronized_update() {
+        // A resize landing on a child that opened a synchronized update and
+        // never closed it must still draw live immediately
+        // (`resize_releases_the_synchronized_update_hold`'s own invariant): the
+        // retained frame that stalled batch was guarding no longer matches the
+        // new geometry either way, so it must be force-released, and a
+        // trailing clear must not retroactively engage a hold either.
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\r\x1b[KRESIZED", &tx);
+        pane.resize(3, 30, 9, 18);
+        assert_eq!(rendered_top_row(&pane, 30, 3), "RESIZED");
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(!pane.resize_recovery_hold_active_for_test());
     }
 
     #[test]
