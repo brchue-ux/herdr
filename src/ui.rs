@@ -1561,19 +1561,40 @@ mod tests {
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let buffer = terminal.backend().buffer();
 
-        let text = (diff_area.y..diff_area.y + diff_area.height)
+        let rows = (diff_area.y..diff_area.y + diff_area.height)
             .map(|row| buffer_row_text(buffer, diff_area, row))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let text = rows.join("\n");
         assert!(text.contains("old line"), "{text}");
         assert!(text.contains("new line"), "{text}");
 
-        let removed_row = diff_area.y + 3; // panel border (1) + header (2) + hunk (1) = row index 3 has "-old line"
-        let added_row = diff_area.y + 4;
-        let removed_fg = buffer[(diff_area.x + 2, removed_row)].fg;
-        let added_fg = buffer[(diff_area.x + 2, added_row)].fg;
-        assert_eq!(removed_fg, app.palette.red, "removed line must be red");
-        assert_eq!(added_fg, app.palette.green, "added line must be green");
+        // Layout (rail/gutter, not fixed columns) shifted where the marker
+        // glyph lands, so locate it by content instead of a hardcoded offset.
+        let removed_row_idx = rows
+            .iter()
+            .position(|row| row.contains("old line"))
+            .expect("removed row");
+        let added_row_idx = rows
+            .iter()
+            .position(|row| row.contains("new line"))
+            .expect("added row");
+        let removed_row = diff_area.y + removed_row_idx as u16;
+        let added_row = diff_area.y + added_row_idx as u16;
+        let removed_marker_x = diff_area.x
+            + rows[removed_row_idx]
+                .chars()
+                .position(|c| c == '-')
+                .expect("- marker") as u16;
+        let added_marker_x = diff_area.x
+            + rows[added_row_idx]
+                .chars()
+                .position(|c| c == '+')
+                .expect("+ marker") as u16;
+
+        let removed_fg = buffer[(removed_marker_x, removed_row)].fg;
+        let added_fg = buffer[(added_marker_x, added_row)].fg;
+        assert_eq!(removed_fg, app.palette.red, "removed marker must be red");
+        assert_eq!(added_fg, app.palette.green, "added marker must be green");
     }
 
     #[test]
