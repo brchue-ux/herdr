@@ -297,6 +297,17 @@ pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> b
     agent.is_some_and(|agent| manifest::should_skip_state_update(agent, screen_content))
 }
 
+/// Half-open line range of `screen` covering the interior of Claude Code's
+/// composer box, borders excluded. `None` for any other agent, or when the
+/// box does not resolve on this screen — see
+/// [`manifest::prompt_box_body_line_range`].
+pub(crate) fn prompt_box_body_line_range(
+    agent: Option<Agent>,
+    screen: &str,
+) -> Option<std::ops::Range<usize>> {
+    manifest::prompt_box_body_line_range(agent?, screen)
+}
+
 /// Identify the agent that owns a screen when the process probe found nothing.
 ///
 /// Only agents whose manifest ships `[[identity]]` rules can be identified this

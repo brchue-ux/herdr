@@ -13,13 +13,132 @@ use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
-use crate::layout::PaneInfo;
+use crate::layout::{PaneId, PaneInfo};
 use crate::popup_size::resolve_popup_geometry;
 use crate::terminal::{TerminalRuntime, TerminalRuntimeRegistry};
 
 pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
     rt.scroll_metrics()
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
+}
+
+// Terminal triview — restyling a Claude Code pane's own PTY output into a
+// transcript zone, a cropped composer zone, and a new bottom zone carrying
+// `crate::app::pane_command_log::PaneCommandLog` — is Claude-only and
+// visual-only by design. Every other agent's pane, and every state where
+// this pane's own shape cannot be confidently read this frame, renders
+// through the unmodified `TerminalRuntime::render` path below: an explicit
+// branch on agent identity and pane state, never an accident of detection
+// quietly returning nothing.
+
+/// Minimum spare rows below the composer for the bottom command-log zone to
+/// be worth drawing — fewer than this would read as a sliver rather than a
+/// real zone, so the pane falls back to a normal full render instead.
+const MIN_TRIVIEW_BOTTOM_ROWS: u16 = 3;
+
+/// Minimum pane height even worth attempting triview detection against — a
+/// cheap bailout before paying for a text read of the live grid.
+const MIN_TRIVIEW_PANE_ROWS: u16 = 10;
+
+fn pane_detected_agent(
+    app: &AppState,
+    ws_idx: usize,
+    pane_id: PaneId,
+) -> Option<crate::detect::Agent> {
+    let ws = app.workspaces.get(ws_idx)?;
+    let terminal_id = ws.terminal_id(pane_id)?;
+    app.terminals.get(terminal_id)?.detected_agent
+}
+
+fn should_attempt_claude_triview(
+    app: &AppState,
+    ws_idx: usize,
+    info: &PaneInfo,
+    terminal_active: bool,
+    rt: &TerminalRuntime,
+) -> bool {
+    info.is_focused
+        && terminal_active
+        && info.inner_rect.height >= MIN_TRIVIEW_PANE_ROWS
+        && !pane_is_scrolled_back(rt)
+        && pane_detected_agent(app, ws_idx, info.id) == Some(crate::detect::Agent::Claude)
+}
+
+/// Draws the herdr-owned parts of a triview pane: the two divider rows left
+/// where Claude's own composer border was cropped out, and the command-log
+/// bottom zone. The transcript and composer zones themselves were already
+/// drawn straight from the live grid by
+/// [`TerminalRuntime::render_claude_triview`] — this only fills what that
+/// call deliberately left blank.
+fn render_claude_triview_chrome(
+    app: &AppState,
+    frame: &mut Frame,
+    info: &PaneInfo,
+    layout: crate::pane::ClaudeTriviewLayout,
+) {
+    let area = info.inner_rect;
+    let divider_style = Style::default().fg(app.palette.surface_dim);
+
+    let top_divider_y = area.y + layout.transcript_rows;
+    render_triview_divider(frame, area, top_divider_y, divider_style);
+
+    let bottom_divider_y = top_divider_y + 1 + layout.composer_rows;
+    render_triview_divider(frame, area, bottom_divider_y, divider_style);
+
+    let log_y = bottom_divider_y + 1;
+    let pane_bottom = area.y + area.height;
+    if log_y >= pane_bottom {
+        return;
+    }
+    let log_area = Rect {
+        x: area.x,
+        y: log_y,
+        width: area.width,
+        height: pane_bottom - log_y,
+    };
+    render_pane_command_log(app, frame, info.id, log_area);
+}
+
+fn render_triview_divider(frame: &mut Frame, pane_area: Rect, y: u16, style: Style) {
+    if y >= pane_area.y + pane_area.height || pane_area.width == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: pane_area.x,
+        y,
+        width: pane_area.width,
+        height: 1,
+    };
+    let rule = "─".repeat(pane_area.width as usize);
+    frame.render_widget(Paragraph::new(rule).style(style), rect);
+}
+
+/// The bottom zone's own content: this pane's own recent shell commands,
+/// oldest at the top, newest anchored to the zone's own bottom row so the
+/// zone reads the same whether it holds one command or all
+/// [`crate::app::pane_command_log::PANE_COMMAND_LOG_MAX`] of them.
+fn render_pane_command_log(app: &AppState, frame: &mut Frame, pane_id: PaneId, area: Rect) {
+    let commands: Vec<&str> = app.pane_command_log.lines(pane_id).collect();
+    let visible_rows = area.height as usize;
+    let shown = &commands[commands.len().saturating_sub(visible_rows)..];
+    let pad_rows = visible_rows.saturating_sub(shown.len());
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
+    lines.extend(std::iter::repeat_n(Line::from(""), pad_rows));
+    lines.extend(shown.iter().map(|command| {
+        Line::from(vec![
+            Span::styled("● ", Style::default().fg(app.palette.accent)),
+            Span::styled(
+                (*command).to_string(),
+                Style::default().fg(app.palette.subtext0),
+            ),
+        ])
+    }));
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(app.palette.panel_bg)),
+        area,
+    );
 }
 
 fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
@@ -374,7 +493,21 @@ pub(super) fn render_panes(
                 && terminal_active
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
-            rt.render(frame, info.inner_rect, show_cursor);
+
+            let triview = should_attempt_claude_triview(app, ws_idx, info, terminal_active, rt)
+                .then(|| {
+                    rt.render_claude_triview(
+                        frame,
+                        info.inner_rect,
+                        show_cursor,
+                        MIN_TRIVIEW_BOTTOM_ROWS,
+                    )
+                })
+                .flatten();
+            match triview {
+                Some(layout) => render_claude_triview_chrome(app, frame, info, layout),
+                None => rt.render(frame, info.inner_rect, show_cursor),
+            }
             render_pane_scrollbar(app, frame, info, rt);
 
             let should_dim = !info.is_focused && multi_pane && !terminal_active;
@@ -389,36 +522,43 @@ pub(super) fn render_panes(
                 }
             }
 
-            let (copy_search_top, copy_search_bottom, copy_search_matches) =
-                validated_copy_mode_search_matches(app, info, rt);
-            render_copy_mode_search_highlights(
-                app,
-                frame,
-                info,
-                copy_search_top,
-                copy_search_bottom,
-                &copy_search_matches,
-                false,
-            );
-            render_selection_highlight(
-                &app.selection,
-                frame,
-                info.id,
-                info.inner_rect,
-                rt.scroll_metrics(),
-                &app.palette,
-                app.host_terminal_theme,
-            );
-            render_copy_mode_search_highlights(
-                app,
-                frame,
-                info,
-                copy_search_top,
-                copy_search_bottom,
-                &copy_search_matches,
-                true,
-            );
-            render_copy_mode_cursor(app, frame, info);
+            // Selection and copy-mode search highlighting assume the drawn
+            // grid maps linearly onto `info.inner_rect`, which the composer
+            // zone above no longer does once its border chrome is cropped
+            // out. Skipped here rather than drawn wrong; revisit if triview
+            // panes need mouse selection.
+            if triview.is_none() {
+                let (copy_search_top, copy_search_bottom, copy_search_matches) =
+                    validated_copy_mode_search_matches(app, info, rt);
+                render_copy_mode_search_highlights(
+                    app,
+                    frame,
+                    info,
+                    copy_search_top,
+                    copy_search_bottom,
+                    &copy_search_matches,
+                    false,
+                );
+                render_selection_highlight(
+                    &app.selection,
+                    frame,
+                    info.id,
+                    info.inner_rect,
+                    rt.scroll_metrics(),
+                    &app.palette,
+                    app.host_terminal_theme,
+                );
+                render_copy_mode_search_highlights(
+                    app,
+                    frame,
+                    info,
+                    copy_search_top,
+                    copy_search_bottom,
+                    &copy_search_matches,
+                    true,
+                );
+                render_copy_mode_cursor(app, frame, info);
+            }
         }
     }
 
@@ -979,6 +1119,100 @@ mod tests {
             &app.view.split_borders,
             frame,
         );
+    }
+
+    #[test]
+    fn pane_detected_agent_returns_the_pane_s_own_terminal_agent() {
+        let mut app = AppState::test_new();
+
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        app.terminals.insert(terminal_id, terminal_state);
+        app.workspaces = vec![ws];
+
+        assert_eq!(
+            pane_detected_agent(&app, 0, pane_id),
+            Some(crate::detect::Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn pane_detected_agent_is_none_for_an_unknown_pane() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("test")];
+        let bogus_pane = crate::layout::PaneId::from_raw(999_999);
+        assert_eq!(pane_detected_agent(&app, 0, bogus_pane), None);
+    }
+
+    #[tokio::test]
+    async fn should_attempt_claude_triview_requires_focus_terminal_mode_and_claude_agent() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        app.terminals.insert(terminal_id.clone(), terminal_state);
+        app.workspaces = vec![ws];
+
+        let rt = TerminalRuntime::test_with_scrollback_bytes(
+            40,
+            MIN_TRIVIEW_PANE_ROWS,
+            1024,
+            b"ready\n",
+        );
+
+        let mut focused_info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, MIN_TRIVIEW_PANE_ROWS),
+            inner_rect: Rect::new(0, 0, 40, MIN_TRIVIEW_PANE_ROWS),
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        };
+        assert!(should_attempt_claude_triview(
+            &app,
+            0,
+            &focused_info,
+            true,
+            &rt
+        ));
+
+        // Not focused: no other pane should ever get the special treatment.
+        let mut unfocused_info = focused_info.clone();
+        unfocused_info.is_focused = false;
+        assert!(!should_attempt_claude_triview(
+            &app,
+            0,
+            &unfocused_info,
+            true,
+            &rt
+        ));
+
+        // Not in terminal mode.
+        assert!(!should_attempt_claude_triview(
+            &app,
+            0,
+            &focused_info,
+            false,
+            &rt
+        ));
+
+        // Too short a pane to bother.
+        focused_info.inner_rect.height = MIN_TRIVIEW_PANE_ROWS - 1;
+        assert!(!should_attempt_claude_triview(
+            &app,
+            0,
+            &focused_info,
+            true,
+            &rt
+        ));
     }
 
     #[test]

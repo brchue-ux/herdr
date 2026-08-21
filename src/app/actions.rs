@@ -3016,6 +3016,7 @@ impl AppState {
                 command,
                 observed_at,
             } => {
+                self.pane_command_log.record(pane_id, command.clone());
                 let text = match self.pane_label_for_status_feed(pane_id) {
                     Some(label) => format!("{label}: {command}"),
                     None => command,
@@ -3640,6 +3641,7 @@ impl AppState {
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
         self.pending_agent_notifications.remove(&pane_id);
+        self.pane_command_log.remove(pane_id);
         self.remove_plugin_pane_records([pane_id]);
         let ws_idx = self
             .workspaces

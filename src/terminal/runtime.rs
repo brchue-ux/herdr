@@ -409,6 +409,17 @@ impl TerminalRuntime {
         self.0.render(frame, area, show_cursor);
     }
 
+    pub(crate) fn render_claude_triview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+        min_bottom_rows: u16,
+    ) -> Option<crate::pane::ClaudeTriviewLayout> {
+        self.0
+            .render_claude_triview(frame, area, show_cursor, min_bottom_rows)
+    }
+
     pub(crate) fn collect_dirty_patch(
         &self,
         area_width: u16,

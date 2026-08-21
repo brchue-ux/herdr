@@ -41,11 +41,11 @@ use self::agent_detection::{
     ScreenDetectionPublishInput, ScreenIdentityConfirmation, AGENT_PENDING_IDLE_RECHECK,
     AGENT_STARTUP_GRACE_WINDOW,
 };
-use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
-    TerminalTextPoint, TerminalWordMotion,
+    ClaudeTriviewLayout, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
+    TerminalTextMatch, TerminalTextPoint, TerminalWordMotion,
 };
+use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub use self::{
     state::PaneState,
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
@@ -3100,6 +3100,17 @@ impl PaneRuntime {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.terminal.render(frame, area, show_cursor);
+    }
+
+    pub(crate) fn render_claude_triview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+        min_bottom_rows: u16,
+    ) -> Option<ClaudeTriviewLayout> {
+        self.terminal
+            .render_claude_triview(frame, area, show_cursor, min_bottom_rows)
     }
 
     pub(crate) fn collect_dirty_patch(

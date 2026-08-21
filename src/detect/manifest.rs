@@ -398,6 +398,28 @@ pub fn transcript_line_range(agent: Agent, screen: &str) -> Option<std::ops::Ran
     subslice_line_range(screen, slice)
 }
 
+/// Line range (half-open, indices into `screen.lines()`) covering the
+/// interior of Claude Code's composer box — the input text, excluding both
+/// border rows. `None` for any other agent (v1, matching
+/// [`super::command_marker`]'s own Claude-only scope), when the box does not
+/// resolve on this screen, or when it resolves to zero interior rows (a
+/// malformed pair of adjacent borders is not a real composer).
+///
+/// Shares `screen` with [`transcript_line_range`] on purpose: a caller
+/// splitting a live pane into transcript/composer zones reads the screen once
+/// and derives both ranges from that single read.
+pub(crate) fn prompt_box_body_line_range(
+    agent: Agent,
+    screen: &str,
+) -> Option<std::ops::Range<usize>> {
+    if agent != Agent::Claude {
+        return None;
+    }
+    let slice = prompt_box_body(screen)?;
+    let range = subslice_line_range(screen, slice)?;
+    (!range.is_empty()).then_some(range)
+}
+
 /// Map a subslice of `content` back to the half-open line range it covers.
 /// Returns `None` when `slice` is not a subslice of `content` — which is how
 /// the region resolver reports "this region is not present on this screen"

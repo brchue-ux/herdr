@@ -511,6 +511,17 @@ impl PaneTerminal {
         self.ghostty.render(frame, area, show_cursor);
     }
 
+    pub(crate) fn render_claude_triview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+        min_bottom_rows: u16,
+    ) -> Option<ClaudeTriviewLayout> {
+        self.ghostty
+            .render_claude_triview(frame, area, show_cursor, min_bottom_rows)
+    }
+
     pub fn collect_dirty_patch(
         &self,
         area_width: u16,
@@ -2199,6 +2210,263 @@ impl GhosttyPaneTerminal {
             .ok()
             .map(|mut core| ghostty_collect_dirty_patch(&mut core, area_width, area_height))
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
+    }
+
+    /// Renders a Claude Code pane as two live zones — the transcript above the
+    /// composer box, and the composer's own body with its border chrome
+    /// cropped out — instead of one full-height copy. `min_bottom_rows` is how
+    /// many spare rows the caller needs left over below the composer (for its
+    /// own command-log zone); this returns `None` rather than guess whenever
+    /// that does not fit, the live screen's shape is not confidently
+    /// recognized this frame, or the underlying grid read fails. The caller's
+    /// job on `None` is exactly [`GhosttyPaneTerminal::render`] — a normal,
+    /// unmodified full-pane draw.
+    ///
+    /// A single lock, one `refresh_render_state`, one dirty-clear — matching
+    /// [`Self::render`]'s own per-frame cost — even though the live grid is
+    /// walked twice (once per zone): FFI row iteration is cheap relative to
+    /// the render-state refresh it draws from, which is what this shares
+    /// across both passes.
+    pub(crate) fn render_claude_triview(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        show_cursor: bool,
+        min_bottom_rows: u16,
+    ) -> Option<ClaudeTriviewLayout> {
+        let mut core = self.core.lock().ok()?;
+        let host_theme = core.host_terminal_theme;
+        let initial_default_foreground = core.initial_default_foreground;
+        let initial_default_background = core.initial_default_background;
+        let held_for_synchronized_update = match refresh_render_state(&mut core, Instant::now()) {
+            RenderStateRefresh::Failed => return None,
+            RenderStateRefresh::Held => {
+                crate::render_prof::event("render.synchronized_update_hold");
+                true
+            }
+            RenderStateRefresh::Updated => false,
+        };
+
+        let layout = claude_triview_layout(&core.terminal, area.height, min_bottom_rows)?;
+
+        let GhosttyPaneCore {
+            render_state,
+            decscusr_tracker,
+            ..
+        } = &mut *core;
+        let colors = render_state.colors().ok();
+        let default_bg = colors
+            .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+        let default_fg = colors
+            .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+        let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+        let resolved_bg = colors.map(|c| ghostty_color(c.background));
+        let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+
+        let transcript_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: layout.transcript_rows,
+        };
+        let composer_area = Rect {
+            x: area.x,
+            y: area.y + layout.transcript_rows + 1,
+            width: area.width,
+            height: layout.composer_rows,
+        };
+
+        {
+            let buf = frame.buffer_mut();
+            blit_terminal_rows(
+                buf,
+                transcript_area,
+                render_state,
+                0,
+                default_fg,
+                default_bg,
+                resolved_fg,
+                resolved_bg,
+                hide_kitty_placeholders,
+            );
+            blit_terminal_rows(
+                buf,
+                composer_area,
+                render_state,
+                layout.transcript_rows + 1,
+                default_fg,
+                default_bg,
+                resolved_fg,
+                resolved_bg,
+                hide_kitty_placeholders,
+            );
+        }
+
+        if !held_for_synchronized_update {
+            ghostty_clear_render_dirty(render_state, area.height);
+        }
+
+        let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
+        if show_cursor {
+            if let Some(cursor) =
+                effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
+            {
+                let skip = layout.transcript_rows + 1;
+                if cursor.y >= skip {
+                    let composer_y = cursor.y - skip;
+                    if cursor.x < composer_area.width && composer_y < composer_area.height {
+                        frame.set_cursor_position((
+                            composer_area.x + cursor.x,
+                            composer_area.y + composer_y,
+                        ));
+                    }
+                }
+            }
+        }
+
+        Some(layout)
+    }
+}
+
+/// The row split [`GhosttyPaneTerminal::render_claude_triview`] drew,
+/// reported so the caller can lay out its own divider and command-log rows
+/// beneath the composer without recomputing the boundary itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClaudeTriviewLayout {
+    /// Rows `[0, transcript_rows)`, drawn at the top of `area`.
+    pub transcript_rows: u16,
+    /// Rows `[transcript_rows + 1, transcript_rows + 1 + composer_rows)`,
+    /// drawn right after a one-row gap where the composer's own top border
+    /// used to be.
+    pub composer_rows: u16,
+}
+
+impl ClaudeTriviewLayout {
+    /// Total rows this layout occupies: the transcript, one gap row where the
+    /// composer's top border was cropped out, the composer body, and one gap
+    /// row where its bottom border was cropped out. Rows in `area` at or past
+    /// this are the caller's to use.
+    pub(crate) fn consumed_rows(&self) -> u16 {
+        self.transcript_rows + 1 + self.composer_rows + 1
+    }
+}
+
+/// Reads exactly the bottom `area_height` rows of the live grid — the same
+/// rows [`GhosttyPaneTerminal::render`] is about to draw — and locates
+/// Claude's composer box in them the same way [`crate::detect::command_marker`]
+/// does, so the row split always matches what is actually on screen this
+/// frame rather than a periodic detection scan that may have gone stale.
+///
+/// Requires the composer's body to start exactly one row after the
+/// transcript ends (its top border) and to leave at least `min_bottom_rows`
+/// spare below it; returns `None` rather than guess when either does not
+/// hold, when the read fails, or when either row count does not fit a `u16`.
+fn claude_triview_layout(
+    terminal: &crate::ghostty::Terminal,
+    area_height: u16,
+    min_bottom_rows: u16,
+) -> Option<ClaudeTriviewLayout> {
+    let recent = ghostty_recent_text_for_terminal(terminal, area_height as usize).ok()?;
+    let claude = Some(crate::detect::Agent::Claude);
+    let transcript_range = crate::detect::transcript_line_range(claude, &recent)?;
+    let composer_range = crate::detect::prompt_box_body_line_range(claude, &recent)?;
+    if composer_range.start != transcript_range.end.saturating_add(1) {
+        return None;
+    }
+    let transcript_rows = u16::try_from(transcript_range.end).ok()?;
+    let composer_rows = u16::try_from(composer_range.len()).ok()?;
+    let layout = ClaudeTriviewLayout {
+        transcript_rows,
+        composer_rows,
+    };
+    (layout.consumed_rows().saturating_add(min_bottom_rows) <= area_height).then_some(layout)
+}
+
+/// Copies up to `area.height` rows of the live grid into `area`, skipping
+/// `skip_rows` rows from the top of the current viewport first. Shared by
+/// [`GhosttyPaneTerminal::render_claude_triview`]'s two zones; identical to
+/// the single-zone copy in [`GhosttyPaneTerminal::render`] when `skip_rows`
+/// is `0`. Blanks every cell in `area` it does not draw real content into,
+/// including when the skip itself runs past the end of the grid — the caller
+/// never needs its own separate clear pass.
+#[allow(clippy::too_many_arguments)]
+fn blit_terminal_rows(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    render_state: &mut crate::ghostty::RenderState,
+    skip_rows: u16,
+    default_fg: Option<Color>,
+    default_bg: Option<Color>,
+    resolved_fg: Option<Color>,
+    resolved_bg: Option<Color>,
+    hide_kitty_placeholders: bool,
+) {
+    let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
+        return;
+    };
+    let Ok(mut row_cells) = crate::ghostty::RowCells::new() else {
+        return;
+    };
+    let Ok(mut rows) = render_state.populate_row_iterator(&mut row_iterator) else {
+        return;
+    };
+    for _ in 0..skip_rows {
+        if !rows.next() {
+            break;
+        }
+    }
+    let mut grapheme_bytes = Vec::new();
+    let mut symbol_scratch = String::new();
+    let mut y = 0u16;
+    while y < area.height && rows.next() {
+        let mut cells = match rows.populate_cells(&mut row_cells) {
+            Ok(cells) => cells,
+            Err(_) => break,
+        };
+        let mut x = 0u16;
+        while x < area.width && cells.next() {
+            let basic = cells.basic_data().unwrap_or_default();
+            let style = ghostty_cell_style(
+                &cells,
+                &basic,
+                default_fg,
+                default_bg,
+                resolved_fg,
+                resolved_bg,
+            );
+            let symbol = match ghostty_buffer_symbol_into(
+                &cells,
+                basic.wide,
+                hide_kitty_placeholders,
+                &mut grapheme_bytes,
+                &mut symbol_scratch,
+            ) {
+                Ok(symbol) => symbol,
+                Err(_) => {
+                    symbol_scratch.clear();
+                    symbol_scratch.push_str(ghostty_blank_symbol_for_width(basic.wide));
+                    symbol_scratch.as_str()
+                }
+            };
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            cell.reset();
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+            x += 1;
+        }
+        while x < area.width {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            ghostty_reset_cell(cell, default_fg, default_bg);
+            x += 1;
+        }
+        y += 1;
+    }
+    while y < area.height {
+        for x in 0..area.width {
+            let cell = &mut buf[(area.x + x, area.y + y)];
+            ghostty_reset_cell(cell, default_fg, default_bg);
+        }
+        y += 1;
     }
 }
 
@@ -4113,6 +4381,94 @@ mod tests {
             .unwrap();
 
         terminal.backend_mut().assert_cursor_position((4, 0));
+    }
+
+    fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// A minimal Claude Code-shaped screen: two transcript lines, a composer
+    /// box holding one input line, and one hint line below the box — enough
+    /// rows for [`GhosttyPaneTerminal::render_claude_triview`] to recognize
+    /// the shape the same way [`crate::detect::command_marker`] does.
+    fn write_claude_shaped_screen(terminal: &mut crate::ghostty::Terminal) {
+        terminal.write(b"first line of output\r\n");
+        terminal.write(b"second line of output\r\n");
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b" > typed input\r\n");
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b"? for shortcuts");
+    }
+
+    #[test]
+    fn render_claude_triview_splits_transcript_and_composer_zones() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(30, 8, 0).unwrap();
+        write_claude_shaped_screen(&mut terminal);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 2);
+        })
+        .unwrap();
+
+        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(layout.transcript_rows, 2);
+        assert_eq!(layout.composer_rows, 1);
+        assert_eq!(layout.consumed_rows(), 5);
+
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer_row_text(buffer, 0, 30), "first line of output");
+        assert_eq!(buffer_row_text(buffer, 1, 30), "second line of output");
+        // Row 2 is the cropped-out top border, left to the caller's own
+        // divider — not asserted here. The composer body lands right after
+        // it, with its border chrome gone.
+        assert_eq!(buffer_row_text(buffer, 3, 30), " > typed input");
+    }
+
+    #[test]
+    fn render_claude_triview_falls_back_without_a_composer_box() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(30, 8, 0).unwrap();
+        terminal.write(b"plain scrollback, no box drawing at all\r\n");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 2);
+        })
+        .unwrap();
+
+        assert!(layout.is_none());
+    }
+
+    #[test]
+    fn render_claude_triview_falls_back_when_bottom_rows_would_not_fit() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(30, 8, 0).unwrap();
+        write_claude_shaped_screen(&mut terminal);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        // consumed_rows() is 5 on this fixture; nothing fits alongside it
+        // once min_bottom_rows demands more than the 3 spare rows there are.
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 4);
+        })
+        .unwrap();
+
+        assert!(layout.is_none());
     }
 
     #[test]

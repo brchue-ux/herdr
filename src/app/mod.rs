@@ -25,6 +25,7 @@ mod ids;
 mod input;
 pub(crate) mod lifecycle;
 pub(crate) mod pane_activity;
+pub(crate) mod pane_command_log;
 pub(crate) mod pane_resize_reflow;
 pub(crate) mod pane_unread;
 pub(crate) mod pending_effects;
@@ -891,6 +892,7 @@ impl App {
             background_scene_layout: None,
             machine_register: crate::machine_register::MachineRegister::default(),
             status_feed: crate::app::status_feed::StatusFeed::default(),
+            pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,
