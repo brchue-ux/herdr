@@ -3795,7 +3795,7 @@ fn render_card_border_rails(
     list_top: u16,
     list_bottom: u16,
     motion: (i32, i32),
-    beat: motion::ArrivalBeat,
+    circuit: motion::ArrivalCircuit,
 ) {
     let Some(shell_frame) = card.card_frame else {
         return;
@@ -3845,41 +3845,32 @@ fn render_card_border_rails(
         let Some(drawn_y) = moved_row(y, motion.1, list_top, list_bottom) else {
             continue;
         };
-        // Beats one and two of the arrival, drawn as the light travelling: the
-        // rail grows *down* to the elbow, then the elbow's run grows *right*
-        // into the edge the card will be generated from. Nothing of the card is
-        // drawn through either — see [`super::motion::ArrivalBeat`].
+        // The rail and the branch grow from their own fixed anchors — the
+        // rail's top edge, the branch's own left edge at the rail — never a
+        // translation of a finished line. See [`super::motion::ArrivalCircuit`].
         let (spans, cols) = if y == connector_y {
-            match beat {
-                motion::ArrivalBeat::Rail(_) => continue,
-                motion::ArrivalBeat::Elbow(t) => {
-                    let lit = ((connector.len() as f32) * t.clamp(0.0, 1.0)).round() as usize;
-                    if lit == 0 {
-                        continue;
-                    }
-                    (connector[..lit.min(connector.len())].to_vec(), width)
-                }
-                _ => (connector.clone(), width),
+            let lit = ((connector.len() as f32) * circuit.tick).round() as usize;
+            if lit == 0 {
+                continue;
             }
+            (connector[..lit.min(connector.len())].to_vec(), width)
         } else if y < connector_y {
-            if let motion::ArrivalBeat::Rail(t) = beat {
-                // Measured from the card's top edge down to the elbow, so the
-                // light's speed does not depend on how tall the card is.
-                let run = f32::from(connector_y.saturating_sub(shell_frame.y));
-                let reached = shell_frame.y + (run * t.clamp(0.0, 1.0)).round() as u16;
-                if y > reached {
-                    continue;
-                }
+            // Measured from the card's top edge down to the elbow, so the
+            // rail's growth rate does not depend on how tall the card is.
+            // Zero at `rail == 0.0`: the segment's fixed anchor is its own
+            // top, and nothing below it is lit until growth reaches there.
+            let run = f32::from(connector_y.saturating_sub(shell_frame.y));
+            let grown = run * circuit.rail;
+            let offset = f32::from(y.saturating_sub(shell_frame.y));
+            if offset >= grown {
+                continue;
             }
             (above.clone(), width)
-        } else if matches!(
-            beat,
-            motion::ArrivalBeat::Rail(_) | motion::ArrivalBeat::Elbow(_)
-        ) {
-            // Nothing below the elbow while the light is still travelling to
-            // it: what runs below a card is the rail leaving it toward its own
-            // children, and a card that does not exist yet has none. Drawing it
-            // would be a line hanging under nothing.
+        } else if circuit.card <= 0.0 {
+            // Nothing below the elbow until the branch exists and the card
+            // has begun to bloom: what runs below a card is the rail leaving
+            // it toward its own children, and a card that does not exist yet
+            // has none. Drawing it would be a line hanging under nothing.
             continue;
         } else if y >= card_bottom {
             (below_the_card.clone(), below_width)
@@ -11832,40 +11823,35 @@ mod a_branch_leaves_its_parents_own_border_column {
         assert!(checked > 0, "no pane box was swept");
     }
 
-    /// **The light travels the tree before the card exists.**
+    /// **The rail grows down from its own fixed anchor before the branch
+    /// grows right, before the card blooms.**
     ///
-    /// Beats one and two of [`image_card::row_arrival`]'s gesture, on the
-    /// characters that carry them: the rail grows *down* to the elbow, and only
-    /// then does the elbow's own run grow *right* into the edge the card will be
-    /// generated from. A rail fully drawn at beat one, or an elbow drawn before
-    /// the rail has reached it, is the gesture played out of order.
+    /// [`image_card::row_arrival`]'s gesture, on the characters that carry the
+    /// first two of its four beats: the rail grows *down* to the elbow from a
+    /// fixed top anchor, and only once it has fully reached the elbow does the
+    /// branch grow *right* out of it. A rail fully drawn while `rail < 1.0`,
+    /// or a branch drawn before the rail has reached it, is the gesture played
+    /// out of order.
     #[test]
-    fn the_light_runs_down_the_rail_before_it_turns_the_elbow() {
-        use crate::ui::sidebar::motion::ArrivalBeat;
+    fn the_rail_grows_down_before_the_branch_grows_right() {
+        use crate::ui::sidebar::motion::ArrivalCircuit;
 
-        // Only the rows the renderer actually draws, per beat, over one card
-        // four cells tall whose connector lands on its second row.
+        // Only the rows the renderer actually draws, per circuit, over one
+        // card four cells tall whose connector lands on its second row.
         let frame = Rect::new(7, 10, 33, 4);
         let connector_y = frame.y + (frame.height - 1) / 2;
-        let drawn = |beat: ArrivalBeat| {
+        let drawn = |circuit: ArrivalCircuit| {
             let mut rows = Vec::new();
             for y in frame.y..frame.y + frame.height {
                 let carried = if y == connector_y {
-                    match beat {
-                        ArrivalBeat::Rail(_) => false,
-                        ArrivalBeat::Elbow(t) => t > 0.0,
-                        _ => true,
-                    }
+                    circuit.tick > 0.0
                 } else if y < connector_y {
-                    match beat {
-                        ArrivalBeat::Rail(t) => {
-                            let run = f32::from(connector_y - frame.y);
-                            y <= frame.y + (run * t.clamp(0.0, 1.0)).round() as u16
-                        }
-                        _ => true,
-                    }
+                    let run = f32::from(connector_y - frame.y);
+                    let grown = run * circuit.rail;
+                    let offset = f32::from(y - frame.y);
+                    offset < grown
                 } else {
-                    !matches!(beat, ArrivalBeat::Rail(_) | ArrivalBeat::Elbow(_))
+                    circuit.card > 0.0
                 };
                 if carried {
                     rows.push(y);
@@ -11874,21 +11860,55 @@ mod a_branch_leaves_its_parents_own_border_column {
             rows
         };
 
-        // Beat one at its start lights the card's own top row and nothing else,
-        // and never the elbow.
-        let opening = drawn(ArrivalBeat::Rail(0.0));
-        assert_eq!(opening, vec![frame.y], "the light did not start at the top");
-        assert!(
-            !drawn(ArrivalBeat::Rail(0.9)).contains(&connector_y),
-            "the elbow lit while the light was still coming down the rail"
-        );
-        // And it does reach the elbow's own row by the end of the beat.
-        assert!(drawn(ArrivalBeat::Rail(1.0)).contains(&(connector_y - 1)));
+        let settled = || ArrivalCircuit {
+            push: 1.0,
+            rail: 1.0,
+            tick: 1.0,
+            card: 1.0,
+        };
 
-        // Beat two lights the elbow, and beat three has the whole tree line.
-        assert!(drawn(ArrivalBeat::Elbow(0.5)).contains(&connector_y));
+        // At the very start of the rail's own growth, nothing is lit at all —
+        // the fixed anchor is the segment's own top, and the segment has zero
+        // extent until growth reaches it. Nothing after it has begun either.
+        let opening = drawn(ArrivalCircuit {
+            rail: 0.0,
+            tick: 0.0,
+            card: 0.0,
+            ..settled()
+        });
         assert_eq!(
-            drawn(ArrivalBeat::Settled).len(),
+            opening,
+            Vec::<u16>::new(),
+            "the rail lit before it had grown at all"
+        );
+        assert!(
+            !drawn(ArrivalCircuit {
+                rail: 0.9,
+                tick: 0.0,
+                card: 0.0,
+                ..settled()
+            })
+            .contains(&connector_y),
+            "the branch lit while the rail was still growing toward it"
+        );
+        // And it does reach the elbow's own row by the end of its growth.
+        assert!(drawn(ArrivalCircuit {
+            rail: 1.0,
+            tick: 0.0,
+            card: 0.0,
+            ..settled()
+        })
+        .contains(&(connector_y - 1)));
+
+        // The branch lights once it has started growing, and a fully settled
+        // row has the whole tree line.
+        assert!(drawn(ArrivalCircuit {
+            tick: 0.5,
+            ..settled()
+        })
+        .contains(&connector_y));
+        assert_eq!(
+            drawn(settled()).len(),
             usize::from(frame.height),
             "a settled row is missing part of its own rail"
         );

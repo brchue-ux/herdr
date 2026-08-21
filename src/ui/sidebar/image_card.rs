@@ -886,12 +886,15 @@ struct CardContent {
     /// The failure spider riding this card, if the fleet says it owns an open
     /// defect. See [`spider`].
     spider: Option<spider::CardSpider>,
-    /// How much of this card is drawn, from its left edge, `0.0..=1.0`.
+    /// This card's own opacity, `0.0..=1.0`.
     ///
-    /// Beat three of [`super::motion::ArrivalBeat`]: a card **generates** left
-    /// to right from where the light landed on its edge. `0.0` is a card that
-    /// does not exist yet and `1.0` is every card at rest, which is every card
-    /// on a settled panel.
+    /// The card-bloom beat of [`super::motion::ArrivalCircuit`]: the card
+    /// fades in whole, at its own final position and size, never a clip or a
+    /// translation. `0.0` is a card that does not exist yet and `1.0` is every
+    /// card at rest, which is every card on a settled panel. The field is
+    /// still named `generate` on the wire — see [`CardContentWire`] — because
+    /// renaming it would be a wire-protocol change with nothing behavioural to
+    /// show for it.
     generate: f32,
     /// How hard this row's work is running, `0.0..=1.0` — a share of the
     /// fleet's own traffic, and zero on anything that is not working.
@@ -1376,11 +1379,11 @@ const BREATH_BLOOM_DIP: f32 = 0.36;
 /// the frame interval.
 const CARD_BREATH_STEPS: f32 = 48.0;
 
-/// Steps of a card's generation the artwork is rebuilt at.
+/// Steps of a card's bloom opacity the artwork is rebuilt at.
 ///
-/// The same ladder the wash uses and for the same reason: a generation front is
-/// a *position*, and a coarse ladder reads as the edge stepping rather than as
-/// the card being drawn.
+/// The same ladder the wash uses and for the same reason: opacity is a
+/// *continuous* fade, and a coarse ladder reads as the card flickering between
+/// discrete shades rather than as smoothly blooming in.
 const GENERATE_STEPS: f32 = 24.0;
 
 /// Steps of the discharge the artwork is rebuilt at.
@@ -2326,7 +2329,7 @@ const DISCHARGE_PEAK_ALPHA: f32 = 0.040;
 /// pattern — there is no clock and no random number generator here, and the
 /// picture is a pure function of the card exactly as everything else drawn in
 /// this module is.
-fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, front: f32) {
+fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, opacity: f32) {
     let amount = card.content.discharge.clamp(0.0, 1.0);
     if amount <= 0.0 {
         return;
@@ -2358,11 +2361,6 @@ fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, front: f3
             continue;
         }
         let x = rect.x + inset + across * (rect.w - inset * 2.0);
-        // A filament the generation front has not reached yet is not drawn: the
-        // discharge is inside the card, and the card is not there yet.
-        if x >= front {
-            continue;
-        }
         let px = x.floor().max(0.0) as u32;
         if px >= sheet.width() {
             continue;
@@ -2373,7 +2371,7 @@ fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, front: f3
             // drawn on it.
             let t = ((y as f32 + 0.5) - top) / (bottom - top);
             let fade = (t * std::f32::consts::PI).sin().max(0.0);
-            sheet.blend(px, y, ink, alpha * fade);
+            sheet.blend(px, y, ink, alpha * fade * opacity);
         }
     }
 }
@@ -2389,25 +2387,22 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let (ox, oy, width, height) = (rect.x, rect.y, rect.w, rect.h);
     let half_stroke = geometry.stroke / 2.0;
 
-    // **The generation front.** Beat three of the arrival: every pixel of this
-    // card right of it has not been drawn yet. It is a *clip on a card being
-    // drawn*, which is F22's whole point — the card is generated in place from
-    // its left edge, never translated home from off the panel. A settled card's
-    // front is its own right edge, which is every card on a settled panel and
-    // therefore the branch that costs nothing.
-    let generate = content.generate.clamp(0.0, 1.0);
-    if generate <= 0.0 {
+    // **The card-bloom opacity.** The card-bloom beat of the arrival: the
+    // whole card fades in at its own final position and size, never a clip or
+    // a translation — the rail and the branch are what carry the sense of
+    // something growing toward it. A settled card's opacity is `1.0`, which is
+    // every card on a settled panel and therefore the branch that costs
+    // nothing.
+    let opacity = content.generate.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
         return;
     }
-    let front = ox + width * generate;
 
     // One pass over the card, reading the same distance for the face, the inner
     // glow and the edge.
     let x0 = ox.floor().max(0.0) as u32;
     let y0 = oy.floor().max(0.0) as u32;
-    let x1 = ((ox + width).ceil() as u32)
-        .min(sheet.width())
-        .min(front.ceil().max(0.0) as u32);
+    let x1 = ((ox + width).ceil() as u32).min(sheet.width());
     let y1 = ((oy + height).ceil() as u32).min(sheet.height());
     if x1 <= x0 {
         return;
@@ -2455,9 +2450,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         h: rect.h,
         r: rect.r,
     };
-    let back_x1 = ((ox + width + measured::GLASS_THICKNESS_PX).ceil() as u32)
-        .min(sheet.width())
-        .min((front + measured::GLASS_THICKNESS_PX).ceil().max(0.0) as u32);
+    let back_x1 = ((ox + width + measured::GLASS_THICKNESS_PX).ceil() as u32).min(sheet.width());
     let back_y1 = ((oy + height + measured::GLASS_THICKNESS_PX).ceil() as u32).min(sheet.height());
     for y in y0..back_y1 {
         let py = y as f32 + 0.5;
@@ -2470,9 +2463,9 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                 continue;
             }
             let d = back.distance(px, py);
-            // The back face reaches a few pixels past the front's last column,
-            // so it borrows that column's own edge colour rather than running
-            // off the end of the gradient.
+            // The back face reaches a few pixels past the front face's own
+            // last column, so it borrows that column's own edge colour rather
+            // than running off the end of the gradient.
             let column = (x.saturating_sub(x0) as usize).min(columns.len().saturating_sub(1));
             let gradient = columns[column];
             let inside = coverage(d);
@@ -2481,12 +2474,17 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                     x,
                     y,
                     measured::GLASS_FACE,
-                    measured::GLASS_BACK_ALPHA * inside,
+                    measured::GLASS_BACK_ALPHA * inside * opacity,
                 );
             }
             let edge = coverage(d.abs() - half_stroke);
             if edge > 0.0 {
-                sheet.blend(x, y, gradient, measured::GLASS_BACK_EDGE_ALPHA * edge);
+                sheet.blend(
+                    x,
+                    y,
+                    gradient,
+                    measured::GLASS_BACK_EDGE_ALPHA * edge * opacity,
+                );
             }
         }
     }
@@ -2495,7 +2493,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     //
     // Behind the face and behind the edge, so no amount of it can make the pane
     // read as opaque. See [`draw_discharge`].
-    draw_discharge(sheet, card, stroke_a, front);
+    draw_discharge(sheet, card, stroke_a, opacity);
 
     // ---- the front face --------------------------------------------------
     //
@@ -2520,7 +2518,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                     x,
                     y,
                     measured::GLASS_FACE,
-                    measured::GLASS_FACE_ALPHA * body,
+                    measured::GLASS_FACE_ALPHA * body * opacity,
                 );
                 // The face is not a vertical ramp: it is a symmetric inner glow
                 // from both edges in the local edge hue, and it is what gives
@@ -2529,7 +2527,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                     let inner = (-(d * d) / (2.0 * inner_sigma * inner_sigma)).exp()
                         * measured::FILL_EDGE_ALPHA;
                     if inner > 0.001 {
-                        sheet.blend(x, y, gradient, inner * body);
+                        sheet.blend(x, y, gradient, inner * body * opacity);
                     }
                 }
             }
@@ -2541,7 +2539,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             // must never take a pixel off the state it is actually in.
             if let Some(rings) = rings {
                 if let Some(alpha) = rings.at(d) {
-                    sheet.blend(x, y, gradient, alpha * body);
+                    sheet.blend(x, y, gradient, alpha * body * opacity);
                 }
             }
 
@@ -2550,7 +2548,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             // construction rather than by tuning.
             let stroke = coverage(d.abs() - half_stroke);
             if stroke > 0.0 {
-                sheet.blend(x, y, gradient, stroke);
+                sheet.blend(x, y, gradient, stroke * opacity);
             }
         }
     }
@@ -2582,11 +2580,11 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                 let d = plate_rect.distance(px, py);
                 let inside = coverage(d);
                 if inside > 0.0 {
-                    sheet.blend(x, y, top.mix(bottom, v), inside);
+                    sheet.blend(x, y, top.mix(bottom, v), inside * opacity);
                 }
                 let line = coverage(d.abs() - hairline);
                 if line > 0.0 {
-                    sheet.blend(x, y, edge, line);
+                    sheet.blend(x, y, edge, line * opacity);
                 }
             }
         }
@@ -2601,10 +2599,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         &content.title,
         content.controls,
     );
-    // Every text bound is cut at the generation front as well as at its own
-    // margin, so a half-generated card is a half-drawn card rather than a whole
-    // one behind a clipped box.
-    let text_right = (ox + column.text_right()).min(front);
+    let text_right = ox + column.text_right();
     let caption_px = column.caption_px;
     let text_left = ox + column.left;
 
@@ -2613,7 +2608,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // character row puts these two on its *first* content row, so this is that
     // row's own vertical order kept: controls at the top, over the title's
     // first line and nothing else.
-    if !content.controls.is_empty() && ox + column.right - geometry.pad < front {
+    if !content.controls.is_empty() {
         let rail = content.controls.layout(font, caption_px);
         // Anchored under the card's top pad. It only gives way on a card too
         // short to hold it there, and then only as far as its own stroke.
@@ -2627,6 +2622,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             caption_px,
             geometry,
             (ox + column.right - rail.width, rail_y),
+            opacity,
         );
     }
 
@@ -2673,7 +2669,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     let block_top = oy + (height - title_block - caption_block) / 2.0;
 
     let ink = measured::INK.restate(1.0, (0.55 + 0.45 * lum).min(1.0));
-    let first_line_right = (ox + column.first_line_right()).min(front);
+    let first_line_right = ox + column.first_line_right();
     for (index, line) in lines.iter().enumerate() {
         let baseline = block_top + leading * index as f32 + title_metrics.ascent;
         // The first line is clipped short of the rail, every line after it runs
@@ -2685,7 +2681,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             text_right
         };
         draw_text(
-            sheet, font, line, TITLE_PX, text_left, baseline, ink, text_left, right,
+            sheet, font, line, TITLE_PX, text_left, baseline, ink, text_left, right, opacity,
         );
     }
 
@@ -2708,6 +2704,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
         };
         draw_text(
             sheet, font, &text, caption_px, text_left, baseline, ink, text_left, text_right,
+            opacity,
         );
     }
 }
@@ -2718,6 +2715,8 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
 /// controls take it for the same reason the chip does: they are the card's
 /// affordances, and an affordance drawn in a hue the card is not at would be a
 /// second thing on it saying what state its work is in.
+#[allow(clippy::too_many_arguments)] // Rail, ink, size, geometry, origin and
+                                     // the card's own opacity: every one varies per call site.
 fn draw_control_rail(
     sheet: &mut Canvas,
     font: &CardFont,
@@ -2726,6 +2725,7 @@ fn draw_control_rail(
     px: f32,
     geometry: &CardGeometry,
     at: (f32, f32),
+    opacity: f32,
 ) {
     let (x, y) = at;
     if let Some(summary) = &rail.summary {
@@ -2748,6 +2748,7 @@ fn draw_control_rail(
             },
             badge_ink,
             (geometry.stroke * 0.5).max(0.9),
+            opacity,
         );
         let metrics = font.metrics(px);
         let baseline = y + (rail.height - metrics.line_height) / 2.0 + metrics.ascent;
@@ -2761,6 +2762,7 @@ fn draw_control_rail(
             badge_ink,
             x + summary.count_x,
             x + rail.width,
+            opacity,
         );
     }
     if let Some(chevron) = &rail.chevron {
@@ -2770,6 +2772,7 @@ fn draw_control_rail(
             chevron.side,
             chevron.group,
             ink,
+            opacity,
         );
     }
 }
@@ -2781,7 +2784,7 @@ fn draw_control_rail(
 /// answer. Hairline and rules are one width, and it is the card's own stroke
 /// halved: the mark is a tenth of the card's height, so the chrome around it
 /// wants to be lighter than the chrome around the card.
-fn draw_summary_mark(sheet: &mut Canvas, mark: RoundRect, ink: Rgb, hairline: f32) {
+fn draw_summary_mark(sheet: &mut Canvas, mark: RoundRect, ink: Rgb, hairline: f32, opacity: f32) {
     let half = hairline / 2.0;
     let rules: [f32; 2] = SUMMARY_MARK_RULES.map(|at| mark.y + mark.h * at);
     for y in mark.y.floor().max(0.0) as u32..((mark.y + mark.h).ceil() as u32) {
@@ -2802,7 +2805,7 @@ fn draw_summary_mark(sheet: &mut Canvas, mark: RoundRect, ink: Rgb, hairline: f3
             let inside = coverage(d + half);
             let alpha = frame.max(rule * inside);
             if alpha > 0.0 {
-                sheet.blend(x, y, ink, alpha);
+                sheet.blend(x, y, ink, alpha * opacity);
             }
         }
     }
@@ -2812,7 +2815,14 @@ fn draw_summary_mark(sheet: &mut Canvas, mark: RoundRect, ink: Rgb, hairline: f3
 ///
 /// Both points are drawn from the same box so the rail's reserved width does not
 /// change when a group is opened or closed — see [`CHEVRON_NOSE`].
-fn draw_chevron(sheet: &mut Canvas, at: (f32, f32), side: f32, group: GroupChevron, ink: Rgb) {
+fn draw_chevron(
+    sheet: &mut Canvas,
+    at: (f32, f32),
+    side: f32,
+    group: GroupChevron,
+    ink: Rgb,
+    opacity: f32,
+) {
     let (x, y) = at;
     let nose = side * CHEVRON_NOSE;
     let slack = (side - nose) / 2.0;
@@ -2833,7 +2843,7 @@ fn draw_chevron(sheet: &mut Canvas, at: (f32, f32), side: f32, group: GroupChevr
         for px in x0..x1 {
             let alpha = coverage(triangle.distance(px as f32 + 0.5, py as f32 + 0.5));
             if alpha > 0.0 {
-                sheet.blend(px, py, ink, alpha);
+                sheet.blend(px, py, ink, alpha * opacity);
             }
         }
     }
@@ -2844,8 +2854,8 @@ fn draw_chevron(sheet: &mut Canvas, at: (f32, f32), side: f32, group: GroupChevr
 /// The clip is the only thing standing in for an ellipsis: a word wider than
 /// its column is drawn and cut at the column edge rather than shortened, which
 /// is the behaviour the captain asked for over a mid-word ellipsis.
-#[allow(clippy::too_many_arguments)] // Text, size, origin, ink and clip bounds:
-                                     // every one of these varies per call site and none of them groups with another.
+#[allow(clippy::too_many_arguments)] // Text, size, origin, ink, clip bounds and
+                                     // the card's own opacity: every one of these varies per call site.
 fn draw_text(
     sheet: &mut Canvas,
     font: &CardFont,
@@ -2856,6 +2866,7 @@ fn draw_text(
     ink: Rgb,
     left: f32,
     right: f32,
+    opacity: f32,
 ) {
     let left = left.floor() as i32;
     let right = right.ceil() as i32;
@@ -2863,7 +2874,7 @@ fn draw_text(
         if gx < left || gx >= right || gx < 0 || gy < 0 {
             return;
         }
-        sheet.blend(gx as u32, gy as u32, ink, coverage);
+        sheet.blend(gx as u32, gy as u32, ink, coverage * opacity);
     });
 }
 
@@ -3480,12 +3491,12 @@ fn compute_card_placement(
             continue;
         };
         content.controls = control_rail(app, entry, &agents, card);
-        // Beat three, resolved where the row's own life is known. A panel with
-        // motion off leaves every card whole, which is what it has always done.
+        // The card-bloom beat, resolved where the row's own life is known. A
+        // panel with motion off leaves every card whole, which is what it has
+        // always done.
         if moving {
-            content.generate = super::motion::arrival_beat(row_settle(app, card)).generated();
-        }
-        if moving {
+            let circuit = super::motion::arrival_circuit(row_settle(app, card));
+            content.generate = circuit.card;
             lives.push(super::motion::RowLife {
                 // The distance to the next row's own top, so the span a row
                 // opens and closes is its height *and* the gap the layout puts
@@ -3493,7 +3504,10 @@ fn compute_card_placement(
                 // `row_gap`, so the two can never disagree about what a row
                 // occupies.
                 height_px: row_span_cells(cards, index) * cell_h,
-                settle: row_settle(app, card),
+                // The push beat, not the raw engine settle: the space below
+                // this row finishes opening before the rail starts growing,
+                // never at the same time as the rail, the branch or the bloom.
+                settle: circuit.push,
             });
         }
         placed.push((frame, content));
@@ -3858,20 +3872,26 @@ fn row_span_cells(cards: &[crate::app::state::WorkspaceCardArea], index: usize) 
 /// The row's element is the same one [`crate::app::runtime`] publishes the
 /// membership for, keyed the same way, so motion cannot end up watching a
 /// different clock from the one the row's own arrival runs on.
-/// Which beat of its arrival this row is on, or
-/// [`super::motion::ArrivalBeat::Settled`] on a host where rows do not move.
 ///
-/// The character renderer's half of the gesture: beats one and two are the light
-/// travelling the tree's own rails and connector, and those are characters. See
+/// Every row reads as fully settled — every [`super::motion::ArrivalCircuit`]
+/// field at `1.0` — on a host where rows do not move.
+///
+/// The character renderer's half of the gesture: the rail growing down and the
+/// branch growing right are drawn in characters here. See
 /// [`super::render_card_border_rails`].
 pub(crate) fn row_arrival(
     app: &AppState,
     card: &crate::app::state::WorkspaceCardArea,
-) -> super::motion::ArrivalBeat {
+) -> super::motion::ArrivalCircuit {
     if !app.sidebar_rows_move() {
-        return super::motion::ArrivalBeat::Settled;
+        return super::motion::ArrivalCircuit {
+            push: 1.0,
+            rail: 1.0,
+            tick: 1.0,
+            card: 1.0,
+        };
     }
-    super::motion::arrival_beat(row_settle(app, card))
+    super::motion::arrival_circuit(row_settle(app, card))
 }
 
 fn row_settle(app: &AppState, card: &crate::app::state::WorkspaceCardArea) -> f32 {
@@ -4950,12 +4970,16 @@ fn card_layer(
 
 /// Lift the selected card, without recolouring it.
 fn lift(sheet: &mut Canvas, card: &PlacedCard<'_>) {
+    let opacity = card.content.generate.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
     let rect = card.rect;
     for y in rect.y.max(0.0) as u32..((rect.y + rect.h).ceil() as u32).min(sheet.height()) {
         for x in rect.x.max(0.0) as u32..((rect.x + rect.w).ceil() as u32).min(sheet.width()) {
             let inside = coverage(rect.distance(x as f32 + 0.5, y as f32 + 0.5));
             if inside > 0.0 {
-                sheet.blend(x, y, measured::STROKE_A, 0.07 * inside);
+                sheet.blend(x, y, measured::STROKE_A, 0.07 * inside * opacity);
             }
         }
     }
@@ -8033,7 +8057,7 @@ mod a_card_is_its_own_shape {
         let ink = Rgb(255, 255, 255);
         let painted = |group| {
             let mut sheet = Canvas::new(16, 16);
-            draw_chevron(&mut sheet, (2.0, 2.0), 10.0, group, ink);
+            draw_chevron(&mut sheet, (2.0, 2.0), 10.0, group, ink, 1.0);
             sheet.rgba8().to_vec()
         };
         let collapsed = painted(GroupChevron::Collapsed);
@@ -8071,6 +8095,7 @@ mod a_card_is_its_own_shape {
                 10.0,
                 &CardGeometry::new(21.0, false),
                 (4.0, 4.0),
+                1.0,
             );
             sheet.rgba8().to_vec()
         };
@@ -8973,15 +8998,17 @@ mod a_card_is_its_own_shape {
         );
     }
 
-    /// **A card is generated left to right, never translated home.**
+    /// **A card blooms in whole, at its own final position and size — never a
+    /// clip and never a translation.**
     ///
-    /// Beat three of [`super::motion::ArrivalBeat`], on the pixels. A card
-    /// part-way through its arrival is drawn from its own left edge up to the
-    /// generation front and not one pixel past it — which is what makes the
-    /// arrival read as the tree growing a branch rather than as a finished
-    /// object sliding in from off the panel.
+    /// The card-bloom beat of [`super::motion::ArrivalCircuit`], on the
+    /// pixels: a card part-way through its own bloom is drawn at its full
+    /// width and height, fainter throughout rather than clipped down one
+    /// side — which is what makes the arrival read as the card fading into
+    /// existence in place rather than as a finished object sliding in, or as a
+    /// wall being built brick by brick.
     #[test]
-    fn a_generating_card_is_drawn_up_to_its_front_and_no_further() {
+    fn a_blooming_card_is_drawn_whole_but_faint() {
         let Some(font) = font::card_font(None) else {
             return; // No face on this machine.
         };
@@ -9045,15 +9072,34 @@ mod a_card_is_its_own_shape {
             "a card whose light has not landed yet drew something"
         );
 
-        // Half way: ink up to the front, nothing past it.
-        let mut half_canvas = Canvas::new(240, 90);
-        let half = CardContent {
-            generate: 0.5,
+        // Half way: fainter everywhere the whole card is drawn, never clipped
+        // to one side of it.
+        let mut whole_canvas = Canvas::new(240, 90);
+        let whole = CardContent {
+            generate: 1.0,
             title: base.title.clone(),
             tidbit: base.tidbit.clone(),
             register: base.register.clone(),
             state_label: base.state_label.clone(),
             ..base
+        };
+        draw_card(
+            &mut whole_canvas,
+            &PlacedCard {
+                rect,
+                content: &whole,
+                geometry: CardGeometry::new(21.0, false),
+            },
+            font,
+        );
+        let mut half_canvas = Canvas::new(240, 90);
+        let half = CardContent {
+            generate: 0.5,
+            title: whole.title.clone(),
+            tidbit: whole.tidbit.clone(),
+            register: whole.register.clone(),
+            state_label: whole.state_label.clone(),
+            ..whole
         };
         draw_card(
             &mut half_canvas,
@@ -9064,25 +9110,34 @@ mod a_card_is_its_own_shape {
             },
             font,
         );
-        let front = (rect.x + rect.w * 0.5).ceil() as u32 + measured::GLASS_THICKNESS_PX as u32;
-        let mut before_front = 0;
+        // The card's own right half — well past where the old left-to-right
+        // reveal would have clipped a 0.5-generated card — carries just as
+        // much ink at half opacity as it does settled, only fainter.
+        let mut lit_on_the_right_half = 0;
+        let mut whole_total_alpha: u64 = 0;
+        let mut half_total_alpha: u64 = 0;
+        let right_half_left = (rect.x + rect.w * 0.6) as u32;
         for y in 0..90u32 {
             for x in 0..240u32 {
-                let alpha = half_canvas.rgba8()[((y * 240 + x) * 4 + 3) as usize];
-                if alpha == 0 {
-                    continue;
+                let idx = ((y * 240 + x) * 4 + 3) as usize;
+                let whole_alpha = whole_canvas.rgba8()[idx];
+                let half_alpha = half_canvas.rgba8()[idx];
+                whole_total_alpha += u64::from(whole_alpha);
+                half_total_alpha += u64::from(half_alpha);
+                if x >= right_half_left && half_alpha > 0 {
+                    lit_on_the_right_half += 1;
                 }
-                assert!(
-                    x <= front,
-                    "a half-generated card painted at column {x}, past its own front \
-                     at {front}"
-                );
-                before_front += 1;
             }
         }
         assert!(
-            before_front > 0,
-            "a half-generated card drew nothing at all on its own side of the front"
+            lit_on_the_right_half > 0,
+            "a half-blooming card drew nothing on its own right half — it was \
+             clipped rather than faded"
+        );
+        assert!(
+            half_total_alpha > 0 && half_total_alpha < whole_total_alpha,
+            "a half-blooming card ({half_total_alpha}) should carry less total \
+             ink than a settled one ({whole_total_alpha}), never the same or more"
         );
     }
 
@@ -10534,9 +10589,9 @@ mod rows_make_room_for_each_other {
     /// asserted an arriving row began a whole panel width off to the right and
     /// travelled home. That is exactly what F22 refuses, and the refusal is not
     /// stylistic: a card sliding across the panel is a *finished object being
-    /// moved*, and the reference's card is **generated** from the point a light
-    /// travelling the tree's rail landed on its edge. See
-    /// [`super::motion::ArrivalBeat`].
+    /// moved*, and the reference's card **blooms** in place, at its own final
+    /// position, once the rail and the branch pointing at it have grown. See
+    /// [`super::motion::ArrivalCircuit`].
     ///
     /// `super::motion`'s own `no_row_ever_carries_a_horizontal_entry_offset`
     /// sweeps the arithmetic; this reads the placement the pipeline actually

@@ -347,6 +347,10 @@ pub(super) fn draw(sheet: &mut Canvas, card: &PlacedCard<'_>) {
     let Some(spider) = content.spider else {
         return;
     };
+    let opacity = content.generate.clamp(0.0, 1.0);
+    if opacity <= 0.0 {
+        return;
+    }
     let full_h = card.rect.h * HEIGHT_FRACTION;
     let full_w = full_h * SPRITE_W as f32 / SPRITE_H as f32;
     if full_h < 1.0 || full_w < 1.0 {
@@ -391,7 +395,7 @@ pub(super) fn draw(sheet: &mut Canvas, card: &PlacedCard<'_>) {
             };
             let x0 = origin.0 + sx as f32 * cell_w;
             let y0 = origin.1 + sy as f32 * cell_h;
-            fill(sheet, (x0, y0, x0 + cell_w, y0 + cell_h), ink);
+            fill(sheet, (x0, y0, x0 + cell_w, y0 + cell_h), ink, opacity);
         }
     }
 }
@@ -404,7 +408,7 @@ pub(super) fn draw(sheet: &mut Canvas, card: &PlacedCard<'_>) {
 /// creature depending on where it landed. The coverage is the overlap area,
 /// which is what keeps the legs the same weight wherever the spider is standing
 /// on its climb.
-fn fill(sheet: &mut Canvas, rect: (f32, f32, f32, f32), ink: Rgb) {
+fn fill(sheet: &mut Canvas, rect: (f32, f32, f32, f32), ink: Rgb, opacity: f32) {
     let (x0, y0, x1, y1) = rect;
     if x1 <= 0.0 || y1 <= 0.0 {
         return;
@@ -423,7 +427,7 @@ fn fill(sheet: &mut Canvas, rect: (f32, f32, f32, f32), ink: Rgb) {
             if cover_x <= 0.0 {
                 continue;
             }
-            sheet.blend(x, y, ink, cover_x * cover_y);
+            sheet.blend(x, y, ink, cover_x * cover_y * opacity);
         }
     }
 }

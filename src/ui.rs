@@ -372,8 +372,9 @@ fn update_sidebar_card_layers(
         // Read here rather than threaded out of `build_cards`, because it is a
         // pure read of the animation engine and the one place a card's whole
         // transition state is resolved must be the same place its offset is.
+        let circuit = sidebar::image_card::row_arrival(app, card);
         card.arriving =
-            sidebar::image_card::row_arrival(app, card) != sidebar::motion::ArrivalBeat::Settled;
+            circuit.push < 1.0 || circuit.rail < 1.0 || circuit.tick < 1.0 || circuit.card < 1.0;
     }
     match build.update {
         sidebar::image_card::CardsUpdate::Unchanged => {}
