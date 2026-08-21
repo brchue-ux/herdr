@@ -2400,6 +2400,11 @@ pub struct AppState {
     /// stream. A session fact, not a picture: see
     /// [`crate::app::status_feed::StatusFeed`].
     pub(crate) status_feed: crate::app::status_feed::StatusFeed,
+    /// Each Claude Code pane's own capped shell-command history, drawn in the
+    /// terminal triview's bottom zone. A session fact for the same reason
+    /// [`Self::status_feed`] is: see
+    /// [`crate::app::pane_command_log::PaneCommandLog`].
+    pub(crate) pane_command_log: crate::app::pane_command_log::PaneCommandLog,
     /// The register's drawn corner, as its own small graphics surface.
     ///
     /// Separate from `background_effects_layer` because the two move on different clocks: that one
@@ -3749,6 +3754,7 @@ impl AppState {
             background_scene_layout: None,
             machine_register: crate::machine_register::MachineRegister::default(),
             status_feed: crate::app::status_feed::StatusFeed::default(),
+            pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_rgba: None,

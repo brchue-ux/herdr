@@ -949,6 +949,65 @@ fn manifest_without_transcript_region_reports_none() {
     assert!(transcript_line_range(Agent::Gemini, "hello\n").is_none());
 }
 
+// ---------------------------------------------------------------------------
+// prompt_box_body_line_range — the terminal triview render path's live boundary
+// source (Claude only).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_prompt_box_body_line_range_excludes_both_borders() {
+    let screen = concat!(
+        "> summarize the report\n",
+        "\n",
+        "  The report says three things.\n",
+        "─────────────────────────────\n",
+        " ❯ rm -rf /tmp/scratch\n",
+        "─────────────────────────────\n",
+        "  ? for shortcuts\n",
+    );
+
+    let range =
+        prompt_box_body_line_range(Agent::Claude, screen).expect("claude composer body range");
+    let lines: Vec<&str> = screen.lines().collect();
+    let body = lines[range].join("\n");
+
+    assert_eq!(body, " ❯ rm -rf /tmp/scratch");
+}
+
+#[test]
+fn claude_prompt_box_body_line_range_is_none_without_a_closing_border() {
+    // Only one horizontal rule on screen: no second border to close the box,
+    // so there is nothing safe to crop — the caller must fall back.
+    let screen = concat!(
+        "  some output\n",
+        "─────────────────────────────\n",
+        " ❯ still typing\n",
+    );
+    assert!(prompt_box_body_line_range(Agent::Claude, screen).is_none());
+}
+
+#[test]
+fn claude_prompt_box_body_line_range_is_none_for_adjacent_borders() {
+    // Two borders with nothing between them is not a real composer body.
+    let screen = concat!(
+        "  some output\n",
+        "─────────────────────────────\n",
+        "─────────────────────────────\n",
+    );
+    assert!(prompt_box_body_line_range(Agent::Claude, screen).is_none());
+}
+
+#[test]
+fn prompt_box_body_line_range_is_none_for_a_non_claude_agent() {
+    let screen = concat!(
+        "  some output\n",
+        "─────────────────────────────\n",
+        " ❯ typing\n",
+        "─────────────────────────────\n",
+    );
+    assert!(prompt_box_body_line_range(Agent::Codex, screen).is_none());
+}
+
 #[test]
 fn transcript_region_must_name_a_known_region() {
     let manifest = r#"
