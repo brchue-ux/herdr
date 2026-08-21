@@ -65,6 +65,23 @@ const RESIZE_RECOVERY_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
 /// quiet after being resized — and those pay nothing: the watch this arms
 /// expires unconsumed with no hold ever engaged.
 const RESIZE_REDRAW_WATCH_WINDOW: Duration = Duration::from_millis(400);
+/// How long since this pane's live grid was last actually read (by either
+/// [`GhosttyPaneTerminal::render`] or the retained dirty-patch path) before a
+/// full-screen clear is treated the same way a resize's own redraw is: worth
+/// engaging [`RESIZE_RECOVERY_HOLD_TIMEOUT`] for.
+///
+/// A pane that is hidden — a background tab, a background workspace — is
+/// still fed live PTY bytes the whole time; only reading its grid for
+/// presentation is skipped. Its child can clear and redraw itself for
+/// reasons that have nothing to do with a resize (a periodic UI refresh, an
+/// idle-agent status tick), landing across more than one PTY read exactly
+/// like a resize-triggered redraw does. Nothing renders while the pane stays
+/// hidden, so no torn frame is visible yet — but the *first* render after it
+/// becomes visible again can land in the middle of that same clear-then-content
+/// split, and unlike the resize case there is no resize call to arm a watch
+/// from. A pane that was actually being drawn recently renders far more often
+/// than this, so the common continuously-visible case never crosses it.
+const HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD: Duration = Duration::from_millis(500);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
@@ -214,6 +231,14 @@ pub(crate) struct GhosttyPaneCore {
     /// does not count: it snapshots an empty grid, and holding that would render
     /// a pane blank whose very first output arrives inside a synchronized update.
     render_state_populated: bool,
+    /// When `render_state` was last actually refreshed from the live grid —
+    /// by either [`GhosttyPaneTerminal::render`] or the retained dirty-patch
+    /// path, the two callers of `refresh_render_state`.
+    ///
+    /// `None` until the first successful refresh, which excludes a pane's
+    /// very first paint from [`HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD`] the
+    /// same way a fresh pane is excluded from the resize-recovery watch.
+    render_state_last_refreshed_at: Option<Instant>,
     windows_powershell_prompt_cwd_reporting: bool,
     /// Set for the duration of a [`crate::server::alt_screen_read::PendingAltScreenRead`]:
     /// harvesting alternate-screen history that isn't exposed as scrollback means
@@ -1032,6 +1057,7 @@ impl GhosttyPaneTerminal {
                 cursor_settle_state: CursorPositionSettleState::default(),
                 synchronized_update_started_at: None,
                 render_state_populated: false,
+                render_state_last_refreshed_at: None,
                 windows_powershell_prompt_cwd_reporting: false,
                 alt_screen_read_hold: false,
                 awaiting_resize_redraw_since: None,
@@ -1214,6 +1240,34 @@ impl GhosttyPaneTerminal {
             if now.duration_since(started) >= RESIZE_REDRAW_WATCH_WINDOW {
                 core.awaiting_resize_redraw_since = None;
             } else if contains_full_screen_clear_sequence(bytes) {
+                core.resize_recovery_started_at = Some(now);
+                core.awaiting_resize_redraw_since = None;
+            }
+        }
+
+        // A resize is not the only reason a pane's own child clears and
+        // redraws itself — see `HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD`. A
+        // clear arriving long after this pane's grid was last actually read
+        // for presentation carries the same risk a resize's own redraw does:
+        // it may land split across more than one PTY read, and the next
+        // render (most likely the one that made this pane visible again)
+        // could land in the middle of it. Engage the same hold directly
+        // rather than a predictive watch, since the clear is already here.
+        //
+        // Checked with the cheap staleness comparison first: an actively
+        // rendered pane is never stale, so the byte scan below never runs on
+        // this hot per-write path for the overwhelmingly common case.
+        if core.resize_recovery_started_at.is_none() {
+            let now = Instant::now();
+            let long_since_rendered = core.render_state_last_refreshed_at.is_some_and(|last| {
+                now.duration_since(last) >= HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD
+            });
+            if long_since_rendered
+                && contains_full_screen_clear_sequence(bytes)
+                && ghostty_detection_text(&core)
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+            {
                 core.resize_recovery_started_at = Some(now);
                 core.awaiting_resize_redraw_since = None;
             }
@@ -1827,6 +1881,20 @@ impl GhosttyPaneTerminal {
             .is_some_and(|core| core.resize_recovery_started_at.is_some())
     }
 
+    /// Pushes the pane's last-refreshed timestamp `elapsed` into the past, so
+    /// tests can simulate a pane that has not been rendered in a while (a
+    /// hidden/backgrounded pane) without actually waiting.
+    #[cfg(test)]
+    fn age_render_state_last_refreshed_for_test(&self, elapsed: Duration) {
+        if let Ok(mut core) = self.core.lock() {
+            if let Some(refreshed) = core.render_state_last_refreshed_at.as_mut() {
+                if let Some(earlier) = refreshed.checked_sub(elapsed) {
+                    *refreshed = earlier;
+                }
+            }
+        }
+    }
+
     pub fn encode_terminal_key(
         &self,
         key: crate::input::TerminalKey,
@@ -2326,6 +2394,7 @@ fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderState
         return RenderStateRefresh::Failed;
     }
     core.render_state_populated = true;
+    core.render_state_last_refreshed_at = Some(now);
     RenderStateRefresh::Updated
 }
 
@@ -5249,6 +5318,90 @@ mod tests {
             "FRESH",
             "once the hold elapses the child's real, complete redraw must be drawn"
         );
+    }
+
+    #[test]
+    fn a_multi_write_redraw_on_a_pane_stale_since_its_last_render_engages_the_hold() {
+        // Regression coverage for the scroll-then-snap symptom the captain hit
+        // attaching to an idle, previously-backgrounded pane: no resize
+        // involved at all, so #172's `awaiting_resize_redraw_since` (armed
+        // only inside `resize()`) never engages. A hidden pane is still fed
+        // live PTY bytes the whole time; only *reading* its grid for
+        // presentation is skipped while it stays hidden. Its child can clear
+        // and redraw itself for reasons that have nothing to do with a
+        // resize (a periodic UI refresh, an idle-agent status tick), split
+        // across more than one PTY read exactly like a resize-triggered
+        // redraw is. The pane's first render in a while — the one that makes
+        // it visible again — can land in the middle of that split.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        // Simulate the pane sitting hidden/backgrounded for a while: nothing
+        // reads its grid for presentation during that stretch.
+        pane.age_render_state_last_refreshed_for_test(
+            HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD + Duration::from_millis(1),
+        );
+
+        // No resize at all — the pane's child redraws itself unprompted,
+        // split across two PTY reads exactly like the resize-triggered case.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "a full-screen clear on a pane stale since its last render must engage the hold, \
+             the same way a resize's own redraw does"
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "ONE",
+            "the clear alone must never be presented as a blank/torn frame"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "the hold must not be released early by the first chunk of a multi-write redraw"
+        );
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FRESH",
+            "once the hold elapses the child's real, complete redraw must be drawn"
+        );
+    }
+
+    #[test]
+    fn a_multi_write_redraw_right_after_being_rendered_is_never_held() {
+        // The overwhelmingly common case — a pane that is actively visible
+        // and being rendered continuously — must not pay for this hold just
+        // because its own child happens to clear and redraw itself. Only a
+        // pane stale since its last render (see the test above) is at risk.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        // Rendered just now, so it is not stale — a clear arriving right
+        // after must not engage the hold.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(
+            !pane.resize_recovery_hold_active_for_test(),
+            "a pane rendered moments ago is not at risk of the gap this hold covers"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "FRESH");
     }
 
     #[test]
