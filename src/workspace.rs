@@ -26,8 +26,8 @@ pub use self::{
     aggregate::AggregateTerminalTitle,
     git::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_remote_url_for_checkout,
-        git_space_identity, git_space_metadata, git_status_cache_key, GitDirtyCounts,
-        GitSpaceMetadata, GitStatusCacheEntry, GitStatusRefreshDemand,
+        git_space_identity, git_space_metadata, git_status_cache_key, GitDiffLine, GitDiffLineKind,
+        GitDiffText, GitDirtyCounts, GitSpaceMetadata, GitStatusCacheEntry, GitStatusRefreshDemand,
     },
     tab::{NewPane, Tab},
 };
@@ -52,6 +52,7 @@ pub struct WorkspaceGitStatus {
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub dirty: Option<GitDirtyCounts>,
+    pub diff: Option<GitDiffText>,
     pub space: Option<GitSpaceMetadata>,
 }
 
@@ -61,6 +62,7 @@ pub struct WorkspaceGitStatusSnapshot {
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub dirty: Option<GitDirtyCounts>,
+    pub diff: Option<GitDiffText>,
     pub space: Option<GitSpaceMetadata>,
 }
 
@@ -114,6 +116,7 @@ impl WorkspaceGitStatusSnapshot {
             branch: self.branch,
             ahead_behind: self.ahead_behind,
             dirty: self.dirty,
+            diff: self.diff,
             space: self.space,
         }
     }
@@ -210,6 +213,11 @@ pub struct Workspace {
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
     /// Cached uncommitted-work counts for this workspace's checkout.
     pub(crate) cached_git_dirty: Option<GitDirtyCounts>,
+    /// Cached unified diff against `HEAD` for this workspace's checkout.
+    ///
+    /// Only ever populated for the workspace backing the currently visible
+    /// diff pane — see `GitStatusRefreshDemand::diff`.
+    pub(crate) cached_git_diff: Option<GitDiffText>,
     /// Remote URL whose pull requests belong to this workspace's checkout.
     pub(crate) cached_remote_url: Option<String>,
     /// Cached open pull request counts for `cached_remote_url`'s repository.
@@ -290,6 +298,7 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_dirty: None,
+            cached_git_diff: None,
             cached_remote_url: None,
             cached_pull_requests: None,
             cached_git_space: identity.space,
@@ -492,6 +501,7 @@ impl Workspace {
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
                 cached_git_dirty: None,
+                cached_git_diff: None,
                 cached_remote_url: None,
                 cached_pull_requests: None,
                 cached_git_space: identity.space,
@@ -1233,6 +1243,10 @@ impl Workspace {
         self.cached_git_dirty
     }
 
+    pub fn git_diff(&self) -> Option<&GitDiffText> {
+        self.cached_git_diff.as_ref()
+    }
+
     pub fn pull_requests(&self) -> Option<crate::forge::PullRequestCounts> {
         self.cached_pull_requests
     }
@@ -1370,6 +1384,7 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_dirty: None,
+            cached_git_diff: None,
             cached_remote_url: None,
             cached_pull_requests: None,
             cached_git_space: None,

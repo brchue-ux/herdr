@@ -53,6 +53,12 @@ pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
 pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
+/// See `data/herdr-diff-pane-scoping-20260818/report.md` §D for the arithmetic
+/// this default is derived from: it sits strictly between the remaining
+/// content width a 27"/24" monitor leaves after the sidebar (folds) and what a
+/// 34" ultrawide leaves (shows all three zones), with margin on both sides
+/// across the sidebar's full configurable width range.
+pub const DEFAULT_DIFF_ZONE_WIDTH_THRESHOLD: u16 = 300;
 
 #[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {

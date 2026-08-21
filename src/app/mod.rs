@@ -747,6 +747,7 @@ impl App {
                 tab_scroll_right_hit_area: Rect::default(),
                 new_tab_hit_area: Rect::default(),
                 terminal_area: Rect::default(),
+                diff_area: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
@@ -778,10 +779,12 @@ impl App {
             sidebar_min_width,
             sidebar_max_width,
             mobile_width_threshold: config.ui.mobile_width_threshold,
+            diff_zone_width_threshold: config.ui.diff_zone_width_threshold,
             sidebar_width_source,
             sidebar_width_auto: false,
             sidebar_collapsed: config.ui.sidebar_start_collapsed,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
+            diff_popup_open: false,
             agent_panel_sort,
             agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
             // Never restored: a status is a claim about the world right now,
@@ -1801,6 +1804,7 @@ impl App {
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
                 self.state.sidebar_collapsed_mode = config.ui.sidebar_collapsed_mode;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;
+                self.state.diff_zone_width_threshold = config.ui.diff_zone_width_threshold;
                 // Re-clamp the live width to the new bounds. No source guard — bounds
                 // always apply, including to widths owned by Persisted or Manual.
                 self.state.sidebar_width = self
@@ -2879,6 +2883,7 @@ mod tests {
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
                 dirty: None,
+                diff: None,
                 space: None,
             }],
             cache_updates: Vec::new(),

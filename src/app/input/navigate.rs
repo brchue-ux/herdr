@@ -392,6 +392,12 @@ impl App {
                 self.state.sidebar_collapsed = !self.state.sidebar_collapsed;
                 leave_navigate_mode(&mut self.state);
             }
+            NavigateAction::ToggleDiffPane => {
+                if self.state.view.diff_area.is_empty() {
+                    self.state.diff_popup_open = !self.state.diff_popup_open;
+                }
+                leave_navigate_mode(&mut self.state);
+            }
             NavigateAction::CyclePaneNext => {
                 self.cycle_pane_via_api(false);
                 leave_navigate_mode(&mut self.state);
@@ -1388,6 +1394,7 @@ pub(crate) enum NavigateAction {
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
+    ToggleDiffPane,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -1537,6 +1544,7 @@ fn non_indexed_action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_diff_pane, NavigateAction::ToggleDiffPane),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -1777,6 +1785,12 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::EnterResizeMode => state.mode = Mode::Resize,
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::ToggleDiffPane => {
+            if state.view.diff_area.is_empty() {
+                state.diff_popup_open = !state.diff_popup_open;
+            }
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {
@@ -3247,6 +3261,28 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].display_name(), "main");
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn toggle_diff_pane_opens_the_popup_fallback_only_while_folded() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.active = Some(0);
+        state.mode = Mode::Navigate;
+
+        // Folded: the zone is not visible, so the action must open the popup.
+        state.view.diff_area = ratatui::layout::Rect::default();
+        execute_navigate_action(&mut state, NavigateAction::ToggleDiffPane);
+        assert!(state.diff_popup_open);
+
+        // Toggling again closes it.
+        execute_navigate_action(&mut state, NavigateAction::ToggleDiffPane);
+        assert!(!state.diff_popup_open);
+
+        // Shown: the fixed zone is already visible, so the popup fallback has
+        // nothing to add and must not be flipped on underneath it.
+        state.view.diff_area = ratatui::layout::Rect::new(100, 0, 100, 20);
+        execute_navigate_action(&mut state, NavigateAction::ToggleDiffPane);
+        assert!(!state.diff_popup_open);
     }
 
     #[test]

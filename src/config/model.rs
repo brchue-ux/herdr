@@ -5,8 +5,8 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
-    SoundConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES,
-    DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    SoundConfig, ThemeConfig, DEFAULT_DIFF_ZONE_WIDTH_THRESHOLD, DEFAULT_MOBILE_WIDTH_THRESHOLD,
+    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -486,6 +486,10 @@ pub struct KeysConfig {
     pub resize_mode: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Toggle the diff pane: folds/unfolds the fixed three-zone layout when
+    /// wide enough to show it, otherwise opens/closes its popup-overlay
+    /// fallback. Default: "prefix+d"
+    pub toggle_diff_pane: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -880,6 +884,11 @@ pub struct UiConfig {
     pub sidebar_collapsed_mode: SidebarCollapsedModeConfig,
     /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
     pub mobile_width_threshold: u16,
+    /// Remaining content width (after the sidebar) at or above which the diff
+    /// pane's fixed three-zone layout shows all three zones side by side.
+    /// Below it the diff zone folds; see `[keybinds] toggle_diff_pane` for the
+    /// popup-overlay fallback. Default: 300.
+    pub diff_zone_width_threshold: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
     /// Copy text selected with the mouse. Default: true.
@@ -1270,6 +1279,7 @@ impl Default for KeysConfig {
             zoom: BindingConfig::one("prefix+z"),
             resize_mode: BindingConfig::one("prefix+r"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_diff_pane: BindingConfig::one("prefix+d"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
             user_fields: BTreeSet::new(),
@@ -1294,6 +1304,7 @@ impl Default for UiConfig {
             sidebar_start_collapsed: false,
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
+            diff_zone_width_threshold: DEFAULT_DIFF_ZONE_WIDTH_THRESHOLD,
             mouse_capture: true,
             copy_on_select: false,
             host_cursor: HostCursorModeConfig::Auto,
@@ -1720,17 +1731,23 @@ cjk_ime_agents = ["claude", "codex"]
             default_config.ui.mobile_width_threshold,
             DEFAULT_MOBILE_WIDTH_THRESHOLD
         );
+        assert_eq!(
+            default_config.ui.diff_zone_width_threshold,
+            DEFAULT_DIFF_ZONE_WIDTH_THRESHOLD
+        );
 
         let toml = r#"
 [ui]
 sidebar_min_width = 12
 sidebar_max_width = 80
 mobile_width_threshold = 96
+diff_zone_width_threshold = 260
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.sidebar_min_width, 12);
         assert_eq!(config.ui.sidebar_max_width, 80);
         assert_eq!(config.ui.mobile_width_threshold, 96);
+        assert_eq!(config.ui.diff_zone_width_threshold, 260);
     }
 
     #[test]

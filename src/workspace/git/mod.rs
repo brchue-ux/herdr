@@ -15,8 +15,8 @@ pub use self::{
     },
     status::{
         git_remote_url_for_checkout, git_status_cache_key, git_status_cache_key_for_space,
-        git_status_snapshot_for_cwd_with_demand, GitDirtyCounts, GitStatusCacheEntry,
-        GitStatusRefreshDemand,
+        git_status_snapshot_for_cwd_with_demand, GitDiffLine, GitDiffLineKind, GitDiffText,
+        GitDirtyCounts, GitStatusCacheEntry, GitStatusRefreshDemand,
     },
 };
 
