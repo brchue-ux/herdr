@@ -370,6 +370,10 @@ impl TerminalRuntime {
         self.0.recent_text_snapshot(lines)
     }
 
+    pub(crate) fn set_alt_screen_read_hold(&self, active: bool) {
+        self.0.set_alt_screen_read_hold(active);
+    }
+
     pub(crate) fn recent_ansi_snapshot(&self, lines: usize) -> crate::pane::TerminalReadSnapshot {
         self.0.recent_ansi_snapshot(lines)
     }

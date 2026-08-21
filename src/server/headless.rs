@@ -3658,21 +3658,25 @@ impl HeadlessServer {
             }
         }
         if let Some(spec) = alt_screen_read_spec {
-            if let Ok(success) = serde_json::from_str::<api::schema::SuccessResponse>(&response) {
-                if let api::schema::ResponseResult::PaneRead { read } = success.result {
-                    let pending = crate::server::alt_screen_read::PendingAltScreenRead::start(
-                        spec.terminal_id,
-                        success.id,
-                        msg.respond_to,
-                        response,
-                        read,
-                        spec.lines,
-                        spec.unwrap,
-                        spec.initial,
-                        Instant::now(),
-                    );
-                    self.pending_alt_screen_reads.push(pending);
-                    return changed;
+            if let Some(runtime) = self.app.terminal_runtimes.get(&spec.terminal_id) {
+                if let Ok(success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
+                {
+                    if let api::schema::ResponseResult::PaneRead { read } = success.result {
+                        let pending = crate::server::alt_screen_read::PendingAltScreenRead::start(
+                            spec.terminal_id,
+                            success.id,
+                            msg.respond_to,
+                            response,
+                            read,
+                            spec.lines,
+                            spec.unwrap,
+                            spec.initial,
+                            Instant::now(),
+                            runtime,
+                        );
+                        self.pending_alt_screen_reads.push(pending);
+                        return changed;
+                    }
                 }
             }
         }
@@ -6770,32 +6774,37 @@ next_tab = ""
     fn terminal_control_rejects_attach_during_alt_screen_read() {
         with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
             let (respond_to, _response_rx) = std::sync::mpsc::channel();
-            server.pending_alt_screen_reads.push(
-                crate::server::alt_screen_read::PendingAltScreenRead::start(
-                    terminal_id,
-                    "read".into(),
-                    respond_to,
-                    "fallback".into(),
-                    api::schema::PaneReadResult {
-                        pane_id: "w1:p1".into(),
-                        workspace_id: "w1".into(),
-                        tab_id: "w1:t1".into(),
-                        source: api::schema::ReadSource::Recent,
-                        format: api::schema::ReadFormat::Text,
-                        text: String::new(),
-                        revision: 0,
-                        truncated: false,
-                        transcript_applied: None,
-                    },
-                    120,
-                    false,
-                    crate::terminal::ScreenSnapshot {
-                        cols: 80,
-                        rows: Vec::new(),
-                    },
-                    Instant::now(),
-                ),
+            let runtime = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("terminal runtime");
+            let pending = crate::server::alt_screen_read::PendingAltScreenRead::start(
+                terminal_id,
+                "read".into(),
+                respond_to,
+                "fallback".into(),
+                api::schema::PaneReadResult {
+                    pane_id: "w1:p1".into(),
+                    workspace_id: "w1".into(),
+                    tab_id: "w1:t1".into(),
+                    source: api::schema::ReadSource::Recent,
+                    format: api::schema::ReadFormat::Text,
+                    text: String::new(),
+                    revision: 0,
+                    truncated: false,
+                    transcript_applied: None,
+                },
+                120,
+                false,
+                crate::terminal::ScreenSnapshot {
+                    cols: 80,
+                    rows: Vec::new(),
+                },
+                Instant::now(),
+                runtime,
             );
+            server.pending_alt_screen_reads.push(pending);
             let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
 
             assert!(

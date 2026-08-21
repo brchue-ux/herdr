@@ -195,6 +195,14 @@ pub(crate) struct GhosttyPaneCore {
     /// a pane blank whose very first output arrives inside a synchronized update.
     render_state_populated: bool,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Set for the duration of a [`crate::server::alt_screen_read::PendingAltScreenRead`]:
+    /// harvesting alternate-screen history that isn't exposed as scrollback means
+    /// driving this pane's own app with real scroll input, which would otherwise
+    /// be visible in every frame drawn while the harvest is in flight. Holding
+    /// `render_state` at its pre-harvest frame keeps the pane's presented content
+    /// still until the read completes and the app is scrolled back to where it
+    /// started.
+    alt_screen_read_hold: bool,
 }
 
 pub(crate) struct PaneTerminal {
@@ -246,6 +254,10 @@ impl PaneTerminal {
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         self.ghostty.scroll_metrics()
+    }
+
+    pub fn set_alt_screen_read_hold(&self, active: bool) {
+        self.ghostty.set_alt_screen_read_hold(active);
     }
 
     pub(crate) fn search_text_matches(
@@ -975,6 +987,7 @@ impl GhosttyPaneTerminal {
                 synchronized_update_started_at: None,
                 render_state_populated: false,
                 windows_powershell_prompt_cwd_reporting: false,
+                alt_screen_read_hold: false,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -984,6 +997,12 @@ impl GhosttyPaneTerminal {
     pub(super) fn set_windows_powershell_prompt_cwd_reporting(&self, enabled: bool) {
         if let Ok(mut core) = self.core.lock() {
             core.windows_powershell_prompt_cwd_reporting = enabled;
+        }
+    }
+
+    pub fn set_alt_screen_read_hold(&self, active: bool) {
+        if let Ok(mut core) = self.core.lock() {
+            core.alt_screen_read_hold = active;
         }
     }
 
@@ -2184,7 +2203,7 @@ enum RenderStateRefresh {
 /// Reads the live grid into `render_state` unless the child is inside a
 /// synchronized update, where the retained snapshot *is* the last complete frame.
 fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderStateRefresh {
-    if synchronized_update_holds_frame(core, now) {
+    if core.alt_screen_read_hold || synchronized_update_holds_frame(core, now) {
         return RenderStateRefresh::Held;
     }
     let GhosttyPaneCore {
@@ -2632,15 +2651,40 @@ fn ghostty_recent_text_for_terminal(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some((start, end, _cols)) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(String::new());
     };
-    let mut rows = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
-    for y in start..=end {
-        rows.push(ghostty_screen_row(terminal, cols, y as u32)?);
+    // One grid_ref pin per row (matching `screen_text_rows_range`'s own row
+    // loop), not one per cell: re-pinning per cell scaled the terminal-core
+    // lock's hold time with rows * cols for no reason.
+    let screen_rows = terminal.screen_text_rows_range(start, end.saturating_add(1))?;
+    let mut rows = Vec::with_capacity(screen_rows.len());
+    for row in &screen_rows {
+        rows.push(screen_text_row_to_line(row));
     }
     trim_trailing_blank_rows(&mut rows);
     Ok(recent_text_from_rows(&rows, lines))
+}
+
+fn screen_text_row_to_line(row: &crate::ghostty::ScreenTextRow) -> String {
+    let mut line = String::new();
+    for cell in &row.cells {
+        if cell.wide == crate::ghostty::CellWide::SpacerTail {
+            continue;
+        }
+        if cell.graphemes.is_empty()
+            || cell.graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+        {
+            line.push(' ');
+        } else {
+            for &codepoint in &cell.graphemes {
+                if let Some(ch) = char::from_u32(codepoint) {
+                    line.push(ch);
+                }
+            }
+        }
+    }
+    line.trim_end().to_string()
 }
 
 fn ghostty_recent_text_unwrapped_for_terminal(
@@ -2711,32 +2755,6 @@ fn ghostty_extract_selection(
     let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
     core.terminal
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
-}
-
-fn ghostty_screen_row(
-    terminal: &crate::ghostty::Terminal,
-    cols: u16,
-    y: u32,
-) -> Result<String, crate::ghostty::Error> {
-    let mut line = String::new();
-    for x in 0..cols {
-        let (wide, graphemes) = terminal.screen_cell(x, y)?;
-        if wide == crate::ghostty::CellWide::SpacerTail {
-            continue;
-        }
-        if graphemes.is_empty()
-            || graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
-        {
-            line.push(' ');
-        } else {
-            for codepoint in graphemes {
-                if let Some(ch) = char::from_u32(codepoint) {
-                    line.push(ch);
-                }
-            }
-        }
-    }
-    Ok(line.trim_end().to_string())
 }
 
 fn ghostty_line_from_cells(
@@ -4872,6 +4890,31 @@ mod tests {
     }
 
     #[test]
+    fn recent_text_at_scale_matches_expected_rows() {
+        // `ghostty_recent_text_for_terminal` used to re-pin the terminal-core
+        // grid once per cell (rows * cols pins) instead of once per row like
+        // `screen_text_rows_range` already does; this is unrelated to the
+        // alt-screen visible-scroll bug (see `alt_screen_read_hold_freezes_render_until_released`)
+        // but is the same redundant-work-in-a-hot-path issue this project's
+        // multiplicative-performance-path convention calls out. Exercise the
+        // read at a scale (hundreds of rows, a wide terminal) where that
+        // redundant per-cell work would have been significant, and check the
+        // exact resulting text.
+        let (tx, _rx) = mpsc::channel(4);
+        let cols = 120u16;
+        let total_lines = 400usize;
+        let mut terminal = crate::ghostty::Terminal::new(cols, 24, 1_000_000).unwrap();
+        write_numbered_lines(&mut terminal, total_lines);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        // +1 accounts for the still-blank cursor row `write_numbered_lines`'
+        // trailing "\r\n" leaves at the bottom, which the read trims away.
+        let snapshot = pane.recent_text(total_lines + 1);
+        let expected: String = (0..total_lines).map(|i| format!("{i:06}\n")).collect();
+        assert_eq!(snapshot, expected);
+    }
+
+    #[test]
     fn plain_text_reads_skip_wide_character_spacer_cells() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(40, 3, 100).unwrap();
@@ -5246,6 +5289,69 @@ mod tests {
             text.trim_end(),
             "FINAL",
             "rows held through a batch must still be dirty when it closes"
+        );
+    }
+
+    #[test]
+    fn alt_screen_read_hold_freezes_render_until_released() {
+        // Regression coverage for the `pane read --source recent` visible-scroll
+        // bug: harvesting alternate-screen history that isn't exposed as
+        // scrollback drives the pane's own app with real scroll input
+        // (`src/server/alt_screen_read.rs`), which would otherwise show up in
+        // every frame drawn while the harvest is in flight. Holding the frame
+        // (the same mechanism a synchronized update uses) must keep the pane's
+        // presented content still for exactly the hold's duration.
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "COMPLETE",
+            "the harvest's own scroll input must not reach the drawn frame"
+        );
+
+        pane.set_alt_screen_read_hold(false);
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "SCROLLED",
+            "releasing the hold must draw the pane's current, settled content"
+        );
+    }
+
+    #[test]
+    fn dirty_patch_is_clean_while_an_alt_screen_read_hold_is_active() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+        assert!(
+            matches!(
+                pane.collect_dirty_patch(20, 3),
+                TerminalDirtyPatchOutcome::Clean
+            ),
+            "the retained frame path must not patch a pane held for an alt-screen read"
+        );
+
+        pane.set_alt_screen_read_hold(false);
+        let patch = match pane.collect_dirty_patch(20, 3) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected the released hold to patch, got {other:?}"),
+        };
+        let (row, cells) = &patch.rows[0];
+        assert_eq!(*row, 0);
+        let text = cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert_eq!(
+            text.trim_end(),
+            "SCROLLED",
+            "rows held through an alt-screen read must still be dirty once released"
         );
     }
 
