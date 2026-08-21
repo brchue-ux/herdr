@@ -44,6 +44,10 @@ pub(crate) struct PendingAltScreenRead {
 }
 
 impl PendingAltScreenRead {
+    // Each field is a distinct, already-resolved piece of the read this state
+    // machine drives to completion; grouping them into a params struct would
+    // just move the same list one level down.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         terminal_id: TerminalId,
         request_id: String,
@@ -54,7 +58,12 @@ impl PendingAltScreenRead {
         unwrap: bool,
         initial: ScreenSnapshot,
         now: Instant,
+        runtime: &TerminalRuntime,
     ) -> Self {
+        // Harvesting scrolls this pane's own alt-screen app with real input;
+        // hold the presented frame at what it showed before the harvest
+        // began so that scroll never reaches the screen.
+        runtime.set_alt_screen_read_hold(true);
         Self {
             terminal_id,
             request_id,
@@ -113,10 +122,10 @@ impl PendingAltScreenRead {
     pub(crate) fn abort(mut self, runtime: Option<&TerminalRuntime>, now: Instant) -> PollOutcome {
         self.valid = false;
         match self.phase {
-            Phase::SettleInitial { .. } => self.complete_fallback(),
+            Phase::SettleInitial { .. } => self.complete_fallback(runtime),
             Phase::Harvest { .. } => match runtime {
                 Some(runtime) => self.start_restore(runtime, now),
-                None => self.complete_fallback(),
+                None => self.complete_fallback(None),
             },
             Phase::ProbeBottom | Phase::RestoreProbe | Phase::Restore { .. } => {
                 self.poll(runtime, now)
@@ -129,22 +138,22 @@ impl PendingAltScreenRead {
             return Some(self);
         }
         let Some(runtime) = runtime else {
-            return self.complete_fallback();
+            return self.complete_fallback(None);
         };
         let Some((screen, snapshot)) = runtime.screen_text_snapshot() else {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         };
         if screen != crate::ghostty::ActiveScreen::Alternate
             || snapshot.cols != self.initial.cols
             || snapshot.rows.len() != self.initial.rows.len()
         {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         }
         if self
             .restore_started_at
             .is_some_and(|started| now.duration_since(started) >= MAX_RESTORE_DURATION)
         {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         }
         if now.duration_since(self.started_at) >= MAX_DURATION
             && !matches!(
@@ -168,7 +177,7 @@ impl PendingAltScreenRead {
                         )
                         .is_err()
                         {
-                            return self.complete_fallback();
+                            return self.complete_fallback(Some(runtime));
                         }
                         self.phase = Phase::ProbeBottom;
                     } else {
@@ -193,7 +202,7 @@ impl PendingAltScreenRead {
                     if self.valid {
                         self.start_harvest(runtime, now)
                     } else {
-                        self.complete_fallback()
+                        self.complete_fallback(Some(runtime))
                     }
                 } else if send_wheel(
                     runtime,
@@ -208,12 +217,12 @@ impl PendingAltScreenRead {
                     self.next_poll_at = now + STEP_SETTLE;
                     Some(self)
                 } else {
-                    self.complete_fallback()
+                    self.complete_fallback(Some(runtime))
                 }
             }
             Phase::RestoreProbe => {
                 if snapshot.similar_text(&self.initial) {
-                    self.complete_fallback()
+                    self.complete_fallback(Some(runtime))
                 } else {
                     self.next_poll_at = now + STEP_SETTLE;
                     Some(self)
@@ -255,9 +264,9 @@ impl PendingAltScreenRead {
                 if snapshot.similar_text(&self.previous) {
                     if stable_checks >= 1 {
                         if self.valid {
-                            self.complete_success()
+                            self.complete_success(runtime)
                         } else {
-                            self.complete_fallback()
+                            self.complete_fallback(Some(runtime))
                         }
                     } else {
                         self.phase = Phase::Restore {
@@ -280,7 +289,7 @@ impl PendingAltScreenRead {
                         self.next_poll_at = now + STEP_SETTLE;
                         Some(self)
                     } else {
-                        self.complete_fallback()
+                        self.complete_fallback(Some(runtime))
                     }
                 }
             }
@@ -290,7 +299,7 @@ impl PendingAltScreenRead {
     fn start_harvest(mut self, runtime: &TerminalRuntime, now: Instant) -> PollOutcome {
         let events = WHEEL_STEP_EVENTS;
         if send_wheel(runtime, MouseEventKind::ScrollUp, events, &self.previous).is_err() {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         }
         self.upward_events = self.upward_events.saturating_add(events);
         self.phase = Phase::Harvest {
@@ -302,7 +311,7 @@ impl PendingAltScreenRead {
 
     fn start_restore(mut self, runtime: &TerminalRuntime, now: Instant) -> PollOutcome {
         if self.upward_events == 0 {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         }
         if send_wheel(
             runtime,
@@ -312,7 +321,7 @@ impl PendingAltScreenRead {
         )
         .is_err()
         {
-            return self.complete_fallback();
+            return self.complete_fallback(Some(runtime));
         }
         self.phase = Phase::Restore { stable_checks: 0 };
         self.restore_started_at = Some(now);
@@ -320,7 +329,7 @@ impl PendingAltScreenRead {
         Some(self)
     }
 
-    fn complete_success(mut self) -> PollOutcome {
+    fn complete_success(mut self, runtime: &TerminalRuntime) -> PollOutcome {
         debug!(
             terminal_id = %self.terminal_id,
             retained_rows = self.history.len(),
@@ -328,6 +337,7 @@ impl PendingAltScreenRead {
             reached_top = self.reached_top,
             "alternate-screen read completed"
         );
+        runtime.set_alt_screen_read_hold(false);
         let truncated = !self.reached_top || self.history.len() > self.lines;
         let snapshot =
             crate::terminal::snapshot_text(&self.history, self.lines, self.unwrap, truncated);
@@ -342,7 +352,7 @@ impl PendingAltScreenRead {
         None
     }
 
-    fn complete_fallback(self) -> PollOutcome {
+    fn complete_fallback(self, runtime: Option<&TerminalRuntime>) -> PollOutcome {
         debug!(
             terminal_id = %self.terminal_id,
             ?self.phase,
@@ -351,6 +361,9 @@ impl PendingAltScreenRead {
             valid = self.valid,
             "alternate-screen read fell back to passive snapshot"
         );
+        if let Some(runtime) = runtime {
+            runtime.set_alt_screen_read_hold(false);
+        }
         let _ = self.respond_to.send(self.fallback_response);
         None
     }

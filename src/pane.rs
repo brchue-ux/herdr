@@ -2967,6 +2967,13 @@ impl PaneRuntime {
         self.terminal.scroll_metrics()
     }
 
+    /// Freezes (or releases) this pane's presented frame while an
+    /// alternate-screen `recent` read is scrolling the pane's own app to
+    /// harvest history, so that harvest is invisible on screen.
+    pub(crate) fn set_alt_screen_read_hold(&self, active: bool) {
+        self.terminal.set_alt_screen_read_hold(active);
+    }
+
     /// Lifetime count of PTY output bytes this runtime has read.
     ///
     /// Monotonic for the life of the runtime and reset by anything that builds
