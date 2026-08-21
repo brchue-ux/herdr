@@ -27,9 +27,10 @@
 //! - **A row's own slot never moves the row itself.** The accumulator is over
 //!   rows *above*, so an arriving card sits at its final resting row from the
 //!   first frame and the tree opens underneath it. Its own arrival is expressed
-//!   as [`ArrivalBeat`] — a light down the rail, the elbow, and the card
-//!   generating left to right — and **never as a horizontal translation**. See
-//!   [`row_offsets`], whose `dx` is now always exactly zero.
+//!   as [`ArrivalCircuit`] — the rail growing down from a fixed anchor, the
+//!   branch growing right from the rail, and the card blooming in place — and
+//!   **never as a horizontal translation**. See [`row_offsets`], whose `dx` is
+//!   now always exactly zero.
 //! - **Motion is the placement's, never the artwork's.** Everything here is an
 //!   offset applied to where an already-rasterised card is *placed*. Nothing in
 //!   it can change a card's pixels, which is what keeps a slide at the cost of
@@ -76,78 +77,93 @@ use crate::app::state::AppState;
 
 /// Where a row is in the four-beat gesture its arrival is.
 ///
-/// # Why a row does not slide in sideways any more
+/// # Why nothing here is welded to anything else
 ///
-/// It used to: an arriving row was translated a panel width and a little over
-/// to the right and travelled home. That is exactly what F22 refuses — *no
-/// row's transform ever carries a horizontal offset* — and the refusal is not
-/// stylistic. A card sliding across the panel is a finished object being moved;
-/// the reference's card is **generated**, left to right, from the point a light
-/// travelling the tree's own rail landed on its edge. One reads as a thing
-/// arriving from off-screen, the other as the tree growing a branch, and the
-/// second is what the picture is about.
+/// A row's arrival used to be one journey: a card sliding a panel width and a
+/// little over to the right, travelling home. F22 already refused the slide —
+/// *no row's transform ever carries a horizontal offset* — and replaced it
+/// with a card **generated** in place. What replaces the *generation* is this:
+/// four pieces, each animating from its own fixed anchor by growing or fading
+/// rather than by moving, none welded to when another one moves. The captain
+/// was specific about the failure mode this avoids — rails and branches rigidly
+/// stuck to the cards they point at, so that a discrepancy in one throws off
+/// all three at once. Grown independently, from anchors that do not move, there
+/// is nothing for them to desynchronise *against*.
 ///
-/// The four beats, and what draws each:
+/// The four beats, non-overlapping windows on the row's own settle, each
+/// resolved by [`arrival_circuit`]:
 ///
-/// 1. [`Self::Rail`] — light runs **down** the parent's rail toward this row's
-///    elbow. Drawn by the character renderer, on the rail cells above the
-///    connector row.
-/// 2. [`Self::Elbow`] — it turns the corner and runs **right**, into the row's
-///    own left edge. Drawn by the same renderer, on the `├──` cells.
-/// 3. [`Self::Generate`] — the card is drawn from its left edge rightward, from
-///    where the light landed. A **clip on a card being drawn**, never a
-///    translation of a finished one.
-/// 4. The column below is pushed down. That is [`row_offsets`]'s `dy`, and it
-///    runs across all three of the above rather than after them, because the
-///    space has to be open by the time the card fills it.
+/// 1. [`ArrivalCircuit::push`] — the rows below make room. This is
+///    [`row_offsets`]'s `dy`, fed [`ArrivalCircuit::push`] instead of the raw
+///    engine settle so the space finishes opening before anything else moves.
+/// 2. [`ArrivalCircuit::rail`] — the rail segment above this row's own elbow
+///    grows **down**, `scaleY` from its fixed top anchor. Never a translation:
+///    the anchor never moves, only how much of the segment is lit.
+/// 3. [`ArrivalCircuit::tick`] — the branch grows **right** out of the rail,
+///    `scaleX` from the rail's own left edge, only once the rail has reached it.
+/// 4. [`ArrivalCircuit::card`] — the card blooms, opacity from `0.0` to `1.0`
+///    with no motion of its own, only once the branch exists to point at it.
 ///
 /// A departure is the same reading counted down, because the engine hands a
 /// dismount back as its mount reversed.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum ArrivalBeat {
-    /// Beat one, `0.0..=1.0` down the rail.
-    Rail(f32),
-    /// Beat two, `0.0..=1.0` along the elbow.
-    Elbow(f32),
-    /// Beat three, `0.0..=1.0` of the card generated from its left edge.
-    Generate(f32),
-    /// The row is at rest and everything about it is drawn.
-    Settled,
+pub(crate) struct ArrivalCircuit {
+    /// `0.0..=1.0`: how much of the row-push below this row has resolved.
+    pub(crate) push: f32,
+    /// `0.0..=1.0`: how far down the rail has grown from its fixed top anchor.
+    pub(crate) rail: f32,
+    /// `0.0..=1.0`: how far right the branch has grown from the rail.
+    pub(crate) tick: f32,
+    /// `0.0..=1.0`: the card's own opacity.
+    pub(crate) card: f32,
 }
 
-/// Where beat one ends, as a fraction of the row's whole arrival.
-const BEAT_RAIL_END: f32 = 0.20;
-/// Where beat two ends. The two travel beats together take under half the
-/// arrival: the light is the *announcement*, and an announcement that outlasts
-/// the thing it announces is a delay rather than a gesture.
-const BEAT_ELBOW_END: f32 = 0.40;
+/// Where each beat's window sits on the row's own settle, `0.0..=1.0`.
+///
+/// Four consecutive, non-overlapping ranges on one cycle — never simultaneous,
+/// so a reader is never asked to watch two of the four pieces move at once.
+/// Matches the reference's own `row-push` / `rail-grow` / `tick-grow` /
+/// `card-bloom` keyframe percentages exactly.
+const PUSH_WINDOW: (f32, f32) = (0.24, 0.42);
+const RAIL_WINDOW: (f32, f32) = (0.44, 0.58);
+const TICK_WINDOW: (f32, f32) = (0.58, 0.70);
+const CARD_WINDOW: (f32, f32) = (0.70, 0.84);
 
-/// Which beat a row at this settle is on.
-pub(crate) fn arrival_beat(settle: f32) -> ArrivalBeat {
+/// Ease-out over one window: held at `0.0` before `start`, held at `1.0` after
+/// `end`, eased between. The reference's own curve for every one of the four
+/// keyframes is `ease-out`; a quadratic is the cheapest curve with that shape
+/// and it is evaluated up to four times a frame per row, so cheap matters.
+fn windowed(settle: f32, (start, end): (f32, f32)) -> f32 {
+    if settle <= start {
+        return 0.0;
+    }
+    if settle >= end {
+        return 1.0;
+    }
+    let t = ((settle - start) / (end - start)).clamp(0.0, 1.0);
+    t * (2.0 - t)
+}
+
+/// Resolve all four beats at once from one row's settle.
+///
+/// A settled row (or one the engine is not tracking) reads as every beat at
+/// `1.0`, which is the same "nothing to animate" honesty [`settle`] already
+/// carries — a panel with no motion configured draws every piece whole.
+pub(crate) fn arrival_circuit(settle: f32) -> ArrivalCircuit {
     let settle = settle.clamp(0.0, 1.0);
     if settle >= 1.0 {
-        return ArrivalBeat::Settled;
+        return ArrivalCircuit {
+            push: 1.0,
+            rail: 1.0,
+            tick: 1.0,
+            card: 1.0,
+        };
     }
-    if settle < BEAT_RAIL_END {
-        return ArrivalBeat::Rail(settle / BEAT_RAIL_END);
-    }
-    if settle < BEAT_ELBOW_END {
-        return ArrivalBeat::Elbow((settle - BEAT_RAIL_END) / (BEAT_ELBOW_END - BEAT_RAIL_END));
-    }
-    ArrivalBeat::Generate((settle - BEAT_ELBOW_END) / (1.0 - BEAT_ELBOW_END))
-}
-
-impl ArrivalBeat {
-    /// How much of the card is drawn, from its left edge, `0.0..=1.0`.
-    ///
-    /// Zero through both travel beats: the card does not exist yet, the light
-    /// running toward it is the whole of what is on screen.
-    pub(crate) fn generated(self) -> f32 {
-        match self {
-            Self::Rail(_) | Self::Elbow(_) => 0.0,
-            Self::Generate(t) => t.clamp(0.0, 1.0),
-            Self::Settled => 1.0,
-        }
+    ArrivalCircuit {
+        push: windowed(settle, PUSH_WINDOW),
+        rail: windowed(settle, RAIL_WINDOW),
+        tick: windowed(settle, TICK_WINDOW),
+        card: windowed(settle, CARD_WINDOW),
     }
 }
 
@@ -325,38 +341,100 @@ mod tests {
         assert_eq!(worst, 0.0, "a row travelled sideways by {worst} px");
     }
 
-    /// The gesture, in order: the light travels the tree first, and only then
-    /// is any of the card drawn.
+    /// The gesture, in order: the push finishes, then the rail grows, then the
+    /// branch grows, then the card blooms — never two of the four moving at
+    /// once, and each strictly after the one before it has finished.
     #[test]
-    fn the_arrival_runs_rail_then_elbow_then_generation() {
-        assert_eq!(arrival_beat(0.0), ArrivalBeat::Rail(0.0));
-        assert!(matches!(arrival_beat(0.1), ArrivalBeat::Rail(_)));
-        assert!(matches!(arrival_beat(0.3), ArrivalBeat::Elbow(_)));
-        assert!(matches!(arrival_beat(0.7), ArrivalBeat::Generate(_)));
-        assert_eq!(arrival_beat(1.0), ArrivalBeat::Settled);
+    fn the_arrival_runs_push_then_rail_then_tick_then_card_in_non_overlapping_windows() {
+        // Nothing has moved yet.
+        let at_zero = arrival_circuit(0.0);
+        assert_eq!(
+            at_zero,
+            ArrivalCircuit {
+                push: 0.0,
+                rail: 0.0,
+                tick: 0.0,
+                card: 0.0
+            }
+        );
 
-        // Nothing of the card exists until the light has landed on its edge.
-        assert_eq!(arrival_beat(0.0).generated(), 0.0);
-        assert_eq!(arrival_beat(0.39).generated(), 0.0);
-        assert!(arrival_beat(0.41).generated() > 0.0);
-        assert_eq!(arrival_beat(1.0).generated(), 1.0);
+        // Mid-push: only push is moving, everything after it is still zero.
+        let mid_push = arrival_circuit(0.30);
+        assert!(mid_push.push > 0.0 && mid_push.push < 1.0);
+        assert_eq!(mid_push.rail, 0.0);
+        assert_eq!(mid_push.tick, 0.0);
+        assert_eq!(mid_push.card, 0.0);
 
-        // And it grows monotonically from there, so a card is never seen to
-        // un-generate part of itself.
-        let mut last = 0.0;
-        for step in 40..=100 {
-            let now = arrival_beat(step as f32 / 100.0).generated();
-            assert!(now >= last, "{now} after {last}");
+        // Mid-rail: push has finished, rail is moving, tick and card have not
+        // started.
+        let mid_rail = arrival_circuit(0.50);
+        assert_eq!(mid_rail.push, 1.0);
+        assert!(mid_rail.rail > 0.0 && mid_rail.rail < 1.0);
+        assert_eq!(mid_rail.tick, 0.0);
+        assert_eq!(mid_rail.card, 0.0);
+
+        // Mid-tick: rail has finished, tick is moving, card has not started.
+        let mid_tick = arrival_circuit(0.64);
+        assert_eq!(mid_tick.rail, 1.0);
+        assert!(mid_tick.tick > 0.0 && mid_tick.tick < 1.0);
+        assert_eq!(mid_tick.card, 0.0);
+
+        // Mid-bloom: tick has finished, only the card is moving.
+        let mid_card = arrival_circuit(0.77);
+        assert_eq!(mid_card.tick, 1.0);
+        assert!(mid_card.card > 0.0 && mid_card.card < 1.0);
+
+        // Settled: every piece whole.
+        assert_eq!(
+            arrival_circuit(1.0),
+            ArrivalCircuit {
+                push: 1.0,
+                rail: 1.0,
+                tick: 1.0,
+                card: 1.0
+            }
+        );
+
+        // Every one of the four grows monotonically over the whole arrival,
+        // so nothing is ever seen to un-grow part of itself.
+        let mut last = ArrivalCircuit {
+            push: 0.0,
+            rail: 0.0,
+            tick: 0.0,
+            card: 0.0,
+        };
+        for step in 0..=100 {
+            let now = arrival_circuit(step as f32 / 100.0);
+            assert!(now.push >= last.push);
+            assert!(now.rail >= last.rail);
+            assert!(now.tick >= last.tick);
+            assert!(now.card >= last.card);
             last = now;
         }
     }
 
     /// A progress the engine hands back outside the unit range cannot put a
-    /// card at a negative width or past whole.
+    /// row's arrival below nothing or past whole.
     #[test]
     fn a_beat_outside_the_unit_range_is_clamped() {
-        assert_eq!(arrival_beat(-4.0), ArrivalBeat::Rail(0.0));
-        assert_eq!(arrival_beat(4.0), ArrivalBeat::Settled);
+        assert_eq!(
+            arrival_circuit(-4.0),
+            ArrivalCircuit {
+                push: 0.0,
+                rail: 0.0,
+                tick: 0.0,
+                card: 0.0
+            }
+        );
+        assert_eq!(
+            arrival_circuit(4.0),
+            ArrivalCircuit {
+                push: 1.0,
+                rail: 1.0,
+                tick: 1.0,
+                card: 1.0
+            }
+        );
     }
 
     /// A departure is the same arithmetic read the other way, because the

@@ -972,12 +972,12 @@ pub struct WorkspaceCardArea {
     /// It used to be spelled `motion_cells.0 != 0`: a row arrived by travelling
     /// in from off the panel's right edge, so "is it mid-transition" and "is it
     /// off to the side" were the same question. F22 retired the slide — a card
-    /// is **generated** in place now, see
-    /// [`crate::ui::sidebar::motion::ArrivalBeat`] — and with it that proxy. The
-    /// question it was really answering is this one, and it has to keep being
-    /// asked: without it a departing row goes on owning its slot in the layout
-    /// while the row contracting over it is drawn there, and every click aimed
-    /// at the visible row is swallowed by the invisible one.
+    /// blooms in place now, see
+    /// [`crate::ui::sidebar::motion::ArrivalCircuit`] — and with it that proxy.
+    /// The question it was really answering is this one, and it has to keep
+    /// being asked: without it a departing row goes on owning its slot in the
+    /// layout while the row contracting over it is drawn there, and every click
+    /// aimed at the visible row is swallowed by the invisible one.
     pub arriving: bool,
     /// True when this row is as tall as it is because a *drawn* card set its
     /// height ([`crate::ui::sidebar::image_card::row_height_cells`]) rather
