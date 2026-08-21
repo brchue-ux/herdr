@@ -56,19 +56,19 @@ const SYNCHRONIZED_UPDATE_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
 /// [`SYNCHRONIZED_UPDATE_HOLD_TIMEOUT`] releases on the child's own DEC 2026
 /// close.
 const RESIZE_RECOVERY_HOLD_TIMEOUT: Duration = Duration::from_millis(150);
-/// How long after a resize a full-screen clear is still treated as that
-/// resize's own redraw, arming [`RESIZE_RECOVERY_HOLD_TIMEOUT`].
+/// How long after a resize a full-screen redraw signal is still treated as
+/// that resize's own redraw, arming [`RESIZE_RECOVERY_HOLD_TIMEOUT`].
 ///
 /// Wide margin over the ~20ms a real `claude` session's resize-triggered
 /// redraw took to land in the measurement above. Most resizes never see a
-/// clear inside this window at all — an initial attach, a pane that stays
-/// quiet after being resized — and those pay nothing: the watch this arms
-/// expires unconsumed with no hold ever engaged.
+/// redraw signal inside this window at all — an initial attach, a pane that
+/// stays quiet after being resized — and those pay nothing: the watch this
+/// arms expires unconsumed with no hold ever engaged.
 const RESIZE_REDRAW_WATCH_WINDOW: Duration = Duration::from_millis(400);
 /// How long since this pane's live grid was last actually read (by either
 /// [`GhosttyPaneTerminal::render`] or the retained dirty-patch path) before a
-/// full-screen clear is treated the same way a resize's own redraw is: worth
-/// engaging [`RESIZE_RECOVERY_HOLD_TIMEOUT`] for.
+/// full-screen redraw signal is treated the same way a resize's own redraw
+/// is: worth engaging [`RESIZE_RECOVERY_HOLD_TIMEOUT`] for.
 ///
 /// A pane that is hidden — a background tab, a background workspace — is
 /// still fed live PTY bytes the whole time; only reading its grid for
@@ -77,10 +77,11 @@ const RESIZE_REDRAW_WATCH_WINDOW: Duration = Duration::from_millis(400);
 /// idle-agent status tick), landing across more than one PTY read exactly
 /// like a resize-triggered redraw does. Nothing renders while the pane stays
 /// hidden, so no torn frame is visible yet — but the *first* render after it
-/// becomes visible again can land in the middle of that same clear-then-content
-/// split, and unlike the resize case there is no resize call to arm a watch
-/// from. A pane that was actually being drawn recently renders far more often
-/// than this, so the common continuously-visible case never crosses it.
+/// becomes visible again can land in the middle of that same
+/// redraw-then-content split, and unlike the resize case there is no resize
+/// call to arm a watch from. A pane that was actually being drawn recently
+/// renders far more often than this, so the common continuously-visible
+/// case never crosses it.
 const HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD: Duration = Duration::from_millis(500);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
@@ -1250,7 +1251,7 @@ impl GhosttyPaneTerminal {
             let now = Instant::now();
             if now.duration_since(started) >= RESIZE_REDRAW_WATCH_WINDOW {
                 core.awaiting_resize_redraw_since = None;
-            } else if contains_full_screen_clear_sequence(bytes) {
+            } else if contains_full_screen_redraw_signal(bytes) {
                 core.resize_recovery_started_at = Some(now);
                 core.awaiting_resize_redraw_since = None;
             }
@@ -1274,7 +1275,7 @@ impl GhosttyPaneTerminal {
                 now.duration_since(last) >= HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD
             });
             if long_since_rendered
-                && contains_full_screen_clear_sequence(bytes)
+                && contains_full_screen_redraw_signal(bytes)
                 && ghostty_detection_text(&core)
                     .map(|text| !text.trim().is_empty())
                     .unwrap_or(false)
@@ -3676,13 +3677,25 @@ fn contains_kitty_graphics_sequence(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|window| window == b"\x1b_G")
 }
 
-/// Whether `bytes` contains an ED sequence erasing the entire visible
-/// display (`\x1b[2J` or the xterm-extended `\x1b[3J`, which also erases
-/// scrollback) — the shape of a full-screen TUI clearing its display to
-/// redraw for a new size.
-fn contains_full_screen_clear_sequence(bytes: &[u8]) -> bool {
+/// Whether `bytes` contains a signal that a full-screen TUI is starting a
+/// fresh redraw of its whole display: an ED sequence erasing the entire
+/// visible display (`\x1b[2J` or the xterm-extended `\x1b[3J`, which also
+/// erases scrollback), or a cursor move to the home position (`\x1b[H`,
+/// `\x1b[;H`, or the explicit `\x1b[1;1H`).
+///
+/// Not every full-screen redraw clears with ED first: plenty of well-behaved
+/// TUIs avoid the flicker of a hard clear and instead move the cursor home
+/// and overwrite each line with an erase-to-end-of-line plus new content.
+/// Detecting only the ED form left that redraw shape with nothing to arm
+/// either hold below with — a redraw in this shape, split across more than
+/// one PTY read on a pane already stale since its last render, landed torn
+/// with no guard ever seeing it.
+fn contains_full_screen_redraw_signal(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|window| window == b"\x1b[2J")
         || bytes.windows(4).any(|window| window == b"\x1b[3J")
+        || bytes.windows(3).any(|window| window == b"\x1b[H")
+        || bytes.windows(4).any(|window| window == b"\x1b[;H")
+        || bytes.windows(6).any(|window| window == b"\x1b[1;1H")
 }
 
 fn should_probe_host_terminal_theme_restore(core: &GhosttyPaneCore) -> bool {
@@ -5758,6 +5771,67 @@ mod tests {
 
         pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
         assert_eq!(rendered_top_row(&pane, 20, 3), "FRESH");
+    }
+
+    #[test]
+    fn a_multi_write_redraw_with_no_literal_clear_on_a_stale_pane_still_engages_the_hold() {
+        // Regression coverage for the scroll-then-snap symptom surviving
+        // three prior fixes (#169, #172, #174), all of them in this same
+        // hold machinery. Reproduced in-process (no live client attach was
+        // possible under this lab's isolation contract) by driving the real
+        // `process_pty_bytes` / `render` pipeline directly: not every
+        // full-screen redraw clears with `\x1b[2J`/`\x1b[3J` first. A well
+        // behaved TUI commonly avoids the flicker of a hard clear and instead
+        // moves the cursor home and overwrites each line with an
+        // erase-to-end-of-line plus new content — a shape the old
+        // `contains_full_screen_clear_sequence` could not see at all, so a
+        // hidden pane's redraw in this shape sailed straight past the hold
+        // #174 built for exactly this scenario, and its first render after
+        // becoming visible again landed torn: some rows already rewritten,
+        // some still the old content.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        // Simulate the pane sitting hidden/backgrounded for a while.
+        pane.age_render_state_last_refreshed_for_test(
+            HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD + Duration::from_millis(1),
+        );
+
+        // No `2J`/`3J` anywhere — cursor home, then the first line rewritten,
+        // split across two PTY reads exactly like the resize case.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[HFRESH", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "a cursor-home redraw with no literal clear, on a pane stale since \
+             its last render, must engage the hold just as a `2J` clear would"
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "ONE",
+            "the cursor-home move alone must never be presented as a torn frame"
+        );
+
+        // ...then the rest of the redraw in a second read.
+        pane.process_pty_bytes(pane_id, 0, b"\r\nTWO2\r\nTHREE2", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "the hold must not be released early by the first chunk of a multi-write redraw"
+        );
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FRESH",
+            "once the hold elapses the child's real, complete redraw must be drawn"
+        );
     }
 
     #[test]
