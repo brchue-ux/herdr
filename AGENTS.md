@@ -591,6 +591,20 @@ and the manifest's own `min_engine_version`. Raising a bundled manifest past the
 engine the website publishes also needs its `STAGED_WEBSITE_MANIFESTS` entry
 updated, or every client below that engine rejects the remote manifest outright.
 
+A fork-local-only manifest field (one only this project's bundled manifest
+declares, like `transcript_region`) needs no special handling to survive a
+remote-catalog update: `load_manifest_uncached` in `src/detect/manifest.rs`
+backfills any such field from the bundled manifest whenever the manifest a
+session actually adopted (override, then remote) leaves it unset. Without
+this, a remote manifest merely numerically newer than the bundled one — an
+ordinary occurrence, since the catalog and this binary release on independent
+schedules — but written before the field existed silently and permanently
+disabled it, with no error: validation only rejects a manifest that
+*declares* the field below its required engine version, never one that
+simply never mentions it. Adding a new such field does not require touching
+the backfill; only a field that a remote manifest might legitimately want to
+override needs to bypass it.
+
 Do not add large agent-specific full-screen fixture suites for routine manifest tuning. Keep Rust tests focused on manifest parsing, rule semantics, skip-state semantics, source precedence, cache reload behavior, and update flow. Use live pane reads for agent-specific screen evidence.
 
 ## Vendored libghostty-vt

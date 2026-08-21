@@ -713,8 +713,39 @@ fn load_manifest(agent: Agent) -> Option<LoadedManifest> {
         .and_then(|(_, loaded)| loaded.clone())
 }
 
+/// Loads the effective manifest for `agent` — override, then remote, then
+/// bundled, in that preference order — and backfills `transcript_region`
+/// from the bundled manifest whenever the chosen source leaves it unset.
+///
+/// `transcript_region` is a herdr-engine capability (which region names this
+/// specific binary knows how to slice, gated by `min_engine_version`), not a
+/// detection improvement an external catalog would ever populate: the
+/// upstream remote catalog this project's remote-manifest updates come from
+/// has no reason to know about a region name added only in this fork's own
+/// bundled manifest. Left unhandled, a remote manifest that is *numerically
+/// newer* than the bundled one (a real, ordinary occurrence — the catalog
+/// and this binary release on independent schedules) but predates this
+/// field would silently and permanently disable it, with no error or
+/// warning: `validate_manifest` only rejects a manifest that *declares*
+/// `transcript_region` below the required engine version, it has nothing to
+/// say about a manifest that simply never mentions the field. Backfilling
+/// after the chosen manifest has already parsed and validated — rather than
+/// injecting the field beforehand — keeps that validation intact for a
+/// remote or override manifest that legitimately does declare the field
+/// itself.
 fn load_manifest_uncached(agent: Agent) -> Option<LoadedManifest> {
     let bundled = bundled_manifest(agent)?;
+    let mut loaded = load_manifest_uncached_preferring_override_or_remote(agent, bundled.clone())?;
+    if loaded.manifest.transcript_region.is_none() {
+        loaded.manifest.transcript_region = bundled.transcript_region;
+    }
+    Some(loaded)
+}
+
+fn load_manifest_uncached_preferring_override_or_remote(
+    agent: Agent,
+    bundled: AgentManifest,
+) -> Option<LoadedManifest> {
     let mut remote = read_remote_manifest(agent, &bundled);
     let cached_remote_version = remote.as_ref().and_then(|loaded| match &loaded.source {
         _ if loaded.cached_remote_version.is_some() => loaded.cached_remote_version.clone(),

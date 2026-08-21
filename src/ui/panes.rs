@@ -34,7 +34,15 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
 /// Minimum spare rows below the composer for the bottom command-log zone to
 /// be worth drawing — fewer than this would read as a sliver rather than a
 /// real zone, so the pane falls back to a normal full render instead.
-const MIN_TRIVIEW_BOTTOM_ROWS: u16 = 3;
+///
+/// Claude Code's own composer always leaves exactly two rows below its own
+/// bottom border in every observed state (idle and working alike): a
+/// model/context/cost line, then a keybinding hint line. It pins these to the
+/// literal bottom of the screen regardless of pane height, so "spare rows
+/// below the composer" never exceeds 2 on a real live pane. A threshold of 3
+/// here demanded one more row than a real Claude Code screen ever has,
+/// meaning triview could never engage outside a synthetic test fixture.
+const MIN_TRIVIEW_BOTTOM_ROWS: u16 = 2;
 
 /// Minimum pane height even worth attempting triview detection against — a
 /// cheap bailout before paying for a text read of the live grid.

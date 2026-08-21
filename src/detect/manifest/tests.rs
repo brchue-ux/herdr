@@ -949,6 +949,65 @@ fn manifest_without_transcript_region_reports_none() {
     assert!(transcript_line_range(Agent::Gemini, "hello\n").is_none());
 }
 
+/// A remote-catalog manifest update is numerically newer than the bundled one
+/// on an entirely independent schedule (see `older_cached_remote_manifest_does_not_shadow_newer_bundled_manifest`),
+/// so it routinely predates a herdr-engine capability like `transcript_region`
+/// that only this fork's bundled manifest declares — the upstream catalog has
+/// no reason to know about it. Adopting the remote manifest for its (real,
+/// wanted) rule improvements must not silently disable a bundled-only
+/// capability it simply never mentions.
+#[test]
+fn remote_manifest_missing_transcript_region_is_backfilled_from_bundled() {
+    with_manifest_dirs("remote-missing-transcript-region", || {
+        write_remote_codex(&remote_manifest("9999.01.01.1", "blocked", "remote-ready"));
+
+        let spec = transcript_region_spec(Agent::Codex);
+
+        assert_eq!(spec.as_deref(), Some("before_current_prompt_marker"));
+        let explain = explain(Agent::Codex, "remote-ready");
+        assert!(
+            matches!(explain.source, Some(ManifestSource::Remote { .. })),
+            "the remote manifest's own rules must still be the active ones"
+        );
+    });
+}
+
+#[test]
+fn local_override_missing_transcript_region_is_backfilled_from_bundled() {
+    with_manifest_dirs("override-missing-transcript-region", || {
+        write_local_codex(&local_manifest("idle", "local-ready"));
+
+        let spec = transcript_region_spec(Agent::Codex);
+
+        assert_eq!(spec.as_deref(), Some("before_current_prompt_marker"));
+        let explain = explain(Agent::Codex, "local-ready");
+        assert!(matches!(explain.source, Some(ManifestSource::Override(_))));
+    });
+}
+
+#[test]
+fn remote_manifest_declaring_its_own_transcript_region_is_not_overridden() {
+    with_manifest_dirs("remote-own-transcript-region", || {
+        let manifest = r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 4
+transcript_region = "before_current_prompt_marker"
+
+[[rules]]
+id = "test"
+state = "blocked"
+contains = ["remote-ready"]
+"#;
+        write_remote_codex(manifest);
+
+        assert_eq!(
+            transcript_region_spec(Agent::Codex).as_deref(),
+            Some("before_current_prompt_marker")
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // prompt_box_body_line_range — the terminal triview render path's live boundary
 // source (Claude only).
