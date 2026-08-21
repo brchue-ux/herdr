@@ -39,7 +39,7 @@ pub struct GitStatusRefreshDemand {
     /// Kept separate from `dirty` because it is only ever true for the one
     /// checkout backing the currently visible diff pane, never for every
     /// checkout a `git_dirty` sidebar token happens to be configured for -
-    /// see `App::diff_pane_demand_target`.
+    /// see `App::diff_pane_target`.
     pub diff: bool,
 }
 
@@ -367,15 +367,16 @@ fn git_dirty_counts(repo_root: &Path) -> Option<GitDirtyCounts> {
 }
 
 /// This checkout's unified diff against `HEAD` (staged and unstaged changes
-/// together), parsed into coloring-ready lines.
+/// together, tracked deletions included), plus a synthetic "new file" section
+/// for every untracked, non-ignored file — so the diff pane shows a worker's
+/// whole visible change set, not just edits to files Git already knew about.
+/// Parsed into coloring-ready lines.
 ///
 /// `--no-renames` matches `git_dirty_counts` above: a rename is shown as a
 /// full delete of the old path plus a full add of the new one rather than a
 /// compact rename record — decided for the diff pane's first cut in
 /// `data/decisions/2026-08-19-terminal-diffpane-standing-authority.md`, same
 /// reasoning as today's dirty-count path (cheaper, easily upgraded later).
-/// Untracked files never appear here: `git diff` only ever compares tracked
-/// content, which is a separate concern from the `?? ` counts above.
 fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
     let output = crate::noninteractive_process::command("git")
         .arg("-C")
@@ -390,29 +391,166 @@ fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
         .output()
         .ok()?;
 
-    // An unborn branch (no commits yet) makes `git diff HEAD` fail; that is
-    // "nothing to diff against", not an error worth surfacing as `None`
-    // (which the pane would otherwise have no way to distinguish from "not a
-    // git checkout at all").
-    if !output.status.success() {
-        return Some(GitDiffText::default());
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = Vec::new();
     let mut truncated = false;
-    for raw in text.lines() {
+
+    // An unborn branch (no commits yet) makes `git diff HEAD` fail; that is
+    // "nothing tracked to diff against", not an error worth surfacing as
+    // `None` (which the pane would otherwise have no way to distinguish from
+    // "not a git checkout at all") — untracked files below can still show.
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        push_diff_lines(text.lines(), &mut lines, &mut truncated);
+    }
+
+    if !truncated {
+        append_untracked_diff_lines(repo_root, &mut lines, &mut truncated);
+    }
+
+    Some(GitDiffText { lines, truncated })
+}
+
+fn push_diff_lines<'a>(
+    raw_lines: impl Iterator<Item = &'a str>,
+    lines: &mut Vec<GitDiffLine>,
+    truncated: &mut bool,
+) {
+    for raw in raw_lines {
         if lines.len() >= GIT_DIFF_MAX_LINES {
-            truncated = true;
-            break;
+            *truncated = true;
+            return;
         }
         lines.push(GitDiffLine {
             kind: classify_diff_line(raw),
             text: raw.to_string(),
         });
     }
+}
 
-    Some(GitDiffText { lines, truncated })
+/// Appends a synthetic "new file" diff section for every untracked,
+/// non-ignored file in `repo_root` — `git diff` itself never reports these,
+/// since it only ever compares content Git already tracks. Each file is read
+/// directly rather than shelled out to `git diff --no-index` against a null
+/// device, which has no portable path across platforms; the header lines
+/// mirror the exact convention `git diff` itself already uses for a tracked
+/// add (see `classify_diff_line`), so the pane renders both identically.
+fn append_untracked_diff_lines(
+    repo_root: &Path,
+    lines: &mut Vec<GitDiffLine>,
+    truncated: &mut bool,
+) {
+    if lines.len() >= GIT_DIFF_MAX_LINES {
+        *truncated = true;
+        return;
+    }
+    let Ok(output) = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "--no-optional-locks",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        if lines.len() >= GIT_DIFF_MAX_LINES {
+            *truncated = true;
+            return;
+        }
+        let rel_path = String::from_utf8_lossy(raw_path).into_owned();
+        push_untracked_file_diff(repo_root, &rel_path, lines, truncated);
+    }
+}
+
+/// How many prefix bytes are sniffed to decide whether an untracked file is
+/// binary, rather than reading the whole file first — matches Git's own
+/// binary-detection heuristic closely enough, and keeps a large stray binary
+/// asset sitting in the worktree from making the background refresh thread
+/// read the whole thing into memory just to conclude it can't be shown.
+const UNTRACKED_BINARY_SNIFF_BYTES: usize = 8000;
+
+fn push_untracked_file_diff(
+    repo_root: &Path,
+    rel_path: &str,
+    lines: &mut Vec<GitDiffLine>,
+    truncated: &mut bool,
+) {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(repo_root.join(rel_path)) else {
+        return;
+    };
+    let mut sniff = [0u8; UNTRACKED_BINARY_SNIFF_BYTES];
+    let Ok(sniffed) = file.read(&mut sniff) else {
+        return;
+    };
+
+    lines.push(GitDiffLine {
+        kind: GitDiffLineKind::FileHeader,
+        text: format!("diff --git a/{rel_path} b/{rel_path}"),
+    });
+    lines.push(GitDiffLine {
+        kind: GitDiffLineKind::FileHeader,
+        text: "new file mode 100644".to_string(),
+    });
+
+    if sniff[..sniffed].contains(&0) {
+        lines.push(GitDiffLine {
+            kind: GitDiffLineKind::FileHeader,
+            text: format!("Binary files /dev/null and b/{rel_path} differ"),
+        });
+        return;
+    }
+
+    let mut content = sniff[..sniffed].to_vec();
+    let mut rest = Vec::new();
+    if file.read_to_end(&mut rest).is_err() {
+        return;
+    }
+    content.extend_from_slice(&rest);
+
+    let text = String::from_utf8_lossy(&content);
+    let content_lines: Vec<&str> = text.lines().collect();
+    if content_lines.is_empty() {
+        // Matches Git's own convention for an empty new file: the two header
+        // lines above, no hunk.
+        return;
+    }
+
+    lines.push(GitDiffLine {
+        kind: GitDiffLineKind::FileHeader,
+        text: "--- /dev/null".to_string(),
+    });
+    lines.push(GitDiffLine {
+        kind: GitDiffLineKind::FileHeader,
+        text: format!("+++ b/{rel_path}"),
+    });
+    lines.push(GitDiffLine {
+        kind: GitDiffLineKind::Hunk,
+        text: format!("@@ -0,0 +1,{} @@", content_lines.len()),
+    });
+    for content_line in content_lines {
+        if lines.len() >= GIT_DIFF_MAX_LINES {
+            *truncated = true;
+            return;
+        }
+        lines.push(GitDiffLine {
+            kind: GitDiffLineKind::Added,
+            text: format!("+{content_line}"),
+        });
+    }
 }
 
 fn classify_diff_line(line: &str) -> GitDiffLineKind {
@@ -774,11 +912,114 @@ mod tests {
             .output()
             .expect("git init");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("new.txt"), "content\n").unwrap();
 
         let diff = git_diff_text(&root).expect("diff on an unborn branch is Some, not None");
 
         assert!(diff.lines.is_empty());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_text_shows_an_untracked_file_even_on_an_unborn_branch() {
+        // `git diff HEAD` alone fails with no commits to diff against, but an
+        // untracked file is still real, visible work — it must not get lost
+        // behind the unborn-branch fallback.
+        let root = temp_test_dir("diff-text-unborn-untracked");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("init")
+            .output()
+            .expect("git init");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("new.txt"), "content\n").unwrap();
+
+        let diff = git_diff_text(&root).expect("diff on an unborn branch is Some, not None");
+
+        assert!(
+            diff.lines
+                .iter()
+                .any(|line| line.text.starts_with("new file mode")),
+            "{:?}",
+            diff.lines
+        );
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+content"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_text_shows_a_new_untracked_file_alongside_a_tracked_edit() {
+        let root = temp_test_dir("diff-text-untracked-add");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
+        run_git(&root, &["add", "tracked.txt"]);
+        run_git(&root, &["commit", "--quiet", "-m", "add tracked"]);
+        std::fs::write(root.join("tracked.txt"), "one\nTWO\n").unwrap();
+        std::fs::write(root.join("brand_new.txt"), "fresh line\n").unwrap();
+
+        let diff = git_diff_text(&root).expect("diff for a real repo");
+
+        assert!(!diff.truncated);
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.text == "diff --git a/tracked.txt b/tracked.txt"));
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+TWO"));
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.text == "diff --git a/brand_new.txt b/brand_new.txt"));
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+fresh line"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_text_marks_a_binary_untracked_file_as_binary() {
+        let root = temp_test_dir("diff-text-untracked-binary");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join("blob.bin"), [0u8, 1, 2, 3, 0, 4]).unwrap();
+
+        let diff = git_diff_text(&root).expect("diff for a real repo");
+
+        assert!(diff
+            .lines
+            .iter()
+            .any(|line| line.text == "Binary files /dev/null and b/blob.bin differ"));
+        assert!(!diff
+            .lines
+            .iter()
+            .any(|line| line.kind == GitDiffLineKind::Added));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diff_text_ignores_untracked_files_excluded_by_gitignore() {
+        let root = temp_test_dir("diff-text-untracked-ignored");
+        init_repo_with_commit(&root);
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        run_git(&root, &["add", ".gitignore"]);
+        run_git(&root, &["commit", "--quiet", "-m", "add gitignore"]);
+        std::fs::write(root.join("ignored.txt"), "should not appear\n").unwrap();
+
+        let diff = git_diff_text(&root).expect("diff for a real repo");
+
+        assert!(!diff
+            .lines
+            .iter()
+            .any(|line| line.text.contains("ignored.txt")));
 
         std::fs::remove_dir_all(root).unwrap();
     }
