@@ -3678,24 +3678,48 @@ fn contains_kitty_graphics_sequence(bytes: &[u8]) -> bool {
 }
 
 /// Whether `bytes` contains a signal that a full-screen TUI is starting a
-/// fresh redraw of its whole display: an ED sequence erasing the entire
+/// redraw of some region of its display: an ED sequence erasing the entire
 /// visible display (`\x1b[2J` or the xterm-extended `\x1b[3J`, which also
-/// erases scrollback), or a cursor move to the home position (`\x1b[H`,
-/// `\x1b[;H`, or the explicit `\x1b[1;1H`).
+/// erases scrollback), or an absolute cursor-position command (CUP/HVP,
+/// `\x1b[<row>;<col>H` or `\x1b[<row>;<col>f`, with either parameter and the
+/// separating `;` optional per the CUP grammar).
 ///
-/// Not every full-screen redraw clears with ED first: plenty of well-behaved
-/// TUIs avoid the flicker of a hard clear and instead move the cursor home
-/// and overwrite each line with an erase-to-end-of-line plus new content.
-/// Detecting only the ED form left that redraw shape with nothing to arm
-/// either hold below with — a redraw in this shape, split across more than
-/// one PTY read on a pane already stale since its last render, landed torn
-/// with no guard ever seeing it.
+/// Home (`\x1b[H`) used to be the only cursor-position form recognized here,
+/// on the theory that a redraw starts by returning to the top-left corner.
+/// It does not have to: a TUI with distinct screen regions (a transcript, a
+/// composer, a status line) redraws one of them by addressing whatever row
+/// it starts at, never touching row 1. That redraw is exactly as capable of
+/// landing split across more than one PTY read on a pane stale since its
+/// last render — reproduced live against a real attached client, where a
+/// `\x1b[5;1H` rewrite of a single line landed as a visibly torn frame with
+/// nothing here to arm either hold below with. Matching the general CUP
+/// grammar rather than one more literal row/col is what closes that class of
+/// gap instead of trading it for a narrower one.
 fn contains_full_screen_redraw_signal(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|window| window == b"\x1b[2J")
         || bytes.windows(4).any(|window| window == b"\x1b[3J")
-        || bytes.windows(3).any(|window| window == b"\x1b[H")
-        || bytes.windows(4).any(|window| window == b"\x1b[;H")
-        || bytes.windows(6).any(|window| window == b"\x1b[1;1H")
+        || contains_cursor_position_sequence(bytes)
+}
+
+/// Whether `bytes` contains a CSI cursor-position command (CUP `H` or HVP
+/// `f`): `ESC` `[` then any run of digits and `;` (covering no parameters,
+/// one, or both — `\x1b[H`, `\x1b[5H`, `\x1b[5;1H` all match), terminated by
+/// `H` or `f`.
+fn contains_cursor_position_sequence(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && matches!(bytes[j], b'H' | b'f') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn should_probe_host_terminal_theme_restore(core: &GhosttyPaneCore) -> bool {
@@ -5835,6 +5859,68 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_screen_redraw_addressed_off_the_home_row_on_a_stale_pane_still_engages_the_hold() {
+        // Regression coverage for the scroll-then-snap symptom surviving four
+        // prior fixes (#169, #172, #174, #175), all of them in this same hold
+        // machinery. Reproduced live against a real attached client under
+        // this lab's isolation contract (a workspace-focus race sending a
+        // `\x1b[5;1H` line rewrite to a pane stale since its last render):
+        // #175 taught this hold to recognize a cursor-*home* move as a redraw
+        // signal, on the theory that a redraw starts at the top-left corner.
+        // It does not have to — a TUI with distinct screen regions (a
+        // transcript, a composer, a status line) redraws one of them with an
+        // absolute cursor move to whatever row it starts at, never touching
+        // row 1. That move matched none of #175's literal home patterns, so
+        // this shape sailed straight past the hold and landed torn on a real
+        // attached client: the old line's content gone, the new line's first
+        // write visible, the rest of that write still pending.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_row(&pane, 20, 3, 2), "THREE");
+
+        // Simulate the pane sitting hidden/backgrounded for a while.
+        pane.age_render_state_last_refreshed_for_test(
+            HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD + Duration::from_millis(1),
+        );
+
+        // No `2J`/`3J`, no cursor-home — an absolute move to the bottom row
+        // only, then that line rewritten, split across two PTY reads exactly
+        // like the resize case.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[3;1HFRESH", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "a redraw addressed to a row other than home, on a pane stale since \
+             its last render, must engage the hold just as a home move would"
+        );
+        assert_eq!(
+            rendered_row(&pane, 20, 3, 2),
+            "THREE",
+            "the mid-screen cursor move alone must never be presented as a torn frame"
+        );
+
+        // ...then the rest of the redraw in a second read.
+        pane.process_pty_bytes(pane_id, 0, b"2", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "the hold must not be released early by the first chunk of a multi-write redraw"
+        );
+        assert_eq!(rendered_row(&pane, 20, 3, 2), "THREE");
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            rendered_row(&pane, 20, 3, 2),
+            "FRESH2",
+            "once the hold elapses the child's real, complete redraw must be drawn"
+        );
+    }
+
+    #[test]
     fn resize_recovery_watch_expires_without_a_clear_so_ordinary_resizes_are_never_held() {
         // The overwhelmingly common case — initial attach, a pane that simply
         // stays quiet after being resized — must never pay for a hold that
@@ -6051,6 +6137,11 @@ mod tests {
 
     /// Draws the pane the way the server does and returns its top row.
     fn rendered_top_row(pane: &GhosttyPaneTerminal, width: u16, height: u16) -> String {
+        rendered_row(pane, width, height, 0)
+    }
+
+    /// Draws the pane the way the server does and returns the given row.
+    fn rendered_row(pane: &GhosttyPaneTerminal, width: u16, height: u16, row: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -6058,7 +6149,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..width)
-            .map(|x| buffer[(x, 0)].symbol())
+            .map(|x| buffer[(x, row)].symbol())
             .collect::<String>()
             .trim_end()
             .to_string()
