@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use serde_json::Value;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
     unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
@@ -151,6 +152,21 @@ fn ping_socket(socket_path: &Path) -> String {
     response.trim().to_string()
 }
 
+/// Queries `session.snapshot` over the API socket and returns the parsed
+/// `result.snapshot` object.
+fn session_snapshot(socket_path: &Path) -> Value {
+    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+
+    let request = r#"{"id":"1","method":"session.snapshot","params":{}}"#;
+    writeln!(stream, "{}", request).unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let value: Value = serde_json::from_str(response.trim()).expect("valid JSON response");
+    value["result"]["snapshot"].clone()
+}
+
 /// Sends a Hello message over the client socket and reads the Welcome response.
 /// Uses bincode v2 wire format: [u32LE length][bincode payload]
 /// bincode v2 standard config uses VarintEncoding:
@@ -243,6 +259,27 @@ fn encode_varint_enum(variant_idx: u32, fields: &[&[u8]]) -> Vec<u8> {
         buf.extend_from_slice(field);
     }
     buf
+}
+
+/// Encode a `String`: length as varint + UTF-8 bytes.
+fn encode_varint_string(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut buf = encode_varint_u32(bytes.len() as u32);
+    buf.extend_from_slice(bytes);
+    buf
+}
+
+/// Encode an `Option<String>`: 1-byte discriminant (0=None, 1=Some), then the
+/// string when present.
+fn encode_option_string(value: Option<&str>) -> Vec<u8> {
+    match value {
+        None => vec![0u8],
+        Some(value) => {
+            let mut buf = vec![1u8];
+            buf.extend_from_slice(&encode_varint_string(value));
+            buf
+        }
+    }
 }
 
 /// Frame a message with u32LE length prefix.
@@ -737,6 +774,84 @@ fn no_hello_client_closed_within_five_seconds() {
     assert!(
         response.contains("pong"),
         "server should still respond to ping: {response}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+/// A Windows client's console input pipeline turns stdin into structured
+/// `ClientInputEvent`s with no arm for a raw host-terminal reply (see
+/// `crate::host_terminal_identity`), so it cannot report a Kitty Graphics
+/// capability confirmation or an XTVERSION identity by forwarding raw bytes
+/// through `ClientMessage::Input` the way a Unix client does. This is the one
+/// place its answer can travel instead — real wire bytes, over a real socket,
+/// against a real spawned server, exactly the shape `herdr --remote`'s bridge
+/// relays untouched (see `remote::bridge::run_remote_client_bridge`, a plain
+/// byte pump with no message-type awareness).
+#[test]
+fn windows_client_reports_host_terminal_probe_answers_over_the_wire() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
+    let (version, error) =
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none(), "handshake should not error: {error:?}");
+
+    let before = session_snapshot(&api_socket);
+    assert_eq!(
+        before["background_scene"]["kitty_graphics_capability_confirmed"], false,
+        "baseline before any probe answer: {before}"
+    );
+    assert_eq!(
+        before["background_scene"]["host_terminal"], "other",
+        "baseline before any probe answer: {before}"
+    );
+
+    // ClientMessage::KittyGraphicsCapabilityConfirmed is variant 11 (no fields).
+    let confirmed_payload = encode_varint_enum(11, &[]);
+    stream
+        .write_all(&frame_message(&confirmed_payload))
+        .unwrap();
+    stream.flush().unwrap();
+
+    // ClientMessage::HostTerminalIdentityReported { name, version } is variant 12.
+    let identity_payload = encode_varint_enum(
+        12,
+        &[
+            &encode_varint_string("Rio"),
+            &encode_option_string(Some("0.5.19")),
+        ],
+    );
+    stream.write_all(&frame_message(&identity_payload)).unwrap();
+    stream.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut after = session_snapshot(&api_socket);
+    while (after["background_scene"]["kitty_graphics_capability_confirmed"] != true
+        || after["background_scene"]["host_terminal"] != "rio")
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+        after = session_snapshot(&api_socket);
+    }
+
+    assert_eq!(
+        after["background_scene"]["kitty_graphics_capability_confirmed"], true,
+        "server should confirm Kitty Graphics capability from the dedicated wire message: {after}"
+    );
+    assert_eq!(
+        after["background_scene"]["host_terminal"], "rio",
+        "server should classify the terminal from the reported XTVERSION identity: {after}"
     );
 
     cleanup_spawned_herdr(spawned, base);

@@ -3203,6 +3203,26 @@ impl HeadlessServer {
                 };
                 client.take_deferred_render() != DeferredRender::None
             }
+            ServerEvent::ClientKittyGraphicsCapabilityConfirmed { client_id } => self
+                .handle_client_input_events(
+                    client_id,
+                    vec![crate::raw_input::RawInputEvent::KittyGraphicsCapability(
+                        true,
+                    )],
+                ),
+            ServerEvent::ClientHostTerminalIdentityReported {
+                client_id,
+                name,
+                version,
+            } => self.handle_client_input_events(
+                client_id,
+                vec![crate::raw_input::RawInputEvent::HostTerminalIdentity(
+                    crate::host_terminal_identity::HostTerminalIdentity::new(
+                        &name,
+                        version.as_deref(),
+                    ),
+                )],
+            ),
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
                 // No render needed — the next iteration will initiate shutdown.
@@ -9424,6 +9444,82 @@ next_tab = ""
 
         assert!(server.clients[&1].kitty_graphics_capability_confirmed);
         assert!(server.app.state.kitty_graphics_capability_confirmed);
+    }
+
+    /// The Windows-client equivalent of
+    /// `foreground_client_kitty_graphics_capability_response_confirms_server_state`:
+    /// a Windows client's console input pipeline cannot forward the raw reply
+    /// bytes `ClientInput` carries (see `client::input::windows_client_input_event_from_raw`),
+    /// so it reports the same fact through the dedicated
+    /// `ClientMessage::KittyGraphicsCapabilityConfirmed` message instead. Both
+    /// paths must land on the identical server-side confirmation.
+    #[tokio::test]
+    async fn windows_client_kitty_graphics_capability_confirmation_confirms_server_state() {
+        let mut server = test_headless_server();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        assert!(!server.app.state.kitty_graphics_capability_confirmed);
+
+        assert!(
+            server.handle_server_event(ServerEvent::ClientKittyGraphicsCapabilityConfirmed {
+                client_id: 1,
+            })
+        );
+
+        assert!(server.clients[&1].kitty_graphics_capability_confirmed);
+        assert!(server.app.state.kitty_graphics_capability_confirmed);
+    }
+
+    /// The Windows-client equivalent of an in-band XTVERSION reply: a Windows
+    /// client reports the already-parsed identity through
+    /// `ClientMessage::HostTerminalIdentityReported` since it cannot forward
+    /// the raw DCS reply bytes the way a Unix client's `ClientInput` does.
+    #[tokio::test]
+    async fn windows_client_host_terminal_identity_report_classifies_the_terminal() {
+        let mut server = test_headless_server();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        assert_eq!(
+            server.clients[&1].host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Other
+        );
+
+        assert!(
+            server.handle_server_event(ServerEvent::ClientHostTerminalIdentityReported {
+                client_id: 1,
+                name: "Rio".to_owned(),
+                version: Some("0.5.19".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            server.clients[&1].host_terminal_kind,
+            crate::kitty_graphics::HostTerminalKind::Rio
+        );
     }
 
     /// A wash the foreground client's terminal draws must still be refused

@@ -1085,6 +1085,22 @@ enum ClientLoopEvent {
     /// the same reply straight out of the byte stream it is already parsing.
     #[cfg(windows)]
     HostCellSizeReported { width_px: u32, height_px: u32 },
+    /// The host terminal answered the Kitty Graphics Protocol capability
+    /// probe, on platforms whose stdin path hands the loop semantic events
+    /// rather than raw bytes. The Unix arm reports this over the wire by
+    /// forwarding the raw reply bytes through `ClientMessage::Input`; this
+    /// platform has no raw bytes to forward, so it is reported explicitly
+    /// via `ClientMessage::KittyGraphicsCapabilityConfirmed` instead.
+    #[cfg(windows)]
+    KittyGraphicsCapabilityConfirmed,
+    /// The host terminal named itself in band, answering XTVERSION. The same
+    /// bargain as `KittyGraphicsCapabilityConfirmed`: reported explicitly via
+    /// `ClientMessage::HostTerminalIdentityReported` rather than as raw bytes.
+    #[cfg(windows)]
+    HostTerminalIdentityReported {
+        name: String,
+        version: Option<String>,
+    },
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received.
@@ -1651,9 +1667,7 @@ async fn run_client_loop(
 
     if state.attach_escape.is_none() && state.kitty_graphics_enabled {
         query_kitty_graphics_capability();
-        if should_query_host_terminal_version() {
-            query_host_terminal_version();
-        }
+        query_host_terminal_version();
     }
 
     // Spawn the resize poller thread.
@@ -1830,6 +1844,20 @@ async fn run_client_loop(
                 // strikes above: the server learns the cell through the resize
                 // path, so there is exactly one way for it to learn it.
                 store_reported_cell_size(&reported_cell_size, width_px, height_px);
+            }
+            #[cfg(windows)]
+            ClientLoopEvent::KittyGraphicsCapabilityConfirmed => {
+                let msg = ClientMessage::KittyGraphicsCapabilityConfirmed;
+                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                    return Err(ClientError::ConnectionLost(e));
+                }
+            }
+            #[cfg(windows)]
+            ClientLoopEvent::HostTerminalIdentityReported { name, version } => {
+                let msg = ClientMessage::HostTerminalIdentityReported { name, version };
+                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                    return Err(ClientError::ConnectionLost(e));
+                }
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -2872,20 +2900,6 @@ fn query_host_terminal_version() {
     let _ = write_host_terminal_version_query(io::stdout());
 }
 
-/// Asked on the same round trip as the Kitty capability probe beside it, and
-/// under the same conditions, because it answers the same class of question —
-/// what may be drawn on this screen — and because the reply framing both rely
-/// on is already armed at this moment by the color query.
-///
-/// Windows is excluded for the reason `should_query_host_terminal_theme` is:
-/// the Windows client parses its own stdin into `ClientInputEvent`s, which
-/// have no arm for a host reply, so an answer would be discarded before it
-/// could reach the server. Asking a question whose answer cannot be delivered
-/// is just noise on the wire.
-fn should_query_host_terminal_version() -> bool {
-    !cfg!(windows)
-}
-
 fn write_host_terminal_version_query(mut writer: impl io::Write) -> io::Result<()> {
     writer.write_all(
         crate::host_terminal_identity::HOST_TERMINAL_VERSION_QUERY_SEQUENCE.as_bytes(),
@@ -3326,11 +3340,6 @@ mod tests {
         write_host_terminal_version_query(&mut output).unwrap();
 
         assert_eq!(output, b"\x1b[>q");
-    }
-
-    #[test]
-    fn host_terminal_version_query_is_disabled_on_windows() {
-        assert_eq!(should_query_host_terminal_version(), !cfg!(windows));
     }
 
     /// The bug this guards: `wants_client_rasterized_cards`/`_signal_tray`/`_background_scene`

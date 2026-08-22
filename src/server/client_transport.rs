@@ -449,6 +449,19 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
+    /// A client's terminal confirmed Kitty Graphics Protocol support
+    /// in band, reported through `ClientMessage::KittyGraphicsCapabilityConfirmed`
+    /// because that client's platform has no way to forward the raw reply
+    /// bytes a Unix client's `ClientInput` already carries.
+    ClientKittyGraphicsCapabilityConfirmed { client_id: u64 },
+    /// A client's terminal named itself in band via XTVERSION, reported
+    /// through `ClientMessage::HostTerminalIdentityReported` for the same
+    /// reason as `ClientKittyGraphicsCapabilityConfirmed`.
+    ClientHostTerminalIdentityReported {
+        client_id: u64,
+        name: String,
+        version: Option<String>,
+    },
     /// Ctrl+C or external shutdown signal received.
     QuitSignal,
 }
@@ -975,6 +988,16 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::KittyGraphicsCapabilityConfirmed => {
+                ServerEvent::ClientKittyGraphicsCapabilityConfirmed { client_id }
+            }
+            ClientMessage::HostTerminalIdentityReported { name, version } => {
+                ServerEvent::ClientHostTerminalIdentityReported {
+                    client_id,
+                    name,
+                    version,
+                }
+            }
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;

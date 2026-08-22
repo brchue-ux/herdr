@@ -375,6 +375,16 @@ fn send_windows_raw_events(
             return false;
         }
     }
+    if kitty_graphics_capability_from_raw_events(&events)
+        && !send_windows_kitty_graphics_capability_confirmed(event_tx)
+    {
+        return false;
+    }
+    if let Some(identity) = host_terminal_identity_from_raw_events(&events) {
+        if !send_windows_host_terminal_identity(identity, event_tx) {
+            return false;
+        }
+    }
     let events = events
         .into_iter()
         .filter_map(windows_client_input_event_from_raw)
@@ -428,6 +438,56 @@ fn send_windows_host_cell_size(
         .is_ok()
 }
 
+/// Whether the host terminal's own answer to the Kitty Graphics Protocol
+/// capability probe is in this batch. Same reasoning as
+/// [`host_cell_size_from_raw_events`]: read here, on the side of the boundary
+/// where the raw event still exists, because `windows_client_input_event_from_raw`
+/// only ever produces app input and this is not that.
+#[cfg(any(windows, test))]
+fn kitty_graphics_capability_from_raw_events(events: &[crate::raw_input::RawInputEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            crate::raw_input::RawInputEvent::KittyGraphicsCapability(true)
+        )
+    })
+}
+
+#[cfg(windows)]
+fn send_windows_kitty_graphics_capability_confirmed(
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    event_tx
+        .blocking_send(ClientLoopEvent::KittyGraphicsCapabilityConfirmed)
+        .is_ok()
+}
+
+/// The host terminal's own answer to XTVERSION, if one is in this batch. Same
+/// reasoning as [`host_cell_size_from_raw_events`].
+#[cfg(any(windows, test))]
+fn host_terminal_identity_from_raw_events(
+    events: &[crate::raw_input::RawInputEvent],
+) -> Option<(String, Option<String>)> {
+    events.iter().rev().find_map(|event| match event {
+        crate::raw_input::RawInputEvent::HostTerminalIdentity(identity) => Some((
+            identity.name().to_owned(),
+            identity.version().map(str::to_owned),
+        )),
+        _ => None,
+    })
+}
+
+#[cfg(windows)]
+fn send_windows_host_terminal_identity(
+    identity: (String, Option<String>),
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    let (name, version) = identity;
+    event_tx
+        .blocking_send(ClientLoopEvent::HostTerminalIdentityReported { name, version })
+        .is_ok()
+}
+
 #[cfg(any(windows, test))]
 fn windows_client_input_event_from_raw(
     event: crate::raw_input::RawInputEvent,
@@ -478,13 +538,15 @@ fn windows_client_input_event_from_raw(
         crate::raw_input::RawInputEvent::HostDefaultColor { .. }
         | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
         | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
-        // Answered to the client, not to the app: it reaches the server as the
-        // cell size on the next resize rather than as an input event.
+        // Answered to the client, not to the app: each already reached the
+        // server before this filter ran — the cell size on the next resize,
+        // and the capability/identity replies explicitly via
+        // `kitty_graphics_capability_from_raw_events` /
+        // `host_terminal_identity_from_raw_events` above, over
+        // `ClientMessage::KittyGraphicsCapabilityConfirmed` /
+        // `HostTerminalIdentityReported` — never as an input event.
         | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
         | crate::raw_input::RawInputEvent::KittyGraphicsCapability(_)
-        // Never produced on this path: the Windows client is not asked to send
-        // the XTVERSION query, precisely because there is no arm here to carry
-        // an answer back. See `client::should_query_host_terminal_version`.
         | crate::raw_input::RawInputEvent::HostTerminalIdentity(_)
         | crate::raw_input::RawInputEvent::Unsupported => None,
     }
@@ -834,6 +896,56 @@ mod windows_tests {
     #[test]
     fn a_host_cell_size_reply_is_not_a_client_input_event() {
         let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[6;21;11t");
+        assert!(!events.is_empty(), "the reply parsed to nothing at all");
+        assert!(events
+            .into_iter()
+            .all(|event| windows_client_input_event_from_raw(event).is_none()));
+    }
+
+    /// The bug this guards: the Kitty capability query is sent unconditionally
+    /// on every platform (`client::query_kitty_graphics_capability` has no
+    /// platform gate), but until this extraction existed its reply had no way
+    /// off the Windows input path at all — the fix in
+    /// `send_windows_raw_events` / `WindowsInputPump::process_raw_events`
+    /// reads it here, the same way `host_cell_size_from_raw_events` already
+    /// does for the cell size reply.
+    #[test]
+    fn kitty_graphics_capability_is_read_out_of_raw_events_before_they_become_input() {
+        let none = crate::raw_input::parse_raw_input_bytes_sync(b"hello");
+        assert!(!kitty_graphics_capability_from_raw_events(&none));
+
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b_Gi=1;OK\x1b\\");
+        assert!(kitty_graphics_capability_from_raw_events(&events));
+    }
+
+    /// A capability reply is never handed to the app as a keystroke.
+    #[test]
+    fn a_kitty_graphics_capability_reply_is_not_a_client_input_event() {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b_Gi=1;OK\x1b\\");
+        assert!(!events.is_empty(), "the reply parsed to nothing at all");
+        assert!(events
+            .into_iter()
+            .all(|event| windows_client_input_event_from_raw(event).is_none()));
+    }
+
+    /// Same guard as `kitty_graphics_capability_is_read_out_of_raw_events_before_they_become_input`,
+    /// for the XTVERSION reply.
+    #[test]
+    fn host_terminal_identity_is_read_out_of_raw_events_before_they_become_input() {
+        let none = crate::raw_input::parse_raw_input_bytes_sync(b"hello");
+        assert_eq!(host_terminal_identity_from_raw_events(&none), None);
+
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1bP>|Rio 0.5.19\x1b\\");
+        assert_eq!(
+            host_terminal_identity_from_raw_events(&events),
+            Some(("Rio".to_owned(), Some("0.5.19".to_owned())))
+        );
+    }
+
+    /// An identity reply is never handed to the app as a keystroke.
+    #[test]
+    fn a_host_terminal_identity_reply_is_not_a_client_input_event() {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1bP>|Rio 0.5.19\x1b\\");
         assert!(!events.is_empty(), "the reply parsed to nothing at all");
         assert!(events
             .into_iter()
