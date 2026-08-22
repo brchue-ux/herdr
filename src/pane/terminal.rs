@@ -2654,6 +2654,21 @@ fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderState
     {
         return RenderStateRefresh::Held;
     }
+    // `resize_recovery_started_at` is only ever set, never cleared, by the two
+    // sites that arm it (an actual resize's own redraw, or a redraw signal on
+    // a pane stale since its last render — see `process_pty_bytes`). Left
+    // alone it stays `Some` for the rest of the pane's life the first time
+    // either arms it, which permanently blocks the *hidden-pane* site from
+    // arming again: it only sets `resize_recovery_started_at` when the field
+    // `is_none()`. A pane that is backgrounded and refocused more than once —
+    // the overwhelmingly common case for a long-lived agent pane — got the
+    // hold's protection on the first idle-to-focus transition only; every
+    // later one raced with no guard at all. Reaching this point means neither
+    // hold above is currently active, so any earlier engagement has already
+    // fully resolved (its content was already presented) — clearing it here
+    // is what lets the hidden-pane site arm again the next time this pane
+    // goes idle.
+    core.resize_recovery_started_at = None;
     let GhosttyPaneCore {
         terminal,
         render_state,
@@ -5768,6 +5783,92 @@ mod tests {
             rendered_top_row(&pane, 20, 3),
             "FRESH",
             "once the hold elapses the child's real, complete redraw must be drawn"
+        );
+    }
+
+    #[test]
+    fn a_second_hidden_redraw_on_the_same_pane_still_engages_the_hold() {
+        // Regression coverage for the scroll-then-snap symptom recurring after
+        // #169/#172/#174/#175/#177 had each closed a narrower gap in what
+        // counts as a redraw signal worth holding for. All five lived in
+        // *detecting* the redraw; none touched how many times the detector
+        // could actually arm per pane.
+        //
+        // `resize_recovery_started_at` is set by two sites (an actual
+        // resize's own redraw, and a redraw signal on a pane stale since its
+        // last render — see `process_pty_bytes`) but was never cleared
+        // anywhere. The hidden-pane site only arms when the field
+        // `is_none()`, so the first idle-to-focus transition that ever
+        // engaged it left it permanently `Some` — every later hidden-pane
+        // redraw on that same pane raced with no guard at all, because the
+        // gate that was supposed to arm it read as already-armed forever.
+        // A long-lived agent pane that gets backgrounded and refocused
+        // repeatedly over a session — the ordinary case, not an edge case —
+        // was protected on the very first such transition and unprotected on
+        // every one after that.
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 3, 10_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049hONE\r\nTWO\r\nTHREE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "ONE");
+
+        // First hidden -> redraw cycle: goes idle, comes back to a split
+        // redraw, the hold engages and releases once the redraw completes —
+        // exactly `a_multi_write_redraw_on_a_pane_stale_since_its_last_render_engages_the_hold`
+        // above.
+        pane.age_render_state_last_refreshed_for_test(
+            HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD + Duration::from_millis(1),
+        );
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "first cycle: a clear on a pane stale since its last render must engage the hold"
+        );
+        pane.process_pty_bytes(pane_id, 0, b"FRESH", &tx);
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(rendered_top_row(&pane, 20, 3), "FRESH");
+
+        // The pane is presented normally for a while — an ordinary render
+        // reading the now-settled live grid, the way a visible/foreground
+        // pane is read continuously.
+        assert_eq!(rendered_top_row(&pane, 20, 3), "FRESH");
+
+        // It goes idle again and comes back to a second split redraw, later
+        // in the same pane's life — the ordinary "switch away, switch back"
+        // cycle repeated.
+        pane.age_render_state_last_refreshed_for_test(
+            HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD + Duration::from_millis(1),
+        );
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[H", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "second cycle: a clear on a pane stale since its last render must engage the hold \
+             again, not just the first time this pane ever went through this"
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FRESH",
+            "second cycle: the clear alone must never be presented as a blank/torn frame"
+        );
+
+        pane.process_pty_bytes(pane_id, 0, b"SECOND", &tx);
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "FRESH",
+            "second cycle: the hold must not be released early by the first chunk of the redraw"
+        );
+
+        pane.age_resize_recovery_hold_for_test(
+            RESIZE_RECOVERY_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "SECOND",
+            "second cycle: once the hold elapses the child's real, complete redraw must be drawn"
         );
     }
 
