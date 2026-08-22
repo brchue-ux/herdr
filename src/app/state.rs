@@ -2369,6 +2369,13 @@ pub struct AppState {
     /// be sent them. See `every_app_viewer_rasterizes_sidebar_cards`.
     /// Recomputed from the attached clients every pass, never persisted.
     pub(crate) sidebar_card_graphics_client_rasterized: bool,
+    /// The background-scene twin of [`Self::sidebar_card_graphics_client_rasterized`]: true when
+    /// every attached full-app viewer draws the whole-terminal ambient scene and its effects
+    /// overlay itself from a `ServerMessage::BackgroundScene`, so this pass need not bake the
+    /// ambient loop or rasterise the effects overlay to pixels at all — see
+    /// `every_app_viewer_rasterizes_background_scene`. Recomputed from the attached clients every
+    /// pass, never persisted.
+    pub(crate) background_scene_client_rasterized: bool,
     /// The sidebar's ambient particle-field wash, its loop frames included via
     /// [`GraphicsLayer::animation`]. `None` when disabled, not yet generated, or the sidebar
     /// column has no area.
@@ -2442,6 +2449,12 @@ pub struct AppState {
     /// steady-state cost is exactly the ambient loop's (zero, once armed) whenever nothing is
     /// happening.
     pub(crate) background_effects_layer: Option<GraphicsLayer>,
+    /// The resolved `SceneEffects` the layer above was rasterised from this pass, kept alongside
+    /// it so a client that rasterises the background scene itself can be handed the same already-
+    /// resolved facts as a `BackgroundScene` message instead of a second, server-side computation
+    /// of them — mirrors why `background_scene_layout` is kept beside `background_scene`. `None`
+    /// exactly when `background_effects_layer` is: nothing currently live.
+    pub(crate) background_scene_effects: Option<crate::solar_system::SceneEffects>,
     /// Every in-flight asteroid, fading crater and travelling comet, plus the transition markers
     /// that stop a durable token from re-firing its comet on every tick it stays published. See
     /// [`crate::app::background_scene::BackgroundEffectsState`].
@@ -3747,6 +3760,7 @@ impl AppState {
             signal_tray_published: PublishedSurfaceRaster::default(),
             signal_tray_graphics_client_rasterized: false,
             sidebar_card_graphics_client_rasterized: false,
+            background_scene_client_rasterized: false,
             sidebar_particle_field: None,
             sidebar_particle_field_key: 0,
             background_scene: None,
@@ -3763,6 +3777,7 @@ impl AppState {
             background_scene_identity: Vec::new(),
             background_scene_generated_at: None,
             background_effects_layer: None,
+            background_scene_effects: None,
             background_effects: crate::app::background_scene::BackgroundEffectsState::default(),
             background_legibility: None,
             pane_graphics_layers: std::collections::HashMap::new(),

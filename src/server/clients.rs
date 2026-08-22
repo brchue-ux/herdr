@@ -77,6 +77,10 @@ pub(crate) struct ClientConnection {
     /// server-embedded signal-tray badge pixels. Set once from the client's
     /// Hello and never changes for the lifetime of the connection.
     pub(crate) wants_client_rasterized_signal_tray: bool,
+    /// Whether this client requested `ServerMessage::BackgroundScene` instead
+    /// of server-embedded ambient background scene pixels. Set once from the
+    /// client's Hello and never changes for the lifetime of the connection.
+    pub(crate) wants_client_rasterized_background_scene: bool,
     /// Stateful parser for app-client input split across transport reads.
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
@@ -172,6 +176,7 @@ impl ClientConnection {
             kitty_graphics_capability_confirmed: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
@@ -327,6 +332,7 @@ impl ClientConnection {
         crate::kitty_graphics::EmbeddedSurfaces {
             cards: !self.wants_client_rasterized_cards,
             signal_tray: !self.wants_client_rasterized_signal_tray,
+            background_scene: !self.wants_client_rasterized_background_scene,
         }
     }
 

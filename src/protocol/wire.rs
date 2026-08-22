@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -402,6 +402,18 @@ pub enum ClientMessage {
         /// able to reproduce one and not the other.
         #[serde(default)]
         wants_client_rasterized_signal_tray: bool,
+        /// Whether the client wants to rasterise the whole-terminal ambient
+        /// background scene itself from a `ServerMessage::BackgroundScene`
+        /// rather than receive server-embedded scene pixels in
+        /// `Terminal`/`Graphics` frames.
+        ///
+        /// Its own flag for the same reason `wants_client_rasterized_signal_tray`
+        /// is its own flag rather than a second meaning for
+        /// `wants_client_rasterized_cards`: three different surfaces, drawn by
+        /// three different code paths, any of which a client may or may not be
+        /// able to reproduce.
+        #[serde(default)]
+        wants_client_rasterized_background_scene: bool,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -821,6 +833,21 @@ pub enum ServerMessage {
         /// reply to a superseded request can be told apart from a live one.
         request_id: u64,
     },
+
+    /// Opaque, bincode-encoded whole-terminal ambient background scene for
+    /// clients that requested `wants_client_rasterized_background_scene`. The
+    /// client decodes this with
+    /// `crate::app::background_scene::BackgroundScene` and rasterises the
+    /// ambient loop and its live effects overlay locally rather than
+    /// receiving server-embedded scene pixels.
+    ///
+    /// Appended after `RequestClipboardText` for the same reason
+    /// `RequestClipboardText` was appended after `TrayScene` — a variant added
+    /// anywhere else shifts the wire tag of everything declared below it.
+    BackgroundScene {
+        /// Bincode-encoded `crate::app::background_scene::BackgroundScene`.
+        bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1140,7 @@ mod tests {
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1153,6 +1181,7 @@ mod tests {
                 host_terminal: HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
                 wants_client_rasterized_signal_tray: false,
+                wants_client_rasterized_background_scene: false,
             }),
             0
         );
@@ -1717,6 +1746,7 @@ mod tests {
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1794,6 +1824,7 @@ mod tests {
                     host_terminal: HostTerminalReport::default(),
                     wants_client_rasterized_cards: false,
                     wants_client_rasterized_signal_tray: false,
+                    wants_client_rasterized_background_scene: false,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2233,6 +2264,7 @@ mod tests {
             host_terminal: HostTerminalReport::default(),
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2272,6 +2304,7 @@ mod tests {
                 host_terminal: HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
                 wants_client_rasterized_signal_tray: false,
+                wants_client_rasterized_background_scene: false,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

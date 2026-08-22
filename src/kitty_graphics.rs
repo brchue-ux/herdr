@@ -264,15 +264,20 @@ pub(crate) struct EmbeddedSurfaces {
     pub(crate) cards: bool,
     /// `HostSurfaceId::SignalTray` — the notification tray's badge artwork.
     pub(crate) signal_tray: bool,
+    /// `HostSurfaceId::BackgroundScene` and `HostSurfaceId::BackgroundEffects`
+    /// together — the whole-terminal ambient scene draws and clears as one
+    /// unit for a client that rasterises it itself, so one flag covers both.
+    pub(crate) background_scene: bool,
 }
 
 impl EmbeddedSurfaces {
     /// Everything embedded: what a client that rasterises nothing itself gets,
-    /// which is every client before either scene message existed and still the
+    /// which is every client before any scene message existed and still the
     /// overwhelming majority of them.
     pub(crate) const ALL: Self = Self {
         cards: true,
         signal_tray: true,
+        background_scene: true,
     };
 }
 
@@ -862,6 +867,59 @@ pub(crate) fn encode_card_scene_graphics(
             )
         })
         .collect();
+
+    let mut bytes = Vec::new();
+    encode_graphics_update(
+        &mut bytes,
+        &placements,
+        false,
+        &mut cache.images,
+        &mut cache.placements,
+        &mut cache.sources,
+    );
+    bytes
+}
+
+/// Encodes a client-rasterised background scene into Kitty graphics protocol
+/// bytes, exactly as the server would encode it under
+/// `HostSurfaceId::BackgroundScene`/`HostSurfaceId::BackgroundEffects`, for a
+/// client that decoded a `ServerMessage::BackgroundScene` and rasterised it
+/// locally with `crate::app::background_scene::rasterise_background_scene`.
+///
+/// `grid` is the whole-terminal cell rect. Unlike the card and tray scenes,
+/// this is two surfaces sharing one `cache`: they always arrive and are
+/// re-encoded together from the same wire message, so — unlike cards and
+/// tray, which are two independent, uncoordinated message streams — there is
+/// no call ordering that could make one delete the other. `effects` is `None`
+/// exactly when nothing is live, which correctly deletes a previously-drawn
+/// effects image when the last asteroid/comet fades: it is simply absent from
+/// this pass's placements, and `encode_graphics_update` deletes the images of
+/// every layer source missing from the pass it is given.
+pub(crate) fn encode_background_scene_graphics(
+    grid: Rect,
+    ambient: &crate::app::state::GraphicsLayer,
+    effects: Option<&crate::app::state::GraphicsLayer>,
+    cell_size: HostCellSize,
+    cache: &mut HostGraphicsCache,
+) -> Vec<u8> {
+    let mut placements = vec![layer_host_placement(
+        HostSurfaceId::BackgroundScene,
+        grid,
+        cell_size,
+        ambient,
+        &cache.images,
+        true,
+    )];
+    if let Some(effects) = effects {
+        placements.push(layer_host_placement(
+            HostSurfaceId::BackgroundEffects,
+            grid,
+            cell_size,
+            effects,
+            &cache.images,
+            true,
+        ));
+    }
 
     let mut bytes = Vec::new();
     encode_graphics_update(
@@ -1526,11 +1584,13 @@ fn surface_layer_placement_targets(
         .chain(
             app.background_scene
                 .as_ref()
+                .filter(|_| embedded.background_scene)
                 .map(|layer| (HostSurfaceId::BackgroundScene, app.screen_rect(), layer)),
         )
         .chain(
             app.background_effects_layer
                 .as_ref()
+                .filter(|_| embedded.background_scene)
                 .map(|layer| (HostSurfaceId::BackgroundEffects, app.screen_rect(), layer)),
         )
         .chain(app.machine_corner_layer.as_ref().map(|layer| {
@@ -2874,6 +2934,98 @@ mod tests {
         .is_empty());
     }
 
+    /// The background-scene twin of the tray test above: the same check that a move to
+    /// client-side rasterisation is byte-identical at the wire, not merely close at the pixels —
+    /// a difference in image id, placement id, `c=`/`r=`/`z=` would still land the ambient loop in
+    /// the wrong place even with the right bytes inside it.
+    #[test]
+    fn a_client_rasterised_background_scene_emits_the_bytes_the_server_would_have_embedded() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.sidebar_rect = Rect::new(0, 0, 40, 30);
+        app.view.terminal_area = Rect::new(40, 0, 80, 30);
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+
+        let cell = test_cell_size();
+        let screen = app.screen_rect();
+        let (nodes, _identity) = crate::app::background_scene::tree_nodes(&app);
+        let width = u32::from(screen.width) * cell.width_px;
+        let height = u32::from(screen.height) * cell.height_px;
+        let layout = crate::solar_system::build_layout(&nodes, width, height);
+        assert!(!layout.is_empty(), "a real workspace must seat a body");
+        let phase = 0.42;
+        let ambient_rgba = crate::solar_system::frame(&layout, phase);
+
+        let png_layer = |rgba: &[u8]| {
+            crate::app::state::GraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Png,
+                width,
+                height,
+                encode_layer_pixels(
+                    crate::api::schema::PaneGraphicsFormat::Png,
+                    width,
+                    height,
+                    rgba,
+                )
+                .expect("encode ambient png"),
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                    z: -2,
+                },
+            )
+        };
+
+        // The server's side: the ambient loop as `App::adopt_baked_background_scene` would
+        // install it, with every other surface absent so what comes out is the background scene
+        // and nothing else.
+        app.background_scene = Some(png_layer(&ambient_rgba));
+        let mut server_cache = HostGraphicsCache::default();
+        let embedded = encode_local_pane_graphics(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            empty_surface(),
+            cell,
+            &mut server_cache,
+            EmbeddedSurfaces::ALL,
+            None,
+        );
+        assert!(
+            !embedded.is_empty(),
+            "the server embedded no background scene graphics to compare against"
+        );
+
+        // The client's side: the same scene as a `BackgroundScene`, over the wire and back.
+        let scene = crate::app::background_scene::build_background_scene(
+            &layout,
+            &crate::solar_system::SceneEffects::default(),
+            phase,
+        );
+        let bytes = crate::app::background_scene::encode_background_scene(&scene).expect("encode");
+        let decoded =
+            crate::app::background_scene::decode_background_scene(&bytes).expect("decode");
+        let (ambient_out, effects_out) =
+            crate::app::background_scene::rasterise_background_scene(&decoded);
+        assert!(effects_out.is_none(), "no effects were live");
+
+        let mut client_cache = HostGraphicsCache::default();
+        let drawn = encode_background_scene_graphics(
+            screen,
+            &png_layer(&ambient_out),
+            None,
+            cell,
+            &mut client_cache,
+        );
+
+        assert_eq!(
+            embedded, drawn,
+            "the client's background scene reached the terminal differently from the server's"
+        );
+    }
+
     /// Every sidebar surface reaches the terminal at exactly one image pixel
     /// per terminal pixel.
     ///
@@ -3034,6 +3186,50 @@ mod tests {
         assert!(
             withheld.contains(&HostSurfaceId::Sidebar),
             "withholding the tray took a client's own sidebar image with it"
+        );
+    }
+
+    /// The background-scene twin of the tray test above: one flag withholds both the ambient
+    /// loop and its effects overlay together, since they always arrive and are re-encoded
+    /// together from the same `BackgroundScene` message.
+    #[test]
+    fn the_background_scene_and_its_effects_are_withheld_together() {
+        let mut app = app_with_sidebar(
+            Rect::new(0, 0, 26, 40),
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        );
+        app.background_scene = Some(sidebar_layer(
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        ));
+        app.background_effects_layer = Some(sidebar_layer(
+            crate::api::schema::PaneGraphicsPlacementParams::default(),
+        ));
+
+        let surfaces = |embedded| {
+            surface_layer_placement_targets(&app, embedded)
+                .map(|(surface, _, _)| surface)
+                .collect::<Vec<_>>()
+        };
+
+        let all = surfaces(EmbeddedSurfaces::ALL);
+        assert!(
+            all.contains(&HostSurfaceId::BackgroundScene)
+                && all.contains(&HostSurfaceId::BackgroundEffects),
+            "a client that rasterises nothing itself must still be sent both background layers"
+        );
+
+        let withheld = surfaces(EmbeddedSurfaces {
+            background_scene: false,
+            ..EmbeddedSurfaces::ALL
+        });
+        assert!(
+            !withheld.contains(&HostSurfaceId::BackgroundScene)
+                && !withheld.contains(&HostSurfaceId::BackgroundEffects),
+            "the background scene's pixels were embedded for a client already drawing them"
+        );
+        assert!(
+            withheld.contains(&HostSurfaceId::Sidebar),
+            "withholding the background scene took a client's own sidebar image with it"
         );
     }
 
