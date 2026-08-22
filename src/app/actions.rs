@@ -2713,44 +2713,72 @@ impl AppState {
                 continue;
             };
 
-            if self.workspaces[ws_idx]
+            // The diff pane's own target (the focused pane's worker) can be a
+            // different cwd than this Space's sidebar identity (its first
+            // tab's root pane) — see `Workspace::focused_pane_cwd_from`. Each
+            // is gated against its own freshly-recomputed source of truth so
+            // a result computed for one never gets applied under the other's
+            // name if the two have since diverged (focus moved, a pane's own
+            // cwd changed) while the refresh was in flight.
+            let is_identity_result = self.workspaces[ws_idx]
                 .resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
                 .as_ref()
-                != Some(&result.resolved_identity_cwd)
-            {
-                continue;
+                == Some(&result.resolved_identity_cwd);
+            let is_diff_result = result.demand.diff
+                && self.workspaces[ws_idx]
+                    .focused_pane_cwd_from(&self.terminals, terminal_runtimes)
+                    .as_ref()
+                    == Some(&result.resolved_identity_cwd);
+
+            let demand = result.demand;
+            let WorkspaceGitStatus {
+                resolved_identity_cwd,
+                auto_label,
+                status_cache_key,
+                branch,
+                ahead_behind,
+                dirty,
+                diff,
+                space,
+                ..
+            } = result;
+
+            if is_identity_result {
+                let ws = &mut self.workspaces[ws_idx];
+                if ws.cached_identity_cwd != resolved_identity_cwd {
+                    ws.cached_identity_cwd = resolved_identity_cwd;
+                }
+                if ws.cached_auto_label != auto_label {
+                    ws.cached_auto_label = auto_label;
+                    changed |= ws.custom_name.is_none();
+                }
+                if ws.cached_git_status_key != status_cache_key {
+                    ws.cached_git_status_key = status_cache_key;
+                }
+                if demand.branch && ws.cached_git_branch != branch {
+                    ws.cached_git_branch = branch;
+                    changed = true;
+                }
+                if demand.ahead_behind && ws.cached_git_ahead_behind != ahead_behind {
+                    ws.cached_git_ahead_behind = ahead_behind;
+                    changed = true;
+                }
+                if demand.dirty && ws.cached_git_dirty != dirty {
+                    ws.cached_git_dirty = dirty;
+                    changed = true;
+                }
+                if ws.cached_git_space != space {
+                    ws.cached_git_space = space;
+                    changed = true;
+                }
             }
 
-            let ws = &mut self.workspaces[ws_idx];
-            if ws.cached_identity_cwd != result.resolved_identity_cwd {
-                ws.cached_identity_cwd = result.resolved_identity_cwd;
-            }
-            if ws.cached_auto_label != result.auto_label {
-                ws.cached_auto_label = result.auto_label;
-                changed |= ws.custom_name.is_none();
-            }
-            if ws.cached_git_status_key != result.status_cache_key {
-                ws.cached_git_status_key = result.status_cache_key;
-            }
-            if result.demand.branch && ws.cached_git_branch != result.branch {
-                ws.cached_git_branch = result.branch;
-                changed = true;
-            }
-            if result.demand.ahead_behind && ws.cached_git_ahead_behind != result.ahead_behind {
-                ws.cached_git_ahead_behind = result.ahead_behind;
-                changed = true;
-            }
-            if result.demand.dirty && ws.cached_git_dirty != result.dirty {
-                ws.cached_git_dirty = result.dirty;
-                changed = true;
-            }
-            if result.demand.diff && ws.cached_git_diff != result.diff {
-                ws.cached_git_diff = result.diff;
-                changed = true;
-            }
-            if ws.cached_git_space != result.space {
-                ws.cached_git_space = result.space;
-                changed = true;
+            if is_diff_result {
+                let ws = &mut self.workspaces[ws_idx];
+                if ws.cached_git_diff != diff {
+                    ws.cached_git_diff = diff;
+                    changed = true;
+                }
             }
         }
         changed
@@ -4484,6 +4512,91 @@ mod tests {
             }],
         );
         assert!(changed);
+        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
+    }
+
+    /// The diff pane's own gate follows the focused pane's cwd
+    /// (`Workspace::focused_pane_cwd_from`), independent of the Space's own
+    /// sidebar identity cwd (its first tab's root pane) — see
+    /// `App::diff_pane_target`.
+    #[test]
+    fn apply_workspace_git_statuses_gates_diff_by_the_focused_panes_cwd_not_the_spaces_identity() {
+        let mut state = app_with_workspaces(&["one"]);
+        let workspace_id = state.workspaces[0].id.clone();
+        let space_identity_cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
+
+        let second_tab_idx = state.workspaces[0].test_add_tab(Some("second worker"));
+        let second_root_pane = state.workspaces[0].tabs[second_tab_idx].root_pane;
+        let second_terminal_id = state.workspaces[0].tabs[second_tab_idx]
+            .terminal_id(second_root_pane)
+            .unwrap()
+            .clone();
+        let worker_cwd = std::path::PathBuf::from("/repo/second-worker");
+        state.terminals.insert(
+            second_terminal_id.clone(),
+            crate::terminal::TerminalState::new(second_terminal_id, worker_cwd.clone()),
+        );
+        state.workspaces[0].active_tab = second_tab_idx;
+        assert_ne!(worker_cwd, space_identity_cwd);
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let diff_text = crate::workspace::GitDiffText {
+            lines: vec![crate::workspace::GitDiffLine {
+                kind: crate::workspace::GitDiffLineKind::Added,
+                text: "+worker change".into(),
+            }],
+            truncated: false,
+        };
+
+        // A diff computed for the focused worker's own cwd applies, even
+        // though it differs from the Space's own sidebar identity cwd.
+        let changed = state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id: workspace_id.clone(),
+                resolved_identity_cwd: worker_cwd.clone(),
+                status_cache_key: worker_cwd.clone(),
+                demand: crate::workspace::GitStatusRefreshDemand {
+                    branch: false,
+                    ahead_behind: false,
+                    dirty: false,
+                    diff: true,
+                },
+                auto_label: "one".into(),
+                branch: None,
+                ahead_behind: None,
+                dirty: None,
+                diff: Some(diff_text.clone()),
+                space: None,
+            }],
+        );
+        assert!(changed);
+        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
+
+        // A stale diff result computed against a cwd that is no longer the
+        // focused pane (e.g. focus moved back while the refresh was in
+        // flight) must not clobber the cached diff.
+        let changed = state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: space_identity_cwd,
+                status_cache_key: worker_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand {
+                    branch: false,
+                    ahead_behind: false,
+                    dirty: false,
+                    diff: true,
+                },
+                auto_label: "one".into(),
+                branch: None,
+                ahead_behind: None,
+                dirty: None,
+                diff: None,
+                space: None,
+            }],
+        );
+        assert!(!changed);
         assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
     }
 
