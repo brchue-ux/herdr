@@ -280,6 +280,29 @@ pub(super) const TIDBIT_INK_MIX: f32 = 0.52;
 /// The tidbit's type size, as a fraction of the title's.
 pub(super) const TIDBIT_SIZE_MUL: f32 = 0.72;
 
+/// The Space badge's healthy ink: `--ok: #3ddc84`, the flight-deck circuit
+/// mockup's own token.
+pub(super) const BADGE_OK: Rgb = Rgb(61, 220, 132);
+/// The Space badge's warn ink: `--amber: #ffb454`, same mockup, `.badge.warn`.
+pub(super) const BADGE_WARN: Rgb = Rgb(255, 180, 84);
+/// The badge pill's own fill, as a share of its ink: the mockup's
+/// `rgba(*, .14)` on both `.badge` and `.badge.warn`.
+pub(super) const BADGE_FILL_ALPHA: f32 = 0.14;
+/// The badge pill's border, as a share of its ink: the mockup's `~.3` on both.
+pub(super) const BADGE_EDGE_ALPHA: f32 = 0.30;
+/// The badge's type size, as a fraction of the caption's own. The mockup sets
+/// `.badge` at `0.56rem` against `.card-name`'s `0.72rem` — 78%, applied here
+/// to the card's own caption size rather than its title, since the badge sits
+/// no taller than the control rail beside it.
+pub(super) const BADGE_SIZE_MUL: f32 = 0.78;
+/// The badge's horizontal padding, as a fraction of its own text height. The
+/// mockup's `0.36rem` against a `0.56rem` badge line is 64%.
+pub(super) const BADGE_PAD_MUL: f32 = 0.64;
+/// The badge's vertical padding, as a fraction of its own text height. The
+/// mockup's `0.06rem` against a `0.56rem` badge line is 11% — a pill that
+/// hugs its text, not a tall chip.
+pub(super) const BADGE_VPAD_MUL: f32 = 0.11;
+
 #[cfg(test)]
 mod tests {
     use super::*;
