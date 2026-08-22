@@ -366,11 +366,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
 
-# Agent status indicators: "ascii" draws single-cell marks that every terminal has
-# (! blocked, > working, - idle, blank unknown); "dots" preserves the compact color
-# marks; "symbols" uses distinct static glyphs for blocked, working, done, idle, and
-# unknown states.
-# status_indicators = "ascii"
+# Agent status indicators: "dots" draws compact color marks; "ascii" draws
+# single-cell marks that every terminal has (! blocked, > working, - idle,
+# blank unknown); "symbols" uses distinct static glyphs for blocked, working,
+# done, idle, and unknown states.
+# status_indicators = "dots"
 
 # Expanded agent rows. Built-ins are state_icon, state_text, workspace, tab, pane, agent,
 # terminal_title, and terminal_title_stripped.

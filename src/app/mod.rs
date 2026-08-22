@@ -4022,7 +4022,7 @@ mod tests {
         let mut app = test_app();
         assert_eq!(
             app.state.status_indicators,
-            crate::config::StatusIndicatorStyle::Ascii
+            crate::config::StatusIndicatorStyle::Dots
         );
 
         app.save_status_indicators(crate::config::StatusIndicatorStyle::Symbols);

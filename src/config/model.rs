@@ -1324,7 +1324,7 @@ impl Default for UiConfig {
             tab_bar_position: TabBarPositionConfig::Top,
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             _legacy_agent_panel_scope: None,
-            status_indicators: StatusIndicatorStyle::Ascii,
+            status_indicators: StatusIndicatorStyle::Dots,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1550,10 +1550,10 @@ agent_panel_scope = "current"
     }
 
     #[test]
-    fn status_indicator_style_defaults_to_ascii_and_parses_symbols() {
+    fn status_indicator_style_defaults_to_dots_and_parses_symbols() {
         assert_eq!(
             Config::default().ui.status_indicators,
-            StatusIndicatorStyle::Ascii
+            StatusIndicatorStyle::Dots
         );
 
         let config: Config = toml::from_str(
