@@ -11700,6 +11700,70 @@ next_tab = ""
         assert!(!server.every_app_viewer_rasterizes_background_scene());
     }
 
+    /// Reproduces the captain's exact sequence from `herdr-remote-background-not-rendering`:
+    /// a Windows `--remote` client is already attached — its Hello already carries
+    /// `wants_client_rasterized_background_scene: true`, unconditional on platform/remote status
+    /// alone — *before* `persistent_background` is turned on and the server config reloaded.
+    /// `herdr background on` + `server reload-config` only ever flips
+    /// `AppState::persistent_background_enabled`; it does not touch, re-negotiate, or resend
+    /// anything about the already-established client connection. If the delegated send path
+    /// depends on anything computed only once at connect time, this is where it would surface as
+    /// a permanent, silent blackout: `background_scene.active` reports `true` (every condition
+    /// `background_scene_active()` itself checks is satisfied), yet the client is never sent a
+    /// single `ServerMessage::BackgroundScene`.
+    #[test]
+    fn a_client_already_connected_before_background_is_enabled_still_gets_sent_the_scene_after_reload(
+    ) {
+        let (mut server, rx1, _rx2) = two_app_client_test_server();
+        server.clients.remove(&2);
+        server.app.state.persistent_background_enabled = false;
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .wants_client_rasterized_background_scene = true;
+        server.clients.get_mut(&1).unwrap().host_terminal_kind =
+            crate::kitty_graphics::HostTerminalKind::Kitty;
+        server.sync_foreground_client_state();
+
+        let start = Instant::now();
+        server.handle_scheduled_tasks_headless(start, false);
+        server.render_and_stream();
+        while rx1.try_recv().is_ok() {}
+        assert!(
+            !server.app.state.background_scene_active(),
+            "the scene must be inactive before the captain runs `herdr background on`"
+        );
+
+        // The reload: exactly what `herdr background on` + `server reload-config` does to
+        // `AppState` for this flag, and nothing else — no client re-handshake, no fresh Hello.
+        server.app.state.persistent_background_enabled = true;
+
+        server.handle_scheduled_tasks_headless(start + Duration::from_millis(200), false);
+        server.render_and_stream();
+
+        assert!(
+            server.app.state.background_scene_active(),
+            "background_scene_active() must now report true, matching the captain's own \
+             `herdr api snapshot`"
+        );
+
+        let mut got_background_scene = false;
+        while let Ok(framed) = rx1.try_recv() {
+            if matches!(
+                read_server_message(framed),
+                ServerMessage::BackgroundScene { .. }
+            ) {
+                got_background_scene = true;
+            }
+        }
+        assert!(
+            got_background_scene,
+            "a client already connected before the reload was never sent a BackgroundScene \
+             afterwards, even though background_scene_active() is true"
+        );
+    }
+
     /// The mirror of the case above: when every app client's own last pass
     /// agrees with the shared view, the retained path is not forced into a
     /// full-render fallback by the new guard.

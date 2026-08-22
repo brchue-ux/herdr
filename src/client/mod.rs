@@ -847,6 +847,25 @@ pub(crate) fn rasterises_cards_locally() -> bool {
     wants_client_rasterized_cards()
 }
 
+/// Whether this connection's Hello may honestly claim it will rasterise a delegated surface
+/// (cards, tray, or the background scene) at all — the "could I" half none of
+/// [`wants_client_rasterized_cards`], [`wants_client_rasterized_signal_tray`], or
+/// [`wants_client_rasterized_background_scene`] checks. Those three only ever answer "would I, on
+/// this platform, over this bridge" from `cfg!(windows) && is_remote_client_process()`, which is
+/// true or false independent of whether kitty graphics is even on for this process.
+///
+/// A client whose own `kitty_graphics_enabled` is off never asks its terminal the capability
+/// question (`query_kitty_graphics_capability`'s own gate) and reports `0x0` for its cell size
+/// (`initial_terminal_geometry`) — both signal "no graphics" to the server on their own. Claiming
+/// delegation anyway tells the server to stand its own rendering down for a surface this
+/// connection is then structurally unable to draw: the server has no way to verify the claim, and
+/// the client cannot keep it. Live-reproduced against a real terminal: the server reports
+/// `background_scene.active: true` and the client is never sent a single `BackgroundScene`
+/// message — not degraded, permanently blank.
+fn may_claim_client_rasterized_surfaces(kitty_graphics_enabled: bool) -> bool {
+    kitty_graphics_enabled
+}
+
 fn wants_client_rasterized_cards() -> bool {
     match std::env::var("HERDR_CLIENT_RASTERIZED_CARDS")
         .ok()
@@ -975,14 +994,16 @@ fn do_handshake(
     cell_height_px: u32,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
+    kitty_graphics_enabled: bool,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
-    let wants_cards = wants_client_rasterized_cards();
-    let wants_signal_tray = wants_client_rasterized_signal_tray();
-    let wants_background_scene = wants_client_rasterized_background_scene();
+    let may_claim = may_claim_client_rasterized_surfaces(kitty_graphics_enabled);
+    let wants_cards = wants_client_rasterized_cards() && may_claim;
+    let wants_signal_tray = wants_client_rasterized_signal_tray() && may_claim;
+    let wants_background_scene = wants_client_rasterized_background_scene() && may_claim;
 
     // Send Hello.
     let hello = ClientMessage::Hello {
@@ -1191,6 +1212,10 @@ fn connect_terminal_session_stream(
         0,
         RenderEncoding::TerminalAnsi,
         true,
+        // This is a direct terminal-session-observe stream, not the interactive app loop that
+        // reads `ServerMessage::CardScene`/`TrayScene`/`BackgroundScene` — it only ever handles
+        // `ServerMessage::Terminal`. Never claim a delegated surface it cannot consume.
+        false,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1428,6 +1453,7 @@ fn run_client_with_mode(
         cell_height_px,
         requested_encoding,
         direct_attach_requested,
+        kitty_graphics_enabled,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -3305,6 +3331,20 @@ mod tests {
     #[test]
     fn host_terminal_version_query_is_disabled_on_windows() {
         assert_eq!(should_query_host_terminal_version(), !cfg!(windows));
+    }
+
+    /// The bug this guards: `wants_client_rasterized_cards`/`_signal_tray`/`_background_scene`
+    /// answer "would I, on this platform, over this bridge" from
+    /// `cfg!(windows) && is_remote_client_process()` alone — true or false independent of whether
+    /// this process can draw a single pixel. Without this second gate ANDed in at the Hello, a
+    /// client with its own `kitty_graphics_enabled` off still claims delegation, the server takes
+    /// it at its word and stands its own rendering down, and the surface goes permanently blank —
+    /// reproduced live against a real terminal (`background_scene.active: true`, zero
+    /// `BackgroundScene` messages ever sent).
+    #[test]
+    fn a_client_may_not_claim_delegated_surfaces_without_its_own_kitty_graphics_enabled() {
+        assert!(!may_claim_client_rasterized_surfaces(false));
+        assert!(may_claim_client_rasterized_surfaces(true));
     }
 
     /// The ioctl is used when it is all there is, and only then.
