@@ -17,7 +17,24 @@ use serde::{Deserialize, Serialize};
 /// 23: added `ClientMessage::KittyGraphicsCapabilityConfirmed` and
 /// `HostTerminalIdentityReported`, the Windows client's only way to carry an
 /// in-band host-terminal probe reply to the server (see `host_terminal_identity`).
-pub const PROTOCOL_VERSION: u32 = 23;
+///
+/// 24: `crate::ui::sidebar::image_card::CardContentWire` gained a `focused_space`
+/// field carried inside `ServerMessage::CardScene`. That field is `#[serde(default)]`,
+/// but bincode's struct encoding is positional, not self-describing: `#[serde(default)]`
+/// only rescues a field the decoder runs out of *bytes* for, which never happens for a
+/// field inserted before the end of a struct nested inside a `Vec` of more than one
+/// element (there are always more bytes coming from the next tuple) or followed by
+/// further sibling fields on `CardScene` (`offsets`, `field`, `bounds`, `bloom_floor`,
+/// `backdrop`). A server and client built on either side of that change both declare
+/// `PROTOCOL_VERSION` 23, so the Hello handshake calls them compatible while
+/// `decode_card_scene` on the newer side hard-fails on every frame — confirmed with a
+/// hand-rolled pre-#186 `CardContentWire` shape decoded by the current decoder:
+/// `UnexpectedVariant { type_name: "Option<T>", ... }`. The failure is caught and only
+/// `debug!`-logged (`decode_and_rasterise_card_scene` in `src/client/mod.rs`), so the
+/// whole card panel silently freezes or stays blank rather than erroring visibly. Bumping
+/// the version turns that silent skew into the loud, actionable "please upgrade" rejection
+/// `check_client_version` already gives any other incompatible pairing.
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
