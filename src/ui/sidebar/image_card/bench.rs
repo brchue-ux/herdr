@@ -422,6 +422,11 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
                 3 => Some(GroupChevron::Collapsed),
                 _ => None,
             },
+            space_badge: (depth == 1).then_some(if index.is_multiple_of(5) {
+                SpaceBadgeMark::Warn
+            } else {
+                SpaceBadgeMark::Healthy((index * 3) as u32)
+            }),
         },
         // Mid-breath rather than settled: the breath is a light ramp the card
         // resolves per pixel, and a fleet drawn entirely at rest would skip it.

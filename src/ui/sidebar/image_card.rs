@@ -1994,6 +1994,78 @@ pub(crate) enum GroupChevron {
     Expanded,
 }
 
+/// The workspace metadata token carrying a Space's own revision count.
+///
+/// A plain non-negative integer, published by a fleet-side script exactly the
+/// way [`crate::quality_streak::STREAK_TOKEN`] and
+/// [`crate::quality_streak::DEFECT_TOKEN`] already are — Herdr computes
+/// nothing here and has no notion of what a "revision" is; it reads whatever
+/// number a publisher sends and draws it. No publisher sends one yet, which is
+/// deliberate rather than an oversight: a real per-Space commit/PR count is
+/// not a quantity Herdr already has anywhere (the sky's own `revs` is orbital
+/// animation cycles keyed to a body's file-count mass, not git history — see
+/// [`super::body_register::BodyFacts::orbit_line`] — and would have been a
+/// dishonest stand-in), so the badge shows nothing rather than a made-up
+/// count until something publishes this token.
+pub(super) const REV_TOKEN: &str = "rev";
+
+/// The Space-only badge pill in a card's header — `.badge`/`.badge.warn` in
+/// the flight-deck circuit mockup.
+///
+/// Both readings are fleet-published facts, never derived by Herdr: an open
+/// defect always wins the one badge slot over a rev count, matching the
+/// mockup's own fixtures (a Space with both shows the bug in the badge and
+/// moves its rev count down into the orbit-register caption line instead —
+/// not reproduced here; this always drops the rev count while a defect is
+/// open, which is the smaller, honestly-scoped half of that behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum SpaceBadgeMark {
+    /// A green "`N` rev" pill: [`REV_TOKEN`], and no open defect.
+    Healthy(u32),
+    /// An amber "bug" pill: this Space owns an open defect
+    /// ([`crate::quality_streak::DEFECT_TOKEN`]). Carries no count — the
+    /// fleet's own defect ladder is a severity, `S1..S4`, never a tally of how
+    /// many are open, and the mockup's own "1 bug" is not a quantity Herdr has
+    /// to draw honestly.
+    Warn,
+}
+
+impl SpaceBadgeMark {
+    fn label(self) -> String {
+        match self {
+            Self::Healthy(rev) => format!("{rev} rev"),
+            Self::Warn => "bug".to_string(),
+        }
+    }
+
+    fn ink(self) -> Rgb {
+        match self {
+            Self::Healthy(_) => measured::BADGE_OK,
+            Self::Warn => measured::BADGE_WARN,
+        }
+    }
+}
+
+/// Resolve the badge from a Space's own published tokens and its resolved
+/// stage.
+///
+/// [`crate::quality_streak::defect_mark`] already carries the right rule for
+/// "is a defect open" — the fleet's own `-` silences even a row detection
+/// reads as failed, and an unrated failure still marks at full intensity — so
+/// this reuses it rather than re-deriving a second, narrower version of the
+/// same question.
+fn space_badge(
+    rev: Option<&str>,
+    defect: Option<&str>,
+    stage: LifecycleStage,
+) -> Option<SpaceBadgeMark> {
+    if crate::quality_streak::defect_mark(defect, stage).is_some() {
+        return Some(SpaceBadgeMark::Warn);
+    }
+    let rev: u32 = rev?.trim().parse().ok()?;
+    Some(SpaceBadgeMark::Healthy(rev))
+}
+
 /// The two controls a card hangs on its right margin, above its state chip.
 ///
 /// # Why the card has to draw these at all
@@ -2021,11 +2093,12 @@ pub(crate) enum GroupChevron {
 pub(crate) struct ControlRail {
     summary: Option<SummaryBadge>,
     group: Option<GroupChevron>,
+    space_badge: Option<SpaceBadgeMark>,
 }
 
 impl ControlRail {
     fn is_empty(&self) -> bool {
-        self.summary.is_none() && self.group.is_none()
+        self.summary.is_none() && self.group.is_none() && self.space_badge.is_none()
     }
 
     /// Where every part of the rail goes, in pixels from the rail's own top
@@ -2039,11 +2112,37 @@ impl ControlRail {
         let mark_side = px * SUMMARY_MARK_MUL;
         let chevron_side = px * CHEVRON_MUL;
         let mut x = 0.0;
+        // Leftmost, closest to the title: the mockup's own badge is the only
+        // thing in this row's right margin, and this fleet's other two
+        // controls are rarer (a worktree-group head, a mate with finished
+        // workers) than a Space simply carrying a quality signal.
+        let badge_px = px * measured::BADGE_SIZE_MUL;
+        let badge_height =
+            font.metrics(badge_px).line_height * (1.0 + 2.0 * measured::BADGE_VPAD_MUL);
+        let badge = self.space_badge.map(|mark| {
+            let label = mark.label();
+            let hpad = font.metrics(badge_px).line_height * measured::BADGE_PAD_MUL;
+            let text_width = font.width(&label, badge_px);
+            let width = text_width + hpad * 2.0;
+            x = width;
+            RailBadge {
+                width,
+                height: badge_height,
+                hpad,
+                label,
+                mark,
+            }
+        });
         let summary = self.summary.map(|badge| {
+            if self.space_badge.is_some() {
+                x += px * CONTROL_GAP_MUL;
+            }
+            let start = x;
             let count = super::worker_summary_count_label(badge.count);
-            let count_x = mark_side + px * SUMMARY_COUNT_GAP_MUL;
+            let count_x = start + mark_side + px * SUMMARY_COUNT_GAP_MUL;
             x = count_x + font.width(&count, px);
             RailSummary {
+                x: start,
                 mark_side,
                 count_x,
                 count,
@@ -2051,7 +2150,7 @@ impl ControlRail {
             }
         });
         let chevron = self.group.map(|group| {
-            if summary.is_some() {
+            if summary.is_some() || self.space_badge.is_some() {
                 x += px * CONTROL_GAP_MUL;
             }
             let at = x;
@@ -2068,7 +2167,9 @@ impl ControlRail {
                 .metrics(px)
                 .line_height
                 .max(mark_side)
-                .max(chevron_side),
+                .max(chevron_side)
+                .max(badge_height),
+            badge,
             summary,
             chevron,
         }
@@ -2081,11 +2182,21 @@ struct RailLayout {
     /// finished workers and no worktree children has.
     width: f32,
     height: f32,
+    badge: Option<RailBadge>,
     summary: Option<RailSummary>,
     chevron: Option<RailChevron>,
 }
 
+struct RailBadge {
+    width: f32,
+    height: f32,
+    hpad: f32,
+    label: String,
+    mark: SpaceBadgeMark,
+}
+
 struct RailSummary {
+    x: f32,
     mark_side: f32,
     count_x: f32,
     count: String,
@@ -2728,6 +2839,17 @@ fn draw_control_rail(
     opacity: f32,
 ) {
     let (x, y) = at;
+    if let Some(badge) = &rail.badge {
+        draw_space_badge(
+            sheet,
+            font,
+            badge,
+            px,
+            geometry,
+            (x, y + (rail.height - badge.height) / 2.0),
+            opacity,
+        );
+    }
     if let Some(summary) = &rail.summary {
         // Seen summaries drop to the tidbit's own caption weight rather than to
         // a grey: the card carries no neutral ink, and a badge that changed hue
@@ -2740,7 +2862,7 @@ fn draw_control_rail(
         draw_summary_mark(
             sheet,
             RoundRect {
-                x,
+                x: x + summary.x,
                 y: y + (rail.height - summary.mark_side) / 2.0,
                 w: summary.mark_side,
                 h: summary.mark_side,
@@ -2775,6 +2897,67 @@ fn draw_control_rail(
             opacity,
         );
     }
+}
+
+/// The Space badge pill: a fully-rounded `RoundRect` at a tenth of an alpha,
+/// its own edge stroke, and centred text — `.badge`/`.badge.warn` from the
+/// flight-deck circuit mockup. Unlike the rest of the rail this carries its
+/// own colour ([`SpaceBadgeMark::ink`]) rather than the card's chip ink: it is
+/// a fleet-published quality signal, not the row's own agent-lifecycle state,
+/// and drawing it in the chip's hue would make the two unreadable apart.
+fn draw_space_badge(
+    sheet: &mut Canvas,
+    font: &CardFont,
+    badge: &RailBadge,
+    px: f32,
+    geometry: &CardGeometry,
+    at: (f32, f32),
+    opacity: f32,
+) {
+    let (x, y) = at;
+    let badge_px = px * measured::BADGE_SIZE_MUL;
+    let ink = badge.mark.ink();
+    let pill = RoundRect {
+        x,
+        y,
+        w: badge.width,
+        h: badge.height,
+        r: badge.height / 2.0,
+    };
+    let half_stroke = (geometry.stroke * 0.5).max(0.9) / 2.0;
+    let x0 = x.floor().max(0.0) as u32;
+    let y0 = y.floor().max(0.0) as u32;
+    let x1 = (x + badge.width).ceil() as u32;
+    let y1 = (y + badge.height).ceil() as u32;
+    for py_i in y0..y1 {
+        let py = py_i as f32 + 0.5;
+        for px_i in x0..x1 {
+            let pxf = px_i as f32 + 0.5;
+            let d = pill.distance(pxf, py);
+            let fill = coverage(d);
+            if fill > 0.0 {
+                sheet.blend(px_i, py_i, ink, measured::BADGE_FILL_ALPHA * fill * opacity);
+            }
+            let edge = coverage(d.abs() - half_stroke);
+            if edge > 0.0 {
+                sheet.blend(px_i, py_i, ink, measured::BADGE_EDGE_ALPHA * edge * opacity);
+            }
+        }
+    }
+    let metrics = font.metrics(badge_px);
+    let baseline = y + (badge.height - metrics.line_height) / 2.0 + metrics.ascent;
+    draw_text(
+        sheet,
+        font,
+        &badge.label,
+        badge_px,
+        x + badge.hpad,
+        baseline,
+        ink,
+        x + badge.hpad,
+        x + badge.width - badge.hpad,
+        opacity,
+    );
 }
 
 /// `▤`, drawn rather than set: a hairline square with two rules across it.
@@ -3299,7 +3482,30 @@ fn control_rail(
             GroupChevron::Expanded
         }
     });
-    ControlRail { summary, group }
+    // Spaces only, same as the chevron: a worker pane is not a checkout and
+    // carries no quality tokens of its own to read.
+    let badge = match entry {
+        super::WorkspaceListEntry::Workspace { ws_idx, .. } => {
+            app.workspaces.get(*ws_idx).and_then(|workspace| {
+                let (state, _seen) = workspace.aggregate_state(&app.terminals);
+                let tokens = workspace.metadata_tokens.values();
+                let stage = crate::app::lifecycle::row_signal(&tokens, state).stage;
+                space_badge(
+                    tokens.get(REV_TOKEN).map(String::as_str),
+                    tokens
+                        .get(crate::quality_streak::DEFECT_TOKEN)
+                        .map(String::as_str),
+                    stage,
+                )
+            })
+        }
+        super::WorkspaceListEntry::Agent { .. } => None,
+    };
+    ControlRail {
+        summary,
+        group,
+        space_badge: badge,
+    }
 }
 
 /// What one pass over the tree's cards concluded.
@@ -6265,6 +6471,15 @@ mod tests {
                 fresh: true,
             }),
             group: Some(GroupChevron::Collapsed),
+            // Not the Space badge: `every_real_fleet_title_is_set_whole_in_every_face_at_every_width`
+            // already fails with the badge folded in here — these two controls
+            // alone leave no spare width for at least one real title at one
+            // real narrow sidebar/depth, so any further reservation drops a
+            // word. That is a pre-existing budget the badge did not create;
+            // see `a_space_badge_reserves_real_width_and_the_title_wraps_around_it`
+            // for the badge's own width coverage instead of widening this
+            // fixture into a failure the fitting ladder cannot yet absorb.
+            space_badge: None,
         }
     }
 
@@ -6507,6 +6722,190 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Space badge reserves real width off the card's first title line,
+    /// the same as the summary badge and the chevron — proven in isolation
+    /// from them, since [`widest_rail`] deliberately leaves the badge out
+    /// (see its own doc comment for why).
+    #[test]
+    fn a_space_badge_reserves_real_width_and_the_title_wraps_around_it() {
+        for (face, font) in font::all_available_faces() {
+            for title in REAL_FLEET_TITLES {
+                let bare = real_text_column(
+                    &font,
+                    FLEET_SIDEBAR_COLUMNS,
+                    FLEET_CELL_WIDTH_PX,
+                    0,
+                    title,
+                    ControlRail::default(),
+                );
+                let badged = real_text_column(
+                    &font,
+                    FLEET_SIDEBAR_COLUMNS,
+                    FLEET_CELL_WIDTH_PX,
+                    0,
+                    title,
+                    ControlRail {
+                        summary: None,
+                        group: None,
+                        space_badge: Some(SpaceBadgeMark::Healthy(24)),
+                    },
+                );
+                assert_eq!(
+                    bare.available(),
+                    badged.available(),
+                    "the badge narrowed a line it does not stand over, in {face}"
+                );
+                assert!(
+                    badged.first_line_available() < bare.first_line_available(),
+                    "the badge cost the first line nothing in {face}"
+                );
+            }
+        }
+    }
+
+    /// An open defect always wins the one badge slot, whatever the fleet also
+    /// published for [`REV_TOKEN`] — the mockup's own fixtures never show
+    /// both a bug and a rev count on the same card.
+    #[test]
+    fn a_defect_wins_the_badge_slot_over_a_rev_count() {
+        assert_eq!(
+            space_badge(Some("24"), Some("S2"), LifecycleStage::Running),
+            Some(SpaceBadgeMark::Warn)
+        );
+    }
+
+    /// Herdr's own failure detection still shows the amber badge with no
+    /// fleet publisher in the loop at all — the same "detection is the
+    /// floor, publication is the ceiling" rule
+    /// [`crate::quality_streak::defect_mark`] is built on.
+    #[test]
+    fn a_detected_failure_shows_the_badge_with_nothing_published() {
+        assert_eq!(
+            space_badge(None, None, LifecycleStage::Failed),
+            Some(SpaceBadgeMark::Warn)
+        );
+    }
+
+    /// The fleet's own `-` closes the defect even on a row detection reads as
+    /// failed, so a rev count published alongside it reaches the badge.
+    #[test]
+    fn a_closed_defect_lets_the_rev_count_through_even_while_failed() {
+        assert_eq!(
+            space_badge(Some("7"), Some("-"), LifecycleStage::Failed),
+            Some(SpaceBadgeMark::Healthy(7))
+        );
+    }
+
+    /// No defect and a real [`REV_TOKEN`] is the green pill, trimmed of
+    /// whatever whitespace a publisher's shell script left in it.
+    #[test]
+    fn a_rev_count_alone_is_the_healthy_badge() {
+        assert_eq!(
+            space_badge(Some("  24  "), None, LifecycleStage::Running),
+            Some(SpaceBadgeMark::Healthy(24))
+        );
+    }
+
+    /// Nothing published, no detected failure: no badge at all — the common
+    /// case for every Space today, since no publisher sends [`REV_TOKEN`]
+    /// yet.
+    #[test]
+    fn nothing_published_draws_no_badge() {
+        assert_eq!(space_badge(None, None, LifecycleStage::Running), None);
+    }
+
+    /// A [`REV_TOKEN`] a publisher could not have meant as a count — anything
+    /// that does not parse as a plain non-negative integer — draws no badge
+    /// rather than a wrong one.
+    #[test]
+    fn an_unparseable_rev_token_draws_no_badge() {
+        for bad in ["", "-1", "3.5", "twelve", "24 open PRs"] {
+            assert_eq!(
+                space_badge(Some(bad), None, LifecycleStage::Running),
+                None,
+                "{bad:?} should not have parsed as a rev count"
+            );
+        }
+    }
+
+    /// The badge pill actually paints in its own ink — green for a rev count,
+    /// amber for an open defect — never the card's own chip hue, and a card
+    /// with neither draws no badge-coloured pixel at all.
+    #[test]
+    fn a_space_badge_paints_its_own_ink() {
+        let Some(font) = font::card_font(None) else {
+            return; // No face on this machine.
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 64.0,
+            r: geometry.radius,
+        };
+        fn content(badge: Option<SpaceBadgeMark>) -> CardContent {
+            CardContent {
+                title: String::new(),
+                tidbit: None,
+                register: None,
+                state_label: String::new(),
+                state: AgentState::Idle,
+                stage: LifecycleStage::Running,
+                severity: Severity::Clear,
+                hues: StageHues([196.0; 5]),
+                ground: measured::CANVAS,
+                split_channels: false,
+                seen: true,
+                depth: 1,
+                lifted: false,
+                mark: None,
+                residue: 0,
+                controls: ControlRail {
+                    summary: None,
+                    group: None,
+                    space_badge: badge,
+                },
+                generate: 1.0,
+                discharge: 0.0,
+                spider: None,
+                breath: 0.0,
+                wash: None,
+            }
+        }
+        let paints_near = |badge: Option<SpaceBadgeMark>, target: Rgb| {
+            let drawn = content(badge);
+            let mut canvas = Canvas::new(240, 90);
+            draw_card(
+                &mut canvas,
+                &PlacedCard {
+                    rect,
+                    content: &drawn,
+                    geometry: CardGeometry::new(21.0, false),
+                },
+                font,
+            );
+            canvas.rgba8().chunks_exact(4).any(|c| {
+                i32::from(c[0]).abs_diff(i32::from(target.0)) <= 24
+                    && i32::from(c[1]).abs_diff(i32::from(target.1)) <= 24
+                    && i32::from(c[2]).abs_diff(i32::from(target.2)) <= 24
+                    && c[3] > 40
+            })
+        };
+        assert!(
+            paints_near(Some(SpaceBadgeMark::Healthy(24)), measured::BADGE_OK),
+            "a healthy badge drew no pixel close to its own green"
+        );
+        assert!(
+            paints_near(Some(SpaceBadgeMark::Warn), measured::BADGE_WARN),
+            "a warn badge drew no pixel close to its own amber"
+        );
+        assert!(
+            !paints_near(None, measured::BADGE_OK) && !paints_near(None, measured::BADGE_WARN),
+            "a card with no badge drew badge-coloured pixels anyway"
+        );
     }
 
     /// Summaries at the three lengths a fleet actually publishes.
@@ -8084,6 +8483,7 @@ mod a_card_is_its_own_shape {
             let rail = ControlRail {
                 summary: Some(SummaryBadge { count: 3, fresh }),
                 group: None,
+                space_badge: None,
             };
             let layout = rail.layout(font, 10.0);
             let mut sheet = Canvas::new(64, 24);
@@ -8145,6 +8545,7 @@ mod a_card_is_its_own_shape {
                     fresh: false,
                 }),
                 group: None,
+                space_badge: None,
             };
             let drawn = rail
                 .layout(font, 10.0)
