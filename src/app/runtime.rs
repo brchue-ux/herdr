@@ -1483,6 +1483,31 @@ impl App {
             return self.clear_background_scene();
         }
 
+        // Every attached viewer draws the ambient loop for itself from a
+        // `ServerMessage::BackgroundScene`, so baking a whole PNG loop here produces frames this
+        // pass withholds anyway — see `crate::server::headless`, which sends the scene *instead
+        // of* them. This is the other half of the fix `observe_background_effects` makes for the
+        // effects overlay: the layout (the cheap half just computed above — geometry, no pixels)
+        // is still installed immediately so a delegating client always has current facts, but the
+        // `herdr-scene-bake` thread and everything after it in this function never runs.
+        //
+        // Unlike the non-delegated path, this installs `layout` every pass rather than only when
+        // a bake completes: there is no baked image left for a later pass to stay in sync with,
+        // so there is nothing gained by waiting.
+        if self.state.background_scene_client_rasterized {
+            let key_changed = key != self.state.background_scene_key
+                || self.state.background_scene_layout.is_none();
+            self.state.background_scene_key = key;
+            self.state.background_scene_identity = identity;
+            if key_changed {
+                self.state.background_scene_generated_at = Some(now);
+            }
+            self.state.background_scene_layout = Some(layout);
+            self.state.background_scene = None;
+            self.background_scene_deferred_bake_at = None;
+            return key_changed;
+        }
+
         let mut changed = false;
         if let Some(finished) = finished {
             // Content may advance while 36 frames are rendering. Installing that coherent
@@ -1692,15 +1717,17 @@ impl App {
         if !self.state.background_scene_active() {
             let forgot = self.state.background_effects.forget_all();
             let had = self.state.background_effects_layer.take().is_some();
+            let had_effects_snapshot = self.state.background_scene_effects.take().is_some();
             let had_legibility = self.state.background_legibility.take().is_some();
-            return forgot || had || had_legibility;
+            return forgot || had || had_effects_snapshot || had_legibility;
         }
 
         if !has_viewers {
             let forgot = self.state.background_effects.forget_all();
             let had = self.state.background_effects_layer.take().is_some();
+            let had_effects_snapshot = self.state.background_scene_effects.take().is_some();
             let had_legibility = self.state.background_legibility.take().is_some();
-            return forgot || had || had_legibility;
+            return forgot || had || had_effects_snapshot || had_legibility;
         }
 
         let Some(layout) = self.state.background_scene_layout.clone() else {
@@ -1766,7 +1793,22 @@ impl App {
 
         if !live_after {
             let had = self.state.background_effects_layer.take().is_some();
-            return live_before || had || legibility_changed;
+            let had_effects_snapshot = self.state.background_scene_effects.take().is_some();
+            return live_before || had || had_effects_snapshot || legibility_changed;
+        }
+
+        // Every attached viewer draws this overlay for itself from a
+        // `ServerMessage::BackgroundScene`, so rasterising and PNG-encoding it here would produce
+        // pixels this pass withholds anyway — see `crate::server::headless`, which sends the
+        // scene *instead of* them. This is the fix for the scene's cost riding on the shared
+        // Linux server's own CPU load: what used to run unconditionally in this loop, competing
+        // with every concurrent build on the box, no longer runs at all once nobody needs the
+        // pixels it would have produced. `effects` (the cheap half — resolved positions, no
+        // pixels) is still handed to a delegating client exactly as-is.
+        self.state.background_scene_effects = Some(effects.clone());
+        if self.state.background_scene_client_rasterized {
+            self.state.background_effects_layer = None;
+            return true;
         }
 
         let frame = crate::solar_system::effects_frame_png(&layout, &effects, phase);
@@ -3069,6 +3111,68 @@ mod tests {
         assert!(app.background_scene_bake.is_some());
         assert!(app.state.background_scene.is_none());
         assert!(app.state.background_scene_layout.is_none());
+    }
+
+    /// The fix for the scene's cost riding on the shared Linux server's own CPU load: a client
+    /// that rasterises the background scene itself is never handed a bake to wait on at all, and
+    /// the layout it needs installs immediately rather than on the old bake-completion cadence,
+    /// since there is no baked image left for a later pass to stay in sync with.
+    #[test]
+    fn a_fully_delegating_fleet_never_bakes_and_installs_the_layout_immediately() {
+        let mut app = background_scene_app();
+        app.state.background_scene_client_rasterized = true;
+        let now = Instant::now();
+
+        assert!(app.observe_background_scene(now), "a first key is a change");
+        assert!(
+            app.background_scene_bake.is_none(),
+            "a delegating fleet must never spawn the herdr-scene-bake worker"
+        );
+        assert!(
+            app.state.background_scene.is_none(),
+            "a delegating fleet must not carry a baked pixel loop"
+        );
+        assert!(
+            app.state.background_scene_layout.is_some(),
+            "the layout must be available immediately for a client to rasterise from"
+        );
+
+        // A second observe with nothing changed reports no change and still bakes nothing.
+        assert!(!app.observe_background_scene(now));
+        assert!(app.background_scene_bake.is_none());
+    }
+
+    /// The effects half of the same fix: a client that rasterises the background scene itself
+    /// still needs the live asteroid/comet facts (`background_scene_effects`), but the server must
+    /// never spend the PNG-encode this pass would otherwise cost on pixels it withholds anyway.
+    #[test]
+    fn a_fully_delegating_fleet_still_resolves_live_effects_but_never_rasterises_them() {
+        let (mut app, pane_id) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        app.state.kitty_graphics_enabled = true;
+        app.state.persistent_background_enabled = true;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 40, 30);
+        app.state.view.terminal_area = ratatui::layout::Rect::new(40, 0, 80, 30);
+        app.state.background_scene_client_rasterized = true;
+
+        let now = Instant::now();
+        assert!(app.observe_background_scene(now));
+        app.state.pending_effects.record_ask(pane_id, now, 1.0);
+
+        assert!(app.observe_background_effects(now, true));
+        assert!(
+            app.state.background_scene_effects.is_some(),
+            "a delegating client still needs the resolved live effects"
+        );
+        assert!(
+            app.state.background_effects_layer.is_none(),
+            "a delegating fleet must never rasterise the effects overlay to pixels"
+        );
     }
 
     #[test]

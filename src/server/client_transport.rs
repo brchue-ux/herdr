@@ -220,6 +220,7 @@ struct ClientWriterQueueState {
     /// other — see [`ClientRenderWriter::try_send_scene`].
     cards: Option<Vec<u8>>,
     tray: Option<Vec<u8>>,
+    background_scene: Option<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
@@ -230,6 +231,7 @@ impl ClientWriterQueueState {
         match surface {
             DelegatedSurface::Cards => &mut self.cards,
             DelegatedSurface::SignalTray => &mut self.tray,
+            DelegatedSurface::BackgroundScene => &mut self.background_scene,
         }
     }
 }
@@ -322,6 +324,10 @@ impl ClientWriterQueue {
                 self.ready.notify_one();
                 return Some(ClientWriteItem::Render(data));
             }
+            if let Some(data) = state.background_scene.take() {
+                self.ready.notify_one();
+                return Some(ClientWriteItem::Render(data));
+            }
             if let Some(data) = state.render.take() {
                 self.ready.notify_one();
                 return Some(ClientWriteItem::Render(data));
@@ -373,6 +379,10 @@ pub(crate) enum ServerEvent {
         /// `ServerMessage::TrayScene` instead of receiving server-embedded
         /// badge pixels.
         wants_client_rasterized_signal_tray: bool,
+        /// Whether this client wants to rasterise the ambient background
+        /// scene itself from `ServerMessage::BackgroundScene` instead of
+        /// receiving server-embedded scene pixels.
+        wants_client_rasterized_background_scene: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -607,6 +617,7 @@ pub(crate) fn handle_client_handshake(
         host_terminal,
         wants_client_rasterized_cards,
         wants_client_rasterized_signal_tray,
+        wants_client_rasterized_background_scene,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -620,6 +631,7 @@ pub(crate) fn handle_client_handshake(
             host_terminal,
             wants_client_rasterized_cards,
             wants_client_rasterized_signal_tray,
+            wants_client_rasterized_background_scene,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -662,6 +674,7 @@ pub(crate) fn handle_client_handshake(
                 host_terminal,
                 wants_client_rasterized_cards,
                 wants_client_rasterized_signal_tray,
+                wants_client_rasterized_background_scene,
             )
         }
         _ => {
@@ -719,6 +732,7 @@ pub(crate) fn handle_client_handshake(
         host_terminal,
         wants_client_rasterized_cards,
         wants_client_rasterized_signal_tray,
+        wants_client_rasterized_background_scene,
         writer,
     });
 
@@ -1395,6 +1409,7 @@ new_tab = "ctrl+notakey"
                 host_terminal: protocol::HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
                 wants_client_rasterized_signal_tray: false,
+                wants_client_rasterized_background_scene: false,
             },
         )
         .expect("write hello");
@@ -1430,6 +1445,7 @@ new_tab = "ctrl+notakey"
                 host_terminal: _,
                 wants_client_rasterized_cards: _,
                 wants_client_rasterized_signal_tray: _,
+                wants_client_rasterized_background_scene: _,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1476,6 +1492,7 @@ new_tab = "ctrl+notakey"
                 host_terminal: protocol::HostTerminalReport::default(),
                 wants_client_rasterized_cards: false,
                 wants_client_rasterized_signal_tray: false,
+                wants_client_rasterized_background_scene: false,
             },
         )
         .expect("write hello");

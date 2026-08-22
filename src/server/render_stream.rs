@@ -42,6 +42,10 @@ impl DelegatedSceneIdentity {
 pub(crate) enum DelegatedSurface {
     Cards,
     SignalTray,
+    /// The whole-terminal ambient background scene and its effects overlay,
+    /// folded in as one surface: they always arrive together in one
+    /// `BackgroundScene` message, so a change to either moves this identity.
+    BackgroundScene,
 }
 
 /// Per-client render baseline for the negotiated render encoding.

@@ -1113,6 +1113,81 @@ fn push_ejecta(
     });
 }
 
+/// Opaque wire snapshot for a client that rasterises the whole-terminal ambient background scene
+/// itself, mirroring `crate::ui::sidebar::image_card::CardScene` and
+/// `crate::ui::TrayScene`: the server resolves *what* to draw this pass — the fleet's current
+/// layout, whichever asteroids/craters/comets are live, and the loop's current phase — and ships
+/// that instead of pixels. The client turns it into pixels with the exact same
+/// `solar_system::frame`/`solar_system::effects_frame` this module's own server-side embed path
+/// calls, so the two are the same picture, computed on whichever side actually draws it.
+///
+/// Deliberately carries `effects` even when empty (`SceneEffects::default()`) rather than an
+/// `Option` — an empty effects set is itself informative: it is what tells the client to stop
+/// drawing whatever asteroid/comet was live in a previous scene.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BackgroundScene {
+    layout: solar_system::SceneLayout,
+    effects: solar_system::SceneEffects,
+    phase: f32,
+}
+
+/// Builds the wire snapshot for a client that rasterises the background scene itself.
+///
+/// `layout` and `effects` are exactly what `App::observe_background_scene`/
+/// `App::observe_background_effects` already resolved this pass for the server's own embed path —
+/// this is not a second computation of the scene, only a second *destination* for the one already
+/// done.
+pub(crate) fn build_background_scene(
+    layout: &solar_system::SceneLayout,
+    effects: &solar_system::SceneEffects,
+    phase: f32,
+) -> BackgroundScene {
+    BackgroundScene {
+        layout: layout.clone(),
+        effects: effects.clone(),
+        phase,
+    }
+}
+
+/// Encodes a [`BackgroundScene`] as the opaque bincode payload carried by
+/// `ServerMessage::BackgroundScene { bytes }`.
+pub(crate) fn encode_background_scene(
+    scene: &BackgroundScene,
+) -> Result<Vec<u8>, bincode::error::EncodeError> {
+    bincode::serde::encode_to_vec(scene, bincode::config::standard())
+}
+
+/// Decodes a [`BackgroundScene`] from the opaque bincode payload carried by
+/// `ServerMessage::BackgroundScene { bytes }`.
+pub(crate) fn decode_background_scene(
+    bytes: &[u8],
+) -> Result<BackgroundScene, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard()).map(|(scene, _)| scene)
+}
+
+/// The whole-terminal pixel size a [`BackgroundScene`] rasterises at.
+pub(crate) fn background_scene_size(scene: &BackgroundScene) -> (u32, u32) {
+    (scene.layout.width(), scene.layout.height())
+}
+
+/// Rasterises a [`BackgroundScene`] shipped by the server into the ambient loop's current frame
+/// and, when anything is live, the transient effects overlay above it — the identical pure
+/// functions `App::observe_background_scene`/`App::observe_background_effects` call server-side,
+/// unchanged and reused as-is, so the client draws the same picture the server would have.
+///
+/// The second element is `None` exactly when `scene.effects` has nothing live, which is also the
+/// signal a caller needs to stop showing whatever effects layer it drew last.
+pub(crate) fn rasterise_background_scene(scene: &BackgroundScene) -> (Vec<u8>, Option<Vec<u8>>) {
+    let ambient = solar_system::frame(&scene.layout, scene.phase);
+    let effects_live = !scene.effects.asteroids.is_empty()
+        || !scene.effects.craters.is_empty()
+        || !scene.effects.ejecta.is_empty()
+        || !scene.effects.comets.is_empty();
+    let effects = effects_live
+        .then(|| solar_system::effects_frame(&scene.layout, &scene.effects, scene.phase));
+    (ambient, effects)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2108,5 +2183,76 @@ mod tests {
         let b = pseudo_angle(42);
         assert_eq!(a, b);
         assert!((0.0..std::f32::consts::TAU).contains(&a));
+    }
+
+    fn one_body_layout() -> solar_system::SceneLayout {
+        let nodes = [solar_system::TreeNode {
+            label: solar_system::SceneLabel::new("sun"),
+            parent: None,
+            kind: solar_system::BodyKind::Sun,
+            stage: crate::anim::cell::LifecycleStage::Running,
+            severity: Severity::Clear,
+            size: solar_system::BodySize::Fixed,
+            streak: 0.0,
+            wear: 0.0,
+            motes: 0,
+            mote_share: 0.0,
+        }];
+        solar_system::build_layout(&nodes, 64, 48)
+    }
+
+    /// A `BackgroundScene` is what a delegating client rasterises the ambient loop from instead
+    /// of the server — this is the whole point of the wire type, so the two must agree on exactly
+    /// the same bytes for exactly the same layout and phase, through a real bincode round-trip and
+    /// not just an in-memory comparison.
+    #[test]
+    fn background_scene_round_trips_through_bincode_and_rasterises_the_same_ambient_frame() {
+        let layout = one_body_layout();
+        let effects = solar_system::SceneEffects::default();
+        let phase = 0.37;
+
+        let scene = build_background_scene(&layout, &effects, phase);
+        let bytes = encode_background_scene(&scene).expect("encode background scene");
+        let decoded = decode_background_scene(&bytes).expect("decode background scene");
+
+        assert_eq!(
+            background_scene_size(&decoded),
+            (layout.width(), layout.height())
+        );
+
+        let expected_ambient = solar_system::frame(&layout, phase);
+        let (ambient, effects_out) = rasterise_background_scene(&decoded);
+        assert_eq!(ambient, expected_ambient);
+        assert!(
+            effects_out.is_none(),
+            "an empty SceneEffects has nothing live to draw an overlay for"
+        );
+    }
+
+    /// The effects overlay is `None` exactly when nothing is live — the signal a delegating
+    /// client needs to stop drawing a finished asteroid/comet rather than freezing its last frame
+    /// on screen.
+    #[test]
+    fn a_live_effect_rasterises_an_overlay_matching_effects_frame_directly() {
+        let layout = one_body_layout();
+        let mut effects = solar_system::SceneEffects::default();
+        effects.asteroids.push(solar_system::AsteroidInFlight {
+            target: 0,
+            severity: Severity::Critical,
+            progress: 0.5,
+            approach_angle: 0.0,
+        });
+        let phase = 0.1;
+
+        let scene = build_background_scene(&layout, &effects, phase);
+        let bytes = encode_background_scene(&scene).expect("encode background scene");
+        let decoded = decode_background_scene(&bytes).expect("decode background scene");
+
+        let expected_effects = solar_system::effects_frame(&layout, &effects, phase);
+        let (_, effects_out) = rasterise_background_scene(&decoded);
+        assert_eq!(
+            effects_out.expect("a live asteroid should rasterise an overlay"),
+            expected_effects
+        );
     }
 }

@@ -187,6 +187,7 @@ fn client_handshake(
             &encode_varint_u32(0),  // HostTerminalReport.is_local: false
             &encode_varint_u32(0),  // wants_client_rasterized_cards: false
             &encode_varint_u32(0),  // wants_client_rasterized_signal_tray: false
+            &encode_varint_u32(0),  // wants_client_rasterized_background_scene: false
         ],
     );
     let framed = frame_message(&hello_payload);

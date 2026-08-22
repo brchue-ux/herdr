@@ -137,6 +137,29 @@ struct ClientState {
     /// encoder's *deltas* against `tray_scene_cache`: dropping an unflushed one
     /// would leave the cache believing an upload happened that never went out.
     pending_tray_graphics: Vec<u8>,
+    /// This client's own rasterisation cache for `ServerMessage::BackgroundScene`.
+    /// Shared between the ambient loop and its effects overlay — unlike cards
+    /// and tray, which are two independent, uncoordinated message streams, the
+    /// two background layers always arrive and are re-encoded together from
+    /// the same wire message, so one cache never sees the other's surface
+    /// missing from a pass it did not itself produce.
+    background_scene_cache: crate::kitty_graphics::HostGraphicsCache,
+    /// The ambient raster this client last actually handed its terminal, so a
+    /// scene whose orbits drifted by an imperceptible amount is not a fresh
+    /// upload — this client's own half of the server's
+    /// `AppState::background_scene`/[`crate::app::state::PublishedSurfaceRaster`]
+    /// bargain that already exists for the tray.
+    published_background_scene_raster: crate::app::state::PublishedSurfaceRaster,
+    /// The ambient layer last actually handed to the encoder, reused verbatim
+    /// on a pass `published_background_scene_raster` refused: the ambient
+    /// surface is always present in `encode_background_scene_graphics`'s
+    /// placements (unlike the effects overlay, which is meant to be dropped
+    /// once nothing is live), so refusing a drifted frame must still hand the
+    /// encoder *something* rather than let the surface read as withdrawn.
+    previous_background_ambient_layer: Option<crate::app::state::GraphicsLayer>,
+    /// Kitty graphics bytes from a rasterised `BackgroundScene` not yet
+    /// spliced into an outgoing frame.
+    pending_background_scene_graphics: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
@@ -720,16 +743,20 @@ impl Drop for TerminalGuard {
 /// This never fires for the real gate. Every Windows `--remote` client is
 /// launched with `HERDR_RENDER_ENCODING=terminal-ansi` already set
 /// (`crate::remote::bridge`), so the only clients it reaches are the ones that
-/// set `HERDR_CLIENT_RASTERIZED_CARDS` or `HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY`
-/// by hand — the dev-box and CI audience those overrides exist for, who
-/// otherwise get a blank surface from the very path they were trying to
-/// exercise. [`warn_if_encoding_cannot_carry_delegated_scenes`] covers what is
-/// left: an explicit `HERDR_RENDER_ENCODING` that names something else.
+/// set `HERDR_CLIENT_RASTERIZED_CARDS`, `HERDR_CLIENT_RASTERIZED_SIGNAL_TRAY`,
+/// or `HERDR_CLIENT_RASTERIZED_BACKGROUND_SCENE` by hand — the dev-box and CI
+/// audience those overrides exist for, who otherwise get a blank surface from
+/// the very path they were trying to exercise.
+/// [`warn_if_encoding_cannot_carry_delegated_scenes`] covers what is left: an
+/// explicit `HERDR_RENDER_ENCODING` that names something else.
 fn requested_render_encoding() -> RenderEncoding {
     match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
         Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
         Some(_) => RenderEncoding::SemanticFrame,
-        None if wants_client_rasterized_cards() || wants_client_rasterized_signal_tray() => {
+        None if wants_client_rasterized_cards()
+            || wants_client_rasterized_signal_tray()
+            || wants_client_rasterized_background_scene() =>
+        {
             RenderEncoding::TerminalAnsi
         }
         None => RenderEncoding::SemanticFrame,
@@ -747,13 +774,17 @@ fn warn_if_encoding_cannot_carry_delegated_scenes(
     encoding: RenderEncoding,
     wants_cards: bool,
     wants_signal_tray: bool,
+    wants_background_scene: bool,
 ) {
-    if encoding != RenderEncoding::SemanticFrame || !(wants_cards || wants_signal_tray) {
+    if encoding != RenderEncoding::SemanticFrame
+        || !(wants_cards || wants_signal_tray || wants_background_scene)
+    {
         return;
     }
     warn!(
         wants_cards,
         wants_signal_tray,
+        wants_background_scene,
         "negotiated SemanticFrame encoding cannot carry client-rasterised sidebar \
          surfaces: their scenes will be rasterised and dropped, and the surface \
          will render blank. Set HERDR_RENDER_ENCODING=terminal-ansi."
@@ -850,6 +881,28 @@ fn wants_client_rasterized_signal_tray() -> bool {
     cfg!(windows) && is_remote_client_process()
 }
 
+/// The same bargain as [`wants_client_rasterized_cards`], for the whole-terminal ambient
+/// background scene: a Windows remote-bridge client draws its own orbits, asteroids and comets
+/// from a `ServerMessage::BackgroundScene` instead of being sent an RGBA image of them every time
+/// the scene's own simulation loop advances — the loop that currently runs on the shared Linux
+/// server and competes with everything else running there for CPU, regardless of how idle the
+/// captain's own Windows machine is.
+///
+/// Deliberately the *same* platform gate rather than a wider one, for the reason
+/// [`wants_client_rasterized_signal_tray`] gives. `HERDR_CLIENT_RASTERIZED_BACKGROUND_SCENE`
+/// overrides it for the same reason its card and tray siblings have an override.
+fn wants_client_rasterized_background_scene() -> bool {
+    match std::env::var("HERDR_CLIENT_RASTERIZED_BACKGROUND_SCENE")
+        .ok()
+        .as_deref()
+    {
+        Some("1" | "true") => return true,
+        Some("0" | "false") => return false,
+        _ => {}
+    }
+    cfg!(windows) && is_remote_client_process()
+}
+
 /// Time to wait for the server's Welcome reply during the handshake.
 ///
 /// A local client talks to an already-connected server, so 5s is plenty. The
@@ -929,6 +982,7 @@ fn do_handshake(
 
     let wants_cards = wants_client_rasterized_cards();
     let wants_signal_tray = wants_client_rasterized_signal_tray();
+    let wants_background_scene = wants_client_rasterized_background_scene();
 
     // Send Hello.
     let hello = ClientMessage::Hello {
@@ -951,6 +1005,7 @@ fn do_handshake(
         host_terminal: crate::kitty_graphics::host_terminal_report_from_env(),
         wants_client_rasterized_cards: wants_cards,
         wants_client_rasterized_signal_tray: wants_signal_tray,
+        wants_client_rasterized_background_scene: wants_background_scene,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -982,6 +1037,7 @@ fn do_handshake(
                 encoding,
                 wants_cards,
                 wants_signal_tray,
+                wants_background_scene,
             );
             Ok(encoding)
         }
@@ -1525,6 +1581,10 @@ async fn run_client_loop(
         previous_tray_scene: None,
         published_tray_raster: crate::app::state::PublishedSurfaceRaster::default(),
         pending_tray_graphics: Vec::new(),
+        background_scene_cache: crate::kitty_graphics::HostGraphicsCache::default(),
+        published_background_scene_raster: crate::app::state::PublishedSurfaceRaster::default(),
+        previous_background_ambient_layer: None,
+        pending_background_scene_graphics: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1830,6 +1890,7 @@ async fn run_client_loop(
                     // `frame.graphics` on a client that did not ask for this.
                     let mut scene_graphics = std::mem::take(&mut state.pending_card_graphics);
                     scene_graphics.append(&mut state.pending_tray_graphics);
+                    scene_graphics.append(&mut state.pending_background_scene_graphics);
                     let _ = write_encoded_frame_with_graphics(
                         &mut stdout,
                         &frame.bytes,
@@ -1867,6 +1928,12 @@ async fn run_client_loop(
                     if state.kitty_graphics_enabled {
                         let graphics = decode_and_rasterise_tray_scene(&bytes, &mut state);
                         state.pending_tray_graphics.extend(graphics);
+                    }
+                }
+                ServerMessage::BackgroundScene { bytes } => {
+                    if state.kitty_graphics_enabled {
+                        let graphics = decode_and_rasterise_background_scene(&bytes, &mut state);
+                        state.pending_background_scene_graphics.extend(graphics);
                     }
                 }
                 ServerMessage::ServerShutdown { reason } => {
@@ -2438,6 +2505,94 @@ fn decode_and_rasterise_tray_scene(bytes: &[u8], state: &mut ClientState) -> Vec
         &layer,
         state.cell_size,
         &mut state.tray_scene_cache,
+    )
+}
+
+/// Decodes a `ServerMessage::BackgroundScene` payload and rasterises it into Kitty graphics bytes
+/// ready to splice into the next outgoing frame, updating `state`'s own rasterisation cache along
+/// the way.
+///
+/// The ambient loop layer is gated by `published_background_scene_raster` the same way the tray
+/// gates its badges (see that field's doc): orbits drift continuously and imperceptibly between
+/// scenes, and re-uploading every drift step would buy the terminal a fresh whole-screen image for
+/// nothing a viewer could see. The effects overlay is never gated this way — an asteroid in flight
+/// or a comet crossing the scene is real, fast motion the drift floor must not suppress.
+fn decode_and_rasterise_background_scene(bytes: &[u8], state: &mut ClientState) -> Vec<u8> {
+    let scene = match crate::app::background_scene::decode_background_scene(bytes) {
+        Ok(scene) => scene,
+        Err(err) => {
+            debug!(%err, "failed to decode BackgroundScene from server");
+            return Vec::new();
+        }
+    };
+    let (width, height) = crate::app::background_scene::background_scene_size(&scene);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let (ambient_rgba, effects_rgba) =
+        crate::app::background_scene::rasterise_background_scene(&scene);
+
+    let kind = crate::kitty_graphics::host_terminal_kind();
+    let is_local = crate::kitty_graphics::host_graphics_is_local();
+    let grid = ratatui::layout::Rect::new(0, 0, state.reported_size.0, state.reported_size.1);
+
+    let ambient_layer =
+        if state
+            .published_background_scene_raster
+            .accept(width, height, &ambient_rgba)
+        {
+            let format =
+                crate::kitty_graphics::preferred_sidebar_pixel_format(true, kind, is_local);
+            let Some(data) =
+                crate::kitty_graphics::encode_layer_pixels(format, width, height, &ambient_rgba)
+            else {
+                return Vec::new();
+            };
+            let layer = crate::app::state::GraphicsLayer::new(
+                format,
+                width,
+                height,
+                data,
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                    z: -2,
+                },
+            );
+            state.previous_background_ambient_layer = Some(layer.clone());
+            layer
+        } else if let Some(layer) = state.previous_background_ambient_layer.clone() {
+            layer
+        } else {
+            return Vec::new();
+        };
+
+    let effects_layer = effects_rgba.and_then(|rgba| {
+        let format = crate::kitty_graphics::preferred_sidebar_pixel_format(false, kind, is_local);
+        let data = crate::kitty_graphics::encode_layer_pixels(format, width, height, &rgba)?;
+        Some(crate::app::state::GraphicsLayer::new(
+            format,
+            width,
+            height,
+            data,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                z: -1,
+            },
+        ))
+    });
+
+    crate::kitty_graphics::encode_background_scene_graphics(
+        grid,
+        &ambient_layer,
+        effects_layer.as_ref(),
+        state.cell_size,
+        &mut state.background_scene_cache,
     )
 }
 

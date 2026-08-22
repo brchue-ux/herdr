@@ -109,7 +109,7 @@ fn field_threads(rows: usize) -> usize {
 /// Which kind of body this node draws as. Carries no colour or size of its own — those are
 /// resolved per-node from lifecycle/severity and [`Self::radius_fraction`] — because two bodies
 /// of the same kind can be in wildly different states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum BodyKind {
     Sun,
     Planet,
@@ -137,7 +137,9 @@ const FILE_FLOOR: f32 = 398.42;
 ///
 /// The register is *tracked files at HEAD*, the same measure the fleet orrery's bridge publishes
 /// (`git ls-tree -r HEAD --name-only`, counted), so a project reads the same size in both places.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum BodySize {
     /// Outside the register, because this body is not a project and so has no file count to be
     /// compared with: the sun (the fleet's router *to* the projects, not one of them — the
@@ -366,7 +368,7 @@ impl BodyKind {
 ///
 /// Derived per layout build and never stored on a [`TreeNode`], because the rule is a *ranking*:
 /// see [`assign_body_types`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum BodyType {
     /// The sun, and every moon.
     Plain,
@@ -626,6 +628,28 @@ pub(crate) struct SceneLabel {
     len: u8,
 }
 
+/// Wire form for a [`SceneLabel`] carried in a `BackgroundScene` message: its own string, not the
+/// fixed-size byte array `[u8; SCENE_LABEL_CAP]` derives cannot serialize. Symmetric with
+/// [`SceneLabel::new`], which already cuts and copies from exactly this shape.
+impl serde::Serialize for SceneLabel {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SceneLabel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::new(&name))
+    }
+}
+
 impl Default for SceneLabel {
     fn default() -> Self {
         Self::EMPTY
@@ -758,7 +782,7 @@ const TRACK_ALPHA: (f32, f32) = (0.045, 0.30);
 /// One body's static placement facts, resolved once per topology change (mirrors
 /// `App::observe_sidebar_particle_field`'s "regenerate on resize, not per tick" cadence — a body
 /// added or removed is the equivalent event here).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct BodyLayout {
     parent: Option<usize>,
     kind: BodyKind,
@@ -1042,7 +1066,7 @@ impl BodyLayout {
 }
 
 /// Every body's static placement for one frame size, ready to be evaluated at any phase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SceneLayout {
     bodies: Vec<BodyLayout>,
     width: u32,
@@ -1399,7 +1423,7 @@ impl Placed {
 /// `age` is `0.0` the instant the asteroid lands and `1.0` once the crater has fully faded — a
 /// caller-computed fraction of [`CRATER_FADE`]/[`RIPPLE_FADE`] rather than a raw duration, so
 /// this module never reads a clock.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Crater {
     pub(crate) body: usize,
     pub(crate) angle_on_surface: f32,
@@ -1411,7 +1435,7 @@ pub(crate) struct Crater {
 }
 
 /// An asteroid still travelling toward its target, before impact.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AsteroidInFlight {
     pub(crate) target: usize,
     pub(crate) severity: Severity,
@@ -1427,7 +1451,7 @@ pub(crate) struct AsteroidInFlight {
 /// different timescales — the rays are a sub-second flash, the scar they leave behind fades for
 /// most of a minute — and because only the rays are drawn *outside* the struck body's own disk.
 /// Like [`Crater::age`], `age` is a caller-resolved fraction so this module never reads a clock.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Ejecta {
     pub(crate) body: usize,
     /// Where on the body the strike landed, in the same local frame [`Crater`] uses — the rays
@@ -1439,7 +1463,7 @@ pub(crate) struct Ejecta {
 }
 
 /// The three magnitudes of a win. The producer names the tier; this renderer owns its visual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum WinTier {
     Ask,
     Ci,
@@ -1484,7 +1508,7 @@ impl WinTier {
 /// A comet crossing the whole scene. `start`/`end` are normalised `0.0..=1.0` scene coordinates;
 /// `magnitude` is the already-resolved work-size intensity (`0.0..=1.0`, quiet green-test tier at
 /// the bottom, a landed large task at the top) driving both brightness and tail length.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Comet {
     pub(crate) start: (f32, f32),
     pub(crate) end: (f32, f32),
@@ -1496,13 +1520,41 @@ pub(crate) struct Comet {
     pub(crate) magnitude: f32,
     pub(crate) tier: WinTier,
     /// Actual earlier normalised positions observed while this comet was live, oldest first.
+    #[serde(with = "comet_trail_wire")]
     pub(crate) trail: std::sync::Arc<Vec<(f32, f32)>>,
     /// `0.0` = just launched, `1.0` = crossed off-scene.
     pub(crate) progress: f32,
 }
 
+/// `Comet::trail`'s wire form: plain-`Vec` on the wire, `Arc`-wrapped once decoded — the client
+/// rasterising a delegated [`crate::app::background_scene::BackgroundScene`] never mutates a
+/// trail, so an `Arc` clone is exactly as cheap as the server's own copy, and neither side pays to
+/// serialize a reference count that means nothing across a process boundary.
+mod comet_trail_wire {
+    use serde::{Deserialize, Serialize};
+
+    pub(super) fn serialize<S>(
+        trail: &std::sync::Arc<Vec<(f32, f32)>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        trail.as_slice().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<std::sync::Arc<Vec<(f32, f32)>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(std::sync::Arc::new(Vec::deserialize(deserializer)?))
+    }
+}
+
 /// Every transient, event-driven overlay live on top of the ambient orbit scene this frame.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SceneEffects {
     pub(crate) asteroids: Vec<AsteroidInFlight>,
     pub(crate) craters: Vec<Crater>,

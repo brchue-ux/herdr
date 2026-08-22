@@ -2922,6 +2922,7 @@ impl HeadlessServer {
                 host_terminal,
                 wants_client_rasterized_cards,
                 wants_client_rasterized_signal_tray,
+                wants_client_rasterized_background_scene,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -2970,6 +2971,8 @@ impl HeadlessServer {
                     client.wants_client_rasterized_cards = wants_client_rasterized_cards;
                     client.wants_client_rasterized_signal_tray =
                         wants_client_rasterized_signal_tray;
+                    client.wants_client_rasterized_background_scene =
+                        wants_client_rasterized_background_scene;
                 }
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -4414,6 +4417,8 @@ impl HeadlessServer {
             let graphics_surface_reset_pending = client.graphics_surface_reset_pending;
             let wants_client_rasterized_cards = client.wants_client_rasterized_cards;
             let wants_client_rasterized_signal_tray = client.wants_client_rasterized_signal_tray;
+            let wants_client_rasterized_background_scene =
+                client.wants_client_rasterized_background_scene;
             let embedded_surfaces = client.embedded_surfaces();
             let composed = if self.app.state.pixel_text_panes_active() {
                 client.renderer.rendered_buffer()
@@ -4512,6 +4517,49 @@ impl HeadlessServer {
                         ),
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to encode tray scene for client");
+                        }
+                    }
+                }
+            }
+
+            // And the whole-terminal ambient background scene, the same way: the fleet's current
+            // layout, whichever asteroids/craters/comets are live, and the loop's current phase,
+            // instead of the RGBA image this client's frames no longer carry. Its own message for
+            // the same reason cards and tray are separate from each other — a client may be able
+            // to reproduce this surface and not the others.
+            if wants_client_rasterized_background_scene
+                && is_app_client
+                && self.app.state.host_paints_pixel_surfaces()
+                && cell_size.is_known()
+            {
+                if let Some(layout) = self.app.state.background_scene_layout.as_ref() {
+                    let generated_at = self
+                        .app
+                        .state
+                        .background_scene_generated_at
+                        .unwrap_or_else(Instant::now);
+                    let phase =
+                        crate::app::background_scene::phase_at(generated_at, Instant::now());
+                    let effects = self
+                        .app
+                        .state
+                        .background_scene_effects
+                        .clone()
+                        .unwrap_or_default();
+                    let scene = crate::app::background_scene::build_background_scene(
+                        layout, &effects, phase,
+                    );
+                    match crate::app::background_scene::encode_background_scene(&scene) {
+                        Ok(bytes) => Self::delegate_scene(
+                            client_id,
+                            &writer,
+                            &mut delegated_scenes,
+                            crate::server::render_stream::DelegatedSurface::BackgroundScene,
+                            bytes,
+                            |bytes| ServerMessage::BackgroundScene { bytes },
+                        ),
+                        Err(err) => {
+                            warn!(client_id, err = %err, "failed to encode background scene for client");
                         }
                     }
                 }
@@ -4861,6 +4909,12 @@ impl HeadlessServer {
         // bake sees this pass's register values.
         changed |= self.app.observe_orbit_tracks(now);
         changed |= self.app.observe_ambient_motes();
+        // Alongside the card/tray folds above, and for the same structural reason: whether this
+        // pass still has to bake the ambient loop and rasterise the effects overlay to pixels is a
+        // fold across every attached viewer, not the foreground one's opinion. Before either
+        // observer below reads it.
+        self.app.state.background_scene_client_rasterized =
+            self.every_app_viewer_rasterizes_background_scene();
         changed |= self.app.observe_background_scene(now);
         changed |= self.app.observe_background_effects(now, has_viewers);
         self.app.sync_state_age_timer(now, has_viewers);
@@ -4973,6 +5027,27 @@ impl HeadlessServer {
             .filter(|client| client.is_full_app_client())
             .peekable();
         viewers.peek().is_some() && viewers.all(|client| client.wants_client_rasterized_cards)
+    }
+
+    /// True when there is at least one client rendering the app and *every* one
+    /// of them draws the whole-terminal ambient background scene itself from a
+    /// `ServerMessage::BackgroundScene`.
+    ///
+    /// The background-scene twin of [`Self::every_app_viewer_rasterizes_sidebar_cards`], with the
+    /// same shape and the same reason for it: the ambient loop and its effects overlay are one
+    /// pair of images on `AppState` shared by every viewer, so baking and rasterising them can
+    /// only be skipped when nobody is left who would be sent the pixels. This is the fix for the
+    /// scene's simulation cost riding on the shared Linux server's own CPU load regardless of how
+    /// idle a delegating Windows client's own machine is — a bake this predicate skips never
+    /// competes with a concurrent build for CPU at all.
+    fn every_app_viewer_rasterizes_background_scene(&self) -> bool {
+        let mut viewers = self
+            .clients
+            .values()
+            .filter(|client| client.is_full_app_client())
+            .peekable();
+        viewers.peek().is_some()
+            && viewers.all(|client| client.wants_client_rasterized_background_scene)
     }
 
     /// Initiates graceful shutdown.
@@ -6033,6 +6108,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -6060,6 +6136,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -6093,6 +6170,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("rio".to_owned()),
                 term: None,
@@ -6133,6 +6211,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("some-unheard-of-terminal".to_owned()),
                 term: Some("xterm-256color".to_owned()),
@@ -6190,6 +6269,7 @@ new_tab = "prefix+t"
                 direct_attach_requested: false,
                 wants_client_rasterized_cards: false,
                 wants_client_rasterized_signal_tray: false,
+                wants_client_rasterized_background_scene: false,
                 // Everything an SSH'd-in client can see of its terminal.
                 host_terminal: crate::protocol::HostTerminalReport {
                     term_program: None,
@@ -6249,6 +6329,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: Some("rio".to_owned()),
                 term: None,
@@ -6292,6 +6373,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport {
                 term_program: None,
                 term: Some("xterm-kitty".to_owned()),
@@ -6346,6 +6428,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -6362,6 +6445,7 @@ new_tab = "prefix+t"
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -6408,6 +6492,7 @@ next_tab = ""
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6486,6 +6571,7 @@ next_tab = ""
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_a,
         }));
@@ -6509,6 +6595,7 @@ next_tab = ""
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer: writer_b,
         }));
@@ -6546,6 +6633,7 @@ next_tab = ""
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -6614,6 +6702,7 @@ next_tab = ""
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -7142,6 +7231,7 @@ next_tab = ""
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -7179,6 +7269,7 @@ next_tab = ""
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -7215,6 +7306,7 @@ next_tab = ""
             direct_attach_requested: false,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -7322,6 +7414,7 @@ next_tab = ""
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -9876,6 +9969,7 @@ next_tab = ""
             direct_attach_requested: true,
             wants_client_rasterized_cards: false,
             wants_client_rasterized_signal_tray: false,
+            wants_client_rasterized_background_scene: false,
             host_terminal: crate::protocol::HostTerminalReport::default(),
             writer,
         }));
@@ -11568,6 +11662,42 @@ next_tab = ""
         // before its own first scene arrives.
         server.clients.clear();
         assert!(!server.every_app_viewer_rasterizes_sidebar_cards());
+    }
+
+    /// The background-scene twin of the cards test above: this is the fold that decides whether
+    /// the server still has to bake the ambient loop and rasterise the effects overlay to pixels
+    /// at all — the fix for the scene's cost riding on the shared Linux server's own CPU load.
+    #[test]
+    fn the_server_stops_drawing_the_background_scene_only_when_every_viewer_draws_its_own() {
+        let (mut server, _rx1, _rx2) = two_app_client_test_server();
+
+        assert!(
+            !server.every_app_viewer_rasterizes_background_scene(),
+            "two ordinary clients had their background scene withheld"
+        );
+
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .wants_client_rasterized_background_scene = true;
+        assert!(
+            !server.every_app_viewer_rasterizes_background_scene(),
+            "the fallback client beside a delegating one was left with a bare screen"
+        );
+
+        server
+            .clients
+            .get_mut(&2)
+            .unwrap()
+            .wants_client_rasterized_background_scene = true;
+        assert!(
+            server.every_app_viewer_rasterizes_background_scene(),
+            "every viewer draws its own background scene and the server drew it anyway"
+        );
+
+        server.clients.clear();
+        assert!(!server.every_app_viewer_rasterizes_background_scene());
     }
 
     /// The mirror of the case above: when every app client's own last pass
