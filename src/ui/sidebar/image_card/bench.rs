@@ -408,6 +408,7 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         depth,
         // One selected card, as a panel has.
         lifted: index == 1,
+        focused_space: index == 1,
         mark: None,
         // A mate that has taken workers back draws a residue stack; a worker
         // does not.
