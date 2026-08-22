@@ -1447,7 +1447,24 @@ impl App {
     /// A body only earns motes for work done *while it was being watched*: a pane already an hour
     /// into a build when the scene first sees it starts from wherever its counter is, rather than
     /// studding its whole orbit in one pass for work nobody was watching.
+    ///
+    /// Gated the same way `observe_background_scene` is gated, and for a cost reason that one
+    /// doesn't have to explain: unlike [`Self::observe_orbit_tracks`], which is one multiply and
+    /// one comparison per body, [`crate::app::background_scene::ambient_mote_inputs`] walks
+    /// `sidebar_agent_entries` and `workspace_list_entries_whole_fleet` — the whole-fleet sidebar
+    /// build — every scheduled-task pass. Running that unconditionally means a fleet nobody will
+    /// ever see it for still pays a per-tick, per-pane cost with no viewer able to observe the
+    /// result. Skipping the call while inactive does not lose any accounting for a body already
+    /// being watched: `AmbientMotes` leaves its `seen_bytes` exactly where consumption last left
+    /// it, so the first call after re-enabling folds every byte produced while paused into one
+    /// catch-up batch — the same "shows the hour" continuity `observe_orbit_tracks` already relies
+    /// on, just deferred instead of sampled continuously. A body seen for the first time ever while
+    /// the scene happens to be off gets the ordinary first-sight treatment above once it finally is
+    /// watched — never a backlog of work nobody was watching.
     pub(crate) fn observe_ambient_motes(&mut self) -> bool {
+        if !self.state.background_scene_active() {
+            return false;
+        }
         let counts = crate::app::background_scene::ambient_mote_inputs(&self.state);
         let mut motes = std::mem::take(&mut self.state.ambient_motes);
         let emitted = motes.consume(counts.iter().map(|(row, bytes)| (row, *bytes)));
@@ -3046,6 +3063,76 @@ mod tests {
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 40, 30);
         app.state.view.terminal_area = ratatui::layout::Rect::new(40, 0, 80, 30);
         app
+    }
+
+    /// Disabling the scene must stop `AmbientMotes` from doing real per-tick work, not just stop
+    /// drawing it. `ambient_mote_inputs` walks the whole fleet's sidebar entries every pass it
+    /// runs, so an inactive scene that still consumed events would keep paying that walk forever
+    /// for a fleet nobody can ever see it. Reactivating must fold in everything produced while
+    /// paused in one pass, the same continuity `observe_orbit_tracks` already relies on.
+    #[test]
+    fn ambient_motes_are_not_consumed_while_the_scene_is_inactive_and_catch_up_once_it_is() {
+        let (mut app, pane_id) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("test pane has a terminal");
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test pane has a terminal");
+        // A pane with no agent name and no detected agent kind is dropped from
+        // `Tab::pane_details` before an owner token is ever read, so it must have one to become a
+        // tree row at all — see `PaneDetail`'s `fallback_agent_label`.
+        terminal.set_agent_name("ambient-repro-worker".to_string());
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::app::agent_tree::OWNER_TOKEN.to_string(),
+                Some("fleet-owner".to_string()),
+            )]),
+            None,
+            Instant::now(),
+        );
+
+        // Active first, so this body earns a `seen_bytes` baseline the way any already-watched
+        // body would before the scene is later turned off.
+        app.state.kitty_graphics_enabled = true;
+        app.state.persistent_background_enabled = true;
+        app.state.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+        app.state
+            .pane_activity
+            .observe(Instant::now(), [(&terminal_id, 0)]);
+        app.observe_ambient_motes();
+        assert_eq!(app.state.ambient_motes.accounting(), (0, 0));
+
+        // Now turn the scene off and let real work pile up while nobody can see it.
+        app.state.persistent_background_enabled = false;
+        app.state.pane_activity.observe(
+            Instant::now(),
+            [(
+                &terminal_id,
+                5 * crate::app::background_scene::BYTES_PER_EVENT,
+            )],
+        );
+        assert!(
+            !app.observe_ambient_motes(),
+            "an inactive scene must not report a change for work nobody can see"
+        );
+        assert_eq!(
+            app.state.ambient_motes.accounting(),
+            (0, 0),
+            "an inactive scene must not consume events either"
+        );
+
+        // Reactivate: the very next pass must fold in everything produced while paused.
+        app.state.persistent_background_enabled = true;
+        assert!(
+            app.observe_ambient_motes(),
+            "reactivating must catch the backlog up in one pass"
+        );
+        assert_eq!(app.state.ambient_motes.accounting(), (5, 5));
     }
 
     /// The scene is a full-surface, fully opaque image whose entire safety is
