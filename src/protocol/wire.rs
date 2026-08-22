@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// 23: added `ClientMessage::KittyGraphicsCapabilityConfirmed` and
+/// `HostTerminalIdentityReported`, the Windows client's only way to carry an
+/// in-band host-terminal probe reply to the server (see `host_terminal_identity`).
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -499,6 +503,43 @@ pub enum ClientMessage {
         /// The clipboard's text, or `None` when this client's clipboard holds
         /// no readable text.
         text: Option<String>,
+    },
+
+    /// The client's terminal confirmed Kitty Graphics Protocol support by
+    /// answering the capability probe raised at attach.
+    ///
+    /// Unix clients report this identically to every other host reply: as raw
+    /// bytes through `Input`, which the server's own `RawInputEvent` framer
+    /// parses into `RawInputEvent::KittyGraphicsCapability`. A Windows
+    /// client's console input pipeline turns stdin into structured
+    /// `ClientInputEvent`s with no arm for a raw host reply — see
+    /// `crate::host_terminal_identity` — so this is the one place its answer
+    /// can travel instead. Never sent by a Unix client, which already has a
+    /// way to say this.
+    ///
+    /// Appended after `ClipboardText` for the same reason every variant above
+    /// it was appended at the end — see
+    /// `client_message_wire_tags_preserve_protocol_15_order`.
+    KittyGraphicsCapabilityConfirmed,
+
+    /// The client's terminal named itself in band, answering XTVERSION
+    /// (`CSI > q`).
+    ///
+    /// The same bargain as [`ClientMessage::KittyGraphicsCapabilityConfirmed`]:
+    /// a Unix client reports this by forwarding the raw XTVERSION reply
+    /// through `Input`, parsed server-side into
+    /// `RawInputEvent::HostTerminalIdentity`. A Windows client has no arm to
+    /// carry that raw reply back, so it reports the already-parsed identity
+    /// here instead.
+    ///
+    /// Appended after `KittyGraphicsCapabilityConfirmed` for the same reason
+    /// every variant above it was appended at the end.
+    HostTerminalIdentityReported {
+        /// The terminal's self-reported name, exactly as it wrote it.
+        name: String,
+        /// The version string as reported, unparsed. `None` when the
+        /// terminal named itself without one.
+        version: Option<String>,
     },
 }
 
@@ -1242,6 +1283,14 @@ mod tests {
             }),
             10
         );
+        assert_eq!(tag(&ClientMessage::KittyGraphicsCapabilityConfirmed), 11);
+        assert_eq!(
+            tag(&ClientMessage::HostTerminalIdentityReported {
+                name: "Rio".to_owned(),
+                version: Some("0.5.19".to_owned()),
+            }),
+            12
+        );
     }
 
     #[test]
@@ -1251,6 +1300,26 @@ mod tests {
                 request_id: u64::MAX,
                 text,
             };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[test]
+    fn client_host_terminal_probe_answer_roundtrip() {
+        for msg in [
+            ClientMessage::KittyGraphicsCapabilityConfirmed,
+            ClientMessage::HostTerminalIdentityReported {
+                name: "Rio".to_owned(),
+                version: Some("0.5.19".to_owned()),
+            },
+            ClientMessage::HostTerminalIdentityReported {
+                name: "tmux".to_owned(),
+                version: None,
+            },
+        ] {
             let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
             let (decoded, _): (ClientMessage, _) =
                 bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();

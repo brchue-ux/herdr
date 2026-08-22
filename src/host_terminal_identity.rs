@@ -58,7 +58,6 @@ impl HostTerminalIdentity {
         self.version.as_deref()
     }
 
-    #[cfg(test)]
     pub(crate) fn new(name: &str, version: Option<&str>) -> Self {
         Self {
             name: name.to_owned(),

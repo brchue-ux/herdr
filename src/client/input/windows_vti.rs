@@ -37,6 +37,8 @@ pub(super) fn raw_console_reader_loop(
                 }
                 let events = pump.idle();
                 if !drain_pump_host_cell_size(&mut pump, &event_tx)
+                    || !drain_pump_kitty_graphics_capability(&mut pump, &event_tx)
+                    || !drain_pump_host_terminal_identity(&mut pump, &event_tx)
                     || !send_windows_client_input_events(events, &event_tx)
                 {
                     return;
@@ -56,6 +58,8 @@ fn process_platform_input_items(
     for item in items {
         let events = pump.process(item);
         if !drain_pump_host_cell_size(pump, event_tx)
+            || !drain_pump_kitty_graphics_capability(pump, event_tx)
+            || !drain_pump_host_terminal_identity(pump, event_tx)
             || !send_windows_client_input_events(events, event_tx)
         {
             return false;
@@ -73,6 +77,29 @@ fn drain_pump_host_cell_size(
         Some((width_px, height_px)) => {
             super::send_windows_host_cell_size(width_px, height_px, event_tx)
         }
+        None => true,
+    }
+}
+
+#[cfg(windows)]
+fn drain_pump_kitty_graphics_capability(
+    pump: &mut WindowsInputPump,
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    if pump.take_kitty_graphics_capability_confirmed() {
+        super::send_windows_kitty_graphics_capability_confirmed(event_tx)
+    } else {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn drain_pump_host_terminal_identity(
+    pump: &mut WindowsInputPump,
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
+) -> bool {
+    match pump.take_host_terminal_identity() {
+        Some(identity) => super::send_windows_host_terminal_identity(identity, event_tx),
         None => true,
     }
 }
@@ -216,6 +243,15 @@ struct WindowsInputPump {
     /// size is the one thing in the stream that the *client* asked for and the
     /// app must never see. See `super::host_cell_size_from_raw_events`.
     host_cell_size: Option<(u32, u32)>,
+    /// The Kitty Graphics Protocol capability probe's reply, if seen since
+    /// this was last drained. Same reasoning as `host_cell_size`, and the
+    /// same reason it is client-answered rather than app-visible: see
+    /// `super::kitty_graphics_capability_from_raw_events`.
+    kitty_graphics_capability_confirmed: bool,
+    /// The XTVERSION reply, if seen since this was last drained. Same
+    /// reasoning as `host_cell_size`. See
+    /// `super::host_terminal_identity_from_raw_events`.
+    host_terminal_identity: Option<(String, Option<String>)>,
 }
 
 impl Default for WindowsInputPump {
@@ -224,6 +260,8 @@ impl Default for WindowsInputPump {
             framer: crate::raw_input::RawInputFramer::for_host_input(),
             paste_from_win32_key_records: false,
             host_cell_size: None,
+            kitty_graphics_capability_confirmed: false,
+            host_terminal_identity: None,
         }
     }
 }
@@ -332,12 +370,29 @@ impl WindowsInputPump {
         if let Some(cell) = super::host_cell_size_from_raw_events(&events) {
             self.host_cell_size = Some(cell);
         }
+        if super::kitty_graphics_capability_from_raw_events(&events) {
+            self.kitty_graphics_capability_confirmed = true;
+        }
+        if let Some(identity) = super::host_terminal_identity_from_raw_events(&events) {
+            self.host_terminal_identity = Some(identity);
+        }
         Self::raw_events_to_client_events(events)
     }
 
     /// The cell size reply seen since this was last asked, if any.
     fn take_host_cell_size(&mut self) -> Option<(u32, u32)> {
         self.host_cell_size.take()
+    }
+
+    /// Whether the Kitty Graphics Protocol capability probe was confirmed
+    /// since this was last asked.
+    fn take_kitty_graphics_capability_confirmed(&mut self) -> bool {
+        std::mem::take(&mut self.kitty_graphics_capability_confirmed)
+    }
+
+    /// The XTVERSION reply seen since this was last asked, if any.
+    fn take_host_terminal_identity(&mut self) -> Option<(String, Option<String>)> {
+        self.host_terminal_identity.take()
     }
 
     fn raw_events_to_client_events(
@@ -361,6 +416,14 @@ struct WindowsInputTranslator {
 impl WindowsInputTranslator {
     fn host_cell_size(&mut self) -> Option<(u32, u32)> {
         self.pump.take_host_cell_size()
+    }
+
+    fn kitty_graphics_capability_confirmed(&mut self) -> bool {
+        self.pump.take_kitty_graphics_capability_confirmed()
+    }
+
+    fn host_terminal_identity(&mut self) -> Option<(String, Option<String>)> {
+        self.pump.take_host_terminal_identity()
     }
 
     fn translate(&mut self, record: WindowsInputRecord) -> Vec<crate::protocol::ClientInputEvent> {
@@ -1583,6 +1646,48 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             [(Press, 3, true, 3), (Release, 1, false, 1)]
+        );
+    }
+
+    /// The bug this guards: until `WindowsInputPump` tracked this fact
+    /// separately, a Kitty capability reply arriving on this path had nowhere
+    /// to go — `windows_client_input_event_from_raw` drops
+    /// `RawInputEvent::KittyGraphicsCapability` because it is answered to the
+    /// client, not the app, and nothing else was reading it.
+    #[test]
+    fn vti_kitty_graphics_capability_reply_is_read_by_the_pump_not_the_app() {
+        let mut translator = WindowsInputTranslator::default();
+        let events: Vec<_> = "\x1b_Gi=1;OK\x1b\\"
+            .chars()
+            .map(key_char)
+            .flat_map(|record| translator.translate(record))
+            .collect();
+
+        assert!(
+            events.is_empty(),
+            "capability reply leaked to the app: {events:?}"
+        );
+        assert!(translator.kitty_graphics_capability_confirmed());
+    }
+
+    /// Same guard as `vti_kitty_graphics_capability_reply_is_read_by_the_pump_not_the_app`,
+    /// for the XTVERSION reply.
+    #[test]
+    fn vti_host_terminal_identity_reply_is_read_by_the_pump_not_the_app() {
+        let mut translator = WindowsInputTranslator::default();
+        let events: Vec<_> = "\x1bP>|Rio 0.5.19\x1b\\"
+            .chars()
+            .map(key_char)
+            .flat_map(|record| translator.translate(record))
+            .collect();
+
+        assert!(
+            events.is_empty(),
+            "identity reply leaked to the app: {events:?}"
+        );
+        assert_eq!(
+            translator.host_terminal_identity(),
+            Some(("Rio".to_owned(), Some("0.5.19".to_owned())))
         );
     }
 
