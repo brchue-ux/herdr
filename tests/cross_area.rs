@@ -850,9 +850,12 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     // Reattach and ensure client-side state reflects the persisted working status.
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
     client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
+    // "●" (the default `dots` status indicator's mark, shared with `blocked`
+    // below and distinguished only by colour) rather than the `ascii` style's
+    // `>` — see `config::model::UiConfig::default`.
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_colored_symbol(frame, ">", (249, 226, 175))
+            frame_contains_colored_symbol(frame, "●", (249, 226, 175))
         })
         .expect("frame decoding should succeed");
     assert!(
@@ -869,9 +872,10 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         "pane agent status should transition to blocked"
     );
 
+    // Same "●" mark as `working` above, at `blocked`'s own colour.
     let saw_blocked_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_colored_symbol(frame, "!", (243, 139, 168))
+            frame_contains_colored_symbol(frame, "●", (243, 139, 168))
         })
         .expect("frame decoding should succeed");
     assert!(
