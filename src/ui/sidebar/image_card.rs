@@ -8998,6 +8998,125 @@ mod a_card_is_its_own_shape {
         );
     }
 
+    /// **A card's own interior is the panel's colour, whatever state it is
+    /// in — the state lives on the border, not the body.**
+    ///
+    /// `GLASS_FACE` is a fixed tint (`measured.rs`), never a function of
+    /// [`AgentState`]/severity, so the deep-interior pixel a card publishes
+    /// must be the same colour on an idle card, a working card and a blocked
+    /// one — the visible difference between states is carried entirely by
+    /// the stroke (drawn at full alpha in the state's own ink) and the thin
+    /// inner glow right at the edge, never by the face. Before the
+    /// flight-deck circuit mockup restyle, `GLASS_FACE` was a bright cyan
+    /// (`rgba(122,196,222,.10)`) that read as a colour wash across the whole
+    /// card regardless of state; this only checks the second half of that —
+    /// that the shared interior colour is dark and desaturated like the
+    /// mockup's own `#0a1220` panel, not a light tint — because the first
+    /// half (state-independence) held before the restyle too and was never
+    /// the bug.
+    #[test]
+    fn a_cards_interior_is_state_independent_and_reads_as_the_panel() {
+        let Some(font) = font::card_font(None) else {
+            return; // No face on this machine.
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 64.0,
+            r: geometry.radius,
+        };
+        // No title, tidbit, register, mark or residue: the card's dead centre
+        // is guaranteed plain glass, never a glyph, an icon plate or a
+        // contour ring, so the sample can only be the face and the (edge-
+        // decayed, and at this distance from every edge negligible) inner
+        // glow.
+        fn content(state: AgentState, stage: LifecycleStage, hues: [f32; 5]) -> CardContent {
+            CardContent {
+                title: String::new(),
+                tidbit: None,
+                register: None,
+                state_label: String::new(),
+                state,
+                stage,
+                severity: Severity::Clear,
+                hues: StageHues(hues),
+                ground: measured::CANVAS,
+                split_channels: false,
+                seen: true,
+                depth: 1,
+                lifted: false,
+                mark: None,
+                residue: 0,
+                controls: ControlRail::default(),
+                generate: 1.0,
+                discharge: 0.0,
+                spider: None,
+                breath: 0.0,
+                wash: None,
+            }
+        }
+
+        // Three states as far apart as the alphabet gets — failed (red),
+        // idle (green) and working (gold) — each a completely different
+        // `hues` array, which is what `CardInks`/the stroke gradient reads.
+        let variants = [
+            (AgentState::Blocked, LifecycleStage::Failed, [10.0; 5]),
+            (AgentState::Idle, LifecycleStage::Running, [140.0; 5]),
+            (AgentState::Working, LifecycleStage::Running, [45.0; 5]),
+        ];
+
+        let mut interiors = Vec::new();
+        for (state, stage, hues) in variants {
+            let content = content(state, stage, hues);
+            let mut canvas = Canvas::new(220, 84);
+            draw_card(
+                &mut canvas,
+                &PlacedCard {
+                    rect,
+                    content: &content,
+                    geometry: CardGeometry::new(21.0, false),
+                },
+                font,
+            );
+            let cx = (rect.x + rect.w / 2.0) as u32;
+            let cy = (rect.y + rect.h / 2.0) as u32;
+            let idx = ((cy * 220 + cx) * 4) as usize;
+            let px = canvas.rgba8();
+            interiors.push((px[idx], px[idx + 1], px[idx + 2]));
+        }
+
+        let (r0, g0, b0) = interiors[0];
+        for (i, &(r, g, b)) in interiors.iter().enumerate() {
+            let delta = i32::from(r).abs_diff(i32::from(r0))
+                + i32::from(g).abs_diff(i32::from(g0))
+                + i32::from(b).abs_diff(i32::from(b0));
+            assert!(
+                delta <= 6,
+                "variant[{i}]'s interior {:?} differs from variant[0]'s {:?} by \
+                 {delta} — the state ink is leaking into the face rather than \
+                 staying on the border and the edge glow",
+                (r, g, b),
+                (r0, g0, b0)
+            );
+        }
+
+        let (_, saturation, lightness) = Rgb(r0, g0, b0).to_hsl();
+        assert!(
+            lightness < 0.25,
+            "the card's own interior tint is L{:.2} — that reads as a light wash, \
+             not the dark, neutral panel (#0a1220 is L0.08) the mockup draws",
+            lightness
+        );
+        assert!(
+            saturation < 0.70,
+            "the card's own interior tint is S{:.2} — a saturated cyan wash, not \
+             the mockup's desaturated navy panel",
+            saturation
+        );
+    }
+
     /// **A card blooms in whole, at its own final position and size — never a
     /// clip and never a translation.**
     ///

@@ -90,13 +90,22 @@ pub(super) const RADIUS_MAX_PX: f32 = 3.0;
 
 /// The card's face, as glass rather than as a plate.
 ///
-/// `rgba(122, 196, 222, .10)` — sampled off the reference's own mate pane. It is
-/// a *tint over what is behind it*, not a fill: at [`GLASS_FACE_ALPHA`] the
-/// starfield, and in herdr the whole-terminal scene, is measurably visible
-/// through the card. That is H7, and it is the load-bearing quality of the
-/// material — a card that occludes the sky is the tree covering the system
-/// rather than hanging in front of it.
-pub(super) const GLASS_FACE: Rgb = Rgb(122, 196, 222);
+/// Was `rgba(122, 196, 222, .10)`, sampled off the fleet-orrery reference's own
+/// mate pane — a bright cyan that, composited over the panel, read as a
+/// state-independent colour wash across the whole card body rather than a
+/// neutral one: the flight-deck circuit mockup's own `.card` (`flightdeck-
+/// spawn-reference.html`, captain-approved) is a flat `#0a1220`, its `--panel`
+/// token, on every card regardless of state. `GLASS_FACE` is now that same
+/// `rgb(10, 18, 32)`, sampled off the rendered mockup rather than its source,
+/// so the tint the glass face carries is the panel's own colour and the card
+/// reads as neutral rather than tinted. [`GLASS_FACE_ALPHA`] is untouched: the
+/// *amount* of tint is not what changed, only which colour it is. It is still
+/// a *tint over what is behind it*, not a fill — at that alpha the starfield,
+/// and in herdr the whole-terminal scene, is measurably visible through the
+/// card. That is H7, and it is the load-bearing quality of the material — a
+/// card that occludes the sky is the tree covering the system rather than
+/// hanging in front of it.
+pub(super) const GLASS_FACE: Rgb = Rgb(10, 18, 32);
 
 /// How much of the face's tint reaches the pixel. The reference's own `.10`.
 pub(super) const GLASS_FACE_ALPHA: f32 = 0.10;
