@@ -98,11 +98,27 @@ fn render_claude_triview_chrome(
     if log_y >= pane_bottom {
         return;
     }
+    // Sized to the pane's own logged commands, not the full remainder of the
+    // pane: Claude's real composer sits in a tall pane with little
+    // conversation far more often than not (its own footer pins to the
+    // literal screen bottom regardless of pane height — see
+    // MIN_TRIVIEW_BOTTOM_ROWS), so claiming every leftover row here painted
+    // a panel_bg-tinted rectangle stretching most of the pane's height with
+    // its one or two command lines bottom-anchored out of sight below it —
+    // reading as a stray tint under the composer and an empty log at a
+    // glance. An empty log draws nothing at all, leaving that space a plain
+    // continuation of the pane's own background.
+    let available_rows = pane_bottom - log_y;
+    let command_count = app.pane_command_log.lines(info.id).count() as u16;
+    let log_height = command_count.min(available_rows);
+    if log_height == 0 {
+        return;
+    }
     let log_area = Rect {
         x: area.x,
         y: log_y,
         width: area.width,
-        height: pane_bottom - log_y,
+        height: log_height,
     };
     render_pane_command_log(app, frame, info.id, log_area);
 }
@@ -1221,6 +1237,83 @@ mod tests {
             true,
             &rt
         ));
+    }
+
+    #[test]
+    fn render_claude_triview_chrome_sizes_the_log_zone_to_its_own_commands() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        app.pane_command_log.record(pane_id, "ls".to_string());
+        app.pane_command_log.record(pane_id, "pwd".to_string());
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, 20),
+            inner_rect: Rect::new(0, 0, 40, 20),
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        };
+        let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_rows: 5,
+            composer_rows: 1,
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| render_claude_triview_chrome(&app, frame, &info, layout))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Divider at row 5, composer's own row at 6, divider at row 7 — the
+        // log zone starts at row 8 and should hold exactly its two commands,
+        // not every row left in the pane down to row 19.
+        assert_eq!(buffer[(0, 8)].symbol(), "●");
+        assert_eq!(buffer[(0, 9)].symbol(), "●");
+        assert_eq!(buffer[(0, 8)].style().bg, Some(app.palette.panel_bg));
+        assert_eq!(buffer[(0, 9)].style().bg, Some(app.palette.panel_bg));
+        // Everything past the two logged commands is untouched — a plain
+        // continuation of the pane's own background, not the log's tint.
+        for row in 10..20 {
+            assert_ne!(
+                buffer[(0, row)].style().bg,
+                Some(app.palette.panel_bg),
+                "row {row} should not carry the log zone's background"
+            );
+        }
+    }
+
+    #[test]
+    fn render_claude_triview_chrome_draws_nothing_for_an_empty_log() {
+        let app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, 20),
+            inner_rect: Rect::new(0, 0, 40, 20),
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        };
+        let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_rows: 5,
+            composer_rows: 1,
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| render_claude_triview_chrome(&app, frame, &info, layout))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for row in 8..20 {
+            assert_ne!(
+                buffer[(0, row)].style().bg,
+                Some(app.palette.panel_bg),
+                "row {row} should not carry the log zone's background when there is no log"
+            );
+        }
     }
 
     #[test]
