@@ -463,6 +463,7 @@ mod tests {
             seen: true,
             depth: 0,
             lifted: false,
+            focused_space: false,
             mark: None,
             // Nothing on this card but the creature: no absorbed workers either.
             residue: 0,

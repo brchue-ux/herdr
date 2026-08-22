@@ -870,6 +870,15 @@ struct CardContent {
     seen: bool,
     depth: u8,
     lifted: bool,
+    /// Whether this row is the active/focused Space. **Not the same claim as
+    /// `lifted`**: a worker's `lifted` is the pane the terminal is currently
+    /// showing, which the captain's flight-deck mockup never accents, but a
+    /// Space's `lifted` — the cursor's row, the active Space, or one being
+    /// dragged — is exactly the row the mockup's `.card.active` singles out.
+    /// So a Space sets this from the same reading `lifted` is, and a worker
+    /// always sets it `false`. See [`CardContent::accented`], the only place
+    /// this is read.
+    focused_space: bool,
     /// The project mark, once there are any. See [`CardMark`].
     mark: Option<CardMark>,
     /// How many finished workers this mate has taken back, already capped to
@@ -935,6 +944,7 @@ impl CardContent {
         self.seen.hash(hasher);
         self.depth.hash(hasher);
         self.lifted.hash(hasher);
+        self.focused_space.hash(hasher);
         self.mark.is_some().hash(hasher);
         // A ring is settled state, so nothing else about the card moves when
         // one is added: a signature blind to this would carry the old pixels
@@ -966,6 +976,42 @@ impl CardContent {
         self.wash.map(CardWashFrame::step).hash(hasher);
     }
 
+    /// Whether this card earns the mockup's strong cyan accent — a border
+    /// drawn at full saturation and luminance, with the outer bloom laid at
+    /// its peak reach.
+    ///
+    /// Exactly two reasons, per the captain's own read of the approved
+    /// flight-deck mockup against a live capture: this is the focused Space
+    /// (`focused_space`), or this card is still mid its own arrival bloom
+    /// (`generate < 1.0`, [`super::motion::ArrivalCircuit::card`]). Neither
+    /// `state` nor `severity` is consulted — a card's own work state now
+    /// reaches the badge, the chip and the discharge filaments, never the
+    /// border, so a `working` card sitting quietly off to the side draws
+    /// exactly the same thin edge as an `idle` one.
+    fn accented(&self) -> bool {
+        self.focused_space || self.generate < 1.0
+    }
+
+    /// Whether this is a worker's card rather than a Space's — the mockup's
+    /// `.card.worker`, which alone carries a `.wk-dot` before its name.
+    ///
+    /// Read off `register`'s own tone rather than a dedicated field: a
+    /// worker's register is *always* `Some(Caption { tone: State, .. })` — its
+    /// third line is its state as a bare word, per [`content_for`]'s `Agent`
+    /// arm — and a Space's is either absent or `Register` — its own orbit
+    /// line, never `State`. No card is built any other way, so the tone
+    /// already carries this distinction without a second source of truth to
+    /// keep in sync with it.
+    fn is_worker(&self) -> bool {
+        matches!(
+            self.register,
+            Some(Caption {
+                tone: CaptionTone::State,
+                ..
+            })
+        )
+    }
+
     /// The light of one stage on this card, at this card's severity.
     ///
     /// The two channels are supplied from two different places and meet only in
@@ -974,11 +1020,11 @@ impl CardContent {
     /// neither is consulted about the other's number.
     fn light_of(&self, stage: LifecycleStage) -> CardLight {
         CardLight::of(
-            stage,
             self.severity,
             self.hues.of(stage),
             self.ground,
             self.split_channels,
+            self.accented(),
         )
     }
 
@@ -1158,20 +1204,23 @@ struct CardLight {
 }
 
 impl CardLight {
-    /// The light one stage at one severity is drawn in, over `ground`.
+    /// The light one severity is drawn in, over `ground`, at one card's
+    /// accent.
     ///
     /// The one place the two channels meet, and they meet by being handed to
     /// different arguments of one function that never crosses them: `hue` goes
     /// only into the hue slot, `severity` only into the saturation and contrast
-    /// slots. `stage` is consulted a second time for the bloom, which is the
+    /// slots. `accented` is consulted a second time for the bloom, which is the
     /// depth cue and not either channel — see [`CardLight::bloom`].
-    fn of(
-        stage: LifecycleStage,
-        severity: Severity,
-        hue: f32,
-        ground: Rgb,
-        split_channels: bool,
-    ) -> Self {
+    ///
+    /// **Not `stage`.** The border used to speak a card's own `LifecycleStage`
+    /// directly — a queued row dim, a running one at full strength — which is
+    /// exactly the "working card glows all the time" defect the captain's
+    /// `herdr-card-border-dot-final-match-20260822` screenshots caught: the
+    /// approved mockup reserves the strong accent for the focused Space and a
+    /// card mid its own arrival, never for a card's work state. `accented`
+    /// carries that binary instead — see [`CardContent::accented`].
+    fn of(severity: Severity, hue: f32, ground: Rgb, split_channels: bool, accented: bool) -> Self {
         let ink = if split_channels {
             Rgb::from_tuple(crate::anim::cell::signal_ink(
                 hue,
@@ -1180,14 +1229,21 @@ impl CardLight {
             ))
         } else {
             // The reference's own answer to "what carries state without a
-            // rainbow": one hue, with saturation and light muted by stage.
-            let mix = crate::anim::cell::one_hue_stage_mix(stage);
+            // rainbow": one hue, with saturation and light muted to the
+            // `Queued` endpoint on an ordinary card and lifted to the
+            // `Running` endpoint only when `accented` — never picked by the
+            // card's own stage any more.
+            let mix = crate::anim::cell::one_hue_stage_mix(if accented {
+                LifecycleStage::Running
+            } else {
+                LifecycleStage::Queued
+            });
             measured::STROKE_A.restate(mix.saturation, mix.luminance)
         };
         Self {
             ink,
             lum: 1.0,
-            bloom: presence(stage),
+            bloom: presence(accented),
         }
     }
 
@@ -1267,18 +1323,19 @@ impl CardLight {
     }
 }
 
-/// How far off the panel a card at this stage stands, before the breath moves
-/// it.
+/// How far off the panel an accented card stands, before the breath moves it.
 ///
-/// The depth channel, kept on stage because that is what the visual target puts
-/// there: work in flight comes forward, a queue sits flat in the panel, and a
-/// finished card is part-way back. `Failed` stands as far forward as `Running` —
-/// a failure is not on the back burner.
-fn presence(stage: LifecycleStage) -> f32 {
-    match stage {
-        LifecycleStage::Running | LifecycleStage::Waiting | LifecycleStage::Failed => 1.0,
-        LifecycleStage::Done => 0.35,
-        LifecycleStage::Queued => 0.0,
+/// The depth channel. It used to be kept on stage — work in flight forward, a
+/// queue flat, a finished card part-way back — but that is the same
+/// state-driven glow the border's own ink gave up in [`CardLight::of`]: the
+/// mockup's box-shadow lift belongs to the focused Space and an arriving card
+/// alone, never to what a card's own work happens to be doing. So this is
+/// binary now, on the same signal.
+fn presence(accented: bool) -> f32 {
+    if accented {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -2487,6 +2544,62 @@ fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, opacity: 
     }
 }
 
+/// The worker status dot's diameter, as a fraction of [`TITLE_PX`] — the
+/// mockup's `.wk-dot` (5px) against its own worker `.card-name` type size
+/// (0.62rem, 9.92px at the mockup's 16px root): a ratio of about one half.
+const DOT_DIAMETER_MUL: f32 = 0.5;
+
+/// The air between the dot and the name that follows it, the same way: the
+/// mockup's `.wk-dot`'s own `margin-right` (0.35rem, 5.6px) against that same
+/// 9.92px type size.
+const DOT_GAP_MUL: f32 = 0.55;
+
+/// How far past its own edge the dot's glow reaches, as a multiple of its
+/// radius — the mockup's `box-shadow: 0 0 5px`, a blur about as wide as the
+/// dot itself.
+const DOT_GLOW_MUL: f32 = 2.0;
+
+/// The glow's own peak alpha, right at the dot's edge — the mockup's
+/// `rgba(90,209,255,0.6)`.
+const DOT_GLOW_ALPHA: f32 = 0.6;
+
+/// A small solid circle with a soft falloff outside it — the worker status
+/// dot, `.wk-dot` in the flight-deck mockup.
+///
+/// Always drawn at [`measured::STROKE_A`], the tree's own full-strength
+/// cyan, never the card's own (possibly dimmed) stroke ink: the mockup's dot
+/// is cyan on every worker row it draws, discharging hard or sitting idle
+/// alike, so this is one more place — with the badge and the discharge
+/// filaments — a worker's state reaches the card outside the border.
+fn draw_worker_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, opacity: f32) {
+    let ink = measured::STROKE_A;
+    let glow_radius = radius * DOT_GLOW_MUL;
+    let glow_sigma = (glow_radius - radius).max(0.5);
+    let x0 = (center.0 - glow_radius).floor().max(0.0) as u32;
+    let y0 = (center.1 - glow_radius).floor().max(0.0) as u32;
+    let x1 = ((center.0 + glow_radius).ceil() as u32).min(sheet.width());
+    let y1 = ((center.1 + glow_radius).ceil() as u32).min(sheet.height());
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let d = ((px - center.0).powi(2) + (py - center.1).powi(2)).sqrt() - radius;
+            let fill = coverage(d);
+            if fill > 0.0 {
+                sheet.blend(x, y, ink, fill * opacity);
+                continue;
+            }
+            // Past the solid disc, a soft falloff carries the glow — never
+            // layered on top of the disc itself, which is already at full
+            // alpha and has nothing to gain from it.
+            let glow = (-(d * d) / (2.0 * glow_sigma * glow_sigma)).exp() * DOT_GLOW_ALPHA;
+            if glow > 0.001 {
+                sheet.blend(x, y, ink, glow * opacity);
+            }
+        }
+    }
+}
+
 fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // The card's chrome and its type are drawn at the settled light; only the
     // body — stroke, fill and inner glow — sweeps with the wash and swings with
@@ -2745,8 +2858,20 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // fewer simply leaves the slot empty; the block is reserved on every card so
     // a row's height does not move when the fleet republishes.
     //
-    // The same numbers the fit tests measure, not a second pair derived here.
+    // The same numbers the fit tests measure, not a second pair derived here —
+    // less the worker dot's own reserve on the first line, which `text_column`
+    // does not know about: a worker's dot sits inline with its name and
+    // nowhere else on the card, so it is taken off the *title's* first-line
+    // width rather than off every line `text_column` lays out, the same way
+    // the rail is taken off the first line and no other.
+    let dot_diameter = TITLE_PX * DOT_DIAMETER_MUL;
+    let dot_reserve = if content.is_worker() {
+        dot_diameter + TITLE_PX * DOT_GAP_MUL
+    } else {
+        0.0
+    };
     let widths = column.title_widths();
+    let widths = ((widths.0 - dot_reserve).max(0.0), widths.1);
     if widths.0 <= 1.0 || widths.1 <= 1.0 {
         return;
     }
@@ -2781,19 +2906,29 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
 
     let ink = measured::INK.restate(1.0, (0.55 + 0.45 * lum).min(1.0));
     let first_line_right = ox + column.first_line_right();
+    let first_line_left = text_left + dot_reserve;
     for (index, line) in lines.iter().enumerate() {
         let baseline = block_top + leading * index as f32 + title_metrics.ascent;
-        // The first line is clipped short of the rail, every line after it runs
-        // the card's full width. A word too wide to break is cut at its own
-        // line's edge, which for line one is the edge the rail stands on.
-        let right = if index == 0 {
-            first_line_right
+        // The first line is clipped short of the rail (and, on a worker,
+        // pushed right of its own dot) — every line after it runs the card's
+        // full width. A word too wide to break is cut at its own line's edge,
+        // which for line one is whichever of those two it met first.
+        let (left, right) = if index == 0 {
+            (first_line_left, first_line_right)
         } else {
-            text_right
+            (text_left, text_right)
         };
         draw_text(
-            sheet, font, line, TITLE_PX, text_left, baseline, ink, text_left, right, opacity,
+            sheet, font, line, TITLE_PX, left, baseline, ink, left, right, opacity,
         );
+    }
+    if content.is_worker() {
+        let radius = dot_diameter / 2.0;
+        let center = (
+            text_left + radius,
+            block_top + title_metrics.line_height / 2.0,
+        );
+        draw_worker_dot(sheet, center, radius, opacity);
     }
 
     let caption_ink = measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX);
@@ -3350,6 +3485,10 @@ fn content_for(
                 // inside a cell — so a cursor that only lifted the active Space
                 // would leave the keyboard cursor with nothing to stand on.
                 lifted: super::workspace_row_highlighted(app, *ws_idx),
+                // The same reading as `lifted`: a Space's own focus *is* what
+                // the mockup's `.card.active` accents. See
+                // [`CardContent::focused_space`].
+                focused_space: super::workspace_row_highlighted(app, *ws_idx),
                 // Filled in by `compute_card_placement`, the pass that knows
                 // how far through its own arrival this row is.
                 generate: 1.0,
@@ -3416,6 +3555,11 @@ fn content_for(
                 seen: detail.seen,
                 depth: entry.depth(),
                 lifted: app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id),
+                // A worker is never the focused Space — only a Space can be
+                // one — so a worker earns the strong accent solely by
+                // arriving, never by being the pane the terminal shows. See
+                // [`CardContent::focused_space`].
+                focused_space: false,
                 generate: 1.0,
                 discharge: discharge_of(detail.state, body),
                 mark: None,
@@ -3861,6 +4005,12 @@ pub(crate) struct CardContentWire {
     seen: bool,
     depth: u8,
     lifted: bool,
+    /// Defaulted rather than required, so a server that has not yet been
+    /// upgraded — and so never sends this field — hands an older client a
+    /// card that reads as unaccented-by-focus rather than one deserialisation
+    /// rejects outright.
+    #[serde(default)]
+    focused_space: bool,
     mark: Option<CardMark>,
     residue: u8,
     controls: ControlRail,
@@ -3891,6 +4041,7 @@ impl From<&CardContent> for CardContentWire {
             seen: content.seen,
             depth: content.depth,
             lifted: content.lifted,
+            focused_space: content.focused_space,
             mark: content.mark,
             residue: content.residue,
             controls: content.controls,
@@ -3918,6 +4069,7 @@ impl From<CardContentWire> for CardContent {
             seen: wire.seen,
             depth: wire.depth,
             lifted: wire.lifted,
+            focused_space: wire.focused_space,
             mark: wire.mark,
             residue: wire.residue,
             generate: wire.generate,
@@ -6861,6 +7013,7 @@ mod tests {
                 seen: true,
                 depth: 1,
                 lifted: false,
+                focused_space: false,
                 mark: None,
                 residue: 0,
                 controls: ControlRail {
@@ -6905,6 +7058,185 @@ mod tests {
         assert!(
             !paints_near(None, measured::BADGE_OK) && !paints_near(None, measured::BADGE_WARN),
             "a card with no badge drew badge-coloured pixels anyway"
+        );
+    }
+
+    /// **Only the focused Space and an arriving card get the strong accent.**
+    ///
+    /// The captain's own read of `herdr-card-border-dot-final-match-20260822`'s
+    /// screenshots: a plain `working` card, neither the focused Space nor mid
+    /// its own arrival, has to draw the same thin border an idle one does —
+    /// the accent is `focused_space || generate < 1.0` and nothing else,
+    /// whatever `AgentState`/`severity` the card carries.
+    #[test]
+    fn only_the_focused_space_or_an_arriving_card_is_accented() {
+        fn content(focused_space: bool, generate: f32) -> CardContent {
+            CardContent {
+                title: String::new(),
+                tidbit: None,
+                register: None,
+                state_label: String::new(),
+                state: AgentState::Working,
+                stage: LifecycleStage::Running,
+                severity: Severity::Critical,
+                hues: StageHues([196.0; 5]),
+                ground: measured::CANVAS,
+                split_channels: false,
+                seen: true,
+                depth: 1,
+                lifted: false,
+                focused_space,
+                mark: None,
+                residue: 0,
+                controls: ControlRail::default(),
+                generate,
+                discharge: 0.0,
+                spider: None,
+                breath: 0.0,
+                wash: None,
+            }
+        }
+
+        let ordinary = content(false, 1.0);
+        let focused = content(true, 1.0);
+        let arriving = content(false, 0.4);
+
+        assert!(
+            !ordinary.accented(),
+            "a plain working card read as accented"
+        );
+        assert!(
+            focused.accented(),
+            "the focused Space did not read as accented"
+        );
+        assert!(
+            arriving.accented(),
+            "an arriving card did not read as accented"
+        );
+
+        let dim = ordinary.arrived_light();
+        let bright_focused = focused.arrived_light();
+        let bright_arriving = arriving.arrived_light();
+        assert_eq!(
+            bright_focused.ink, bright_arriving.ink,
+            "the focused Space and an arriving card should draw the same strong accent"
+        );
+        assert_ne!(
+            dim.ink, bright_focused.ink,
+            "an unaccented working card drew the same ink as the focused Space"
+        );
+        assert!(
+            dim.bloom < bright_focused.bloom,
+            "an unaccented card's bloom ({:.3}) should be strictly less than an \
+             accented one's ({:.3})",
+            dim.bloom,
+            bright_focused.bloom
+        );
+    }
+
+    /// **The worker status dot exists, and only on a worker.**
+    ///
+    /// `image_card.rs` never drew the pixel twin of the character path's
+    /// `state_icon` dots (PR #180) — the mockup's `.wk-dot`, a small solid
+    /// circle at the tree's own full-strength cyan before a worker's name.
+    /// Checked by colour rather than by position: an unaccented card at rest
+    /// draws no other pixel anywhere near `measured::STROKE_A`'s own
+    /// saturation — the border and face are both dimmed off it — so any pixel
+    /// that close can only be the dot (or its glow).
+    #[test]
+    fn a_worker_card_draws_its_status_dot_and_a_space_does_not() {
+        let Some(font) = font::card_font(None) else {
+            return; // No face on this machine.
+        };
+        let geometry = CardGeometry::new(21.0, false);
+        let rect = RoundRect {
+            x: 10.0,
+            y: 10.0,
+            w: 200.0,
+            h: 64.0,
+            r: geometry.radius,
+        };
+        fn content(register: Option<Caption>) -> CardContent {
+            CardContent {
+                title: "fm/verve-notes".into(),
+                tidbit: None,
+                register,
+                state_label: "working".into(),
+                state: AgentState::Working,
+                stage: LifecycleStage::Running,
+                severity: Severity::Clear,
+                hues: StageHues([196.0; 5]),
+                ground: measured::CANVAS,
+                split_channels: false,
+                seen: true,
+                depth: 1,
+                lifted: false,
+                focused_space: false,
+                mark: None,
+                residue: 0,
+                controls: ControlRail::default(),
+                generate: 1.0,
+                discharge: 0.0,
+                spider: None,
+                breath: 0.0,
+                wash: None,
+            }
+        }
+
+        let worker = content(Some(Caption {
+            text: "working".into(),
+            tone: CaptionTone::State,
+        }));
+        let space = content(Some(Caption {
+            text: "streak 5 · T 13.4s".into(),
+            tone: CaptionTone::Register,
+        }));
+        assert!(
+            worker.is_worker(),
+            "the fixture's own worker did not read as one"
+        );
+        assert!(
+            !space.is_worker(),
+            "the fixture's own Space read as a worker"
+        );
+
+        let close_to_cyan = |canvas: &Canvas| {
+            canvas.rgba8().chunks_exact(4).any(|c| {
+                c[3] > 40
+                    && i32::from(c[0]).abs_diff(i32::from(measured::STROKE_A.0)) <= 24
+                    && i32::from(c[1]).abs_diff(i32::from(measured::STROKE_A.1)) <= 24
+                    && i32::from(c[2]).abs_diff(i32::from(measured::STROKE_A.2)) <= 24
+            })
+        };
+
+        let mut worker_canvas = Canvas::new(220, 84);
+        draw_card(
+            &mut worker_canvas,
+            &PlacedCard {
+                rect,
+                content: &worker,
+                geometry: CardGeometry::new(21.0, false),
+            },
+            font,
+        );
+        assert!(
+            close_to_cyan(&worker_canvas),
+            "a worker card drew no pixel near the tree's own cyan — the status dot is missing"
+        );
+
+        let mut space_canvas = Canvas::new(220, 84);
+        draw_card(
+            &mut space_canvas,
+            &PlacedCard {
+                rect,
+                content: &space,
+                geometry: CardGeometry::new(21.0, false),
+            },
+            font,
+        );
+        assert!(
+            !close_to_cyan(&space_canvas),
+            "a Space card, which the mockup never gives a dot, drew one anyway"
         );
     }
 
@@ -7264,15 +7596,17 @@ mod tests {
     }
 
     /// With the split switched off the card is exactly what it was: the
-    /// reference's one hue family, with state carried by saturation and bloom.
+    /// reference's one hue family, with the accent carried by saturation and
+    /// bloom — but keyed on `accented` rather than on the card's own stage,
+    /// since the border no longer speaks work state at all.
     ///
     /// This is the invariant the card shipped with, kept as the `stage_hue =
     /// false` contract rather than deleted, so the fallback really is the old
     /// look and not an untested branch nobody has drawn.
     #[test]
     fn without_the_split_a_card_stays_inside_the_measured_hue_family() {
-        for stage in LifecycleStage::ALL {
-            let light = CardLight::of(stage, Severity::Critical, 0.0, measured::CANVAS, false);
+        for accented in [false, true] {
+            let light = CardLight::of(Severity::Critical, 0.0, measured::CANVAS, false, accented);
             assert!((0.0..=1.0).contains(&light.lum));
             assert!((0.0..=1.0).contains(&light.bloom));
             // Desaturating toward grey is allowed; rotating the hue is not, and
@@ -7280,7 +7614,7 @@ mod tests {
             let Rgb(r, g, b) = light.ink;
             assert!(
                 b >= r && g >= r,
-                "{stage:?} moved the stroke out of the blue-cyan family: {r},{g},{b}"
+                "accented={accented} moved the stroke out of the blue-cyan family: {r},{g},{b}"
             );
         }
     }
@@ -7301,7 +7635,7 @@ mod tests {
             let inks: Vec<_> = Severity::ALL
                 .into_iter()
                 .map(|severity| {
-                    CardLight::of(stage, severity, hue, ground, true)
+                    CardLight::of(severity, hue, ground, true, false)
                         .ink
                         .to_hsl()
                 })
@@ -7318,7 +7652,7 @@ mod tests {
         for severity in Severity::ALL {
             let placed = crate::anim::cell::signal_light(severity, ground.as_tuple());
             for (stage, hue) in LifecycleStage::ALL.into_iter().zip(hues) {
-                let (_, sat, light) = CardLight::of(stage, severity, hue, ground, true)
+                let (_, sat, light) = CardLight::of(severity, hue, ground, true, false)
                     .ink
                     .to_hsl();
                 assert!(
@@ -7327,7 +7661,7 @@ mod tests {
                      asks for {placed:.3}: the stage channel reached into the \
                      severity channel"
                 );
-                let first = CardLight::of(LifecycleStage::Queued, severity, hues[0], ground, true)
+                let first = CardLight::of(severity, hues[0], ground, true, false)
                     .ink
                     .to_hsl()
                     .1;
@@ -7358,7 +7692,7 @@ mod tests {
                         &crate::app::state::Palette::catppuccin(),
                         &crate::terminal_theme::TerminalTheme::default(),
                     );
-                    let (h, _, l) = CardLight::of(stage, severity, hue, ground, true)
+                    let (h, _, l) = CardLight::of(severity, hue, ground, true, false)
                         .ink
                         .to_hsl();
                     (stage, severity, h, l)
@@ -7406,7 +7740,7 @@ mod tests {
             let greys: Vec<f32> = Severity::ALL
                 .into_iter()
                 .map(|severity| {
-                    let ink = CardLight::of(stage, severity, hue, ground, true).ink;
+                    let ink = CardLight::of(severity, hue, ground, true, false).ink;
                     crate::ui::color::relative_luminance(ink.as_tuple())
                 })
                 .collect();
@@ -9448,6 +9782,7 @@ mod a_card_is_its_own_shape {
                 seen: true,
                 depth: 1,
                 lifted: false,
+                focused_space: false,
                 mark: None,
                 residue: 0,
                 controls: ControlRail::default(),
@@ -9557,6 +9892,7 @@ mod a_card_is_its_own_shape {
             seen: true,
             depth: 1,
             lifted: false,
+            focused_space: false,
             mark: None,
             residue: 0,
             controls: ControlRail::default(),
@@ -9700,6 +10036,7 @@ mod a_card_is_its_own_shape {
             seen: true,
             depth: 1,
             lifted: false,
+            focused_space: false,
             mark: None,
             residue: 0,
             controls: ControlRail::default(),
@@ -12052,6 +12389,15 @@ mod cards_breathe_and_wash {
     /// is recessed rather than attention-seeking). A breath that brightened
     /// would make an idle card periodically outshine a working one, which
     /// inverts the only thing a card's light is for.
+    ///
+    /// The depth cue used to be the bloom specifically — an ordinary card had
+    /// a real halo to recede from, and receding read as depth rather than as a
+    /// dimmer. It no longer does: only the focused Space and an arriving card
+    /// carry any bloom at all now ([`CardContent::accented`]), so an
+    /// unaccented resting card's bloom sits flat at its own settled zero and
+    /// the whole of the breath has to read in luminance alone. Asserting the
+    /// bloom stays flat here is what would catch the border speaking work
+    /// state again.
     #[test]
     fn at_rest_a_cards_breath_only_ever_sets_it_back() {
         let (mut app, now) = breathing_fleet();
@@ -12089,16 +12435,15 @@ mod cards_breathe_and_wash {
             (hi - lo) / hi.max(1e-6)
         };
         let lum_swing = swing(&lums);
-        let bloom_swing = swing(&blooms);
         assert!(
             lum_swing > 0.02,
             "the card did not breathe at all: its light moved by {lum_swing:.4}"
         );
         assert!(
-            bloom_swing > lum_swing * 2.0,
-            "the depth cue is the point: the bloom swung {bloom_swing:.3} against \
-             the ink's {lum_swing:.3}, so this reads as a dimmer rather than as \
-             a card settling back into the panel"
+            blooms.iter().all(|bloom| *bloom == settled.bloom),
+            "an unaccented resting card's bloom moved at all ({blooms:?}) — it \
+             has no depth to recede from any more, so this is the border \
+             speaking work state again"
         );
         // And it stays readable at the trough. The spec's digestibility
         // condition does not take a break for half of every cycle.
@@ -12335,10 +12680,17 @@ mod cards_breathe_and_wash {
     /// in [`CardLight::breathed`], so the overshoot existed in the engine and
     /// never once in the artwork.
     ///
-    /// Asserted on the *drawn ink* and not on the envelope, because a number
-    /// that survives quantisation and is then flattened on the way to the
-    /// colour has still not reached the screen: a card at the top of its snap
-    /// has to be measurably further back than the same card at a full breath.
+    /// Asserted on the *drawn ink's luminance* and not on the envelope,
+    /// because a number that survives quantisation and is then flattened on
+    /// the way to the colour has still not reached the screen: a card at the
+    /// top of its snap has to be measurably further back than the same card
+    /// at a full breath.
+    ///
+    /// Luminance rather than bloom now: bloom is no longer a function of a
+    /// card's own work state at all ([`CardContent::accented`]), so an
+    /// unaccented working card's bloom sits flat at zero throughout and has
+    /// nothing left to bottom out into. The breath still dips luminance on
+    /// every card, accented or not, so that channel still carries the claim.
     #[test]
     fn the_snaps_overshoot_survives_the_ladder_and_reaches_the_ink() {
         let (mut app, now) = breathing_fleet();
@@ -12346,7 +12698,7 @@ mod cards_breathe_and_wash {
             return;
         }
         let mut peak_breath = f32::MIN;
-        let mut deepest_bloom = f32::MAX;
+        let mut deepest_lum = f32::MAX;
         // Four live cycles at a step far finer than the ladder, so what is
         // being walked is the curve rather than the sampling.
         for step in 0..=2_000u64 {
@@ -12355,7 +12707,7 @@ mod cards_breathe_and_wash {
                 return;
             };
             peak_breath = peak_breath.max(card.breath);
-            deepest_bloom = deepest_bloom.min(card.arrived_light().bloom);
+            deepest_lum = deepest_lum.min(card.arrived_light().lum);
         }
         assert!(
             peak_breath > 1.0,
@@ -12371,15 +12723,15 @@ mod cards_breathe_and_wash {
             "the envelope reached {peak_breath:.4}, short of the stated ten per \
              cent overshoot by more than the ladder's own rung of {rung:.4}"
         );
-        // And it is visible: a full breath sets the bloom back by
-        // `BREATH_BLOOM_DIP`, so an overshoot has to set it back further still.
+        // And it is visible: a full breath sets luminance back by
+        // `BREATH_LUM_DIP`, so an overshoot has to set it back further still.
         let Some(card) = card_in(&app, AgentState::Working) else {
             return;
         };
-        let at_full_breath = card.settled_light().bloom * (1.0 - BREATH_BLOOM_DIP);
+        let at_full_breath = card.settled_light().lum * (1.0 - BREATH_LUM_DIP);
         assert!(
-            deepest_bloom < at_full_breath,
-            "the card's bloom bottomed out at {deepest_bloom:.4}, which is no \
+            deepest_lum < at_full_breath,
+            "the card's luminance bottomed out at {deepest_lum:.4}, which is no \
              deeper than the {at_full_breath:.4} a full breath alone reaches — \
              the overshoot is in the envelope but not in the ink"
         );
@@ -12467,12 +12819,17 @@ mod cards_breathe_and_wash {
     }
 
     /// **The acceptance criterion.** A state change leaves the *whole* card
-    /// changed, not a highlight that passes over and leaves nothing behind.
+    /// drawn in the destination's arrived light — never a half-updated band —
+    /// once the wash's own window has closed.
     ///
-    /// Checked at the end of the sweep across every column of the card: all of
-    /// them are the new state's light, none of them have gone back. A band
-    /// would end with the card exactly as it started, which is the thing this
-    /// is not.
+    /// This used to also assert that the destination's ink differed from the
+    /// state the card left, back when the border spoke a card's own
+    /// `AgentState` directly. It no longer does — see
+    /// [`CardContent::accented`] — so an unaccented card genuinely draws the
+    /// same thin default at every stage now, and Idle and Working converging
+    /// on one ink is the captain's
+    /// `herdr-card-border-dot-final-match-20260822` fix working as intended,
+    /// not a regression this test should still catch.
     #[test]
     fn a_finished_wash_leaves_the_whole_card_in_the_new_state() {
         let Some((mut app, now, _)) = washing(AgentState::Idle, AgentState::Working) else {
@@ -12499,33 +12856,30 @@ mod cards_breathe_and_wash {
                 "column {index} of 32 was left in a state the card is no longer in"
             );
         }
-        // And the state it left is genuinely gone from the card, rather than
-        // the two states having happened to resolve alike.
-        assert_ne!(
-            arrived,
-            card.light_at(AgentState::Idle).breathed(card.breath).inks()
-        );
     }
 
-    /// And while it is crossing, the card really is two states: the new one
-    /// behind the front and the one it left ahead of it.
+    /// **An ordinary wash no longer has two sides.**
     ///
-    /// This is what makes the change legible *as a change* rather than as a
-    /// card that is suddenly a different colour, and it is the reason the wash
-    /// has to remember the state the card came from at all.
+    /// Before the captain's `herdr-card-border-dot-final-match-20260822` fix
+    /// this swept a visible front of bloom across the card as its `AgentState`
+    /// crossed a wash — the new state's presence ahead of the front, the old
+    /// state's behind it. That was the same "the border speaks work state"
+    /// defect the fix retired: a card's own work no longer reaches the border
+    /// at all, only whether it is the focused Space or mid its own arrival —
+    /// [`CardContent::accented`] — so an unaccented card crossing
+    /// Idle→Working, neither end accented, now reads as one flat state
+    /// throughout the sweep. Nothing left to be "two sides" of.
     #[test]
-    fn a_wash_in_flight_is_new_on_its_left_and_old_on_its_right() {
-        let Some((mut app, now, from)) = washing(AgentState::Idle, AgentState::Working) else {
+    fn a_wash_in_flight_never_shows_two_sides_on_an_unaccented_card() {
+        let Some((mut app, now, _)) = washing(AgentState::Idle, AgentState::Working) else {
             return;
         };
         let window = app.sidebar_cards.wash_duration();
-        let left_behind = presence(crate::app::lifecycle::stage(None, from));
-        let arriving = presence(crate::app::lifecycle::stage(None, AgentState::Working));
 
         // Somewhere in the middle of the sweep. Sampled across several steps
         // rather than at one, because where the front is at any single instant
         // is the curve's business and not this test's.
-        let mut saw_two_sides = false;
+        let mut saw_a_wash = false;
         for step in 1..=8 {
             let at = now + window / 12 * step;
             app.anim.advance(at);
@@ -12534,36 +12888,20 @@ mod cards_breathe_and_wash {
                 return;
             };
             let Some(_) = card.wash else { continue };
+            saw_a_wash = true;
             let columns = across(&card);
             let left = columns.first().copied().expect("sampled");
             let right = columns.last().copied().expect("sampled");
-            // Read as the *bloom strength*: it is the number the two states
-            // differ in most, and it is what the halo — the depth cue the whole
-            // effect is about — is laid from.
-            if left.bloom > right.bloom + 1e-3 {
-                saw_two_sides = true;
-                assert!(
-                    left.bloom <= arriving + 1e-6,
-                    "the left of the card overshot the state it was arriving at"
-                );
-                assert!(
-                    right.bloom <= left_behind + 1e-6,
-                    "the right of the card had already passed the state it is \
-                     still meant to be in"
-                );
-                // And every column between the two is on the ramp between them,
-                // in order: a front, not two halves.
-                for pair in columns.windows(2) {
-                    assert!(
-                        pair[0].bloom >= pair[1].bloom - 1e-3,
-                        "the front doubled back on itself inside the card"
-                    );
-                }
-            }
+            assert!(
+                (left.bloom - right.bloom).abs() < 1e-6,
+                "an unaccented card's wash showed two different blooms \
+                 ({left:?} against {right:?}) — the border is speaking work \
+                 state again"
+            );
         }
         assert!(
-            saw_two_sides,
-            "the card was never two states at once, so nothing swept across it"
+            saw_a_wash,
+            "the fixture never crossed a wash at all, so this proved nothing"
         );
     }
 
@@ -13045,6 +13383,7 @@ mod cards_breathe_and_wash {
             seen: true,
             depth: 1,
             lifted: false,
+            focused_space: false,
             mark: None,
             residue,
             controls: ControlRail::default(),
