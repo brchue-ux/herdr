@@ -83,6 +83,17 @@ const RESIZE_REDRAW_WATCH_WINDOW: Duration = Duration::from_millis(400);
 /// renders far more often than this, so the common continuously-visible
 /// case never crosses it.
 const HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD: Duration = Duration::from_millis(500);
+/// Leak guard on the alternate-screen read hold.
+///
+/// Unlike the other holds in this file, that one is released by another
+/// module's state machine (`src/server/alt_screen_read.rs`) rather than by a
+/// deadline of its own, and that machine's worst case — `MAX_DURATION` before
+/// it forces a restore plus `MAX_RESTORE_DURATION` to finish one — is a little
+/// over 20 seconds. This is comfortably past that, so it can only ever fire
+/// for a release that never arrives (a pane whose runtime disappeared
+/// mid-harvest takes `complete_fallback(None)`, which has no runtime to
+/// release through) and never for a harvest that is still running.
+const ALT_SCREEN_READ_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
@@ -249,6 +260,10 @@ pub(crate) struct GhosttyPaneCore {
     /// still until the read completes and the app is scrolled back to where it
     /// started.
     alt_screen_read_hold: bool,
+    /// When [`Self::alt_screen_read_hold`] was raised, so a release that never
+    /// arrives cannot freeze the pane for the rest of its life. See
+    /// [`ALT_SCREEN_READ_HOLD_TIMEOUT`].
+    alt_screen_read_hold_since: Option<Instant>,
     /// Armed by a resize that found this pane with real content on screen;
     /// consumed by the first write inside [`RESIZE_REDRAW_WATCH_WINDOW`] that
     /// looks like the child clearing its screen to redraw for the new size, at
@@ -1072,6 +1087,7 @@ impl GhosttyPaneTerminal {
                 render_state_last_refreshed_at: None,
                 windows_powershell_prompt_cwd_reporting: false,
                 alt_screen_read_hold: false,
+                alt_screen_read_hold_since: None,
                 awaiting_resize_redraw_since: None,
                 resize_recovery_started_at: None,
             }),
@@ -1089,6 +1105,7 @@ impl GhosttyPaneTerminal {
     pub fn set_alt_screen_read_hold(&self, active: bool) {
         if let Ok(mut core) = self.core.lock() {
             core.alt_screen_read_hold = active;
+            core.alt_screen_read_hold_since = active.then(Instant::now);
         }
     }
 
@@ -1893,6 +1910,17 @@ impl GhosttyPaneTerminal {
             .is_some_and(|core| core.resize_recovery_started_at.is_some())
     }
 
+    #[cfg(test)]
+    fn age_alt_screen_read_hold_for_test(&self, elapsed: Duration) {
+        if let Ok(mut core) = self.core.lock() {
+            if let Some(started) = core.alt_screen_read_hold_since.as_mut() {
+                if let Some(earlier) = started.checked_sub(elapsed) {
+                    *started = earlier;
+                }
+            }
+        }
+    }
+
     /// Pushes the pane's last-refreshed timestamp `elapsed` into the past, so
     /// tests can simulate a pane that has not been rendered in a while (a
     /// hidden/backgrounded pane) without actually waiting.
@@ -2622,6 +2650,19 @@ fn synchronized_update_holds_frame(core: &mut GhosttyPaneCore, now: Instant) -> 
     now.duration_since(started) < SYNCHRONIZED_UPDATE_HOLD_TIMEOUT
 }
 
+/// Whether this pane must draw the frame it showed before an alternate-screen
+/// history harvest started driving its own app with real scroll input.
+///
+/// Bounded by [`ALT_SCREEN_READ_HOLD_TIMEOUT`] purely as a leak guard; the
+/// harvest's own state machine releases this long before that.
+fn alt_screen_read_holds_frame(core: &GhosttyPaneCore, now: Instant) -> bool {
+    if !core.alt_screen_read_hold {
+        return false;
+    }
+    core.alt_screen_read_hold_since
+        .is_none_or(|started| now.duration_since(started) < ALT_SCREEN_READ_HOLD_TIMEOUT)
+}
+
 /// Whether this pane must draw its pre-resize frame instead of the live grid,
 /// because it was resized while it had real content on screen and its child's
 /// own resize-triggered redraw may still be landing.
@@ -2645,14 +2686,56 @@ enum RenderStateRefresh {
     Failed,
 }
 
+/// Why `render_state` is being brought up to date.
+///
+/// Every hold in this file works by *not* reading the live grid, leaving
+/// `render_state` at the last complete frame — so a hold only actually holds
+/// for as long as nothing else advances that snapshot. Reading it is what a
+/// paint path does; a reader that merely needs the pane's current cells (the
+/// per-frame hyperlink scan, the pane-read API, a palette query) must go
+/// through the same seam so it cannot walk the grid forward behind an
+/// engaged hold, and must not leave the pane looking like it was presented.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenderStateUse {
+    /// A paint path: whatever this reads is what the pane draws, so it stamps
+    /// the presentation clock and clears a redraw hold that has fully
+    /// resolved.
+    Present,
+    /// A non-paint reader. It sees exactly what the pane is currently
+    /// showing — including a held frame — and changes no hold state.
+    Read,
+}
+
 /// Reads the live grid into `render_state` unless the child is inside a
 /// synchronized update, where the retained snapshot *is* the last complete frame.
 fn refresh_render_state(core: &mut GhosttyPaneCore, now: Instant) -> RenderStateRefresh {
-    if core.alt_screen_read_hold
+    refresh_render_state_for(core, now, RenderStateUse::Present)
+}
+
+/// The one seam that may advance `render_state`. See [`RenderStateUse`] for
+/// why non-paint readers must come through here too.
+fn refresh_render_state_for(
+    core: &mut GhosttyPaneCore,
+    now: Instant,
+    use_kind: RenderStateUse,
+) -> RenderStateRefresh {
+    if alt_screen_read_holds_frame(core, now)
         || synchronized_update_holds_frame(core, now)
         || resize_recovery_holds_frame(core, now)
     {
         return RenderStateRefresh::Held;
+    }
+    if use_kind == RenderStateUse::Read {
+        let GhosttyPaneCore {
+            terminal,
+            render_state,
+            ..
+        } = &mut *core;
+        if render_state.update(terminal).is_err() {
+            return RenderStateRefresh::Failed;
+        }
+        core.render_state_populated = true;
+        return RenderStateRefresh::Updated;
     }
     // `resize_recovery_started_at` is only ever set, never cleared, by the two
     // sites that arm it (an actual resize's own redraw, or a redraw signal on
@@ -2898,12 +2981,22 @@ fn ghostty_visible_hyperlinks(
     core: &mut GhosttyPaneCore,
     area: Rect,
 ) -> Result<VisibleHyperlinks, crate::ghostty::Error> {
+    // Runs once per full render, per visible pane, straight after the pane was
+    // drawn: an unguarded `render_state.update` here walks the snapshot the
+    // draw just held forward to the live grid, so the *next* frame draws live
+    // content with the hold still engaged. The hyperlinks a frame carries
+    // describe that frame, so reading the held snapshot is also the correct
+    // answer, not a compromise.
+    if refresh_render_state_for(core, Instant::now(), RenderStateUse::Read)
+        == RenderStateRefresh::Failed
+    {
+        return Ok(Vec::new());
+    }
     let GhosttyPaneCore {
         terminal,
         render_state,
         ..
     } = core;
-    render_state.update(terminal)?;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
@@ -2926,12 +3019,15 @@ fn ghostty_visible_hyperlinks(
 }
 
 fn ghostty_visible_text(core: &mut GhosttyPaneCore) -> Result<String, crate::ghostty::Error> {
-    let GhosttyPaneCore {
-        terminal,
-        render_state,
-        ..
-    } = core;
-    render_state.update(terminal)?;
+    // An API read of what the pane shows, so it reads through the same seam:
+    // a held pane is showing its retained frame, and advancing the snapshot
+    // here would also release that frame into the next drawn one.
+    if refresh_render_state_for(core, Instant::now(), RenderStateUse::Read)
+        == RenderStateRefresh::Failed
+    {
+        return Ok(String::new());
+    }
+    let GhosttyPaneCore { render_state, .. } = core;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
@@ -3556,12 +3652,12 @@ fn cursor_color_query_color(core: &mut GhosttyPaneCore) -> Option<crate::ghostty
 }
 
 fn palette_color_query_response(index: u8, core: &mut GhosttyPaneCore) -> Option<Bytes> {
-    let GhosttyPaneCore {
-        terminal,
-        render_state,
-        ..
-    } = core;
-    render_state.update(terminal).ok()?;
+    if refresh_render_state_for(core, Instant::now(), RenderStateUse::Read)
+        == RenderStateRefresh::Failed
+    {
+        return None;
+    }
+    let GhosttyPaneCore { render_state, .. } = core;
     let colors = render_state.colors().ok()?;
     let color = colors.palette[usize::from(index)];
     Some(osc_rgb_response(
@@ -6404,6 +6500,110 @@ mod tests {
             rendered_top_row(&pane, 20, 3),
             "SCROLLED",
             "releasing the hold must draw the pane's current, settled content"
+        );
+    }
+
+    /// The server's own frame loop is `render` → `visible_hyperlinks` →
+    /// `render`: `render_and_stream` scans every visible pane for hyperlinks
+    /// immediately after drawing it, once per full render per client
+    /// (`src/server/headless.rs`, `render_stream::visible_hyperlinks`).
+    ///
+    /// That scan used to call `render_state.update` directly instead of going
+    /// through `refresh_render_state`, so the frame a hold had just kept off
+    /// the screen was walked forward to the live grid before the next draw.
+    /// Every hold in this file — alternate-screen read, DEC 2026 synchronized
+    /// update, resize recovery, hidden-pane redraw — therefore survived
+    /// exactly one frame no matter what its timeout said, which is why a
+    /// 2.7-second alternate-screen harvest still painted its own scroll to a
+    /// live client with the hold engaged on every render.
+    #[test]
+    fn a_hyperlink_scan_between_frames_does_not_release_a_held_frame() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        // The frame loop's own hyperlink pass, in its real position: after the
+        // pane was drawn, before the next draw.
+        let _ = pane.visible_hyperlinks(Rect::new(0, 0, 20, 3));
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "COMPLETE",
+            "a hyperlink scan between two frames must not walk a held pane's frame forward"
+        );
+
+        pane.set_alt_screen_read_hold(false);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "SCROLLED");
+    }
+
+    /// Same seam, reached from the API side: a fleet poller reading panes is
+    /// enough to release every hold on every pane it touches.
+    #[test]
+    fn an_api_text_read_does_not_release_a_held_frame() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+
+        let _ = pane.visible_text();
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "COMPLETE",
+            "a pane-read API call must not walk a held pane's frame forward"
+        );
+
+        pane.set_alt_screen_read_hold(false);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "SCROLLED");
+    }
+
+    /// The hold is a hold on *presentation*, not a freeze of the pane: the
+    /// hidden-pane arming site keys off how long it has been since the pane
+    /// was last drawn, so a non-paint reader must not make an unpainted pane
+    /// look freshly presented.
+    #[test]
+    fn a_non_paint_read_does_not_count_as_the_pane_being_presented() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+        pane.age_render_state_last_refreshed_for_test(HIDDEN_PANE_REDRAW_RECOVERY_THRESHOLD);
+
+        let _ = pane.visible_text();
+        let _ = pane.visible_hyperlinks(Rect::new(0, 0, 20, 3));
+
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[2J\x1b[HREDRAW", &tx);
+        assert!(
+            pane.resize_recovery_hold_active_for_test(),
+            "a stale hidden pane's redraw must still arm the hold after an API read"
+        );
+    }
+
+    #[test]
+    fn an_alt_screen_read_hold_that_is_never_released_still_expires() {
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        // The harvest's own state machine owns the release; a pane whose
+        // runtime disappears mid-harvest never gets one.
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+        assert_eq!(rendered_top_row(&pane, 20, 3), "COMPLETE");
+
+        pane.age_alt_screen_read_hold_for_test(
+            ALT_SCREEN_READ_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            rendered_top_row(&pane, 20, 3),
+            "SCROLLED",
+            "an unreleased alternate-screen hold must not freeze the pane forever"
         );
     }
 
