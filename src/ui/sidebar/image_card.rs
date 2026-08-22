@@ -4005,10 +4005,15 @@ pub(crate) struct CardContentWire {
     seen: bool,
     depth: u8,
     lifted: bool,
-    /// Defaulted rather than required, so a server that has not yet been
-    /// upgraded — and so never sends this field — hands an older client a
-    /// card that reads as unaccented-by-focus rather than one deserialisation
-    /// rejects outright.
+    /// `#[serde(default)]` alone does **not** make this field skew-safe: bincode's
+    /// struct encoding is positional, and this field sits inside a `Vec` of possibly
+    /// many cards with more `CardScene` fields following it, so a decoder never
+    /// truly runs out of bytes at this point — it just misreads the next sibling's
+    /// bytes as this field's, which is what raises the wire-tag error, not what
+    /// gracefully defaults it. What actually protects against this shape change is
+    /// `crate::protocol::wire::PROTOCOL_VERSION` (bumped for it — see its own doc),
+    /// so a mismatched server/client pairing gets a clean handshake rejection instead
+    /// of a silently frozen card panel.
     #[serde(default)]
     focused_space: bool,
     mark: Option<CardMark>,
@@ -8435,6 +8440,117 @@ mod a_card_is_its_own_shape {
     #[test]
     fn card_scene_decode_rejects_garbage_bytes() {
         assert!(decode_card_scene(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
+    /// A pre-#186 `CardContentWire` shape — `focused_space` spliced back out,
+    /// same field order otherwise — fails to decode against the current
+    /// decoder rather than silently defaulting `focused_space` to `false`.
+    ///
+    /// Pins down why `focused_space`'s own `#[serde(default)]` is not what
+    /// protects a version-skewed server/client pairing: bincode's struct
+    /// encoding is positional, so a decoder only "runs out of bytes" for a
+    /// truly trailing field at the very end of the whole message, never for
+    /// one nested inside a `Vec` of possibly many cards with more `CardScene`
+    /// fields following. What actually protects this pairing is
+    /// `crate::protocol::wire::PROTOCOL_VERSION`. If this test ever starts
+    /// passing, that means `CardContentWire` (or its embedding) changed to
+    /// tolerate schema evolution for real — and the `PROTOCOL_VERSION` doc
+    /// comment referencing this test should be revisited.
+    #[test]
+    fn card_scene_decode_rejects_pre_186_wire_shape() {
+        #[derive(serde::Serialize)]
+        struct OldCardContentWire {
+            title: String,
+            tidbit: Option<String>,
+            register: Option<Caption>,
+            state_label: String,
+            state: AgentState,
+            stage: LifecycleStage,
+            severity: Severity,
+            hues: StageHues,
+            ground: Rgb,
+            split_channels: bool,
+            seen: bool,
+            depth: u8,
+            lifted: bool,
+            // No `focused_space`: this is the pre-#186 field order.
+            mark: Option<CardMark>,
+            residue: u8,
+            controls: ControlRail,
+            generate: f32,
+            discharge: f32,
+            breath: f32,
+            spider: Option<spider::CardSpider>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct OldCardScene {
+            placed: Vec<(Rect, OldCardContentWire)>,
+            offsets: Vec<(i32, i32)>,
+            field: Rect,
+            bounds: Rect,
+            bloom_floor: u16,
+            backdrop: Rgb,
+        }
+
+        let app = pixel_fleet_app();
+        let rect = sidebar_rect();
+        let cards = super::super::compute_workspace_card_areas(&app, rect);
+        let Some(scene) = build_card_scene(&app, &cards, rect, app.host_cell_size) else {
+            println!("SKIP: no proportional face on this machine");
+            return;
+        };
+        assert!(!scene.placed.is_empty(), "need at least one real card");
+
+        let old_scene = OldCardScene {
+            placed: scene
+                .placed
+                .iter()
+                .cloned()
+                .map(|(rect, wire)| {
+                    (
+                        rect,
+                        OldCardContentWire {
+                            title: wire.title,
+                            tidbit: wire.tidbit,
+                            register: wire.register,
+                            state_label: wire.state_label,
+                            state: wire.state,
+                            stage: wire.stage,
+                            severity: wire.severity,
+                            hues: wire.hues,
+                            ground: wire.ground,
+                            split_channels: wire.split_channels,
+                            seen: wire.seen,
+                            depth: wire.depth,
+                            lifted: wire.lifted,
+                            mark: wire.mark,
+                            residue: wire.residue,
+                            controls: wire.controls,
+                            generate: wire.generate,
+                            discharge: wire.discharge,
+                            breath: wire.breath,
+                            spider: wire.spider,
+                        },
+                    )
+                })
+                .collect(),
+            offsets: scene.offsets.clone(),
+            field: scene.field,
+            bounds: scene.bounds,
+            bloom_floor: scene.bloom_floor,
+            backdrop: scene.backdrop,
+        };
+
+        let old_bytes = bincode::serde::encode_to_vec(&old_scene, bincode::config::standard())
+            .expect("encode old-shaped CardScene");
+
+        assert!(
+            decode_card_scene(&old_bytes).is_err(),
+            "a pre-#186 CardContentWire payload decoded without error; \
+             focused_space's #[serde(default)] is masking version skew that \
+             PROTOCOL_VERSION should be catching instead"
+        );
     }
 
     /// The cards a build published, or `None` when this machine has no
