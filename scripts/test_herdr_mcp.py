@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import socket
+import struct
 import tempfile
 import threading
 import unittest
@@ -13,6 +15,18 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import herdr_mcp
+
+
+def _fake_png(width: int, height: int) -> bytes:
+    """A minimal-but-valid PNG header: enough for `png_dimensions` to read."""
+    return (
+        herdr_mcp.PNG_SIGNATURE
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
 
 
 SNAPSHOT = {
@@ -403,6 +417,179 @@ class RenderTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": "/home/x"}):
             self.assertEqual(herdr_mcp._home_relative("/home/x/repos/a"), "~/repos/a")
             self.assertEqual(herdr_mcp._home_relative("/home/xyz/a"), "/home/xyz/a")
+
+
+class DisplayResolutionTests(unittest.TestCase):
+    def test_prefers_the_dedicated_env_var(self):
+        with mock.patch.dict(os.environ, {"HERDR_MCP_DISPLAY": ":7", "DISPLAY": ":0"}):
+            self.assertEqual(herdr_mcp.resolve_display(), ":7")
+
+    def test_falls_back_to_display(self):
+        with mock.patch.dict(os.environ, {"DISPLAY": ":0"}, clear=True):
+            self.assertEqual(herdr_mcp.resolve_display(), ":0")
+
+    def test_raises_with_no_display_configured(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(herdr_mcp.HerdrApiError):
+                herdr_mcp.resolve_display()
+
+
+class PngDimensionsTests(unittest.TestCase):
+    def test_reads_width_and_height_from_ihdr(self):
+        self.assertEqual(herdr_mcp.png_dimensions(_fake_png(1600, 1000)), (1600, 1000))
+
+    def test_rejects_non_png_bytes(self):
+        with self.assertRaises(herdr_mcp.HerdrApiError):
+            herdr_mcp.png_dimensions(b"not a png")
+
+
+class PaneScreenshotTests(unittest.TestCase):
+    """`herdr_pane_screenshot`'s Herdr-side logic: target resolution, the focus
+    guard, and the cell-to-pixel crop math. The actual pixel capture
+    (`capture_display_png` / `crop_png`) is mocked throughout -- it shells out
+    to ImageMagick against a real X display, which this suite has neither."""
+
+    RECTS = {
+        "pane-a": {"x": 0, "y": 0, "width": 40, "height": 24},
+        "pane-b": {"x": 40, "y": 0, "width": 40, "height": 24},
+        "pane-c": {"x": 0, "y": 0, "width": 80, "height": 24},
+    }
+
+    def _responder(self, *, graphics_info_ok=True):
+        def responder(request):
+            method = request["method"]
+            if method == "session.snapshot":
+                return {
+                    "id": request["id"],
+                    "result": {"type": "session_snapshot", "snapshot": SNAPSHOT},
+                }
+            if method == "pane.layout":
+                pane_id = request["params"]["pane_id"]
+                pane = next(p for p in SNAPSHOT["panes"] if p["pane_id"] == pane_id)
+                tab_id = pane["tab_id"]
+                tab_panes = [p for p in SNAPSHOT["panes"] if p["tab_id"] == tab_id]
+                layout = {
+                    "workspace_id": pane["workspace_id"],
+                    "tab_id": tab_id,
+                    "zoomed": False,
+                    "area": {"x": 0, "y": 0, "width": 80, "height": 24},
+                    "focused_pane_id": tab_panes[0]["pane_id"],
+                    "panes": [
+                        {
+                            "pane_id": p["pane_id"],
+                            "focused": p["pane_id"] == tab_panes[0]["pane_id"],
+                            "rect": self.RECTS[p["pane_id"]],
+                        }
+                        for p in tab_panes
+                    ],
+                    "splits": [],
+                }
+                return {"id": request["id"], "result": {"type": "pane_layout", "layout": layout}}
+            if method == "pane.graphics.info":
+                if not graphics_info_ok:
+                    return {
+                        "id": request["id"],
+                        "error": {
+                            "code": "cell_size_unavailable",
+                            "message": "host cell size is unavailable",
+                        },
+                    }
+                return {
+                    "id": request["id"],
+                    "result": {
+                        "type": "pane_graphics_info",
+                        "cell_width_px": 10,
+                        "cell_height_px": 20,
+                    },
+                }
+            return {"id": request["id"], "error": {"code": "unknown_method", "message": method}}
+
+        return responder
+
+    def _serve(self, *, graphics_info_ok=True):
+        server = FakeHerdrServer(self._responder(graphics_info_ok=graphics_info_ok))
+        self.addCleanup(server.close)
+        patcher = mock.patch.dict(os.environ, {"HERDR_MCP_SOCKET": str(server.path)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return server
+
+    @staticmethod
+    def _client_factory(session):
+        return herdr_mcp.HerdrClient(session)
+
+    def test_requires_exactly_one_target(self):
+        self._serve()
+        for args in ({}, {"pane_id": "pane-a", "tab_id": "tab-1"}):
+            with self.subTest(args=args):
+                with self.assertRaises(herdr_mcp.HerdrApiError) as ctx:
+                    herdr_mcp.tool_herdr_pane_screenshot(self._client_factory, args)
+                self.assertIn("exactly one of", str(ctx.exception))
+
+    def test_refuses_a_target_not_currently_shown(self):
+        # pane-c lives in ws-2/tab-2, both focused=False in SNAPSHOT.
+        self._serve()
+        with self.assertRaises(herdr_mcp.HerdrApiError) as ctx:
+            herdr_mcp.tool_herdr_pane_screenshot(self._client_factory, {"pane_id": "pane-c"})
+        self.assertIn("not the workspace/tab currently shown", str(ctx.exception))
+
+    def test_whole_window_capture_needs_no_cell_geometry(self):
+        self._serve()
+        fake_png = _fake_png(800, 600)
+        with (
+            mock.patch.object(herdr_mcp, "resolve_display", return_value=":99"),
+            mock.patch.object(herdr_mcp, "capture_display_png", return_value=fake_png) as capture,
+            mock.patch.object(herdr_mcp, "crop_png") as crop,
+        ):
+            content = herdr_mcp.tool_herdr_pane_screenshot(self._client_factory, {"tab_id": "tab-1"})
+        capture.assert_called_once_with(":99")
+        crop.assert_not_called()
+        image = next(b for b in content if b["type"] == "image")
+        self.assertEqual(image["mimeType"], "image/png")
+        self.assertEqual(base64.b64decode(image["data"]), fake_png)
+        text = next(b for b in content if b["type"] == "text")
+        self.assertIn("800x600px", text["text"])
+        self.assertIn("whole window", text["text"])
+
+    def test_pane_capture_crops_to_the_pane_rect_in_pixels(self):
+        self._serve()
+        fake_png = _fake_png(800, 600)
+        cropped_png = _fake_png(400, 480)
+        with (
+            mock.patch.object(herdr_mcp, "resolve_display", return_value=":99"),
+            mock.patch.object(herdr_mcp, "capture_display_png", return_value=fake_png),
+            mock.patch.object(herdr_mcp, "crop_png", return_value=cropped_png) as crop,
+        ):
+            content = herdr_mcp.tool_herdr_pane_screenshot(
+                self._client_factory, {"pane_id": "pane-a"}
+            )
+        # pane-a's rect is 0,0,40x24 cells at 10x20px/cell.
+        crop.assert_called_once_with(fake_png, (0, 0, 400, 480))
+        image = next(b for b in content if b["type"] == "image")
+        self.assertEqual(base64.b64decode(image["data"]), cropped_png)
+        text = next(b for b in content if b["type"] == "text")
+        self.assertIn("400x480px", text["text"])
+        self.assertIn("pane pane-a", text["text"])
+
+    def test_missing_cell_size_refuses_the_crop_with_a_clear_reason(self):
+        self._serve(graphics_info_ok=False)
+        with self.assertRaises(herdr_mcp.HerdrApiError) as ctx:
+            herdr_mcp.tool_herdr_pane_screenshot(self._client_factory, {"pane_id": "pane-a"})
+        self.assertIn("experimental.kitty_graphics", str(ctx.exception))
+
+    def test_tool_schema_exposes_all_three_addressing_modes(self):
+        tool = next(
+            t for t in herdr_mcp._tool_definitions() if t["name"] == "herdr_pane_screenshot"
+        )
+        props = tool["inputSchema"]["properties"]
+        self.assertIn("pane_id", props)
+        self.assertIn("workspace_id", props)
+        self.assertIn("tab_id", props)
+
+    def test_not_reachable_through_herdr_query(self):
+        # It is a composite Python tool, like herdr_overview/herdr_pane, not a
+        # Herdr API method -- so it was never a candidate for READ_ONLY_METHODS.
+        self.assertNotIn("herdr_pane_screenshot", herdr_mcp.READ_ONLY_METHODS)
 
 
 class McpProtocolTests(unittest.TestCase):
