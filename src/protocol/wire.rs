@@ -34,6 +34,13 @@ use serde::{Deserialize, Serialize};
 /// whole card panel silently freezes or stays blank rather than erroring visibly. Bumping
 /// the version turns that silent skew into the loud, actionable "please upgrade" rejection
 /// `check_client_version` already gives any other incompatible pairing.
+///
+/// `CardContentWire` has since also gained `crew` — the workers a Space's card
+/// draws inside its own box — which is the same class of positional shape change
+/// and needs no further bump: 24 has not been published in either channel (both
+/// `website/latest.json` and `website/preview.json` still declare 19), so every
+/// pairing that could see either field is a pairing already separated by 24. The
+/// bump is owed once per *published* protocol, not once per incompatible change.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are

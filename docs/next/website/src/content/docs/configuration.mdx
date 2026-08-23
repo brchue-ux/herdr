@@ -912,6 +912,29 @@ that overlap have their glows blended by the terminal rather than one clipping t
 other. The layout is unchanged: same rows, same tiers, same titles. The character
 fallback is unchanged too, and applies to both.
 
+### Workers inside their Space's card
+
+A drawn card carries the workers its Space is running **inside its own box**,
+under a dashed rule below the header, bars and orbit line: a dot, the worker's
+name, and one dim line saying what that worker is doing. A worker the Space
+dispatched itself sits flush with the card's own left margin with a
+full-strength dot; one that reached it through a second mate is shifted one
+fixed step in and drawn dimmer — one step, whichever mate it came through and
+however deep the chain. Both appear in the same list, told apart by the step and
+nothing else. A second mate with a checkout of its own is a Space in its own
+right and heads its own list.
+
+Each worker is still a row of the panel: clicking one selects its pane and the
+keyboard walks through them exactly as before. With `row_motion = "slide"` a
+worker arriving in the list opens its own track first — pushing the rows below it
+and the card's own closing edge down together — and only then fades in; a worker
+leaving fades out first and the gap closes after it. With `row_motion` at its
+default `none`, the list is simply drawn at rest.
+
+This needs the same conditions the cards themselves need. Below 34 columns, with
+`kitty_graphics = false`, or on any panel drawing character cards, each worker
+keeps a card of its own with its own connector, exactly as before.
+
 The persistent background's win comets have their own control, independent of the bodies and
 other effects in the scene:
 
