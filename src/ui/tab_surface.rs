@@ -94,10 +94,45 @@ pub(crate) fn tab_surface_hyperlinks(
     for info in surface.pane_infos {
         if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         {
-            links.extend(runtime.visible_hyperlinks(info.inner_rect));
+            let triview = runtime.last_claude_triview_layout();
+            links.extend(
+                runtime
+                    .visible_hyperlinks(info.inner_rect)
+                    .into_iter()
+                    .filter_map(|((x, y), uri, id)| {
+                        Some(((x, project_pane_row(triview, info.inner_rect, y)?), uri, id))
+                    }),
+            );
         }
     }
     links
+}
+
+/// Where a grid-derived pane row was actually **drawn** in `inner_rect`.
+///
+/// `visible_hyperlinks` and `cursor_state` both read the live grid and offset
+/// it by the pane's own origin, which is right whenever a pane row is the grid
+/// row of the same index. A Claude triview pane whose log zone has taken rows
+/// off the top of the transcript is the one case where it is not: the
+/// transcript and composer are drawn `transcript_skip` rows higher than they
+/// sit in the grid. Without this the frame cursor lands `transcript_skip` rows
+/// below the composer it belongs to — inside the command-log zone, which reads
+/// as a second input line hidden under the log.
+///
+/// `None` when the split did not draw that grid row at all (a cropped composer
+/// border, or a transcript row the log zone scrolled off the top).
+fn project_pane_row(
+    triview: Option<crate::pane::ClaudeTriviewLayout>,
+    inner_rect: Rect,
+    row: u16,
+) -> Option<u16> {
+    let Some(layout) = triview else {
+        return Some(row);
+    };
+    let grid_row = row.checked_sub(inner_rect.y)?;
+    layout
+        .pane_row_for_grid_row(grid_row)
+        .map(|pane_row| inner_rect.y + pane_row)
 }
 
 pub(crate) fn tab_surface_cursor(
@@ -130,7 +165,16 @@ pub(crate) fn tab_surface_cursor(
             detected.is_some_and(|agent| app.cjk_ime_agents.contains(&agent))
         });
 
-    if let Some(cursor) = runtime.cursor_state(info.inner_rect, true) {
+    let triview = runtime.last_claude_triview_layout();
+    if let Some(cursor) = runtime
+        .cursor_state(info.inner_rect, true)
+        .and_then(|cursor| {
+            Some(crate::pane::TerminalCursorState {
+                y: project_pane_row(triview, info.inner_rect, cursor.y)?,
+                ..cursor
+            })
+        })
+    {
         let visible = if reveal {
             !scrolled_back
         } else {
@@ -165,6 +209,138 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Direction;
     use ratatui::Terminal;
+
+    /// Claude Code v2.1.241's real screen shape at `cols` x `rows`: a
+    /// transcript floating above a full-width rule pair around a `\u{276F} `
+    /// composer, then the two footer rows it pins to the literal floor.
+    fn claude_screen_bytes(cols: usize, rows: usize) -> Vec<u8> {
+        let rule = "\u{2500}".repeat(cols);
+        let mut lines: Vec<String> = vec![
+            "\u{276F} run the checks".to_string(),
+            String::new(),
+            "\u{25CF} Running the crate's unit tests".to_string(),
+            "  \u{23BF}  $ cargo nextest run --lib".to_string(),
+            String::new(),
+            "\u{25CF} All green.".to_string(),
+        ];
+        lines.resize(rows - 5, String::new());
+        lines.push(rule.clone());
+        lines.push("\u{276F} typed input".to_string());
+        lines.push(rule);
+        lines.push("  \u{2839} Sonnet 5 5% $0.09".to_string());
+        lines.push("  \u{23F5}\u{23F5} accept edits on".to_string());
+        let mut bytes = lines.join("\r\n").into_bytes();
+        // Park the caret where Claude Code parks it: at the end of the
+        // composer's own text, three rows off the floor. Without this the
+        // cursor is wherever the last write left it, and the projection under
+        // test would never be asked about the composer at all.
+        bytes.extend_from_slice(
+            format!(
+                "\x1b[{};{}H",
+                rows - 3,
+                "\u{276F} typed input".chars().count() + 1
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    /// The captain's bug, at the seam it broke: with commands in the pane's
+    /// log the split shifts the composer up, and the frame cursor was still
+    /// being reported on the composer's *grid* row — `transcript_skip` rows
+    /// further down, inside the command-log zone. On screen that reads as a
+    /// second input line hiding behind the command output, with the caret
+    /// moving in it as you type.
+    ///
+    /// Asserted against the row the composer was actually drawn on in this
+    /// frame's own buffer, not against the layout's arithmetic, so a split
+    /// that moved would move the expectation with it.
+    #[tokio::test]
+    async fn the_frame_cursor_follows_a_shifted_claude_composer() {
+        let cols: u16 = 60;
+        let rows: u16 = 20;
+
+        let mut workspace = Workspace::test_new("claude");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        // A placeholder, only so the view resolves; the real screen is written
+        // at the size the pane's own chrome leaves it.
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(cols, rows, b""),
+        );
+
+        let mut app = AppState::test_new();
+        let mut terminal_state =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        app.terminals.insert(terminal_id, terminal_state);
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+        for command in ["cargo nextest run", "git status", "ls -la"] {
+            app.pane_command_log.record(pane_id, command.to_string());
+        }
+
+        let registry = TerminalRuntimeRegistry::default();
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        let area = Rect::new(0, 0, cols, rows);
+        crate::ui::compute_view_without_resizing_panes(&mut app, &registry, area);
+        let inner = app
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .expect("the focused pane")
+            .inner_rect;
+        // The agent draws to the pane it was given, so the fixture is written
+        // at exactly that size: a grid taller than the pane would be read from
+        // its own bottom and every row index would be off by the difference.
+        app.workspaces[0].insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                inner.width,
+                inner.height,
+                &claude_screen_bytes(inner.width as usize, inner.height as usize),
+            ),
+        );
+        crate::ui::compute_view_without_resizing_panes(&mut app, &registry, area);
+        terminal
+            .draw(|frame| {
+                render_tab_surface(&app, &registry, app.view.tab_surface(), frame);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..cols)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        let composer_row = (0..rows)
+            .find(|&y| row_text(y).starts_with('\u{276F}') && row_text(y).contains("typed input"))
+            .expect("the composer body is on screen");
+        // The split really did shift: the log zone is drawn below the
+        // composer, so a test that passed by accident on an unshifted pane is
+        // ruled out.
+        assert!(
+            (composer_row + 1..rows).any(|y| row_text(y).starts_with('\u{25CF}')),
+            "no command-log zone was drawn, so nothing was shifted"
+        );
+
+        let cursor = tab_surface_cursor(&app, &registry, app.view.tab_surface())
+            .expect("a focused Claude pane in terminal mode owns the host cursor");
+        assert_eq!(
+            cursor.y,
+            composer_row,
+            "the caret is on {:?}, not on the composer it belongs to",
+            row_text(cursor.y)
+        );
+    }
 
     #[tokio::test]
     async fn explicit_surface_layout_drives_render_cursor_and_hyperlinks() {

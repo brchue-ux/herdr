@@ -428,6 +428,15 @@ impl TerminalRuntime {
         self.0.collect_dirty_patch(area_width, area_height)
     }
 
+    /// The Claude triview split this pane's last paint drew, or `None` when
+    /// it drew the unmodified full-pane copy.
+    ///
+    /// The projection every reader of a *drawn* pane row needs: see
+    /// [`crate::pane::ClaudeTriviewLayout::pane_row_for_grid_row`].
+    pub(crate) fn last_claude_triview_layout(&self) -> Option<crate::pane::ClaudeTriviewLayout> {
+        self.0.last_claude_triview_layout()
+    }
+
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.0.visible_hyperlinks(area)
     }

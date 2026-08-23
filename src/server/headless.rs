@@ -4124,6 +4124,28 @@ impl HeadlessServer {
             ) else {
                 retained_fallback!("missing_runtime");
             };
+            // A dirty patch is a set of *grid* rows written straight onto the
+            // pane rows of the same index. That is exactly right for the
+            // unmodified full-pane render, and wrong for a Claude triview
+            // pane whose command-log zone has shifted the transcript and
+            // composer up off the top of the grid: the patch would repaint
+            // the composer `transcript_skip` rows below where the last full
+            // render drew it — a second input line, painted over the command
+            // log the split had just put there. The split's own dividers and
+            // log rows are not grid rows at all, so there is nothing to
+            // rewrite them here either. Refuse and take the full render.
+            //
+            // Keyed on the shift, not on the split being active, for the same
+            // reason `crate::ui::panes` keys its selection guard that way: an
+            // unshifted split still maps every pane row onto the grid row of
+            // the same index, and giving up the fast path on every focused
+            // Claude pane would be a real cost for no correctness gain.
+            if runtime
+                .last_claude_triview_layout()
+                .is_some_and(|layout| layout.transcript_skip > 0)
+            {
+                retained_fallback!("triview_row_shift");
+            }
             match runtime.collect_dirty_patch(info.inner_rect.width, info.inner_rect.height) {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained.pane_clean");
@@ -11685,6 +11707,103 @@ next_tab = ""
                 .expect("retained frame with kitty enabled"),
         );
         assert!(retained.cells.iter().any(|cell| cell.symbol == "Z"));
+    }
+
+    /// A dirty patch writes grid rows onto the pane rows of the same index.
+    /// A Claude triview pane whose command-log zone has shifted the transcript
+    /// and composer up is the one pane where that is wrong: the patch would
+    /// repaint the composer `transcript_skip` rows lower, over the log the
+    /// split had just drawn there — the captain's "two input lines, one hiding
+    /// behind the command output". The fast path has to decline and let the
+    /// full render draw the split.
+    #[tokio::test]
+    async fn retained_pty_update_declines_for_a_shifted_claude_triview() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"");
+        server.render_and_stream();
+        let _ = client_rx.recv_timeout(Duration::from_millis(100));
+        // The agent draws into the pane its own chrome left it, not into the
+        // client's full window: a grid taller than the pane would be read from
+        // its own bottom and every row index here would be off by the
+        // difference.
+        let inner = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .expect("the focused pane")
+            .inner_rect;
+        let cols = usize::from(inner.width);
+        let rows = usize::from(inner.height);
+        let rule = "\u{2500}".repeat(cols);
+        let mut lines: Vec<String> = vec![
+            "\u{276F} run the checks".to_string(),
+            String::new(),
+            "\u{25CF} All green.".to_string(),
+        ];
+        lines.resize(rows - 5, String::new());
+        lines.push(rule.clone());
+        lines.push("\u{276F} typed input".to_string());
+        lines.push(rule);
+        lines.push("  \u{2839} Sonnet 5 5% $0.09".to_string());
+        lines.push("  \u{23F5}\u{23F5} accept edits on".to_string());
+        let screen = lines.join("\r\n").into_bytes();
+
+        server.app.state.workspaces[0].insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                inner.width,
+                inner.height,
+                &screen,
+            ),
+        );
+        let terminal_id = server.app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("terminal id");
+        let mut terminal_state =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        server
+            .app
+            .state
+            .terminals
+            .insert(terminal_id, terminal_state);
+        for command in ["cargo nextest run", "git status", "ls -la"] {
+            server
+                .app
+                .state
+                .pane_command_log
+                .record(pane_id, command.to_string());
+        }
+
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        let layout = runtime
+            .last_claude_triview_layout()
+            .expect("the full render drew the split");
+        assert!(
+            layout.transcript_skip > 0,
+            "the log zone took no rows, so nothing is shifted and this proves nothing"
+        );
+
+        // The agent redraws its composer, which is what typing into it looks
+        // like on the wire.
+        runtime.test_process_pty_bytes(
+            format!("\x1b[{};1H\x1b[K\u{276F} typed inputX", rows - 3).as_bytes(),
+        );
+
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
     #[tokio::test]
