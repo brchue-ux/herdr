@@ -469,6 +469,14 @@ impl App {
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(menu, idx)
                     }
+                    MouseAction::PasteIntoPane { ws_idx, pane_id } => {
+                        // Focus first, and through the same API path a left
+                        // click uses: a paste goes to the pane the user
+                        // pointed at, which is also the one they now expect
+                        // their keyboard to reach.
+                        self.focus_pane_internal_via_api(ws_idx, pane_id);
+                        self.request_pane_clipboard_paste(source_id, ws_idx, pane_id);
+                    }
                 }
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))

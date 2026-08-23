@@ -199,31 +199,43 @@ pub struct App {
     pub(crate) local_input_source_switch: bool,
     /// Whether this process's own OS clipboard is the one the user copies into.
     /// The headless server sets this to false: with `herdr --remote` the app
-    /// runs on the far host, so a modal paste has to be answered by the client
-    /// that pressed the shortcut. See [`App::request_modal_clipboard_paste`].
+    /// runs on the far host, so a paste has to be answered by the client that
+    /// asked for it. See [`App::request_clipboard_paste`].
     pub(crate) local_clipboard_reads: bool,
-    /// The modal paste waiting on an input source's clipboard answer, if any.
+    /// The paste waiting on an input source's clipboard answer, if any.
     pending_clipboard_read: Option<PendingClipboardRead>,
     next_clipboard_request_id: u64,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
-/// A modal paste that asked an input source for its clipboard and is waiting
-/// for the answer.
+/// A paste that asked an input source for its clipboard and is waiting for the
+/// answer.
 ///
-/// Only ever one: a second paste shortcut supersedes the first rather than
-/// queueing behind it, because both would land in the same text input and the
-/// user pressing the key again means they want the current clipboard.
+/// Only ever one: a second paste supersedes the first rather than queueing
+/// behind it, because asking again means the user wants the current clipboard.
 #[derive(Debug)]
 struct PendingClipboardRead {
     request_id: u64,
     source_id: InputSourceId,
-    /// Which modal was focused when the request went out. An answer that
-    /// arrives after the user left that modal belongs to a text input that no
-    /// longer exists.
+    /// Which mode was current when the request went out. An answer that
+    /// arrives after the user left it belongs to a modal that no longer
+    /// exists; a pane paste checks its own target instead.
     mode: Mode,
     requested_at: Instant,
+    target: ClipboardPasteTarget,
+}
+
+/// Where a clipboard answer is meant to land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardPasteTarget {
+    /// The focused modal text input, reached by a paste shortcut.
+    Modal,
+    /// A pane's child process, reached by a plain right-click over it.
+    Pane {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
 }
 
 /// How long a clipboard answer stays applicable.
@@ -2269,16 +2281,33 @@ impl App {
     /// Reached only when the shortcut arrived as a plain key: a genuine
     /// bracketed paste already carries the client's text and is inserted
     /// directly by the `Paste` arm of [`Self::route_client_events_from`].
+    pub(crate) fn request_modal_clipboard_paste(&mut self, source_id: InputSourceId) {
+        self.request_clipboard_paste(source_id, ClipboardPasteTarget::Modal);
+    }
+
+    /// Sends the clipboard belonging to whoever right-clicked into the pane
+    /// they clicked, the way every other terminal's right-click paste does.
+    pub(crate) fn request_pane_clipboard_paste(
+        &mut self,
+        source_id: InputSourceId,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) {
+        self.request_clipboard_paste(source_id, ClipboardPasteTarget::Pane { ws_idx, pane_id });
+    }
+
+    /// Asks an input source for its clipboard text and remembers where the
+    /// answer is meant to land.
     ///
     /// The clipboard that matters is the one on the machine the user copied on,
     /// and this process is not always that machine — under `herdr --remote` the
     /// app runs on the far host while the user's clipboard is on the near one.
     /// So the answer is asked for rather than read, except in monolithic herdr,
-    /// which *is* the terminal the user is typing into and has nobody to ask.
-    pub(crate) fn request_modal_clipboard_paste(&mut self, source_id: InputSourceId) {
+    /// which *is* the terminal the user is working in and has nobody to ask.
+    fn request_clipboard_paste(&mut self, source_id: InputSourceId, target: ClipboardPasteTarget) {
         if self.local_clipboard_reads {
             if let Some(text) = crate::platform::read_clipboard_text() {
-                self.paste_into_active_text_input(&text);
+                self.apply_clipboard_paste(target, &text);
             }
             return;
         }
@@ -2300,17 +2329,43 @@ impl App {
             source_id,
             mode: self.state.mode,
             requested_at: Instant::now(),
+            target,
         });
     }
 
-    /// Applies an input source's clipboard answer to the modal paste that asked
-    /// for it.
+    /// Delivers clipboard text to whichever target asked for it.
     ///
-    /// Returns whether text actually reached a text input, so the caller can
+    /// Returns whether anything actually received it, so the caller can decide
+    /// the frame needs redrawing.
+    fn apply_clipboard_paste(&mut self, target: ClipboardPasteTarget, text: &str) -> bool {
+        match target {
+            ClipboardPasteTarget::Modal => self.paste_into_active_text_input(text),
+            ClipboardPasteTarget::Pane { ws_idx, pane_id } => {
+                let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    ws_idx,
+                    pane_id,
+                ) else {
+                    return false;
+                };
+                if let Err(err) = runtime.try_send_paste(text.to_owned()) {
+                    warn!(pane = pane_id.raw(), %err, "failed to paste into pane");
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    /// Applies an input source's clipboard answer to the paste that asked for
+    /// it.
+    ///
+    /// Returns whether text actually reached its target, so the caller can
     /// decide the frame needs redrawing. Answers that no longer apply — a
     /// superseded request, a different input source, an empty clipboard, a
-    /// modal the user has since left, or one that took longer than
-    /// [`CLIPBOARD_READ_TTL`] to come back — are dropped rather than pasted.
+    /// modal the user has since left, a pane that has since closed, or one that
+    /// took longer than [`CLIPBOARD_READ_TTL`] to come back — are dropped
+    /// rather than pasted.
     pub(crate) fn apply_clipboard_read_response(
         &mut self,
         source_id: InputSourceId,
@@ -2334,10 +2389,15 @@ impl App {
         if Instant::now().saturating_duration_since(pending.requested_at) >= CLIPBOARD_READ_TTL {
             return false;
         }
-        if self.state.mode != pending.mode || !input::modal_paste_target_active(&self.state) {
+        // A modal answer is only good while the same modal is still up. A pane
+        // answer is not tied to a mode at all — the user right-clicked a pane,
+        // and `apply_clipboard_paste` drops it on its own if that pane is gone.
+        if pending.target == ClipboardPasteTarget::Modal
+            && (self.state.mode != pending.mode || !input::modal_paste_target_active(&self.state))
+        {
             return false;
         }
-        self.paste_into_active_text_input(&text)
+        self.apply_clipboard_paste(pending.target, &text)
     }
 
     /// Handles a key event in non-terminal mode for the headless server.

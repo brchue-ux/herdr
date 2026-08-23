@@ -60,6 +60,28 @@ pub(super) enum MouseAction {
         menu: ContextMenuState,
         idx: usize,
     },
+    /// A plain right-click over a pane: paste whatever is on the clipboard of
+    /// the machine that clicked into that pane, the way a terminal does.
+    PasteIntoPane {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+}
+
+/// Whether a right-click asks for Herdr's own context menu.
+///
+/// The bare right-click is the paste gesture users bring from every other
+/// terminal, so Herdr's menu moved off it and onto `shift`+right-click. Any
+/// *other* modified right-click keeps opening the menu exactly as it always
+/// did: that is the conservative reading — only the one gesture the paste
+/// needed changes hands — and it leaves a working fallback in terminals that
+/// keep `shift`+mouse for their own bypass and never forward it here.
+///
+/// A configured `ui.right_click_passthrough_modifier` chord never reaches this:
+/// [`AppState::handle_right_click_passthrough`] claims it first, and the config
+/// rejects `shift` so the two can never name the same gesture.
+fn is_context_menu_chord(mouse: MouseEvent) -> bool {
+    !mouse.modifiers.is_empty()
 }
 
 enum MobileMouseResult {
@@ -991,7 +1013,9 @@ impl AppState {
                 }
             }
 
-            MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
+            MouseEventKind::Down(MouseButton::Right)
+                if is_context_menu_chord(mouse) && in_sidebar && !self.sidebar_collapsed =>
+            {
                 self.workspace_press = None;
                 self.tab_press = None;
                 if self
@@ -1045,7 +1069,8 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right)
-                if !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
+                if is_context_menu_chord(mouse)
+                    && !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
                     && self.tab_at(mouse.column, mouse.row).is_some() =>
             {
                 if let (Some(ws_idx), Some(tab_idx)) =
@@ -1061,7 +1086,9 @@ impl AppState {
                 }
             }
 
-            MouseEventKind::Down(MouseButton::Right) if !in_sidebar => {
+            MouseEventKind::Down(MouseButton::Right)
+                if is_context_menu_chord(mouse) && !in_sidebar =>
+            {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
                     let ws_idx = self.active?;
                     let tab_idx = self
@@ -1095,6 +1122,23 @@ impl AppState {
                     });
                     self.mode = Mode::ContextMenu;
                 }
+            }
+
+            // Plain right-click is the terminal-standard paste gesture, so it
+            // pastes into the pane under the cursor rather than opening
+            // Herdr's own menu — that moved to `shift`+right-click above. The
+            // clipboard cannot be read from here (under `--remote` it lives on
+            // the machine that clicked, not this one), so this only names the
+            // target and lets `App` ask whoever clicked for their text.
+            MouseEventKind::Down(MouseButton::Right) if !in_sidebar => {
+                let info = self.pane_at(mouse.column, mouse.row).cloned()?;
+                let ws_idx = self.active?;
+                self.selection = None;
+                self.selection_autoscroll = None;
+                return Some(MouseAction::PasteIntoPane {
+                    ws_idx,
+                    pane_id: info.id,
+                });
             }
 
             _ => {}
@@ -2062,11 +2106,23 @@ mod tests {
     };
     use super::*;
     use crate::app::input::modal::handle_context_menu_key;
+    use crate::app::App;
     use crate::{
         app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    /// The gesture that opens Herdr's own context menu.
+    ///
+    /// The bare right-click pastes now, so every menu test has to say which
+    /// chord it means rather than relying on the button alone.
+    fn menu_right_click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            modifiers: KeyModifiers::SHIFT,
+            ..mouse(MouseEventKind::Down(MouseButton::Right), col, row)
+        }
+    }
 
     /// An `AppState` whose screen is exactly `cols` x `rows`.
     fn state_sized(cols: u16, rows: u16) -> crate::app::state::AppState {
@@ -2549,6 +2605,161 @@ mod tests {
         assert!(input_rx.try_recv().is_err());
     }
 
+    /// A pane, its runtime, and the app around it, wired the way the headless
+    /// server runs one: this process's clipboard is not the user's, so a paste
+    /// has to be asked for.
+    fn app_with_pane_and_remote_clipboard() -> (App, PaneInfo, tokio::sync::mpsc::Receiver<Bytes>) {
+        let mut app = app_for_mouse_test();
+        app.local_clipboard_reads = false;
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        let (runtime, input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                b"",
+                4,
+            );
+        ws.insert_test_runtime(pane_id, runtime);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.right_click_passthrough_modifiers = None;
+        (app, info, input_rx)
+    }
+
+    /// Drain the app event channel for the "ask this input source for its
+    /// clipboard" intents a paste emits.
+    fn drained_clipboard_reads(app: &mut App) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = app.event_rx.try_recv() {
+            if let crate::events::AppEvent::ClipboardRead {
+                source_id,
+                request_id,
+            } = ev
+            {
+                out.push((source_id, request_id));
+            }
+        }
+        out
+    }
+
+    /// The gesture the captain asked for: right-click pastes, the way it does
+    /// in every other terminal, instead of opening Herdr's own menu.
+    #[tokio::test]
+    async fn bare_right_click_pastes_the_clickers_clipboard_into_the_pane() {
+        let (mut app, info, mut input_rx) = app_with_pane_and_remote_clipboard();
+
+        app.handle_mouse_from_input_source(
+            7,
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                info.inner_rect.x + 2,
+                info.inner_rect.y + 3,
+            ),
+        );
+
+        assert_eq!(app.state.mode, Mode::Terminal, "no menu opened");
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(
+            drained_clipboard_reads(&mut app),
+            vec![(7, 0)],
+            "the input source that right-clicked is the one asked for its clipboard"
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the click alone sends nothing: the text has not arrived yet"
+        );
+
+        assert!(app.apply_clipboard_read_response(7, 0, Some("pasted-text".to_owned())));
+        assert_eq!(
+            input_rx.try_recv().expect("pasted text reaches the pane"),
+            Bytes::from("pasted-text")
+        );
+    }
+
+    /// A pane paste is not a modal paste: nothing about it is tied to the mode
+    /// the click happened in, so leaving that mode while the answer is in
+    /// flight must not swallow the text.
+    #[tokio::test]
+    async fn a_pane_paste_answer_still_lands_after_the_mode_changed() {
+        let (mut app, info, mut input_rx) = app_with_pane_and_remote_clipboard();
+
+        app.handle_mouse_from_input_source(
+            7,
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                info.inner_rect.x + 2,
+                info.inner_rect.y + 3,
+            ),
+        );
+        assert_eq!(drained_clipboard_reads(&mut app), vec![(7, 0)]);
+
+        app.state.mode = Mode::Navigate;
+
+        assert!(app.apply_clipboard_read_response(7, 0, Some("still-lands".to_owned())));
+        assert_eq!(
+            input_rx.try_recv().expect("pasted text reaches the pane"),
+            Bytes::from("still-lands")
+        );
+    }
+
+    /// The other half of the remap: Herdr's own menu is still one gesture away.
+    #[tokio::test]
+    async fn shift_right_click_opens_herdrs_own_pane_menu_instead_of_pasting() {
+        let (mut app, info, mut input_rx) = app_with_pane_and_remote_clipboard();
+
+        app.handle_mouse_from_input_source(
+            7,
+            menu_right_click(info.inner_rect.x + 2, info.inner_rect.y + 3),
+        );
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(matches!(
+            app.state
+                .context_menu
+                .as_ref()
+                .expect("pane context menu")
+                .kind,
+            ContextMenuKind::Pane { .. }
+        ));
+        assert!(
+            drained_clipboard_reads(&mut app).is_empty(),
+            "the menu chord asks for no clipboard"
+        );
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    /// The sidebar has no pane to paste into, so a bare right-click there is
+    /// inert rather than opening the workspace menu the shift chord owns.
+    #[tokio::test]
+    async fn bare_right_click_in_the_sidebar_neither_pastes_nor_opens_a_menu() {
+        let (mut app, _info, _input_rx) = app_with_pane_and_remote_clipboard();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let sidebar = app.state.view.sidebar_rect;
+        let row = (sidebar.y..sidebar.y + sidebar.height)
+            .find(|row| app.state.workspace_at_row(*row) == Some(0))
+            .expect("a workspace row in the sidebar");
+        let col = sidebar.x + 1;
+
+        app.handle_mouse_from_input_source(
+            7,
+            mouse(MouseEventKind::Down(MouseButton::Right), col, row),
+        );
+        assert!(app.state.context_menu.is_none());
+        assert!(drained_clipboard_reads(&mut app).is_empty());
+
+        app.handle_mouse_from_input_source(7, menu_right_click(col, row));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(app.state.context_menu.is_some());
+    }
+
     #[tokio::test]
     async fn configured_right_click_passthrough_forwards_full_gesture_to_pane() {
         let mut app = app_for_mouse_test();
@@ -2861,8 +3072,7 @@ mod tests {
             .rect;
         let target_rect_before = target_info.rect;
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
+        app.handle_mouse(menu_right_click(
             target_info.inner_rect.x,
             target_info.inner_rect.y,
         ));
@@ -2941,8 +3151,7 @@ mod tests {
             );
         app.state.insert_test_runtime(target, runtime);
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
+        app.handle_mouse(menu_right_click(
             target_info.inner_rect.x,
             target_info.inner_rect.y,
         ));
@@ -3989,11 +4198,7 @@ mod tests {
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let second_tab = app.state.view.tab_hit_areas[1];
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
-            second_tab.x + 1,
-            second_tab.y,
-        ));
+        app.handle_mouse(menu_right_click(second_tab.x + 1, second_tab.y));
 
         assert_eq!(app.state.workspaces[0].active_tab, 0);
         let menu = app.state.context_menu.as_ref().expect("tab context menu");
@@ -4020,11 +4225,7 @@ mod tests {
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let second_tab = app.state.view.tab_hit_areas[1];
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
-            second_tab.x + 1,
-            second_tab.y,
-        ));
+        app.handle_mouse(menu_right_click(second_tab.x + 1, second_tab.y));
 
         let menu = app
             .state
@@ -4069,8 +4270,7 @@ mod tests {
             .expect("first pane info")
             .clone();
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
+        app.handle_mouse(menu_right_click(
             first_info.inner_rect.x + 1,
             first_info.inner_rect.y + 1,
         ));
@@ -4122,8 +4322,7 @@ mod tests {
             .expect("pane info")
             .clone();
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
+        app.handle_mouse(menu_right_click(
             pane_info.inner_rect.x + 1,
             pane_info.inner_rect.y + 1,
         ));
