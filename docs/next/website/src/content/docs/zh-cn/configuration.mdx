@@ -105,7 +105,7 @@ Git 工作区行提供 worktree 操作。`New worktree` 会创建检出：如果
 manage_ssh_config = true
 ```
 
-启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含你的 `~/.ssh/config` 和 `/etc/ssh/ssh_config`，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Herdr 还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。
+启用后，`herdr --remote` 会写入一份私有的临时 SSH 配置：先包含你的 `~/.ssh/config` 和 `/etc/ssh/ssh_config`，再添加兜底的 `ServerAliveInterval` 和 `ServerAliveCountMax` 值。你自己的保活设置优先。Herdr 还会为每次远程连接使用私有的 OpenSSH control socket，以复用首次通过身份验证的连接。设置 `manage_ssh_config = false` 可通过普通 `ssh` 进行远程连接，不使用 Herdr 生成的配置或 control socket。此设置仅适用于 macOS 和 Linux：Windows OpenSSH 不支持 ControlMaster，因此在 Windows 上 `herdr --remote` 始终运行普通 `ssh`，`manage_ssh_config` 不起作用。
 
 ## 按键绑定
 

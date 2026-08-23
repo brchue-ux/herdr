@@ -214,18 +214,28 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     let mut socket_to_stdout = stream.try_clone()?;
     let mut stdin_to_socket = stream;
 
-    // `interprocess` exposes no portable half-close (Windows named pipes have
-    // no equivalent to shutting down one direction while keeping the other
-    // open), so unlike the historical Unix-only version of this bridge, this
-    // side does not signal write-closed early. The peer instead notices the
-    // socket close when this whole process exits, which happens as soon as
-    // the download direction below returns. In practice this bridge is only
-    // ever exec'd by `run_remote`'s ssh child on the remote host, which is
-    // always Linux under this architecture (the server stays on Linux), so
-    // the loss of the early signal has no real-world deployment path anyway.
+    // Once stdin hits EOF — which is how this process learns the local
+    // `herdr --remote` side is gone, since ssh closes it when its own stdin
+    // closes — the server has to be told, or it keeps a phantom client
+    // connection open forever: `client_transport` has a handshake read
+    // timeout but no idle timeout on an established connection.
+    //
+    // Dropping `stdin_to_socket` is not enough. `try_clone()` on a Unix
+    // domain socket is `dup(2)`, and `socket_to_stdout` below still holds a
+    // descriptor for the same socket, so closing this one delivers no EOF.
+    // Only `shutdown(SHUT_WR)` does. Without it the remote server never tears
+    // down, this process never returns from the download copy, ssh never
+    // exits, and the local bridge's `Drop` blocks forever joining a thread
+    // that is itself blocked reading ssh's stdout.
+    //
+    // `interprocess` exposes no portable half-close (a Windows named pipe has
+    // no equivalent), so this is `#[cfg(unix)]`. Nothing is lost: this bridge
+    // only ever runs on the remote *host*, and a Herdr server is Unix-only.
     let _upload = thread::spawn(move || {
         let mut stdin = io::stdin();
         let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        #[cfg(unix)]
+        let _ = ipc::shutdown_local_stream_write(&stdin_to_socket);
     });
 
     copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
@@ -1616,13 +1626,14 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
 
 fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
     let base = std::env::temp_dir();
+    crate::platform::create_private_dir_all(&base)?;
     for attempt in 0..100 {
         let dir = base.join(format!(
             "herdr-remote-{}-{}-{attempt}",
             std::process::id(),
             asset_key
         ));
-        match fs::create_dir(&dir) {
+        match create_private_dir_exclusive(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -1633,6 +1644,32 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
         io::ErrorKind::AlreadyExists,
         "failed to create private herdr remote download directory",
     ))
+}
+
+/// Creates one directory for a staged remote binary, failing if it is already
+/// there.
+///
+/// Fail-if-exists is what makes a predictable name (pid plus asset key) in a
+/// shared temp directory safe: only the process that atomically created the
+/// directory can be the one holding it. [`crate::platform::create_private_dir_all`]
+/// deliberately succeeds on a directory that already exists, so it cannot be
+/// the creating call here — it is instead what makes the *base* private. The
+/// `0700` below is the Unix half of the same bargain, the mode
+/// [`private_ssh_config_dir`] already uses in this file.
+#[cfg(unix)]
+fn create_private_dir_exclusive(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// A Windows directory has no mode to narrow; it inherits its parent's ACL,
+/// and the parent here is either the already per-user `%TEMP%` or a directory
+/// [`crate::platform::create_private_dir_all`] stamped with Herdr's protected
+/// DACL.
+#[cfg(windows)]
+fn create_private_dir_exclusive(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
 }
 
 fn confirm_remote_install(
@@ -1690,7 +1727,11 @@ fn reattach_command(
     live_handoff: bool,
 ) -> String {
     let program = if program.is_empty() { "herdr" } else { program };
-    let mut command = format!("{} --remote {}", shell_quote(program), shell_quote(target));
+    let mut command = format!(
+        "{} --remote {}",
+        reattach_program(program),
+        reattach_quote(target)
+    );
     if keybindings != RemoteKeybindings::Local {
         command.push_str(" --remote-keybindings ");
         command.push_str(keybindings.as_str());
@@ -1700,9 +1741,49 @@ fn reattach_command(
     }
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
-        command.push_str(&shell_quote(session_name));
+        command.push_str(&reattach_quote(session_name));
     }
     command
+}
+
+/// Quotes one argument of the *displayed* reattach hint, for the shell the
+/// user will retype it into — as opposed to [`shell_quote`], which quotes for
+/// the POSIX shell on the remote host and must stay POSIX on every platform.
+///
+/// The hint is only ever shown, never executed, but a hint that cannot be
+/// pasted is worse than none.
+#[cfg(not(windows))]
+fn reattach_quote(value: &str) -> String {
+    shell_quote(value)
+}
+
+/// PowerShell escapes an embedded apostrophe by doubling it, not with POSIX's
+/// `'\''`. Quoting unconditionally also sidesteps [`shell_quote`]'s unquoted
+/// set, which excludes `\` — so every full install path took its quoted branch
+/// and came out POSIX-escaped.
+#[cfg(windows)]
+fn reattach_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn reattach_program(program: &str) -> String {
+    shell_quote(program)
+}
+
+/// A quoted string in PowerShell's command position is parsed as a bare string
+/// expression, and the `--remote` after it becomes an unexpected token — the
+/// call operator `&` is what makes it a command. `argv[0]` is also unreliable
+/// on Windows (a Terminal profile or shortcut passes whatever it likes), so
+/// prefer the real image path when there is one.
+#[cfg(windows)]
+fn reattach_program(program: &str) -> String {
+    let path = std::env::current_exe()
+        .ok()
+        .filter(|path| path.is_absolute())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| program.to_string());
+    format!("& {}", reattach_quote(&path))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1733,6 +1814,7 @@ fn command_failed(context: &str, output: &Output) -> io::Error {
 
 struct SshStdioBridge {
     local_socket: PathBuf,
+    socket_identity: ipc::SocketFileIdentity,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1745,10 +1827,30 @@ impl SshStdioBridge {
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
-        let _ = std::fs::remove_file(&local_socket);
+        // `prepare_socket_path` refuses to start when something is *live* at
+        // the path rather than blindly unlinking it, and creates the parent
+        // privately. The path embeds this process's pid, so a live collision
+        // needs pid reuse — but a stale socket left by the process that had
+        // the pid before is exactly what it removes, and stomping a live one
+        // would break the attach that owns it.
+        ipc::prepare_socket_path(&local_socket, |path| {
+            format!("remote bridge is already listening at {}", path.display())
+        })?;
         let listener: LocalListener = ipc::bind_local_listener(&local_socket)?;
-        ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
-        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+        let socket_identity = ipc::socket_file_identity(&local_socket)?;
+        // Both of these can fail after the socket file exists; leaving it
+        // behind would make the next attach's `prepare_socket_path` do the
+        // stale-socket dance for a file this process knows it owns.
+        if let Err(err) =
+            ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)
+        {
+            let _ = ipc::remove_socket_file_if_owned(&local_socket, &socket_identity);
+            return Err(err);
+        }
+        if let Err(err) = listener.set_nonblocking(ListenerNonblockingMode::Accept) {
+            let _ = ipc::remove_socket_file_if_owned(&local_socket, &socket_identity);
+            return Err(err);
+        }
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
@@ -1769,6 +1871,7 @@ impl SshStdioBridge {
                             &remote_herdr,
                             &session_name,
                             thread_ssh_options.as_ref(),
+                            &thread_stop,
                         ) {
                             eprintln!("herdr: remote bridge failed: {err}");
                         }
@@ -1786,6 +1889,7 @@ impl SshStdioBridge {
 
         Ok(Self {
             local_socket,
+            socket_identity,
             should_stop,
             thread: Some(thread),
         })
@@ -1795,10 +1899,19 @@ impl SshStdioBridge {
 impl Drop for SshStdioBridge {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
-        let _ = std::fs::remove_file(&self.local_socket);
+        // Unix: unlink first, so a client racing the shutdown fails to
+        // connect instead of reaching a listener that is about to go away.
+        // Windows: the file is only an identity marker and removing it does
+        // not close the named pipe, so removing it before the listener is
+        // dropped would let a concurrent `prepare_socket_path` read the pipe
+        // as stale while it is still live.
+        #[cfg(unix)]
+        let _ = ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        #[cfg(windows)]
+        let _ = ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
     }
 }
 
@@ -1905,12 +2018,27 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     })
 }
 
+/// Bridges one accepted local client connection to a fresh `ssh` child running
+/// `herdr remote-client-bridge` on the remote host.
+///
+/// `bridge_stop` is the owning [`SshStdioBridge`]'s stop flag, not a
+/// connection-local one. It has to reach in here because `Drop` sets it and
+/// then joins this thread: without it, a stop request could only be observed
+/// after both copy directions had already finished on their own, which is
+/// exactly what does not happen when the remote end is wedged (a dead link, or
+/// a remote `herdr` old enough to predate the write half-close restored in
+/// [`run_remote_client_bridge`]). Reading ssh's stdout is an uninterruptible
+/// blocking pipe read, so a flag check inside that loop would never be reached;
+/// the download therefore runs on its own thread and this one supervises,
+/// killing the ssh child when the bridge is stopping — which closes the pipe
+/// and unblocks the read.
 fn bridge_connection(
     stream: LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     ssh_options: Option<&ManagedSshOptions>,
+    bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
@@ -1935,38 +2063,62 @@ fn bridge_connection(
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
 
-    // `interprocess` exposes no portable half-close (a Windows named pipe has
-    // no equivalent to shutting down one direction while keeping the other
-    // open, unlike a Unix domain socket's `shutdown(SHUT_WR)`). Instead of
-    // relying on that signal to unblock the upload side once the ssh session
-    // ends, the upload side polls nonblocking against `should_stop`, and both
-    // of this connection's stream handles are dropped once both directions
-    // are done — which the peer (the local `herdr client` process) observes
-    // as a closed connection either way.
+    // The upload side polls nonblocking against `connection_stop` rather than
+    // relying on a blocking read being interrupted, so this connection can be
+    // torn down from outside it.
     //
     // On Unix, `try_clone()` dups the fd, and `O_NONBLOCK` lives on the
     // shared open file description rather than per-fd — so setting polling
     // mode on `stream_to_child` also makes `child_to_stream`'s writes
     // (below) nonblocking-capable, even though only one clone asked for it.
     // `write_all_polling_safe` is written to tolerate that.
-    let should_stop = Arc::new(AtomicBool::new(false));
+    let connection_stop = Arc::new(AtomicBool::new(false));
     let mut stream_to_child = stream.try_clone()?;
     ipc::set_local_stream_polling(&mut stream_to_child, true)?;
 
-    let upload_stop = Arc::clone(&should_stop);
+    let upload_stop = Arc::clone(&connection_stop);
     let upload = thread::spawn(move || {
         let _ = copy_flush_cancelable(&mut stream_to_child, &mut child_stdin, &upload_stop);
     });
 
-    let mut child_to_stream = stream;
-    let _ = copy_child_stdout_to_local_stream(&mut child_stdout, &mut child_to_stream);
-    should_stop.store(true, Ordering::Release);
-    drop(child_to_stream);
+    let download = thread::spawn(move || {
+        let mut child_to_stream = stream;
+        let _ = copy_child_stdout_to_local_stream(&mut child_stdout, &mut child_to_stream);
+        // Tell the local client no more remote output is coming without
+        // waiting for the upload thread to drop its dup of the same socket;
+        // see `ipc::shutdown_local_stream_write` for why a drop alone is not
+        // an EOF. Windows named pipes have no half-close, so there the peer
+        // learns of it when both handles are gone.
+        #[cfg(unix)]
+        let _ = ipc::shutdown_local_stream_write(&child_to_stream);
+        drop(child_to_stream);
+    });
 
-    let status = child.wait()?;
+    let mut stopping = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(err);
+            }
+        }
+        if bridge_stop.load(Ordering::Acquire) {
+            stopping = true;
+            let _ = child.kill();
+            break child.wait();
+        }
+        thread::sleep(BRIDGE_ACCEPT_POLL);
+    };
+
+    connection_stop.store(true, Ordering::Release);
     let _ = upload.join();
+    let _ = download.join();
+    let status = status?;
 
-    if status.success() {
+    if status.success() || stopping {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -2559,6 +2711,7 @@ mod tests {
         assert!(RemotePlatform::from_uname("FreeBSD", "x86_64").is_none());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn reattach_command_includes_remote_and_session() {
         assert_eq!(
@@ -2600,6 +2753,34 @@ mod tests {
                 true,
             ),
             "herdr --remote host --handoff"
+        );
+    }
+
+    /// The Windows hint has to be pastable into PowerShell, where a quoted
+    /// string in command position needs the `&` call operator and an embedded
+    /// apostrophe is doubled rather than POSIX-escaped. The program itself
+    /// comes from `current_exe()`, so only its shape is asserted here.
+    #[cfg(windows)]
+    #[test]
+    fn reattach_command_quotes_for_powershell() {
+        let command = reattach_command(
+            "herdr",
+            "host name",
+            "it's work",
+            RemoteKeybindings::Local,
+            false,
+        );
+        assert!(
+            command.starts_with("& '"),
+            "PowerShell needs the call operator: {command}"
+        );
+        assert!(
+            command.ends_with(" --remote 'host name' --session 'it''s work'"),
+            "unexpected argument quoting: {command}"
+        );
+        assert!(
+            !command.contains("'\\''"),
+            "POSIX apostrophe escaping leaked into the Windows hint: {command}"
         );
     }
 
