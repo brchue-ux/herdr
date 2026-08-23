@@ -1,4 +1,9 @@
-use super::{ghostty_line_from_cells, GhosttyPaneCore, TerminalReadSnapshot};
+use std::time::Instant;
+
+use super::{
+    ghostty_line_from_cells, refresh_render_state_for, GhosttyPaneCore, RenderStateRefresh,
+    RenderStateUse, TerminalReadSnapshot,
+};
 
 const CACHE_LINES: usize = 2000;
 
@@ -106,12 +111,15 @@ fn viewport_is_at_bottom(core: &GhosttyPaneCore) -> bool {
 fn visible_render_lines(
     core: &mut GhosttyPaneCore,
 ) -> Result<Vec<RenderedLine>, crate::ghostty::Error> {
-    let GhosttyPaneCore {
-        terminal,
-        render_state,
-        ..
-    } = core;
-    render_state.update(terminal)?;
+    // Runs on every PTY write on Windows. Advancing `render_state` here would
+    // walk a held frame forward to the live grid between two draws, which is
+    // exactly what every hold in the parent module exists to prevent.
+    if refresh_render_state_for(core, Instant::now(), RenderStateUse::Read)
+        == RenderStateRefresh::Failed
+    {
+        return Ok(Vec::new());
+    }
+    let GhosttyPaneCore { render_state, .. } = core;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
