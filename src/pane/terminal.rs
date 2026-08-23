@@ -290,6 +290,19 @@ pub(crate) struct GhosttyPaneCore {
     /// pre-resize frame here keeps every shape of it off screen until either
     /// this timeout elapses or the child settles.
     resize_recovery_started_at: Option<Instant>,
+    /// The [`ClaudeTriviewLayout`] the last paint of this pane actually drew,
+    /// or `None` when it drew the unmodified full-pane render.
+    ///
+    /// A triview paint is the one case where a pane row is **not** the grid
+    /// row of the same index: the log zone is opened by shifting the
+    /// transcript and composer up off the top of the grid
+    /// ([`ClaudeTriviewLayout::transcript_skip`]). Everything downstream that
+    /// projects a grid position onto the drawn pane — the frame cursor, the
+    /// hyperlink hit map, the retained dirty-patch fast path — has to know
+    /// that, and only the paint itself knows whether the split resolved this
+    /// frame. Recording it here is how they find out without re-reading the
+    /// grid and re-deciding the split for themselves.
+    last_triview_layout: Option<ClaudeTriviewLayout>,
 }
 
 pub(crate) struct PaneTerminal {
@@ -573,6 +586,10 @@ impl PaneTerminal {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.ghostty.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn last_claude_triview_layout(&self) -> Option<ClaudeTriviewLayout> {
+        self.ghostty.last_claude_triview_layout()
     }
 
     pub fn kitty_image_placements_with_data_filter<F>(
@@ -1090,6 +1107,7 @@ impl GhosttyPaneTerminal {
                 alt_screen_read_hold_since: None,
                 awaiting_resize_redraw_since: None,
                 resize_recovery_started_at: None,
+                last_triview_layout: None,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -2181,6 +2199,19 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    /// The [`ClaudeTriviewLayout`] this pane's last paint drew, or `None`
+    /// when it drew the unmodified full-pane copy and a pane row is simply
+    /// the grid row of the same index.
+    ///
+    /// Read by everything that projects a live grid position onto the pane as
+    /// it was actually drawn — see [`ClaudeTriviewLayout::pane_row_for_grid_row`].
+    pub(crate) fn last_claude_triview_layout(&self) -> Option<ClaudeTriviewLayout> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.last_triview_layout)
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
@@ -2203,6 +2234,9 @@ impl GhosttyPaneTerminal {
         let Ok(mut core) = self.core.lock() else {
             return;
         };
+        // Whatever the last paint drew, this one is the unmodified full-pane
+        // copy, so every pane row is the grid row of the same index again.
+        core.last_triview_layout = None;
         let host_theme = core.host_terminal_theme;
         let initial_default_foreground = core.initial_default_foreground;
         let initial_default_background = core.initial_default_background;
@@ -2360,6 +2394,10 @@ impl GhosttyPaneTerminal {
         requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
         let mut core = self.core.lock().ok()?;
+        // Cleared up front so every bail-out below leaves the identity
+        // mapping behind: on `None` the caller draws `Self::render`, which is
+        // the unmodified full-pane copy.
+        core.last_triview_layout = None;
         let host_theme = core.host_terminal_theme;
         let initial_default_foreground = core.initial_default_foreground;
         let initial_default_background = core.initial_default_background;
@@ -2373,6 +2411,9 @@ impl GhosttyPaneTerminal {
         };
 
         let layout = claude_triview_layout(&core.terminal, area.height, requested_log_rows)?;
+        // Recorded before anything is blitted: this is the projection every
+        // later reader of the drawn pane has to share.
+        core.last_triview_layout = Some(layout);
 
         let GhosttyPaneCore {
             render_state,
@@ -2568,6 +2609,45 @@ impl ClaudeTriviewLayout {
     /// sat before the transcript's shift moved the zone that draws it.
     pub(crate) fn grid_composer_start(&self) -> u16 {
         self.transcript_skip + self.transcript_rows + 1
+    }
+
+    /// Where grid row `grid_row` was actually drawn in the pane's own `area`,
+    /// or `None` when this paint did not draw it at all.
+    ///
+    /// The split is three live zones with two cropped rows between them, so
+    /// the projection has exactly three cases:
+    ///
+    /// * the transcript and the composer body were both shifted **up** by
+    ///   [`Self::transcript_skip`] to open the log zone, so they land
+    ///   `transcript_skip` rows above their grid row;
+    /// * the agent's own footer never moved — the rows the log took came from
+    ///   above it — so it lands on its grid row;
+    /// * the composer's two border rows were cropped out and replaced in
+    ///   place by this module's dividers, and the `transcript_skip` oldest
+    ///   transcript rows scrolled off the top, so none of those were drawn.
+    ///
+    /// With `transcript_skip == 0` this is the identity on every row it draws,
+    /// which is what makes an unshifted split safe for the callers that
+    /// assumed identity before the log zone could ever fill.
+    pub(crate) fn pane_row_for_grid_row(&self, grid_row: u16) -> Option<u16> {
+        let composer_start = self.grid_composer_start();
+        let composer_end = composer_start + self.composer_rows;
+        if grid_row < self.transcript_skip {
+            // Scrolled off the top of the transcript zone to make the log room.
+            None
+        } else if grid_row < composer_start.saturating_sub(1) {
+            Some(grid_row - self.transcript_skip)
+        } else if grid_row == composer_start - 1 || grid_row == composer_end {
+            // The composer's own top and bottom borders, cropped out.
+            None
+        } else if grid_row < composer_end {
+            Some(grid_row - self.transcript_skip)
+        } else if grid_row < self.footer_start() + self.footer_rows {
+            // The agent's own footer, left where it drew it.
+            Some(grid_row)
+        } else {
+            None
+        }
     }
 }
 
@@ -5028,6 +5108,112 @@ mod tests {
         }
         assert_eq!(buffer_row_text(buffer, 12, 60), "~/proj main 42% context");
         assert_eq!(buffer_row_text(buffer, 13, 60), "? for shortcuts");
+    }
+
+    /// Every reader of a *drawn* pane row has to agree with what was drawn,
+    /// and the log zone is the one thing that makes them disagree: it opens
+    /// its rows by shifting the transcript and composer up off the top of the
+    /// grid, so the composer is no longer on the pane row of its own grid
+    /// index. Asserted against the same 60x14 screen the shift test above
+    /// draws, and against the buffer it produced rather than against the
+    /// layout's own arithmetic.
+    #[test]
+    fn a_shifted_triview_reports_where_it_really_drew_each_grid_row() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 9);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        assert_eq!(
+            pane.last_claude_triview_layout(),
+            None,
+            "nothing has been painted yet"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(60, 14);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 3);
+        })
+        .unwrap();
+
+        let layout = pane
+            .last_claude_triview_layout()
+            .expect("a triview paint records the split it drew");
+        assert_eq!(layout.transcript_skip, 3);
+
+        // The composer's own grid row, and the row it was actually drawn on.
+        // The captain's bug is exactly this pair being assumed equal: the
+        // frame cursor landed on grid row 10 of a pane whose composer was
+        // drawn on row 7, which is three rows down inside the command log.
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
+        assert_eq!(layout.grid_composer_start(), 10);
+        assert_eq!(layout.pane_row_for_grid_row(10), Some(7));
+
+        // The transcript is shifted by the same amount, and the rows the log
+        // zone took off its top were not drawn at all.
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 04");
+        assert_eq!(layout.pane_row_for_grid_row(3), Some(0));
+        for scrolled_off in 0..3 {
+            assert_eq!(layout.pane_row_for_grid_row(scrolled_off), None);
+        }
+
+        // The composer's two border rows were cropped out and replaced in
+        // place by the caller's dividers, so neither is a drawn grid row.
+        assert_eq!(layout.pane_row_for_grid_row(9), None);
+        assert_eq!(layout.pane_row_for_grid_row(11), None);
+
+        // The agent's own footer never moved: the log's rows came from above
+        // it, so its grid rows are its pane rows.
+        assert_eq!(buffer_row_text(buffer, 12, 60), "~/proj main 42% context");
+        assert_eq!(layout.pane_row_for_grid_row(12), Some(12));
+        assert_eq!(layout.pane_row_for_grid_row(13), Some(13));
+        assert_eq!(layout.pane_row_for_grid_row(14), None);
+
+        // An unmodified full-pane draw puts the identity mapping back, so a
+        // pane that stops resolving the split cannot leave a stale shift
+        // behind for the cursor to be projected through.
+        term.draw(|frame| {
+            pane.render(frame, Rect::new(0, 0, 60, 14), false);
+        })
+        .unwrap();
+        assert_eq!(pane.last_claude_triview_layout(), None);
+    }
+
+    /// With nothing asked for the log, nothing comes off the transcript and
+    /// the projection is the identity on every row the split draws — which is
+    /// why the callers that assumed identity were right until the log could
+    /// fill, and why the retained fast path is only given up on a real shift.
+    #[test]
+    fn an_unshifted_triview_projects_every_drawn_row_onto_itself() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 9);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 14);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 0);
+        })
+        .unwrap();
+
+        let layout = pane.last_claude_triview_layout().expect("a triview paint");
+        assert_eq!(layout.transcript_skip, 0);
+        assert_eq!(layout.log_rows, 0);
+        for grid_row in 0..14u16 {
+            let drawn = layout.pane_row_for_grid_row(grid_row);
+            // Only the two cropped border rows are missing; everything else
+            // is exactly where it always was.
+            if grid_row == layout.grid_composer_start() - 1
+                || grid_row == layout.grid_composer_start() + layout.composer_rows
+            {
+                assert_eq!(drawn, None, "grid row {grid_row} is a cropped border");
+            } else {
+                assert_eq!(drawn, Some(grid_row), "grid row {grid_row}");
+            }
+        }
     }
 
     /// A log big enough to gut the transcript is not worth what it costs:
