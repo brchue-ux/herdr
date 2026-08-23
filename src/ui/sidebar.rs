@@ -12840,3 +12840,186 @@ mod a_scrolled_panel_still_draws_its_workers {
         );
     }
 }
+
+/// The tray's rows belong to the tree the moment the tray stops drawing.
+///
+/// [`tray::reserved_rows`] returning `0` is only half of the promise. The other
+/// half — the half a reader of that function cannot check — is that the rows it
+/// stops reserving are *taken*: that the tree lays more workers out into them
+/// rather than leaving a band of panel below the last card. A tray switched off
+/// that left ten dead rows at the foot of the panel would satisfy every
+/// existing test in this file, because every one of them asks about the tray's
+/// own geometry and none of them asks what the tree did with what it gave back.
+///
+/// So this module asks the tree instead, at three joints:
+///
+/// - the body grows by exactly the rows the tray had reserved,
+/// - more workers are drawn, and the lowest one drawn reaches down past where
+///   the tray's top edge used to be,
+/// - and a tree already scrolled to its tray-on bottom refills through the real
+///   view pass, rather than holding a stale offset that would leave the
+///   reclaimed rows blank until the reader scrolled.
+#[cfg(test)]
+mod the_trays_rows_go_back_to_the_tree {
+    use super::*;
+    use crate::ui::sidebar::AgentState;
+    use crate::workspace::Workspace;
+
+    /// A mate Space carrying `workers` panes, each a named idle agent
+    /// delegated inside that Space — the shape the tree draws crew rows for.
+    fn fleet(workers: usize) -> AppState {
+        let mut app = AppState::test_new();
+        let mut mate = Workspace::test_new("2ndmate-explore");
+        let panes = (0..workers)
+            .map(|_| mate.test_split(ratatui::layout::Direction::Vertical))
+            .collect::<Vec<_>>();
+        app.workspaces = vec![Workspace::test_new("firstmate"), mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+        let space_id = app.workspaces[1].id.clone();
+        for (index, pane) in panes.iter().enumerate() {
+            let terminal_id = app.workspaces[1].tabs[0].panes[pane]
+                .attached_terminal_id
+                .clone();
+            let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
+                continue;
+            };
+            terminal.set_agent_name(format!("worker-{index}"));
+            terminal.state = AgentState::Idle;
+            terminal.created_by = Some(crate::api::schema::PaneOrigin {
+                pane_id: format!("creator-{index}"),
+                workspace_id: space_id.clone(),
+            });
+        }
+        app
+    }
+
+    /// A panel wide enough to draw cards and short enough that the fleet
+    /// overflows it, which is the only condition under which the question means
+    /// anything: a tree that already fits has no use for the rows either way.
+    const PANEL: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 30,
+    };
+
+    /// The whole terminal the view is computed against. The sidebar is pinned
+    /// to [`PANEL`]'s width so the panel the view lays out is the panel the
+    /// direct-layout assertions measure.
+    const SCREEN: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 30,
+    };
+
+    #[test]
+    fn switching_the_tray_off_hands_its_rows_to_the_tree_and_the_tree_fills_them() {
+        let mut app = fleet(20);
+        let list = workspace_list_rect(PANEL);
+
+        app.sidebar_signal_tray.enabled = true;
+        let reserved = tray::reserved_rows(&app, list);
+        assert!(
+            reserved > 0,
+            "the panel is too small to hold the tray, so there is nothing to reclaim"
+        );
+        let with_tray_body = workspace_list_body_rect(&app, list, false);
+        let with_tray = workspace_list_scroll_metrics(&app, list);
+        let (with_tray_cards, _) = compute_workspace_list_areas(&app, PANEL);
+        let tray_top = tray::tray_rect(&app, list).y;
+
+        app.sidebar_signal_tray.enabled = false;
+        let no_tray_body = workspace_list_body_rect(&app, list, false);
+        let without_tray = workspace_list_scroll_metrics(&app, list);
+        let (without_tray_cards, _) = compute_workspace_list_areas(&app, PANEL);
+
+        assert_eq!(
+            no_tray_body.height,
+            with_tray_body.height + reserved,
+            "the body did not grow by the rows the tray stopped reserving"
+        );
+        assert!(
+            without_tray.viewport_rows > with_tray.viewport_rows,
+            "the tree draws no more rows without the tray ({} then {})",
+            with_tray.viewport_rows,
+            without_tray.viewport_rows
+        );
+        assert!(
+            without_tray.max_offset_from_bottom < with_tray.max_offset_from_bottom,
+            "the tree still has as far to scroll with the tray gone"
+        );
+
+        let lowest = |cards: &[crate::app::state::WorkspaceCardArea]| {
+            cards.last().map(|card| card.rect.y + card.rect.height)
+        };
+        let with_tray_lowest = lowest(&with_tray_cards).expect("the panel drew rows with the tray");
+        let without_tray_lowest =
+            lowest(&without_tray_cards).expect("the panel drew rows without the tray");
+        assert!(
+            with_tray_cards.len() < without_tray_cards.len(),
+            "the same number of rows was drawn into a taller body"
+        );
+        assert!(
+            with_tray_lowest <= tray_top,
+            "a row was drawn over the tray's own rect"
+        );
+        assert!(
+            without_tray_lowest > tray_top,
+            "the lowest worker stops where the tray used to start ({without_tray_lowest} against \
+             a tray top of {tray_top}), so the reclaimed rows are drawing nothing"
+        );
+    }
+
+    /// The transition, not the two end states: a tree parked at the bottom of
+    /// the tray-on layout must refill when the tray goes, rather than holding
+    /// an offset that is now past the end and leaving the reclaimed rows blank.
+    ///
+    /// The renormalisation is [`crate::ui::compute_view`]'s, which is why this
+    /// goes through the view rather than calling the layout directly — the
+    /// direct call is exactly the path that would still hold the stale offset.
+    #[test]
+    fn a_tree_parked_at_the_tray_on_bottom_refills_when_the_tray_goes() {
+        let mut app = fleet(20);
+        app.sidebar_width = PANEL.width;
+        let list = workspace_list_rect(PANEL);
+
+        app.sidebar_signal_tray.enabled = true;
+        let reserved = tray::reserved_rows(&app, list);
+        app.workspace_scroll = workspace_list_scroll_metrics(&app, list).max_offset_from_bottom;
+        assert!(
+            app.workspace_scroll > 0,
+            "the fleet did not overflow the panel, so there is no stale offset to hold"
+        );
+        let parked = app.workspace_scroll;
+
+        app.sidebar_signal_tray.enabled = false;
+        crate::ui::compute_view(&mut app, SCREEN);
+
+        assert!(
+            app.workspace_scroll < parked,
+            "the view kept the tray-on offset ({parked}), so the reclaimed rows draw nothing"
+        );
+
+        let body = workspace_list_body_rect(&app, list, false);
+        let lowest = app
+            .view
+            .workspace_card_areas
+            .last()
+            .map(|card| card.rect.y + card.rect.height)
+            .expect("the panel drew rows after the tray went");
+        let unused = (body.y + body.height).saturating_sub(lowest);
+        assert!(
+            unused < reserved,
+            "{unused} of the tray's {reserved} rows are still blank under the lowest worker"
+        );
+    }
+}
