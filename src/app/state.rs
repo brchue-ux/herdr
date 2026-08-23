@@ -727,11 +727,17 @@ impl Palette {
             subtext0: Color::Rgb(100, 113, 126), // --dim
             mauve: Color::Rgb(58, 127, 163),     // --cyan-dim
             green: Color::Rgb(61, 220, 132),     // --ok
-            yellow: Color::Rgb(255, 180, 84),    // --amber
-            red: Color::Rgb(255, 180, 84),       // --amber (mockup has no distinct danger hue)
-            blue: Color::Rgb(58, 127, 163),      // --cyan-dim
-            teal: Color::Rgb(90, 209, 255),      // --cyan
-            peach: Color::Rgb(255, 180, 84),     // --amber
+            // Working/running uses --cyan, not --amber: the mockup's own
+            // `.active-line::before` — its "something is happening now"
+            // dot — is coloured `var(--cyan)`, and reserving amber for
+            // `red` below keeps "working" and "blocked" visually distinct
+            // (both would otherwise render the identical amber dot, since
+            // the mockup has only one warm accent).
+            yellow: Color::Rgb(90, 209, 255), // --cyan
+            red: Color::Rgb(255, 180, 84),    // --amber — the mockup's "warn" badge color
+            blue: Color::Rgb(58, 127, 163),   // --cyan-dim
+            teal: Color::Rgb(58, 127, 163),   // --cyan-dim (kept distinct from `yellow`'s cyan)
+            peach: Color::Rgb(255, 180, 84),  // --amber
         }
     }
 
@@ -4961,7 +4967,12 @@ mod tests {
         assert_eq!(p.overlay1, Color::Rgb(100, 113, 126), "--dim");
         assert_eq!(p.text, Color::Rgb(230, 237, 243), "--ink");
         assert_eq!(p.green, Color::Rgb(61, 220, 132), "--ok");
-        assert_eq!(p.yellow, Color::Rgb(255, 180, 84), "--amber");
+        assert_eq!(p.yellow, Color::Rgb(90, 209, 255), "--cyan");
+        assert_eq!(p.red, Color::Rgb(255, 180, 84), "--amber");
+        assert_ne!(
+            p.yellow, p.red,
+            "working and blocked must stay visually distinct"
+        );
     }
 
     #[test]

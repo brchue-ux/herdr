@@ -465,7 +465,7 @@ fn theme_runtime_config(
         .theme
         .name
         .clone()
-        .unwrap_or_else(|| "catppuccin".to_string());
+        .unwrap_or_else(|| "abyss".to_string());
     let (default_dark, default_light) = sibling_theme_names(&manual_name);
     state::ThemeRuntimeConfig {
         manual_name,
@@ -516,7 +516,7 @@ fn resolve_effective_theme(
 ) -> (state::Palette, String) {
     let (name, fallback) = if runtime.auto_switch {
         match appearance.unwrap_or(crate::terminal_theme::HostAppearance::Dark) {
-            crate::terminal_theme::HostAppearance::Dark => (&runtime.dark_name, "catppuccin"),
+            crate::terminal_theme::HostAppearance::Dark => (&runtime.dark_name, "abyss"),
             crate::terminal_theme::HostAppearance::Light => {
                 (&runtime.light_name, "catppuccin-latte")
             }
@@ -3430,6 +3430,46 @@ mod tests {
             Some(crate::terminal_theme::HostAppearance::Dark)
         );
         assert_eq!(app.state.theme_name, "catppuccin");
+    }
+
+    /// `abyss` is the theme an unconfigured `[theme] name` resolves to — both
+    /// directly (`theme_runtime_config`'s fallback) and as the `auto_switch`
+    /// dark-appearance fallback (`resolve_effective_theme`'s `"abyss"`
+    /// literal) — since the mockup's dark palette became Herdr's default.
+    /// `catppuccin` remains available and completely unaffected for anyone
+    /// who explicitly configures it.
+    #[test]
+    fn abyss_is_the_unconfigured_default_theme_including_for_auto_switch_dark() {
+        let config = Config::default();
+        assert_eq!(config.theme.name, None, "default config sets no theme name");
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(app.state.theme_name, "abyss");
+        assert_eq!(app.state.palette, state::Palette::abyss());
+
+        // An unresolvable configured `dark_name` under `auto_switch` must
+        // fall back to abyss's palette, not catppuccin's — this is the
+        // literal fallback string in `resolve_effective_theme`'s dark arm,
+        // distinct from `theme_runtime_config`'s own unconfigured-default
+        // fallback exercised above.
+        let mut auto_config = Config::default();
+        auto_config.theme.auto_switch = true;
+        auto_config.theme.dark_name = Some("not-a-real-theme".to_string());
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut auto_app = App::new(
+            &auto_config,
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        auto_app.set_host_terminal_appearance(crate::terminal_theme::HostAppearance::Dark, true);
+        assert_eq!(
+            auto_app.state.palette,
+            state::Palette::abyss(),
+            "an unresolvable auto_switch dark_name must fall back to abyss, not catppuccin"
+        );
     }
 
     #[test]
