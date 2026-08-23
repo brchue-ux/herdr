@@ -3733,8 +3733,9 @@ fn crew_for(
     index: usize,
     agents: &[AgentPanelEntry],
     moving: bool,
+    limit: usize,
 ) -> Vec<crew::CrewMember> {
-    (index + 1..index + 1 + super::crew_len(entries, index))
+    (index + 1..index + 1 + super::crew_len(entries, index).min(limit))
         .filter_map(|row| {
             let tier = super::crew_tier(entries, row)?;
             let super::WorkspaceListEntry::Agent { entry_idx, .. } = entries.get(row)? else {
@@ -4067,7 +4068,7 @@ fn compute_card_placement(
         // here — it has a rect, it takes a click, it opens and closes — but the
         // ink on it belongs to the head's own image, so nothing is placed for it
         // and nothing of it is rasterised twice.
-        if nested && super::crew_head(&entries, card.entry_idx).is_some() {
+        if nested && super::drawn_crew_head(app, &entries, card.entry_idx).is_some() {
             continue;
         }
         let Some(mut content) = content_for(app, entry, &agents, &bodies) else {
@@ -4075,7 +4076,16 @@ fn compute_card_placement(
         };
         content.controls = control_rail(app, entry, &agents, card);
         if nested {
-            content.crew = crew_for(app, &entries, card.entry_idx, &agents, moving);
+            // Only the crew rows this pass actually laid out. A list that ran
+            // off the bottom of the panel would otherwise be drawn past the box
+            // the layout closed under its last visible row.
+            let drawn = cards[index + 1..]
+                .iter()
+                .take_while(|row| {
+                    super::drawn_crew_head(app, &entries, row.entry_idx) == Some(card.entry_idx)
+                })
+                .count();
+            content.crew = crew_for(app, &entries, card.entry_idx, &agents, moving, drawn);
         }
         // The card-bloom beat, resolved where the row's own life is known. A
         // panel with motion off leaves every card whole, which is what it has
@@ -14745,6 +14755,41 @@ mod a_card_draws_the_workers_it_carries {
             via > direct,
             "the second mate's row is not stepped in: {direct} vs {via}"
         );
+    }
+
+    /// **A panel with no row motion draws every worker settled.**
+    ///
+    /// Herdr's answer to the mockup's `prefers-reduced-motion`: `row_motion` is
+    /// `none` out of the box, and a panel that does not move rows does not open
+    /// a track or fade anything in — it draws the list at the state it ends in.
+    /// Read through the real `crew_for`, so this is the branch the renderer
+    /// takes rather than a restatement of it.
+    #[test]
+    fn a_panel_with_no_row_motion_draws_every_worker_settled() {
+        let app = crate::ui::sidebar::a_space_card_carries_its_own_workers::crewed_fleet();
+        assert!(
+            !app.sidebar_rows_move(),
+            "the fixture has to be a panel with motion off"
+        );
+        let entries = super::super::workspace_list_entries(&app);
+        let agents = super::super::sidebar_agent_entries(&app);
+        let crew = crew_for(
+            &app,
+            &entries,
+            0,
+            &agents,
+            app.sidebar_rows_move(),
+            usize::MAX,
+        );
+        assert_eq!(crew.len(), 3, "the Space lost a worker");
+        for member in &crew {
+            assert_eq!(
+                member.arrival,
+                crew::CrewArrival::SETTLED,
+                "{} is mid-gesture on a panel that moves nothing",
+                member.name
+            );
+        }
     }
 
     /// **The track opens before any ink appears.**

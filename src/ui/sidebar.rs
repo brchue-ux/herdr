@@ -609,6 +609,23 @@ pub(crate) fn crew_head(entries: &[WorkspaceListEntry], idx: usize) -> Option<us
     None
 }
 
+/// [`crew_head`], but only when that head is a row the panel is actually
+/// drawing.
+///
+/// A card's box is drawn by its *head*, so a worker whose head has scrolled off
+/// the top has nothing to be inside of: it goes back to being a card of its own
+/// rather than becoming an invisible row under a border nobody drew. The panel's
+/// own first drawn row is the whole test — the tree walk emits a head before
+/// everything it owns, so a head at or after the scroll is on screen and one
+/// before it is not.
+pub(crate) fn drawn_crew_head(
+    app: &AppState,
+    entries: &[WorkspaceListEntry],
+    idx: usize,
+) -> Option<usize> {
+    crew_head(entries, idx).filter(|head| *head >= app.workspace_scroll)
+}
+
 /// Which indent step the row at `idx` draws at inside its Space's card.
 ///
 /// `0` for a worker the Space dispatched itself — its parent *is* the card it is
@@ -2169,7 +2186,7 @@ fn list_entry_height(
         // has something to open and close when it arrives and leaves. What it no
         // longer keeps is a card's height — it is two lines of type inside
         // somebody else's box.
-        if crew_is_drawn(app, fold_width) && crew_tier(entries, entry_idx).is_some() {
+        if crew_is_drawn(app, fold_width) && drawn_crew_head(app, entries, entry_idx).is_some() {
             return image_card::crew_row_cells(app, fold_width)
                 .unwrap_or(rows)
                 .min(body_height);
@@ -2450,7 +2467,7 @@ pub(crate) fn compute_workspace_list_areas(
                 // still its own row with its own shell, so it keeps its own
                 // column and nothing about that panel changes.
                 nested
-                    .then(|| crew_head(&entries, entry_idx))
+                    .then(|| drawn_crew_head(app, &entries, entry_idx))
                     .flatten()
                     .and_then(|head| entries.get(head))
                     .unwrap_or(entry),
@@ -2467,7 +2484,7 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     if nested {
-        stretch_cards_over_their_crew(&entries, &mut cards);
+        stretch_cards_over_their_crew(app, &entries, &mut cards);
     }
     (cards, headers)
 }
@@ -2483,13 +2500,14 @@ pub(crate) fn compute_workspace_list_areas(
 /// ran out of room part-way through closes its box at the last row it drew
 /// instead of reaching past the bottom of the panel.
 fn stretch_cards_over_their_crew(
+    app: &AppState,
     entries: &[WorkspaceListEntry],
     cards: &mut [crate::app::state::WorkspaceCardArea],
 ) {
     let mut head: Option<usize> = None;
     for index in 0..cards.len() {
         let entry_idx = cards[index].entry_idx;
-        if crew_head(entries, entry_idx).is_some() {
+        if drawn_crew_head(app, entries, entry_idx).is_some() {
             let Some(head) = head else {
                 continue;
             };
@@ -3665,7 +3683,7 @@ fn render_agent_row(
     // step inside that box. So it grows no rail and takes no connector — a
     // `├─` beside it would be a second, weaker statement of what the border
     // already says, drawn in the gutter of a card it is not outside of.
-    if crew_is_drawn(app, fold_width) && crew_head(entries, card.entry_idx).is_some() {
+    if crew_is_drawn(app, fold_width) && drawn_crew_head(app, entries, card.entry_idx).is_some() {
         return;
     }
 
@@ -12448,7 +12466,7 @@ mod a_filtered_tree_says_what_it_is_holding_back {
 /// which rows are in which card's list, at which step, in which order, and that
 /// every one of them is still a row you can click.
 #[cfg(test)]
-mod a_space_card_carries_its_own_workers {
+pub(crate) mod a_space_card_carries_its_own_workers {
     use super::*;
     use crate::workspace::Workspace;
 
@@ -12461,7 +12479,7 @@ mod a_space_card_carries_its_own_workers {
     /// fixture is for is the captain's third requirement: a second mate working
     /// in the *same* Space a direct worker is in, where both have to land in the
     /// one list told apart by nothing but the step.
-    fn crewed_fleet() -> AppState {
+    pub(super) fn crewed_fleet() -> AppState {
         let mut app = AppState::test_new();
         let mut space = Workspace::test_new("herdr");
         let direct = space.test_split(ratatui::layout::Direction::Vertical);
@@ -12704,6 +12722,121 @@ mod a_space_card_carries_its_own_workers {
                 .filter(|card| card.agent.is_some())
                 .all(|card| card.card_frame.is_some()),
             "a worker lost its own shell on a panel with no card to be inside of"
+        );
+    }
+}
+
+/// **A worker list survives being scrolled through.**
+///
+/// The card's box is drawn by its *head*, so the two rows that can come apart
+/// are the ones the panel cuts: a worker whose head has scrolled off the top,
+/// and a list that runs off the bottom. Both were live defects of the first
+/// implementation — the first drew nothing at all where the workers should be,
+/// the second drew rows past the border the layout had already closed.
+#[cfg(test)]
+mod a_scrolled_panel_still_draws_its_workers {
+    use super::a_space_card_carries_its_own_workers::crewed_fleet;
+    use super::*;
+
+    fn drawing(mut app: AppState) -> AppState {
+        app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
+        app.sidebar_card_shapes = true;
+        app.view.sidebar_card_layers_published = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        app
+    }
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 42, 46)
+    }
+
+    /// **A worker whose Space has scrolled off is a card of its own again.**
+    ///
+    /// There is no box above it to be inside of, so nesting it would leave a row
+    /// with no frame, no ink and no border — an invisible row where a worker is.
+    #[test]
+    fn a_worker_whose_head_scrolled_off_gets_its_own_box_back() {
+        let mut app = drawing(crewed_fleet());
+        if image_card::row_height_cells(&app, row_fold_width(&app, workspace_list_rect(area())))
+            .is_none()
+        {
+            return; // No proportional face on this machine.
+        }
+        let entries = workspace_list_entries(&app);
+        assert!(crew_head(&entries, 1).is_some(), "row 1 heads no crew list");
+
+        // Scrolled past the Space itself.
+        app.workspace_scroll = 1;
+        assert_eq!(
+            drawn_crew_head(&app, &entries, 1),
+            None,
+            "a worker was still nested under a head the panel is not drawing"
+        );
+        let cards = compute_workspace_card_areas(&app, area());
+        assert!(!cards.is_empty(), "the scrolled panel drew nothing at all");
+        for card in &cards {
+            assert!(
+                card.card_frame.is_some(),
+                "a row with no head above it drew neither a box nor ink: {card:?}"
+            );
+        }
+    }
+
+    /// **A list that runs off the bottom closes its box under the last row it
+    /// drew, and draws no more than that.**
+    ///
+    /// The card's own height comes from the crew it is *drawn* with, so a card
+    /// handed more workers than the panel laid out would paint them past its own
+    /// closing edge.
+    #[test]
+    fn a_list_cut_by_the_panels_floor_stops_where_the_panel_does() {
+        let app = drawing(crewed_fleet());
+        let full = area();
+        if image_card::row_height_cells(&app, row_fold_width(&app, workspace_list_rect(full)))
+            .is_none()
+        {
+            return;
+        }
+        let entries = workspace_list_entries(&app);
+        let all = compute_workspace_card_areas(&app, full);
+        assert_eq!(
+            all.len(),
+            entries.len(),
+            "the fixture did not fit to begin with"
+        );
+
+        // Exactly the Space and one worker, plus the rows the panel reserves for
+        // its own header and footer — so the last two workers have nowhere to go.
+        let cut = Rect::new(
+            0,
+            0,
+            42,
+            all[0].rect.height
+                + all[1].rect.height
+                + WORKSPACE_SECTION_HEADER_ROWS
+                + WORKSPACE_SECTION_FOOTER_ROWS,
+        );
+        let cards = compute_workspace_card_areas(&app, cut);
+        assert!(
+            cards.len() < entries.len(),
+            "the fixture was not actually cut: {} rows in {:?}",
+            cards.len(),
+            cut
+        );
+        let head = cards
+            .iter()
+            .find(|card| crew_head(&entries, card.entry_idx).is_none())
+            .expect("the Space's own row");
+        let frame = head.card_frame.expect("the Space has a box");
+        let last = cards.last().expect("a laid-out row");
+        assert_eq!(
+            frame.y + frame.height,
+            last.rect.y + last.rect.height,
+            "the box does not close under the last worker the panel drew"
         );
     }
 }
