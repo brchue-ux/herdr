@@ -1567,6 +1567,55 @@ mod tests {
         assert!(row_text(&app, 3).contains("cmd 0"), "{}", row_text(&app, 3));
     }
 
+    /// Diff-shaped text (a `+`/`-` prefixed line, a unified-diff hunk header)
+    /// fed into the middle zone's own model — `AppState::pane_command_log`,
+    /// the triview log zone's data source — must render as a plain log line
+    /// with the zone's uniform "● " bullet and `subtext0` styling, never with
+    /// `diff_pane`'s green/red marker colors or gutter/rail layout. This is
+    /// the regression guard for "no diff text may appear in the middle
+    /// terminal/log region": the only place `+`/`-`/`@@` content is allowed
+    /// to paint as a diff is `crate::ui::diff_pane`.
+    #[test]
+    fn diff_shaped_text_in_the_pane_command_log_never_gets_diff_styling() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        app.pane_command_log
+            .record(pane_id, "+new line".to_string());
+        app.pane_command_log
+            .record(pane_id, "-old line".to_string());
+        app.pane_command_log
+            .record(pane_id, "@@ -1,2 +1,2 @@".to_string());
+
+        let area = Rect::new(0, 0, 30, 3);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 3)).unwrap();
+        terminal
+            .draw(|frame| render_pane_command_log(&app, frame, pane_id, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String { (0..30).map(|x| buffer[(x, y)].symbol()).collect() };
+
+        // Newest first: the hunk header, then the removed line, then the
+        // added line — each behind the log zone's own bullet, not a diff
+        // gutter/marker.
+        assert!(row_text(0).contains("● @@ -1,2 +1,2 @@"), "{}", row_text(0));
+        assert!(row_text(1).contains("● -old line"), "{}", row_text(1));
+        assert!(row_text(2).contains("● +new line"), "{}", row_text(2));
+
+        // The '+' and '-' characters are part of the uniformly-styled
+        // command text, never `diff_pane::content_row`'s per-kind marker
+        // color (`p.green` for added, `p.red` for removed).
+        let plus_x = row_text(2).find('+').expect("added line's '+'") as u16;
+        let plus_fg = buffer[(area.x + plus_x, area.y + 2)].fg;
+        assert_eq!(plus_fg, app.palette.subtext0);
+        assert_ne!(plus_fg, app.palette.green);
+
+        let minus_x = row_text(1).find('-').expect("removed line's '-'") as u16;
+        let minus_fg = buffer[(area.x + minus_x, area.y + 1)].fg;
+        assert_eq!(minus_fg, app.palette.subtext0);
+        assert_ne!(minus_fg, app.palette.red);
+    }
+
     #[test]
     fn pane_border_title_trims_and_truncates() {
         assert_eq!(

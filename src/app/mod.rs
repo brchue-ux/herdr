@@ -803,6 +803,7 @@ impl App {
             sidebar_collapsed: config.ui.sidebar_start_collapsed,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             diff_popup_open: false,
+            diff_pane_scroll: 0,
             agent_panel_sort,
             agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
             // Never restored: a status is a claim about the world right now,

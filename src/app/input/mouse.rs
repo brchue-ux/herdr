@@ -213,6 +213,12 @@ impl AppState {
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
 
+        let diff_area = self.view.diff_area;
+        let in_diff_area = mouse.column >= diff_area.x
+            && mouse.column < diff_area.x + diff_area.width
+            && mouse.row >= diff_area.y
+            && mouse.row < diff_area.y + diff_area.height;
+
         if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar) {
             return None;
         }
@@ -969,6 +975,10 @@ impl AppState {
                     }
                     _ => {}
                 }
+            }
+
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if in_diff_area => {
+                self.scroll_diff_pane(mouse);
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -1809,6 +1819,30 @@ impl AppState {
         true
     }
 
+    /// Scrolls the diff/Changes zone by one wheel notch, independently of
+    /// the sidebar and terminal/pane scroll state — see `AppState::view.diff_area`
+    /// and `crate::ui::diff_pane::normalized_diff_scroll`, which this shares
+    /// its clamp with.
+    fn scroll_diff_pane(&mut self, mouse: MouseEvent) {
+        let older = match mouse.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
+            _ => return,
+        };
+        let lines = self.mouse_scroll_lines;
+        let requested = if older {
+            self.diff_pane_scroll.saturating_add(lines)
+        } else {
+            self.diff_pane_scroll.saturating_sub(lines)
+        };
+        // Match `render_panel_shell`'s `Borders::ALL` inset (1 row each
+        // side) so this clamp agrees with `render_diff_content`'s own.
+        let diff_area = self.view.diff_area;
+        let diff_scroll_area = Rect::new(0, 0, diff_area.width, diff_area.height.saturating_sub(2));
+        self.diff_pane_scroll =
+            crate::ui::diff_pane::normalized_diff_scroll(self, diff_scroll_area, requested);
+    }
+
     fn handle_right_click_passthrough(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2401,6 +2435,72 @@ mod tests {
             app.state.pane_command_log_scroll.get(&pane_id).copied(),
             None,
             "a wheel over the transcript must not touch the log zone's own scroll"
+        );
+    }
+
+    /// The Changes/diff zone scrolls independently of the sidebar and the
+    /// terminal/pane scrollback — see `AppState::scroll_diff_pane` and
+    /// `crate::ui::diff_pane::normalized_diff_scroll`.
+    #[test]
+    fn wheel_over_the_diff_zone_scrolls_it_without_touching_workspace_or_pane_scroll() {
+        use crate::workspace::{GitDiffLine, GitDiffLineKind, GitDiffText, GitSpaceMetadata};
+
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("one");
+        ws.cached_git_space = Some(GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "/repo".into(),
+            repo_name: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        ws.cached_git_diff = Some(GitDiffText {
+            lines: (0..40)
+                .map(|i| GitDiffLine {
+                    kind: GitDiffLineKind::Context,
+                    text: format!("line {i}"),
+                })
+                .collect(),
+            truncated: false,
+        });
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        // main_area.width = 200 - 26 (default sidebar) = 174 >= 150.
+        app.state.diff_zone_width_threshold = 150;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 200, 20));
+        let diff_area = app.state.view.diff_area;
+        assert!(!diff_area.is_empty(), "diff zone must be showing");
+        let workspace_scroll_before = app.state.workspace_scroll;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            diff_area.x + 1,
+            diff_area.y,
+        ));
+
+        assert_eq!(
+            app.state.diff_pane_scroll, app.state.mouse_scroll_lines,
+            "scrolling over the diff zone should advance its own offset"
+        );
+        assert_eq!(
+            app.state.workspace_scroll, workspace_scroll_before,
+            "the sidebar's own scroll must not move"
+        );
+
+        // Scrolling over the terminal zone, just to the left of the diff
+        // zone, must not touch the diff zone's own scroll.
+        app.state.diff_pane_scroll = 0;
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            diff_area.x - 1,
+            diff_area.y,
+        ));
+        assert_eq!(
+            app.state.diff_pane_scroll, 0,
+            "a wheel over the terminal zone must not touch the diff zone's own scroll"
         );
     }
 

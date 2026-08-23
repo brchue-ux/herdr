@@ -1,8 +1,15 @@
-//! The diff pane: a fixed third zone (sibling to the sidebar and terminal
-//! zones) showing the active Space's uncommitted `git diff`, plus a
-//! popup-overlay fallback for when the zone is folded — see
-//! `crate::app::AppState::diff_zone_width_threshold` for the fold rule and
-//! `crate::app::AppState::diff_popup_open` for the fallback's toggle state.
+//! The diff pane — herdr's "Changes" zone: a third zone, always to the right
+//! of the sidebar and terminal zones, showing the active Space's uncommitted
+//! `git diff`, plus a popup-overlay fallback for when the zone is folded —
+//! see `crate::app::AppState::diff_zone_width_threshold` for the fold rule
+//! and `crate::app::AppState::diff_popup_open` for the fallback's toggle
+//! state. Its own width is a percentage of the remaining space
+//! (`crate::ui::DIFF_ZONE_PERCENT`), and it scrolls independently of the
+//! sidebar and terminal zones via `crate::app::AppState::diff_pane_scroll`.
+//! This is the ONLY place unified-diff content — hunks, `+`/`-` lines, file
+//! headers — ever renders; the triview log zone (`crate::ui::panes`) renders
+//! plain command text through an unrelated model
+//! (`crate::app::pane_command_log`) and never calls into this module.
 //!
 //! Styled to echo the same rail/card-edge material the sidebar tree and
 //! panel borders already use (`crate::ui::navigator`'s `│`/`├──`/`└──`
@@ -75,7 +82,23 @@ fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    render_diff_lines(app, frame, area, diff);
+    let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
+    render_diff_lines(app, frame, area, diff, scroll);
+}
+
+/// Clamps `requested` to how far the active diff can actually scroll for
+/// `area`, mirroring `crate::ui::sidebar::normalized_workspace_scroll`. Both
+/// the per-frame render clamp (`compute_view_internal`) and the mouse wheel
+/// handler (`AppState::scroll_diff_pane`) call through this so the two can
+/// never disagree.
+pub(crate) fn normalized_diff_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
+    let total = app
+        .active
+        .and_then(|idx| app.workspaces.get(idx))
+        .and_then(|ws| ws.git_diff())
+        .map(|diff| diff.lines.len())
+        .unwrap_or(0);
+    requested.min(total.saturating_sub(area.height as usize))
 }
 
 fn render_message(frame: &mut Frame, area: Rect, text: &str, color: Color) {
@@ -131,17 +154,25 @@ fn file_header_path(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn render_diff_lines(app: &AppState, frame: &mut Frame, area: Rect, diff: &GitDiffText) {
+fn render_diff_lines(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    diff: &GitDiffText,
+    scroll: usize,
+) {
     let visible_rows = area.height as usize;
     let width = area.width as usize;
 
-    // No scroll state in v1 (Stage 3 polish per the scoping report), and the
-    // diff is always shown from its top, so a bounded forward walk from
-    // line 0 — stopping once enough terminal rows exist to know whether the
-    // pane overflows — is exactly the prefix the pane goes on to render.
-    // Header/hunk rows can spend more than one terminal row per diff line,
-    // so the walk keeps going a little past `visible_rows` before it can be
-    // sure it has enough.
+    // `scroll` is a count of source diff lines (not terminal rows) to skip
+    // before the same bounded forward walk this pane always did from line 0
+    // — stopping once enough terminal rows exist to know whether the
+    // remainder still overflows. Header/hunk rows can spend more than one
+    // terminal row per diff line, so the walk keeps going a little past
+    // `visible_rows` before it can be sure it has enough. Line-number
+    // continuity (`old_ln`/`new_ln`) still walks from the true top even when
+    // scrolled, so a scrolled-in hunk's gutter numbers are correct rather
+    // than restarting from 0.
     let mut rows: Vec<DiffRow> = Vec::new();
     let mut terminal_rows = 0usize;
     let mut consumed = 0usize;
@@ -149,9 +180,28 @@ fn render_diff_lines(app: &AppState, frame: &mut Frame, area: Rect, diff: &GitDi
     let mut new_ln: u32 = 0;
 
     let diff_lines: &Vec<GitDiffLine> = &diff.lines;
-    for line in diff_lines {
-        if terminal_rows > visible_rows {
+    for (idx, line) in diff_lines.iter().enumerate() {
+        if idx >= scroll && terminal_rows > visible_rows {
             break;
+        }
+        if idx < scroll {
+            // Still walked (for line-number continuity) but not rendered.
+            match line.kind {
+                GitDiffLineKind::Hunk => {
+                    if let Some((old_start, new_start)) = parse_hunk_header(&line.text) {
+                        old_ln = old_start;
+                        new_ln = new_start;
+                    }
+                }
+                GitDiffLineKind::Added => new_ln = new_ln.saturating_add(1),
+                GitDiffLineKind::Removed => old_ln = old_ln.saturating_add(1),
+                GitDiffLineKind::Context => {
+                    old_ln = old_ln.saturating_add(1);
+                    new_ln = new_ln.saturating_add(1);
+                }
+                GitDiffLineKind::FileHeader => {}
+            }
+            continue;
         }
         consumed += 1;
         match line.kind {
@@ -231,14 +281,24 @@ fn render_diff_lines(app: &AppState, frame: &mut Frame, area: Rect, diff: &GitDi
         .max(2);
 
     let mut lines: Vec<Line> = Vec::with_capacity(terminal_rows.min(visible_rows + 2));
+    if scroll > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "↑ {scroll} line{} above",
+                if scroll == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(app.palette.subtext0),
+        )));
+    }
     for row in &rows {
         push_row(app, &mut lines, row, width, gutter_w);
     }
 
-    let overflowed = consumed < diff.lines.len() || diff.truncated;
+    let shown = scroll + consumed;
+    let overflowed = shown < diff.lines.len() || diff.truncated;
     if overflowed {
         lines.truncate(visible_rows.saturating_sub(1));
-        let hidden = diff.lines.len().saturating_sub(consumed);
+        let hidden = diff.lines.len().saturating_sub(shown);
         let suffix = if diff.truncated { "+" } else { "" };
         lines.push(Line::from(Span::styled(
             format!("… {hidden}{suffix} more lines"),
