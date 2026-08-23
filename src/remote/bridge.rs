@@ -27,8 +27,6 @@ const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
-#[cfg(unix)]
-const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
@@ -1644,7 +1642,7 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
             std::process::id(),
             asset_key
         ));
-        match create_private_dir_exclusive(&dir) {
+        match crate::platform::create_private_dir_exclusive(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -1655,32 +1653,6 @@ fn private_download_dir(asset_key: &str) -> io::Result<PathBuf> {
         io::ErrorKind::AlreadyExists,
         "failed to create private herdr remote download directory",
     ))
-}
-
-/// Creates one directory for a staged remote binary, failing if it is already
-/// there.
-///
-/// Fail-if-exists is what makes a predictable name (pid plus asset key) in a
-/// shared temp directory safe: only the process that atomically created the
-/// directory can be the one holding it. [`crate::platform::create_private_dir_all`]
-/// deliberately succeeds on a directory that already exists, so it cannot be
-/// the creating call here — it is instead what makes the *base* private. The
-/// `0700` below is the Unix half of the same bargain, the mode
-/// [`private_ssh_config_dir`] already uses in this file.
-#[cfg(unix)]
-fn create_private_dir_exclusive(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    fs::DirBuilder::new().mode(0o700).create(path)
-}
-
-/// A Windows directory has no mode to narrow; it inherits its parent's ACL,
-/// and the parent here is either the already per-user `%TEMP%` or a directory
-/// [`crate::platform::create_private_dir_all`] stamped with Herdr's protected
-/// DACL.
-#[cfg(windows)]
-fn create_private_dir_exclusive(path: &Path) -> io::Result<()> {
-    fs::create_dir(path)
 }
 
 fn confirm_remote_install(
@@ -1762,39 +1734,17 @@ fn reattach_command(
 /// the POSIX shell on the remote host and must stay POSIX on every platform.
 ///
 /// The hint is only ever shown, never executed, but a hint that cannot be
-/// pasted is worse than none.
-#[cfg(not(windows))]
+/// pasted is worse than none. A platform whose local shell is not POSIX
+/// answers [`crate::platform::reattach_hint_quote`]; the rest fall through to
+/// the POSIX quoting already used for the remote command.
 fn reattach_quote(value: &str) -> String {
-    shell_quote(value)
+    crate::platform::reattach_hint_quote(value).unwrap_or_else(|| shell_quote(value))
 }
 
-/// PowerShell escapes an embedded apostrophe by doubling it, not with POSIX's
-/// `'\''`. Quoting unconditionally also sidesteps [`shell_quote`]'s unquoted
-/// set, which excludes `\` — so every full install path took its quoted branch
-/// and came out POSIX-escaped.
-#[cfg(windows)]
-fn reattach_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(not(windows))]
+/// Renders the program word of the *displayed* reattach hint; see
+/// [`reattach_quote`] for the platform override.
 fn reattach_program(program: &str) -> String {
-    shell_quote(program)
-}
-
-/// A quoted string in PowerShell's command position is parsed as a bare string
-/// expression, and the `--remote` after it becomes an unexpected token — the
-/// call operator `&` is what makes it a command. `argv[0]` is also unreliable
-/// on Windows (a Terminal profile or shortcut passes whatever it likes), so
-/// prefer the real image path when there is one.
-#[cfg(windows)]
-fn reattach_program(program: &str) -> String {
-    let path = std::env::current_exe()
-        .ok()
-        .filter(|path| path.is_absolute())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| program.to_string());
-    format!("& {}", reattach_quote(&path))
+    crate::platform::reattach_hint_program(program).unwrap_or_else(|| shell_quote(program))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1938,13 +1888,13 @@ impl Drop for SshStdioBridge {
 /// socket, which is what constrains its path length.
 fn private_ssh_config_dir(multiplexing: bool) -> io::Result<PathBuf> {
     let mut last_error = None;
-    for base in private_ssh_config_bases(multiplexing) {
+    for base in crate::platform::remote_ssh_config_bases(multiplexing) {
         for attempt in 0..100 {
             let dir = base.join(format!("herdr-ssh-{}-{attempt}", std::process::id()));
-            if !control_socket_fits(&dir, multiplexing) {
+            if !crate::platform::remote_ssh_control_socket_fits(&dir, multiplexing) {
                 continue;
             }
-            match create_private_dir_exclusive(&dir) {
+            match crate::platform::create_private_dir_exclusive(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
@@ -1961,55 +1911,6 @@ fn private_ssh_config_dir(multiplexing: bool) -> io::Result<PathBuf> {
             "failed to create private herdr ssh config directory",
         )
     }))
-}
-
-/// Temp bases to try for that directory, best first.
-///
-/// A Unix socket path is byte-capped, so when the directory has to hold the
-/// ControlMaster socket a long `TMPDIR` needs the shortest standard base behind
-/// it.
-#[cfg(unix)]
-fn private_ssh_config_bases(multiplexing: bool) -> Vec<PathBuf> {
-    let mut bases = vec![std::env::temp_dir()];
-    let short_tmp = PathBuf::from("/tmp");
-    if multiplexing && bases.first() != Some(&short_tmp) {
-        bases.push(short_tmp);
-    }
-    bases
-}
-
-/// Windows OpenSSH never multiplexes, so nothing in this directory is a socket
-/// and no path budget forces a shorter base than `%TEMP%`.
-#[cfg(windows)]
-fn private_ssh_config_bases(_multiplexing: bool) -> Vec<PathBuf> {
-    vec![std::env::temp_dir()]
-}
-
-/// Whether the ControlMaster socket that would live in `dir` fits the
-/// platform's socket path limit.
-#[cfg(unix)]
-fn control_socket_fits(dir: &Path, multiplexing: bool) -> bool {
-    !multiplexing || fits_unix_socket_path(&dir.join(SSH_CONTROL_SOCKET_NAME))
-}
-
-/// Trivially true on Windows: `multiplexing` is always false there, so no
-/// control socket is ever placed in `dir`.
-#[cfg(windows)]
-fn control_socket_fits(_dir: &Path, _multiplexing: bool) -> bool {
-    true
-}
-
-/// The ControlMaster socket path inside `dir`, or `None` where the platform's
-/// OpenSSH cannot multiplex.
-#[cfg(unix)]
-fn control_socket_path(dir: &Path, multiplexing: bool) -> Option<PathBuf> {
-    multiplexing.then(|| dir.join(SSH_CONTROL_SOCKET_NAME))
-}
-
-/// Windows OpenSSH has no `ControlMaster`, so there is never a control socket.
-#[cfg(windows)]
-fn control_socket_path(_dir: &Path, _multiplexing: bool) -> Option<PathBuf> {
-    None
 }
 
 /// Quotes a path for an ssh_config `Include` so a path containing spaces (or
@@ -2035,7 +1936,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     let paths = crate::platform::remote_ssh_config_paths();
     let dir = private_ssh_config_dir(paths.multiplexing)?;
     let path = dir.join("config");
-    let control_path = control_socket_path(&dir, paths.multiplexing);
+    let control_path = crate::platform::remote_ssh_control_socket_path(&dir, paths.multiplexing);
 
     let mut contents = String::new();
     for include in &paths.includes {
@@ -2053,7 +1954,8 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     contents.push_str("  ServerAliveInterval 15\n");
     contents.push_str("  ServerAliveCountMax 4\n");
 
-    let mut file = create_private_file_exclusive(&path)?;
+    let mut file =
+        crate::platform::create_private_file_exclusive(&path, BRIDGE_SOCKET_PERMISSION_MODE)?;
     file.write_all(contents.as_bytes())?;
     Ok(ManagedSshConfig {
         options: ManagedSshOptions {
@@ -2061,33 +1963,6 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
             control_path,
         },
     })
-}
-
-/// Creates the managed ssh config, failing if anything already sits at `path`.
-///
-/// Fail-if-exists plus the `0600` is the file half of the bargain
-/// [`private_ssh_config_dir`] makes for the directory: `ssh -F` reads this file,
-/// so nobody else may be able to write it.
-#[cfg(unix)]
-fn create_private_file_exclusive(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(BRIDGE_SOCKET_PERMISSION_MODE)
-        .open(path)
-}
-
-/// A Windows file has no mode to narrow; it inherits the ACL of its parent,
-/// which is the private directory [`private_ssh_config_dir`] just created
-/// inside the already per-user `%TEMP%`.
-#[cfg(windows)]
-fn create_private_file_exclusive(path: &Path) -> io::Result<File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
 }
 
 /// Bridges one accepted local client connection to a fresh `ssh` child running
@@ -2336,7 +2211,7 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let readable = tmpdir.join(format!(
         "herdr-remote-{pid}-{target_clean}-{session_clean}.sock"
     ));
-    if fits_local_socket_path(&readable) {
+    if crate::platform::fits_local_socket_path(&readable) {
         return readable;
     }
 
@@ -2350,53 +2225,10 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     let hash = short_socket_hash(target, session_name);
     let short_name = format!("herdr-r-{pid}-{target_prefix}-{hash}.sock");
     let short_in_tmp = tmpdir.join(&short_name);
-    if fits_local_socket_path(&short_in_tmp) {
+    if crate::platform::fits_local_socket_path(&short_in_tmp) {
         return short_in_tmp;
     }
-    last_resort_short_socket_path(short_name)
-}
-
-#[cfg(unix)]
-fn last_resort_short_socket_path(short_name: String) -> PathBuf {
-    PathBuf::from("/tmp").join(short_name)
-}
-
-#[cfg(windows)]
-fn last_resort_short_socket_path(short_name: String) -> PathBuf {
-    // There is no shorter conventional temp root on Windows than
-    // `std::env::temp_dir()`, and `fits_local_socket_path`'s 200-byte budget
-    // is generous enough that this branch is not expected to be reached in
-    // practice; return the best available name rather than fail outright.
-    std::env::temp_dir().join(short_name)
-}
-
-fn fits_local_socket_path(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        fits_unix_socket_path(path)
-    }
-    #[cfg(windows)]
-    {
-        fits_windows_pipe_path(path)
-    }
-}
-
-/// `sun_path` is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve 1
-/// byte for the trailing NUL and use the smaller cap for portability.
-#[cfg(unix)]
-fn fits_unix_socket_path(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    const MAX: usize = 103;
-    path.as_os_str().as_bytes().len() <= MAX
-}
-
-/// Named pipe full paths (`\\.\pipe\<name>`) are limited to 256 characters
-/// total; this budget leaves headroom for that prefix plus
-/// `interprocess`'s namespacing.
-#[cfg(windows)]
-fn fits_windows_pipe_path(path: &Path) -> bool {
-    const MAX: usize = 200;
-    path.as_os_str().len() <= MAX
+    crate::platform::last_resort_short_socket_path(short_name)
 }
 
 fn short_socket_hash(target: &str, session: &str) -> String {
@@ -2527,7 +2359,7 @@ mod tests {
         let dir_mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "ssh config dir must be user-only");
         assert!(
-            fits_unix_socket_path(&control_path),
+            crate::platform::fits_local_socket_path(&control_path),
             "control socket path must fit portable Unix socket limits"
         );
 
@@ -3611,7 +3443,7 @@ mod tests {
         );
         assert!(filename.contains("-dev-default."), "got {filename}");
         assert!(
-            fits_unix_socket_path(&path),
+            crate::platform::fits_local_socket_path(&path),
             "socket path too long: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
@@ -3629,7 +3461,7 @@ mod tests {
         let session = "a-fairly-long-session-name-here";
         let path = local_forward_socket_path(target, session);
         assert!(
-            fits_unix_socket_path(&path),
+            crate::platform::fits_local_socket_path(&path),
             "socket path too long for sun_path: {} ({} bytes)",
             path.display(),
             socket_path_byte_len(&path)
@@ -3648,7 +3480,7 @@ mod tests {
         std::env::set_var("TMPDIR", &long_dir);
 
         let path = local_forward_socket_path("longish-host.example.com", "default");
-        let fits = fits_unix_socket_path(&path);
+        let fits = crate::platform::fits_local_socket_path(&path);
         let parent = path.parent().map(Path::to_path_buf);
         let filename = path
             .file_name()
@@ -3676,17 +3508,10 @@ mod tests {
         let _guard = remote_env_lock().lock().unwrap();
         let path = local_forward_socket_path("dev", "default");
         assert!(
-            fits_windows_pipe_path(&path),
+            crate::platform::fits_local_socket_path(&path),
             "socket path too long for the named pipe budget: {}",
             path.display()
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn fits_windows_pipe_path_rejects_names_past_the_budget() {
-        let too_long = std::env::temp_dir().join("a".repeat(250));
-        assert!(!fits_windows_pipe_path(&too_long));
     }
 
     #[test]

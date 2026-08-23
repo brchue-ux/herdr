@@ -253,6 +253,115 @@ pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<
     std::fs::create_dir_all(path)
 }
 
+/// Creates one directory, failing if it is already there.
+///
+/// Fail-if-exists is what makes a predictable name in a shared temp directory
+/// safe: only the process that atomically created the directory can be the one
+/// holding it. [`create_private_dir_all`] deliberately succeeds on a directory
+/// that already exists, so it cannot be the creating call — it is instead what
+/// makes the *base* private. The `0700` here is the Unix half of the same
+/// bargain.
+#[cfg(unix)]
+pub(crate) fn create_private_dir_exclusive(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Creates one file, failing if anything already sits at `path`.
+///
+/// Fail-if-exists plus `unix_mode` is the file half of the bargain
+/// [`create_private_dir_exclusive`] makes for the directory. `unix_mode` is the
+/// Unix permission bits to stamp; a platform whose files carry no mode ignores
+/// it and relies on the parent directory's inherited protection instead.
+#[cfg(unix)]
+pub(crate) fn create_private_file_exclusive(
+    path: &std::path::Path,
+    unix_mode: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(unix_mode)
+        .open(path)
+}
+
+/// The name of the ControlMaster socket inside the private ssh config dir.
+#[cfg(unix)]
+const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+
+/// Temp bases to try for the private ssh config directory, best first.
+///
+/// A Unix socket path is byte-capped, so when the directory has to hold the
+/// ControlMaster socket a long `TMPDIR` needs the shortest standard base behind
+/// it.
+#[cfg(unix)]
+pub(crate) fn remote_ssh_config_bases(multiplexing: bool) -> Vec<std::path::PathBuf> {
+    let mut bases = vec![std::env::temp_dir()];
+    let short_tmp = std::path::PathBuf::from("/tmp");
+    if multiplexing && bases.first() != Some(&short_tmp) {
+        bases.push(short_tmp);
+    }
+    bases
+}
+
+/// Whether the ControlMaster socket that would live in `dir` fits the
+/// platform's socket path limit.
+#[cfg(unix)]
+pub(crate) fn remote_ssh_control_socket_fits(dir: &std::path::Path, multiplexing: bool) -> bool {
+    !multiplexing || fits_local_socket_path(&dir.join(SSH_CONTROL_SOCKET_NAME))
+}
+
+/// The ControlMaster socket path inside `dir`, or `None` where the platform's
+/// OpenSSH cannot multiplex.
+#[cfg(unix)]
+pub(crate) fn remote_ssh_control_socket_path(
+    dir: &std::path::Path,
+    multiplexing: bool,
+) -> Option<std::path::PathBuf> {
+    multiplexing.then(|| dir.join(SSH_CONTROL_SOCKET_NAME))
+}
+
+/// Whether `path` fits the platform's local-endpoint path budget.
+///
+/// `sun_path` is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve 1 byte
+/// for the trailing NUL and use the smaller cap for portability.
+#[cfg(unix)]
+pub(crate) fn fits_local_socket_path(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const MAX: usize = 103;
+    path.as_os_str().as_bytes().len() <= MAX
+}
+
+/// The shortest conventional temp root, for when even a hashed short name does
+/// not fit under `TMPDIR`.
+#[cfg(unix)]
+pub(crate) fn last_resort_short_socket_path(short_name: String) -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp").join(short_name)
+}
+
+/// A platform override for one argument of the *displayed* reattach hint, for
+/// the shell the user will retype it into.
+///
+/// `None` means the local shell is POSIX, so the POSIX quoting the caller
+/// already applies to the remote command is right for the hint too. Only a
+/// platform whose local shell is not POSIX has to answer.
+#[cfg(unix)]
+pub(crate) fn reattach_hint_quote(_value: &str) -> Option<String> {
+    None
+}
+
+/// A platform override for the program word of the *displayed* reattach hint.
+///
+/// `None` means the caller's POSIX quoting of `argv[0]` is right; see
+/// [`reattach_hint_quote`].
+#[cfg(unix)]
+pub(crate) fn reattach_hint_program(_program: &str) -> Option<String> {
+    None
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_common;
 
