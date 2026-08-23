@@ -195,7 +195,7 @@ const ACCENT_MID_MIX: f32 = 0.45;
 /// content owns its whole appearance, and this has to survive being serialized
 /// to a client that rasterises the card for itself.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(super) struct CardSpider {
+pub(crate) struct CardSpider {
     /// How far along its climb, in `0.0..=1.0`. `1.0` is arrived and resting.
     climb: f32,
     /// This frame of the resting pulse, in `0.0..=1.0`. `1.0` while climbing:
@@ -308,12 +308,12 @@ pub(super) fn resolve(
 /// Each leg takes a share of the climb proportional to its own length, which is
 /// the same rule the character path uses, so a tall card's climb up its own
 /// border is not rushed relative to the jog to centre.
-fn centre_at(card: &PlacedCard<'_>, size: (f32, f32), climb: f32) -> (f32, f32) {
+fn centre_at(rect: &super::RoundRect, size: (f32, f32), climb: f32) -> (f32, f32) {
     let (w, h) = size;
-    let rest_y = (card.rect.y - h * STRADDLE).max(0.0) + h / 2.0;
-    let border_x = card.rect.x.max(w / 2.0);
-    let centre_x = card.rect.x + card.rect.w / 2.0;
-    let start = (border_x, card.rect.y + card.rect.h);
+    let rest_y = (rect.y - h * STRADDLE).max(0.0) + h / 2.0;
+    let border_x = rect.x.max(w / 2.0);
+    let centre_x = rect.x + rect.w / 2.0;
+    let start = (border_x, rect.y + rect.h);
     let knee = (border_x, rest_y);
     let rest = (centre_x, rest_y);
 
@@ -347,16 +347,50 @@ pub(super) fn draw(sheet: &mut Canvas, card: &PlacedCard<'_>) {
     let Some(spider) = content.spider else {
         return;
     };
-    let opacity = content.generate.clamp(0.0, 1.0);
+    draw_at(
+        sheet,
+        spider,
+        &card.rect,
+        Palette {
+            ground: content.ground,
+            hue: content.hues.of(content.stage),
+        },
+        content.generate,
+    );
+}
+
+/// The two colours a marker resolves itself against: the card's own ground, and
+/// the hue of the stage its work is at.
+///
+/// Taken as a pair rather than off a [`super::CardContent`] because a marker no
+/// longer only ever rides a card. A worker drawn inside its Space's own box
+/// (see [`super::crew`]) has no card of its own, and the alternative to this was
+/// dropping its failure marker on the floor — which is exactly the class of
+/// silent loss the marker exists to prevent.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Palette {
+    pub(super) ground: Rgb,
+    pub(super) hue: f32,
+}
+
+/// Draw one marker over `rect`, at `opacity`.
+pub(super) fn draw_at(
+    sheet: &mut Canvas,
+    spider: CardSpider,
+    rect: &super::RoundRect,
+    palette: Palette,
+    opacity: f32,
+) {
+    let opacity = opacity.clamp(0.0, 1.0);
     if opacity <= 0.0 {
         return;
     }
-    let full_h = card.rect.h * HEIGHT_FRACTION;
+    let full_h = rect.h * HEIGHT_FRACTION;
     let full_w = full_h * SPRITE_W as f32 / SPRITE_H as f32;
     if full_h < 1.0 || full_w < 1.0 {
         return;
     }
-    let (cx, cy) = centre_at(card, (full_w, full_h), spider.climb);
+    let (cx, cy) = centre_at(rect, (full_w, full_h), spider.climb);
     let squash = spider.squash.clamp(0.0, 1.0);
     let draw_h = full_h * (1.0 - SQUASH_DEPTH * squash);
     let draw_w = full_w * (1.0 + SQUASH_SPREAD * squash);
@@ -368,9 +402,9 @@ pub(super) fn draw(sheet: &mut Canvas, card: &PlacedCard<'_>) {
     // real render of this build, not by the assertion below.
     let origin = (cx - draw_w / 2.0, cy - draw_h / 2.0);
 
-    let ground = content.ground;
+    let ground = palette.ground;
     let hot = Rgb::from_tuple(crate::anim::cell::marker_ink(
-        content.hues.of(content.stage),
+        palette.hue,
         spider.intensity,
         ground.as_tuple(),
     ));
@@ -473,6 +507,7 @@ mod tests {
             breath: 0.0,
             spider,
             wash: None,
+            crew: Vec::new(),
         }
     }
 
@@ -502,6 +537,7 @@ mod tests {
             },
             content,
             geometry: CardGeometry::new(21.0, false),
+            crew: crate::ui::sidebar::image_card::crew::CrewBands::default(),
         }
     }
 

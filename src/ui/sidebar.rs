@@ -553,6 +553,93 @@ impl WorkspaceListEntry {
     }
 }
 
+/// Whether a Space's card is on screen carrying its own workers.
+///
+/// The crew list is a *card*: it exists exactly when a pixel card is actually
+/// covering these rows, and not merely when the layout could size one. The two
+/// come apart for a frame at a time — a panel whose cards have not been
+/// published yet still draws its rows in characters — and a layout that had
+/// already folded the workers into a box nothing was drawing would leave their
+/// connectors standing inside a border that was not there. So this is
+/// [`image_card::card_covers_row`], the same reading the character row stands
+/// down on, and every part of the feature is gated on it: the heights, the gaps,
+/// the stretched frame, and the rails.
+fn crew_is_drawn(app: &AppState, fold_width: u16) -> bool {
+    image_card::card_covers_row(app, fold_width)
+}
+
+/// The row that owns the row at `idx` in the drawn tree.
+///
+/// The nearest row above it at a shallower depth, which a depth-first walk makes
+/// the parent by construction — [`crate::app::agent_tree::walk_tree`] emits every
+/// child immediately after its parent and no shallower row can come between them.
+fn tree_parent(entries: &[WorkspaceListEntry], idx: usize) -> Option<usize> {
+    let depth = entries.get(idx)?.depth();
+    (0..idx).rev().find(|row| entries[*row].depth() < depth)
+}
+
+/// The Space whose card the row at `idx` is drawn *inside*, if any.
+///
+/// A Space's card carries its workers in its own box now, under a dashed rule —
+/// the captain's confirmed mockups. Which rows those are is not a new fact: the
+/// tree walk has already put every worker under whatever owns it, so this is
+/// simply "walk up the parents until a Space is reached". Nothing here reads a
+/// token and nothing publishes one — see
+/// [`crate::app::agent_tree::resolve_owner`], which is still the only thing that
+/// decides who owns whom.
+///
+/// `None` when the walk runs out of parents without meeting a Space: a pane
+/// standing at the root of the tree is a card in its own right, and so is
+/// everything hanging off it. Following the *nearest Workspace above* instead of
+/// the parent chain is what would break that — a root pane's own workers would
+/// be folded into the card of a Space they are not inside.
+pub(crate) fn crew_head(entries: &[WorkspaceListEntry], idx: usize) -> Option<usize> {
+    if !matches!(entries.get(idx)?, WorkspaceListEntry::Agent { .. }) {
+        return None;
+    }
+    let mut cursor = idx;
+    // Bounded by the entry count: every step moves strictly up the list.
+    for _ in 0..entries.len() {
+        let parent = tree_parent(entries, cursor)?;
+        match entries[parent] {
+            WorkspaceListEntry::Workspace { .. } => return Some(parent),
+            WorkspaceListEntry::Agent { .. } => cursor = parent,
+        }
+    }
+    None
+}
+
+/// Which indent step the row at `idx` draws at inside its Space's card.
+///
+/// `0` for a worker the Space dispatched itself — its parent *is* the card it is
+/// drawn in — and `1` for one that reached it through anybody at all. **`1` for
+/// anything deeper too**: past the first step the indent has stopped answering
+/// "did this come through somebody" and started eating a 26-column sidebar. The
+/// same saturation [`crate::app::agent_tree::display_depth`] applies to the
+/// tree's own columns, for the same reason.
+pub(crate) fn crew_tier(entries: &[WorkspaceListEntry], idx: usize) -> Option<u8> {
+    let head = crew_head(entries, idx)?;
+    Some(u8::from(tree_parent(entries, idx) != Some(head)))
+}
+
+/// How many worker rows the Space at `head` carries inside its own card.
+///
+/// `0` for an `Agent` row — a worker dispatches nothing that draws under it —
+/// and for a Space running nothing, which is the card every Space drew before
+/// this existed.
+pub(crate) fn crew_len(entries: &[WorkspaceListEntry], head: usize) -> usize {
+    let Some(WorkspaceListEntry::Workspace { .. }) = entries.get(head) else {
+        return 0;
+    };
+    let depth = entries[head].depth();
+    entries[head.saturating_add(1)..]
+        .iter()
+        .take_while(|entry| {
+            matches!(entry, WorkspaceListEntry::Agent { .. }) && entry.depth() > depth
+        })
+        .count()
+}
+
 /// Whether something hangs off the row at `idx`.
 ///
 /// The next row one level deeper is exactly how the walk emits a subtree, so a
@@ -2056,11 +2143,15 @@ fn render_session_status(app: &AppState, frame: &mut Frame, area: Rect) {
 fn list_entry_height(
     app: &AppState,
     agents: &[AgentPanelEntry],
-    entry: &WorkspaceListEntry,
+    entries: &[WorkspaceListEntry],
+    entry_idx: usize,
     body_height: u16,
     fold_width: u16,
     bodies: &body_register::BodyRegister,
 ) -> u16 {
+    let Some(entry) = entries.get(entry_idx) else {
+        return 0;
+    };
     // The pixel card is a skin over this row's cells, so it does not get to
     // move the row — but it does get to say how many cells the row is, because
     // a card drawn shorter than its rect would leave a band of the character
@@ -2073,7 +2164,26 @@ fn list_entry_height(
     // rank by the captain's decision, and width is the rank signal. See
     // `image_card::BASE_HEIGHT_PX`.
     if let Some(rows) = image_card::row_height_cells(app, fold_width) {
-        return rows.min(body_height);
+        // A worker drawn inside its Space's card is still a *row*: it keeps its
+        // own rect, so clicking it still selects its pane and the engine still
+        // has something to open and close when it arrives and leaves. What it no
+        // longer keeps is a card's height — it is two lines of type inside
+        // somebody else's box.
+        if crew_is_drawn(app, fold_width) && crew_tier(entries, entry_idx).is_some() {
+            return image_card::crew_row_cells(app, fold_width)
+                .unwrap_or(rows)
+                .min(body_height);
+        }
+        // The dashed rule is carried by the head and not by the first worker,
+        // so every worker row is the same height — which is what lets a row
+        // arriving anywhere in the list push the ones below it by exactly one
+        // row's worth.
+        let divider = if crew_is_drawn(app, fold_width) && crew_len(entries, entry_idx) > 0 {
+            image_card::crew_divider_cells(app, fold_width).unwrap_or(0)
+        } else {
+            0
+        };
+        return rows.saturating_add(divider).min(body_height);
     }
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
     let shell = RowShell::for_fold_width(fold_width);
@@ -2106,7 +2216,24 @@ fn list_entry_height(
 
 /// Gap after one tree row. Each kind keeps its own `row_gap`; the compact
 /// worktree-group packing is unchanged.
-fn list_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
+fn list_entry_gap(
+    app: &AppState,
+    entries: &[WorkspaceListEntry],
+    entry_idx: usize,
+    fold_width: u16,
+) -> u16 {
+    // No gap anywhere *inside* a card: between a Space and the first worker in
+    // its own box, or between two of them. The same rule a worktree group
+    // already follows, for the same reason — a gap here would be a band of
+    // panel showing through the middle of one border.
+    //
+    // Gated on a card actually being drawn, because the crew list is a *card*
+    // and there is no box to be inside of without one: a panel on the character
+    // fallback keeps every gap it always had, and a worker there is still its
+    // own row with its own air around it.
+    if crew_is_drawn(app, fold_width) && crew_head(entries, entry_idx.saturating_add(1)).is_some() {
+        return 0;
+    }
     match entries.get(entry_idx) {
         Some(WorkspaceListEntry::Workspace { .. }) => workspace_entry_gap(app, entries, entry_idx),
         Some(WorkspaceListEntry::Agent { .. }) => agent_entry_gap(app, entry_idx, entries.len()),
@@ -2127,8 +2254,16 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
     let agents = sidebar_agent_entries(app);
     // Ranked once for the whole walk. See [`body_register`].
     let bodies = body_register::BodyRegister::resolve(app);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
+    for entry_idx in scroll..entries.len() {
+        let row_height = list_entry_height(
+            app,
+            &agents,
+            &entries,
+            entry_idx,
+            body.height,
+            fold_width,
+            &bodies,
+        );
         if row_height == 0 {
             continue;
         }
@@ -2138,7 +2273,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
         used_rows = used_rows.saturating_add(row_height);
         visible += 1;
         used_rows = used_rows
-            .saturating_add(list_entry_gap(app, &entries, entry_idx))
+            .saturating_add(list_entry_gap(app, &entries, entry_idx, fold_width))
             .min(body.height);
     }
     visible
@@ -2152,12 +2287,21 @@ fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let bodies = body_register::BodyRegister::resolve(app);
     let mut used_rows = 0u16;
     let mut start = entries.len();
-    for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
+    for entry_idx in (0..entries.len()).rev() {
+        let row_height = list_entry_height(
+            app,
+            &agents,
+            &entries,
+            entry_idx,
+            body.height,
+            fold_width,
+            &bodies,
+        );
         if row_height == 0 {
             continue;
         }
-        let needed = row_height.saturating_add(list_entry_gap(app, &entries, entry_idx));
+        let needed =
+            row_height.saturating_add(list_entry_gap(app, &entries, entry_idx, fold_width));
         if used_rows.saturating_add(needed) > body.height {
             break;
         }
@@ -2246,6 +2390,7 @@ pub(crate) fn compute_workspace_list_areas(
     // lookup. `list_entry_height` asks the same question again per row, which is
     // where the height itself comes from; this is only the fact that it did.
     let drawn_card = image_card::row_height_cells(app, fold_width).is_some();
+    let nested = crew_is_drawn(app, fold_width);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
@@ -2256,7 +2401,15 @@ pub(crate) fn compute_workspace_list_areas(
     // Ranked once for the whole walk. See [`body_register`].
     let bodies = body_register::BodyRegister::resolve(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let row_height = list_entry_height(app, &agents, entry, body.height, fold_width, &bodies);
+        let row_height = list_entry_height(
+            app,
+            &agents,
+            &entries,
+            entry_idx,
+            body.height,
+            fold_width,
+            &bodies,
+        );
         if row_height == 0 {
             continue;
         }
@@ -2290,18 +2443,68 @@ pub(crate) fn compute_workspace_list_areas(
             worktree_child,
             entry_idx,
             agent,
-            card_frame: card_frame_for(rect, entry, fold_width),
+            card_frame: card_frame_for(
+                rect,
+                // A crew row borrows the border it is drawn inside — but only
+                // where there *is* one. On the character fallback a worker is
+                // still its own row with its own shell, so it keeps its own
+                // column and nothing about that panel changes.
+                nested
+                    .then(|| crew_head(&entries, entry_idx))
+                    .flatten()
+                    .and_then(|head| entries.get(head))
+                    .unwrap_or(entry),
+                fold_width,
+            ),
             motion_cells: (0, 0),
             arriving: false,
             drawn_card,
         });
         row_y = row_y
             .saturating_add(row_height)
-            .saturating_add(list_entry_gap(app, &entries, entry_idx))
+            .saturating_add(list_entry_gap(app, &entries, entry_idx, fold_width))
             .min(body_bottom);
     }
 
+    if nested {
+        stretch_cards_over_their_crew(&entries, &mut cards);
+    }
     (cards, headers)
+}
+
+/// Grow every Space's card frame down over the worker rows drawn inside it.
+///
+/// The rows themselves are unchanged — a crew row keeps its own rect, which is
+/// what a click on a worker lands on and what the engine opens and closes when
+/// it arrives. What changes is the *box*: one border around the Space and
+/// everything it is running, rather than one border each.
+///
+/// Measured off the crew rows that were actually laid out, so a list the panel
+/// ran out of room part-way through closes its box at the last row it drew
+/// instead of reaching past the bottom of the panel.
+fn stretch_cards_over_their_crew(
+    entries: &[WorkspaceListEntry],
+    cards: &mut [crate::app::state::WorkspaceCardArea],
+) {
+    let mut head: Option<usize> = None;
+    for index in 0..cards.len() {
+        let entry_idx = cards[index].entry_idx;
+        if crew_head(entries, entry_idx).is_some() {
+            let Some(head) = head else {
+                continue;
+            };
+            let bottom = cards[index].rect.y.saturating_add(cards[index].rect.height);
+            if let Some(frame) = cards[head].card_frame.as_mut() {
+                frame.height = bottom.saturating_sub(frame.y);
+            }
+            continue;
+        }
+        head = matches!(
+            entries.get(entry_idx),
+            Some(WorkspaceListEntry::Workspace { .. })
+        )
+        .then_some(index);
+    }
 }
 
 /// Where this row's card shell stands, if the panel is wide enough to draw one.
@@ -2321,11 +2524,19 @@ pub(crate) fn compute_workspace_list_areas(
 /// the row *is*. That is still the whole of the captain's size rule — a worker
 /// the first mate opened hangs at depth 1 and is still drawn a sub agent's
 /// width — it is just read off the left edge now.
-fn card_frame_for(rect: Rect, entry: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
+/// `head` is the row whose *border* this frame belongs to, which is this row
+/// itself on every card and the Space above it on a crew row.
+///
+/// A crew row has no box of its own: it is type inside somebody else's border,
+/// so it takes that border's column rather than the one its own depth would put
+/// it in. Its indent inside the card is the *tier* step ([`crew_tier`]), drawn
+/// by the rasteriser — one step for everything a second mate dispatched, and
+/// nothing at all for a worker the Space dispatched itself.
+fn card_frame_for(rect: Rect, head: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
     if !RowShell::for_fold_width(fold_width).is_card() {
         return None;
     }
-    let left = card_left_offset(entry.depth(), entry.rank(), fold_width);
+    let left = card_left_offset(head.depth(), head.rank(), fold_width);
     let width = fold_width.saturating_sub(left);
     (width > card::CHROME_COLS && rect.height > card::CHROME_ROWS)
         .then(|| Rect::new(rect.x.saturating_add(left), rect.y, width, rect.height))
@@ -3449,6 +3660,15 @@ fn render_agent_row(
     let connector_style = Style::default().fg(p.overlay0);
     let top_charge = ConnectorCharge::new(app, connector_style, signal_phase, row_severity);
 
+    // A worker drawn inside its Space's card hangs off nothing the tree has to
+    // draw: the box it is in *is* the relation, and its tier is the indent
+    // step inside that box. So it grows no rail and takes no connector — a
+    // `├─` beside it would be a second, weaker statement of what the border
+    // already says, drawn in the gutter of a card it is not outside of.
+    if crew_is_drawn(app, fold_width) && crew_head(entries, card.entry_idx).is_some() {
+        return;
+    }
+
     if let Some(shell) = &card_shell {
         let (mut connector, _) = agent_row_prefix(
             entry.depth(),
@@ -3501,7 +3721,7 @@ fn render_agent_row(
             above,
             below,
             row_opens_a_branch(entries, card.entry_idx).then(|| branch_rail_span(p)),
-            list_entry_gap(app, entries, card.entry_idx),
+            list_entry_gap(app, entries, card.entry_idx, fold_width),
             list_top,
             list_bottom,
             motion,
@@ -5438,7 +5658,7 @@ fn render_workspace_list(
                 above,
                 below,
                 row_opens_a_branch(&entries, card.entry_idx).then(|| branch_rail_span(p)),
-                list_entry_gap(app, &entries, card.entry_idx),
+                list_entry_gap(app, &entries, card.entry_idx, fold_width),
                 area.y,
                 list_bottom,
                 motion,
@@ -11620,6 +11840,13 @@ mod a_branch_line_meets_its_card_in_the_middle {
     /// the middle row is two down rather than one — a four-cell row cannot say
     /// anything here, because there the two rows agree and it is the card that
     /// moves onto the line instead.
+    ///
+    /// **The row under test is the second mate's Space, not the worker inside
+    /// it.** A worker is drawn inside its Space's own box now (see
+    /// [`crew_head`]) and hangs off no branch at all, so it can no longer answer
+    /// this question. The branch this asserts is the one that still exists —
+    /// the first mate's line reaching down to the second mate — and it is the
+    /// same geometry on the same code path.
     #[test]
     fn the_renderer_draws_the_branch_on_that_row_and_not_on_the_name_row() {
         let mut app = AppState::test_new();
@@ -11636,6 +11863,14 @@ mod a_branch_line_meets_its_card_in_the_middle {
             None,
             now,
         );
+        // The pane is left *unowned* on purpose. A pane that named the second
+        // mate as its owner is a worker, and a worker is drawn inside its
+        // Space's own box now (see [`crew_head`]) — which stretches that box
+        // over its worker rows and makes its cell count even, and an even count
+        // is exactly the case this fixture cannot use: there the connector row
+        // and the name row agree and there is nothing to tell apart. The branch
+        // under test is the first mate's line down to the second mate, and that
+        // exists whether or not the second mate is running anything.
         let terminal_id = app.workspaces[1].tabs[0].panes[&worker]
             .attached_terminal_id
             .clone();
@@ -11643,13 +11878,7 @@ mod a_branch_line_meets_its_card_in_the_middle {
             .terminals
             .get_mut(&terminal_id)
             .expect("a test terminal");
-        carrier.set_agent_name("worker".to_string());
         carrier.state = AgentState::Idle;
-        carrier.metadata_tokens.patch(
-            std::collections::HashMap::from([("owner".to_string(), Some("2ndmate-a".to_string()))]),
-            None,
-            now,
-        );
         app.kitty_graphics_enabled = true;
         app.kitty_graphics_capability_confirmed = true;
         app.sidebar_card_shapes = true;
@@ -11673,10 +11902,10 @@ mod a_branch_line_meets_its_card_in_the_middle {
             .view
             .workspace_card_areas
             .iter()
-            .find(|card| card.agent.is_some())
+            .find(|card| card.agent.is_none() && card.ws_idx == 1)
             .copied()
         else {
-            panic!("the worker row is missing from the tree");
+            panic!("the second mate's row is missing from the tree");
         };
         if !card.drawn_card {
             return; // No proportional face on this machine; nothing draws a card.
@@ -11704,7 +11933,7 @@ mod a_branch_line_meets_its_card_in_the_middle {
         assert_eq!(
             branch_rows,
             vec![card.connector_y()],
-            "the worker's branch is not on the row its card's middle falls in"
+            "the second mate's branch is not on the row its card's middle falls in"
         );
     }
 }
@@ -12206,6 +12435,275 @@ mod a_filtered_tree_says_what_it_is_holding_back {
             view_notice_rect_after(&app, area, 1).width,
             0,
             "the notice drew into columns it did not have"
+        );
+    }
+}
+
+/// **A Space's card carries the workers it is running, inside its own box.**
+///
+/// The captain's confirmed mockups: header, bars and orbit line, then a dashed
+/// rule, then one compact row per worker — one border around the Space and
+/// everything running in it, rather than one border each. What this module
+/// pins is the part that is a *fact about the tree* rather than about pixels:
+/// which rows are in which card's list, at which step, in which order, and that
+/// every one of them is still a row you can click.
+#[cfg(test)]
+mod a_space_card_carries_its_own_workers {
+    use super::*;
+    use crate::workspace::Workspace;
+
+    /// A Space running three things: a worker it dispatched itself, a second
+    /// mate *pane*, and that mate's own worker.
+    ///
+    /// The second mate is a pane rather than a Space on purpose. A mate with a
+    /// checkout of its own is a Space and heads its own card — that case is
+    /// [`super::crew_head`]'s scan stopping at a `Workspace`. The case this
+    /// fixture is for is the captain's third requirement: a second mate working
+    /// in the *same* Space a direct worker is in, where both have to land in the
+    /// one list told apart by nothing but the step.
+    fn crewed_fleet() -> AppState {
+        let mut app = AppState::test_new();
+        let mut space = Workspace::test_new("herdr");
+        let direct = space.test_split(ratatui::layout::Direction::Vertical);
+        let mate = space.test_split(ratatui::layout::Direction::Vertical);
+        let via = space.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![space];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        for (pane, name, owner) in [
+            (direct, "fm/direct", "herdr"),
+            (mate, "mate", "herdr"),
+            (via, "fm/via", "mate"),
+        ] {
+            let id = app.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&id).expect("a test terminal");
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([("owner".to_string(), Some(owner.to_string()))]),
+                None,
+                now,
+            );
+        }
+        app
+    }
+
+    /// The same fleet with the pixel path live, which is the only panel that
+    /// draws a worker list at all.
+    fn drawing(mut app: AppState) -> AppState {
+        app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
+        app.sidebar_card_shapes = true;
+        app.view.sidebar_card_layers_published = true;
+        app.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        app
+    }
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 42, 46)
+    }
+
+    /// The tree, with each row's name so a failure says which row moved.
+    fn named(app: &AppState) -> Vec<(String, Option<usize>, Option<u8>)> {
+        let entries = workspace_list_entries(app);
+        let agents = sidebar_agent_entries(app);
+        entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let name = match entry {
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                        app.workspaces[*ws_idx].display_name().to_string()
+                    }
+                    WorkspaceListEntry::Agent { entry_idx, .. } => {
+                        agents[*entry_idx].agent_name.clone().unwrap_or_default()
+                    }
+                };
+                (name, crew_head(&entries, idx), crew_tier(&entries, idx))
+            })
+            .collect()
+    }
+
+    /// **Both mates' workers are in the one list, told apart only by the step.**
+    ///
+    /// A direct worker and a second mate's worker running in the same Space land
+    /// in the same card, at tier `0` and tier `1` — never in two sections and
+    /// never in two cards. The second mate's own pane is a row of that list too,
+    /// at the Space's own margin: it is something the Space dispatched, which is
+    /// all tier `0` claims.
+    #[test]
+    fn both_tiers_land_in_one_list() {
+        let app = crewed_fleet();
+        let rows = named(&app);
+        assert_eq!(rows[0].1, None, "the Space itself is in nobody's list");
+        for (name, head, tier) in rows.iter().skip(1) {
+            assert_eq!(*head, Some(0), "{name} left the Space's own card");
+            match name.as_str() {
+                "fm/direct" | "mate" => assert_eq!(*tier, Some(0), "{name} is not flush"),
+                "fm/via" => assert_eq!(*tier, Some(1), "{name} is not stepped in"),
+                other => panic!("unexpected row {other}"),
+            }
+        }
+        assert_eq!(crew_len(&workspace_list_entries(&app), 0), 3);
+    }
+
+    /// **One step, whichever mate it came through and however deep the chain.**
+    ///
+    /// A worker dispatched by a second mate's own second mate draws at the same
+    /// step as one dispatched by the second mate. Past the first step the indent
+    /// has stopped saying anything a reader needs and started eating the panel.
+    #[test]
+    fn a_deeper_chain_still_draws_at_one_step() {
+        let mut app = crewed_fleet();
+        let deeper = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        app.ensure_test_terminals();
+        let id = app.workspaces[0].tabs[0].panes[&deeper]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&id).expect("a test terminal");
+        terminal.set_agent_name("fm/deeper".to_string());
+        terminal.state = AgentState::Idle;
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("fm/via".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+        let rows = named(&app);
+        let deeper = rows
+            .iter()
+            .find(|(name, _, _)| name == "fm/deeper")
+            .expect("the deeper worker is missing from the tree");
+        assert_eq!(deeper.1, Some(0), "it left the Space's own card");
+        assert_eq!(deeper.2, Some(1), "a third tier was invented");
+    }
+
+    /// **The newest worker lands above the one added before it.**
+    ///
+    /// Not something the spawning frame has to catch: [`enter_at_head`] orders
+    /// the whole roster newest-first and [`crate::app::agent_tree::arrange_owner_tree`]
+    /// keeps that order inside every group, so "the newest is on top" is an
+    /// invariant of the list. This is the assertion that says so out loud, on the
+    /// list the card actually draws.
+    #[test]
+    fn the_newest_worker_lands_above_the_one_before_it() {
+        let app = crewed_fleet();
+        let rows = named(&app);
+        let position = |wanted: &str| {
+            rows.iter()
+                .position(|(name, _, _)| name == wanted)
+                .unwrap_or_else(|| panic!("{wanted} is missing from the tree"))
+        };
+        // `via` was split last, so it is the newest pane in the fleet; `mate`
+        // came before it and `direct` before that.
+        assert!(
+            position("mate") < position("fm/direct"),
+            "the older worker is above the newer one: {rows:?}"
+        );
+        assert!(
+            position("fm/via") < position("fm/direct"),
+            "a second mate's newer worker sank below an older direct one: {rows:?}"
+        );
+    }
+
+    /// **A worker is drawn inside its Space's box and gets no box of its own.**
+    ///
+    /// The Space's frame reaches the bottom of its last worker's row, and every
+    /// worker row answers with no frame at all — which is what stops the panel
+    /// drawing a card per worker inside the card that already contains them.
+    #[test]
+    fn a_worker_gets_no_box_of_its_own_and_the_space_reaches_over_it() {
+        let app = drawing(crewed_fleet());
+        if image_card::row_height_cells(&app, row_fold_width(&app, workspace_list_rect(area())))
+            .is_none()
+        {
+            return; // No proportional face on this machine; nothing draws a card.
+        }
+        let cards = compute_workspace_card_areas(&app, area());
+        let entries = workspace_list_entries(&app);
+        let (head, crew): (Vec<&crate::app::state::WorkspaceCardArea>, Vec<_>) = cards
+            .iter()
+            .partition(|card| crew_head(&entries, card.entry_idx).is_none());
+        assert_eq!(head.len(), 1, "the Space did not stay one card");
+        assert_eq!(crew.len(), 3, "a worker row went missing");
+        assert!(
+            crew.iter().all(|card| card.card_frame.is_none()),
+            "a worker drew a box of its own inside the card it is in"
+        );
+        let frame = head[0].card_frame.expect("the Space has a box");
+        let last = crew.last().expect("a worker row");
+        assert_eq!(
+            frame.y + frame.height,
+            last.rect.y + last.rect.height,
+            "the Space's box does not close under its last worker"
+        );
+    }
+
+    /// **Every worker is still a row, so a click on one still selects its pane.**
+    ///
+    /// The rows tile with no gap and no overlap, and each worker's own rect is
+    /// inside the box drawn around it. Hit testing resolves a row from a `y`
+    /// through these rects and nothing else, so this *is* the argument that
+    /// moving the ink did not move the click.
+    #[test]
+    fn the_rows_still_tile_so_a_click_still_lands_on_the_worker() {
+        let app = drawing(crewed_fleet());
+        if image_card::row_height_cells(&app, row_fold_width(&app, workspace_list_rect(area())))
+            .is_none()
+        {
+            return;
+        }
+        let cards = compute_workspace_card_areas(&app, area());
+        let entries = workspace_list_entries(&app);
+        let frame = cards[0].card_frame.expect("the Space has a box");
+        let mut next = cards[0].rect.y;
+        for card in &cards {
+            assert!(card.rect.height > 0, "a row with no cells is not a row");
+            assert_eq!(card.rect.y, next, "the rows stopped tiling at {card:?}");
+            next = card.rect.y + card.rect.height;
+            if crew_head(&entries, card.entry_idx).is_none() {
+                continue;
+            }
+            assert!(
+                card.rect.y >= frame.y && card.rect.y + card.rect.height <= frame.y + frame.height,
+                "a worker's own row is outside the box it is drawn in: {card:?}"
+            );
+            assert!(
+                card.agent.is_some(),
+                "a worker row lost the pane a click on it resolves to"
+            );
+        }
+    }
+
+    /// **A panel drawing no cards keeps every row it always had.**
+    ///
+    /// The crew list is a *card*: on the character fallback there is no box to be
+    /// inside of, so a worker is its own row with its own height and its own air
+    /// around it, exactly as before. Nothing about that panel changes.
+    #[test]
+    fn a_panel_that_draws_no_cards_keeps_every_worker_row_it_had() {
+        let app = crewed_fleet();
+        assert!(
+            !crew_is_drawn(&app, row_fold_width(&app, workspace_list_rect(area()))),
+            "this fixture has to be one with no pixel card"
+        );
+        let cards = compute_workspace_card_areas(&app, area());
+        let entries = workspace_list_entries(&app);
+        assert_eq!(cards.len(), entries.len(), "a row went missing");
+        assert!(
+            cards
+                .iter()
+                .filter(|card| card.agent.is_some())
+                .all(|card| card.card_frame.is_some()),
+            "a worker lost its own shell on a panel with no card to be inside of"
         );
     }
 }

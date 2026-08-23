@@ -445,6 +445,31 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         // `CardContentWire` drops it, so setting it here would be a lie about
         // what a client draws.
         wash: None,
+        // A mate carries a crew, a worker never does — so the benchmark's
+        // fleet exercises both the list and the plain card, and the cost of a
+        // Space's card is measured with the rows it really draws. Two rows
+        // apiece, one of them through a second mate, so the dimmer tier is on
+        // screen too.
+        crew: if depth == 1 {
+            vec![
+                crew::CrewMember {
+                    name: format!("fm/bench-{index}"),
+                    detail: Some("laying the crew list out".to_string()),
+                    tier: 0,
+                    arrival: crew::CrewArrival::SETTLED,
+                    spider: None,
+                },
+                crew::CrewMember {
+                    name: format!("fm/bench-{index}-via"),
+                    detail: Some("dispatched by a second mate".to_string()),
+                    tier: 1,
+                    arrival: crew::CrewArrival::SETTLED,
+                    spider: None,
+                },
+            ]
+        } else {
+            Vec::new()
+        },
     }
 }
 
