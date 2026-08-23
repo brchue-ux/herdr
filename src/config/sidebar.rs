@@ -2081,6 +2081,7 @@ rows = [["state_icon", { token = "workspace", fg = "#89b4fa", bold = true, dim =
             Agent::Hermes,
             Agent::Kilo,
             Agent::Qodercli,
+            Agent::Qwen,
             Agent::Maki,
         ];
         let entries = agents
