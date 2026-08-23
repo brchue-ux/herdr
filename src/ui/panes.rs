@@ -31,18 +31,16 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
 // branch on agent identity and pane state, never an accident of detection
 // quietly returning nothing.
 
-/// Minimum spare rows below the composer for the bottom command-log zone to
-/// be worth drawing — fewer than this would read as a sliver rather than a
-/// real zone, so the pane falls back to a normal full render instead.
+/// Most rows the bottom command-log zone is ever given, whatever else is on
+/// screen. The zone is a glance at what the agent has been running, not a
+/// second terminal, and every row it takes is a row of transcript
+/// ([`crate::pane::ClaudeTriviewLayout::transcript_skip`]) — so it is capped
+/// rather than allowed to grow to whatever the pane has spare.
 ///
-/// Claude Code's own composer always leaves exactly two rows below its own
-/// bottom border in every observed state (idle and working alike): a
-/// model/context/cost line, then a keybinding hint line. It pins these to the
-/// literal bottom of the screen regardless of pane height, so "spare rows
-/// below the composer" never exceeds 2 on a real live pane. A threshold of 3
-/// here demanded one more row than a real Claude Code screen ever has,
-/// meaning triview could never engage outside a synthetic test fixture.
-const MIN_TRIVIEW_BOTTOM_ROWS: u16 = 2;
+/// Matches [`crate::app::pane_command_log::PANE_COMMAND_LOG_MAX`], which is
+/// how many commands a pane's log holds, so the cap and the log's own memory
+/// cannot disagree.
+const MAX_TRIVIEW_LOG_ROWS: u16 = crate::app::pane_command_log::PANE_COMMAND_LOG_MAX as u16;
 
 /// Minimum pane height even worth attempting triview detection against — a
 /// cheap bailout before paying for a text read of the live grid.
@@ -74,8 +72,8 @@ fn should_attempt_claude_triview(
 
 /// Draws the herdr-owned parts of a triview pane: the two divider rows left
 /// where Claude's own composer border was cropped out, and the command-log
-/// bottom zone. The transcript and composer zones themselves were already
-/// drawn straight from the live grid by
+/// bottom zone. The transcript, composer and agent-footer zones themselves
+/// were already drawn straight from the live grid by
 /// [`TerminalRuntime::render_claude_triview`] — this only fills what that
 /// call deliberately left blank.
 fn render_claude_triview_chrome(
@@ -93,32 +91,32 @@ fn render_claude_triview_chrome(
     let bottom_divider_y = top_divider_y + 1 + layout.composer_rows;
     render_triview_divider(frame, area, bottom_divider_y, divider_style);
 
-    let log_y = bottom_divider_y + 1;
-    let pane_bottom = area.y + area.height;
-    if log_y >= pane_bottom {
-        return;
-    }
-    // Sized to the pane's own logged commands, not the full remainder of the
-    // pane: Claude's real composer sits in a tall pane with little
-    // conversation far more often than not (its own footer pins to the
-    // literal screen bottom regardless of pane height — see
-    // MIN_TRIVIEW_BOTTOM_ROWS), so claiming every leftover row here painted
-    // a panel_bg-tinted rectangle stretching most of the pane's height with
-    // its one or two command lines bottom-anchored out of sight below it —
-    // reading as a stray tint under the composer and an empty log at a
-    // glance. An empty log draws nothing at all, leaving that space a plain
-    // continuation of the pane's own background.
-    let available_rows = pane_bottom - log_y;
-    let command_count = app.pane_command_log.lines(info.id).count() as u16;
-    let log_height = command_count.min(available_rows);
-    if log_height == 0 {
+    // Above the agent's own footer, never over it. Claude Code pins its
+    // status line — the user's `statusLine` command when one is configured —
+    // and its shortcut hint to the literal bottom of the screen, so the rows
+    // right under the composer's cropped border used to be the agent's, and
+    // starting the log there put herdr's zone on top of them: with commands
+    // logged, a panel_bg rectangle over the status line; with none, a blank
+    // band the pane background showed through. Both read as a bar covering
+    // the status bar, and both went away the moment a mode change (a
+    // right-click's context menu) dropped the pane back to the plain
+    // full-grid render.
+    //
+    // The rows this draws into are the ones `render_claude_triview` opened by
+    // shifting the transcript and the composer up, so they are the split's to
+    // give and the footer below is untouched. `log_rows` is already sized to
+    // exactly the commands the caller asked to show and capped at
+    // MAX_TRIVIEW_LOG_ROWS; a log with nothing in it, or a transcript with no
+    // rows to spare, leaves this zero and the space is a plain continuation
+    // of the pane's own background.
+    if layout.log_rows == 0 {
         return;
     }
     let log_area = Rect {
         x: area.x,
-        y: log_y,
+        y: area.y + layout.consumed_rows(),
         width: area.width,
-        height: log_height,
+        height: layout.log_rows,
     };
     render_pane_command_log(app, frame, info.id, log_area);
 }
@@ -520,11 +518,17 @@ pub(super) fn render_panes(
 
             let triview = should_attempt_claude_triview(app, ws_idx, info, terminal_active, rt)
                 .then(|| {
+                    // Asked for, not reserved: the rows come out of the
+                    // transcript's own top and the split grants what it can.
+                    let requested_log_rows =
+                        u16::try_from(app.pane_command_log.lines(info.id).count())
+                            .unwrap_or(u16::MAX)
+                            .min(MAX_TRIVIEW_LOG_ROWS);
                     rt.render_claude_triview(
                         frame,
                         info.inner_rect,
                         show_cursor,
-                        MIN_TRIVIEW_BOTTOM_ROWS,
+                        requested_log_rows,
                     )
                 })
                 .flatten();
@@ -1239,23 +1243,87 @@ mod tests {
         ));
     }
 
+    fn triview_pane_info(pane_id: PaneId, height: u16) -> PaneInfo {
+        PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, height),
+            inner_rect: Rect::new(0, 0, 40, height),
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        }
+    }
+
+    /// The captain's report: *"my status bar is blocked by a black bar, and
+    /// only appears when I right click."* The log zone used to start at the
+    /// composer's cropped bottom border, which is where Claude Code pins its
+    /// own status line and shortcut hint — so herdr's `panel_bg` rectangle
+    /// went straight over them, and right-clicking (any mode that is not
+    /// `Mode::Terminal`) put them back only because it disengaged triview
+    /// altogether.
+    ///
+    /// The zone now sits in rows the split opened above the footer, so what
+    /// this asserts is a gap: the log is drawn, and the two rows under it are
+    /// untouched.
     #[test]
-    fn render_claude_triview_chrome_sizes_the_log_zone_to_its_own_commands() {
+    fn render_claude_triview_chrome_keeps_its_log_clear_of_the_agent_footer() {
         let mut app = AppState::test_new();
         let pane_id = PaneId::from_raw(1);
         app.pane_command_log.record(pane_id, "ls".to_string());
         app.pane_command_log.record(pane_id, "pwd".to_string());
-        let info = PaneInfo {
-            id: pane_id,
-            rect: Rect::new(0, 0, 40, 20),
-            inner_rect: Rect::new(0, 0, 40, 20),
-            scrollbar_rect: None,
-            borders: Borders::NONE,
-            is_focused: true,
-        };
+        let info = triview_pane_info(pane_id, 12);
+        // A 7-row transcript that gave 2 rows up: dividers at 5 and 7, log at
+        // 8..10, the agent's own footer on the pane's floor at 10..12.
         let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_skip: 2,
             transcript_rows: 5,
             composer_rows: 1,
+            log_rows: 2,
+            footer_rows: 2,
+        };
+        assert_eq!(layout.footer_start() + layout.footer_rows, 12);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| render_claude_triview_chrome(&app, frame, &info, layout))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 8)].symbol(), "●");
+        assert_eq!(buffer[(0, 9)].symbol(), "●");
+        assert_eq!(buffer[(0, 8)].style().bg, Some(app.palette.panel_bg));
+        assert_eq!(buffer[(0, 9)].style().bg, Some(app.palette.panel_bg));
+        // Rows 10 and 11 are the agent's own — `render_claude_triview`
+        // blitted its status line and hint there and this pass must not
+        // touch them.
+        for row in 10..12 {
+            assert_ne!(
+                buffer[(0, row)].style().bg,
+                Some(app.palette.panel_bg),
+                "row {row} is the agent's own footer, not the log zone's"
+            );
+            assert_ne!(buffer[(0, row)].symbol(), "●");
+        }
+    }
+
+    /// The zone is exactly the rows the split granted, never the rest of the
+    /// pane. Claiming every leftover row painted a `panel_bg` rectangle
+    /// stretching most of a tall pane with its one or two commands
+    /// bottom-anchored out of sight below it.
+    #[test]
+    fn render_claude_triview_chrome_draws_only_the_rows_the_split_granted() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        app.pane_command_log.record(pane_id, "ls".to_string());
+        app.pane_command_log.record(pane_id, "pwd".to_string());
+        let info = triview_pane_info(pane_id, 20);
+        let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_skip: 2,
+            transcript_rows: 5,
+            composer_rows: 1,
+            log_rows: 2,
+            footer_rows: 2,
         };
 
         let mut terminal =
@@ -1265,15 +1333,8 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        // Divider at row 5, composer's own row at 6, divider at row 7 — the
-        // log zone starts at row 8 and should hold exactly its two commands,
-        // not every row left in the pane down to row 19.
         assert_eq!(buffer[(0, 8)].symbol(), "●");
         assert_eq!(buffer[(0, 9)].symbol(), "●");
-        assert_eq!(buffer[(0, 8)].style().bg, Some(app.palette.panel_bg));
-        assert_eq!(buffer[(0, 9)].style().bg, Some(app.palette.panel_bg));
-        // Everything past the two logged commands is untouched — a plain
-        // continuation of the pane's own background, not the log's tint.
         for row in 10..20 {
             assert_ne!(
                 buffer[(0, row)].style().bg,
@@ -1283,21 +1344,50 @@ mod tests {
         }
     }
 
+    /// A transcript with no rows to spare grants no log zone, and the chrome
+    /// draws nothing there rather than taking a row from the status line.
+    #[test]
+    fn render_claude_triview_chrome_draws_no_log_when_the_split_granted_none() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        app.pane_command_log.record(pane_id, "ls".to_string());
+        let info = triview_pane_info(pane_id, 10);
+        let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_skip: 0,
+            transcript_rows: 5,
+            composer_rows: 1,
+            log_rows: 0,
+            footer_rows: 2,
+        };
+        assert_eq!(layout.footer_start(), layout.consumed_rows());
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| render_claude_triview_chrome(&app, frame, &info, layout))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for row in 8..10 {
+            assert_ne!(
+                buffer[(0, row)].style().bg,
+                Some(app.palette.panel_bg),
+                "row {row} is the agent's own footer, not the log zone's"
+            );
+        }
+    }
+
     #[test]
     fn render_claude_triview_chrome_draws_nothing_for_an_empty_log() {
         let app = AppState::test_new();
         let pane_id = PaneId::from_raw(1);
-        let info = PaneInfo {
-            id: pane_id,
-            rect: Rect::new(0, 0, 40, 20),
-            inner_rect: Rect::new(0, 0, 40, 20),
-            scrollbar_rect: None,
-            borders: Borders::NONE,
-            is_focused: true,
-        };
+        let info = triview_pane_info(pane_id, 20);
         let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_skip: 0,
             transcript_rows: 5,
             composer_rows: 1,
+            log_rows: 0,
+            footer_rows: 2,
         };
 
         let mut terminal =
