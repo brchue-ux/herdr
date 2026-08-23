@@ -662,7 +662,12 @@ impl HeadlessServer {
                 needs_graphics_render = false;
             }
 
-            self.poll_pending_alt_screen_reads(now);
+            if self.poll_pending_alt_screen_reads(now) {
+                needs_render = true;
+                needs_full_render = true;
+                needs_graphics_render = false;
+                crate::render_prof::event("full_render_cause.alt_screen_read_completed");
+            }
             if self.process_deferred_alt_screen_reads() {
                 needs_render = true;
                 needs_full_render = true;
@@ -3379,8 +3384,16 @@ impl HeadlessServer {
         })
     }
 
-    fn poll_pending_alt_screen_reads(&mut self, now: Instant) {
+    /// Advances every in-flight alternate-screen harvest one step.
+    ///
+    /// Returns whether any of them finished. A harvest releases the polled
+    /// pane's frame hold as it completes, and that pane's PTY output asked for
+    /// no render for as long as the hold was engaged
+    /// (`PaneTerminal::process_pty_bytes`), so the release is the one moment
+    /// the pane is owed a redraw.
+    fn poll_pending_alt_screen_reads(&mut self, now: Instant) -> bool {
         let pending = std::mem::take(&mut self.pending_alt_screen_reads);
+        let mut completed = false;
         for read in pending {
             let runtime = self.app.terminal_runtimes.get(&read.terminal_id);
             let remains_idle = self
@@ -3397,10 +3410,12 @@ impl HeadlessServer {
             } else {
                 read.abort(runtime, now)
             };
-            if let Some(read) = outcome {
-                self.pending_alt_screen_reads.push(read);
+            match outcome {
+                Some(read) => self.pending_alt_screen_reads.push(read),
+                None => completed = true,
             }
         }
+        completed
     }
 
     fn alt_screen_read_conflict(&self, request: &api::schema::Request) -> AltScreenReadConflict {
@@ -6947,6 +6962,75 @@ next_tab = ""
                 Some(format!(
                     "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
                 ))
+            );
+        });
+    }
+
+    #[test]
+    fn a_completed_alt_screen_read_reports_that_a_render_is_owed() {
+        // While a harvest holds a pane's frame, that pane's PTY output asks for
+        // no render at all (`PaneTerminal::process_pty_bytes`) — which is what
+        // keeps one pane's harvest from recompositing the whole window for
+        // seconds. The hold's release is therefore the only moment the pane can
+        // be redrawn, so the poll has to tell the loop it happened.
+        with_terminal_session_test_server(|server, terminal_id, _, _| {
+            // Only an idle agent is ever harvested, and `poll` aborts a harvest
+            // the moment that stops being true.
+            server
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("terminal")
+                .state = crate::detect::AgentState::Idle;
+            let (respond_to, response_rx) = std::sync::mpsc::channel();
+            let runtime = server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("terminal runtime");
+            let started = Instant::now();
+            let pending = crate::server::alt_screen_read::PendingAltScreenRead::start(
+                terminal_id,
+                "read".into(),
+                respond_to,
+                "fallback".into(),
+                api::schema::PaneReadResult {
+                    pane_id: "w1:p1".into(),
+                    workspace_id: "w1".into(),
+                    tab_id: "w1:t1".into(),
+                    source: api::schema::ReadSource::Recent,
+                    format: api::schema::ReadFormat::Text,
+                    text: String::new(),
+                    revision: 0,
+                    truncated: false,
+                    transcript_applied: None,
+                },
+                120,
+                false,
+                crate::terminal::ScreenSnapshot {
+                    cols: 80,
+                    rows: Vec::new(),
+                },
+                started,
+                runtime,
+            );
+            server.pending_alt_screen_reads.push(pending);
+
+            assert!(
+                !server.poll_pending_alt_screen_reads(started),
+                "a harvest that has not reached its next step owes nothing yet"
+            );
+            assert_eq!(server.pending_alt_screen_reads.len(), 1);
+
+            assert!(
+                server.poll_pending_alt_screen_reads(started + Duration::from_secs(1)),
+                "the harvest finished, so the pane it was holding is owed a redraw"
+            );
+            assert!(server.pending_alt_screen_reads.is_empty());
+            assert!(
+                response_rx.try_recv().is_ok(),
+                "a finished harvest answers its caller"
             );
         });
     }

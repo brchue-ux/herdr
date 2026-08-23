@@ -1409,13 +1409,28 @@ impl GhosttyPaneTerminal {
             reported_cwd
         };
 
-        let request_render = !synchronized_output;
-        let render_delay = render_delay_after_pty_write(
-            synchronized_output,
-            has_kitty_graphics_sequence,
-            cursor_position_settle_pending(&core),
-            CURSOR_POSITION_SETTLE_ENABLED,
-        );
+        // An engaged alternate-screen read hold is a promise that this pane
+        // draws its pre-harvest frame no matter what arrives on the PTY — and
+        // the harvest's own injected scroll is what is arriving. Asking for a
+        // render per chunk cannot change one cell of this pane, but the ask is
+        // not pane-scoped: every retained-render escape hatch (visible kitty
+        // graphics, a non-empty graphics cache, any non-`Terminal` mode) turns
+        // it into a full recomposite of the whole window, so one pane's harvest
+        // buys the entire UI a render storm for the harvest's duration. Suppress
+        // it the same way an open DEC 2026 batch is suppressed; the server marks
+        // the pane dirty once when the hold lifts.
+        let alt_screen_read_hold = alt_screen_read_holds_frame(&core, Instant::now());
+        let request_render = !synchronized_output && !alt_screen_read_hold;
+        let render_delay = if alt_screen_read_hold {
+            None
+        } else {
+            render_delay_after_pty_write(
+                synchronized_output,
+                has_kitty_graphics_sequence,
+                cursor_position_settle_pending(&core),
+                CURSOR_POSITION_SETTLE_ENABLED,
+            )
+        };
         if request_render {
             crate::render_prof::event("pty.request_render");
         }
@@ -1424,6 +1439,9 @@ impl GhosttyPaneTerminal {
         }
         if synchronized_output {
             crate::render_prof::event("pty.synchronized_output_suppressed");
+        }
+        if alt_screen_read_hold {
+            crate::render_prof::event("pty.alt_screen_read_hold_suppressed");
         }
         ProcessBytesResult {
             request_render,
@@ -6986,6 +7004,67 @@ mod tests {
         assert!(
             pane.resize_recovery_hold_active_for_test(),
             "a stale hidden pane's redraw must still arm the hold after an API read"
+        );
+    }
+
+    #[test]
+    fn pty_bytes_arriving_under_an_alt_screen_read_hold_ask_for_no_render() {
+        // The hold above proves the harvest's scroll never reaches the drawn
+        // frame. This proves it never reaches the *render loop* either. Asking
+        // for a render per PTY chunk is not pane-scoped work: with visible
+        // kitty graphics, a non-empty graphics cache, or any non-`Terminal`
+        // mode, the retained per-pane update is refused and the ask becomes a
+        // full recomposite of the whole window. A harvest scrolls its pane for
+        // seconds, so a held pane that still asks stalls the entire UI for the
+        // harvest's duration — which is the whole-window freeze this hold was
+        // supposed to be invisible for.
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        let before = pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        assert!(before.request_render);
+
+        pane.set_alt_screen_read_hold(true);
+        for _ in 0..8 {
+            let held = pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx);
+            assert!(
+                !held.request_render,
+                "a pane that cannot change one drawn cell must not arm a render"
+            );
+            assert!(
+                held.render_delay.is_none(),
+                "nor a delayed one, which lands after the same held frame"
+            );
+        }
+
+        pane.set_alt_screen_read_hold(false);
+        let after = pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KSETTLED", &tx);
+        assert!(
+            after.request_render,
+            "releasing the hold must restore the pane's normal render requests"
+        );
+    }
+
+    #[test]
+    fn an_expired_alt_screen_read_hold_stops_suppressing_render_requests() {
+        // The leak guard that unfreezes the pane must unfreeze its render
+        // requests with it, or a harvest whose runtime disappears leaves the
+        // pane drawing live content that nothing ever asks to be drawn.
+        let (pane, tx, _rx, pane_id) = synchronized_victim_pane();
+        pane.process_pty_bytes(pane_id, 0, b"COMPLETE", &tx);
+        pane.set_alt_screen_read_hold(true);
+        assert!(
+            !pane
+                .process_pty_bytes(pane_id, 0, b"\r\x1b[KSCROLLED", &tx)
+                .request_render
+        );
+
+        pane.age_alt_screen_read_hold_for_test(
+            ALT_SCREEN_READ_HOLD_TIMEOUT + Duration::from_millis(1),
+        );
+
+        assert!(
+            pane.process_pty_bytes(pane_id, 0, b"\r\x1b[KLATER", &tx)
+                .request_render,
+            "an expired hold must stop suppressing renders exactly when it stops holding"
         );
     }
 
