@@ -103,6 +103,40 @@ fn security_descriptor_from_sddl(
     SecurityDescriptor::deserialize(&sddl)
 }
 
+/// The Windows OpenSSH search path: the user's `%USERPROFILE%\.ssh\config`,
+/// then the system `%PROGRAMDATA%\ssh\ssh_config`.
+///
+/// `multiplexing` is false: Windows OpenSSH has no `ControlMaster` support, so
+/// the managed config Herdr writes there carries only the keepalive fallback.
+/// Without it a `herdr --remote` session whose link dies silently is not
+/// noticed until TCP itself gives up.
+pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
+    let mut includes = Vec::new();
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        includes.push(PathBuf::from(profile).join(".ssh").join("config"));
+    }
+    if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+        includes.push(PathBuf::from(program_data).join("ssh").join("ssh_config"));
+    }
+    super::RemoteSshConfigPaths {
+        includes,
+        multiplexing: false,
+    }
+}
+
+/// Renders a native path for an ssh_config `Include` directive.
+///
+/// OpenSSH's config parser is the same code on every platform, and an
+/// `Include` whose path carries backslashes does not resolve — quoted or not,
+/// and *silently*, with no warning. That failure mode is the dangerous one
+/// here: a dropped `Include` would leave herdr's `Host *` fallback as the only
+/// block in the file, so herdr's keepalives would override the user's own
+/// settings instead of standing behind them. Windows file APIs accept `/` as a
+/// separator, so rewriting names the same file.
+pub(crate) fn ssh_config_include_path(path: &std::path::Path) -> String {
+    super::ssh_config_forward_slashes(path)
+}
+
 /// `std::fs::create_dir_all` with a protected DACL on every level Herdr creates.
 ///
 /// Levels that already exist are left exactly as they are: this hardens the

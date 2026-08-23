@@ -188,6 +188,60 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+/// Where OpenSSH looks for the config files Herdr's managed remote-attach config
+/// has to `Include`, and whether this platform's OpenSSH can multiplex.
+///
+/// Both facts are OS knowledge, and they travel together because the second one
+/// decides whether the private directory Herdr writes the config into also has
+/// to hold a ControlMaster socket.
+pub(crate) struct RemoteSshConfigPaths {
+    /// Config files to `Include`, most specific first. ssh applies the *first*
+    /// value it sees for an option, so the order here is what makes the user's
+    /// own settings beat Herdr's fallbacks.
+    ///
+    /// Paths that do not exist are expected; the caller skips them.
+    pub(crate) includes: Vec<std::path::PathBuf>,
+    /// Whether `ControlMaster`/`ControlPersist` connection multiplexing over a
+    /// control socket is available. Windows OpenSSH has no ControlMaster
+    /// support, so the managed config there is keepalives only.
+    pub(crate) multiplexing: bool,
+}
+
+/// The Unix OpenSSH search path: the user's `~/.ssh/config`, then the system
+/// `/etc/ssh/ssh_config`.
+#[cfg(unix)]
+pub(crate) fn remote_ssh_config_paths() -> RemoteSshConfigPaths {
+    let mut includes = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        includes.push(std::path::PathBuf::from(home).join(".ssh").join("config"));
+    }
+    includes.push(std::path::PathBuf::from("/etc/ssh/ssh_config"));
+    RemoteSshConfigPaths {
+        includes,
+        multiplexing: true,
+    }
+}
+
+/// Renders a native path for an ssh_config `Include` directive.
+///
+/// On Unix a path is used as written: `\` is a legal byte in a Unix filename,
+/// so rewriting it would name a different file.
+#[cfg(unix)]
+pub(crate) fn ssh_config_include_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Rewrites a path's separators into the forward slashes OpenSSH's config
+/// parser wants, for the platforms whose native separator it cannot take.
+///
+/// Shared rather than inlined into the Windows implementation so the rewrite
+/// rule itself is covered by tests on every platform, not only by a Windows
+/// CI leg.
+#[cfg(any(windows, test))]
+pub(crate) fn ssh_config_forward_slashes(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Creates the directory tree that holds Herdr's private runtime state.
 ///
 /// On Unix this is a plain `create_dir_all`: the socket inside is a file, and

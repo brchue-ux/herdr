@@ -467,8 +467,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # When true (default), herdr runs remote ssh through a generated config that
 # includes your ~/.ssh/config first and adds ServerAliveInterval/
 # ServerAliveCountMax as fallbacks (so any keepalive values you set yourself
-# still win) to survive idle network/NAT timeouts. Herdr also uses a private
-# per-attach OpenSSH control socket to reuse the first authenticated connection.
+# still win) to survive idle network/NAT timeouts. On macOS and Linux herdr
+# also uses a private per-attach OpenSSH control socket to reuse the first
+# authenticated connection; Windows OpenSSH has no ControlMaster support, so on
+# Windows the generated config carries the keepalive fallback only.
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true

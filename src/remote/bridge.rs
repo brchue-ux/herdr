@@ -465,7 +465,9 @@ struct PreparedRemoteHerdr {
 #[derive(Clone)]
 struct ManagedSshOptions {
     config_path: PathBuf,
-    control_path: PathBuf,
+    /// `None` where the platform's OpenSSH cannot multiplex, in which case the
+    /// managed config carries the keepalive fallback and nothing else.
+    control_path: Option<PathBuf>,
 }
 
 struct ManagedSshConfig {
@@ -493,7 +495,13 @@ impl RemoteSsh {
         }
     }
 
-    #[cfg(unix)]
+    /// Windows OpenSSH has no ControlMaster support, so the config written
+    /// there omits the control socket and every ssh invocation runs
+    /// unmultiplexed (see `bridge_connection`, which already pays for one ssh
+    /// child per local connection either way). The keepalive fallback is the
+    /// part that matters on every platform: OpenSSH defaults to
+    /// `ServerAliveInterval 0`, so without it a link that dies silently is not
+    /// noticed until TCP itself gives up.
     fn managed_config(manage_ssh_config: bool) -> Option<ManagedSshConfig> {
         if !manage_ssh_config {
             return None;
@@ -505,22 +513,21 @@ impl RemoteSsh {
             .ok()
     }
 
-    // The managed config's whole purpose is ControlMaster/ControlPersist
-    // multiplexing over a Unix control socket, which Windows OpenSSH does not
-    // support. Every ssh invocation on Windows runs plain instead of reusing
-    // a shared connection; see `bridge_connection`, which already pays for
-    // one ssh child per local connection either way.
-    #[cfg(windows)]
-    fn managed_config(_manage_ssh_config: bool) -> Option<ManagedSshConfig> {
-        None
-    }
-
     fn target(&self) -> &str {
         &self.target
     }
 
     fn options(&self) -> Option<&ManagedSshOptions> {
         self.managed_config.as_ref().map(|config| &config.options)
+    }
+
+    /// Whether dropping this handle should ask ssh to close a shared
+    /// ControlMaster connection. False without a control socket: there is no
+    /// shared connection, and ssh would reject the request.
+    fn should_close_control_master(&self) -> bool {
+        self.options()
+            .and_then(|options| options.control_path.as_ref())
+            .is_some()
     }
 
     fn command(&self) -> Command {
@@ -655,7 +662,7 @@ fn remote_install_commit_script(tmp_path: &str, dest_path: &str) -> String {
 
 impl Drop for RemoteSsh {
     fn drop(&mut self) {
-        if self.managed_config.is_none() {
+        if !self.should_close_control_master() {
             return;
         }
 
@@ -678,11 +685,15 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
         return;
     };
 
+    command.arg("-F").arg(&options.config_path);
+
+    let Some(control_path) = options.control_path.as_ref() else {
+        return;
+    };
+
     command
-        .arg("-F")
-        .arg(&options.config_path)
         .arg("-S")
-        .arg(&options.control_path)
+        .arg(control_path)
         .arg("-o")
         .arg("ControlMaster=auto")
         .arg("-o")
@@ -1923,26 +1934,17 @@ impl Drop for SshStdioBridge {
 /// from pre-planting a symlink or world-writable file that herdr would write
 /// and `ssh -F` would then read.
 ///
-/// Unix-only: it exists to hold the ControlMaster socket, which
-/// [`RemoteSsh::managed_config`] only sets up on Unix.
-#[cfg(unix)]
-fn private_ssh_config_dir() -> io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    let mut bases = vec![std::env::temp_dir()];
-    let short_tmp = PathBuf::from("/tmp");
-    if bases.first() != Some(&short_tmp) {
-        bases.push(short_tmp);
-    }
-
+/// `multiplexing` says whether the directory also has to hold the ControlMaster
+/// socket, which is what constrains its path length.
+fn private_ssh_config_dir(multiplexing: bool) -> io::Result<PathBuf> {
     let mut last_error = None;
-    for base in bases {
+    for base in private_ssh_config_bases(multiplexing) {
         for attempt in 0..100 {
             let dir = base.join(format!("herdr-ssh-{}-{attempt}", std::process::id()));
-            if !fits_unix_socket_path(&dir.join(SSH_CONTROL_SOCKET_NAME)) {
+            if !control_socket_fits(&dir, multiplexing) {
                 continue;
             }
-            match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            match create_private_dir_exclusive(&dir) {
                 Ok(()) => return Ok(dir),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => {
@@ -1961,11 +1963,59 @@ fn private_ssh_config_dir() -> io::Result<PathBuf> {
     }))
 }
 
+/// Temp bases to try for that directory, best first.
+///
+/// A Unix socket path is byte-capped, so when the directory has to hold the
+/// ControlMaster socket a long `TMPDIR` needs the shortest standard base behind
+/// it.
+#[cfg(unix)]
+fn private_ssh_config_bases(multiplexing: bool) -> Vec<PathBuf> {
+    let mut bases = vec![std::env::temp_dir()];
+    let short_tmp = PathBuf::from("/tmp");
+    if multiplexing && bases.first() != Some(&short_tmp) {
+        bases.push(short_tmp);
+    }
+    bases
+}
+
+/// Windows OpenSSH never multiplexes, so nothing in this directory is a socket
+/// and no path budget forces a shorter base than `%TEMP%`.
+#[cfg(windows)]
+fn private_ssh_config_bases(_multiplexing: bool) -> Vec<PathBuf> {
+    vec![std::env::temp_dir()]
+}
+
+/// Whether the ControlMaster socket that would live in `dir` fits the
+/// platform's socket path limit.
+#[cfg(unix)]
+fn control_socket_fits(dir: &Path, multiplexing: bool) -> bool {
+    !multiplexing || fits_unix_socket_path(&dir.join(SSH_CONTROL_SOCKET_NAME))
+}
+
+/// Trivially true on Windows: `multiplexing` is always false there, so no
+/// control socket is ever placed in `dir`.
+#[cfg(windows)]
+fn control_socket_fits(_dir: &Path, _multiplexing: bool) -> bool {
+    true
+}
+
+/// The ControlMaster socket path inside `dir`, or `None` where the platform's
+/// OpenSSH cannot multiplex.
+#[cfg(unix)]
+fn control_socket_path(dir: &Path, multiplexing: bool) -> Option<PathBuf> {
+    multiplexing.then(|| dir.join(SSH_CONTROL_SOCKET_NAME))
+}
+
+/// Windows OpenSSH has no `ControlMaster`, so there is never a control socket.
+#[cfg(windows)]
+fn control_socket_path(_dir: &Path, _multiplexing: bool) -> Option<PathBuf> {
+    None
+}
+
 /// Quotes a path for an ssh_config `Include` so a path containing spaces (or
 /// glob metacharacters) is treated as one literal token instead of being split
 /// or expanded by ssh — otherwise the user's config might not be Included and
 /// herdr's fallback would wrongly take effect.
-#[cfg(unix)]
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -1978,37 +2028,32 @@ fn ssh_config_quote(path: &str) -> String {
 /// an explicit `0` to disable it). Herdr's keepalive values apply only when
 /// the user has none.
 ///
-/// Unix-only: see [`private_ssh_config_dir`].
-#[cfg(unix)]
+/// Which files those are, and whether the private directory also has to hold a
+/// ControlMaster socket, are the platform's answers — see
+/// [`crate::platform::remote_ssh_config_paths`].
 fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = private_ssh_config_dir()?;
+    let paths = crate::platform::remote_ssh_config_paths();
+    let dir = private_ssh_config_dir(paths.multiplexing)?;
     let path = dir.join("config");
-    let control_path = dir.join(SSH_CONTROL_SOCKET_NAME);
+    let control_path = control_socket_path(&dir, paths.multiplexing);
 
     let mut contents = String::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let user_config = PathBuf::from(home).join(".ssh").join("config");
-        if user_config.is_file() {
+    for include in &paths.includes {
+        // Skipping what is not there keeps ssh from warning on a missing
+        // Include, and keeps herdr's fallback from being the only block in the
+        // file for no reason.
+        if include.is_file() {
             contents.push_str(&format!(
                 "Include {}\n",
-                ssh_config_quote(&user_config.to_string_lossy())
+                ssh_config_quote(&crate::platform::ssh_config_include_path(include))
             ));
         }
-    }
-    if Path::new("/etc/ssh/ssh_config").is_file() {
-        contents.push_str("Include /etc/ssh/ssh_config\n");
     }
     contents.push_str("Host *\n");
     contents.push_str("  ServerAliveInterval 15\n");
     contents.push_str("  ServerAliveCountMax 4\n");
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(BRIDGE_SOCKET_PERMISSION_MODE)
-        .open(&path)?;
+    let mut file = create_private_file_exclusive(&path)?;
     file.write_all(contents.as_bytes())?;
     Ok(ManagedSshConfig {
         options: ManagedSshOptions {
@@ -2016,6 +2061,33 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
             control_path,
         },
     })
+}
+
+/// Creates the managed ssh config, failing if anything already sits at `path`.
+///
+/// Fail-if-exists plus the `0600` is the file half of the bargain
+/// [`private_ssh_config_dir`] makes for the directory: `ssh -F` reads this file,
+/// so nobody else may be able to write it.
+#[cfg(unix)]
+fn create_private_file_exclusive(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(BRIDGE_SOCKET_PERMISSION_MODE)
+        .open(path)
+}
+
+/// A Windows file has no mode to narrow; it inherits the ACL of its parent,
+/// which is the private directory [`private_ssh_config_dir`] just created
+/// inside the already per-user `%TEMP%`.
+#[cfg(windows)]
+fn create_private_file_exclusive(path: &Path) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Bridges one accepted local client connection to a fresh `ssh` child running
@@ -2392,7 +2464,11 @@ mod tests {
 
         let managed_config = write_managed_ssh_config().expect("write managed config");
         let path = managed_config.options.config_path.clone();
-        let control_path = managed_config.options.control_path.clone();
+        let control_path = managed_config
+            .options
+            .control_path
+            .clone()
+            .expect("unix OpenSSH multiplexes, so the config has a control socket");
         let contents = std::fs::read_to_string(&path).expect("read keepalive config");
 
         // herdr's fallback transport settings are present...
@@ -2413,6 +2489,7 @@ mod tests {
         assert!(!contents.contains("ControlPath"));
         // ...and any user config is Included (quoted) BEFORE it so
         // first-value-wins keeps the user's own settings.
+        let fallback_at = contents.find("Host *").expect("fallback present");
         if let Some(home) = std::env::var_os("HOME") {
             let user_config = PathBuf::from(home).join(".ssh").join("config");
             if user_config.is_file() {
@@ -2421,12 +2498,23 @@ mod tests {
                     ssh_config_quote(&user_config.to_string_lossy())
                 );
                 let include_at = contents.find(&include).expect("user config Included");
-                let fallback_at = contents.find("Host *").expect("fallback present");
                 assert!(
                     include_at < fallback_at,
                     "user config must be Included before herdr's fallback: {contents}"
                 );
             }
+        }
+        // The system config is Included the same way — quoted, and still before
+        // herdr's fallback block.
+        if Path::new("/etc/ssh/ssh_config").is_file() {
+            let include = format!("Include {}", ssh_config_quote("/etc/ssh/ssh_config"));
+            let include_at = contents
+                .find(&include)
+                .unwrap_or_else(|| panic!("system config Included: {contents}"));
+            assert!(
+                include_at < fallback_at,
+                "system config must be Included before herdr's fallback: {contents}"
+            );
         }
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -2446,7 +2534,6 @@ mod tests {
         drop(managed_config);
     }
 
-    #[cfg(unix)]
     #[test]
     fn ssh_config_quote_wraps_path_with_spaces() {
         assert_eq!(
@@ -2460,7 +2547,11 @@ mod tests {
     fn remote_ssh_command_uses_managed_config_when_present() {
         let managed_config = write_managed_ssh_config().expect("write managed config");
         let config_path = managed_config.options.config_path.clone();
-        let control_path = managed_config.options.control_path.clone();
+        let control_path = managed_config
+            .options
+            .control_path
+            .clone()
+            .expect("unix OpenSSH multiplexes, so the config has a control socket");
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
@@ -2503,6 +2594,122 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(args, vec!["-T".to_string(), "example".to_string()]);
+    }
+
+    /// The option shape Windows gets: a managed config for the keepalive
+    /// fallback, and no ControlMaster, because Windows OpenSSH has none.
+    #[cfg(unix)]
+    #[test]
+    fn managed_ssh_without_a_control_socket_neither_multiplexes_nor_closes_a_master() {
+        let mut managed_config = write_managed_ssh_config().expect("write managed config");
+        managed_config.options.control_path = None;
+        let config_path = managed_config.options.config_path.clone();
+        let ssh = RemoteSsh {
+            target: "example".to_string(),
+            managed_config: Some(managed_config),
+        };
+
+        let command = ssh.command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-F".to_string(),
+                config_path.to_string_lossy().into_owned(),
+                "-T".to_string(),
+                "example".to_string(),
+            ],
+            "without a control socket the only managed option is the config file"
+        );
+        assert!(
+            !ssh.should_close_control_master(),
+            "there is no shared connection to close"
+        );
+    }
+
+    /// OpenSSH's config parser reads `\` as an escape on every platform, so a
+    /// native Windows path has to be rewritten before it can be `Include`d.
+    #[test]
+    fn ssh_config_include_paths_use_forward_slashes() {
+        assert_eq!(
+            crate::platform::ssh_config_forward_slashes(Path::new(
+                r"C:\Users\Ada Lovelace\.ssh\config"
+            )),
+            "C:/Users/Ada Lovelace/.ssh/config"
+        );
+        assert_eq!(
+            ssh_config_quote(&crate::platform::ssh_config_forward_slashes(Path::new(
+                r"C:\ProgramData\ssh\ssh_config"
+            ))),
+            "\"C:/ProgramData/ssh/ssh_config\""
+        );
+    }
+
+    /// Runs on the Windows CI leg (`scripts/windows_check.ps1` selects tests by
+    /// the `windows_` prefix), which is the only place the real Windows path
+    /// discovery and file creation are exercised.
+    #[cfg(windows)]
+    #[test]
+    fn windows_managed_ssh_config_keeps_keepalives_without_control_master() {
+        let managed_config = write_managed_ssh_config().expect("write managed config");
+        let path = managed_config.options.config_path.clone();
+        let contents = std::fs::read_to_string(&path).expect("read keepalive config");
+
+        assert!(
+            managed_config.options.control_path.is_none(),
+            "Windows OpenSSH has no ControlMaster, so no control socket is placed"
+        );
+        assert!(
+            contents.contains("Host *")
+                && contents.contains("ServerAliveInterval 15")
+                && contents.contains("ServerAliveCountMax 4"),
+            "the keepalive fallback is the whole point of the config: {contents}"
+        );
+        assert!(!contents.contains("ControlMaster"), "{contents}");
+        assert!(!contents.contains("ControlPersist"), "{contents}");
+        assert!(!contents.contains("ControlPath"), "{contents}");
+        assert!(
+            !contents.contains('\\'),
+            "Include paths must not carry backslashes, which ssh reads as escapes: {contents}"
+        );
+
+        let includes = crate::platform::remote_ssh_config_paths().includes;
+        assert!(
+            !includes.is_empty(),
+            "USERPROFILE and PROGRAMDATA are always set on Windows; an empty list \
+             would make every assertion below vacuous"
+        );
+        for include in includes {
+            // Checked whether or not the file exists, so this bites on a runner
+            // that happens to have neither config.
+            let rendered = crate::platform::ssh_config_include_path(&include);
+            assert!(
+                !rendered.contains('\\') && rendered.contains('/'),
+                "a rendered Windows path must carry forward slashes only: {rendered}"
+            );
+            if !include.is_file() {
+                continue;
+            }
+            let directive = format!("Include {}", ssh_config_quote(&rendered));
+            let include_at = contents
+                .find(&directive)
+                .unwrap_or_else(|| panic!("{include:?} Included as {directive}: {contents}"));
+            let fallback_at = contents.find("Host *").expect("fallback present");
+            assert!(
+                include_at < fallback_at,
+                "first-value-wins needs every Include before herdr's fallback: {contents}"
+            );
+        }
+
+        drop(managed_config);
+        assert!(
+            !path.exists(),
+            "dropping the managed config removes its private directory"
+        );
     }
 
     #[test]

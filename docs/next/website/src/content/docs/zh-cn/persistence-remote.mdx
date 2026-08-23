@@ -67,7 +67,7 @@ herdr --remote workbox
 
 这说的是远程服务器的平台,而不是你从哪台机器发起连接。`herdr --remote` 也可以从 Windows 二进制运行。
 
-默认情况下,`herdr --remote` 通过一个临时 SSH 配置运行桥接: 先包含你的 SSH 配置,再补充兜底的保活设置。已有的用户保活设置优先。设置 `[remote].manage_ssh_config = false` 可以不用 Herdr 生成的桥接配置,而使用普通 `ssh`。Windows OpenSSH 不支持 ControlMaster,因此在 Windows 上 `herdr --remote` 始终运行普通 `ssh`,`[remote].manage_ssh_config` 不起作用。
+`herdr --remote` 通过一个临时 SSH 配置运行远程设置和桥接: 先包含你自己的 SSH 配置,再补充兜底的保活设置。已有的用户保活设置优先。没有这个兜底时,OpenSSH 的默认值是 `ServerAliveInterval 0`,因此笔记本休眠、Wi-Fi 掉线或 VPN 断开导致连接静默断开时,要等到 TCP 自己放弃才会被发现。在 macOS 和 Linux 上,生成的配置还会设置每次连接私有的 control socket 以复用连接;Windows OpenSSH 不支持 ControlMaster,因此在 Windows 上生成的配置只带保活兜底,每次 ssh 调用都不复用连接。设置 `[remote].manage_ssh_config = false` 可以不用 Herdr 生成的配置和 control socket,而使用普通 `ssh`。
 
 默认情况下,如果需要替换或重启运行中的远程服务器,远程连接使用常规的重启/停止流程。要对受支持的运行中远程服务器启用实验性实时交接,加上 `--handoff`:
 
