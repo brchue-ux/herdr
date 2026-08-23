@@ -23,14 +23,25 @@
 //! closed pane's entry is dropped via [`Self::remove`], though a stale entry
 //! left behind (a pane closed through some path that does not call it) is
 //! never read again and costs at most [`PANE_COMMAND_LOG_MAX`] short strings.
+//!
+//! # Retention is not the same number as the zone's own height
+//!
+//! The terminal triview's bottom zone is a fixed
+//! `CLAUDE_TRIVIEW_LOG_ROWS` rows regardless of how many
+//! commands this log holds, and scrolls internally to reach the rest — see
+//! that constant's own doc. [`PANE_COMMAND_LOG_MAX`] is only how much history
+//! is worth keeping around for that scroll to reach; it is deliberately far
+//! bigger than the zone's own height.
 
 use std::collections::{HashMap, VecDeque};
 
 use crate::layout::PaneId;
 
-/// How many commands one pane's log holds. Matches the terminal triview's
-/// bottom zone, which never draws more than this many rows.
-pub(crate) const PANE_COMMAND_LOG_MAX: usize = 8;
+/// How many commands one pane's log retains, oldest evicted first. Sized for
+/// a long session's worth of scrollable history rather than for the visible
+/// zone height — at a few dozen bytes per command this is a trivial memory
+/// cost per pane.
+pub(crate) const PANE_COMMAND_LOG_MAX: usize = 500;
 
 /// Every pane's own capped command history, oldest evicted first.
 #[derive(Debug, Clone, Default)]
@@ -93,15 +104,17 @@ mod tests {
     }
 
     #[test]
-    fn caps_at_eight_and_evicts_the_oldest() {
+    fn caps_retention_and_evicts_the_oldest() {
         let mut log = PaneCommandLog::default();
-        for i in 0..10 {
+        let overflow = PANE_COMMAND_LOG_MAX + 2;
+        for i in 0..overflow {
             log.record(pane(1), format!("cmd {i}"));
         }
         let lines: Vec<&str> = log.lines(pane(1)).collect();
         assert_eq!(lines.len(), PANE_COMMAND_LOG_MAX);
         assert_eq!(lines.first(), Some(&"cmd 2"));
-        assert_eq!(lines.last(), Some(&"cmd 9"));
+        let expected_last = format!("cmd {}", overflow - 1);
+        assert_eq!(lines.last(), Some(&expected_last.as_str()));
     }
 
     #[test]

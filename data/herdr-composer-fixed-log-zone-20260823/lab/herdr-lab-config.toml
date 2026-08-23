@@ -1,0 +1,6 @@
+onboarding = false
+
+[ui]
+sidebar_width = 26
+mouse_capture = true
+copy_on_select = true

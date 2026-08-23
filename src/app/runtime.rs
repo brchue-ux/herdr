@@ -3758,7 +3758,7 @@ mod tests {
         let now = Instant::now();
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
         // Drag to a different cell so it becomes Dragging
-        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None);
+        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None, None);
         app.state.selection = Some(sel);
         app.state.selection_autoscroll = Some(state::SelectionAutoscroll {
             direction: state::SelectionAutoscrollDirection::Down,
@@ -3780,7 +3780,7 @@ mod tests {
         // Create a selection that is already finished (not in progress)
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
         // Drag to a different cell so it becomes visible, then finish
-        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None);
+        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None, None);
         sel.finish(); // now it's Done, not in progress
         app.state.selection = Some(sel);
         app.state.selection_autoscroll = Some(state::SelectionAutoscroll {
@@ -3869,7 +3869,7 @@ mod tests {
         let (mut app, pane_id) = test_app_with_runtime(80, 24, &[]);
         let now = Instant::now();
         let mut sel = crate::selection::Selection::anchor(pane_id, 5, 5, None);
-        sel.drag(0, 0, ratatui::layout::Rect::new(0, 0, 80, 24), None);
+        sel.drag(0, 0, ratatui::layout::Rect::new(0, 0, 80, 24), None, None);
         app.state.selection = Some(sel);
         app.state.selection_autoscroll = Some(state::SelectionAutoscroll {
             direction: state::SelectionAutoscrollDirection::Up,
@@ -3891,7 +3891,7 @@ mod tests {
         let (mut app, pane_id) = test_app_with_runtime(80, 24, &[]);
         let now = Instant::now();
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
-        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None);
+        sel.drag(5, 5, ratatui::layout::Rect::new(0, 0, 80, 24), None, None);
         app.state.selection = Some(sel);
         app.state.selection_autoscroll = Some(state::SelectionAutoscroll {
             direction: state::SelectionAutoscrollDirection::Down,

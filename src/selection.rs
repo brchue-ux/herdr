@@ -129,14 +129,25 @@ impl Selection {
     /// Extend the selection as the mouse drags. Activates highlighting
     /// once the cursor moves to a different cell than the anchor.
     /// Screen coordinates are clamped to the pane boundary.
+    ///
+    /// `triview` is the pane's own [`crate::pane::ClaudeTriviewLayout`] when
+    /// it is a Claude triview pane this frame: the drawn pane row
+    /// `clamp_to_pane` computes is not the grid row of the same index once a
+    /// log zone has shifted the transcript and composer up, so it is
+    /// projected onto the grid row the drag actually landed on before being
+    /// treated as a viewport row.
     pub fn drag(
         &mut self,
         screen_col: u16,
         screen_row: u16,
         pane_inner: Rect,
         metrics: Option<ScrollMetrics>,
+        triview: Option<crate::pane::ClaudeTriviewLayout>,
     ) {
         let (viewport_row, col) = clamp_to_pane(screen_col, screen_row, pane_inner);
+        let viewport_row = triview.map_or(viewport_row, |layout| {
+            layout.grid_row_for_pane_row(viewport_row)
+        });
         self.cursor = (absolute_row_for_viewport_row(viewport_row, metrics), col);
         if self.cursor != self.anchor {
             self.phase = Phase::Dragging;
@@ -493,7 +504,7 @@ mod tests {
     #[test]
     fn drag_then_finish() {
         let mut sel = Selection::anchor(PaneId::from_raw(0), 5, 10, None);
-        sel.drag(20, 7, Rect::new(10, 5, 80, 24), None);
+        sel.drag(20, 7, Rect::new(10, 5, 80, 24), None, None);
         assert!(sel.is_visible());
         assert!(!sel.was_just_click());
         let copied = sel.finish();
@@ -522,6 +533,7 @@ mod tests {
                 max_offset_from_bottom: 10,
                 viewport_rows: 4,
             }),
+            None,
         );
 
         assert_eq!(sel.ordered_cells(), ((8, 0), (9, 10)));

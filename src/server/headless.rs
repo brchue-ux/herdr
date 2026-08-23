@@ -4135,11 +4135,14 @@ impl HeadlessServer {
             // log rows are not grid rows at all, so there is nothing to
             // rewrite them here either. Refuse and take the full render.
             //
-            // Keyed on the shift, not on the split being active, for the same
-            // reason `crate::ui::panes` keys its selection guard that way: an
-            // unshifted split still maps every pane row onto the grid row of
-            // the same index, and giving up the fast path on every focused
-            // Claude pane would be a real cost for no correctness gain.
+            // Keyed on the shift rather than on the split being active, for
+            // the same reason `crate::ui::panes` keys its selection
+            // projection that way — even though the shift is now fixed
+            // (`CLAUDE_TRIVIEW_LOG_ROWS`) and effectively always present once
+            // the split engages at all, so in practice this declines the
+            // fast path for every focused Claude triview pane: the log zone
+            // is not optional real estate any more, it is where the
+            // captain's next `Bash(...)` shows up.
             if runtime
                 .last_claude_triview_layout()
                 .is_some_and(|layout| layout.transcript_skip > 0)
@@ -11793,7 +11796,8 @@ next_tab = ""
             .expect("the full render drew the split");
         assert!(
             layout.transcript_skip > 0,
-            "the log zone took no rows, so nothing is shifted and this proves nothing"
+            "the fixed log zone should always shift the transcript once the \
+             split engages; if it did not, this test would prove nothing"
         );
 
         // The agent redraws its composer, which is what typing into it looks

@@ -414,10 +414,8 @@ impl TerminalRuntime {
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        requested_log_rows: u16,
     ) -> Option<crate::pane::ClaudeTriviewLayout> {
-        self.0
-            .render_claude_triview(frame, area, show_cursor, requested_log_rows)
+        self.0.render_claude_triview(frame, area, show_cursor)
     }
 
     pub(crate) fn collect_dirty_patch(

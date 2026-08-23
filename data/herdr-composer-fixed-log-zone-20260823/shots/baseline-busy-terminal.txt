@@ -1,0 +1,41 @@
+  transcript line 03 — herdr triview repro
+  transcript line 04 — herdr triview repro
+  transcript line 05 — herdr triview repro
+  transcript line 06 — herdr triview repro
+  transcript line 07 — herdr triview repro
+  transcript line 08 — herdr triview repro
+  transcript line 09 — herdr triview repro
+  transcript line 10 — herdr triview repro
+  transcript line 11 — herdr triview repro
+  transcript line 12 — herdr triview repro
+  transcript line 13 — herdr triview repro
+  transcript line 14 — herdr triview repro
+  transcript line 15 — herdr triview repro
+  transcript line 16 — herdr triview repro
+  transcript line 17 — herdr triview repro
+  transcript line 18 — herdr triview repro
+  transcript line 19 — herdr triview repro
+  transcript line 20 — herdr triview repro
+  transcript line 21 — herdr triview repro
+  transcript line 22 — herdr triview repro
+  transcript line 23 — herdr triview repro
+  transcript line 24 — herdr triview repro
+  transcript line 25 — herdr triview repro
+  transcript line 26 — herdr triview repro
+  transcript line 27 — herdr triview repro
+  transcript line 28 — herdr triview repro
+● Running the script now.
+
+● Running multi-step loop, midpoint check, whoami, pwd with sleeps · 11s
+  ⎿  $ for i in 1 2 3 4 5 6; do echo step $i; sleep 1.5; done; echo
+     midpoint; ps -eo pid,cmd | head -5; sleep 1.5; whoami; sleep 1.5;
+     pwd (9s · 7 lines)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+✶ Kneading… (14s · ↓ 211 tokens)
+  ⎿  Tip: You can control how big a workflow is just by prompting.
+ ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ❯
+ ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⠋ Sonnet 5            5% ▁▁▁▁▁▁▁▁ $0.10
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
