@@ -6,6 +6,7 @@ mod locate;
 mod model;
 mod sidebar;
 mod sound;
+mod tab_bar;
 mod theme;
 
 pub use self::{
@@ -33,6 +34,7 @@ pub use self::{
         SidebarTokenStyle, SpaceSidebarToken, SpacesSidebarConfig,
     },
     sound::SoundConfig,
+    tab_bar::TabBarRightEntryConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
 };
 
@@ -48,6 +50,10 @@ pub use self::sidebar::SidebarRowMotion;
 
 pub(crate) use self::io::upsert_top_level_bool;
 pub(crate) use self::keybinds::parse_key_combo;
+pub(crate) use self::tab_bar::{
+    parse_tab_bar_datetime_format, tab_bar_right_diagnostics, MAX_TAB_BAR_COMMAND_INTERVAL_SECONDS,
+    MAX_TAB_BAR_COMMAND_TIMEOUT_SECONDS, MAX_TAB_BAR_RIGHT_ENTRIES,
+};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
@@ -92,6 +98,7 @@ impl Config {
             .chain(keybind_diags)
             .chain(self.remote_image_paste_key().err())
             .chain(self.ui.sound.diagnostics())
+            .chain(tab_bar_right_diagnostics(&self.ui.tab_bar_right))
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.ui.sidebar.agents.view.diagnostics())
             .collect()

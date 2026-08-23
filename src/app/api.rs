@@ -64,6 +64,11 @@ impl App {
                 results,
                 cache_updates,
             } => self.handle_git_status_refreshed(results, cache_updates),
+            AppEvent::TabBarCommandFinished {
+                generation,
+                segment_index,
+                result,
+            } => self.handle_tab_bar_command_finished(generation, segment_index, result),
             AppEvent::PullRequestsRefreshed { results } => {
                 self.handle_pull_requests_refreshed(results)
             }
@@ -158,6 +163,19 @@ impl App {
                 .record(crate::anim::CardRow::Agent(pane_id), observed_at);
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
+            return;
+        }
+
+        if let AppEvent::TabBarCommandFinished {
+            generation,
+            segment_index,
+            result,
+        } = ev
+        {
+            if self.handle_tab_bar_command_finished(generation, segment_index, result) {
+                self.render_dirty.request_generic();
+                self.render_notify.notify_one();
+            }
             return;
         }
 

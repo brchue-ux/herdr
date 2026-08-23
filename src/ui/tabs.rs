@@ -14,6 +14,11 @@ use crate::app::AppState;
 const MIN_TAB_WIDTH: u16 = 8;
 const NEW_TAB_WIDTH: u16 = 3;
 const TAB_SCROLL_BUTTON_WIDTH: u16 = 3;
+const ZOOM_INDICATOR: &str = "ZOOM";
+// The narrowest overflowing tab strip worth keeping interactive: one
+// minimum-width tab, both scroll controls, and the new-tab control.
+const MIN_TAB_STRIP_WIDTH: u16 =
+    MIN_TAB_WIDTH + NEW_TAB_WIDTH + TAB_SCROLL_BUTTON_WIDTH.saturating_mul(2);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TabBarView {
@@ -90,6 +95,104 @@ fn tab_chrome_label(ws: &crate::workspace::Workspace, tab_idx: usize) -> String 
         format!("{name} Z")
     } else {
         name
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VisibleStatusSegment<'a> {
+    text: &'a str,
+    accent: bool,
+}
+
+fn visible_status_segments(app: &AppState) -> Vec<VisibleStatusSegment<'_>> {
+    let zoomed = app
+        .active
+        .and_then(|index| app.workspaces.get(index))
+        .is_some_and(|workspace| workspace.zoomed);
+    app.tab_bar_right
+        .iter()
+        .filter_map(|segment| match segment {
+            crate::app::state::TabBarStatusSegment::Zoom if zoomed => Some(VisibleStatusSegment {
+                text: ZOOM_INDICATOR,
+                accent: true,
+            }),
+            crate::app::state::TabBarStatusSegment::Text(Some(text))
+                if display_width_u16(text) > 0 =>
+            {
+                Some(VisibleStatusSegment {
+                    text,
+                    accent: false,
+                })
+            }
+            crate::app::state::TabBarStatusSegment::Zoom
+            | crate::app::state::TabBarStatusSegment::Text(_) => None,
+        })
+        .collect()
+}
+
+fn tab_bar_status_width(app: &AppState) -> u16 {
+    let segments = visible_status_segments(app);
+    let content_width = segments.iter().fold(0_u16, |width, segment| {
+        width.saturating_add(display_width_u16(segment.text))
+    });
+    let separators = u16::try_from(segments.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    content_width
+        .saturating_add(display_width_u16(&app.tab_bar_right_separator).saturating_mul(separators))
+}
+
+/// Widest decoration prefix any tab in `ws` can draw.
+///
+/// Derived from the tab count rather than measured per tab, so it allocates
+/// nothing on the render path and does not move when a tab is renamed.
+fn max_tab_decor_width(ws: &crate::workspace::Workspace, decor: TabLabelDecor) -> u16 {
+    // Matches `tab_decor_width`: one cell for the state mark plus a separating
+    // space, and the widest 1-based position plus a separating space.
+    let dot: u16 = if decor.state_dot { 2 } else { 0 };
+    let index = if decor.index {
+        u16::try_from(ws.tabs.len().max(1).ilog10() + 2).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    dot.saturating_add(index)
+}
+
+/// The narrowest strip worth keeping interactive, once label decorations are
+/// accounted for.
+///
+/// `MIN_TAB_STRIP_WIDTH` sizes an undecorated label. A state mark and a jump
+/// number are drawn inside the tab, so on exactly the rows where the status is
+/// already competing for space they would eat the title instead. Reserving the
+/// decoration width here makes the status yield first, so a decorated tab keeps
+/// the same readable minimum an undecorated one gets.
+fn min_tab_strip_width(app: &AppState) -> u16 {
+    let decor = TabLabelDecor::from_state(app);
+    let decor_width = app
+        .active
+        .and_then(|index| app.workspaces.get(index))
+        .map(|ws| max_tab_decor_width(ws, decor))
+        .unwrap_or(0);
+    MIN_TAB_STRIP_WIDTH.saturating_add(decor_width)
+}
+
+fn tab_bar_status_area(app: &AppState, area: Rect) -> Option<Rect> {
+    let width = tab_bar_status_width(app);
+    if width == 0 {
+        return None;
+    }
+    let reserved = width.saturating_add(1);
+    (area.width.saturating_sub(reserved) >= min_tab_strip_width(app))
+        .then(|| Rect::new(area.x + area.width.saturating_sub(width), area.y, width, 1))
+}
+
+// Tabs win over status decoration on narrow rows. The extra reserved cell is
+// the gap between the interactive strip and the right-aligned status entries.
+pub(crate) fn tab_bar_content_area(app: &AppState, area: Rect) -> Rect {
+    let reserved = tab_bar_status_area(app, area)
+        .map(|status| status.width.saturating_add(1))
+        .unwrap_or(0);
+    Rect {
+        width: area.width.saturating_sub(reserved),
+        ..area
     }
 }
 
@@ -470,15 +573,47 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         }
     }
     if last_visible_idx.is_some_and(|idx| idx + 1 < ws.tabs.len()) {
+        let content = tab_bar_content_area(app, area);
+        let content_right = content.x + content.width;
         let x = if app.mouse_capture && app.view.tab_scroll_right_hit_area.width > 0 {
             app.view.tab_scroll_right_hit_area.x.saturating_sub(1)
         } else {
-            area.x + area.width.saturating_sub(1)
+            content_right.saturating_sub(1)
         };
         if x >= area.x && x < area.x + area.width {
             frame.buffer_mut()[(x, area.y)]
                 .set_symbol("…")
                 .set_style(Style::default().fg(p.overlay0));
+        }
+    }
+
+    if let Some(status_area) = tab_bar_status_area(app, area) {
+        let segments = visible_status_segments(app);
+        let separator_width = display_width_u16(&app.tab_bar_right_separator);
+        let mut x = status_area.x;
+        for (index, segment) in segments.iter().enumerate() {
+            if index > 0 && separator_width > 0 {
+                let rect = Rect::new(x, area.y, separator_width, 1);
+                frame.render_widget(
+                    Paragraph::new(app.tab_bar_right_separator.as_str())
+                        .style(Style::default().fg(p.overlay0).bg(p.panel_bg)),
+                    rect,
+                );
+                x = x.saturating_add(separator_width);
+            }
+
+            let width = display_width_u16(segment.text);
+            let rect = Rect::new(x, area.y, width, 1);
+            let style = if segment.accent {
+                Style::default()
+                    .fg(panel_contrast_fg(p))
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.overlay1).bg(p.panel_bg)
+            };
+            frame.render_widget(Paragraph::new(segment.text).style(style), rect);
+            x = x.saturating_add(width);
         }
     }
 }
@@ -533,6 +668,240 @@ mod tests {
             app.workspaces[0].tab_display_name(custom_tab).as_deref(),
             Some("test")
         );
+    }
+
+    #[test]
+    fn tab_bar_renders_ordered_status_entries_with_separator() {
+        let mut app = AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].zoomed = true;
+        app.tab_bar_right = vec![
+            crate::app::state::TabBarStatusSegment::Zoom,
+            crate::app::state::TabBarStatusSegment::Text(Some("wintermute".into())),
+            crate::app::state::TabBarStatusSegment::Text(Some("14:30".into())),
+        ];
+        app.tab_bar_right_separator = " · ".into();
+
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.view.tab_bar_rect = Rect::new(0, 0, 60, 1);
+        let content = tab_bar_content_area(&app, app.view.tab_bar_rect);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            content,
+            0,
+            true,
+            false,
+            TabLabelDecor::from_state(&app),
+        );
+        app.view.tab_hit_areas = view.tab_hit_areas.clone();
+
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = buffer_row_text(buffer, app.view.tab_bar_rect, 0);
+        assert!(
+            row.ends_with("ZOOM · wintermute · 14:30"),
+            "tab row: {row:?}"
+        );
+        let status_x = 60 - display_width_u16("ZOOM · wintermute · 14:30");
+        assert_eq!(buffer[(status_x, 0)].style().bg, Some(app.palette.accent));
+        for rect in &view.tab_hit_areas {
+            assert!(rect.x + rect.width <= content.x + content.width);
+        }
+    }
+
+    #[test]
+    fn hidden_status_entries_do_not_leave_dangling_separators() {
+        let mut app = AppState::test_new();
+        app.tab_bar_right = vec![
+            crate::app::state::TabBarStatusSegment::Zoom,
+            crate::app::state::TabBarStatusSegment::Text(None),
+            crate::app::state::TabBarStatusSegment::Text(Some("wintermute".into())),
+        ];
+        app.tab_bar_right_separator = " | ".into();
+        app.workspaces = vec![Workspace::test_new("test")];
+        app.active = Some(0);
+        app.view.tab_bar_rect = Rect::new(0, 0, 40, 1);
+        let content = tab_bar_content_area(&app, app.view.tab_bar_rect);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            content,
+            0,
+            true,
+            false,
+            TabLabelDecor::from_state(&app),
+        );
+        app.view.tab_hit_areas = view.tab_hit_areas;
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let row = buffer_row_text(terminal.backend().buffer(), app.view.tab_bar_rect, 0);
+        assert!(row.ends_with("wintermute"), "tab row: {row:?}");
+        assert!(!row.contains(" | "), "tab row: {row:?}");
+    }
+
+    #[test]
+    fn status_reservation_keeps_a_minimum_width_tab_between_scroll_controls() {
+        let mut app = AppState::test_new();
+        app.tab_bar_right = vec![crate::app::state::TabBarStatusSegment::Text(Some(
+            "x".into(),
+        ))];
+        let mut workspace = Workspace::test_new("test");
+        workspace.test_add_tab(None);
+        workspace.test_add_tab(None);
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+
+        let too_narrow = Rect::new(0, 0, MIN_TAB_STRIP_WIDTH + 1, 1);
+        assert_eq!(tab_bar_content_area(&app, too_narrow), too_narrow);
+
+        let wide_enough = Rect::new(0, 0, MIN_TAB_STRIP_WIDTH + 2, 1);
+        let content = tab_bar_content_area(&app, wide_enough);
+        assert_eq!(content.width, MIN_TAB_STRIP_WIDTH);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            content,
+            0,
+            true,
+            true,
+            TabLabelDecor::from_state(&app),
+        );
+        assert!(view.tab_hit_areas[0].width >= MIN_TAB_WIDTH);
+    }
+
+    #[test]
+    fn status_reservation_leaves_room_for_the_tab_label_decorations() {
+        // A width that is wide enough for the status once, and would still be
+        // wide enough if the state mark and jump number were free.
+        let mut app = AppState::test_new();
+        app.tab_bar_right = vec![crate::app::state::TabBarStatusSegment::Text(Some(
+            "x".into(),
+        ))];
+        app.show_tab_state_dots = crate::config::TabDecorationConfig::Always;
+        app.show_tab_numbers = crate::config::TabDecorationConfig::Always;
+        let mut workspace = Workspace::test_new("test");
+        // Named, so the first tab carries both decorations: an auto-named tab
+        // renders its position as its title and is deliberately not numbered.
+        workspace.tabs[0].custom_name = Some("alpha".into());
+        workspace.test_add_tab(Some("bravo"));
+        workspace.test_add_tab(Some("charlie"));
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+
+        let decor_width = max_tab_decor_width(&app.workspaces[0], TabLabelDecor::from_state(&app));
+        assert!(decor_width > 0, "decorations should reserve columns");
+        assert_eq!(min_tab_strip_width(&app), MIN_TAB_STRIP_WIDTH + decor_width);
+
+        // Undecorated this row would carry the status; decorated it must not,
+        // because the columns the status wants are the tab title's.
+        let borderline = Rect::new(0, 0, MIN_TAB_STRIP_WIDTH + 2, 1);
+        assert_eq!(tab_bar_status_area(&app, borderline), None);
+        assert_eq!(tab_bar_content_area(&app, borderline), borderline);
+
+        let wide_enough = Rect::new(0, 0, MIN_TAB_STRIP_WIDTH + decor_width + 2, 1);
+        let content = tab_bar_content_area(&app, wide_enough);
+        assert_eq!(content.width, MIN_TAB_STRIP_WIDTH + decor_width);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            content,
+            0,
+            true,
+            true,
+            TabLabelDecor::from_state(&app),
+        );
+        // The first tab still gets its minimum plus everything the decorations
+        // draw, so its title keeps the room an undecorated tab's title has.
+        assert!(
+            view.tab_hit_areas[0].width >= MIN_TAB_WIDTH + decor_width,
+            "first tab {:?} lost columns to the status",
+            view.tab_hit_areas[0]
+        );
+    }
+
+    #[test]
+    fn tab_bar_draws_state_marks_and_status_entries_on_the_same_row() {
+        let mut app = AppState::test_new();
+        app.show_tab_state_dots = crate::config::TabDecorationConfig::Always;
+        app.show_tab_numbers = crate::config::TabDecorationConfig::Always;
+        app.tab_bar_right = vec![
+            crate::app::state::TabBarStatusSegment::Zoom,
+            crate::app::state::TabBarStatusSegment::Text(Some("wintermute".into())),
+        ];
+        app.tab_bar_right_separator = " · ".into();
+        let mut ws = Workspace::test_new("test");
+        ws.zoomed = true;
+        ws.test_add_tab(Some("build"));
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.view.tab_bar_rect = Rect::new(0, 0, 70, 1);
+        let content = tab_bar_content_area(&app, app.view.tab_bar_rect);
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            content,
+            0,
+            true,
+            false,
+            TabLabelDecor::from_state(&app),
+        );
+        app.view.tab_hit_areas = view.tab_hit_areas.clone();
+
+        let backend = TestBackend::new(70, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tab_bar(&app, frame, app.view.tab_bar_rect))
+            .unwrap();
+
+        let row = buffer_row_text(terminal.backend().buffer(), app.view.tab_bar_rect, 0);
+        // The status sits at the right edge, the decorated label at the left,
+        // and neither has overwritten the other.
+        assert!(row.ends_with("ZOOM · wintermute"), "tab row: {row:?}");
+        assert!(row.contains("2 build"), "tab row: {row:?}");
+        for rect in &view.tab_hit_areas {
+            assert!(
+                rect.x + rect.width <= content.x + content.width,
+                "tab {rect:?} runs into the status area"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_status_entries_yield_to_tab_controls_on_narrow_rows() {
+        let mut app = AppState::test_new();
+        app.tab_bar_right = vec![
+            crate::app::state::TabBarStatusSegment::Text(Some(
+                "a-hostname-wider-than-the-whole-bar".into(),
+            )),
+            crate::app::state::TabBarStatusSegment::Text(Some("14:30".into())),
+        ];
+        app.workspaces = vec![Workspace::test_new("test")];
+        app.active = Some(0);
+        app.view.tab_bar_rect = Rect::new(0, 0, 30, 1);
+
+        assert_eq!(
+            tab_bar_content_area(&app, app.view.tab_bar_rect),
+            app.view.tab_bar_rect
+        );
+        assert_eq!(tab_bar_status_area(&app, app.view.tab_bar_rect), None);
+
+        let view = compute_tab_bar_view(
+            &app.workspaces[0],
+            tab_bar_content_area(&app, app.view.tab_bar_rect),
+            0,
+            true,
+            true,
+            TabLabelDecor::from_state(&app),
+        );
+        assert!(view.tab_hit_areas[0].width > 0);
+        assert!(view.new_tab_hit_area.width > 0);
     }
 
     #[test]
