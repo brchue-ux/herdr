@@ -2425,6 +2425,13 @@ pub struct AppState {
     /// [`Self::status_feed`] is: see
     /// [`crate::app::pane_command_log::PaneCommandLog`].
     pub(crate) pane_command_log: crate::app::pane_command_log::PaneCommandLog,
+    /// How far each Claude triview pane's command-log zone is scrolled past
+    /// its newest entry — 0 keeps the newest
+    /// `CLAUDE_TRIVIEW_LOG_ROWS` in view, larger values reveal
+    /// older ones. TUI presentation state, not a session fact: unlike
+    /// [`Self::pane_command_log`] itself, this is only where one viewer's own
+    /// scroll happens to sit right now.
+    pub(crate) pane_command_log_scroll: std::collections::HashMap<PaneId, u16>,
     /// The register's drawn corner, as its own small graphics surface.
     ///
     /// Separate from `background_effects_layer` because the two move on different clocks: that one
@@ -3791,6 +3798,7 @@ impl AppState {
             machine_register: crate::machine_register::MachineRegister::default(),
             status_feed: crate::app::status_feed::StatusFeed::default(),
             pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
+            pane_command_log_scroll: std::collections::HashMap::new(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_absence: None,

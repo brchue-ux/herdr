@@ -913,6 +913,7 @@ impl App {
             machine_register: crate::machine_register::MachineRegister::default(),
             status_feed: crate::app::status_feed::StatusFeed::default(),
             pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
+            pane_command_log_scroll: std::collections::HashMap::new(),
             machine_corner_layer: None,
             machine_corner_key: 0,
             machine_corner_absence: None,

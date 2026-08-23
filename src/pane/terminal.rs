@@ -570,10 +570,8 @@ impl PaneTerminal {
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
-        self.ghostty
-            .render_claude_triview(frame, area, show_cursor, requested_log_rows)
+        self.ghostty.render_claude_triview(frame, area, show_cursor)
     }
 
     pub fn collect_dirty_patch(
@@ -2364,17 +2362,21 @@ impl GhosttyPaneTerminal {
     /// Renders a Claude Code pane as three live zones — the transcript, the
     /// composer's own body with its border chrome cropped out, and the
     /// agent's own footer (its status line and shortcut hint) — instead of
-    /// one full-height copy, opening `requested_log_rows` rows between the
-    /// composer and that footer for the caller's own command-log zone.
+    /// one full-height copy, opening a fixed
+    /// [`CLAUDE_TRIVIEW_LOG_ROWS`] rows between the composer and that footer
+    /// for the caller's own command-log zone.
     ///
     /// The rows for the log come off the **top of the transcript**, which is
     /// the only place in the pane that has any to give: Claude Code pins its
     /// footer to the literal bottom of the screen, so every row of the grid
     /// is already carrying something. The transcript's oldest visible rows
     /// are the cheapest to drop — they have already scrolled and are a
-    /// scroll away — and dropping `n` of them shifts the composer up by `n`,
-    /// which is exactly the gap the log then fills. The footer never moves:
-    /// it stays on the pane's own floor where the agent drew it.
+    /// scroll away. The shift is always exactly
+    /// [`CLAUDE_TRIVIEW_LOG_ROWS`] whenever this engages at all, never more
+    /// or fewer depending on how many commands the log actually holds, so the
+    /// composer's own row never moves from one frame to the next — see
+    /// [`claude_triview_layout`]. The footer never moves either: it stays on
+    /// the pane's own floor where the agent drew it.
     ///
     /// Returns `None` rather than guess whenever the live screen's shape is
     /// not confidently recognized this frame or the underlying grid read
@@ -2391,7 +2393,6 @@ impl GhosttyPaneTerminal {
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
         let mut core = self.core.lock().ok()?;
         // Cleared up front so every bail-out below leaves the identity
@@ -2410,7 +2411,7 @@ impl GhosttyPaneTerminal {
             RenderStateRefresh::Updated => false,
         };
 
-        let layout = claude_triview_layout(&core.terminal, area.height, requested_log_rows)?;
+        let layout = claude_triview_layout(&core.terminal, area.height)?;
         // Recorded before anything is blitted: this is the projection every
         // later reader of the drawn pane has to share.
         core.last_triview_layout = Some(layout);
@@ -2546,14 +2547,18 @@ impl GhosttyPaneTerminal {
 pub(crate) struct ClaudeTriviewLayout {
     /// Grid rows dropped off the **top** of the transcript so the block below
     /// it can move up and leave [`Self::log_rows`] free above the agent's
-    /// footer.
+    /// footer. Always exactly [`CLAUDE_TRIVIEW_LOG_ROWS`] whenever this
+    /// layout exists at all — see [`claude_triview_layout`] — so the
+    /// composer's own row never moves between frames just because the log
+    /// zone's *content* grew or shrank.
     ///
     /// The transcript is the only zone with rows to give: Claude Code pins
     /// its footer to the literal bottom of the screen, so nothing in the pane
     /// is unused. Its oldest visible rows are the cheapest to drop — they
     /// have already scrolled past and are a scroll away — and the transcript
-    /// keeps at least [`MIN_TRANSCRIPT_ROWS`] whatever the caller asks for,
-    /// so a short conversation is never collapsed to make room for a log.
+    /// keeps at least [`MIN_TRANSCRIPT_ROWS`]; a pane too short to give up a
+    /// full [`CLAUDE_TRIVIEW_LOG_ROWS`] without breaking that floor does not
+    /// get this layout at all rather than a smaller one.
     pub transcript_skip: u16,
     /// Rows `[0, transcript_rows)` of `area`, blitted from grid rows
     /// `[transcript_skip, transcript_skip + transcript_rows)`.
@@ -2563,8 +2568,10 @@ pub(crate) struct ClaudeTriviewLayout {
     /// used to be.
     pub composer_rows: u16,
     /// Rows `[consumed_rows(), consumed_rows() + log_rows)`: the caller's own
-    /// bottom zone, opened by [`Self::transcript_skip`] and never larger than
-    /// what it asked for. Zero when the transcript had no rows to spare.
+    /// bottom zone. Always exactly [`CLAUDE_TRIVIEW_LOG_ROWS`] — never zero,
+    /// never smaller or larger depending on how many commands are actually
+    /// recorded, which is what lets the caller draw an internally-scrollable
+    /// zone of a fixed height instead of one that resizes with its content.
     pub log_rows: u16,
     /// Rows `[footer_start(), footer_start() + footer_rows)`: the agent's own
     /// footer, everything it drew below its composer's bottom border. For
@@ -2576,6 +2583,14 @@ pub(crate) struct ClaudeTriviewLayout {
     /// caller must not draw over these rows.
     pub footer_rows: u16,
 }
+
+/// Rows the caller's own command-log zone always occupies whenever this
+/// layout exists at all: never zero, never more, never sized to how many
+/// commands are actually recorded. Fixing this rather than sizing it to
+/// content is what keeps the composer's own row from moving between frames —
+/// see [`ClaudeTriviewLayout::transcript_skip`]. A log with more commands
+/// than this scrolls internally instead of growing the zone.
+pub(crate) const CLAUDE_TRIVIEW_LOG_ROWS: u16 = 8;
 
 /// Rows the transcript zone always keeps, however many the caller's own
 /// bottom zone asks for. A transcript squeezed below this stops being a
@@ -2649,6 +2664,33 @@ impl ClaudeTriviewLayout {
             None
         }
     }
+
+    /// The live grid row that was actually drawn at pane row `pane_row`, the
+    /// inverse of [`Self::pane_row_for_grid_row`] — used to project a mouse
+    /// click's on-screen row onto the grid-row coordinates
+    /// [`crate::selection::Selection`] stores its anchor and cursor in, so a
+    /// drag over what the split moved lands on the row it actually shows
+    /// rather than the row of the same index in the unshifted grid.
+    ///
+    /// Transcript, both cropped border rows, and the composer body all share
+    /// one shift: `pane_row + transcript_skip` is the grid row every one of
+    /// them was copied from, dividers included — a divider row lands on the
+    /// grid row of the composer border it stands in for, which is a
+    /// reasonable place for a click that landed exactly on a one-row rule to
+    /// resolve to. The agent's own footer never shifted, so it is the
+    /// identity there. The one row range with no live grid row at all is the
+    /// command-log zone — herdr's own content, never copied from the grid —
+    /// so a click inside it reads as the nearest live row, the footer
+    /// immediately below (there is no divider between them to cross),
+    /// exactly as an out-of-bounds screen coordinate already clamps to the
+    /// pane's own edge rather than being discarded.
+    pub(crate) fn grid_row_for_pane_row(&self, pane_row: u16) -> u16 {
+        if pane_row < self.consumed_rows() {
+            pane_row + self.transcript_skip
+        } else {
+            pane_row.max(self.footer_start())
+        }
+    }
 }
 
 /// Reads exactly the bottom `area_height` rows of the live grid — the same
@@ -2660,19 +2702,14 @@ impl ClaudeTriviewLayout {
 /// Requires the composer's body to start exactly one row after the
 /// transcript ends (its top border) and the agent to have drawn at least
 /// [`MIN_AGENT_FOOTER_ROWS`] below it; returns `None` rather than guess when
-/// either does not hold, when the read fails, or when a row count does not
-/// fit a `u16`.
-///
-/// `requested_log_rows` is how many rows the caller wants for its own bottom
-/// zone. It is a request, not a reservation: the rows come off the top of the
-/// transcript ([`ClaudeTriviewLayout::transcript_skip`]) and the transcript
-/// keeps [`MIN_TRANSCRIPT_ROWS`] whatever is asked, so the granted
-/// [`ClaudeTriviewLayout::log_rows`] can be smaller — and on a very short
-/// conversation, zero. The agent's own footer is never a donor.
+/// either does not hold, when the read fails, when a row count does not fit
+/// a `u16`, or when the transcript cannot give up a full
+/// [`CLAUDE_TRIVIEW_LOG_ROWS`] without dropping below
+/// [`MIN_TRANSCRIPT_ROWS`] — this layout is the fixed shift or nothing, never
+/// a smaller shift to fit a short pane.
 fn claude_triview_layout(
     terminal: &crate::ghostty::Terminal,
     area_height: u16,
-    requested_log_rows: u16,
 ) -> Option<ClaudeTriviewLayout> {
     let recent = ghostty_recent_text_for_terminal(terminal, area_height as usize).ok()?;
     let claude = Some(crate::detect::Agent::Claude);
@@ -2695,8 +2732,10 @@ fn claude_triview_layout(
     if cropped_rows > area_height || footer_rows < MIN_AGENT_FOOTER_ROWS {
         return None;
     }
-    let transcript_skip =
-        requested_log_rows.min(transcript_rows.saturating_sub(MIN_TRANSCRIPT_ROWS));
+    if transcript_rows < CLAUDE_TRIVIEW_LOG_ROWS.checked_add(MIN_TRANSCRIPT_ROWS)? {
+        return None;
+    }
+    let transcript_skip = CLAUDE_TRIVIEW_LOG_ROWS;
     Some(ClaudeTriviewLayout {
         transcript_skip,
         transcript_rows: transcript_rows - transcript_skip,
@@ -4835,22 +4874,6 @@ mod tests {
             .to_string()
     }
 
-    /// A minimal Claude Code-shaped screen: two transcript lines, a composer
-    /// box holding one input line, then the agent's own two footer rows — a
-    /// status line and a shortcut hint, exactly what Claude Code pins to the
-    /// literal bottom of its screen. Enough rows for
-    /// [`GhosttyPaneTerminal::render_claude_triview`] to recognize the shape
-    /// the same way [`crate::detect::command_marker`] does.
-    fn write_claude_shaped_screen(terminal: &mut crate::ghostty::Terminal) {
-        terminal.write(b"first line of output\r\n");
-        terminal.write(b"second line of output\r\n");
-        terminal.write("──────────────────────────\r\n".as_bytes());
-        terminal.write(b" > typed input\r\n");
-        terminal.write("──────────────────────────\r\n".as_bytes());
-        terminal.write(b"~/proj main 42%\r\n");
-        terminal.write(b"? for shortcuts");
-    }
-
     /// The same screen with a taller transcript, so there are rows the log
     /// zone can actually be given.
     fn write_tall_claude_shaped_screen(
@@ -4931,7 +4954,7 @@ mod tests {
         let mut terminal = crate::ghostty::Terminal::new(cols as u16, rows, 0).unwrap();
         write_real_claude_v2_screen(&mut terminal, cols, rows as usize);
 
-        let layout = claude_triview_layout(&terminal, rows, 0)
+        let layout = claude_triview_layout(&terminal, rows)
             .expect("a real Claude Code screen must resolve a triview layout");
 
         assert_eq!(layout.composer_rows, 1, "the `\u{276F} ` input line");
@@ -4944,34 +4967,11 @@ mod tests {
             rows,
             "every row of the pane is accounted for"
         );
-        // Nothing was asked for the log, so nothing came off the transcript
-        // and the pane's rows still map one-to-one onto the grid's.
-        assert_eq!(layout.transcript_skip, 0);
-        assert_eq!(layout.log_rows, 0);
-    }
-
-    /// Asking for log rows takes them off the transcript's top and never off
-    /// the agent's footer, on that same real screen.
-    #[test]
-    fn a_real_claude_code_screen_gives_the_log_zone_rows_from_its_transcript() {
-        let cols = 120usize;
-        let rows = 34u16;
-        let mut terminal = crate::ghostty::Terminal::new(cols as u16, rows, 0).unwrap();
-        write_real_claude_v2_screen(&mut terminal, cols, rows as usize);
-
-        let layout = claude_triview_layout(&terminal, rows, 3)
-            .expect("a real Claude Code screen must resolve a triview layout");
-
-        assert_eq!(layout.log_rows, 3);
-        assert_eq!(layout.transcript_skip, 3);
-        assert_eq!(
-            layout.footer_rows, 2,
-            "the footer is never a donor for the log zone"
-        );
-        assert_eq!(
-            layout.consumed_rows() + layout.log_rows + layout.footer_rows,
-            rows
-        );
+        // The log zone is a fixed CLAUDE_TRIVIEW_LOG_ROWS regardless of how
+        // many commands this pane's log actually holds — there is no request
+        // to honor any more, and this screen's transcript has rows to spare.
+        assert_eq!(layout.transcript_skip, CLAUDE_TRIVIEW_LOG_ROWS);
+        assert_eq!(layout.log_rows, CLAUDE_TRIVIEW_LOG_ROWS);
     }
 
     /// The command log's own source, run over the same real screen text: both
@@ -5004,224 +5004,51 @@ mod tests {
     #[test]
     fn render_claude_triview_splits_transcript_and_composer_zones() {
         let (tx, _rx) = mpsc::channel(4);
-        let mut terminal = crate::ghostty::Terminal::new(30, 8, 0).unwrap();
-        write_claude_shaped_screen(&mut terminal);
+        // 12 transcript lines: enough for the fixed log zone
+        // (`CLAUDE_TRIVIEW_LOG_ROWS`) to fit while keeping `MIN_TRANSCRIPT_ROWS`.
+        let mut terminal = crate::ghostty::Terminal::new(60, 17, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 12);
         let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
 
-        let backend = ratatui::backend::TestBackend::new(30, 8);
+        let backend = ratatui::backend::TestBackend::new(60, 17);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 17), false);
         })
         .unwrap();
 
         let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
-        assert_eq!(layout.transcript_rows, 2);
+        assert_eq!(layout.transcript_skip, CLAUDE_TRIVIEW_LOG_ROWS);
+        assert_eq!(layout.transcript_rows, 4);
         assert_eq!(layout.composer_rows, 1);
-        assert_eq!(layout.consumed_rows(), 5);
+        assert_eq!(layout.log_rows, CLAUDE_TRIVIEW_LOG_ROWS);
+        assert_eq!(layout.footer_rows, 2);
+        assert_eq!(layout.consumed_rows(), 7);
+        assert_eq!(layout.footer_start(), 15);
 
         let buffer = term.backend().buffer();
-        assert_eq!(buffer_row_text(buffer, 0, 30), "first line of output");
-        assert_eq!(buffer_row_text(buffer, 1, 30), "second line of output");
-        // Row 2 is the cropped-out top border, left to the caller's own
+        // The 8 oldest transcript rows are the ones the fixed zone took.
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 09");
+        assert_eq!(buffer_row_text(buffer, 3, 60), "transcript line 12");
+        // Row 4 is the cropped-out top border, left to the caller's own
         // divider — not asserted here. The composer body lands right after
         // it, with its border chrome gone.
-        assert_eq!(buffer_row_text(buffer, 3, 30), " > typed input");
+        assert_eq!(buffer_row_text(buffer, 5, 60), " > typed input");
+        // The agent's own status line and shortcut hint, past the log zone
+        // this call leaves blank, still on the pane's own floor.
+        assert_eq!(buffer_row_text(buffer, 15, 60), "~/proj main 42% context");
+        assert_eq!(buffer_row_text(buffer, 16, 60), "? for shortcuts");
     }
 
-    /// A Claude Code screen the way one really lands: the composer pinned to
-    /// the bottom with its own status line and shortcut hint under it. Both
-    /// have to survive the split — they are the "status bar" a right-click
-    /// used to be the only way to get back — and with no log asked for they
-    /// stay exactly on the rows the agent drew them on.
+    /// The fixed log zone is never partially granted: a transcript too short
+    /// to give up the full [`CLAUDE_TRIVIEW_LOG_ROWS`] without dropping below
+    /// [`MIN_TRANSCRIPT_ROWS`] does not get this layout at all, rather than a
+    /// smaller one — the point of a fixed zone is that its height never
+    /// depends on what the pane happens to be able to spare.
     #[test]
-    fn render_claude_triview_draws_the_agents_own_footer_rows() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut terminal = crate::ghostty::Terminal::new(60, 10, 0).unwrap();
-        write_tall_claude_shaped_screen(&mut terminal, 5);
-        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
-
-        let backend = ratatui::backend::TestBackend::new(60, 10);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        let mut layout = None;
-        term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 10), false, 0);
-        })
-        .unwrap();
-
-        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
-        assert_eq!(layout.transcript_skip, 0);
-        assert_eq!(layout.transcript_rows, 5);
-        assert_eq!(layout.composer_rows, 1);
-        assert_eq!(layout.log_rows, 0);
-        assert_eq!(layout.footer_rows, 2);
-        assert_eq!(layout.consumed_rows(), 8);
-        assert_eq!(layout.footer_start(), 8);
-
-        let buffer = term.backend().buffer();
-        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 01");
-        assert_eq!(buffer_row_text(buffer, 6, 60), " > typed input");
-        assert_eq!(buffer_row_text(buffer, 8, 60), "~/proj main 42% context");
-        assert_eq!(buffer_row_text(buffer, 9, 60), "? for shortcuts");
-    }
-
-    /// The log zone's rows come off the **top of the transcript**, and the
-    /// agent's footer does not move: it stays on the pane's own floor, below
-    /// the log, which is the layout the captain asked for. The transcript
-    /// loses only its oldest visible rows, which have already scrolled.
-    #[test]
-    fn render_claude_triview_opens_the_log_zone_out_of_the_transcript() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
-        write_tall_claude_shaped_screen(&mut terminal, 9);
-        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
-
-        let backend = ratatui::backend::TestBackend::new(60, 14);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        let mut layout = None;
-        term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 3);
-        })
-        .unwrap();
-
-        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
-        assert_eq!(layout.transcript_skip, 3);
-        assert_eq!(layout.transcript_rows, 6);
-        assert_eq!(layout.composer_rows, 1);
-        assert_eq!(layout.log_rows, 3);
-        assert_eq!(layout.footer_rows, 2);
-        // Composer at pane row 7, dividers at 6 and 8, log at 9..12, and the
-        // footer still on the grid rows the agent drew it on.
-        assert_eq!(layout.consumed_rows(), 9);
-        assert_eq!(layout.footer_start(), 12);
-        assert_eq!(layout.grid_composer_start(), 10);
-
-        let buffer = term.backend().buffer();
-        // The three oldest transcript rows are the ones that went.
-        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 04");
-        assert_eq!(buffer_row_text(buffer, 5, 60), "transcript line 09");
-        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
-        // Rows 9..12 are the caller's — this call leaves them blank.
-        for row in 9..12 {
-            assert_eq!(buffer_row_text(buffer, row, 60), "");
-        }
-        assert_eq!(buffer_row_text(buffer, 12, 60), "~/proj main 42% context");
-        assert_eq!(buffer_row_text(buffer, 13, 60), "? for shortcuts");
-    }
-
-    /// Every reader of a *drawn* pane row has to agree with what was drawn,
-    /// and the log zone is the one thing that makes them disagree: it opens
-    /// its rows by shifting the transcript and composer up off the top of the
-    /// grid, so the composer is no longer on the pane row of its own grid
-    /// index. Asserted against the same 60x14 screen the shift test above
-    /// draws, and against the buffer it produced rather than against the
-    /// layout's own arithmetic.
-    #[test]
-    fn a_shifted_triview_reports_where_it_really_drew_each_grid_row() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
-        write_tall_claude_shaped_screen(&mut terminal, 9);
-        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
-
-        assert_eq!(
-            pane.last_claude_triview_layout(),
-            None,
-            "nothing has been painted yet"
-        );
-
-        let backend = ratatui::backend::TestBackend::new(60, 14);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|frame| {
-            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 3);
-        })
-        .unwrap();
-
-        let layout = pane
-            .last_claude_triview_layout()
-            .expect("a triview paint records the split it drew");
-        assert_eq!(layout.transcript_skip, 3);
-
-        // The composer's own grid row, and the row it was actually drawn on.
-        // The captain's bug is exactly this pair being assumed equal: the
-        // frame cursor landed on grid row 10 of a pane whose composer was
-        // drawn on row 7, which is three rows down inside the command log.
-        let buffer = term.backend().buffer();
-        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
-        assert_eq!(layout.grid_composer_start(), 10);
-        assert_eq!(layout.pane_row_for_grid_row(10), Some(7));
-
-        // The transcript is shifted by the same amount, and the rows the log
-        // zone took off its top were not drawn at all.
-        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 04");
-        assert_eq!(layout.pane_row_for_grid_row(3), Some(0));
-        for scrolled_off in 0..3 {
-            assert_eq!(layout.pane_row_for_grid_row(scrolled_off), None);
-        }
-
-        // The composer's two border rows were cropped out and replaced in
-        // place by the caller's dividers, so neither is a drawn grid row.
-        assert_eq!(layout.pane_row_for_grid_row(9), None);
-        assert_eq!(layout.pane_row_for_grid_row(11), None);
-
-        // The agent's own footer never moved: the log's rows came from above
-        // it, so its grid rows are its pane rows.
-        assert_eq!(buffer_row_text(buffer, 12, 60), "~/proj main 42% context");
-        assert_eq!(layout.pane_row_for_grid_row(12), Some(12));
-        assert_eq!(layout.pane_row_for_grid_row(13), Some(13));
-        assert_eq!(layout.pane_row_for_grid_row(14), None);
-
-        // An unmodified full-pane draw puts the identity mapping back, so a
-        // pane that stops resolving the split cannot leave a stale shift
-        // behind for the cursor to be projected through.
-        term.draw(|frame| {
-            pane.render(frame, Rect::new(0, 0, 60, 14), false);
-        })
-        .unwrap();
-        assert_eq!(pane.last_claude_triview_layout(), None);
-    }
-
-    /// With nothing asked for the log, nothing comes off the transcript and
-    /// the projection is the identity on every row the split draws — which is
-    /// why the callers that assumed identity were right until the log could
-    /// fill, and why the retained fast path is only given up on a real shift.
-    #[test]
-    fn an_unshifted_triview_projects_every_drawn_row_onto_itself() {
-        let (tx, _rx) = mpsc::channel(4);
-        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
-        write_tall_claude_shaped_screen(&mut terminal, 9);
-        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
-
-        let backend = ratatui::backend::TestBackend::new(60, 14);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|frame| {
-            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 0);
-        })
-        .unwrap();
-
-        let layout = pane.last_claude_triview_layout().expect("a triview paint");
-        assert_eq!(layout.transcript_skip, 0);
-        assert_eq!(layout.log_rows, 0);
-        for grid_row in 0..14u16 {
-            let drawn = layout.pane_row_for_grid_row(grid_row);
-            // Only the two cropped border rows are missing; everything else
-            // is exactly where it always was.
-            if grid_row == layout.grid_composer_start() - 1
-                || grid_row == layout.grid_composer_start() + layout.composer_rows
-            {
-                assert_eq!(drawn, None, "grid row {grid_row} is a cropped border");
-            } else {
-                assert_eq!(drawn, Some(grid_row), "grid row {grid_row}");
-            }
-        }
-    }
-
-    /// A log big enough to gut the transcript is not worth what it costs:
-    /// the transcript keeps [`MIN_TRANSCRIPT_ROWS`] and the zone gets
-    /// whatever is left over, which can be nothing at all.
-    #[test]
-    fn render_claude_triview_never_shrinks_the_transcript_below_its_floor() {
-        for (transcript_lines, expected_log_rows) in [(4usize, 1u16), (3, 0)] {
+    fn claude_triview_layout_declines_a_transcript_too_short_for_the_fixed_zone() {
+        for transcript_lines in [10usize, 3] {
             let rows = u16::try_from(transcript_lines).unwrap() + 5;
             let (tx, _rx) = mpsc::channel(4);
             let mut terminal = crate::ghostty::Terminal::new(60, rows, 0).unwrap();
@@ -5232,23 +5059,188 @@ mod tests {
             let mut term = ratatui::Terminal::new(backend).unwrap();
             let mut layout = None;
             term.draw(|frame| {
-                layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, rows), false, 8);
+                layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, rows), false);
             })
             .unwrap();
+            assert!(
+                layout.is_none(),
+                "{transcript_lines}-row transcript cannot give up \
+                 {CLAUDE_TRIVIEW_LOG_ROWS} rows and keep {MIN_TRANSCRIPT_ROWS}"
+            );
+        }
 
-            let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
-            assert_eq!(
-                layout.log_rows, expected_log_rows,
-                "a {transcript_lines}-row transcript asked for 8 log rows"
-            );
-            assert!(layout.transcript_rows >= MIN_TRANSCRIPT_ROWS);
-            assert_eq!(layout.footer_rows, 2);
-            // Whatever the split granted, the footer is still last.
-            assert_eq!(
-                layout.footer_start() + layout.footer_rows,
-                rows,
-                "the agent's footer must still end on the pane's own floor"
-            );
+        // Exactly enough — the boundary this gates on is inclusive.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 16, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 11);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 16);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 16), false);
+        })
+        .unwrap();
+        let layout = layout.expect("an 11-row transcript is exactly enough");
+        assert_eq!(layout.transcript_rows, MIN_TRANSCRIPT_ROWS);
+    }
+
+    /// The log zone's rows come off the **top of the transcript**, and the
+    /// agent's footer does not move: it stays on the pane's own floor, below
+    /// the log, which is the layout the captain asked for. The transcript
+    /// loses only its oldest visible rows, which have already scrolled.
+    #[test]
+    fn render_claude_triview_opens_the_log_zone_out_of_the_transcript() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 19, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 14);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 19);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 19), false);
+        })
+        .unwrap();
+
+        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(layout.transcript_skip, CLAUDE_TRIVIEW_LOG_ROWS);
+        assert_eq!(layout.transcript_rows, 6);
+        assert_eq!(layout.composer_rows, 1);
+        assert_eq!(layout.log_rows, CLAUDE_TRIVIEW_LOG_ROWS);
+        assert_eq!(layout.footer_rows, 2);
+        // Composer at pane row 7, dividers at 6 and 8, log at 9..17, and the
+        // footer still on the grid rows the agent drew it on.
+        assert_eq!(layout.consumed_rows(), 9);
+        assert_eq!(layout.footer_start(), 17);
+        assert_eq!(layout.grid_composer_start(), 15);
+
+        let buffer = term.backend().buffer();
+        // The 8 oldest transcript rows are the ones that went.
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 09");
+        assert_eq!(buffer_row_text(buffer, 5, 60), "transcript line 14");
+        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
+        // Rows 9..17 are the caller's — this call leaves them blank.
+        for row in 9..17 {
+            assert_eq!(buffer_row_text(buffer, row, 60), "");
+        }
+        assert_eq!(buffer_row_text(buffer, 17, 60), "~/proj main 42% context");
+        assert_eq!(buffer_row_text(buffer, 18, 60), "? for shortcuts");
+    }
+
+    /// Every reader of a *drawn* pane row has to agree with what was drawn,
+    /// and the log zone is the one thing that makes them disagree: it opens
+    /// its rows by shifting the transcript and composer up off the top of the
+    /// grid, so the composer is no longer on the pane row of its own grid
+    /// index. Asserted against the same 60x19 screen the shift test above
+    /// draws, and against the buffer it produced rather than against the
+    /// layout's own arithmetic.
+    #[test]
+    fn a_shifted_triview_reports_where_it_really_drew_each_grid_row() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 19, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 14);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        assert_eq!(
+            pane.last_claude_triview_layout(),
+            None,
+            "nothing has been painted yet"
+        );
+
+        let backend = ratatui::backend::TestBackend::new(60, 19);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 19), false);
+        })
+        .unwrap();
+
+        let layout = pane
+            .last_claude_triview_layout()
+            .expect("a triview paint records the split it drew");
+        assert_eq!(layout.transcript_skip, CLAUDE_TRIVIEW_LOG_ROWS);
+
+        // The composer's own grid row, and the row it was actually drawn on.
+        // The captain's bug is exactly this pair being assumed equal: the
+        // frame cursor landed on grid row 15 of a pane whose composer was
+        // drawn on row 7, eight rows up inside the command log.
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
+        assert_eq!(layout.grid_composer_start(), 15);
+        assert_eq!(layout.pane_row_for_grid_row(15), Some(7));
+
+        // The transcript is shifted by the same amount, and the rows the log
+        // zone took off its top were not drawn at all.
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 09");
+        assert_eq!(layout.pane_row_for_grid_row(8), Some(0));
+        for scrolled_off in 0..8 {
+            assert_eq!(layout.pane_row_for_grid_row(scrolled_off), None);
+        }
+
+        // The composer's two border rows were cropped out and replaced in
+        // place by the caller's dividers, so neither is a drawn grid row.
+        assert_eq!(layout.pane_row_for_grid_row(14), None);
+        assert_eq!(layout.pane_row_for_grid_row(16), None);
+
+        // The agent's own footer never moved: the log's rows came from above
+        // it, so its grid rows are its pane rows.
+        assert_eq!(buffer_row_text(buffer, 17, 60), "~/proj main 42% context");
+        assert_eq!(layout.pane_row_for_grid_row(17), Some(17));
+        assert_eq!(layout.pane_row_for_grid_row(18), Some(18));
+        assert_eq!(layout.pane_row_for_grid_row(19), None);
+
+        // An unmodified full-pane draw puts the identity mapping back, so a
+        // pane that stops resolving the split cannot leave a stale shift
+        // behind for the cursor to be projected through.
+        term.draw(|frame| {
+            pane.render(frame, Rect::new(0, 0, 60, 19), false);
+        })
+        .unwrap();
+        assert_eq!(pane.last_claude_triview_layout(), None);
+    }
+
+    /// A click or drag landing on either cropped divider row, or anywhere in
+    /// the command-log zone itself, has no grid row of its own to read
+    /// selection text from — both are herdr's own content, never copied from
+    /// the grid. Rather than come back empty, it reads as the nearest live
+    /// content: a divider resolves to the real border row it stands in for,
+    /// and the log zone resolves to the footer immediately below it, since
+    /// there is no divider between them to cross.
+    #[test]
+    fn grid_row_for_pane_row_reads_a_divider_or_the_log_zone_as_the_nearest_live_row() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 19, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 14);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 19);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            pane.render_claude_triview(frame, Rect::new(0, 0, 60, 19), false);
+        })
+        .unwrap();
+        let layout = pane.last_claude_triview_layout().expect("a triview paint");
+
+        // Round-trips with `pane_row_for_grid_row` everywhere it draws
+        // something real: transcript, composer, and footer alike.
+        for grid_row in 0u16..19 {
+            if let Some(pane_row) = layout.pane_row_for_grid_row(grid_row) {
+                assert_eq!(
+                    layout.grid_row_for_pane_row(pane_row),
+                    grid_row,
+                    "pane row {pane_row} should read back as grid row {grid_row}"
+                );
+            }
+        }
+
+        // The two dividers: the composer's own cropped top and bottom border.
+        assert_eq!(layout.grid_row_for_pane_row(6), 14);
+        assert_eq!(layout.grid_row_for_pane_row(8), 16);
+        // The log zone: no grid row of its own, reads as the footer below.
+        for pane_row in 9..17 {
+            assert_eq!(layout.grid_row_for_pane_row(pane_row), 17);
         }
     }
 
@@ -5263,7 +5255,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false);
         })
         .unwrap();
 
@@ -5290,7 +5282,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false);
         })
         .unwrap();
 
@@ -6156,7 +6148,7 @@ mod tests {
             .expect("scroll metrics after initial scroll");
         let mut selection =
             crate::selection::Selection::anchor(PaneId::from_raw(1), 0, 0, Some(metrics));
-        selection.drag(5, 2, Rect::new(0, 0, 8, 3), Some(metrics));
+        selection.drag(5, 2, Rect::new(0, 0, 8, 3), Some(metrics), None);
 
         pane.scroll_reset();
 

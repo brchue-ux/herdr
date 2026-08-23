@@ -39,21 +39,12 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
 // too, so the unmodified full-pane render was the steady state and the split
 // was the exception. The zones are a property of what the pane is showing,
 // not of where the keyboard is pointed, so the only mode still excluded is
-// `Mode::Copy`: copy mode's selection maps buffer rows straight onto grid
+// `Mode::Copy`: copy mode's own selection maps buffer rows straight onto grid
 // rows, and a split that has shifted the transcript would hand back the
-// wrong text. See `render_panes`'s own selection guard, which turns on the
-// same fact rather than on the split merely being active.
-
-/// Most rows the bottom command-log zone is ever given, whatever else is on
-/// screen. The zone is a glance at what the agent has been running, not a
-/// second terminal, and every row it takes is a row of transcript
-/// ([`crate::pane::ClaudeTriviewLayout::transcript_skip`]) — so it is capped
-/// rather than allowed to grow to whatever the pane has spare.
-///
-/// Matches [`crate::app::pane_command_log::PANE_COMMAND_LOG_MAX`], which is
-/// how many commands a pane's log holds, so the cap and the log's own memory
-/// cannot disagree.
-const MAX_TRIVIEW_LOG_ROWS: u16 = crate::app::pane_command_log::PANE_COMMAND_LOG_MAX as u16;
+// wrong text. Mouse-drag selection has no such restriction — it projects
+// through the layout's own [`crate::pane::ClaudeTriviewLayout::grid_row_for_pane_row`]
+// wherever a triview split is active, in `render_panes` and in
+// `crate::app::input::mouse`'s mouse-down and drag handlers alike.
 
 /// Minimum pane height even worth attempting triview detection against — a
 /// cheap bailout before paying for a text read of the live grid.
@@ -116,14 +107,10 @@ fn render_claude_triview_chrome(
     //
     // The rows this draws into are the ones `render_claude_triview` opened by
     // shifting the transcript and the composer up, so they are the split's to
-    // give and the footer below is untouched. `log_rows` is already sized to
-    // exactly the commands the caller asked to show and capped at
-    // MAX_TRIVIEW_LOG_ROWS; a log with nothing in it, or a transcript with no
-    // rows to spare, leaves this zero and the space is a plain continuation
-    // of the pane's own background.
-    if layout.log_rows == 0 {
-        return;
-    }
+    // give and the footer below is untouched. `log_rows` is a fixed
+    // `CLAUDE_TRIVIEW_LOG_ROWS` whenever `layout` exists at all — never zero
+    // — so an empty or short log still gets the full zone, padded rather
+    // than shrunk; see `render_pane_command_log`.
     let log_area = Rect {
         x: area.x,
         y: area.y + layout.consumed_rows(),
@@ -148,17 +135,41 @@ fn render_triview_divider(frame: &mut Frame, pane_area: Rect, y: u16, style: Sty
 }
 
 /// The bottom zone's own content: this pane's own recent shell commands,
-/// oldest at the top, newest anchored to the zone's own bottom row so the
-/// zone reads the same whether it holds one command or all
-/// [`crate::app::pane_command_log::PANE_COMMAND_LOG_MAX`] of them.
+/// newest at the zone's own **top** row, each new command pushing the
+/// earlier ones down — the opposite of the transcript above it, which grows
+/// bottom-up like any normal scrollback. Reversed on purpose: this zone is a
+/// glance at what just ran, and the newest command is the one worth reading
+/// without having to look away from the composer right above it.
+///
+/// A pane's log can hold more of
+/// [`crate::app::pane_command_log::PANE_COMMAND_LOG_MAX`] than the zone's own
+/// `CLAUDE_TRIVIEW_LOG_ROWS` rows can show at once;
+/// `app.pane_command_log_scroll` is how far past the newest entry this
+/// particular view has scrolled to reach the rest, clamped here rather than
+/// trusted so a stale offset from a since-shrunk log cannot draw past the
+/// end.
 fn render_pane_command_log(app: &AppState, frame: &mut Frame, pane_id: PaneId, area: Rect) {
     let commands: Vec<&str> = app.pane_command_log.lines(pane_id).collect();
     let visible_rows = area.height as usize;
-    let shown = &commands[commands.len().saturating_sub(visible_rows)..];
+    let max_scroll = commands.len().saturating_sub(visible_rows);
+    let scroll = (app
+        .pane_command_log_scroll
+        .get(&pane_id)
+        .copied()
+        .unwrap_or(0) as usize)
+        .min(max_scroll);
+    // Newest first, then windowed by the scroll offset: index 0 of this
+    // order is the newest command, matching the zone's own top row.
+    let shown: Vec<&str> = commands
+        .iter()
+        .rev()
+        .skip(scroll)
+        .take(visible_rows)
+        .copied()
+        .collect();
     let pad_rows = visible_rows.saturating_sub(shown.len());
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
-    lines.extend(std::iter::repeat_n(Line::from(""), pad_rows));
     lines.extend(shown.iter().map(|command| {
         Line::from(vec![
             Span::styled("● ", Style::default().fg(app.palette.accent)),
@@ -168,6 +179,7 @@ fn render_pane_command_log(app: &AppState, frame: &mut Frame, pane_id: PaneId, a
             ),
         ])
     }));
+    lines.extend(std::iter::repeat_n(Line::from(""), pad_rows));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -526,20 +538,7 @@ pub(super) fn render_panes(
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
 
             let triview = should_attempt_claude_triview(app, ws_idx, info, rt)
-                .then(|| {
-                    // Asked for, not reserved: the rows come out of the
-                    // transcript's own top and the split grants what it can.
-                    let requested_log_rows =
-                        u16::try_from(app.pane_command_log.lines(info.id).count())
-                            .unwrap_or(u16::MAX)
-                            .min(MAX_TRIVIEW_LOG_ROWS);
-                    rt.render_claude_triview(
-                        frame,
-                        info.inner_rect,
-                        show_cursor,
-                        requested_log_rows,
-                    )
-                })
+                .then(|| rt.render_claude_triview(frame, info.inner_rect, show_cursor))
                 .flatten();
             match triview {
                 Some(layout) => render_claude_triview_chrome(app, frame, info, layout),
@@ -559,54 +558,55 @@ pub(super) fn render_panes(
                 }
             }
 
-            // Selection and copy-mode search highlighting assume the drawn
-            // grid maps linearly onto `info.inner_rect`. A triview pane still
-            // does whenever `transcript_skip` is zero: the two cropped border
-            // rows are replaced in place by this module's own dividers, so
-            // every pane row — transcript, composer body, and the agent's
-            // footer alike — is still the grid row of the same index. Only
-            // the log zone breaks that, by shifting the transcript up off the
-            // top of the grid, and only then is highlighting skipped rather
-            // than drawn wrong.
+            // Selection assumes the drawn grid maps linearly onto
+            // `info.inner_rect`; a triview split breaks that whenever it is
+            // active, since the log zone always shifts the transcript and
+            // composer up now (`ClaudeTriviewLayout::transcript_skip` is
+            // fixed, never zero, once the split engages at all). Rather than
+            // skip highlighting for every triview pane,
+            // `render_selection_highlight` projects each pane row through
+            // the layout itself before testing it against the selection —
+            // the same projection `crate::app::input::mouse`'s mouse-down and
+            // drag handlers apply before ever storing a row in
+            // `app.selection`.
             //
-            // Gating on the shift and not on the split being active at all
-            // matters now that the split is the steady state rather than a
-            // `Mode::Terminal`-only path: keying it the old way would have
-            // silently taken mouse selection away from every focused Claude
-            // pane.
-            let rows_shifted = triview.is_some_and(|layout| layout.transcript_skip > 0);
-            if !rows_shifted {
-                let (copy_search_top, copy_search_bottom, copy_search_matches) =
-                    validated_copy_mode_search_matches(app, info, rt);
-                render_copy_mode_search_highlights(
-                    app,
-                    frame,
-                    info,
-                    copy_search_top,
-                    copy_search_bottom,
-                    &copy_search_matches,
-                    false,
-                );
-                render_selection_highlight(
-                    &app.selection,
-                    frame,
-                    info.id,
-                    info.inner_rect,
-                    rt.scroll_metrics(),
-                    &app.palette,
-                    app.host_terminal_theme,
-                );
-                render_copy_mode_search_highlights(
-                    app,
-                    frame,
-                    info,
-                    copy_search_top,
-                    copy_search_bottom,
-                    &copy_search_matches,
-                    true,
-                );
-                render_copy_mode_cursor(app, frame, info);
-            }
+            // Copy-mode search highlighting and the copy-mode cursor stay
+            // unconditional too: both already no-op outside `Mode::Copy`
+            // (`app.copy_mode` is only ever `Some` there), and `Mode::Copy`
+            // is the one mode `should_attempt_claude_triview` excludes, so
+            // `triview` is always `None` whenever they would actually draw
+            // anything.
+            let (copy_search_top, copy_search_bottom, copy_search_matches) =
+                validated_copy_mode_search_matches(app, info, rt);
+            render_copy_mode_search_highlights(
+                app,
+                frame,
+                info,
+                copy_search_top,
+                copy_search_bottom,
+                &copy_search_matches,
+                false,
+            );
+            render_selection_highlight(
+                &app.selection,
+                frame,
+                info.id,
+                info.inner_rect,
+                rt.scroll_metrics(),
+                triview,
+                &app.palette,
+                app.host_terminal_theme,
+            );
+            render_copy_mode_search_highlights(
+                app,
+                frame,
+                info,
+                copy_search_top,
+                copy_search_bottom,
+                &copy_search_matches,
+                true,
+            );
+            render_copy_mode_cursor(app, frame, info);
         }
     }
 
@@ -1040,12 +1040,21 @@ fn render_copy_mode_search_highlights(
     }
 }
 
+/// `triview` is the same layout [`render_panes`] just drew this pane
+/// through, if any: each pane row `y` is projected through
+/// [`crate::pane::ClaudeTriviewLayout::grid_row_for_pane_row`] before being
+/// tested against `selection`, which stores its own anchor and cursor in
+/// grid-row coordinates (see `crate::selection`'s own header). Without this
+/// a triview pane's shifted rows would test the wrong row's membership,
+/// painting the highlight over content the selection does not actually
+/// cover.
 fn render_selection_highlight(
     selection: &Option<crate::selection::Selection>,
     frame: &mut Frame,
     pane_id: crate::layout::PaneId,
     inner: Rect,
     scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    triview: Option<crate::pane::ClaudeTriviewLayout>,
     p: &Palette,
     host_theme: crate::terminal_theme::TerminalTheme,
 ) {
@@ -1054,8 +1063,9 @@ fn render_selection_highlight(
             let buf = frame.buffer_mut();
             let style = automatic_selection_style(p, host_theme);
             for y in 0..inner.height {
+                let grid_y = triview.map_or(y, |layout| layout.grid_row_for_pane_row(y));
                 for x in 0..inner.width {
-                    if sel.contains(y, x, scroll_metrics) {
+                    if sel.contains(grid_y, x, scroll_metrics) {
                         let cell = &mut buf[(inner.x + x, inner.y + y)];
                         cell.set_style(style);
                     }
@@ -1374,10 +1384,12 @@ mod tests {
             );
         }
         // The command text is still shown — the gutter, not censorship, is
-        // what separates it from a hunk.
-        let log_row: String = (0..40).map(|x| buffer[(x, 9)].symbol()).collect();
+        // what separates it from a hunk. The newest command is the one
+        // recorded last ("+++ b/src/main.rs") and the zone's own top row is
+        // the newest, per its top-down growth direction.
+        let log_row: String = (0..40).map(|x| buffer[(x, 8)].symbol()).collect();
         assert!(log_row.contains("+++ b/src/main.rs"), "got {log_row:?}");
-        assert_eq!(buffer[(0, 9)].symbol(), "●");
+        assert_eq!(buffer[(0, 8)].symbol(), "●");
     }
 
     /// The zone is exactly the rows the split granted, never the rest of the
@@ -1479,6 +1491,80 @@ mod tests {
                 "row {row} should not carry a log-zone bullet when there is no log"
             );
         }
+    }
+
+    /// New commands spawn at the zone's own top row, pushing earlier ones
+    /// down — the opposite of the transcript above it, which grows bottom-up
+    /// like normal scrollback. A log with fewer commands than the zone's
+    /// height pads the *bottom*, not the top, so the newest is always the
+    /// first line the captain reads.
+    #[test]
+    fn render_pane_command_log_grows_top_down_and_pads_the_bottom() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        app.pane_command_log
+            .record(pane_id, "git status".to_string());
+        app.pane_command_log.record(pane_id, "npm test".to_string());
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_pane_command_log(&app, frame, pane_id, Rect::new(0, 0, 20, 4));
+            })
+            .unwrap();
+
+        let row = |y: u16| -> String {
+            let buffer = terminal.backend().buffer();
+            (0..20).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+        assert!(
+            row(0).contains("npm test"),
+            "newest at the top: {:?}",
+            row(0)
+        );
+        assert!(
+            row(1).contains("git status"),
+            "the earlier command pushed down: {:?}",
+            row(1)
+        );
+        assert_eq!(row(2).trim(), "", "padding is at the bottom, not the top");
+        assert_eq!(row(3).trim(), "");
+    }
+
+    /// A log holding more commands than the zone can show at once keeps the
+    /// newest visible by default, and scrolling past them reveals older ones
+    /// — down to the true oldest and no further.
+    #[test]
+    fn render_pane_command_log_scrolls_to_reveal_older_commands() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        for i in 0..10 {
+            app.pane_command_log.record(pane_id, format!("cmd {i}"));
+        }
+        let area = Rect::new(0, 0, 20, 4);
+        let row_text = |app: &AppState, y: u16| -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 4)).unwrap();
+            terminal
+                .draw(|frame| render_pane_command_log(app, frame, pane_id, area))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..20).map(|x| buffer[(x, y)].symbol()).collect()
+        };
+
+        // Unscrolled: the 4 newest, newest first.
+        assert!(row_text(&app, 0).contains("cmd 9"));
+        assert!(row_text(&app, 3).contains("cmd 6"));
+
+        // Scrolled past the visible window: the next 4 older commands.
+        app.pane_command_log_scroll.insert(pane_id, 4);
+        assert!(row_text(&app, 0).contains("cmd 5"));
+        assert!(row_text(&app, 3).contains("cmd 2"));
+
+        // Scrolled past the end: clamped to the true oldest, never blank.
+        app.pane_command_log_scroll.insert(pane_id, 50);
+        assert!(row_text(&app, 3).contains("cmd 0"), "{}", row_text(&app, 3));
     }
 
     #[test]
@@ -1948,6 +2034,7 @@ mod tests {
                     frame,
                     PaneId::from_raw(1),
                     Rect::new(0, 0, 4, 1),
+                    None,
                     None,
                     &palette,
                     host_theme,

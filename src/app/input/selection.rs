@@ -17,8 +17,9 @@ impl AppState {
             return;
         };
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
+        let triview = self.pane_claude_triview_layout(terminal_runtimes, pane_id);
         if let Some(selection) = self.selection.as_mut() {
-            selection.drag(screen_col, screen_row, info.inner_rect, metrics);
+            selection.drag(screen_col, screen_row, info.inner_rect, metrics, triview);
         }
     }
 
@@ -213,7 +214,7 @@ mod autoscroll_tests {
         });
         // Anchor at (5, 10), drag to different cell above pane
         let mut sel = crate::selection::Selection::anchor(pane_id, 5, 10, None);
-        sel.drag(4, 5, Rect::new(0, 5, 80, 24), None);
+        sel.drag(4, 5, Rect::new(0, 5, 80, 24), None, None);
         state.selection = Some(sel);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         state.update_selection_drag(&terminal_runtimes, 5, 4);
@@ -226,7 +227,7 @@ mod autoscroll_tests {
         let (mut state, pane_id) = make_state_with_pane();
         // Anchor at (5, 10), drag to top edge row (row 0) — different cell
         let mut sel = crate::selection::Selection::anchor(pane_id, 5, 10, None);
-        sel.drag(0, 0, Rect::new(0, 0, 80, 24), None);
+        sel.drag(0, 0, Rect::new(0, 0, 80, 24), None, None);
         state.selection = Some(sel);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         state.update_selection_drag(&terminal_runtimes, 0, 0);
@@ -250,7 +251,7 @@ mod autoscroll_tests {
         let (mut state, pane_id) = make_state_with_pane();
         // Anchor at (0, 0), drag to bottom edge row (row 23) — different cell
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
-        sel.drag(23, 0, Rect::new(0, 0, 80, 24), None);
+        sel.drag(23, 0, Rect::new(0, 0, 80, 24), None, None);
         state.selection = Some(sel);
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         state.update_selection_drag(&terminal_runtimes, 0, 23);
@@ -275,7 +276,7 @@ mod autoscroll_tests {
         let (mut state, pane_id) = make_state_with_pane();
         // Anchor at (0, 0), drag to different cell below pane
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
-        sel.drag(5, 5, Rect::new(0, 0, 80, 24), None);
+        sel.drag(5, 5, Rect::new(0, 0, 80, 24), None, None);
         state.selection = Some(sel);
         // Drag cursor one row below the pane bottom
         let terminal_runtimes = TerminalRuntimeRegistry::new();
@@ -289,7 +290,7 @@ mod autoscroll_tests {
         let (mut state, pane_id) = make_state_with_pane();
         // Anchor at (0, 0), drag to (5, 5) so it's truly dragging
         let mut sel = crate::selection::Selection::anchor(pane_id, 0, 0, None);
-        sel.drag(5, 5, Rect::new(0, 0, 80, 24), None);
+        sel.drag(5, 5, Rect::new(0, 0, 80, 24), None, None);
         state.selection = Some(sel);
         // Set autoscroll first
         state.selection_autoscroll = Some(SelectionAutoscroll {

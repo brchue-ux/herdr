@@ -644,6 +644,15 @@ impl AppState {
                         mouse.row - info.inner_rect.y,
                         mouse.column - info.inner_rect.x,
                     );
+                    // A triview pane's drawn row is not the grid row of the
+                    // same index once its log zone has shifted the
+                    // transcript and composer up; project onto the grid row
+                    // the click actually landed on before anchoring, the way
+                    // `render_selection_highlight` does for the highlight it
+                    // draws back from this same selection.
+                    let row = self
+                        .pane_claude_triview_layout(terminal_runtimes, info.id)
+                        .map_or(row, |layout| layout.grid_row_for_pane_row(row));
                     self.selection = Some(Selection::anchor(
                         info.id,
                         row,
@@ -1746,6 +1755,60 @@ impl AppState {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
     }
 
+    /// The triview split `pane_id`'s last paint actually drew, if it was a
+    /// Claude triview pane this frame — the same layout mouse-selection
+    /// projects a click's pane row through. `None` for every other pane and
+    /// for a Claude pane that fell back to the unmodified full render.
+    pub(crate) fn pane_claude_triview_layout(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::pane::ClaudeTriviewLayout> {
+        self.active
+            .and_then(|i| self.runtime_for_pane_in_workspace(terminal_runtimes, i, pane_id))
+            .and_then(crate::terminal::TerminalRuntime::last_claude_triview_layout)
+    }
+
+    /// Scrolls `info`'s own command-log zone instead of its PTY scrollback
+    /// when the wheel lands inside that zone, so reviewing older commands
+    /// never disengages the triview split the way scrolling the pane itself
+    /// does (`should_attempt_claude_triview`'s `!pane_is_scrolled_back`
+    /// gate) — the zone's history is herdr's own content, not a view onto
+    /// the agent's scrollback. Returns `true` when it handled the event.
+    fn scroll_pane_command_log_at(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        mouse: MouseEvent,
+    ) -> bool {
+        let older = match mouse.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
+            _ => return false,
+        };
+        let Some(layout) = self.pane_claude_triview_layout(terminal_runtimes, info.id) else {
+            return false;
+        };
+        let Some(pane_row) = mouse.row.checked_sub(info.inner_rect.y) else {
+            return false;
+        };
+        if pane_row < layout.consumed_rows() || pane_row >= layout.footer_start() {
+            return false;
+        }
+
+        let visible_rows = layout.log_rows;
+        let total = u16::try_from(self.pane_command_log.lines(info.id).count()).unwrap_or(u16::MAX);
+        let max_scroll = total.saturating_sub(visible_rows);
+        let lines = u16::try_from(self.mouse_scroll_lines).unwrap_or(u16::MAX);
+        let entry = self.pane_command_log_scroll.entry(info.id).or_insert(0);
+        *entry = if older {
+            entry.saturating_add(lines).min(max_scroll)
+        } else {
+            entry.saturating_sub(lines)
+        };
+        true
+    }
+
     fn handle_right_click_passthrough(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1832,6 +1895,9 @@ impl AppState {
         if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
             if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
+                return;
+            }
+            if self.scroll_pane_command_log_at(terminal_runtimes, &info, mouse) {
                 return;
             }
             match mouse.kind {
@@ -2130,6 +2196,212 @@ mod tests {
         state.view.sidebar_rect = Rect::new(0, 0, 0, rows);
         state.view.terminal_area = Rect::new(0, 0, cols, rows);
         state
+    }
+
+    /// A rendered, focused Claude triview pane: 14 numbered transcript
+    /// lines (enough for the fixed log zone to shift the composer up
+    /// without breaking `MIN_TRANSCRIPT_ROWS`), a composer, and the agent's
+    /// own two footer rows. Rendered once so `last_claude_triview_layout()`
+    /// reports the real split a mouse click has to project through.
+    fn app_with_rendered_claude_triview() -> (App, crate::layout::PaneInfo) {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        let mut terminal_state =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(Agent::Claude);
+        app.state.terminals.insert(terminal_id, terminal_state);
+
+        // Offset past `app_for_mouse_test()`'s own sidebar_rect (0..26): a
+        // pane starting at column 0 would have every click of this test
+        // routed as a sidebar hit instead of a pane hit.
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 0, 60, 19));
+        let info = pane_infos[0].clone();
+
+        let cols = info.inner_rect.width as usize;
+        let rows = info.inner_rect.height as usize;
+        let rule = "\u{2500}".repeat(cols);
+        let mut lines: Vec<String> = (1..=14)
+            .map(|n| format!("transcript line {n:02}"))
+            .collect();
+        lines.resize(rows - 5, String::new());
+        lines.push(rule.clone());
+        lines.push("\u{276F} typed input".to_string());
+        lines.push(rule);
+        lines.push("~/proj main 42% context".to_string());
+        lines.push("? for shortcuts".to_string());
+        let screen = lines.join("\r\n").into_bytes();
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                &screen,
+            ),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        // Three commands recorded so the log zone would have content even
+        // under the old request-sized behavior — the fixed zone no longer
+        // needs this to shift, but a real pane always has some.
+        for command in ["cargo nextest run", "git status", "ls -la"] {
+            app.state
+                .pane_command_log
+                .record(pane_id, command.to_string());
+        }
+
+        let registry = crate::terminal::TerminalRuntimeRegistry::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(86, 19)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::render_tab_surface(
+                    &app.state,
+                    &registry,
+                    app.state.view.tab_surface(),
+                    frame,
+                );
+            })
+            .unwrap();
+
+        (app, info)
+    }
+
+    /// The captain's bug: a drag over what the split actually drew must
+    /// select that row's own text, not the row of the same index in the
+    /// unshifted grid — `transcript_skip` rows earlier, off screen once the
+    /// log zone has taken rows off the transcript's top.
+    #[tokio::test]
+    async fn mouse_selection_lands_on_the_row_the_triview_split_actually_drew() {
+        let (mut app, info) = app_with_rendered_claude_triview();
+        let pane_id = info.id;
+
+        // Pane row 5 is "transcript line 14" — the split's own bottom-most
+        // visible transcript row, per `ClaudeTriviewLayout::transcript_skip`
+        // shifting the display up by `CLAUDE_TRIVIEW_LOG_ROWS` (8): grid row
+        // 5 + 8 = 13, which is "transcript line 14" (grid row 0 is line 01).
+        let row = info.inner_rect.y + 5;
+        let start_col = info.inner_rect.x;
+        let end_col = info.inner_rect.x + 18;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start_col,
+            row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), end_col, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), end_col, row));
+
+        let selection = app.state.selection.clone().expect("a selection was made");
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        let text = runtime
+            .extract_selection(&selection)
+            .expect("selected text");
+        assert!(
+            text.contains("transcript line 14"),
+            "selected {text:?}, expected the row actually drawn there, not \
+             the identity-mapped grid row"
+        );
+    }
+
+    /// The composer's own drawn row projects correctly too, not just plain
+    /// transcript rows — this is the exact row PR #209's cursor fix already
+    /// covers for the frame caret; this is the same projection for a click.
+    #[tokio::test]
+    async fn mouse_selection_on_the_composer_row_lands_on_the_composer() {
+        let (mut app, info) = app_with_rendered_claude_triview();
+        let pane_id = info.id;
+
+        // Pane row 7 is the composer body (`" \u{276F} typed input"`).
+        let row = info.inner_rect.y + 7;
+        let start_col = info.inner_rect.x;
+        let end_col = info.inner_rect.x + 12;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start_col,
+            row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), end_col, row));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), end_col, row));
+
+        let selection = app.state.selection.clone().expect("a selection was made");
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        let text = runtime
+            .extract_selection(&selection)
+            .expect("selected text");
+        assert!(
+            text.contains("typed input"),
+            "selected {text:?}, expected the composer row"
+        );
+    }
+
+    /// A wheel notch over the command-log zone advances that zone's own
+    /// scroll offset instead of the pane's PTY scrollback — scrolling to
+    /// review older commands must not be the same gesture that disengages
+    /// the triview split (`should_attempt_claude_triview`'s
+    /// `!pane_is_scrolled_back` gate).
+    #[tokio::test]
+    async fn wheel_over_the_log_zone_scrolls_it_without_touching_pane_scrollback() {
+        let (mut app, info) = app_with_rendered_claude_triview();
+        let pane_id = info.id;
+        for i in 0..20 {
+            app.state
+                .pane_command_log
+                .record(pane_id, format!("cmd {i}"));
+        }
+
+        // Pane row 9 is the log zone's own top row (`consumed_rows() == 9`).
+        let log_row = info.inner_rect.y + 9;
+        let col = info.inner_rect.x + 2;
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, log_row));
+
+        assert_eq!(
+            app.state.pane_command_log_scroll.get(&pane_id).copied(),
+            Some(app.state.mouse_scroll_lines as u16),
+            "scrolling over the log zone should advance its own offset"
+        );
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        assert_eq!(
+            runtime.scroll_metrics().map(|m| m.offset_from_bottom),
+            Some(0),
+            "the pane's own PTY scrollback must not move"
+        );
+    }
+
+    /// The same wheel gesture over the transcript, just above the log zone,
+    /// keeps scrolling the pane's own PTY scrollback exactly as it always
+    /// has — only the log zone's own rows get the new behavior.
+    #[tokio::test]
+    async fn wheel_over_the_transcript_still_scrolls_the_pane() {
+        let (mut app, info) = app_with_rendered_claude_triview();
+        let pane_id = info.id;
+        for i in 0..20 {
+            app.state
+                .pane_command_log
+                .record(pane_id, format!("cmd {i}"));
+        }
+
+        let transcript_row = info.inner_rect.y;
+        let col = info.inner_rect.x + 2;
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, col, transcript_row));
+
+        assert_eq!(
+            app.state.pane_command_log_scroll.get(&pane_id).copied(),
+            None,
+            "a wheel over the transcript must not touch the log zone's own scroll"
+        );
     }
 
     #[test]

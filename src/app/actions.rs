@@ -3705,6 +3705,7 @@ impl AppState {
     fn handle_pane_died(&mut self, pane_id: PaneId) {
         self.pending_agent_notifications.remove(&pane_id);
         self.pane_command_log.remove(pane_id);
+        self.pane_command_log_scroll.remove(&pane_id);
         self.remove_plugin_pane_records([pane_id]);
         let ws_idx = self
             .workspaces
