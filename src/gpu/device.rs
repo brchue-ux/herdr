@@ -124,7 +124,7 @@ fn acquire() -> Option<Context> {
 /// server's, and the client that needs this has none — this parks until the
 /// waker says otherwise, which for a native backend means it never parks at
 /// all.
-pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
 

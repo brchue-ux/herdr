@@ -30,6 +30,10 @@
 //! composed none did not use one.
 
 mod combined;
+// The probe stands up a `wgpu` device of its own, so it exists only in a build
+// that has one to stand up.
+#[cfg(feature = "gpu-raster")]
+mod upload_churn;
 
 use std::time::{Duration, Instant};
 
@@ -65,9 +69,27 @@ pub(super) fn run_bench_command(args: &[String]) -> std::io::Result<i32> {
                 Ok(2)
             }
         },
+        #[cfg(feature = "gpu-raster")]
+        Some("upload-churn") => match upload_churn::parse(&args[1..]) {
+            Ok(options) => Ok(upload_churn::run(options)),
+            Err(message) => {
+                eprintln!("error: {message}");
+                eprintln!("{}", upload_churn::USAGE);
+                Ok(2)
+            }
+        },
+        #[cfg(not(feature = "gpu-raster"))]
+        Some("upload-churn") => {
+            eprintln!(
+                "error: this build has no gpu-raster feature, so there is no wgpu device to churn"
+            );
+            Ok(2)
+        }
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
             println!("{}", combined::USAGE);
+            #[cfg(feature = "gpu-raster")]
+            println!("{}", upload_churn::USAGE);
             Ok(0)
         }
         Some(other) => {

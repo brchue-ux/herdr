@@ -1,0 +1,239 @@
+name: Windows GPU probe
+
+# A lab, not a gate. Dispatch-only, on purpose and permanently.
+#
+# The Windows render-stall investigation (`herdr-windows-render-stall-20260822`)
+# ended with a leading hypothesis it could not test from Linux: Rio allocates a
+# fresh GPU texture for every one of Herdr's 13.9 idle image uploads per second
+# and drops the previous one, and on DX12 that churn goes through wgpu-hal's
+# suballocator down to a synchronous `ID3D12Device::CreateHeap` on the thread
+# drawing the window.
+#
+# That mechanism splits in two, and only one half needs a real GPU:
+#
+#   - Does steady mixed-size ~200 KB texture churn make the allocator keep
+#     asking for heaps? That is pure Rust above the driver
+#     (wgpu-hal/src/dx12/suballocation.rs, gpu-allocator/src/d3d12), so a
+#     software D3D12 adapter answers it faithfully. A flat series kills the
+#     hypothesis for free; a climbing one narrows it to a cost question.
+#   - What does a heap request COST on an AMD RDNA2 consumer driver? Nothing
+#     reachable from CI has that card. This workflow does not pretend otherwise.
+#
+# So: two measurements, both free, both on the `windows-latest` runner CI
+# already pays nothing for on a public repository.
+#
+#   1. `herdr bench cards` — prints the DX12 adapter the runner actually offers
+#      (settling by measurement whether it is WARP-only), and drives the real
+#      `src/gpu/bloom.rs` compute path including its unbounded
+#      `poll(wait_indefinitely())` readback on a real DX12 device.
+#   2. `herdr bench upload-churn` — replays the measured cadence through
+#      `create_texture`/drop and samples `Device::generate_allocator_report()`
+#      throughout, writing the series as an artifact.
+#
+# Nothing here runs on push or pull_request. Adding it to the always-on job
+# would put a quarter-hour lab in front of every commit for a question that is
+# asked once; the same reasoning that dropped the macOS leg
+# (`.github/workflows/ci.yml`) applies here in reverse.
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_seconds:
+        description: "Seconds to replay the upload cadence for (allocator growth needs minutes, not seconds)"
+        required: false
+        default: "900"
+      memory_hint:
+        description: "wgpu memory hint: performance = 256 MiB DX12 blocks (Rio's default), memory-usage = 8 MiB (herdr's own device)"
+        required: false
+        default: performance
+        type: choice
+        options:
+          - performance
+          - memory-usage
+          - both
+      gpu_backend:
+        description: "Which wgpu backend the probe should acquire"
+        required: false
+        default: dx12
+        type: choice
+        options:
+          - dx12
+          - auto
+          - vulkan
+      bench_frames:
+        description: "Timed frames per backend for `herdr bench cards`"
+        required: false
+        default: "200"
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  probe:
+    name: Windows GPU probe
+    runs-on: windows-latest
+    # A release build from cold plus up to two quarter-hour probes. Generous on
+    # purpose: this runs by hand, so a timeout here only ever costs a re-run.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # Same restore-key prefix as `check (windows-latest)` so this reuses the
+      # vendored libghostty-vt build that job already saved; its own primary key
+      # so the two never race to save the same entry.
+      - name: Restore Zig build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .zig-cache
+          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-${{ github.run_id }}-${{ github.run_attempt }}-gpu-probe
+          restore-keys: |
+            zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: windows-gpu-probe
+
+      # Free, and it is half of what §2.2 of the lab-options report could only
+      # infer: what display adapters this image actually has, and whether the
+      # redistributable WARP that wgpu's own CI installs is even needed here.
+      - name: Record the runner's graphics inventory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $out = "artifacts\runner-graphics.txt"
+          "runner image: $env:ImageOS / $env:ImageVersion" | Out-File -FilePath $out -Encoding utf8
+          "os: $([System.Environment]::OSVersion.VersionString)" | Out-File -FilePath $out -Encoding utf8 -Append
+          "user: $env:USERNAME" | Out-File -FilePath $out -Encoding utf8 -Append
+          "" | Out-File -FilePath $out -Encoding utf8 -Append
+          "== Win32_VideoController ==" | Out-File -FilePath $out -Encoding utf8 -Append
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion, DriverDate, AdapterCompatibility, VideoProcessor, AdapterRAM, Status |
+            Format-List | Out-File -FilePath $out -Encoding utf8 -Append
+          "== D3D / WARP runtime present ==" | Out-File -FilePath $out -Encoding utf8 -Append
+          foreach ($dll in @("d3d12.dll", "d3d12core.dll", "d3d10warp.dll", "dxgi.dll", "dxcompiler.dll")) {
+            $path = Join-Path $env:SystemRoot "System32\$dll"
+            if (Test-Path $path) {
+              $version = (Get-Item $path).VersionInfo.FileVersion
+              "$dll present, version $version" | Out-File -FilePath $out -Encoding utf8 -Append
+            } else {
+              "$dll ABSENT" | Out-File -FilePath $out -Encoding utf8 -Append
+            }
+          }
+          Get-Content $out
+
+      - name: Build Herdr (release)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "release build failed with exit code $LASTEXITCODE" }
+
+      # Increment A. One command, and it turns three inferences into
+      # measurements: the adapter line is the runner's real DX12 adapter, the
+      # gpu column is `src/gpu/bloom.rs` on a real DX12 device (readback and
+      # all), and the speedup line is the first CPU-vs-GPU number this code has
+      # ever had on Windows.
+      - name: Bench card rasterisation (CPU vs GPU on a real DX12 device)
+        shell: pwsh
+        # Dispatch inputs reach PowerShell as environment variables rather than
+        # as expanded template text: `bench_frames` and `probe_seconds` are free
+        # strings, and interpolating a free string into a script body is how a
+        # workflow input becomes a command. The `||` fallbacks restate the
+        # declared defaults so the steps are still runnable from an event that
+        # carries no `inputs` context.
+        env:
+          BENCH_FRAMES: ${{ inputs.bench_frames || '200' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:BENCH_FRAMES -notmatch '^[0-9]+$') {
+            throw "bench_frames must be a whole number, not '$env:BENCH_FRAMES'"
+          }
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $exe = Join-Path $PWD "target\x86_64-pc-windows-msvc\release\herdr.exe"
+          & $exe bench cards --backend both --frames $env:BENCH_FRAMES |
+            Tee-Object -FilePath artifacts\bench-cards.txt
+          if ($LASTEXITCODE -ne 0) { throw "herdr bench cards failed with exit code $LASTEXITCODE" }
+
+      # Increment B. The falsification test: if reserved bytes and block count
+      # sit still across a quarter of an hour of the real cadence while this
+      # probe's own live texture count stays flat, allocator growth is not the
+      # mechanism and no Windows lab is needed for it.
+      - name: Probe allocator growth under herdr's idle upload cadence
+        shell: pwsh
+        env:
+          PROBE_SECONDS: ${{ inputs.probe_seconds || '900' }}
+          MEMORY_HINT: ${{ inputs.memory_hint || 'performance' }}
+          GPU_BACKEND: ${{ inputs.gpu_backend || 'dx12' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:PROBE_SECONDS -notmatch '^[0-9]+$') {
+            throw "probe_seconds must be a whole number, not '$env:PROBE_SECONDS'"
+          }
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $exe = Join-Path $PWD "target\x86_64-pc-windows-msvc\release\herdr.exe"
+          $hints = if ($env:MEMORY_HINT -eq "both") {
+            @("performance", "memory-usage")
+          } else {
+            @($env:MEMORY_HINT)
+          }
+          foreach ($hint in $hints) {
+            Write-Host "=== upload-churn, memory hint $hint ==="
+            & $exe bench upload-churn `
+              --seconds $env:PROBE_SECONDS `
+              --sample-seconds 5 `
+              --memory-hint $hint `
+              --gpu-backend $env:GPU_BACKEND `
+              --out "artifacts\upload-churn-$hint.csv" |
+              Tee-Object -FilePath "artifacts\upload-churn-$hint.txt"
+            if ($LASTEXITCODE -ne 0) {
+              throw "herdr bench upload-churn ($hint) failed with exit code $LASTEXITCODE"
+            }
+          }
+
+      # A failed probe is still evidence, so this runs either way.
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-gpu-probe
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Summarise
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $summary = $env:GITHUB_STEP_SUMMARY
+          "## Windows GPU probe" | Out-File -FilePath $summary -Encoding utf8 -Append
+          "" | Out-File -FilePath $summary -Encoding utf8 -Append
+          foreach ($file in @("artifacts\bench-cards.txt", "artifacts\upload-churn-performance.txt", "artifacts\upload-churn-memory-usage.txt")) {
+            if (Test-Path $file) {
+              "### $(Split-Path -Leaf $file)" | Out-File -FilePath $summary -Encoding utf8 -Append
+              '```' | Out-File -FilePath $summary -Encoding utf8 -Append
+              Get-Content $file | Out-File -FilePath $summary -Encoding utf8 -Append
+              '```' | Out-File -FilePath $summary -Encoding utf8 -Append
+            }
+          }

@@ -882,6 +882,31 @@ fn bench_command() -> Command {
                 .arg(option("cell-width", "PX").help("Host cell width in pixels"))
                 .arg(option("cell-height", "PX").help("Host cell height in pixels")),
         )
+        .subcommand(
+            Command::new("upload-churn")
+                .about("Replay the idle image-upload cadence and watch the GPU allocator")
+                .arg(option("seconds", "N").help("How long to run"))
+                .arg(option("sample-seconds", "N").help("Seconds between allocator samples"))
+                .arg(option("rate", "PER_SEC").help("Whole-surface uploads per second"))
+                .arg(option("cards", "N").help("Card surfaces beside the signal tray"))
+                .arg(option("card-size", "WxH").help("Card surface size in pixels"))
+                .arg(option("tray-size", "WxH").help("Signal tray surface size in pixels"))
+                .arg(
+                    option("memory-hint", "HINT")
+                        .value_parser(["performance", "memory-usage"])
+                        .help("Memory block size policy to ask wgpu for"),
+                )
+                .arg(
+                    option("gpu-backend", "BACKEND")
+                        .value_parser(["auto", "dx12", "vulkan", "gl", "metal"])
+                        .help("Which wgpu backend to acquire"),
+                )
+                .arg(
+                    option("out", "PATH")
+                        .value_hint(ValueHint::AnyPath)
+                        .help("Write the sample series to this CSV"),
+                ),
+        )
 }
 
 fn integration_command() -> Command {
