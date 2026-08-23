@@ -30,6 +30,19 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
 // through the unmodified `TerminalRuntime::render` path below: an explicit
 // branch on agent identity and pane state, never an accident of detection
 // quietly returning nothing.
+//
+// # Why this is not gated on `Mode::Terminal`
+//
+// It used to be, and that made the split a thing you had to be *typing into*
+// a pane to see. `AppState` starts in `Mode::Navigate`, and every overlay —
+// a context menu, the settings screen, the navigator — leaves `Terminal`
+// too, so the unmodified full-pane render was the steady state and the split
+// was the exception. The zones are a property of what the pane is showing,
+// not of where the keyboard is pointed, so the only mode still excluded is
+// `Mode::Copy`: copy mode's selection maps buffer rows straight onto grid
+// rows, and a split that has shifted the transcript would hand back the
+// wrong text. See `render_panes`'s own selection guard, which turns on the
+// same fact rather than on the split merely being active.
 
 /// Most rows the bottom command-log zone is ever given, whatever else is on
 /// screen. The zone is a glance at what the agent has been running, not a
@@ -60,11 +73,10 @@ fn should_attempt_claude_triview(
     app: &AppState,
     ws_idx: usize,
     info: &PaneInfo,
-    terminal_active: bool,
     rt: &TerminalRuntime,
 ) -> bool {
     info.is_focused
-        && terminal_active
+        && app.mode != Mode::Copy
         && info.inner_rect.height >= MIN_TRIVIEW_PANE_ROWS
         && !pane_is_scrolled_back(rt)
         && pane_detected_agent(app, ws_idx, info.id) == Some(crate::detect::Agent::Claude)
@@ -516,7 +528,7 @@ pub(super) fn render_panes(
                 && !pane_is_scrolled_back(rt)
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
 
-            let triview = should_attempt_claude_triview(app, ws_idx, info, terminal_active, rt)
+            let triview = should_attempt_claude_triview(app, ws_idx, info, rt)
                 .then(|| {
                     // Asked for, not reserved: the rows come out of the
                     // transcript's own top and the split grants what it can.
@@ -551,11 +563,22 @@ pub(super) fn render_panes(
             }
 
             // Selection and copy-mode search highlighting assume the drawn
-            // grid maps linearly onto `info.inner_rect`, which the composer
-            // zone above no longer does once its border chrome is cropped
-            // out. Skipped here rather than drawn wrong; revisit if triview
-            // panes need mouse selection.
-            if triview.is_none() {
+            // grid maps linearly onto `info.inner_rect`. A triview pane still
+            // does whenever `transcript_skip` is zero: the two cropped border
+            // rows are replaced in place by this module's own dividers, so
+            // every pane row — transcript, composer body, and the agent's
+            // footer alike — is still the grid row of the same index. Only
+            // the log zone breaks that, by shifting the transcript up off the
+            // top of the grid, and only then is highlighting skipped rather
+            // than drawn wrong.
+            //
+            // Gating on the shift and not on the split being active at all
+            // matters now that the split is the steady state rather than a
+            // `Mode::Terminal`-only path: keying it the old way would have
+            // silently taken mouse selection away from every focused Claude
+            // pane.
+            let rows_shifted = triview.is_some_and(|layout| layout.transcript_skip > 0);
+            if !rows_shifted {
                 let (copy_search_top, copy_search_bottom, copy_search_matches) =
                     validated_copy_mode_search_matches(app, info, rt);
                 render_copy_mode_search_highlights(
@@ -1176,10 +1199,15 @@ mod tests {
         assert_eq!(pane_detected_agent(&app, 0, bogus_pane), None);
     }
 
+    /// The split follows what the pane is showing, not where the keyboard is
+    /// pointed. `AppState::test_new()` starts in `Mode::Navigate` and this
+    /// deliberately leaves it there: a test that set `Mode::Terminal` first
+    /// would pass just as well against the old gate that made the split
+    /// invisible everywhere else.
     #[tokio::test]
-    async fn should_attempt_claude_triview_requires_focus_terminal_mode_and_claude_agent() {
+    async fn should_attempt_claude_triview_engages_outside_terminal_mode() {
         let mut app = AppState::test_new();
-        app.mode = Mode::Terminal;
+        assert_eq!(app.mode, Mode::Navigate, "the mode a captain idles in");
 
         let ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -1204,13 +1232,23 @@ mod tests {
             borders: Borders::NONE,
             is_focused: true,
         };
-        assert!(should_attempt_claude_triview(
-            &app,
-            0,
-            &focused_info,
-            true,
-            &rt
-        ));
+        assert!(should_attempt_claude_triview(&app, 0, &focused_info, &rt));
+
+        // Typing into the pane must not be what turns it on, but must not
+        // turn it off either.
+        app.mode = Mode::Terminal;
+        assert!(should_attempt_claude_triview(&app, 0, &focused_info, &rt));
+
+        // An overlay is drawn over the pane, not instead of it: a context
+        // menu used to drop the whole pane back to the unmodified render.
+        app.mode = Mode::ContextMenu;
+        assert!(should_attempt_claude_triview(&app, 0, &focused_info, &rt));
+
+        // Copy mode is the one exception — its selection reads buffer rows
+        // as grid rows.
+        app.mode = Mode::Copy;
+        assert!(!should_attempt_claude_triview(&app, 0, &focused_info, &rt));
+        app.mode = Mode::Navigate;
 
         // Not focused: no other pane should ever get the special treatment.
         let mut unfocused_info = focused_info.clone();
@@ -1219,28 +1257,12 @@ mod tests {
             &app,
             0,
             &unfocused_info,
-            true,
-            &rt
-        ));
-
-        // Not in terminal mode.
-        assert!(!should_attempt_claude_triview(
-            &app,
-            0,
-            &focused_info,
-            false,
             &rt
         ));
 
         // Too short a pane to bother.
         focused_info.inner_rect.height = MIN_TRIVIEW_PANE_ROWS - 1;
-        assert!(!should_attempt_claude_triview(
-            &app,
-            0,
-            &focused_info,
-            true,
-            &rt
-        ));
+        assert!(!should_attempt_claude_triview(&app, 0, &focused_info, &rt));
     }
 
     fn triview_pane_info(pane_id: PaneId, height: u16) -> PaneInfo {
@@ -1305,6 +1327,58 @@ mod tests {
             );
             assert_ne!(buffer[(0, row)].symbol(), "●");
         }
+    }
+
+    /// The terminal zone's own rows never read as a diff.
+    ///
+    /// `+`/`-` change text belongs exclusively to the Changes pane
+    /// ([`crate::ui::diff_pane`], which draws into `view.diff_area` — a
+    /// sibling of the terminal area, never a subrect of it). This module is
+    /// the only other writer into a pane's rows, so it is where that could
+    /// break: the log renders arbitrary agent-supplied command text, and a
+    /// command like `git apply` can carry a leading `+` or `-` of its own.
+    ///
+    /// The `● ` gutter is what keeps it honest — every log row starts with
+    /// the bullet, so no row this draws can ever be mistaken for a hunk line.
+    /// Asserted against command text chosen to look exactly like one.
+    #[test]
+    fn the_terminal_zone_never_draws_a_line_that_reads_as_a_diff_hunk() {
+        let mut app = AppState::test_new();
+        let pane_id = PaneId::from_raw(1);
+        // Real commands whose own text is diff-shaped.
+        app.pane_command_log
+            .record(pane_id, "-- git apply".to_string());
+        app.pane_command_log
+            .record(pane_id, "+++ b/src/main.rs".to_string());
+        let info = triview_pane_info(pane_id, 12);
+        let layout = crate::pane::ClaudeTriviewLayout {
+            transcript_skip: 2,
+            transcript_rows: 5,
+            composer_rows: 1,
+            log_rows: 2,
+            footer_rows: 2,
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| render_claude_triview_chrome(&app, frame, &info, layout))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for row in 0..12 {
+            let text: String = (0..40).map(|x| buffer[(x, row)].symbol()).collect();
+            let first = text.trim_start().chars().next().unwrap_or(' ');
+            assert!(
+                !matches!(first, '+' | '-'),
+                "row {row} ({text:?}) reads as a diff hunk;                  +/- text belongs only in the Changes pane"
+            );
+        }
+        // The command text is still shown — the gutter, not censorship, is
+        // what separates it from a hunk.
+        let log_row: String = (0..40).map(|x| buffer[(x, 9)].symbol()).collect();
+        assert!(log_row.contains("+++ b/src/main.rs"), "got {log_row:?}");
+        assert_eq!(buffer[(0, 9)].symbol(), "●");
     }
 
     /// The zone is exactly the rows the split granted, never the rest of the

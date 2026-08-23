@@ -1,0 +1,8 @@
+onboarding = false
+
+[ui]
+sidebar_width = 26
+mouse_capture = true
+# The fixed three-zone layout normally needs 300 content columns; the lab
+# window is narrower, and the folded popup would not show the zone in place.
+diff_zone_width_threshold = 100
