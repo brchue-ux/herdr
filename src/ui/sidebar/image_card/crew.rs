@@ -505,21 +505,36 @@ fn draw_row(
 /// its title, at one size and always at full strength. This one is smaller and
 /// carries the tier, so it takes both as arguments rather than being a second
 /// copy of that function with the constants changed.
+///
+/// # Why the halo is sampled well past itself
+///
+/// Because a Gaussian cut off where it is still visible is a *square*, and at
+/// this size that is what a reader sees: the dot's own glow reaching the edge of
+/// the box it was sampled in at about a third of an alpha and stopping dead. Live
+/// capture, not arithmetic — the first lab screenshot of this list has a bright
+/// rounded rectangle around every full-strength dot. The box now runs to three
+/// sigmas, where the falloff is under a 255th and the edge is nothing to see.
+///
+/// The second half of the same failure is the boundary: a pixel the disc only
+/// partly covers used to take its fill and *skip* the glow, so it came out darker
+/// than the halo around it and the dot wore a dark ring. The glow is laid over
+/// the fill at `1 - fill` instead, which is the same number the disc did not use.
 fn draw_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, presence: f32, opacity: f32) {
     let ink = measured::STROKE_A;
     // A dimmed row draws no glow at all, per the mockup's `box-shadow: none`:
     // the glow is what makes a dot read as lit, and a lit dot at a lower alpha
     // is a dim light rather than a light that is not this row's.
-    let glow_radius = if presence >= 1.0 {
-        radius * 2.0
+    let lit = presence >= 1.0;
+    let sigma = (radius * GLOW_SIGMA_MUL).max(0.5);
+    let reach = if lit {
+        radius + sigma * GLOW_REACH_SIGMAS
     } else {
         radius
     };
-    let glow_sigma = (glow_radius - radius).max(0.5);
-    let x0 = (center.0 - glow_radius).floor().max(0.0) as u32;
-    let y0 = (center.1 - glow_radius).floor().max(0.0) as u32;
-    let x1 = ((center.0 + glow_radius).ceil() as u32).min(sheet.width());
-    let y1 = ((center.1 + glow_radius).ceil() as u32).min(sheet.height());
+    let x0 = (center.0 - reach).floor().max(0.0) as u32;
+    let y0 = (center.1 - reach).floor().max(0.0) as u32;
+    let x1 = ((center.0 + reach).ceil() as u32).min(sheet.width());
+    let y1 = ((center.1 + reach).ceil() as u32).min(sheet.height());
     for y in y0..y1 {
         let py = y as f32 + 0.5;
         for x in x0..x1 {
@@ -528,18 +543,32 @@ fn draw_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, presence: f32, 
             let fill = coverage(d);
             if fill > 0.0 {
                 sheet.blend(x, y, ink, fill * presence * opacity);
+            }
+            if !lit || fill >= 1.0 {
                 continue;
             }
-            if glow_radius <= radius {
-                continue;
-            }
-            let glow = (-(d * d) / (2.0 * glow_sigma * glow_sigma)).exp() * 0.6;
+            // Laid over whatever the disc did not cover, so the boundary is one
+            // ramp rather than two effects meeting at a seam.
+            let glow = (-(d.max(0.0).powi(2)) / (2.0 * sigma * sigma)).exp()
+                * GLOW_PEAK_ALPHA
+                * (1.0 - fill);
             if glow > 0.001 {
                 sheet.blend(x, y, ink, glow * opacity);
             }
         }
     }
 }
+
+/// The halo's width, as a multiple of the dot's own radius — the mockup's
+/// `box-shadow: 0 0 5px` against its `4.5px` dot.
+const GLOW_SIGMA_MUL: f32 = 0.9;
+
+/// How far the halo is sampled, in sigmas. Past three the falloff is under a
+/// 255th of an alpha and the box's own edge has nothing to show.
+const GLOW_REACH_SIGMAS: f32 = 3.0;
+
+/// The halo's alpha at the disc's own edge — the mockup's `rgba(90,209,255,0.6)`.
+const GLOW_PEAK_ALPHA: f32 = 0.6;
 
 #[cfg(test)]
 mod tests {
@@ -616,6 +645,89 @@ mod tests {
                 arrival.open
             );
         }
+    }
+
+    /// **A lit dot's halo is round, and reaches nothing.**
+    ///
+    /// Two failures at once, both found on a live capture rather than in
+    /// arithmetic. A Gaussian sampled only as far as it is still bright is a
+    /// *square*: the first lab screenshot of this list has a hard-edged
+    /// rectangle of glow around every full-strength dot. And a pixel the disc
+    /// only partly covered used to take that fill and skip the glow, so it came
+    /// out darker than the halo around it and the dot wore a dark ring.
+    ///
+    /// Measured on the dot alone, on an empty canvas, so nothing else on a card
+    /// can be mistaken for it: points at one radius must agree, whatever
+    /// direction they are in, and far enough out there must be nothing at all.
+    #[test]
+    fn a_lit_dot_has_a_round_halo_that_reaches_nothing() {
+        let mut sheet = Canvas::new(60, 60);
+        let radius = 2.7;
+        draw_dot(&mut sheet, (30.0, 30.0), radius, 1.0, 1.0);
+        let px = sheet.rgba8();
+        let alpha = |dx: i32, dy: i32| {
+            let x = (30 + dx) as u32;
+            let y = (30 + dy) as u32;
+            px[((y * 60 + x) * 4 + 3) as usize]
+        };
+
+        // **Round, measured as a ring.** Every pixel at one radius from the
+        // centre should carry one alpha. A Gaussian does that; a Gaussian
+        // clipped to its own bounding box does not — the part of the ring
+        // outside the box reads zero while the part inside it is still lit, and
+        // that discontinuity *is* the square edge a reader sees.
+        //
+        // The tolerance is not zero because a ring of whole pixels is not a
+        // circle: `draw_dot` samples pixel centres, so the band admits a
+        // quarter-pixel of real radius and the falloff across that is a few
+        // 255ths. The clip's own discontinuity is an order of magnitude more —
+        // it spans the whole halo, from lit to nothing.
+        let ring: Vec<u8> = (0..60)
+            .flat_map(|y| (0..60).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let d =
+                    ((*x as f32 + 0.5 - 30.0).powi(2) + (*y as f32 + 0.5 - 30.0).powi(2)).sqrt();
+                (6.9..=7.15).contains(&d)
+            })
+            .map(|(x, y)| px[((y * 60 + x) * 4 + 3) as usize])
+            .collect();
+        assert!(!ring.is_empty(), "the fixture sampled no ring at all");
+        let (low, high) = (
+            ring.iter().copied().min().unwrap_or(0),
+            ring.iter().copied().max().unwrap_or(0),
+        );
+        assert!(
+            high - low <= 6,
+            "the halo is not round: one radius spans {low}..={high}, which is a \
+             Gaussian cut off at the edge of its own box"
+        );
+        assert!(high > 0, "there is no halo to be round");
+
+        // The disc is solid, the ring just outside it is lit, and far out there
+        // is nothing — a monotone falloff with no moat in it.
+        assert_eq!(alpha(0, 0), 255, "the disc is not solid");
+        assert!(alpha(3, 0) > 0, "the ring outside the disc is unlit");
+        assert!(
+            alpha(3, 0) > alpha(7, 0),
+            "the halo does not fall off: {} then {}",
+            alpha(3, 0),
+            alpha(7, 0)
+        );
+        assert_eq!(
+            alpha(20, 0),
+            0,
+            "the halo is still lit past its own falloff"
+        );
+
+        // A dimmed row draws the disc and no halo at all.
+        let mut dim = Canvas::new(60, 60);
+        draw_dot(&mut dim, (30.0, 30.0), radius, VIA_MATE_PRESENCE, 1.0);
+        let dim = dim.rgba8();
+        assert_eq!(
+            dim[((30 * 60 + 33) * 4 + 3) as usize],
+            0,
+            "a dimmed row lit a halo the mockup gives it none of"
+        );
     }
 
     /// A second mate's row is dimmer *and* stepped in — one signal said twice,
