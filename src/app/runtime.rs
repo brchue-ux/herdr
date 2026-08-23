@@ -1348,17 +1348,22 @@ impl App {
         {
             self.state.machine_corner_key = 0;
             self.state.machine_corner_rgba = None;
-            return self.state.machine_corner_layer.take().is_some();
+            // Not an absence to report either: nothing is drawing this corner at all, so there is
+            // no blank box for a reason to explain. See `Self::note_corner_absence`.
+            let noted = self.note_corner_absence(None);
+            return self.state.machine_corner_layer.take().is_some() || noted;
         }
 
-        let register = &self.state.machine_register;
         // F21: absent is absent. A stalled or unsupported register draws nothing at all rather
         // than holding its last picture on screen as though it were current.
-        if register.absence(now).is_some() {
+        let absence = self.state.machine_register.absence(now);
+        let noted = self.note_corner_absence(absence);
+        if absence.is_some() {
             self.state.machine_corner_key = 0;
             self.state.machine_corner_rgba = None;
-            return self.state.machine_corner_layer.take().is_some();
+            return self.state.machine_corner_layer.take().is_some() || noted;
         }
+        let register = &self.state.machine_register;
 
         // Everything the drawn corner depends on, folded into one number — the same shape
         // `background_scene_key` uses, and for the same reason: rendering on a timer and diffing
@@ -1372,7 +1377,7 @@ impl App {
             hasher.finish().max(1)
         };
         if key == self.state.machine_corner_key && self.state.machine_corner_layer.is_some() {
-            return false;
+            return noted;
         }
 
         let corner = crate::solar_system::MachineCorner {
@@ -1383,13 +1388,19 @@ impl App {
             cores: register.cores().iter().map(|core| core.current()).collect(),
         };
 
-        let width = u32::from(rect.width) * cell.width_px;
-        let height = u32::from(rect.height) * cell.height_px;
-        let rgba = crate::solar_system::machine_corner_frame(&corner, width, height);
+        let layout = crate::solar_system::MachineCornerLayout::new(rect.width, rect.height);
+        let width = layout.width_px(cell.width_px);
+        let height = layout.height_px(cell.height_px);
+        let rgba = crate::solar_system::machine_corner_frame(
+            &corner,
+            &layout,
+            cell.width_px,
+            cell.height_px,
+        );
         let png = crate::solar_system::encode_rgba_png(width, height, &rgba);
         if png.is_empty() {
             self.state.machine_corner_rgba = None;
-            return self.state.machine_corner_layer.take().is_some();
+            return self.state.machine_corner_layer.take().is_some() || noted;
         }
 
         self.state.machine_corner_key = key;
@@ -1412,6 +1423,27 @@ impl App {
             },
         ));
         true
+    }
+
+    /// Record why the corner is blank, so the cells over it can say so.
+    ///
+    /// The picture cannot explain its own absence — an empty box and a box that is not there are
+    /// the same rectangle of sky — and that is precisely what the corner's words are for. The
+    /// reason is settled here, on the tick that has a clock, rather than in `crate::ui`, which
+    /// draws from `&AppState` and must not read one.
+    ///
+    /// [`crate::machine_register::Absence::Unsupported`] is deliberately **not** recorded.
+    /// It is not a corner waiting to come back: this build reads no host state on that platform
+    /// and never will within the session, so a permanent note saying so would put a surface over
+    /// the sky where today there is none, on every machine that is not Linux. The three recoverable
+    /// absences resolve on their own and are worth a line while they last.
+    ///
+    /// Returns whether the note changed, so a caller can arm a repaint for it.
+    fn note_corner_absence(&mut self, absence: Option<crate::machine_register::Absence>) -> bool {
+        let note = absence
+            .filter(|absence| !matches!(absence, crate::machine_register::Absence::Unsupported));
+        let was = std::mem::replace(&mut self.state.machine_corner_absence, note);
+        was != note
     }
 
     /// Advance every body's orbit-track wear, and forget the bodies that have left.

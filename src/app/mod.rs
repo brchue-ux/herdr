@@ -896,6 +896,7 @@ impl App {
             pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
+            machine_corner_absence: None,
             machine_corner_rgba: None,
             orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
             ambient_motes: crate::app::background_scene::AmbientMotes::default(),
