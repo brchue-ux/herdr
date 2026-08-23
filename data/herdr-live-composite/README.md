@@ -71,7 +71,7 @@ refresh, on a 1.5 s cadence and off-thread, landing on a client that is already
 up and drawing — so "something is on screen" is a readiness signal for painting
 and says nothing about whether the surface under test has begun animating. A
 capture started there can spend its first pairs on a genuinely static warm-up,
-out of a budget of seven of which five must move.
+out of a judged window of which most must move.
 
 Measured: over eight runs against one stable base, one failed 4/7 with three
 0 px pairs followed by four moving ones (run 31272863267) — a working tray,
@@ -92,10 +92,9 @@ so for about two seconds the animation is genuinely running and every pair still
 measures **0 px** against a per-channel floor of 24. There is nothing left to
 wait for — the fade-in *is* the animation — so no readiness signal can fix it.
 
-Hence the other half: capture runs to **12 frames** and `--tail-pairs 7` takes
-the verdict from the last seven, printing the earlier ones marked
-`(warm-up, not judged)`. The assertion stays exactly as strict as it was, 5 of
-7, on a window now guaranteed to sit past the fade rather than straddling it.
+Hence the other half: capture runs past the fade and `--tail-pairs` takes the
+verdict from a trailing window, printing the earlier pairs marked
+`(warm-up, not judged)`.
 
 Neither half can hide the defect it sits in front of. The gate warns on timeout
 and captures anyway, so a tray that never moves is still reported by the
@@ -103,6 +102,74 @@ assertion with its numbers. And the tail window is where a freeze is *most*
 visible: a tray that animates and then stops — the #97 shape exactly — freezes
 inside the judged pairs, which is checked against real frames rather than
 asserted.
+
+### The window is sized for the beat, not for the fade
+
+Both mitigations above answer a *transient*: something that happens once, at the
+start, and is over. The failures that kept arriving after them were not that
+shape, and the reason took 154 measured pairs per pass to see.
+
+A lit badge snaps and settles on `BADGE_CHARGE_PERIOD` — 2,660 ms — and a
+resting one breathes over 5,880 ms. Sampling a 2.66 s cycle every 0.6 s advances
+0.226 of a turn per frame, so the samples walk around the cycle rather than
+landing on it, and re-enter the slow part of the waveform every four to five
+frames. There the whole badge layer moves by less than the 24-per-channel floor:
+the pair measures 10-12 px against a 25 px floor and reads STILL while the
+surface is animating perfectly.
+
+That it is a beat and not a warm-up is what the pair positions say. Over the
+fourteen most recent runs, the `on` pass put its still pairs at positions 1, 6
+and 11 — 10, 9 and 7 times respectively — with a gap of five in 11 of 27
+intervals. A transient loads the head; this repeats forever.
+
+| | moving | still | beat period | worst 7-pair window |
+|---|---|---|---|---|
+| `off` | 85.7% | 14.3% | 4 frames | 5 of 7 |
+| `on` | 73.4% | 26.6% | 5 frames | **3 of 7** |
+
+The `on` pass is the compressed one: the badge swing composites over a lit
+background, so the same animation clears the floor on fewer pixels. Its
+structural rate is 73.4%, and the threshold it was being judged against was 5 of
+7 — **71.4%**. A threshold sitting on a surface's own duty cycle is not
+strictness, it is a coin toss, and the tail windows say so. Those fourteen runs
+scored 3, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6 out of 7 on the `on` pass: nine
+landed exactly on the line with no margin at all, and the first one to land a
+trough in the judged window twice went red on a build whose tray was fine.
+
+That build is the control, because it was re-run unchanged. Run 32616990497 on
+commit `c189d70b` scored **3 of 7** and went red; re-run on the same commit,
+same runner image, same kitty, it scored **5 of 7** and went green — straight
+back onto the line. Nothing between the two runs but which phase of the badge
+cycle the capture happened to start on.
+
+Repositioning a seven-pair window inside an eleven-pair capture cannot escape a
+trough that returns every five pairs. Lengthening it can, because a beat with a
+fixed duty cycle averages out over a window longer than its period. Measured
+worst case over *every* window of each length on the `on` pass:
+
+    3/7  ->  4/8  ->  5/9  ->  6/10  ->  7/11
+
+So capture runs to **18 frames** and `--tail-pairs 12` takes the verdict from
+the last twelve — past two full beats on either pass.
+
+The threshold on that window comes from a stated margin rule rather than from
+taste: **two pairs below the worst window a healthy tray has ever produced.**
+The worst measured is 63.6% — 7 of 11, `on` pass — which over twelve pairs is
+7.6, so the line is **6 of 12**. Every recorded window of nine pairs or more, on
+either pass, clears it: the worst are 5/9, 6/10 and 7/11 against a 50% line.
+
+Six of twelve is not weak where it matters. A frozen tray scores 0. A tray that
+animates and then stops reaches six only if every pair before the freeze moved,
+and on a surface whose own duty cycle is 73.4% six clean pairs in a row is a
+one-in-seven event — the other six times in seven it goes red. A tray frozen for
+the last two thirds of the window cannot pass at all. The old 5-of-7 rule was no
+better on that axis, and much worse on the one that was actually firing.
+
+The tempting fix is the wrong one. Dropping `--level` so the compressed swing
+clears it would work on the numbers and destroy the assertion: on a still pair
+the background scene alone already contributes 10-12 px inside the tray region,
+so a lower floor buys a tray assertion that a moving *background* satisfies on
+its own. Window length is the axis that cannot go vacuous.
 
 ## The detectors prove they can fail, first
 

@@ -28,16 +28,70 @@ NS="${HERDR_NS:-herdr-dev}"
 ROOT="${CAPTURE_ROOT:-/tmp/herdr-composite-$BG}"
 OUT="${COMPOSITE_OUT:-$HERE/proof/$BG}"
 DISP="${COMPOSITE_DISPLAY:-:97}"
-# Twelve rather than eight. The tray's pulse opens on an amplitude envelope, so
-# the first pairs after capture starts can measure a real animation that is
-# still too small to clear any floor worth setting; `--tail-pairs` below takes
-# the verdict from the last seven, and these four are the headroom that leaves.
-FRAMES="${FRAMES:-12}"
+# Eighteen rather than twelve. Two separate things eat into a capture, and the
+# frame budget has to cover both.
+#
+# The first is the fade-in `--tail-pairs` was added for: the tray's pulse opens
+# on an amplitude envelope, so the pairs right after capture starts can measure
+# a real animation that is still too small to clear any floor worth setting.
+#
+# The second is a *beat*, and it is the one that has actually been failing runs.
+# A lit badge snaps and settles on `BADGE_CHARGE_PERIOD` — 2,660 ms — and a
+# resting one breathes over 5,880 ms. Sampling a 2.66 s cycle every 0.6 s
+# advances 0.226 of a turn per frame, so the samples walk slowly around the
+# cycle and re-enter the slow part of the waveform every four to five frames.
+# In that part the whole badge layer moves by less than the 24-per-channel
+# floor: the pair measures 10-12 px against a 25 px floor and reads STILL while
+# the surface is animating perfectly.
+#
+# Measured across the fourteen most recent runs, 154 pairs per pass:
+#
+#             moving   still   beat period   worst 7-pair window
+#   off       85.7%    14.3%   4 frames      5 of 7
+#   on        73.4%    26.6%   5 frames      3 of 7
+#
+# The `on` pass is the compressed one: the badge swing composites over a lit
+# background, so the same animation clears the floor on fewer pixels. Its
+# structural rate is 73.4% and the threshold it was being judged against was
+# 5 of 7 — 71.4%. A threshold sitting on a surface's own duty cycle is not
+# strictness, it is a coin toss, and the tail windows say so: over those
+# fourteen runs the `on` pass scored 3,5,5,5,5,5,5,5,5,5,6,6,6,6 out of 7.
+# Nine landed exactly on the line with no margin at all.
+#
+# The tempting fix — drop `--level` so the compressed swing clears it — is the
+# wrong one. On a still pair the background scene alone already contributes
+# 10-12 px inside the tray region, so a lower floor buys a tray assertion that
+# a moving *background* can satisfy on its own. That is the vacuous-check
+# failure mode this rig exists to avoid.
+#
+# Widening the judged window is the axis that is safe, because a beat with a
+# fixed duty cycle averages out over a longer window instead of being sampled
+# seven pairs at a time. Measured worst case over every window of each length,
+# `on` pass: 3/7, 4/8, 5/9, 6/10, 7/11 — a clean monotone rise as the window
+# grows past the beat period.
+FRAMES="${FRAMES:-18}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-0.6}"
-# How many trailing pairs the tray verdict is taken from. Seven keeps the
-# assertion exactly as strict as it was — 5 of 7 — on a window that is now
-# guaranteed to sit past the fade-in rather than straddling it.
-TRAY_JUDGED_PAIRS="${TRAY_JUDGED_PAIRS:-7}"
+# How many trailing pairs the tray verdict is taken from. Twelve is past two
+# full beats on either pass, which is what stops the phase the capture happened
+# to start on from deciding the verdict. The five pairs it leaves in front are
+# the fade-in headroom, one more than before.
+TRAY_JUDGED_PAIRS="${TRAY_JUDGED_PAIRS:-12}"
+# What the tray has to clear on that window, set by a stated margin rule rather
+# than by taste: two pairs below the worst window a healthy tray has ever
+# produced. The worst measured is 63.6% — 7 of 11, `on` pass — which over
+# twelve pairs is 7.6, so six.
+#
+# Six of twelve is not weak where it matters. A frozen tray scores 0. A tray
+# that animates and then stops — #97 exactly — reaches six only if every single
+# pair before the freeze moved, and on a surface whose own duty cycle is 73.4%
+# six clean pairs in a row is a one-in-seven event; the other six times in
+# seven it goes red. A tray frozen for the last two thirds cannot pass at all.
+# The old 5-of-7 rule was no better on that axis and much worse on the other.
+#
+# Deliberately its own knob rather than the live pane's `MIN_PAIRS`. The control
+# below runs at 100% of pairs on every recorded run; the tray does not, and one
+# shared number would have to be set for whichever is tighter.
+TRAY_MIN_PAIRS="${TRAY_MIN_PAIRS:-6}"
 export LAB_TMP="$ROOT"
 
 # Resolved once, because the warm-up gate below and the tray assertion at the
@@ -345,12 +399,14 @@ echo "=================== ASSERTIONS (BACKGROUND=$BG) ==================="
 #
 # The floor is calibrated against a real run, not guessed: eight badges breathing
 # move 74-75 px per 0.6 s pair, and did so on 7 of 7 pairs. 25 is comfortably
-# above nothing and far below the real signal, so a freeze is unambiguous.
+# above nothing and far below the real signal, so a freeze is unambiguous. What
+# it does *not* do is clear the badge waveform's own slow region, which is what
+# `TRAY_JUDGED_PAIRS` and `TRAY_MIN_PAIRS` above are sized for.
 python3 "$HERE/assert_motion.py" "$OUT"/frame-*.png \
   --region "$TRAY_REGION" \
   --label "signal tray badges" \
   --min-changed-px "$TRAY_MIN_PX" \
-  --min-active-pairs "${MIN_PAIRS:-5}" \
+  --min-active-pairs "$TRAY_MIN_PAIRS" \
   --tail-pairs "$TRAY_JUDGED_PAIRS"
 
 # The control: a real process is writing to a real pty in the lower pane. If this
