@@ -201,6 +201,9 @@ pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<
     std::fs::create_dir_all(path)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_common;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

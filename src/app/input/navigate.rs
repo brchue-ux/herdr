@@ -854,7 +854,7 @@ impl App {
         )
     }
 
-    fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
+    pub(crate) fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
         let mut env = vec![(
             crate::api::SOCKET_PATH_ENV_VAR.to_string(),
             crate::api::socket_path().display().to_string(),

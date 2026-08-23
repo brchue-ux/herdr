@@ -12,6 +12,11 @@ use super::{
     LimitedRead, Signal,
 };
 
+pub(crate) use super::unix_common::{
+    configure_status_command, hostname, local_datetime, status_commands_supported,
+    StatusCommandGuard,
+};
+
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 

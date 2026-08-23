@@ -12,6 +12,11 @@ use super::{
     LimitedRead, Signal,
 };
 
+pub(crate) use super::unix_common::{
+    configure_status_command, hostname, local_datetime, status_commands_supported,
+    StatusCommandGuard,
+};
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;

@@ -39,6 +39,7 @@ mod session;
 pub(crate) mod signal_tray;
 pub mod state;
 pub(crate) mod status_feed;
+mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
@@ -185,6 +186,10 @@ pub struct App {
     /// Wake owed because a changed scene was held behind the rebake floor.
     pub(crate) background_scene_deferred_bake_at: Option<Instant>,
     pub(crate) detached_custom_command_children: Vec<std::process::Child>,
+    tab_bar_status_generation: u64,
+    tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
+    tab_bar_commands: Vec<tab_bar_status::TabBarCommandRuntime>,
+    next_tab_bar_datetime_refresh: Option<Instant>,
     pub(crate) persist_pane_history: bool,
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) input_leases: input::InputLeaseTable,
@@ -822,6 +827,8 @@ impl App {
             show_tab_state_dots: config.ui.show_tab_state_dots,
             show_tab_numbers: config.ui.show_tab_numbers,
             tab_bar_position: config.ui.tab_bar_position,
+            tab_bar_right: Vec::new(),
+            tab_bar_right_separator: String::new(),
             pane_history_persistence: config.experimental.pane_history,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
@@ -969,7 +976,7 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
-        Self {
+        let mut app = Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
@@ -1014,6 +1021,10 @@ impl App {
             background_scene_next_bake_at: None,
             background_scene_deferred_bake_at: None,
             detached_custom_command_children: Vec::new(),
+            tab_bar_status_generation: 0,
+            tab_bar_datetimes: Vec::new(),
+            tab_bar_commands: Vec::new(),
+            next_tab_bar_datetime_refresh: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
             persist_pane_history: config.experimental.pane_history,
@@ -1036,7 +1047,9 @@ impl App {
             next_clipboard_request_id: 0,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
-        }
+        };
+        app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
+        app
     }
 
     #[cfg(unix)]
@@ -1799,6 +1812,9 @@ impl App {
             } else {
                 diagnostics.extend(config.ui.sound.diagnostics());
                 diagnostics.extend(config.ui.sidebar.agents.view.diagnostics());
+                diagnostics.extend(crate::config::tab_bar_right_diagnostics(
+                    &config.ui.tab_bar_right,
+                ));
 
                 self.state.default_sidebar_width = config.ui.sidebar_width;
                 if self.state.sidebar_width_source == state::SidebarWidthSource::ConfigDefault {
@@ -1840,6 +1856,10 @@ impl App {
                 self.state.show_tab_state_dots = config.ui.show_tab_state_dots;
                 self.state.show_tab_numbers = config.ui.show_tab_numbers;
                 self.state.tab_bar_position = config.ui.tab_bar_position;
+                self.configure_tab_bar_status(
+                    &config.ui.tab_bar_right,
+                    &config.ui.tab_bar_right_separator,
+                );
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
                 self.state.status_indicators = config.ui.status_indicators;
@@ -2851,6 +2871,37 @@ mod tests {
 
         assert!(!changed);
         assert!(!app.git_refresh_in_flight);
+    }
+
+    #[test]
+    fn tab_bar_command_events_render_only_when_visible_output_changes() {
+        if !crate::platform::status_commands_supported() {
+            return;
+        }
+
+        let mut app = test_app();
+        app.configure_tab_bar_status(
+            &[crate::config::TabBarRightEntryConfig::Command {
+                command: "status".into(),
+                interval_seconds: 5,
+                timeout_seconds: 2,
+            }],
+            " ",
+        );
+        let generation = app.tab_bar_status_generation;
+        let event = |generation, output: Option<&str>| AppEvent::TabBarCommandFinished {
+            generation,
+            segment_index: 0,
+            result: Ok(output.map(str::to_string)),
+        };
+
+        assert!(!app.handle_internal_event_with_prefix_sync(event(generation, None)));
+        assert!(app.handle_internal_event_with_prefix_sync(event(generation, Some("ready"))));
+        assert!(!app.handle_internal_event_with_prefix_sync(event(generation, Some("ready"))));
+        assert!(!app.handle_internal_event_with_prefix_sync(event(
+            generation.wrapping_add(1),
+            Some("stale"),
+        )));
     }
 
     #[test]

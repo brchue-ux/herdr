@@ -362,6 +362,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Desktop tab row placement: "top" or "bottom".
 # tab_bar_position = "top"
 
+# Ordered status entries at the right edge of the desktop tab bar.
+# Supported types: zoom, hostname, datetime, text, and command.
+# Hostname, datetime, and command entries resolve on the Herdr server.
+# tab_bar_right = []
+# tab_bar_right_separator = " "
+
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
