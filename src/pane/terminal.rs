@@ -557,10 +557,10 @@ impl PaneTerminal {
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        min_bottom_rows: u16,
+        requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
         self.ghostty
-            .render_claude_triview(frame, area, show_cursor, min_bottom_rows)
+            .render_claude_triview(frame, area, show_cursor, requested_log_rows)
     }
 
     pub fn collect_dirty_patch(
@@ -2309,27 +2309,37 @@ impl GhosttyPaneTerminal {
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
     }
 
-    /// Renders a Claude Code pane as two live zones — the transcript above the
-    /// composer box, and the composer's own body with its border chrome
-    /// cropped out — instead of one full-height copy. `min_bottom_rows` is how
-    /// many spare rows the caller needs left over below the composer (for its
-    /// own command-log zone); this returns `None` rather than guess whenever
-    /// that does not fit, the live screen's shape is not confidently
-    /// recognized this frame, or the underlying grid read fails. The caller's
-    /// job on `None` is exactly [`GhosttyPaneTerminal::render`] — a normal,
-    /// unmodified full-pane draw.
+    /// Renders a Claude Code pane as three live zones — the transcript, the
+    /// composer's own body with its border chrome cropped out, and the
+    /// agent's own footer (its status line and shortcut hint) — instead of
+    /// one full-height copy, opening `requested_log_rows` rows between the
+    /// composer and that footer for the caller's own command-log zone.
+    ///
+    /// The rows for the log come off the **top of the transcript**, which is
+    /// the only place in the pane that has any to give: Claude Code pins its
+    /// footer to the literal bottom of the screen, so every row of the grid
+    /// is already carrying something. The transcript's oldest visible rows
+    /// are the cheapest to drop — they have already scrolled and are a
+    /// scroll away — and dropping `n` of them shifts the composer up by `n`,
+    /// which is exactly the gap the log then fills. The footer never moves:
+    /// it stays on the pane's own floor where the agent drew it.
+    ///
+    /// Returns `None` rather than guess whenever the live screen's shape is
+    /// not confidently recognized this frame or the underlying grid read
+    /// fails. The caller's job on `None` is exactly
+    /// [`GhosttyPaneTerminal::render`] — a normal, unmodified full-pane draw.
     ///
     /// A single lock, one `refresh_render_state`, one dirty-clear — matching
     /// [`Self::render`]'s own per-frame cost — even though the live grid is
-    /// walked twice (once per zone): FFI row iteration is cheap relative to
-    /// the render-state refresh it draws from, which is what this shares
-    /// across both passes.
+    /// walked three times (once per zone): FFI row iteration is cheap
+    /// relative to the render-state refresh it draws from, which is what this
+    /// shares across all three passes.
     pub(crate) fn render_claude_triview(
         &self,
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        min_bottom_rows: u16,
+        requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
         let mut core = self.core.lock().ok()?;
         let host_theme = core.host_terminal_theme;
@@ -2344,7 +2354,7 @@ impl GhosttyPaneTerminal {
             RenderStateRefresh::Updated => false,
         };
 
-        let layout = claude_triview_layout(&core.terminal, area.height, min_bottom_rows)?;
+        let layout = claude_triview_layout(&core.terminal, area.height, requested_log_rows)?;
 
         let GhosttyPaneCore {
             render_state,
@@ -2373,13 +2383,36 @@ impl GhosttyPaneTerminal {
             height: layout.composer_rows,
         };
 
+        // The agent's own footer — whatever it drew below its composer's
+        // bottom border, which for Claude Code is its status line (the user's
+        // `statusLine` command when one is configured) and its shortcut hint.
+        // A third live zone, blitted exactly like the other two, and left on
+        // the pane's own floor: `footer_start` is both its row in `area` and
+        // its row in the grid, because the shift that opened the log zone
+        // came out of the transcript above it.
+        //
+        // These rows are not spare and never were. The caller's command-log
+        // zone used to begin right under the composer's cropped border,
+        // which is the status line's own row: with commands logged it painted
+        // a tinted rectangle over them, with none it left them unblitted and
+        // the pane background showed through as a blank band — herdr erasing
+        // the agent's status bar, and only giving it back when a mode change
+        // (a right-click's context menu) dropped the pane back to
+        // `Self::render`.
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + layout.footer_start(),
+            width: area.width,
+            height: layout.footer_rows,
+        };
+
         {
             let buf = frame.buffer_mut();
             blit_terminal_rows(
                 buf,
                 transcript_area,
                 render_state,
-                0,
+                layout.transcript_skip,
                 default_fg,
                 default_bg,
                 resolved_fg,
@@ -2390,13 +2423,26 @@ impl GhosttyPaneTerminal {
                 buf,
                 composer_area,
                 render_state,
-                layout.transcript_rows + 1,
+                layout.grid_composer_start(),
                 default_fg,
                 default_bg,
                 resolved_fg,
                 resolved_bg,
                 hide_kitty_placeholders,
             );
+            if footer_area.height > 0 {
+                blit_terminal_rows(
+                    buf,
+                    footer_area,
+                    render_state,
+                    layout.footer_start(),
+                    default_fg,
+                    default_bg,
+                    resolved_fg,
+                    resolved_bg,
+                    hide_kitty_placeholders,
+                );
+            }
         }
 
         if !held_for_synchronized_update {
@@ -2408,7 +2454,10 @@ impl GhosttyPaneTerminal {
             if let Some(cursor) =
                 effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
             {
-                let skip = layout.transcript_rows + 1;
+                // Grid rows, not pane rows: the composer body's own row in
+                // the live grid, which the transcript's shift moved the zone
+                // away from but not the grid.
+                let skip = layout.grid_composer_start();
                 if cursor.y >= skip {
                     let composer_y = cursor.y - skip;
                     if cursor.x < composer_area.width && composer_y < composer_area.height {
@@ -2427,24 +2476,80 @@ impl GhosttyPaneTerminal {
 
 /// The row split [`GhosttyPaneTerminal::render_claude_triview`] drew,
 /// reported so the caller can lay out its own divider and command-log rows
-/// beneath the composer without recomputing the boundary itself.
+/// without recomputing the boundaries itself.
+///
+/// Every field is a count of rows in the pane's own `area`, top to bottom:
+/// `transcript_rows`, one cropped-border gap, `composer_rows`, one more
+/// cropped-border gap, `log_rows`, `footer_rows`. The one exception is
+/// [`Self::transcript_skip`], which is a count of *grid* rows the transcript
+/// zone starts past — the shift that opened the log zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClaudeTriviewLayout {
-    /// Rows `[0, transcript_rows)`, drawn at the top of `area`.
+    /// Grid rows dropped off the **top** of the transcript so the block below
+    /// it can move up and leave [`Self::log_rows`] free above the agent's
+    /// footer.
+    ///
+    /// The transcript is the only zone with rows to give: Claude Code pins
+    /// its footer to the literal bottom of the screen, so nothing in the pane
+    /// is unused. Its oldest visible rows are the cheapest to drop — they
+    /// have already scrolled past and are a scroll away — and the transcript
+    /// keeps at least [`MIN_TRANSCRIPT_ROWS`] whatever the caller asks for,
+    /// so a short conversation is never collapsed to make room for a log.
+    pub transcript_skip: u16,
+    /// Rows `[0, transcript_rows)` of `area`, blitted from grid rows
+    /// `[transcript_skip, transcript_skip + transcript_rows)`.
     pub transcript_rows: u16,
     /// Rows `[transcript_rows + 1, transcript_rows + 1 + composer_rows)`,
     /// drawn right after a one-row gap where the composer's own top border
     /// used to be.
     pub composer_rows: u16,
+    /// Rows `[consumed_rows(), consumed_rows() + log_rows)`: the caller's own
+    /// bottom zone, opened by [`Self::transcript_skip`] and never larger than
+    /// what it asked for. Zero when the transcript had no rows to spare.
+    pub log_rows: u16,
+    /// Rows `[footer_start(), footer_start() + footer_rows)`: the agent's own
+    /// footer, everything it drew below its composer's bottom border. For
+    /// Claude Code that is its status line — the user's `statusLine` command
+    /// when one is configured — and its shortcut hint.
+    ///
+    /// Blitted by [`GhosttyPaneTerminal::render_claude_triview`] like the
+    /// other two live zones, and left exactly where the agent drew it, so the
+    /// caller must not draw over these rows.
+    pub footer_rows: u16,
 }
 
+/// Rows the transcript zone always keeps, however many the caller's own
+/// bottom zone asks for. A transcript squeezed below this stops being a
+/// transcript, and a log big enough to do that is not worth what it costs.
+const MIN_TRANSCRIPT_ROWS: u16 = 3;
+
+/// Rows the agent must have drawn below its composer's bottom border for the
+/// screen to be the shape this recognizes. Claude Code's own composer leaves
+/// exactly two in every observed state — a model/context/cost line, then a
+/// keybinding hint line — pinned to the literal bottom of the screen
+/// regardless of pane height.
+const MIN_AGENT_FOOTER_ROWS: u16 = 2;
+
 impl ClaudeTriviewLayout {
-    /// Total rows this layout occupies: the transcript, one gap row where the
-    /// composer's top border was cropped out, the composer body, and one gap
-    /// row where its bottom border was cropped out. Rows in `area` at or past
-    /// this are the caller's to use.
+    /// Rows of `area` before the caller's own bottom zone: the transcript,
+    /// one gap row where the composer's top border was cropped out, the
+    /// composer body, and one gap row where its bottom border was cropped
+    /// out.
     pub(crate) fn consumed_rows(&self) -> u16 {
         self.transcript_rows + 1 + self.composer_rows + 1
+    }
+
+    /// The agent footer's first row — in `area` and, identically, in the live
+    /// grid, because the rows the log zone occupies were taken from above it
+    /// rather than from under it.
+    pub(crate) fn footer_start(&self) -> u16 {
+        self.consumed_rows() + self.log_rows
+    }
+
+    /// The composer body's first row in the live **grid**, which is where it
+    /// sat before the transcript's shift moved the zone that draws it.
+    pub(crate) fn grid_composer_start(&self) -> u16 {
+        self.transcript_skip + self.transcript_rows + 1
     }
 }
 
@@ -2455,13 +2560,21 @@ impl ClaudeTriviewLayout {
 /// frame rather than a periodic detection scan that may have gone stale.
 ///
 /// Requires the composer's body to start exactly one row after the
-/// transcript ends (its top border) and to leave at least `min_bottom_rows`
-/// spare below it; returns `None` rather than guess when either does not
-/// hold, when the read fails, or when either row count does not fit a `u16`.
+/// transcript ends (its top border) and the agent to have drawn at least
+/// [`MIN_AGENT_FOOTER_ROWS`] below it; returns `None` rather than guess when
+/// either does not hold, when the read fails, or when a row count does not
+/// fit a `u16`.
+///
+/// `requested_log_rows` is how many rows the caller wants for its own bottom
+/// zone. It is a request, not a reservation: the rows come off the top of the
+/// transcript ([`ClaudeTriviewLayout::transcript_skip`]) and the transcript
+/// keeps [`MIN_TRANSCRIPT_ROWS`] whatever is asked, so the granted
+/// [`ClaudeTriviewLayout::log_rows`] can be smaller — and on a very short
+/// conversation, zero. The agent's own footer is never a donor.
 fn claude_triview_layout(
     terminal: &crate::ghostty::Terminal,
     area_height: u16,
-    min_bottom_rows: u16,
+    requested_log_rows: u16,
 ) -> Option<ClaudeTriviewLayout> {
     let recent = ghostty_recent_text_for_terminal(terminal, area_height as usize).ok()?;
     let claude = Some(crate::detect::Agent::Claude);
@@ -2472,11 +2585,27 @@ fn claude_triview_layout(
     }
     let transcript_rows = u16::try_from(transcript_range.end).ok()?;
     let composer_rows = u16::try_from(composer_range.len()).ok()?;
-    let layout = ClaudeTriviewLayout {
-        transcript_rows,
+    // The two cropped zones at their natural, unshifted position: the
+    // transcript, the composer's top border, its body, its bottom border.
+    let cropped_rows = transcript_rows.checked_add(composer_rows)?.checked_add(2)?;
+    // `recent` is the viewport's own rows with its blank tail trimmed
+    // (`ghostty_recent_text_for_terminal`), so its line count is exactly how
+    // far down the pane the agent actually drew. Everything between the
+    // composer's cropped bottom border and there is the agent's footer.
+    let drawn_rows = u16::try_from(recent.lines().count()).ok()?.min(area_height);
+    let footer_rows = drawn_rows.saturating_sub(cropped_rows);
+    if cropped_rows > area_height || footer_rows < MIN_AGENT_FOOTER_ROWS {
+        return None;
+    }
+    let transcript_skip =
+        requested_log_rows.min(transcript_rows.saturating_sub(MIN_TRANSCRIPT_ROWS));
+    Some(ClaudeTriviewLayout {
+        transcript_skip,
+        transcript_rows: transcript_rows - transcript_skip,
         composer_rows,
-    };
-    (layout.consumed_rows().saturating_add(min_bottom_rows) <= area_height).then_some(layout)
+        log_rows: transcript_skip,
+        footer_rows,
+    })
 }
 
 /// Copies up to `area.height` rows of the live grid into `area`, skipping
@@ -4609,15 +4738,34 @@ mod tests {
     }
 
     /// A minimal Claude Code-shaped screen: two transcript lines, a composer
-    /// box holding one input line, and one hint line below the box — enough
-    /// rows for [`GhosttyPaneTerminal::render_claude_triview`] to recognize
-    /// the shape the same way [`crate::detect::command_marker`] does.
+    /// box holding one input line, then the agent's own two footer rows — a
+    /// status line and a shortcut hint, exactly what Claude Code pins to the
+    /// literal bottom of its screen. Enough rows for
+    /// [`GhosttyPaneTerminal::render_claude_triview`] to recognize the shape
+    /// the same way [`crate::detect::command_marker`] does.
     fn write_claude_shaped_screen(terminal: &mut crate::ghostty::Terminal) {
         terminal.write(b"first line of output\r\n");
         terminal.write(b"second line of output\r\n");
         terminal.write("──────────────────────────\r\n".as_bytes());
         terminal.write(b" > typed input\r\n");
         terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b"~/proj main 42%\r\n");
+        terminal.write(b"? for shortcuts");
+    }
+
+    /// The same screen with a taller transcript, so there are rows the log
+    /// zone can actually be given.
+    fn write_tall_claude_shaped_screen(
+        terminal: &mut crate::ghostty::Terminal,
+        transcript_lines: usize,
+    ) {
+        for index in 1..=transcript_lines {
+            terminal.write(format!("transcript line {index:02}\r\n").as_bytes());
+        }
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b" > typed input\r\n");
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b"~/proj main 42% context\r\n");
         terminal.write(b"? for shortcuts");
     }
 
@@ -4632,7 +4780,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 2);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
         })
         .unwrap();
 
@@ -4650,6 +4798,122 @@ mod tests {
         assert_eq!(buffer_row_text(buffer, 3, 30), " > typed input");
     }
 
+    /// A Claude Code screen the way one really lands: the composer pinned to
+    /// the bottom with its own status line and shortcut hint under it. Both
+    /// have to survive the split — they are the "status bar" a right-click
+    /// used to be the only way to get back — and with no log asked for they
+    /// stay exactly on the rows the agent drew them on.
+    #[test]
+    fn render_claude_triview_draws_the_agents_own_footer_rows() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 10, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 5);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 10);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 10), false, 0);
+        })
+        .unwrap();
+
+        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(layout.transcript_skip, 0);
+        assert_eq!(layout.transcript_rows, 5);
+        assert_eq!(layout.composer_rows, 1);
+        assert_eq!(layout.log_rows, 0);
+        assert_eq!(layout.footer_rows, 2);
+        assert_eq!(layout.consumed_rows(), 8);
+        assert_eq!(layout.footer_start(), 8);
+
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 01");
+        assert_eq!(buffer_row_text(buffer, 6, 60), " > typed input");
+        assert_eq!(buffer_row_text(buffer, 8, 60), "~/proj main 42% context");
+        assert_eq!(buffer_row_text(buffer, 9, 60), "? for shortcuts");
+    }
+
+    /// The log zone's rows come off the **top of the transcript**, and the
+    /// agent's footer does not move: it stays on the pane's own floor, below
+    /// the log, which is the layout the captain asked for. The transcript
+    /// loses only its oldest visible rows, which have already scrolled.
+    #[test]
+    fn render_claude_triview_opens_the_log_zone_out_of_the_transcript() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 14, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 9);
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(60, 14);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        term.draw(|frame| {
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 14), false, 3);
+        })
+        .unwrap();
+
+        let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(layout.transcript_skip, 3);
+        assert_eq!(layout.transcript_rows, 6);
+        assert_eq!(layout.composer_rows, 1);
+        assert_eq!(layout.log_rows, 3);
+        assert_eq!(layout.footer_rows, 2);
+        // Composer at pane row 7, dividers at 6 and 8, log at 9..12, and the
+        // footer still on the grid rows the agent drew it on.
+        assert_eq!(layout.consumed_rows(), 9);
+        assert_eq!(layout.footer_start(), 12);
+        assert_eq!(layout.grid_composer_start(), 10);
+
+        let buffer = term.backend().buffer();
+        // The three oldest transcript rows are the ones that went.
+        assert_eq!(buffer_row_text(buffer, 0, 60), "transcript line 04");
+        assert_eq!(buffer_row_text(buffer, 5, 60), "transcript line 09");
+        assert_eq!(buffer_row_text(buffer, 7, 60), " > typed input");
+        // Rows 9..12 are the caller's — this call leaves them blank.
+        for row in 9..12 {
+            assert_eq!(buffer_row_text(buffer, row, 60), "");
+        }
+        assert_eq!(buffer_row_text(buffer, 12, 60), "~/proj main 42% context");
+        assert_eq!(buffer_row_text(buffer, 13, 60), "? for shortcuts");
+    }
+
+    /// A log big enough to gut the transcript is not worth what it costs:
+    /// the transcript keeps [`MIN_TRANSCRIPT_ROWS`] and the zone gets
+    /// whatever is left over, which can be nothing at all.
+    #[test]
+    fn render_claude_triview_never_shrinks_the_transcript_below_its_floor() {
+        for (transcript_lines, expected_log_rows) in [(4usize, 1u16), (3, 0)] {
+            let rows = u16::try_from(transcript_lines).unwrap() + 5;
+            let (tx, _rx) = mpsc::channel(4);
+            let mut terminal = crate::ghostty::Terminal::new(60, rows, 0).unwrap();
+            write_tall_claude_shaped_screen(&mut terminal, transcript_lines);
+            let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+            let backend = ratatui::backend::TestBackend::new(60, rows);
+            let mut term = ratatui::Terminal::new(backend).unwrap();
+            let mut layout = None;
+            term.draw(|frame| {
+                layout = pane.render_claude_triview(frame, Rect::new(0, 0, 60, rows), false, 8);
+            })
+            .unwrap();
+
+            let layout = layout.expect("a Claude-shaped screen resolves a triview layout");
+            assert_eq!(
+                layout.log_rows, expected_log_rows,
+                "a {transcript_lines}-row transcript asked for 8 log rows"
+            );
+            assert!(layout.transcript_rows >= MIN_TRANSCRIPT_ROWS);
+            assert_eq!(layout.footer_rows, 2);
+            // Whatever the split granted, the footer is still last.
+            assert_eq!(
+                layout.footer_start() + layout.footer_rows,
+                rows,
+                "the agent's footer must still end on the pane's own floor"
+            );
+        }
+    }
+
     #[test]
     fn render_claude_triview_falls_back_without_a_composer_box() {
         let (tx, _rx) = mpsc::channel(4);
@@ -4661,27 +4925,34 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 2);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
         })
         .unwrap();
 
         assert!(layout.is_none());
     }
 
+    /// A screen with fewer than [`MIN_AGENT_FOOTER_ROWS`] rows under the
+    /// composer's bottom border is not the shape this recognizes — a real
+    /// Claude Code screen always has exactly two — so it renders unmodified
+    /// rather than being split on a guess.
     #[test]
-    fn render_claude_triview_falls_back_when_bottom_rows_would_not_fit() {
+    fn render_claude_triview_falls_back_without_the_agents_own_footer() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(30, 8, 0).unwrap();
-        write_claude_shaped_screen(&mut terminal);
+        terminal.write(b"first line of output\r\n");
+        terminal.write(b"second line of output\r\n");
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b" > typed input\r\n");
+        terminal.write("──────────────────────────\r\n".as_bytes());
+        terminal.write(b"? for shortcuts");
         let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
 
         let backend = ratatui::backend::TestBackend::new(30, 8);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         let mut layout = None;
-        // consumed_rows() is 5 on this fixture; nothing fits alongside it
-        // once min_bottom_rows demands more than the 3 spare rows there are.
         term.draw(|frame| {
-            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 4);
+            layout = pane.render_claude_triview(frame, Rect::new(0, 0, 30, 8), false, 0);
         })
         .unwrap();
 

@@ -3107,10 +3107,10 @@ impl PaneRuntime {
         frame: &mut Frame,
         area: Rect,
         show_cursor: bool,
-        min_bottom_rows: u16,
+        requested_log_rows: u16,
     ) -> Option<ClaudeTriviewLayout> {
         self.terminal
-            .render_claude_triview(frame, area, show_cursor, min_bottom_rows)
+            .render_claude_triview(frame, area, show_cursor, requested_log_rows)
     }
 
     pub(crate) fn collect_dirty_patch(
