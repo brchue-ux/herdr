@@ -44,6 +44,16 @@ pub(crate) mod bloom;
 mod device;
 mod scene;
 
+/// Drive a `wgpu` future to completion on the calling thread.
+///
+/// Re-exported for `herdr bench upload-churn`, which stands up a *second*,
+/// deliberately differently-configured device (see
+/// `crate::cli::bench::upload_churn`) and so cannot go through [`device`]'s
+/// process-wide one — but has the same three `async` calls to resolve and no
+/// more reason than [`device`] has to pull in an executor for them.
+#[cfg(feature = "gpu-raster")]
+pub(crate) use device::block_on;
+
 #[cfg(not(feature = "gpu-raster"))]
 #[path = "bloom_disabled.rs"]
 pub(crate) mod bloom;
