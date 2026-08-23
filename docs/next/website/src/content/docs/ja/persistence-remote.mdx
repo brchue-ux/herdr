@@ -67,7 +67,7 @@ herdr --remote workbox
 
 これはリモートサーバー側のプラットフォームの話であり、アタッチ元のマシンのことではありません。`herdr --remote` は Windows バイナリからも実行できます。
 
-デフォルトでは、`herdr --remote` はあなたの SSH config を最初に include し、その後にフォールバックのキープアライブ設定を加えた一時的な SSH config を通してブリッジを実行します。既存のユーザーのキープアライブ設定が優先されます。Herdr が生成するブリッジ設定を使わず素の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。Windows の OpenSSH には ControlMaster のサポートがないため、Windows では `herdr --remote` は常に素の `ssh` を実行し、`[remote].manage_ssh_config` は効果がありません。
+`herdr --remote` は、あなたの SSH config を最初に include し、その後にフォールバックのキープアライブ設定を加えた一時的な SSH config を通して、リモートのセットアップとブリッジを実行します。既存のユーザーのキープアライブ設定が優先されます。このフォールバックがないと OpenSSH の既定は `ServerAliveInterval 0` なので、ノート PC のスリープ、Wi-Fi の切断、VPN の停止などで接続が黙って切れても、TCP 自体が諦めるまで検出されません。macOS と Linux では、生成される config は接続再利用のためのアタッチごとのプライベートなコントロールソケットも設定します。Windows の OpenSSH には ControlMaster のサポートがないため、Windows で生成される config はキープアライブのフォールバックだけを含み、すべての ssh 呼び出しは多重化なしで実行されます。Herdr が生成する config やコントロールソケットを使わず素の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。
 
 デフォルトでは、実行中のリモートサーバーの置き換えや再起動が必要な場合、リモートアタッチは通常の再起動/停止フローを使います。対応する実行中リモートサーバーで実験的なライブハンドオフにオプトインするには `--handoff` を渡します:
 
