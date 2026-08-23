@@ -452,6 +452,7 @@ mod tests {
             ("rose_pine", Palette::rose_pine()),
             ("rose_pine_dawn", Palette::rose_pine_dawn()),
             ("vesper", Palette::vesper()),
+            ("abyss", Palette::abyss()),
         ] {
             let resting = Style::default().fg(p.overlay0);
             let quiet = pulse(0, 0, Some(10.0));

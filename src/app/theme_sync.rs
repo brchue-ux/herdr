@@ -170,15 +170,19 @@ mod tests {
     use crate::terminal_theme::{DefaultColorKind, RgbColor, TerminalTheme};
     use crate::ui::color::{contrast_ratio, resolve_color_rgb};
 
+    /// Pinned to `catppuccin` rather than whatever the ambient default theme
+    /// is: these tests exercise the host-background contrast-floor
+    /// mechanism generically, via a theme whose `overlay`/`surface` tokens
+    /// are known to need lifting against a white host background. The
+    /// default theme's own tokens are not guaranteed to need any floor
+    /// adjustment there — `abyss`, for one, already clears every floor
+    /// against white unmodified — which would make these assertions
+    /// vacuous (or fail outright) if they instead tracked the default.
     fn test_app() -> App {
+        let mut config = crate::config::Config::default();
+        config.theme.name = Some("catppuccin".to_string());
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        )
+        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
     }
 
     fn white() -> RgbColor {

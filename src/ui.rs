@@ -7,7 +7,7 @@ use ratatui::{
 
 pub(crate) mod color;
 mod dialogs;
-mod diff_pane;
+pub(crate) mod diff_pane;
 mod keybind_help;
 mod machine_corner;
 mod menus;
@@ -155,10 +155,19 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
-/// The diff zone's own width when shown. Fixed rather than user-tunable for
-/// v1 — `AppState::diff_zone_width_threshold` is the tunable knob (whether the
-/// zone shows at all); see `data/herdr-diff-pane-scoping-20260818/report.md` §D.
-const DIFF_ZONE_WIDTH: u16 = 100;
+/// The diff/"Changes" zone's share of `main_area`'s width when shown, as a
+/// percentage — not user-tunable for v1, mirroring `DIFF_ZONE_WIDTH`'s prior
+/// fixed-column design (`AppState::diff_zone_width_threshold` remains the
+/// tunable knob for whether the zone shows at all; see
+/// `data/herdr-diff-pane-scoping-20260818/report.md` §D). Chosen so Changes
+/// and the terminal zone split `main_area` at roughly the same ratio as the
+/// "Rio Window, Assembled" mockup's Terminal:Changes proportions (38:43).
+const DIFF_ZONE_PERCENT: u16 = 53;
+
+/// Floor under `DIFF_ZONE_PERCENT`'s computed width so a deliberately tiny
+/// custom `diff_zone_width_threshold` can't shrink the zone to an unreadable
+/// sliver once it does show.
+const DIFF_ZONE_MIN_WIDTH: u16 = 40;
 
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
@@ -412,9 +421,12 @@ fn split_diff_zone(app: &AppState, main_area: Rect) -> (Rect, Rect) {
     if main_area.width < app.diff_zone_width_threshold {
         return (main_area, Rect::default());
     }
+    let diff_w = ((main_area.width as u32 * DIFF_ZONE_PERCENT as u32) / 100) as u16;
+    let diff_w = diff_w
+        .max(DIFF_ZONE_MIN_WIDTH)
+        .min(main_area.width.saturating_sub(1));
     let [content_area, diff_area] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(DIFF_ZONE_WIDTH)])
-            .areas(main_area);
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(diff_w)]).areas(main_area);
     (content_area, diff_area)
 }
 
@@ -446,6 +458,15 @@ fn compute_view_internal(
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
 
     let (content_area, diff_area) = split_diff_zone(app, main_area);
+    // `render_panel_shell`'s `Borders::ALL` insets the rendered inner area by
+    // 1 row on each side, so clamp against that same inner height here —
+    // otherwise this per-frame clamp and `render_diff_content`'s own
+    // (correct) clamp against its actual inner area could disagree by up to
+    // 2 rows.
+    let diff_inner_height = diff_area.height.saturating_sub(2);
+    let diff_scroll_area = Rect::new(0, 0, diff_area.width, diff_inner_height);
+    app.diff_pane_scroll =
+        diff_pane::normalized_diff_scroll(app, diff_scroll_area, app.diff_pane_scroll);
 
     let (tab_bar_rect, terminal_area) = app
         .active
@@ -1385,11 +1406,12 @@ mod tests {
         app.diff_zone_width_threshold = 150;
 
         // main_area.width = 200 - 26 (default sidebar) = 174 >= 150.
+        // diff_w = 174 * DIFF_ZONE_PERCENT(53) / 100 = 92; content_area = 82.
         compute_view(&mut app, Rect::new(0, 0, 200, 20));
 
         assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
-        assert_eq!(app.view.diff_area, Rect::new(100, 0, 100, 20));
-        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 74, 19));
+        assert_eq!(app.view.diff_area, Rect::new(108, 0, 92, 20));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 82, 19));
     }
 
     #[test]
@@ -1607,6 +1629,62 @@ mod tests {
         let added_fg = buffer[(added_marker_x, added_row)].fg;
         assert_eq!(removed_fg, app.palette.red, "removed marker must be red");
         assert_eq!(added_fg, app.palette.green, "added marker must be green");
+    }
+
+    /// A diff longer than the zone can show at once scrolls independently
+    /// (`AppState::diff_pane_scroll`), revealing later content and clamping
+    /// at the end rather than scrolling past it.
+    #[test]
+    fn diff_zone_scrolls_to_reveal_later_lines_and_clamps_at_the_end() {
+        let long_diff = crate::workspace::GitDiffText {
+            lines: (0..40)
+                .map(|i| crate::workspace::GitDiffLine {
+                    kind: crate::workspace::GitDiffLineKind::Context,
+                    text: format!(" line {i}"),
+                })
+                .collect(),
+            truncated: false,
+        };
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![diff_pane_test_workspace(Some(long_diff))];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.diff_zone_width_threshold = 150;
+
+        let render_diff_text = |app: &crate::app::state::AppState| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+            terminal.draw(|frame| render(app, frame)).unwrap();
+            let diff_area = app.view.diff_area;
+            (diff_area.y..diff_area.y + diff_area.height)
+                .map(|row| buffer_row_text(terminal.backend().buffer(), diff_area, row))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+        let unscrolled = render_diff_text(&app);
+        assert!(unscrolled.contains("line 0"), "{unscrolled}");
+        assert!(!unscrolled.contains('↑'), "{unscrolled}");
+
+        app.diff_pane_scroll = 10;
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+        let scrolled = render_diff_text(&app);
+        assert!(
+            !scrolled.contains("line 0"),
+            "scrolled view must not still show the very first line: {scrolled}"
+        );
+        assert!(scrolled.contains("line 10"), "{scrolled}");
+        assert!(scrolled.contains("↑ 10 lines above"), "{scrolled}");
+
+        // Requesting scroll far past the end clamps rather than blanking.
+        app.diff_pane_scroll = 10_000;
+        compute_view(&mut app, Rect::new(0, 0, 200, 20));
+        assert!(
+            app.diff_pane_scroll < 40,
+            "scroll must clamp to the diff's own length, got {}",
+            app.diff_pane_scroll
+        );
     }
 
     #[test]

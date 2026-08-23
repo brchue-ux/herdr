@@ -697,6 +697,50 @@ impl Palette {
         }
     }
 
+    /// Abyss — the "Rio Window, Assembled" mockup's dark theme: a near-black
+    /// void, cyan primary accent, amber secondary accent, and a green `ok`
+    /// status color. Every field below is one of the mockup's own ten
+    /// `:root` custom-property values (`--void #04070c`, `--panel #0a1220`,
+    /// `--edge #16233a`, `--cyan #5ad1ff`, `--cyan-dim #3a7fa3`, `--amber
+    /// #ffb454`, `--ok #3ddc84`, `--ink #e6edf3`, `--dim #64717e`, `--faint
+    /// #37414d`) — never a color picked to merely look similar. Where this
+    /// struct has more fields than the mockup has tokens (e.g. two "surface"
+    /// levels, or both a "yellow" and a "red" status), the closest token is
+    /// reused rather than inventing a new hex value; see the PR description
+    /// for the full field-by-token mapping table.
+    pub fn abyss() -> Self {
+        Self {
+            accent: Color::Rgb(90, 209, 255), // --cyan
+            panel_bg: Color::Rgb(10, 18, 32), // --panel
+            // Built-in themes leave the sidebar background as the host
+            // terminal's own (see `built_in_themes_leave_sidebar_background_unset`);
+            // only an explicit user override sets it. The mockup's --void
+            // near-black backdrop is instead approximated by `panel_bg` and
+            // the host-contrast floor `refresh_sidebar_palette` applies.
+            sidebar_bg: Color::Reset,
+            surface0: Color::Rgb(10, 18, 32),    // --panel
+            surface1: Color::Rgb(22, 35, 58),    // --edge
+            surface_dim: Color::Rgb(22, 35, 58), // --edge (all panel/card borders)
+            overlay0: Color::Rgb(55, 65, 77),    // --faint
+            overlay1: Color::Rgb(100, 113, 126), // --dim
+            text: Color::Rgb(230, 237, 243),     // --ink
+            subtext0: Color::Rgb(100, 113, 126), // --dim
+            mauve: Color::Rgb(58, 127, 163),     // --cyan-dim
+            green: Color::Rgb(61, 220, 132),     // --ok
+            // Working/running uses --cyan, not --amber: the mockup's own
+            // `.active-line::before` — its "something is happening now"
+            // dot — is coloured `var(--cyan)`, and reserving amber for
+            // `red` below keeps "working" and "blocked" visually distinct
+            // (both would otherwise render the identical amber dot, since
+            // the mockup has only one warm accent).
+            yellow: Color::Rgb(90, 209, 255), // --cyan
+            red: Color::Rgb(255, 180, 84),    // --amber — the mockup's "warn" badge color
+            blue: Color::Rgb(58, 127, 163),   // --cyan-dim
+            teal: Color::Rgb(58, 127, 163),   // --cyan-dim (kept distinct from `yellow`'s cyan)
+            peach: Color::Rgb(255, 180, 84),  // --amber
+        }
+    }
+
     /// Resolve a theme by name. Returns None for unknown names.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_lowercase().replace([' ', '_'], "-").as_str() {
@@ -718,6 +762,7 @@ impl Palette {
             "rose-pine" | "rosepine" => Some(Self::rose_pine()),
             "rose-pine-dawn" | "rosepine-dawn" | "dawn" => Some(Self::rose_pine_dawn()),
             "vesper" => Some(Self::vesper()),
+            "abyss" => Some(Self::abyss()),
             _ => None,
         }
     }
@@ -1566,6 +1611,7 @@ pub const THEME_NAMES: &[&str] = &[
     "rose-pine",
     "rose-pine-dawn",
     "vesper",
+    "abyss",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,6 +2113,12 @@ pub struct AppState {
     /// `toggle_diff_pane` keybinding. Pure client presentation state — never
     /// shared with the server/API surface.
     pub diff_popup_open: bool,
+    /// How far the diff zone (or its popup-overlay fallback) has scrolled
+    /// past the top of the active diff, in source diff lines. Clamped each
+    /// frame in `compute_view_internal` against the diff's own length —
+    /// see `crate::ui::diff_pane::normalized_diff_scroll`. Pure client
+    /// presentation state, like `diff_popup_open` beside it.
+    pub diff_pane_scroll: usize,
     /// Order agent rows take within their owner in the sidebar tree.
     pub agent_panel_sort: AgentPanelSort,
     /// Every source that currently wants to own the built-in Agents view. It
@@ -3682,6 +3734,7 @@ impl AppState {
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             diff_popup_open: false,
+            diff_pane_scroll: 0,
             agent_panel_sort: AgentPanelSort::Spaces,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             session_status: None,
@@ -4898,6 +4951,27 @@ mod tests {
         assert_eq!(
             Palette::catppuccin().with_overrides(&custom).sidebar_bg,
             Color::Rgb(24, 24, 37)
+        );
+    }
+
+    /// `abyss` must reproduce the "Rio Window, Assembled" mockup's own
+    /// `:root` hex values exactly — see `Palette::abyss`'s doc comment for
+    /// the full field-by-token mapping.
+    #[test]
+    fn abyss_theme_uses_the_mockups_exact_hex_values() {
+        let p = Palette::from_name("abyss").expect("abyss should resolve");
+        assert_eq!(p.accent, Color::Rgb(90, 209, 255), "--cyan");
+        assert_eq!(p.panel_bg, Color::Rgb(10, 18, 32), "--panel");
+        assert_eq!(p.surface_dim, Color::Rgb(22, 35, 58), "--edge");
+        assert_eq!(p.overlay0, Color::Rgb(55, 65, 77), "--faint");
+        assert_eq!(p.overlay1, Color::Rgb(100, 113, 126), "--dim");
+        assert_eq!(p.text, Color::Rgb(230, 237, 243), "--ink");
+        assert_eq!(p.green, Color::Rgb(61, 220, 132), "--ok");
+        assert_eq!(p.yellow, Color::Rgb(90, 209, 255), "--cyan");
+        assert_eq!(p.red, Color::Rgb(255, 180, 84), "--amber");
+        assert_ne!(
+            p.yellow, p.red,
+            "working and blocked must stay visually distinct"
         );
     }
 

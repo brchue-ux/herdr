@@ -136,15 +136,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # onboarding = true
 
 [theme]
-# Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
+# Built-in themes: abyss, catppuccin, terminal, tokyo-night, dracula, nord,
 #                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
 #                  vesper
-# name = "catppuccin"
+# name = "abyss"
 
 # Follow host terminal light/dark appearance and switch Herdr UI themes.
 # Existing manual behavior is unchanged unless this is true.
 # auto_switch = false
-# dark_name = "catppuccin"
+# dark_name = "abyss"
 # light_name = "catppuccin-latte"
 
 # Override individual color tokens on top of the base theme.
