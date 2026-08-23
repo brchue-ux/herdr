@@ -9,10 +9,33 @@
 //! separate pass over the same evidence.
 //!
 //! v1 covers Claude Code only — the report this shipped from named it the
-//! cheapest agent to start with, and its `⏺ Bash(...)` bullet is the one
+//! cheapest agent to start with, and its tool-call bullet is the one
 //! documented, stable marker of a tool call actually being a shell command
 //! rather than a read, an edit, or anything else Claude's bullet glyph also
 //! introduces.
+//!
+//! # Two shapes, because Claude Code draws two
+//!
+//! Captured live from Claude Code v2.1.241 at 120x34, both forms confirmed on
+//! the same session:
+//!
+//! * `● Bash(npm test)` — the *expanded* transcript (`ctrl+o`, "verbose"),
+//!   and every Claude Code old enough to have printed tool calls unfolded.
+//!   The bullet is U+25CF; releases up to and including the one this module
+//!   first shipped against used U+23FA, so both are accepted — a glyph swap
+//!   in the agent must not silently empty a pane's command log.
+//! * `  ⎿  $ npm test` — the *collapsed* default view, which is what a pane
+//!   actually shows unless its user turned verbose on. Here the bullet line
+//!   carries a prose description ("Sleeping 20s in Python then printing ok")
+//!   and the command itself only appears on the `⎿` result line, prefixed
+//!   `$ `. Non-command results use U+00A0 after the same `⎿`, never `$ `,
+//!   which is what keeps this from matching a `Read`'s output.
+//!
+//! The collapsed form is transient: once the call finishes, Claude Code folds
+//! the whole block down to `Ran 1 shell command` and the `⎿  $ ` line leaves
+//! the screen. That is precisely why
+//! [`crate::app::pane_command_log::PaneCommandLog`] keeps its own copy — the
+//! scan sees the line while it is up, and the zone outlives it.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -21,9 +44,28 @@ use regex::Regex;
 
 use super::Agent;
 
+/// The expanded transcript's own shape: a tool bullet introducing `Bash(`.
+/// Both bullet glyphs Claude Code has used are accepted — see this module's
+/// header on why neither may be the only one.
 fn bash_bullet_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*\x{23FA}\s+Bash\(").expect("bash bullet pattern is valid"))
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*[\x{23FA}\x{25CF}]\s+Bash\(").expect("bash bullet pattern is valid")
+    })
+}
+
+/// The collapsed default view's shape: a `⎿` result line whose content is a
+/// `$ `-prefixed shell command. Deliberately requires the literal `$` and a
+/// following space — every other `⎿` result Claude Code draws puts U+00A0
+/// there instead, so a `Read`'s or a `Grep`'s output cannot match.
+fn shell_echo_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\s*\x{23BF}\s+\$\s+\S").expect("shell echo pattern is valid"))
+}
+
+/// Whether `line` is either shape of "Claude Code ran this shell command".
+fn is_command_marker(line: &str) -> bool {
+    bash_bullet_regex().is_match(line) || shell_echo_regex().is_match(line)
 }
 
 /// Every line in `screen` that reads as Claude Code reporting a Bash tool
@@ -44,31 +86,40 @@ pub(crate) fn command_markers(agent: Option<Agent>, screen: &str) -> Vec<String>
     }
     let range = super::transcript_line_range(agent, screen).unwrap_or(0..screen.lines().count());
     let region = screen.lines().skip(range.start).take(range.len());
-    let pattern = bash_bullet_regex();
     region
-        .filter(|line| pattern.is_match(line))
+        .filter(|line| is_command_marker(line))
         .map(str::trim_end)
         .map(str::to_string)
         .collect()
 }
 
-/// Pulls the command text out of one `⏺ Bash(...)` marker line, for a caller
-/// that wants to show the command itself rather than the raw bullet.
+/// Pulls the command text out of one marker line — either shape — for a
+/// caller that wants to show the command itself rather than the raw bullet.
 ///
-/// Takes everything between the first `Bash(` and the last `)`, so a command
-/// that itself contains parentheses is not truncated at the first one. Falls
-/// back to the whole trimmed line if the shape does not match — this is a
-/// display helper, not a second parser with its own failure mode.
+/// For the expanded `● Bash(...)` form, takes everything between the first
+/// `Bash(` and the last `)`, so a command that itself contains parentheses is
+/// not truncated at the first one. For the collapsed `⎿  $ ...` form, takes
+/// everything after the `$ `. Falls back to the whole trimmed line if neither
+/// shape matches — this is a display helper, not a second parser with its own
+/// failure mode.
 pub(crate) fn bash_command_text(marker_line: &str) -> String {
     let trimmed = marker_line.trim();
-    let Some(start) = trimmed.find("Bash(") else {
-        return trimmed.to_string();
-    };
-    let after = &trimmed[start + "Bash(".len()..];
-    match after.rfind(')') {
-        Some(end) => after[..end].trim().to_string(),
-        None => after.trim().to_string(),
+    if let Some(start) = trimmed.find("Bash(") {
+        let after = &trimmed[start + "Bash(".len()..];
+        return match after.rfind(')') {
+            Some(end) => after[..end].trim().to_string(),
+            None => after.trim().to_string(),
+        };
     }
+    // `⎿  $ cmd`: strip the result marker and the shell sigil, keeping the
+    // command exactly as the agent echoed it.
+    if let Some(rest) = trimmed.strip_prefix('\u{23BF}') {
+        let rest = rest.trim_start();
+        if let Some(command) = rest.strip_prefix('$') {
+            return command.trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Diffs one scan's markers against what a caller has already acknowledged,
@@ -160,6 +211,55 @@ mod tests {
             command_markers(Some(Agent::Claude), screen),
             vec!["⏺ Bash(npm test)".to_string()]
         );
+    }
+
+    /// Claude Code v2.1.241's expanded transcript, captured live: the bullet
+    /// is U+25CF, not the U+23FA this module first shipped against. A pane's
+    /// command log went permanently empty when the agent swapped the glyph,
+    /// so both are accepted rather than tracking whichever is current.
+    #[test]
+    fn the_current_black_circle_bullet_is_found() {
+        let screen = "\u{25CF} Bash(pwd)\n  \u{23BF} \u{a0}/tmp\n";
+        assert_eq!(
+            command_markers(Some(Agent::Claude), screen),
+            vec!["\u{25CF} Bash(pwd)".to_string()]
+        );
+    }
+
+    /// The collapsed default view — what a pane shows unless verbose is on.
+    /// The bullet line carries a prose description and only the `\u{23BF}` result
+    /// line has the command, prefixed `$ `.
+    #[test]
+    fn the_collapsed_views_dollar_echo_is_a_command() {
+        let screen =
+            "\u{25CF} Sleeping 20s in Python then printing ok\n  \u{23BF}  $ python3 -c \"pass\"\n";
+        assert_eq!(
+            command_markers(Some(Agent::Claude), screen),
+            vec!["  \u{23BF}  $ python3 -c \"pass\"".to_string()]
+        );
+    }
+
+    /// Every non-command `\u{23BF}` result Claude Code draws puts U+00A0 where a
+    /// shell command puts `$ `. Matching the marker alone would turn every
+    /// file read and every grep hit into a logged "command".
+    #[test]
+    fn a_non_command_result_line_is_not_a_command() {
+        let screen =
+            "\u{25CF} Read(src/main.rs)\n  \u{23BF} \u{a0}total 4\n  \u{23BF} \u{a0}/tmp/x\n";
+        assert!(command_markers(Some(Agent::Claude), screen).is_empty());
+    }
+
+    #[test]
+    fn bash_command_text_extracts_the_collapsed_echo() {
+        assert_eq!(
+            bash_command_text("  \u{23BF}  $ cargo nextest run"),
+            "cargo nextest run"
+        );
+    }
+
+    #[test]
+    fn bash_command_text_extracts_the_current_bullet_form() {
+        assert_eq!(bash_command_text("\u{25CF} Bash(npm test)"), "npm test");
     }
 
     #[test]

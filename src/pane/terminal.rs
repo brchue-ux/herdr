@@ -4769,6 +4769,140 @@ mod tests {
         terminal.write(b"? for shortcuts");
     }
 
+    /// Claude Code v2.1.241's real screen, captured live at 120x34 from the
+    /// actual CLI rather than reconstructed from the detector's assumptions.
+    ///
+    /// Everything here is verbatim shape from that capture: a full-width
+    /// U+2500 rule at column 0 (no leading space), a `\u{276F} ` composer body, a
+    /// closing rule, then exactly two footer rows — the model/context/cost
+    /// line and the shortcuts hint — pinned to the screen floor. The
+    /// transcript above carries the two forms the agent actually prints for
+    /// a shell call, the collapsed `\u{23BF}  $ ` echo and a `\u{25CF} Bash(...)` bullet.
+    fn write_real_claude_v2_screen(
+        terminal: &mut crate::ghostty::Terminal,
+        cols: usize,
+        rows: usize,
+    ) {
+        let rule = "\u{2500}".repeat(cols);
+        // Claude Code pins the composer and its footer to the literal bottom
+        // of the screen and lets the transcript float above them, so the
+        // rows between are blank — not the end of the drawn area. Building
+        // the screen top-down without that filler is what makes a fixture
+        // stop resembling the thing it is standing in for.
+        let transcript: Vec<String> = vec![
+            String::new(),
+            "\u{276F} run the tests".to_string(),
+            String::new(),
+            "\u{25CF} Running the crate's unit tests".to_string(),
+            "  \u{23BF}  $ cargo nextest run --lib".to_string(),
+            String::new(),
+            "\u{25CF} Bash(git status --short)".to_string(),
+            "  \u{23BF} \u{a0}M src/main.rs".to_string(),
+            String::new(),
+            "\u{25CF} All green.".to_string(),
+            String::new(),
+            "\u{273B} Brewed for 3s".to_string(),
+        ];
+        let bottom = [
+            rule.clone(),
+            "\u{276F} ".to_string(),
+            rule,
+            "  \u{2839} Sonnet 5 \u{2387}master            5% \u{2581}\u{2581}\u{2581} $0.09 \u{276F}".to_string(),
+            "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle) \u{b7} \u{2190} for agents".to_string(),
+        ];
+        let mut lines = transcript;
+        lines.resize(rows - bottom.len(), String::new());
+        lines.extend(bottom);
+        for (index, line) in lines.iter().enumerate() {
+            terminal.write(line.as_bytes());
+            if index + 1 < lines.len() {
+                terminal.write(b"\r\n");
+            }
+        }
+    }
+
+    /// The whole point of the split: it must resolve against the agent's real
+    /// screen, not only against a fixture written to the detector's own
+    /// assumptions. Guards the shape facts a Claude Code release can change
+    /// under herdr — a full-width rule pair around the composer and exactly
+    /// two footer rows below it.
+    #[test]
+    fn claude_triview_layout_resolves_against_a_real_claude_code_screen() {
+        let cols = 120usize;
+        let rows = 34u16;
+        let mut terminal = crate::ghostty::Terminal::new(cols as u16, rows, 0).unwrap();
+        write_real_claude_v2_screen(&mut terminal, cols, rows as usize);
+
+        let layout = claude_triview_layout(&terminal, rows, 0)
+            .expect("a real Claude Code screen must resolve a triview layout");
+
+        assert_eq!(layout.composer_rows, 1, "the `\u{276F} ` input line");
+        assert_eq!(
+            layout.footer_rows, 2,
+            "the status line and the shortcuts hint Claude pins to the floor"
+        );
+        assert_eq!(
+            layout.consumed_rows() + layout.log_rows + layout.footer_rows,
+            rows,
+            "every row of the pane is accounted for"
+        );
+        // Nothing was asked for the log, so nothing came off the transcript
+        // and the pane's rows still map one-to-one onto the grid's.
+        assert_eq!(layout.transcript_skip, 0);
+        assert_eq!(layout.log_rows, 0);
+    }
+
+    /// Asking for log rows takes them off the transcript's top and never off
+    /// the agent's footer, on that same real screen.
+    #[test]
+    fn a_real_claude_code_screen_gives_the_log_zone_rows_from_its_transcript() {
+        let cols = 120usize;
+        let rows = 34u16;
+        let mut terminal = crate::ghostty::Terminal::new(cols as u16, rows, 0).unwrap();
+        write_real_claude_v2_screen(&mut terminal, cols, rows as usize);
+
+        let layout = claude_triview_layout(&terminal, rows, 3)
+            .expect("a real Claude Code screen must resolve a triview layout");
+
+        assert_eq!(layout.log_rows, 3);
+        assert_eq!(layout.transcript_skip, 3);
+        assert_eq!(
+            layout.footer_rows, 2,
+            "the footer is never a donor for the log zone"
+        );
+        assert_eq!(
+            layout.consumed_rows() + layout.log_rows + layout.footer_rows,
+            rows
+        );
+    }
+
+    /// The command log's own source, run over the same real screen text: both
+    /// shapes Claude Code v2.1.241 prints for a shell call are found, and its
+    /// non-command `\u{23BF}` results are not.
+    #[test]
+    fn a_real_claude_code_screen_yields_both_command_marker_shapes() {
+        let cols = 120usize;
+        let rows = 34u16;
+        let mut terminal = crate::ghostty::Terminal::new(cols as u16, rows, 0).unwrap();
+        write_real_claude_v2_screen(&mut terminal, cols, rows as usize);
+
+        let recent = ghostty_recent_text_for_terminal(&terminal, rows as usize).unwrap();
+        let markers = crate::detect::command_markers(Some(crate::detect::Agent::Claude), &recent);
+        let commands: Vec<String> = markers
+            .iter()
+            .map(|marker| crate::detect::bash_command_text(marker))
+            .collect();
+        assert_eq!(
+            commands,
+            vec![
+                "cargo nextest run --lib".to_string(),
+                "git status --short".to_string(),
+            ],
+            "collapsed `\u{23BF}  $ ` echo and expanded `\u{25CF} Bash(...)` bullet both count; \
+             the `\u{23BF} \u{a0}M src/main.rs` result line does not"
+        );
+    }
+
     #[test]
     fn render_claude_triview_splits_transcript_and_composer_zones() {
         let (tx, _rx) = mpsc::channel(4);

@@ -608,6 +608,31 @@ simply never mentions it. Adding a new such field does not require touching
 the backfill; only a field that a remote manifest might legitimately want to
 override needs to bypass it.
 
+An agent's on-screen vocabulary is a moving target, and a marker keyed to one
+glyph fails silently — the feature reading it just stays empty forever. Claude
+Code v2.1.241, captured live, draws its tool bullet as `●` (U+25CF) where
+earlier releases used `⏺` (U+23FA), and in its default non-verbose view it
+prints no `Bash(...)` line for a shell call at all: the command appears only
+as a `⎿  $ ` echo under a prose description, and folds away to `Ran 1 shell
+command` once the call finishes. `src/detect/command_marker.rs` therefore
+accepts both bullets and both shapes. When adding a marker, accept every form
+you have evidence for rather than the current one, and prefer a discriminator
+the agent uses structurally — non-command `⎿` results put U+00A0 where a shell
+command puts `$ `, which is what separates a logged command from a file read.
+
+Capture that evidence from the real CLI, not from memory: `claude` in a plain
+sized PTY (`tmux new-session -d -x 120 -y 34`, then `tmux capture-pane -p`) is
+enough, and is how the shapes above were established before any herdr code was
+touched.
+
+For anything that renders a pane differently, screenshot the mode herdr
+actually starts in (`Mode::Navigate`), not only `Mode::Terminal`. A render path
+gated on `Mode::Terminal` is off in the mode a captain idles in and in every
+overlay, so a harness that only shoots terminal mode will show a feature
+working that is invisible in practice. `data/herdr-triview-default-state-20260823/`
+has the harness that shoots all three modes; `data/herdr-triview-status-bar-20260822/`
+is the earlier terminal-mode-only one.
+
 Do not add large agent-specific full-screen fixture suites for routine manifest tuning. Keep Rust tests focused on manifest parsing, rule semantics, skip-state semantics, source precedence, cache reload behavior, and update flow. Use live pane reads for agent-specific screen evidence.
 
 ## Vendored libghostty-vt
