@@ -65,6 +65,7 @@ enum ManagedAgentPhase {
         deadline: Instant,
         observed_expected: bool,
     },
+    Blocked,
     Active,
 }
 
@@ -170,6 +171,7 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
+    agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
 }
 
@@ -206,6 +208,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
+            agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
         }
     }
@@ -225,6 +228,69 @@ impl TerminalState {
         self.declared_agent = agent;
         self.revision = self.revision.wrapping_add(1);
         true
+    }
+
+    /// Record that process detection found `agent` before any screen evidence.
+    ///
+    /// The state deliberately lands on `Unknown`, not `Idle`: the process is up
+    /// but the agent has not drawn a prompt yet, and calling that `Idle` is what
+    /// let text be sent before the agent could receive it. `Idle` arrives only
+    /// once the screen detector confirms it, and
+    /// [`Self::finish_agent_process_acquisition`] marks that first `Idle` as a
+    /// startup arrival rather than a completion.
+    pub fn set_detected_agent_process_at(
+        &mut self,
+        agent: Agent,
+        now: Instant,
+    ) -> TerminalStateMutation {
+        let starts_acquisition = !self
+            .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
+            && !self.detected_state_observed_before_release_suppression(Some(agent), now);
+        let mutation = self.set_detected_state_with_screen_signals_at(
+            Some(agent),
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now,
+        );
+        if starts_acquisition {
+            self.agent_process_acquisition_pending = true;
+        }
+        mutation
+    }
+
+    /// Close the startup window opened by [`Self::set_detected_agent_process_at`],
+    /// reporting whether the state change that closed it was the agent arriving
+    /// at its prompt rather than finishing work.
+    ///
+    /// The window closes on the first confirmed `Idle` — but also when the agent
+    /// it was acquiring is gone. Without that second exit the flag latches on
+    /// forever for an agent that dies during startup, and everything reading it
+    /// (the completion gate here, the `stopped` tray signal) would keep treating
+    /// that pane as mid-startup for the rest of the session.
+    pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
+        if !self.agent_process_acquisition_pending {
+            return false;
+        }
+        let reached_idle = self.state == AgentState::Idle;
+        let agent_gone = self.effective_known_agent().is_none();
+        let suppress_completion = reached_idle && self.recent_agent_process_exit.is_none();
+        if reached_idle || agent_gone {
+            self.agent_process_acquisition_pending = false;
+        }
+        suppress_completion
+    }
+
+    /// True while process detection has claimed an agent that the screen
+    /// detector has not confirmed a prompt for yet.
+    ///
+    /// A pane in this window reads as `AgentState::Unknown`, which is the same
+    /// state a pane whose agent *exited* reads as. Readers that treat `Unknown`
+    /// as "this worker stopped" must exclude it.
+    pub(crate) fn agent_process_acquisition_pending(&self) -> bool {
+        self.agent_process_acquisition_pending
     }
 
     pub(crate) fn terminal_title_stripped(&self) -> Option<String> {
@@ -1869,8 +1935,12 @@ impl TerminalState {
     }
 
     pub fn managed_agent_launch_pending(&self) -> bool {
-        self.managed_agent
-            .is_some_and(|managed| matches!(managed.phase, ManagedAgentPhase::Pending { .. }))
+        self.managed_agent.is_some_and(|managed| {
+            matches!(
+                managed.phase,
+                ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
+            )
+        })
     }
 
     pub fn managed_agent_interactive_ready(&self) -> bool {
@@ -1903,7 +1973,7 @@ impl TerminalState {
             ManagedAgentPhase::Pending {
                 observed_expected, ..
             } => observed_expected || known_agent == Some(managed.kind),
-            ManagedAgentPhase::Active => false,
+            ManagedAgentPhase::Blocked | ManagedAgentPhase::Active => false,
         };
         let clear = process_exited
             || known_agent.is_some_and(|agent| agent != managed.kind)
@@ -1914,20 +1984,35 @@ impl TerminalState {
             self.clear_agent_name();
             return true;
         }
+        if managed.phase == ManagedAgentPhase::Blocked {
+            if known_agent == Some(managed.kind) && self.state == AgentState::Idle {
+                self.managed_agent = Some(ManagedAgent {
+                    kind: managed.kind,
+                    phase: ManagedAgentPhase::Active,
+                });
+                return true;
+            }
+            return false;
+        }
         if let ManagedAgentPhase::Pending {
             ready_after,
             deadline,
             observed_expected: previous_observed_expected,
         } = managed.phase
         {
+            if known_agent == Some(managed.kind) && self.state == AgentState::Blocked {
+                self.managed_agent = Some(ManagedAgent {
+                    kind: managed.kind,
+                    phase: ManagedAgentPhase::Blocked,
+                });
+                return true;
+            }
             if now >= deadline {
                 self.clear_agent_name();
                 return true;
             }
             if ready_after.is_none_or(|ready_after| now >= ready_after) {
-                if known_agent == Some(managed.kind)
-                    && matches!(self.state, AgentState::Idle | AgentState::Blocked)
-                {
+                if known_agent == Some(managed.kind) && self.state == AgentState::Idle {
                     self.managed_agent = Some(ManagedAgent {
                         kind: managed.kind,
                         phase: ManagedAgentPhase::Active,
@@ -1996,6 +2081,7 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
+        self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
         self.clear_agent_name();
     }
@@ -2122,6 +2208,105 @@ mod tests {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
     }
 
+    /// The startup window has to close on its own even when the thing it was
+    /// waiting for never arrives. An agent that dies before drawing a prompt
+    /// used to leave the flag latched on for the life of the terminal, which
+    /// would silently suppress the next real completion and keep the pane
+    /// looking like it was still starting.
+    #[test]
+    fn a_startup_window_closes_when_the_agent_never_reaches_a_prompt() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.set_detected_agent_process_at(Agent::Pi, now);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert!(terminal.agent_process_acquisition_pending());
+
+        // The process goes away without ever showing an interactive prompt.
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            true,
+            now + Duration::from_secs(1),
+        );
+        assert!(!terminal.finish_agent_process_acquisition());
+        assert!(
+            !terminal.agent_process_acquisition_pending(),
+            "a window with no agent left to acquire must not stay open"
+        );
+
+        // A later, unrelated completion in the same terminal is therefore a
+        // real one.
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now + Duration::from_secs(2),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_secs(3),
+        );
+        assert!(
+            !terminal.finish_agent_process_acquisition(),
+            "a completion after the window closed must not be suppressed"
+        );
+    }
+
+    /// And the window closes exactly once: the first confirmed prompt ends it,
+    /// so the work the agent is then given completes normally.
+    #[test]
+    fn a_startup_window_closes_at_the_first_confirmed_prompt() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.set_detected_agent_process_at(Agent::Pi, now);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_millis(500),
+        );
+        assert!(
+            terminal.finish_agent_process_acquisition(),
+            "arriving at the prompt is the suppressed transition"
+        );
+        assert!(!terminal.agent_process_acquisition_pending());
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            now + Duration::from_secs(1),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_secs(2),
+        );
+        assert!(!terminal.finish_agent_process_acquisition());
+    }
+
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
             .unwrap()
@@ -2146,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_agent_activates_only_after_matching_settled_detection() {
+    fn managed_agent_readiness_tracks_detection_state() {
         let mut terminal = test_terminal();
         let now = Instant::now();
         terminal.begin_managed_agent(
@@ -2156,23 +2341,35 @@ mod tests {
             Duration::from_millis(100),
             Duration::from_secs(1),
         );
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Unknown);
 
         assert!(terminal.managed_agent_launch_pending());
         assert!(!terminal.managed_agent_interactive_ready());
         assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(100), false));
-        assert!(!terminal.managed_agent_launch_pending());
-        assert!(terminal.managed_agent_interactive_ready());
-        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(terminal.managed_agent_launch_pending());
 
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(102), false));
+        assert!(terminal.managed_agent_launch_pending());
+        assert!(!terminal.managed_agent_interactive_ready());
+        assert_eq!(terminal.next_managed_agent_deadline(), None);
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), false));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), false));
+        assert!(!terminal.managed_agent_launch_pending());
         assert!(terminal.managed_agent_interactive_ready());
 
         terminal.set_detected_state(None, AgentState::Unknown);
         assert!(terminal.managed_agent_interactive_ready());
-        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_millis(101), false));
+        assert!(!terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), false));
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
-        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_millis(102), true));
+        assert!(terminal.reconcile_managed_agent_at(now + Duration::from_secs(2), true));
         assert_eq!(terminal.agent_name, None);
     }
 
@@ -5363,6 +5560,7 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
 
         terminal.clear_agent_runtime_identity_after_respawn();
 
@@ -5371,6 +5569,7 @@ mod tests {
         assert!(terminal.agent_name.is_none());
         assert!(terminal.persisted_agent_session.is_none());
         assert!(!terminal.respawn_shell_on_exit);
+        assert!(!terminal.finish_agent_process_acquisition());
     }
 
     #[test]

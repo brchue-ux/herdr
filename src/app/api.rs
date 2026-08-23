@@ -119,13 +119,25 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        let _ = self.handle_internal_event_with_pane_updates(ev);
+    }
+
+    /// The same dispatch, but reporting the `PaneStateUpdate`s it produced.
+    ///
+    /// The headless server needs them to honour `suppress_completion` on the
+    /// forwarding path: only the update itself knows whether an `Idle` it just
+    /// produced is a real completion or an agent finishing startup.
+    pub(crate) fn handle_internal_event_with_pane_updates(
+        &mut self,
+        ev: AppEvent,
+    ) -> Vec<crate::app::actions::PaneStateUpdate> {
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
             #[cfg(test)]
             let _ = content;
             self.show_clipboard_feedback();
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::PrefixInputSource { active } = ev {
@@ -134,14 +146,14 @@ impl App {
             // App-internal drain consume the event before the forwarding drain, the flag keeps the
             // switch out of the headless server process.
             if !self.local_input_source_switch {
-                return;
+                return Vec::new();
             }
             if active {
                 self.prefix_input_source.switch_to_ascii();
             } else {
                 self.prefix_input_source.restore();
             }
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::GitStatusRefreshed {
@@ -150,7 +162,7 @@ impl App {
         } = ev
         {
             self.handle_git_status_refreshed(results, cache_updates);
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::CommandAcknowledged {
@@ -163,7 +175,7 @@ impl App {
                 .record(crate::anim::CardRow::Agent(pane_id), observed_at);
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::TabBarCommandFinished {
@@ -176,7 +188,7 @@ impl App {
                 self.render_dirty.request_generic();
                 self.render_notify.notify_one();
             }
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::PluginCommandFinished {
@@ -207,17 +219,17 @@ impl App {
                     crate::api::schema::PluginCommandStatus::Failed
                 };
             }
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::WorktreeAddFinished(result) = ev {
             self.handle_worktree_add_finished(*result);
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
@@ -228,7 +240,7 @@ impl App {
                 .is_some_and(|popup| popup.pane_id == *pane_id)
             {
                 self.close_popup_pane();
-                return;
+                return Vec::new();
             }
             let previous_toast = self.state.toast.clone();
             if let Some(update) = self.state.publish_pane_process_exit_if_agent(*pane_id) {
@@ -243,7 +255,7 @@ impl App {
                 self.overlay_panes.remove(pane_id);
                 self.render_dirty.request_generic();
                 self.render_notify.notify_one();
-                return;
+                return Vec::new();
             }
         }
 
@@ -437,6 +449,7 @@ impl App {
 
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
+        pane_updates
     }
 
     fn reset_agent_detection_for_agents(&self, agents: &[crate::detect::Agent]) {
