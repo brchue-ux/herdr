@@ -65,9 +65,9 @@ herdr --remote workbox
 
 リモートアタッチは x86_64 と aarch64 の Linux および macOS ホストをサポートします。Herdr はリモートのプラットフォームを確認し、リモートの `PATH` 上にある一致する `herdr` を優先し、次に `~/.local/bin/herdr` を確認します。一致するバイナリがない場合、対話的な実行では `~/.local/bin/herdr` へのインストールを提案します。非対話的な実行はホストを変更せずに失敗します。`~/.local/bin` がリモートの `PATH` にない場合、Herdr はインストール後に警告します。
 
-ネイティブ Windows の `herdr --remote` は Windows ベータの範囲外です。Windows からはサーバーに SSH してそこで `herdr` を実行してください。
+これはリモートサーバー側のプラットフォームの話であり、アタッチ元のマシンのことではありません。`herdr --remote` は Windows バイナリからも実行できます。
 
-デフォルトでは、`herdr --remote` はあなたの SSH config を最初に include し、その後にフォールバックのキープアライブ設定を加えた一時的な SSH config を通してブリッジを実行します。既存のユーザーのキープアライブ設定が優先されます。Herdr が生成するブリッジ設定を使わず素の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。
+デフォルトでは、`herdr --remote` はあなたの SSH config を最初に include し、その後にフォールバックのキープアライブ設定を加えた一時的な SSH config を通してブリッジを実行します。既存のユーザーのキープアライブ設定が優先されます。Herdr が生成するブリッジ設定を使わず素の `ssh` を使うには `[remote].manage_ssh_config = false` を設定してください。Windows の OpenSSH には ControlMaster のサポートがないため、Windows では `herdr --remote` は常に素の `ssh` を実行し、`[remote].manage_ssh_config` は効果がありません。
 
 デフォルトでは、実行中のリモートサーバーの置き換えや再起動が必要な場合、リモートアタッチは通常の再起動/停止フローを使います。対応する実行中リモートサーバーで実験的なライブハンドオフにオプトインするには `--handoff` を渡します:
 

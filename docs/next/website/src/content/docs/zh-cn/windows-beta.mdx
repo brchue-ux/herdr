@@ -92,7 +92,6 @@ Herdr 的窗格文本复制在 Windows 测试版上可用。在窗格内拖选�
 | 能力 | 状态 |
 | --- | --- |
 | 直接终端附加 | 不支持 |
-| Windows 二进制的 `herdr --remote` | 不支持 |
 | 实时服务器交接 | 不支持 |
 | Unix 文件描述符交接 | 不支持 |
 | Unix 前台进程组 | 不支持 |
@@ -100,14 +99,7 @@ Herdr 的窗格文本复制在 Windows 测试版上可用。在窗格内拖选�
 | 前缀输入法切换 | 不支持 |
 | 签名二进制 / 规避 SmartScreen | 不支持 |
 
-在 Windows 上进行远程工作,请 SSH 到服务器并在那里运行 `herdr`:
-
-```powershell
-ssh you@server
-herdr
-```
-
-这种模式下 Herdr 运行在远程主机上。Windows 原生的 `herdr --remote` 不在测试版范围内。
+在 Windows 上进行远程工作,请从 Windows 二进制运行 `herdr --remote you@server` — 参见[持久化与远程访问](/zh-cn/docs/persistence-remote/)。远程服务器本身仍须是 Linux 或 macOS;Herdr 的服务端不在 Windows 上运行。
 
 Windows 更新通过 Windows 安装器进行,并更新带版本号的安装联接点。更新后请重启运行中的 Herdr 会话。实时交接仅限 Unix。
 

@@ -132,7 +132,7 @@ Remote attach manages its SSH connection with a temporary keepalive and connecti
 manage_ssh_config = true
 ```
 
-When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Herdr also uses a private per-attach OpenSSH control socket to reuse the first authenticated connection. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
+When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Herdr also uses a private per-attach OpenSSH control socket to reuse the first authenticated connection. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket. This setting is macOS and Linux only: Windows OpenSSH has no ControlMaster support, so on Windows `herdr --remote` always runs plain `ssh` and `manage_ssh_config` has no effect.
 
 ## Keybindings
 
