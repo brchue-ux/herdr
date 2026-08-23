@@ -326,7 +326,16 @@ impl FleetSignals {
                     // agent is a worker that stopped. An unowned shell is just
                     // a shell, and lighting the tray for one would make the
                     // signal useless in any session with a spare terminal open.
-                    AgentState::Unknown if owned => {
+                    //
+                    // A worker that is still *starting* reads as `Unknown` too:
+                    // process detection claims the agent before the screen
+                    // detector has confirmed its prompt, and the pane holds that
+                    // state for the whole startup grace window. That is the
+                    // opposite of stopped, so it is excluded by the same flag
+                    // that gates the startup completion notification.
+                    AgentState::Unknown
+                        if owned && !terminal.agent_process_acquisition_pending() =>
+                    {
                         signals.set(FleetSignal::Stopped);
                         awaiting = true;
                     }
@@ -817,6 +826,126 @@ mod tests {
             signals_for_pane_state(AgentState::Unknown, true, Some("mate"))
                 .is_live(FleetSignal::Stopped),
             "a worker the fleet launched and that is no longer running an agent is stopped"
+        );
+    }
+
+    /// The other half of that distinction, and the one an agent *starting* can
+    /// break. `AgentState::Unknown` is also what a pane reads as for the three
+    /// seconds between process detection claiming an agent and the screen
+    /// detector confirming its prompt, so a worker the fleet just launched
+    /// spends that window looking exactly like a worker that stopped.
+    #[test]
+    fn a_worker_that_is_still_starting_is_not_a_stopped_worker() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let pane_id = *app.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = app.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("terminal exists")
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([(
+                    crate::app::agent_tree::OWNER_TOKEN.to_string(),
+                    Some("mate".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+
+        // The real startup path: process detection claims the agent before any
+        // screen evidence exists.
+        app.handle_app_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            app.terminals[&terminal_id].state,
+            AgentState::Unknown,
+            "process detection must not claim a prompt it has not seen"
+        );
+        assert!(
+            !FleetSignals::resolve(&app).is_live(FleetSignal::Stopped),
+            "an agent that is still starting has not stopped"
+        );
+
+        // Once the screen confirms the prompt the pane is a normal live agent,
+        // and a later exit still reads as stopped.
+        app.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(!FleetSignals::resolve(&app).is_live(FleetSignal::Stopped));
+
+        app.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+        assert!(
+            FleetSignals::resolve(&app).is_live(FleetSignal::Stopped),
+            "a worker whose agent exited is still a stopped worker"
+        );
+    }
+
+    /// The failure mode the startup exclusion could introduce: a worker whose
+    /// agent dies before it ever draws a prompt must still light `stopped`,
+    /// not disappear behind a window that never closed.
+    #[test]
+    fn a_worker_that_dies_while_starting_is_still_a_stopped_worker() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        let pane_id = *app.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = app.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("terminal exists")
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([(
+                    crate::app::agent_tree::OWNER_TOKEN.to_string(),
+                    Some("mate".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+
+        app.handle_app_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: std::time::Instant::now(),
+        });
+        app.handle_app_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert!(
+            FleetSignals::resolve(&app).is_live(FleetSignal::Stopped),
+            "an agent that never reached its prompt still stopped"
         );
     }
 
