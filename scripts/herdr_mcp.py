@@ -19,6 +19,14 @@ Two properties are deliberate:
   See `SIDE_EFFECT_NOTES` for the two read-shaped methods that are excluded
   because they are not actually side-effect free.
 
+`herdr_pane_screenshot` is the one tool here that is not a socket call at all:
+it shells out to ImageMagick to screenshot the local X display Herdr's own
+terminal is rendering to, then (for a single pane) crops the result using cell
+geometry read from the socket. It sees only what that local display shows — a
+real terminal under Xvfb in a lab, or a local kitty session — and has no path
+to a remote client's own screen (e.g. a Windows/Rio client attached over
+`--remote`). See its tool description for the exact requirements.
+
 Run it with no arguments to serve MCP over stdio:
 
     python3 scripts/herdr_mcp.py
@@ -32,10 +40,14 @@ is a useful smoke check against a running session:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import socket
+import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -522,6 +534,123 @@ def render_pane_detail(pane: dict[str, Any], process: dict[str, Any] | None) -> 
 
 
 # ---------------------------------------------------------------------------
+# Screenshot capture
+# ---------------------------------------------------------------------------
+#
+# This is the one capability in this file that never touches Herdr's socket.
+# `herdr_pane_screenshot` gets its pixels from an external screenshot of the
+# local X display Herdr's terminal happens to be rendered on — the same
+# `import -window root` used throughout `data/*/lab.sh` and by PR #192's own
+# verification captures (`data/herdr-worker-card-nested-tiered/README.md`).
+# Being a subprocess against the X server rather than a request on the API
+# socket is what makes it structurally read-only: there is no method name to
+# refuse, because nothing is sent to Herdr at all. Only the crop rectangle
+# (which pane covers which cells, and how large a cell is in pixels) comes
+# from the socket, and both of those calls are already in `READ_ONLY_METHODS`.
+#
+# This also means it can only ever see what that local display shows. In a
+# lab (Xvfb + a real terminal sized to fill it, no window manager) that is
+# exactly Herdr's own window and nothing else. On an ordinary desktop with a
+# window manager, `import -window root` captures the whole screen, which may
+# include other windows — point `HERDR_MCP_DISPLAY` at an isolated display for
+# a clean capture. Either way it is the *local* display only: there is no path
+# from here to a remote client's own screen, e.g. a Windows/Rio client
+# attached over `--remote`.
+
+DISPLAY_ENV_VAR = "HERDR_MCP_DISPLAY"
+SCREENSHOT_BIN_ENV_VAR = "HERDR_MCP_SCREENSHOT_BIN"
+CROP_BIN_ENV_VAR = "HERDR_MCP_CROP_BIN"
+SCREENSHOT_TIMEOUT_ENV_VAR = "HERDR_MCP_SCREENSHOT_TIMEOUT_SECONDS"
+DEFAULT_SCREENSHOT_TIMEOUT_SECONDS = 15.0
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _screenshot_timeout() -> float:
+    try:
+        return float(
+            os.environ.get(SCREENSHOT_TIMEOUT_ENV_VAR, DEFAULT_SCREENSHOT_TIMEOUT_SECONDS)
+        )
+    except ValueError:
+        return DEFAULT_SCREENSHOT_TIMEOUT_SECONDS
+
+
+def resolve_display() -> str:
+    """The X display to screenshot: `HERDR_MCP_DISPLAY`, else `DISPLAY`."""
+    display = os.environ.get(DISPLAY_ENV_VAR) or os.environ.get("DISPLAY")
+    if not display:
+        raise HerdrApiError(
+            "no X display configured. Set HERDR_MCP_DISPLAY (or DISPLAY) to the display "
+            "Herdr's own terminal is actually rendered on -- a lab Xvfb display or a "
+            "local kitty session. This connector has no path to a remote client's screen."
+        )
+    return display
+
+
+def capture_display_png(display: str) -> bytes:
+    """Screenshot `display`'s root window as PNG bytes via ImageMagick `import`.
+
+    A subprocess against the X server, never Herdr's own socket, so this
+    cannot read or perturb session state. Kept as its own function so tests
+    can substitute a fake capture without a real X server or ImageMagick.
+    """
+    binary = os.environ.get(SCREENSHOT_BIN_ENV_VAR, "import")
+    cmd = [binary, "-display", display, "-window", "root", "png:-"]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=_screenshot_timeout()
+        )
+    except FileNotFoundError as err:
+        raise HerdrApiError(
+            f"screenshot tool {binary!r} not found. Install ImageMagick, or point "
+            f"{SCREENSHOT_BIN_ENV_VAR} at an equivalent that writes PNG bytes to stdout."
+        ) from err
+    except subprocess.TimeoutExpired as err:
+        raise HerdrApiError(f"screenshot of display {display!r} timed out") from err
+    if proc.returncode != 0 or not proc.stdout:
+        raise HerdrApiError(
+            f"screenshot of display {display!r} failed: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return proc.stdout
+
+
+def crop_png(data: bytes, rect_px: tuple[int, int, int, int]) -> bytes:
+    """Crop PNG bytes to `(x, y, width, height)` pixels via ImageMagick `convert`."""
+    x, y, width, height = rect_px
+    binary = os.environ.get(CROP_BIN_ENV_VAR, "convert")
+    cmd = [binary, "-", "-crop", f"{width}x{height}+{x}+{y}", "+repage", "png:-"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_screenshot_timeout(),
+        )
+    except FileNotFoundError as err:
+        raise HerdrApiError(
+            f"crop tool {binary!r} not found. Install ImageMagick, or point "
+            f"{CROP_BIN_ENV_VAR} at an equivalent."
+        ) from err
+    except subprocess.TimeoutExpired as err:
+        raise HerdrApiError("cropping the screenshot timed out") from err
+    if proc.returncode != 0 or not proc.stdout:
+        raise HerdrApiError(
+            f"cropping the screenshot failed: {proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return proc.stdout
+
+
+def png_dimensions(data: bytes) -> tuple[int, int]:
+    """Width, height read from a PNG's IHDR chunk. Stdlib-only, no Pillow."""
+    if len(data) < 24 or data[:8] != PNG_SIGNATURE:
+        raise HerdrApiError("captured data is not a PNG image")
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -615,6 +744,48 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "herdr_pane_screenshot",
+            "description": (
+                "A real PNG screenshot of what Herdr is actually drawing right now -- pixels, "
+                "not a character grid, so kitty-graphics cards, ambient backgrounds and colors "
+                "are genuinely visible. Pass pane_id to capture just that pane, cropped to its "
+                "exact cell rect; pass workspace_id or tab_id to capture the whole window, which "
+                "is what checking a cross-pane layout needs. Exactly one of the three is "
+                "required. The target must be the workspace/tab currently shown on screen -- a "
+                "pane sitting in a background tab cannot be captured, and this tool never "
+                "changes focus to make one visible.\n\n"
+                "This reads whatever *local* display Herdr's own terminal happens to be "
+                "rendered on (a real terminal under Xvfb in a lab, or a local kitty session) by "
+                "shelling out to ImageMagick -- it never sends anything to Herdr's socket to get "
+                "the pixels. It has no path to a remote client's own screen, e.g. a Windows/Rio "
+                "client attached over --remote. Requires ImageMagick (`import`/`convert`) and an "
+                "X display reachable via HERDR_MCP_DISPLAY or DISPLAY; cropping to one pane also "
+                "requires experimental.kitty_graphics enabled so Herdr knows the terminal's cell "
+                "pixel size (whole-window capture does not need this)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": SESSION_PROPERTY,
+                    "pane_id": {
+                        "type": "string",
+                        "description": "Capture just this pane, cropped to its cell rect.",
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "description": (
+                            "Capture the whole window; this workspace must be the focused one."
+                        ),
+                    },
+                    "tab_id": {
+                        "type": "string",
+                        "description": "Capture the whole window; this tab must be the focused one.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "herdr_query",
             "description": (
                 "Call any read-only Herdr JSON API method directly and return its raw result. "
@@ -701,6 +872,117 @@ def tool_herdr_pane_read(client_factory: Callable[[str | None], HerdrClient], ar
     return (text + ("\n" + " ".join(notes) if notes else "")).rstrip() + "\n"
 
 
+def _resolve_screenshot_target(
+    client: HerdrClient, args: dict
+) -> tuple[str | None, str, str, str]:
+    """Validate the request and return `(crop_pane_id, rep_pane_id, workspace_id, tab_id)`.
+
+    `crop_pane_id` is `None` for a whole-window capture. `rep_pane_id` is any
+    pane in the target tab, which is all `pane.layout` needs to describe it.
+    Refuses a target outside the workspace/tab currently shown on screen,
+    since a screenshot cannot show anything else.
+    """
+    pane_id = args.get("pane_id")
+    workspace_id = args.get("workspace_id")
+    tab_id = args.get("tab_id")
+    given = [name for name, value in (("pane_id", pane_id), ("workspace_id", workspace_id), ("tab_id", tab_id)) if value]
+    if len(given) != 1:
+        raise HerdrApiError(
+            "pass exactly one of pane_id, workspace_id or tab_id to say what to capture "
+            f"(got: {given or 'none'})"
+        )
+
+    result = client.call("session.snapshot")
+    snapshot = result.get("snapshot", result)
+    workspaces = {w["workspace_id"]: w for w in snapshot.get("workspaces") or []}
+    tabs = {t["tab_id"]: t for t in snapshot.get("tabs") or []}
+    panes = snapshot.get("panes") or []
+    panes_by_id = {p["pane_id"]: p for p in panes}
+
+    crop_pane_id: str | None = None
+    if pane_id:
+        pane = panes_by_id.get(pane_id)
+        if pane is None:
+            raise HerdrApiError(f"no pane {pane_id!r} in this session")
+        target_ws_id = pane["workspace_id"]
+        target_tab_id = pane["tab_id"]
+        crop_pane_id = pane_id
+    elif tab_id:
+        tab = tabs.get(tab_id)
+        if tab is None:
+            raise HerdrApiError(f"no tab {tab_id!r} in this session")
+        target_ws_id = tab["workspace_id"]
+        target_tab_id = tab_id
+    else:
+        ws = workspaces.get(workspace_id)
+        if ws is None:
+            raise HerdrApiError(f"no workspace {workspace_id!r} in this session")
+        target_ws_id = workspace_id
+        target_tab_id = ws.get("active_tab_id")
+        if not target_tab_id:
+            raise HerdrApiError(f"workspace {workspace_id!r} has no active tab")
+
+    ws = workspaces.get(target_ws_id)
+    tab = tabs.get(target_tab_id)
+    if ws is None or tab is None:
+        raise HerdrApiError("could not resolve the target's workspace and tab")
+    if not (ws.get("focused") and tab.get("focused")):
+        raise HerdrApiError(
+            "refused: that target is not the workspace/tab currently shown on the local "
+            "display. A screenshot can only show what Herdr is actually rendering right "
+            "now; focus it first (outside this read-only connector), then retry."
+        )
+
+    rep_pane = next((p for p in panes if p.get("tab_id") == target_tab_id), None)
+    if rep_pane is None:
+        raise HerdrApiError(f"tab {target_tab_id!r} has no panes")
+
+    return crop_pane_id, rep_pane["pane_id"], target_ws_id, target_tab_id
+
+
+def tool_herdr_pane_screenshot(
+    client_factory: Callable[[str | None], HerdrClient], args: dict
+) -> list[dict[str, Any]]:
+    client = client_factory(args.get("session"))
+    crop_pane_id, rep_pane_id, _workspace_id, tab_id = _resolve_screenshot_target(client, args)
+
+    crop_rect_px: tuple[int, int, int, int] | None = None
+    if crop_pane_id:
+        layout = client.call("pane.layout", {"pane_id": rep_pane_id}).get("layout", {})
+        pane_rect = next(
+            (p["rect"] for p in layout.get("panes") or [] if p["pane_id"] == crop_pane_id),
+            None,
+        )
+        if pane_rect is None:
+            raise HerdrApiError(f"pane {crop_pane_id!r} is not part of the visible layout")
+        try:
+            cell = client.call("pane.graphics.info", {"pane_id": rep_pane_id})
+        except HerdrApiError as err:
+            raise HerdrApiError(
+                f"cannot crop to one pane: {err}. Herdr only knows the terminal's cell "
+                "pixel size once experimental.kitty_graphics is enabled and a client has "
+                "attached. Capture the whole workspace/tab instead, or enable it."
+            ) from err
+        crop_rect_px = (
+            pane_rect["x"] * cell["cell_width_px"],
+            pane_rect["y"] * cell["cell_height_px"],
+            pane_rect["width"] * cell["cell_width_px"],
+            pane_rect["height"] * cell["cell_height_px"],
+        )
+
+    display = resolve_display()
+    png_bytes = capture_display_png(display)
+    if crop_rect_px is not None:
+        png_bytes = crop_png(png_bytes, crop_rect_px)
+    width, height = png_dimensions(png_bytes)
+
+    what = f"pane {crop_pane_id}" if crop_pane_id else f"tab {tab_id} (whole window)"
+    return [
+        {"type": "image", "data": base64.b64encode(png_bytes).decode("ascii"), "mimeType": "image/png"},
+        {"type": "text", "text": f"{what}: {width}x{height}px PNG captured from display {display}"},
+    ]
+
+
 def tool_herdr_query(client_factory: Callable[[str | None], HerdrClient], args: dict) -> str:
     method = args["method"]
     if not is_read_only_method(method):
@@ -713,11 +995,12 @@ def tool_herdr_query(client_factory: Callable[[str | None], HerdrClient], args: 
     return json.dumps(result, indent=2, sort_keys=True)
 
 
-TOOLS: dict[str, Callable[[Callable[[str | None], HerdrClient], dict], str]] = {
+TOOLS: dict[str, Callable[[Callable[[str | None], HerdrClient], dict], Any]] = {
     "herdr_sessions": tool_herdr_sessions,
     "herdr_overview": tool_herdr_overview,
     "herdr_pane": tool_herdr_pane,
     "herdr_pane_read": tool_herdr_pane_read,
+    "herdr_pane_screenshot": tool_herdr_pane_screenshot,
     "herdr_query": tool_herdr_query,
 }
 
@@ -808,8 +1091,9 @@ class McpServer:
         if handler is None:
             raise HerdrApiError(f"unknown tool: {name}")
         arguments = params.get("arguments") or {}
-        text = handler(self._client_factory, arguments)
-        return {"content": [{"type": "text", "text": text}], "isError": False}
+        result = handler(self._client_factory, arguments)
+        content = [{"type": "text", "text": result}] if isinstance(result, str) else result
+        return {"content": content, "isError": False}
 
     def serve(self, stdin: Iterable[str], stdout: Any) -> None:
         for line in stdin:
@@ -868,10 +1152,32 @@ def _selftest(session: str | None) -> int:
     print()
     print("# overview")
     try:
-        print(tool_herdr_overview(server._client_factory, {"session": session}), end="")
+        snapshot_result = server._client_factory(session).call("session.snapshot")
     except HerdrApiError as err:
         print(f"unavailable: {err}")
         return 1
+    snapshot = snapshot_result.get("snapshot", snapshot_result)
+    print(render_overview(snapshot), end="")
+
+    print()
+    print("# screenshot")
+    focused_ws = next((w for w in snapshot.get("workspaces") or [] if w.get("focused")), None)
+    tab_id = focused_ws.get("active_tab_id") if focused_ws else None
+    if not tab_id:
+        print("skipped: no focused workspace with an active tab")
+    else:
+        try:
+            content = tool_herdr_pane_screenshot(
+                server._client_factory, {"session": session, "tab_id": tab_id}
+            )
+            image_block = next(b for b in content if b["type"] == "image")
+            png_bytes = base64.b64decode(image_block["data"])
+            out_path = Path(tempfile.gettempdir()) / f"herdr_mcp_selftest_{os.getpid()}.png"
+            out_path.write_bytes(png_bytes)
+            width, height = png_dimensions(png_bytes)
+            print(f"saved {out_path} ({width}x{height}px, {len(png_bytes)} bytes)")
+        except HerdrApiError as err:
+            print(f"unavailable: {err}")
     return 0
 
 

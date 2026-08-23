@@ -22,7 +22,9 @@ already running, which has two consequences worth keeping:
 
 ## Install
 
-Nothing to install — Python 3 standard library only.
+Nothing to install — Python 3 standard library only. The one exception is
+`herdr_pane_screenshot`, which shells out to ImageMagick (`import`/`convert`);
+every other tool has no dependency beyond Python itself.
 
 Claude Code:
 
@@ -62,6 +64,7 @@ python3 scripts/herdr_mcp.py --policy                # what it may and may not s
 | `herdr_overview` | The whole session as a workspace → tab → pane tree: labels, agent status, focus, cwd, worktree, ownership, metadata tokens. One call, and usually the only one needed. |
 | `herdr_pane` | One pane in full, including shell pid, tty and foreground processes. |
 | `herdr_pane_read` | The text currently on a pane's screen. |
+| `herdr_pane_screenshot` | A real PNG of what Herdr is actually drawing: one pane cropped, or the whole window. |
 | `herdr_query` | Any read-only API method by name, raw result. The escape hatch when a shaped tool does not carry the field you need. |
 
 `herdr_overview` output looks like this:
@@ -110,6 +113,36 @@ Session liveness in `herdr_sessions` is probed with a connect-and-close, which
 is exactly what `herdr session list` itself does
 (`src/session.rs::is_running_at`). Nothing is written to that socket.
 
+## `herdr_pane_screenshot`, and what it can and cannot reach
+
+This tool is the one thing in this file that is not a socket call at all. Its
+pixels come from an external screenshot of the *local* X display Herdr's own
+terminal happens to be rendered on — the same `import -window root` technique
+`data/herdr-worker-card-nested-tiered/` and `data/herdr-live-composite/` use
+for their own live verification captures. Cropping to one pane additionally
+reads two already-allowlisted methods (`pane.layout` for the pane's cell rect,
+`pane.graphics.info` for the cell's pixel size), but the pixels themselves
+never pass through Herdr's socket, so there is no method name here that needed
+enforcing — nothing is sent to Herdr to get an image back.
+
+That external-capture design is also its limit: it can only see whatever that
+local display shows. In a lab (Xvfb + a real terminal sized to fill it, no
+window manager) that is exactly Herdr's own window. On an ordinary desktop
+with a window manager, the same command captures the whole screen, which may
+include other windows — point `HERDR_MCP_DISPLAY` at an isolated display for a
+clean capture. Either way, it is the *local* display only. There is no path
+from here to a remote client's own screen — e.g. a Windows/Rio client attached
+over `--remote` renders on a different machine entirely, and this connector
+has no way to reach it.
+
+Cropping to one pane also requires `experimental.kitty_graphics` enabled and a
+kitty-graphics-capable client to have attached, since that is what makes
+Herdr's cell pixel size (`pane.graphics.info`) known. Whole-window capture
+(`workspace_id`/`tab_id`) needs neither.
+
+See `data/herdr-mcp-visual-access-20260823/README.md` for real captures and the
+exact live verification performed.
+
 ## Environment
 
 | Variable | Effect |
@@ -117,6 +150,10 @@ is exactly what `herdr session list` itself does
 | `HERDR_MCP_SOCKET` | Use this socket path directly, ignoring session name resolution. |
 | `HERDR_MCP_APP_DIR` | App directory name under the config dir. Set to `herdr-dev` to talk to a debug build's server. |
 | `HERDR_MCP_TIMEOUT_SECONDS` | Socket timeout, default 10. |
+| `HERDR_MCP_DISPLAY` | X display `herdr_pane_screenshot` screenshots. Falls back to `DISPLAY`. |
+| `HERDR_MCP_SCREENSHOT_BIN` | Screenshot binary, default `import` (ImageMagick). Must write PNG bytes to stdout. |
+| `HERDR_MCP_CROP_BIN` | Crop binary, default `convert` (ImageMagick). Must read PNG bytes from stdin and write PNG bytes to stdout. |
+| `HERDR_MCP_SCREENSHOT_TIMEOUT_SECONDS` | Timeout for the screenshot/crop subprocess, default 15. |
 
 Socket paths otherwise resolve exactly as `src/session.rs` resolves them:
 `$XDG_CONFIG_HOME/herdr/herdr.sock` (or `~/.config/herdr/herdr.sock`) for the
@@ -129,5 +166,11 @@ python3 -m unittest scripts.test_herdr_mcp
 ```
 
 They cover the read-only gate, socket path resolution, the wire round trip
-against a fake Herdr socket, the digest rendering, and a full MCP stdio
-handshake. `just test` and `just check` run them.
+against a fake Herdr socket, the digest rendering, the screenshot tool's target
+resolution and crop math (with the actual pixel capture mocked out), and a full
+MCP stdio handshake. `just test` and `just check` run them.
+
+Live capture itself — the real `import`/`convert` subprocess against a real
+display — is not part of this suite (it needs an X server and ImageMagick).
+It was verified once, live, against a real `kitty` under `Xvfb`; see
+`data/herdr-mcp-visual-access-20260823/README.md` for that evidence.
