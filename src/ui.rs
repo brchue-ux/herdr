@@ -9,6 +9,7 @@ pub(crate) mod color;
 mod dialogs;
 mod diff_pane;
 mod keybind_help;
+mod machine_corner;
 mod menus;
 mod mobile;
 mod navigator;
@@ -777,6 +778,16 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
             frame,
             app.status_feed_rect(),
             &app.status_feed,
+            app.machine_corner_rect(),
+            &app.palette,
+        );
+        // The machine register's own words, over the surface that draws its grooves and cores.
+        // Drawn after the stream so the two are written in the order they reserve space in —
+        // `render_status_feed` already steps around this rect via `status::corner_reservation`,
+        // and this writes only inside it.
+        crate::ui::machine_corner::render_machine_corner(
+            app,
+            frame,
             app.machine_corner_rect(),
             &app.palette,
         );
@@ -2351,6 +2362,100 @@ mod tests {
                 .map(|row| buffer_row_text(buffer, area, row))
                 .all(|row| !row.contains("herdr-line-")),
             "the stream drew with the scene off"
+        );
+    }
+
+    /// The machine corner's words share the scene's gate, and reach the frame through the same
+    /// pass its sibling readout does.
+    ///
+    /// Held here rather than only in `crate::ui::machine_corner` because that module's own tests
+    /// call the renderer directly: this is the wiring, and a renderer nobody calls passes every
+    /// test it has.
+    #[test]
+    fn the_machine_corner_names_its_quantities_and_shares_the_scene_gate() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        app.selected = 0;
+        app.mode = Mode::Navigate;
+        app.kitty_graphics_enabled = true;
+        app.persistent_background_enabled = true;
+        app.host_terminal_kind = crate::kitty_graphics::HostTerminalKind::Kitty;
+        app.every_app_viewer_draws_ambient_wash = true;
+
+        let now = std::time::Instant::now();
+        for index in 0..4u32 {
+            app.machine_register.sample(
+                Some(crate::platform::MachineCounters {
+                    cpu_total: Some((u64::from(index) * 250, u64::from(index) * 1_000)),
+                    cpu_per_core: vec![Some((u64::from(index) * 250, u64::from(index) * 1_000)); 4],
+                    memory_kib: Some((4_718_000, 10_000_000)),
+                    swap_kib: Some((0, 8_000_000)),
+                    load_average_1m: Some(2.4),
+                    sources: vec!["/proc/stat", "/proc/meminfo", "/proc/loadavg"],
+                }),
+                now + crate::machine_register::SAMPLE_INTERVAL * index,
+            );
+        }
+        // The words are drawn over a corner that is being drawn; the fixture stands one up rather
+        // than running the tick loop's graphics path.
+        app.machine_corner_layer = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            1,
+            1,
+            vec![0],
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                z: -1,
+            },
+        ));
+
+        let area = Rect::new(0, 0, 120, 40);
+        compute_view(&mut app, area);
+        let corner = app.machine_corner_rect();
+        assert!(corner.width > 0, "the fixture's corner does not fit");
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let screen = |terminal: &Terminal<TestBackend>| {
+            (corner.y..corner.y + corner.height)
+                .map(|row| {
+                    (corner.x..corner.x + corner.width)
+                        .map(|col| terminal.backend().buffer()[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let on = screen(&terminal);
+        for word in [
+            "machine",
+            "cores",
+            "cpu",
+            "mem",
+            "swap",
+            "load",
+            "of history",
+        ] {
+            assert!(on.contains(word), "the corner never said {word:?}:\n{on}");
+        }
+        assert!(
+            on.contains("25%"),
+            "the corner named cpu without valuing it:\n{on}"
+        );
+
+        // And with the scene off it is not drawn at all: it is part of that surface family and
+        // shares its gate, exactly as the status stream does.
+        app.persistent_background_enabled = false;
+        compute_view(&mut app, area);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let off = screen(&terminal);
+        assert!(
+            !off.contains("machine") && !off.contains("of history"),
+            "the corner drew its words with the scene off:\n{off}"
         );
     }
 

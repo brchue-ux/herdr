@@ -2422,6 +2422,13 @@ pub struct AppState {
     /// What the corner above was drawn for: its cell geometry and the register's own generation.
     /// Zero whenever nothing is drawn. Redrawn only when this moves, never once per tick.
     pub(crate) machine_corner_key: u64,
+    /// Why the corner is blank, when it is blank for a reason worth saying.
+    ///
+    /// `None` whenever the readout is live, and whenever the corner is not being drawn at all.
+    /// Set on the tick loop by `App::note_corner_absence`, which owns the rule about which
+    /// absences are worth a line; `crate::ui::machine_corner` reads it and writes the reason into
+    /// the cells the picture would otherwise have left empty and unexplained.
+    pub(crate) machine_corner_absence: Option<crate::machine_register::Absence>,
     /// The same corner's raw RGBA, kept beside the encoded layer.
     ///
     /// The per-cell legibility pass has to composite this surface to decide the foreground for the
@@ -3771,6 +3778,7 @@ impl AppState {
             pane_command_log: crate::app::pane_command_log::PaneCommandLog::default(),
             machine_corner_layer: None,
             machine_corner_key: 0,
+            machine_corner_absence: None,
             machine_corner_rgba: None,
             orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
             ambient_motes: crate::app::background_scene::AmbientMotes::default(),

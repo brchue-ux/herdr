@@ -4407,17 +4407,195 @@ const CORE_GAP: f32 = 1.35;
 /// the sun and the rings already hold, and for the same reason.
 const CORE_RGB01: (f32, f32, f32) = (0.62, 0.72, 0.80);
 
+/// The share of a cell's own height a core body may fill.
+///
+/// The core row is one terminal row of [`MachineCornerLayout`]'s grid, so a body that outgrew its
+/// row would reach into the groove under it or the words beside it. Under a half, so two adjacent
+/// rows of bodies could never touch.
+const CORE_ROW_FILL: f32 = 0.45;
+
+/// Where each part of the machine corner sits, in the corner's own cells.
+///
+/// **One layout, read by both halves of the corner.** [`machine_corner_frame`] places its grooves
+/// and its core bodies from it, and `crate::ui::machine_corner` places the terminal cells that
+/// name them from the same one. Two spellings of this would put a label on a different row from
+/// the groove it names, which is the same failure `crate::ui::warning_banner_present` exists to
+/// prevent for the toast — and here it would be worse, because a mislabelled readout is not
+/// obviously wrong the way a misplaced click is.
+///
+/// # Why the corner has words again, and why they are cells rather than pixels
+///
+/// This generator still refuses a font, and the reason it gave still holds: *herdr's text surface
+/// is the terminal itself, and painting a private bitmap font into a wash that sits under real
+/// glyphs is exactly the thing this scene does not do.* What that reasoning got wrong was the
+/// conclusion — it sent the words to the session API and left the corner with none, and four
+/// unlabelled bars over a row of dots do not say which quantity is which, what any of them is
+/// worth, where the numbers came from or how far back the trace reaches. The refusal was right
+/// about the *medium* and wrong about the *readout*.
+///
+/// So the corner keeps every pixel it draws and gets its words set in the terminal's own font, on
+/// the cells beside them, exactly as `crate::ui::status::render_status_feed` already writes
+/// herdr's own stream over this same scene. Real glyphs, real theming, and the per-cell legibility
+/// pass (`crate::app::background_legibility`) already composites this surface when it decides a
+/// foreground, so the words are legible against the grooves for free.
+///
+/// **This layout is what keeps them from colliding.** The words own a gutter of columns on the
+/// left; the grooves and the core bodies start at [`Self::field_col`] and never reach into it. Row
+/// centres are cell-row centres, so a 4px groove sits in the middle of a row whose text is on the
+/// same baseline rather than at whatever height an even division of the box happened to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MachineCornerLayout {
+    cols: u16,
+    rows: u16,
+}
+
+impl MachineCornerLayout {
+    /// How many quantity rows the corner lays out. `crate::machine_register::Quantity::ALL`'s
+    /// length, held here rather than imported so this generator stays independent of the
+    /// register — a caller handing it more histories than this gets them dropped rather than
+    /// drawn over the footer.
+    pub(crate) const QUANTITIES: usize = 4;
+
+    /// Columns the words occupy, measured from the corner's left edge.
+    ///
+    /// Eleven: a five-column label (`cores`, `swap`) then one space then a five-column value
+    /// (`12/12`, `0.60`, `100%`), right-aligned so the numbers read down as a column rather than
+    /// ragged against their labels.
+    pub(crate) const TEXT_COLS: u16 = 11;
+
+    /// One column of air between the last glyph and the first pixel of the field. The same gutter
+    /// `crate::ui::status::corner_reservation` puts between this corner and the status stream.
+    const GUTTER_COLS: u16 = 1;
+
+    /// The narrowest field worth drawing a groove in. Under this the corner keeps its whole width
+    /// for the picture and draws no words at all — a readout squeezed until neither half is
+    /// legible is worse than either half alone.
+    const MIN_FIELD_COLS: u16 = 8;
+
+    pub(crate) fn new(cols: u16, rows: u16) -> Self {
+        Self { cols, rows }
+    }
+
+    pub(crate) fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    pub(crate) fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    /// The corner's surface size in pixels, for a given cell.
+    pub(crate) fn width_px(&self, cell_width_px: u32) -> u32 {
+        u32::from(self.cols) * cell_width_px
+    }
+
+    pub(crate) fn height_px(&self, cell_height_px: u32) -> u32 {
+        u32::from(self.rows) * cell_height_px
+    }
+
+    /// The first column the picture may draw in, and so the column the words must stop before.
+    ///
+    /// `0` when the box is too narrow to carry both, which is the whole-picture case: there is no
+    /// gutter, [`Self::text_cols`] is `0`, and the cell renderer draws nothing.
+    pub(crate) fn field_col(&self) -> u16 {
+        let wanted = Self::TEXT_COLS + Self::GUTTER_COLS;
+        if self.cols < wanted.saturating_add(Self::MIN_FIELD_COLS) {
+            return 0;
+        }
+        wanted
+    }
+
+    /// How many columns the words have. `0` whenever the picture has the whole box.
+    pub(crate) fn text_cols(&self) -> u16 {
+        if self.field_col() == 0 {
+            0
+        } else {
+            Self::TEXT_COLS
+        }
+    }
+
+    /// The row the header sits on: what this readout is, where its numbers come from, and how
+    /// often they are taken.
+    pub(crate) fn header_row(&self) -> Option<u16> {
+        (self.rows > 0).then_some(0)
+    }
+
+    /// The row the core bodies and their count sit on, directly under the header — the substrate,
+    /// above the aggregates that are measured across it.
+    pub(crate) fn cores_row(&self) -> Option<u16> {
+        (self.rows > 1).then_some(1)
+    }
+
+    /// The row the footer sits on: how far back the grooves reach.
+    ///
+    /// Only on a box tall enough to also carry a blank row, so the footer is never crushed against
+    /// the last groove.
+    pub(crate) fn footer_row(&self) -> Option<u16> {
+        (self.rows >= Self::body_top() + Self::QUANTITIES as u16 + 2)
+            .then(|| self.rows.saturating_sub(1))
+    }
+
+    /// The row `index`'s label, value and groove all share, in
+    /// `crate::machine_register::Quantity::ALL` order.
+    ///
+    /// `None` for an index the box has no room for, which is what stops a taller register from
+    /// drawing over the footer on a box that was only ever sized for four.
+    pub(crate) fn quantity_row(&self, index: usize) -> Option<u16> {
+        if index >= Self::QUANTITIES {
+            return None;
+        }
+        let top = Self::body_top();
+        let bottom = self.footer_row().unwrap_or(self.rows);
+        let band = bottom.saturating_sub(top);
+        // One row of air between the core strip and the aggregates when there is room for it: the
+        // bodies above are the machine, and the four grooves below are statements about it.
+        let air = u16::from(band > Self::QUANTITIES as u16);
+        let row = top.saturating_add(air).saturating_add(index as u16);
+        (row < bottom).then_some(row)
+    }
+
+    /// The first row under the header and the core strip.
+    const fn body_top() -> u16 {
+        2
+    }
+
+    /// A cell row's own vertical centre, in pixels.
+    pub(crate) fn row_centre_px(&self, row: u16, cell_height_px: u32) -> f32 {
+        f64::from(u32::from(row) * cell_height_px + cell_height_px / 2) as f32
+    }
+
+    /// The horizontal span the picture gets, in pixels: `[x0, x1)`, already inset by the widest a
+    /// groove is ever drawn so a full-wear track cannot bleed off either end.
+    pub(crate) fn field_span_px(&self, cell_width_px: u32) -> (f32, f32) {
+        let pad = GROOVE_WIDTH_PX.1;
+        let x0 = (u32::from(self.field_col()) * cell_width_px) as f32 + pad;
+        let x1 = (self.width_px(cell_width_px) as f32 - pad).max(x0 + 1.0);
+        (x0, x1)
+    }
+}
+
 /// Render the machine corner: one groove per quantity, and one shaded body per logical CPU.
 ///
-/// Returns RGBA8 sized `width` x `height`, transparent everywhere nothing is drawn — this is its
-/// own small surface placed at the corner, not a pass over the whole scene. That is what makes it
-/// affordable: the register moves every two seconds, and re-baking the whole 36-frame ambient loop
-/// at that cadence would cost more CPU than it has.
+/// Returns RGBA8 sized [`MachineCornerLayout::width_px`] x [`MachineCornerLayout::height_px`],
+/// transparent everywhere nothing is drawn — this is its own small surface placed at the corner,
+/// not a pass over the whole scene. That is what makes it affordable: the register moves every two
+/// seconds, and re-baking the whole 36-frame ambient loop at that cadence would cost more CPU than
+/// it has.
+///
+/// Sized from the layout rather than from a width and a height of its own, so the surface and the
+/// cell grid its words are set on cannot disagree about where a row is.
 ///
 /// Draws nothing at all when there is nothing measured. F21: no fabricated machine number, ever,
 /// and no decorative history — not a seeded trace, not an animated idle, not a zero standing in
 /// for an unknown.
-pub(crate) fn machine_corner_frame(corner: &MachineCorner, width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn machine_corner_frame(
+    corner: &MachineCorner,
+    layout: &MachineCornerLayout,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> Vec<u8> {
+    let width = layout.width_px(cell_width_px);
+    let height = layout.height_px(cell_height_px);
     let pixels = width as usize * height as usize;
     let mut buf = vec![[0.0f32; 4]; pixels];
     if width == 0 || height == 0 || corner.is_empty() {
@@ -4425,45 +4603,52 @@ pub(crate) fn machine_corner_frame(corner: &MachineCorner, width: u32, height: u
     }
 
     let scale = width.min(height) as f32;
-    let pad = GROOVE_WIDTH_PX.1;
-    let inner_width = (width as f32 - pad * 2.0).max(1.0);
+    let (x0, x1) = layout.field_span_px(cell_width_px);
+    let field_width = (x1 - x0).max(1.0);
 
-    // A core body is sized to fit the row it is in, not to a fraction of the frame: this surface
+    // A core body is sized to fit the field it is in, not to a fraction of the frame: this surface
     // is a corner box a couple of dozen cells across, and a 64-core host has to fit the same width
-    // a 4-core one does. The cap the other way keeps a 2-core machine from drawing two moons.
+    // a 4-core one does. The cap the other way keeps a 2-core machine from drawing two moons, and
+    // [`CORE_ROW_FILL`] keeps any of them from outgrowing the terminal row it shares with its own
+    // label.
     let cores = corner.cores.len().max(1) as f32;
     let core_radius_max = (CORE_RADIUS_FRACTION * scale)
-        .min(inner_width / (cores * 2.0 * CORE_GAP))
+        .min(field_width / (cores * 2.0 * CORE_GAP))
+        .min(cell_height_px as f32 * CORE_ROW_FILL)
         .max(1.2);
 
-    // The core row sits at the top, and the grooves fill the rest evenly. The cores identify the
-    // row below them by construction: the CPU groove is the one the cores belong to, which is what
-    // lets the four grooves be read in a fixed order without this generator needing a font. The
-    // labelled numbers go out over the session API, where they can be read as text — herdr's text
-    // surface is the terminal itself, and painting a private bitmap font into a wash that sits
-    // *under* real glyphs is exactly the thing this scene does not do.
-    let core_row_height = core_radius_max * 2.0 + pad * 2.0;
-    draw_core_row(
-        &mut buf,
-        width,
-        height,
-        &corner.cores,
-        (pad, pad + core_radius_max),
-        core_radius_max,
-    );
+    if let Some(row) = layout.cores_row() {
+        draw_core_row(
+            &mut buf,
+            width,
+            height,
+            &corner.cores,
+            (x0, layout.row_centre_px(row, cell_height_px)),
+            core_radius_max,
+        );
+    }
 
-    // Evenly over what is left, so the readout fills its box at any cell size rather than huddling
-    // at the top of one.
-    let rows = corner.grooves.len().max(1) as f32;
-    let band = ((height as f32 - core_row_height - pad) / rows).max(GROOVE_WIDTH_PX.1 * 1.5);
-    for (row, history) in corner.grooves.iter().enumerate() {
+    // Each groove on its own cell row's centre line, sharing that row with the words that name it
+    // and give its current value. The cores still identify the CPU groove by construction — they
+    // are the row above it — but they are no longer the *only* thing that does.
+    for (index, history) in corner.grooves.iter().enumerate() {
         if history.is_empty() {
             // No groove at all rather than a flat one: an unworn track and an unmeasured one are
             // different statements, and only one of them is true here.
             continue;
         }
-        let y = core_row_height + band * (row as f32 + 0.5);
-        draw_groove(&mut buf, width, height, history, y, pad, width as f32 - pad);
+        let Some(row) = layout.quantity_row(index) else {
+            continue;
+        };
+        draw_groove(
+            &mut buf,
+            width,
+            height,
+            history,
+            layout.row_centre_px(row, cell_height_px),
+            x0,
+            x1,
+        );
     }
 
     pack_rgba8(&buf, false)
@@ -7321,6 +7506,23 @@ mod tests {
         }
     }
 
+    /// This project's reference cell — the 10x21 the corner has always been measured at.
+    const CORNER_CELL: (u32, u32) = (10, 21);
+
+    /// The corner rendered at `cols` x `rows` cells, on the reference cell.
+    ///
+    /// Cells rather than pixels because the surface is sized from the layout now: the picture and
+    /// the words it shares a box with are placed from one geometry, so a test that named a pixel
+    /// size could ask for a surface no terminal could produce.
+    fn corner_frame(corner: &MachineCorner, cols: u16, rows: u16) -> Vec<u8> {
+        machine_corner_frame(
+            corner,
+            &MachineCornerLayout::new(cols, rows),
+            CORNER_CELL.0,
+            CORNER_CELL.1,
+        )
+    }
+
     /// How many pixels of the corner carry anything at all.
     fn drawn_pixels(rgba: &[u8]) -> usize {
         rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
@@ -7333,17 +7535,14 @@ mod tests {
         // plausible number invented from nothing is worse than an empty corner.
         let empty = MachineCorner::default();
         assert!(empty.is_empty());
-        assert_eq!(drawn_pixels(&machine_corner_frame(&empty, 260, 168)), 0);
+        assert_eq!(drawn_pixels(&corner_frame(&empty, 26, 8)), 0);
 
         // A register that has cores but has measured none of them is the same case, and it is the
         // one a "draw what you have" implementation gets wrong: the cores exist, so a naive draw
         // puts twelve bodies on screen claiming twelve idle CPUs.
         let all_absent = corner_of(&[&[], &[], &[], &[]], &[None; 12]);
         assert!(all_absent.is_empty());
-        assert_eq!(
-            drawn_pixels(&machine_corner_frame(&all_absent, 260, 168)),
-            0
-        );
+        assert_eq!(drawn_pixels(&corner_frame(&all_absent, 26, 8)), 0);
     }
 
     #[test]
@@ -7355,15 +7554,15 @@ mod tests {
         let one_missing = corner_of(&[&[0.5; 60], &[], &[0.5; 60], &[0.5; 60]], &[]);
         let all_missing = corner_of(&[&[], &[], &[], &[]], &[Some(0.5)]);
 
-        let four = drawn_pixels(&machine_corner_frame(&measured, 260, 168));
-        let three = drawn_pixels(&machine_corner_frame(&one_missing, 260, 168));
+        let four = drawn_pixels(&corner_frame(&measured, 26, 8));
+        let three = drawn_pixels(&corner_frame(&one_missing, 26, 8));
         assert!(three < four, "a missing quantity still drew a groove");
         // ...and it is a whole groove's worth that went, not a rounding difference.
         assert!(four - three > 200, "only {} pixels went", four - three);
 
         // A corner with no history at all but one live core still draws the core: the rules are
         // per quantity, not per corner.
-        assert!(drawn_pixels(&machine_corner_frame(&all_missing, 260, 168)) > 0);
+        assert!(drawn_pixels(&corner_frame(&all_missing, 26, 8)) > 0);
     }
 
     #[test]
@@ -7373,7 +7572,7 @@ mod tests {
         // way of encoding a magnitude into a frame that already has one.
         let wear = |value: f32| {
             let corner = corner_of(&[&vec![value; 60]], &[]);
-            let rgba = machine_corner_frame(&corner, 260, 60);
+            let rgba = corner_frame(&corner, 26, 8);
             // Total ink, which is thickness and brightness together — both are the encoding.
             rgba.chunks_exact(4).map(|px| u32::from(px[3])).sum::<u32>()
         };
@@ -7398,8 +7597,8 @@ mod tests {
         // specific lie: it claims a past the register does not have.
         let young = corner_of(&[&[1.0; 6]], &[]);
         let old = corner_of(&[&[1.0; HISTORY_GROOVE_SAMPLES]], &[]);
-        let young_ink = drawn_pixels(&machine_corner_frame(&young, 600, 60));
-        let old_ink = drawn_pixels(&machine_corner_frame(&old, 600, 60));
+        let young_ink = drawn_pixels(&corner_frame(&young, 60, 8));
+        let old_ink = drawn_pixels(&corner_frame(&old, 60, 8));
         assert!(
             (young_ink as f32) < old_ink as f32 * 0.3,
             "six samples drew {young_ink} against a full history's {old_ink}"
@@ -7413,9 +7612,8 @@ mod tests {
         // A core is sized on the same cube root every planet obeys, and a core that reported
         // nothing is drawn *absent* rather than at zero — which is the distinction that makes the
         // row worth having.
-        let ink = |cores: &[Option<f32>]| {
-            drawn_pixels(&machine_corner_frame(&corner_of(&[], cores), 260, 60))
-        };
+        let ink =
+            |cores: &[Option<f32>]| drawn_pixels(&corner_frame(&corner_of(&[], cores), 26, 8));
         let idle = ink(&[Some(0.0); 4]);
         let busy = ink(&[Some(1.0); 4]);
         assert!(
@@ -7433,8 +7631,8 @@ mod tests {
             one_absent < busy,
             "an absent core still drew a body: {one_absent} vs {busy}"
         );
-        let mixed = machine_corner_frame(&corner_of(&[], &[Some(1.0), None, Some(1.0)]), 260, 60);
-        let shifted = machine_corner_frame(&corner_of(&[], &[Some(1.0), Some(1.0)]), 260, 60);
+        let mixed = corner_frame(&corner_of(&[], &[Some(1.0), None, Some(1.0)]), 26, 8);
+        let shifted = corner_frame(&corner_of(&[], &[Some(1.0), Some(1.0)]), 26, 8);
         assert_ne!(
             mixed, shifted,
             "an absent core's slot was closed up, renumbering every core after it"
@@ -7449,7 +7647,7 @@ mod tests {
             let cores: Vec<Option<f32>> =
                 (0..count).map(|i| Some(i as f32 / count as f32)).collect();
             let corner = corner_of(&[&[0.5; 60], &[0.5; 60], &[0.5; 60], &[0.5; 60]], &cores);
-            let rgba = machine_corner_frame(&corner, 260, 168);
+            let rgba = corner_frame(&corner, 26, 8);
             assert_eq!(
                 rgba.len(),
                 260 * 168 * 4,
@@ -7460,11 +7658,92 @@ mod tests {
     }
 
     #[test]
+    fn the_picture_never_reaches_into_the_columns_the_words_own() {
+        // The corner's two halves share one box, and this is the seam. The words are terminal
+        // cells and the picture is pixels, so nothing at draw time stops a groove from running
+        // under a label — only the layout does, and only if both halves actually obey it.
+        //
+        // Held at full wear on every quantity with a full core row, which is the widest anything
+        // is ever drawn.
+        let layout = MachineCornerLayout::new(26, 8);
+        let corner = corner_of(
+            &[&[1.0; 60], &[1.0; 60], &[1.0; 60], &[1.0; 60]],
+            &[Some(1.0); 12],
+        );
+        let rgba = corner_frame(&corner, 26, 8);
+        let width = layout.width_px(CORNER_CELL.0) as usize;
+        let gutter_px = u32::from(layout.text_cols()) * CORNER_CELL.0;
+        assert!(gutter_px > 0, "the fixture drew no gutter to protect");
+
+        for (index, px) in rgba.chunks_exact(4).enumerate() {
+            if px[3] == 0 {
+                continue;
+            }
+            let x = (index % width) as u32;
+            assert!(
+                x >= gutter_px,
+                "the picture drew at column {x}px, inside the {gutter_px}px the words own"
+            );
+        }
+    }
+
+    #[test]
+    fn every_row_of_the_picture_stays_inside_the_terminal_row_it_shares() {
+        // The other half of the same seam, vertically. Each groove and the core strip sit on one
+        // cell row's centre, and a label sits on that same row — so ink that spilled into the row
+        // above or below would land under a *different* quantity's word. Checked per band rather
+        // than in aggregate, because a groove drifting one row down still draws the same number of
+        // pixels.
+        let layout = MachineCornerLayout::new(26, 8);
+        let corner = corner_of(
+            &[&[1.0; 60], &[1.0; 60], &[1.0; 60], &[1.0; 60]],
+            &[Some(1.0); 12],
+        );
+        let rgba = corner_frame(&corner, 26, 8);
+        let width = layout.width_px(CORNER_CELL.0) as usize;
+        let cell_h = CORNER_CELL.1;
+
+        let mut rows_with_ink: Vec<u32> = Vec::new();
+        for (index, px) in rgba.chunks_exact(4).enumerate() {
+            if px[3] == 0 {
+                continue;
+            }
+            let row = (index / width) as u32 / cell_h;
+            if !rows_with_ink.contains(&row) {
+                rows_with_ink.push(row);
+            }
+        }
+        rows_with_ink.sort_unstable();
+
+        let mut expected: Vec<u32> = vec![u32::from(layout.cores_row().expect("a cores row"))];
+        for index in 0..MachineCornerLayout::QUANTITIES {
+            expected.push(u32::from(
+                layout.quantity_row(index).expect("a quantity row"),
+            ));
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            rows_with_ink, expected,
+            "the picture drew outside the terminal rows its words are on"
+        );
+        // ...and the header and footer rows are among the ones it left alone, which is what makes
+        // room for the words that are only text.
+        assert!(
+            !rows_with_ink.contains(&0),
+            "the header row has picture in it"
+        );
+        assert!(
+            !rows_with_ink.contains(&u32::from(layout.footer_row().expect("a footer row"))),
+            "the footer row has picture in it"
+        );
+    }
+
+    #[test]
     fn the_corner_is_a_transparent_overlay_not_a_second_backdrop() {
         // It is placed over the scene, so everywhere it does not draw has to show the sky through
         // it. An opaque corner box would punch a rectangle out of the picture.
         let corner = corner_of(&[&[1.0; 60]], &[Some(1.0)]);
-        let rgba = machine_corner_frame(&corner, 260, 168);
+        let rgba = corner_frame(&corner, 26, 8);
         let transparent = rgba.chunks_exact(4).filter(|px| px[3] == 0).count();
         assert!(
             transparent > 260 * 168 / 2,
