@@ -169,10 +169,7 @@ fn render_pane_command_log(app: &AppState, frame: &mut Frame, pane_id: PaneId, a
         ])
     }));
 
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(app.palette.panel_bg)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
@@ -1314,17 +1311,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 8)].symbol(), "●");
         assert_eq!(buffer[(0, 9)].symbol(), "●");
-        assert_eq!(buffer[(0, 8)].style().bg, Some(app.palette.panel_bg));
-        assert_eq!(buffer[(0, 9)].style().bg, Some(app.palette.panel_bg));
+        // The log zone no longer fills a `panel_bg` rectangle behind its own
+        // rows either — see `render_pane_command_log`'s own history: a
+        // theme-constant fill read as a separate layer pasted over the
+        // pane's real background rather than a continuation of it. Dropping
+        // the widget's `.style()` leaves each cell `Color::Reset`, ratatui's
+        // "use the terminal's own default" — the pane's real background
+        // shows through instead of a herdr-chosen fill.
+        assert_eq!(buffer[(0, 8)].style().bg, Some(Color::Reset));
+        assert_eq!(buffer[(0, 9)].style().bg, Some(Color::Reset));
         // Rows 10 and 11 are the agent's own — `render_claude_triview`
         // blitted its status line and hint there and this pass must not
         // touch them.
         for row in 10..12 {
-            assert_ne!(
-                buffer[(0, row)].style().bg,
-                Some(app.palette.panel_bg),
-                "row {row} is the agent's own footer, not the log zone's"
-            );
             assert_ne!(buffer[(0, row)].symbol(), "●");
         }
     }
@@ -1382,9 +1381,11 @@ mod tests {
     }
 
     /// The zone is exactly the rows the split granted, never the rest of the
-    /// pane. Claiming every leftover row painted a `panel_bg` rectangle
-    /// stretching most of a tall pane with its one or two commands
-    /// bottom-anchored out of sight below it.
+    /// pane. Claiming every leftover row previously painted a `panel_bg`
+    /// rectangle stretching most of a tall pane with its one or two commands
+    /// bottom-anchored out of sight below it; now that the zone carries no
+    /// background fill at all, spillover would instead show up as a stray
+    /// `●` bullet outside the granted rows.
     #[test]
     fn render_claude_triview_chrome_draws_only_the_rows_the_split_granted() {
         let mut app = AppState::test_new();
@@ -1411,9 +1412,9 @@ mod tests {
         assert_eq!(buffer[(0, 9)].symbol(), "●");
         for row in 10..20 {
             assert_ne!(
-                buffer[(0, row)].style().bg,
-                Some(app.palette.panel_bg),
-                "row {row} should not carry the log zone's background"
+                buffer[(0, row)].symbol(),
+                "●",
+                "row {row} should not carry a log-zone bullet"
             );
         }
     }
@@ -1444,8 +1445,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for row in 8..10 {
             assert_ne!(
-                buffer[(0, row)].style().bg,
-                Some(app.palette.panel_bg),
+                buffer[(0, row)].symbol(),
+                "●",
                 "row {row} is the agent's own footer, not the log zone's"
             );
         }
@@ -1473,9 +1474,9 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for row in 8..20 {
             assert_ne!(
-                buffer[(0, row)].style().bg,
-                Some(app.palette.panel_bg),
-                "row {row} should not carry the log zone's background when there is no log"
+                buffer[(0, row)].symbol(),
+                "●",
+                "row {row} should not carry a log-zone bullet when there is no log"
             );
         }
     }
