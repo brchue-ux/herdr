@@ -139,6 +139,92 @@ pub(crate) fn ssh_config_include_path(path: &std::path::Path) -> String {
     super::ssh_config_forward_slashes(path)
 }
 
+/// A Windows directory has no mode to narrow; it inherits its parent's ACL, and
+/// the parent is either the already per-user `%TEMP%` or a directory
+/// [`create_private_dir_all`] stamped with Herdr's protected DACL.
+pub(crate) fn create_private_dir_exclusive(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+/// A Windows file has no mode to narrow, so `unix_mode` is ignored; the file
+/// inherits the ACL of its parent, which is the private directory
+/// [`create_private_dir_exclusive`] just created inside the already per-user
+/// `%TEMP%`.
+pub(crate) fn create_private_file_exclusive(
+    path: &std::path::Path,
+    _unix_mode: u32,
+) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Windows OpenSSH never multiplexes, so nothing in the private ssh config
+/// directory is a socket and no path budget forces a shorter base than
+/// `%TEMP%`.
+pub(crate) fn remote_ssh_config_bases(_multiplexing: bool) -> Vec<PathBuf> {
+    vec![std::env::temp_dir()]
+}
+
+/// Trivially true on Windows: `multiplexing` is always false there, so no
+/// control socket is ever placed in `dir`.
+pub(crate) fn remote_ssh_control_socket_fits(_dir: &std::path::Path, _multiplexing: bool) -> bool {
+    true
+}
+
+/// Windows OpenSSH has no `ControlMaster`, so there is never a control socket.
+pub(crate) fn remote_ssh_control_socket_path(
+    _dir: &std::path::Path,
+    _multiplexing: bool,
+) -> Option<PathBuf> {
+    None
+}
+
+/// Whether `path` fits the platform's local-endpoint path budget.
+///
+/// Named pipe full paths (`\\.\pipe\<name>`) are limited to 256 characters
+/// total; this budget leaves headroom for that prefix plus `interprocess`'s
+/// namespacing.
+pub(crate) fn fits_local_socket_path(path: &std::path::Path) -> bool {
+    const MAX: usize = 200;
+    path.as_os_str().len() <= MAX
+}
+
+/// There is no shorter conventional temp root on Windows than
+/// `std::env::temp_dir()`, and [`fits_local_socket_path`]'s 200-byte budget is
+/// generous enough that this branch is not expected to be reached in practice;
+/// return the best available name rather than fail outright.
+pub(crate) fn last_resort_short_socket_path(short_name: String) -> PathBuf {
+    std::env::temp_dir().join(short_name)
+}
+
+/// PowerShell escapes an embedded apostrophe by doubling it, not with POSIX's
+/// `'\''`. Quoting unconditionally also sidesteps the caller's POSIX unquoted
+/// set, which excludes `\` — so every full install path took its quoted branch
+/// and came out POSIX-escaped.
+pub(crate) fn reattach_hint_quote(value: &str) -> Option<String> {
+    Some(powershell_quote(value))
+}
+
+/// A quoted string in PowerShell's command position is parsed as a bare string
+/// expression, and the `--remote` after it becomes an unexpected token — the
+/// call operator `&` is what makes it a command. `argv[0]` is also unreliable
+/// on Windows (a Terminal profile or shortcut passes whatever it likes), so
+/// prefer the real image path when there is one.
+pub(crate) fn reattach_hint_program(program: &str) -> Option<String> {
+    let path = std::env::current_exe()
+        .ok()
+        .filter(|path| path.is_absolute())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| program.to_string());
+    Some(format!("& {}", powershell_quote(&path)))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// `std::fs::create_dir_all` with a protected DACL on every level Herdr creates.
 ///
 /// Levels that already exist are left exactly as they are: this hardens the
@@ -2227,6 +2313,12 @@ impl Drop for InputSourceRestore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fits_local_socket_path_rejects_names_past_the_budget() {
+        let too_long = std::env::temp_dir().join("a".repeat(250));
+        assert!(!super::fits_local_socket_path(&too_long));
+    }
+
     use std::{
         fs,
         process::{Command, Stdio},
