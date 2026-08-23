@@ -270,17 +270,15 @@ impl BodyKind {
     /// **semi-major axis**, not a radius, since every mate's orbit is an ellipse. Unused for
     /// [`Self::Sun`], which never orbits anything.
     ///
-    /// A second mate reads its own rung of [`ORBIT_LADDER`]; a mate with no rung (nothing seated it,
-    /// which can only be a caller drawing an unseated body) falls back to the innermost so it is
-    /// never placed on top of the sun. A worker keeps its single small ring around its own mate —
-    /// the ladder is the *mate* tier's composition, and a worker's distance from its mate carries
-    /// nothing.
+    /// A second mate reads its own rung of the ladder ([`ladder_rung`]); a mate with no rung
+    /// (nothing seated it, which can only be a caller drawing an unseated body) falls back to the
+    /// innermost so it is never placed on top of the sun. A worker keeps its single small ring
+    /// around its own mate — the ladder is the *mate* tier's composition, and a worker's distance
+    /// from its mate carries nothing.
     fn orbit_radius_fraction(self, slot: Option<usize>) -> f32 {
         match self {
             Self::Sun => 0.0,
-            Self::Planet => {
-                ORBIT_LADDER[slot.unwrap_or(0).min(ORBIT_LADDER_SLOTS - 1)] * LADDER_UNIT_FRACTION
-            }
+            Self::Planet => ladder_rung(slot.unwrap_or(0)) * LADDER_UNIT_FRACTION,
             Self::Moon => 0.055,
         }
     }
@@ -391,19 +389,156 @@ const RINGED_RANK_REMAINDER: usize = 2;
 /// How many second mates the ring seats.
 ///
 /// A41(a): *"orbit slots are composition — they are the spacing the whole field is built on — so
-/// the capacity is a card number and not a code accident."* Eight is the fleet orrery's own
-/// `ORBIT_LADDER` length, and it is a decision rather than a limit found by measurement.
-pub(crate) const ORBIT_LADDER_SLOTS: usize = 8;
+/// the capacity is a card number and not a code accident."* It stays a card number: twelve is the
+/// captain's own decision (2026-08-23), taken with eleven mates in the fleet so the ring has
+/// headroom above the roster rather than being resized to fit it exactly.
+///
+/// Raising it is a change to the *count*, never to the span and never to a rung that was already
+/// there. [`ladder_rung`] is what makes that true — the eight published rungs stopped being the
+/// capacity the day this stopped being 8, and became the ladder the extra seats are cut into.
+pub(crate) const ORBIT_LADDER_SLOTS: usize = 12;
 
-/// The fleet orrery's own `ORBIT_LADDER`, in its scene units (`hone-bodies.html:5747`).
+/// The fleet orrery's own `ORBIT_LADDER`, in its scene units (`hone-bodies.html:5747`) — now the
+/// **profile** the ring's rungs are cut from rather than the whole of them.
 ///
 /// **The spread is the composition.** Eight seated mates on *one* radius is a clock face, not a
 /// solar system — every effect already built on top of it (the wear grooves, the mass-driven
 /// period, the ring cap) reads as one ring at eight angles because there was only ever one ring.
 /// The ladder is what those things were built to sit on: innermost to outermost is `1140/186 =
 /// 6.13x`, so the eye reads distance from the sun as a register before it reads anything else.
-const ORBIT_LADDER: [f32; ORBIT_LADDER_SLOTS] =
-    [186.0, 292.0, 400.0, 512.0, 672.0, 826.0, 980.0, 1140.0];
+///
+/// Both ends are load-bearing and neither is free to move, which is exactly why more seats are cut
+/// *into* the profile instead of appended past it. The inner end clears the sun: `186` sits only
+/// `48` units outside the corona's own reach (`SUN_RADIUS_FRACTION * CORONA_REACH`, `138` units),
+/// so there is no room for a rung inside it. The outer end already overfills the frame — the
+/// outermost rung draws at `1134px` against a `1080px` short side (see [`LADDER_UNIT_FRACTION`]) —
+/// so a rung outside it would put a mate off-screen for most of its own orbit.
+const ORBIT_LADDER_PROFILE: [f32; 8] = [186.0, 292.0, 400.0, 512.0, 672.0, 826.0, 980.0, 1140.0];
+
+/// The semi-major axis of one seat's orbit, in [`ORBIT_LADDER_PROFILE`]'s scene units.
+///
+/// **Every published rung is still a rung.** A capacity above the profile's own length is served by
+/// cutting the profile's *segments*, never by resampling the whole curve: each of the seven
+/// segments keeps at least one part, and the `slots - 8` extra parts go to whichever segment
+/// currently holds the widest one, which is the highest-averages rule. At `slots == 8` no segment
+/// is cut and the ladder is the published array, value for value.
+///
+/// That is the difference between a capacity change and a redraw, and it is not a nicety. The
+/// obvious alternative — sample twelve rungs evenly along the profile — moves *every* rung inward,
+/// including the innermost occupied ones, and a three-mate fleet's second and third mates land at
+/// `253` and `321` instead of `292` and `400`. Measured, that pulls their worker moons close enough
+/// to the corona to fail H13's own Weber bar (`0.529` against `0.55`,
+/// `a_worker_moon_is_found_without_hunting_for_it`). Cutting segments cannot do that: a fleet with
+/// fewer mates than the profile has rungs draws exactly where it drew before.
+///
+/// The three facts the ladder carries survive any capacity, because all three are properties of the
+/// profile's endpoints rather than of its length:
+///
+/// - the innermost rung stays clear of the sun's corona,
+/// - the outermost rung still overfills the frame,
+/// - and the innermost-to-outermost spread stays `6.13x`, which is the register the eye reads
+///   distance as.
+///
+/// What a higher capacity does spend is the gap between neighbours, and that is the honest cost of
+/// the captain's decision rather than a bug in it: the ladder's four widest segments are the ones
+/// that get cut, so at twelve seats the outer half of the ring goes from `154..160`-unit gaps to
+/// `77..80`, while the inner three are untouched. The bound that keeps it a ladder is that no two
+/// seats can merge into one — see `no_two_rungs_are_close_enough_for_their_mates_to_merge`, which
+/// is what says the ceiling under this rule is thirteen seats and not more.
+///
+/// `slots` below the profile's own length is not a case this has: the profile is the floor of the
+/// capacity, and [`ladder_rung`] asserts it at compile time.
+fn ladder_rung_of(slot: usize, slots: usize) -> f32 {
+    const SEGMENTS: usize = ORBIT_LADDER_PROFILE.len() - 1;
+    let span = |i: usize| ORBIT_LADDER_PROFILE[i + 1] - ORBIT_LADDER_PROFILE[i];
+
+    // How many parts each segment is cut into. One each to begin with — that is the published
+    // ladder — and then the extras, one at a time, to whichever segment is currently holding the
+    // widest part. Strictly-greater keeps a tie with the innermost segment, so the table is the
+    // same on every machine and every run.
+    let parts = slots.saturating_sub(1).max(SEGMENTS);
+    let mut cuts = [1usize; SEGMENTS];
+    for _ in SEGMENTS..parts {
+        let mut widest = 0usize;
+        let mut widest_part = 0.0f32;
+        for (i, cut) in cuts.iter().enumerate() {
+            let part = span(i) / *cut as f32;
+            if part > widest_part {
+                widest_part = part;
+                widest = i;
+            }
+        }
+        cuts[widest] += 1;
+    }
+
+    // Walk out along the cut ladder to the seat asked for. A seat past the last rung is the last
+    // rung, never an index off the end.
+    let slot = slot.min(parts);
+    let mut seen = 0usize;
+    for (i, cut) in cuts.iter().enumerate() {
+        if slot < seen + cut {
+            return ORBIT_LADDER_PROFILE[i] + span(i) * (slot - seen) as f32 / *cut as f32;
+        }
+        seen += cut;
+    }
+    ORBIT_LADDER_PROFILE[SEGMENTS]
+}
+
+/// [`ladder_rung_of`] at the ring's own capacity — the rung a seated second mate actually sits on.
+fn ladder_rung(slot: usize) -> f32 {
+    // The profile is the floor of the capacity: below its own length there are not enough segments
+    // to cut, and the outermost rung — the frame overfill — would stop being drawn at all.
+    const { assert!(ORBIT_LADDER_SLOTS >= ORBIT_LADDER_PROFILE.len()) };
+    ladder_rung_of(slot, ORBIT_LADDER_SLOTS)
+}
+
+/// The turn between one seat's starting bearing and the next — the golden angle, `pi * (3 - √5)`.
+///
+/// **A seat's angular elements are seeded off its seat number, not off its rung's radius.** The
+/// artifact seeded both from one number (`hone-bodies.html:5910`, `rung * 0.37` and friends), and
+/// that is a *hash*: it scattered acceptably for the eight published rungs and for nothing else.
+/// Measured on the twelve-seat ladder before this changed, it put **nine of twelve mates inside one
+/// 120-degree wedge**, with two of them 1.5 degrees apart — the ring collapsed into a clump on one
+/// side of the sun, captions on top of each other, while a third of the sky held nothing. That is
+/// the composition the ladder's own spacing exists to produce, thrown away by a rule that never
+/// promised to spread anything.
+///
+/// The golden angle promises it. It is the classic maximal-avoidance turn: for *every* count, the
+/// bearings it produces are as close to evenly spread as an unchanging step can make them, and no
+/// two ever coincide. At twelve seats the tightest bearing gap is 20.1 degrees against the
+/// 30-degree ideal, and the busiest 120-degree wedge holds five mates rather than nine.
+const SEAT_BEARING_TURN: f32 = 2.399_963_2;
+
+/// The step of the two remaining per-seat sequences: the tilt of a mate's own orbital plane, and
+/// where on that plane its periapsis falls.
+///
+/// Two more irrational steps rather than two more reads of the same number, for the same reason
+/// [`SEAT_BEARING_TURN`] is one: the rung-hash gave the twelve-seat ladder only **nine distinct
+/// inclinations for twelve orbits** — the two outermost rungs landed on the same tilt, which is
+/// precisely the pair of concentric contour lines [`INCLINATION_SPAN`] exists to prevent. A
+/// Kronecker step never repeats and never correlates with the bearing, so a mate's plane says
+/// nothing about where it started and every plane is its own.
+///
+/// Deliberately *not* the golden ratio's own `0.618034`: [`SEAT_BEARING_TURN`] is `2*pi` times
+/// `0.381966`, and `frac(n * 0.618034)` is exactly `1 - frac(n * 0.381966)`, so a golden step here
+/// would make a mate's tilt a straight function of the bearing it starts on. `sqrt(3) - 1` and
+/// `sqrt(2) - 1` share nothing with it or with each other.
+const SEAT_INCLINATION_STEP: f32 = 0.732_051;
+const SEAT_PERIAPSIS_STEP: f32 = 0.414_214;
+
+/// One term of a Kronecker sequence, in `0.0..1.0` — the fractional part of `(slot + 1) * step`.
+///
+/// **Counted from one rather than from zero**, and [`SEAT_BEARING_TURN`] is applied the same way,
+/// so that no seat draws a term of exactly zero. A zero term is degenerate in all three of the
+/// places these sequences are read: the first seat would start on the frame's exact horizontal
+/// axis — collinear with the sun's own caption box and with the corona's horizontal spokes, and
+/// with its ring shadow falling precisely along a pixel row — and it would sit at the hard edge of
+/// the inclination band rather than inside it. Offsetting the index costs nothing: the sequence is
+/// the same set of terms either way, only rotated.
+fn seat_sequence(slot: usize, step: f32) -> f32 {
+    let x = (slot + 1) as f32 * step;
+    x - x.floor()
+}
 
 /// One ladder unit as a fraction of `min(width, height)`.
 ///
@@ -500,8 +635,8 @@ fn scene_origin(width: u32, height: u32) -> (f32, f32) {
 /// A dropped mate takes its own workers with it: a worker orbits its mate, and a mate that is not
 /// in the picture has nothing for its workers to orbit.
 ///
-/// Which rung of [`ORBIT_LADDER`] each node sits on, whether it is drawn at all, and the seated and
-/// overflow counts.
+/// Which rung of the ladder ([`ladder_rung`]) each node sits on, whether it is drawn at all, and
+/// the seated and overflow counts.
 pub(crate) struct Ladder {
     /// Whether this node is drawn — `false` for a mate the ring had no slot for, and everything
     /// under it.
@@ -1152,19 +1287,19 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
             .map(|body| body.base_angle)
             .unwrap_or(0.0);
         let ladder_slot = slot.get(idx).copied().flatten();
-        // A mate's own orbital elements are seeded off its rung, exactly as the artifact seeds a
-        // mate that arrives over the bridge (`hone-bodies.html:5910`): angle, eccentricity,
-        // periapsis and inclination all fall out of one number, so two identical snapshots place
-        // the same body identically and no two mates share a plane.
+        // A mate's own orbital elements fall out of its seat number and its own file count, so two
+        // identical snapshots place the same body identically and no two mates share a plane. The
+        // artifact seeded all four off the rung's *radius* (`hone-bodies.html:5910`); see
+        // [`SEAT_BEARING_TURN`] for what that costs at any capacity but the one it was drawn at.
         //
         // Spread-by-sibling-index is what a *worker* still gets: workers share one ring around
         // their mate, so the even spread is the only thing keeping them apart.
         let base_angle = match ladder_slot {
-            Some(rung) => (ORBIT_LADDER[rung] * 0.37).rem_euclid(2.0 * PI),
+            Some(seat) => ((seat + 1) as f32 * SEAT_BEARING_TURN).rem_euclid(2.0 * PI),
             None => parent_angle + (sibling_index as f32 / sibling_count as f32) * 2.0 * PI,
         };
         let (eccentricity, periapsis, inclination) = match ladder_slot {
-            Some(rung) => {
+            Some(seat) => {
                 // Eccentricity is read off the mate's *own* file count rather than off its rung —
                 // the artifact's `e = 0.085 + ((files*13)%9)/58` — so the register shows up in the
                 // shape of the path as well as in its size. An unmeasured project has no count to
@@ -1175,9 +1310,9 @@ pub(crate) fn build_layout(nodes: &[TreeNode], width: u32, height: u32) -> Scene
                 };
                 let e = ECCENTRICITY_FLOOR
                     + ((files.wrapping_mul(13)) % 9) as f32 / ECCENTRICITY_DIVISOR;
-                let rung_units = ORBIT_LADDER[rung];
-                let incl = ((rung_units as u32 % 17) as f32 / 17.0 - 0.5) * INCLINATION_SPAN;
-                (e, (rung_units * 0.021).rem_euclid(2.0 * PI), incl)
+                let incl = (seat_sequence(seat, SEAT_INCLINATION_STEP) - 0.5) * INCLINATION_SPAN;
+                let periapsis = seat_sequence(seat, SEAT_PERIAPSIS_STEP) * 2.0 * PI;
+                (e, periapsis, incl)
             }
             // A worker's ring sits in its mate's own plane, and is round: the register it would
             // read has nothing in it, and a tilted ring around a body a few dozen pixels across is
@@ -6858,18 +6993,43 @@ mod tests {
             // the body moves, which is exactly what varies across a fleet. The fade is quadratic,
             // so the far end of a trail is nearly gone by design and asserting on it would be
             // asserting that the fade does not work.
+            //
+            // **Bounded by where the trail is actually drawn**, which is the other half of the same
+            // sentence: `draw_trail` stops laying down samples once `TRAIL_ALPHA * u^2` falls under
+            // its own `0.004` floor, so a probe that walked past that point would be asserting on a
+            // stretch of orbit the renderer deliberately leaves empty. Before this bound the walk
+            // ran the whole lookback, and whether it landed on drawn trail or on the empty tail was
+            // a property of the fixture's phase rather than of the trail: the heaviest mate here is
+            // also the slowest, and at five of any twenty-four phases it does not clear its own disc
+            // until past the fade — measured identically before and after the ring's capacity moved.
+            let drawn_back = 1.0 - (0.004f32 / TRAIL_ALPHA).sqrt();
             let here = layout.position(idx, phase);
             let mut behind = here;
-            for step in 1..=40 {
-                let back = step as f32 / 40.0 * TRAIL_LOOKBACK * 2.0 * PI;
-                let at = layout.position(idx, phase - back);
+            const STEPS: usize = 40;
+            for step in 1..=STEPS {
+                let fraction = step as f32 / STEPS as f32;
+                if fraction > drawn_back {
+                    break;
+                }
+                let at = layout.position(idx, phase - fraction * TRAIL_LOOKBACK * 2.0 * PI);
                 let gap = ((at.0 - here.0).powi(2) + (at.1 - here.1).powi(2)).sqrt();
                 if gap > body.body_radius_px * 1.6 {
                     behind = at;
                     break;
                 }
             }
-            assert_ne!(behind, here, "body {idx} barely moved");
+            if behind == here {
+                // Nothing to sample means the whole drawn trail is inside the body's own disc —
+                // a wake shorter than the body is wide. That is a real statement about a huge slow
+                // body rather than a missing trail, so it is asserted rather than skipped past.
+                let far = layout.position(idx, phase - drawn_back * TRAIL_LOOKBACK * 2.0 * PI);
+                let reach = ((far.0 - here.0).powi(2) + (far.1 - here.1).powi(2)).sqrt();
+                assert!(
+                    reach <= body.body_radius_px * 1.6,
+                    "body {idx} moved {reach:.1}px under its own trail and still showed none"
+                );
+                continue;
+            }
 
             // Differenced against the identical frame with trails withheld, so what is measured
             // is the trail rather than whatever the sky happens to be doing there.
@@ -7793,10 +7953,188 @@ mod tests {
         nodes
     }
 
+    /// The eight rungs the scene shipped with, in [`ORBIT_LADDER_PROFILE`]'s own units.
+    const PUBLISHED_LADDER: [f32; 8] = [186.0, 292.0, 400.0, 512.0, 672.0, 826.0, 980.0, 1140.0];
+
+    /// The widest a second mate can ever draw, in ladder units — the diameter of a body sitting on
+    /// the planet tier's ceiling. Two neighbouring rungs closer together than this can put two
+    /// mates edge to edge, at which point the ladder has stopped being a ladder.
+    fn widest_mate_diameter_in_ladder_units() -> f32 {
+        2.0 * MATE_RADIUS_CEIL / LADDER_UNIT_FRACTION
+    }
+
     #[test]
-    fn the_ring_seats_the_heaviest_eight_and_counts_the_rest() {
+    fn eight_seats_are_still_the_published_ladder_exactly() {
+        // The capacity is a card number; the profile is the composition. Raising the first must
+        // never move the second, so the ladder the scene shipped at has to come back value for
+        // value rather than merely close — at eight seats no segment is cut, so nothing here is
+        // interpolated at all.
+        let rungs: Vec<f32> = (0..8).map(|slot| ladder_rung_of(slot, 8)).collect();
+        assert_eq!(rungs, PUBLISHED_LADDER.to_vec());
+    }
+
+    #[test]
+    fn extra_seats_are_cut_into_the_widest_gaps_and_leave_the_rest_alone() {
+        // The rule in one assertion: every published rung survives at twelve seats, and the four
+        // new ones bisect the profile's four widest segments — `512..672`, `672..826`, `826..980`
+        // and `980..1140` — rather than being spread over the whole curve. That is what lets a
+        // fleet smaller than the profile draw exactly where it drew before.
+        let rungs: Vec<f32> = (0..12).map(|slot| ladder_rung_of(slot, 12)).collect();
+        assert_eq!(
+            rungs,
+            vec![
+                186.0, 292.0, 400.0, 512.0, 592.0, 672.0, 749.0, 826.0, 903.0, 980.0, 1_060.0,
+                1_140.0
+            ]
+        );
+        for published in PUBLISHED_LADDER {
+            assert!(
+                rungs.contains(&published),
+                "twelve seats dropped the published rung {published}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_capacity_keeps_both_ends_of_the_ladder_and_its_order() {
+        // The three facts the ladder carries are properties of the profile's *endpoints*, not of
+        // its length: the innermost rung clears the sun's corona, the outermost still overfills
+        // the frame, and the spread between them is the register the eye reads distance as. None
+        // of the three may move when the seat count does.
+        for slots in [8usize, 9, 11, ORBIT_LADDER_SLOTS, 13] {
+            let inner = ladder_rung_of(0, slots);
+            let outer = ladder_rung_of(slots - 1, slots);
+            assert_eq!(
+                inner, PUBLISHED_LADDER[0],
+                "{slots} seats moved the inner rung"
+            );
+            assert_eq!(
+                outer, PUBLISHED_LADDER[7],
+                "{slots} seats moved the outer rung"
+            );
+            assert!(
+                (outer / inner - 6.129).abs() < 0.001,
+                "{slots} seats changed the ladder's spread"
+            );
+            for slot in 1..slots {
+                assert!(
+                    ladder_rung_of(slot, slots) > ladder_rung_of(slot - 1, slots),
+                    "{slots} seats put rung {slot} inside its own neighbour"
+                );
+            }
+            // A rung past the last seat is the last seat, never an index off the end.
+            assert_eq!(ladder_rung_of(slots + 3, slots), outer);
+        }
+    }
+
+    #[test]
+    fn no_two_rungs_are_close_enough_for_their_mates_to_merge() {
+        // What a higher capacity actually spends is the gap between neighbours — the ladder's
+        // span is fixed at both ends, so more seats can only come out of the space between them.
+        // The bound that keeps it a ladder rather than a band is that two mates on adjacent rungs
+        // can never touch, even with both of them drawn at the planet tier's ceiling.
+        //
+        // This is the gate on the capacity, not a description of it: at 14 seats the tightest gap
+        // falls under the bound and this test is what says so.
+        let widest = widest_mate_diameter_in_ladder_units();
+        let tightest = (1..ORBIT_LADDER_SLOTS)
+            .map(|slot| ladder_rung(slot) - ladder_rung(slot - 1))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            tightest > widest,
+            "{ORBIT_LADDER_SLOTS} seats leave a {tightest:.1}-unit gap for a {widest:.1}-unit mate"
+        );
+    }
+
+    #[test]
+    fn every_capacity_spreads_its_seats_around_the_sun() {
+        // The bearing rule is a spacing rule, so it is held to a spacing bound rather than to a
+        // golden reference. The measured failure it replaced: seeding off the rung's radius put
+        // **nine of twelve mates inside one 120-degree wedge**, two of them 1.5 degrees apart, and
+        // left a third of the sky empty — a clump on one side of the sun with its captions on top
+        // of each other, at the exact capacity the ring was being raised to.
+        //
+        // A seat count that clumps is a seat count that cannot be drawn, so every capacity from a
+        // pair up to past the ring's own is checked rather than only the one in force.
+        for slots in [2usize, 5, 8, 11, ORBIT_LADDER_SLOTS, 16] {
+            let mut bearings: Vec<f32> = (0..slots)
+                .map(|seat| ((seat + 1) as f32 * SEAT_BEARING_TURN).rem_euclid(2.0 * PI))
+                .collect();
+            bearings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let even = 2.0 * PI / slots as f32;
+            let gaps: Vec<f32> = (0..slots)
+                .map(|i| {
+                    if i + 1 == slots {
+                        bearings[0] + 2.0 * PI - bearings[i]
+                    } else {
+                        bearings[i + 1] - bearings[i]
+                    }
+                })
+                .collect();
+            let tightest = gaps.iter().copied().fold(f32::INFINITY, f32::min);
+            let widest = gaps.iter().copied().fold(0.0f32, f32::max);
+
+            // No two seats start within a third of an even spread of each other, and no arc of the
+            // sky is left more than twice an even spread wide. Both bounds are loose enough to be
+            // about clumping rather than about the golden angle's exact arithmetic.
+            assert!(
+                tightest > even / 3.0,
+                "{slots} seats start {tightest} rad apart, under a third of {even}"
+            );
+            assert!(
+                widest < even * 2.0,
+                "{slots} seats leave a {widest} rad hole, over twice {even}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_seats_share_an_orbital_plane() {
+        // What [`INCLINATION_SPAN`] exists for: without a per-mate tilt the rungs are concentric
+        // contour lines rather than independent orbits. Seeding the tilt off the rung's radius gave
+        // the twelve-seat ladder only nine distinct planes — and the pair it collapsed was the two
+        // *outermost* rungs, the ones with the least radial separation to fall back on.
+        let tilts: Vec<f32> = (0..ORBIT_LADDER_SLOTS)
+            .map(|seat| (seat_sequence(seat, SEAT_INCLINATION_STEP) - 0.5) * INCLINATION_SPAN)
+            .collect();
+        for (a, first) in tilts.iter().enumerate() {
+            for (b, second) in tilts.iter().enumerate().skip(a + 1) {
+                assert!(
+                    (first - second).abs() > 1e-3,
+                    "seats {a} and {b} share a plane at {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_ring_draws_every_seat_on_its_own_groove() {
+        // The track layer deduplicates orbits within half a pixel of each other (`distinct_orbits`),
+        // and "each rung is its own curve" is what makes it a field of nested grooves rather than
+        // one line. A capacity that packed two rungs inside that tolerance would silently collapse
+        // two mates onto one groove, so the full ring is checked at the smallest frame the scene is
+        // ever composed into rather than only at a comfortable one.
+        let nodes = ranked_fleet(ORBIT_LADDER_SLOTS)
+            .into_iter()
+            .map(|node| TreeNode { wear: 1.0, ..node })
+            .collect::<Vec<_>>();
+        let layout = build_layout(&nodes, 640, 400);
+        assert_eq!(
+            distinct_orbits(&layout).len(),
+            ORBIT_LADDER_SLOTS,
+            "two seats share one groove"
+        );
+    }
+
+    #[test]
+    fn the_ring_seats_the_heaviest_it_can_and_counts_the_rest() {
         // The real case rather than a corner: seventeen mates, five of them unmeasured — the
-        // roster A42's own CHECK is driven by. The nine smallest have to be the nine dropped.
+        // roster A42's own CHECK is driven by. Whatever the ring's capacity is, the mates it drops
+        // have to be the smallest ones, so both halves of this are read off `ORBIT_LADDER_SLOTS`
+        // rather than written out: a capacity change is a change to how many are seated, never to
+        // *which*.
+        const MATES: usize = 17;
         let mut files: Vec<Option<u32>> = (0..12).map(|i| Some((i + 1) * 200)).collect();
         files.extend(std::iter::repeat_n(None, 5));
         let nodes = fleet_of(&files);
@@ -7805,11 +8143,19 @@ mod tests {
         let (seated, beyond) = layout.ladder_occupancy();
         assert_eq!(
             (seated, beyond),
-            (ORBIT_LADDER_SLOTS, 17 - ORBIT_LADDER_SLOTS)
+            (ORBIT_LADDER_SLOTS, MATES - ORBIT_LADDER_SLOTS)
         );
 
-        // And they are the heaviest eight — 2400 down to 1000 — by tracked files, not by roster
-        // order and not by arrival.
+        // And they are the heaviest, by tracked files — not by roster order and not by arrival.
+        // The five unmeasured mates rank at the register's floor (A42(b)), which is below every
+        // measured one here, so at any capacity up to twelve the seated set is the top of the
+        // 200..2400 run and nothing else.
+        const {
+            assert!(
+                ORBIT_LADDER_SLOTS <= 12,
+                "the roster has only 12 measured mates"
+            )
+        };
         let seated_files: Vec<Option<u32>> = nodes
             .iter()
             .enumerate()
@@ -7819,19 +8165,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            seated_files,
-            vec![
-                Some(1_000),
-                Some(1_200),
-                Some(1_400),
-                Some(1_600),
-                Some(1_800),
-                Some(2_000),
-                Some(2_200),
-                Some(2_400)
-            ]
-        );
+        let expected: Vec<Option<u32>> = (0..12)
+            .map(|i| Some((i + 1) * 200))
+            .skip(12 - ORBIT_LADDER_SLOTS)
+            .collect();
+        assert_eq!(seated_files, expected);
     }
 
     #[test]
@@ -8242,40 +8580,24 @@ mod tests {
         // A54's rule: a mate is a gas giant *unless* its rank is 2 mod 3. That is "even
         // distribution" read as even spacing rather than as 50/50 — the captain asked for more gas
         // planets in the same sentence, and a 50/50 split adds none.
-        // A full ladder, so this is about the modulus alone rather than about the ladder's cap.
+        // A full ladder, so this is about the modulus alone rather than about the ladder's cap —
+        // and the expected run is generated from the modulus for the same reason, so raising the
+        // cap tests the rule at the new length instead of failing on the old one's transcript.
         let types = types_of(&ranked_fleet(ORBIT_LADDER_SLOTS));
         let mates = &types[1..];
+        let expected: Vec<BodyType> = (0..ORBIT_LADDER_SLOTS)
+            .map(|rank| {
+                if rank % RINGED_RANK_MODULUS == RINGED_RANK_REMAINDER {
+                    BodyType::Ringed
+                } else {
+                    BodyType::Gas
+                }
+            })
+            .collect();
         assert_eq!(
-            mates,
-            [
-                BodyType::Gas,
-                BodyType::Gas,
-                BodyType::Ringed,
-                BodyType::Gas,
-                BodyType::Gas,
-                BodyType::Ringed,
-                BodyType::Gas,
-                BodyType::Gas,
-            ],
+            mates, expected,
             "the ringed mates are not every third one, heaviest first"
         );
-
-        // The proportion is the point, and it has to hold for a fleet that is not a multiple of
-        // three as well as one that is — and, past the ladder, for the mates that got a seat.
-        for count in 1..=20 {
-            let types = types_of(&ranked_fleet(count));
-            let ringed = types.iter().filter(|t| **t == BodyType::Ringed).count();
-            let gas = types.iter().filter(|t| **t == BodyType::Gas).count();
-            assert_eq!(
-                ringed + gas,
-                count.min(ORBIT_LADDER_SLOTS),
-                "every *seated* second mate needs a type, and nothing else may have one"
-            );
-            assert!(
-                gas >= ringed,
-                "{count} mates split {gas} gas / {ringed} ringed — that is not two in three"
-            );
-        }
     }
 
     #[test]
