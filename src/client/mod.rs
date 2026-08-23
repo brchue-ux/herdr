@@ -930,11 +930,9 @@ fn wants_client_rasterized_background_scene() -> bool {
 /// window; on a high-latency link that easily exceeds 5s, so it gets a far
 /// larger budget. See issue #753.
 const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
 const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn handshake_read_timeout() -> Duration {
-    #[cfg(unix)]
     if is_remote_client_process() {
         return REMOTE_HANDSHAKE_READ_TIMEOUT;
     }
@@ -3094,6 +3092,14 @@ mod tests {
                 restore_env_var(key, value);
             }
         }
+    }
+
+    #[test]
+    fn remote_client_uses_extended_handshake_timeout() {
+        let _guard = env_lock().lock().unwrap();
+        let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
+
+        assert_eq!(handshake_read_timeout(), REMOTE_HANDSHAKE_READ_TIMEOUT);
     }
 
     #[test]

@@ -134,6 +134,22 @@ pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) 
     }
 }
 
+/// Signals "no more data from this side" to the peer without closing the
+/// connection, so the peer's own read returns EOF while this side can still
+/// read what the peer sends back.
+///
+/// Unix-only, and deliberately so: `try_clone()` on a Unix domain socket is
+/// `dup(2)`, and dropping one dup'd descriptor delivers no EOF to the peer —
+/// only `shutdown(SHUT_WR)` does. A Windows named pipe has no equivalent
+/// half-close, so callers that need this on both platforms have to arrange
+/// teardown some other way (see `remote::bridge::bridge_connection`).
+#[cfg(unix)]
+pub(crate) fn shutdown_local_stream_write(stream: &LocalStream) -> io::Result<()> {
+    match stream {
+        LocalStream::UdSocket(stream) => stream.inner().shutdown(std::net::Shutdown::Write),
+    }
+}
+
 pub(crate) fn poll_local_stream_read(
     stream: &mut LocalStream,
     buf: &mut [u8],
@@ -302,6 +318,65 @@ mod tests {
     #[cfg(windows)]
     use std::path::PathBuf;
 
+    /// `try_clone()` on a Unix domain socket is `dup(2)`, so closing one
+    /// descriptor leaves the socket open and the peer sees no EOF — only
+    /// `shutdown(SHUT_WR)` delivers one. The remote half of Herdr's ssh bridge
+    /// depends on that difference: without the half-close the remote server
+    /// never learns its client is gone, and the whole teardown chain wedges
+    /// (see `remote::bridge::run_remote_client_bridge`).
+    ///
+    /// Both halves are asserted, because the drop-only case passing is what
+    /// makes the shutdown case meaningful.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_cloned_stream_is_not_eof_but_shutdown_write_is() {
+        use interprocess::local_socket::traits::Listener as _;
+        use interprocess::TryClone as _;
+        use std::io::Write as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "herdr-halfclose-{}-{}.sock",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = bind_local_listener(&path).expect("bind");
+        let client = connect_local_stream(&path).expect("connect");
+        let mut server = listener.accept().expect("accept");
+        set_local_stream_polling(&mut server, true).expect("poll mode");
+
+        let mut upload = client.try_clone().expect("clone");
+        upload.write_all(b"hello").expect("write");
+
+        let mut buffer = [0_u8; 16];
+        assert!(matches!(
+            poll_local_stream_read(&mut server, &mut buffer).expect("read data"),
+            LocalStreamRead::Data(5)
+        ));
+
+        // Closing the dup alone: the socket is still open, so no EOF.
+        drop(upload);
+        assert!(
+            matches!(
+                poll_local_stream_read(&mut server, &mut buffer).expect("read after drop"),
+                LocalStreamRead::Pending
+            ),
+            "dropping one dup'd descriptor must not look like a closed peer"
+        );
+
+        // The half-close is what the peer actually observes as EOF.
+        shutdown_local_stream_write(&client).expect("shutdown write");
+        assert!(matches!(
+            poll_local_stream_read(&mut server, &mut buffer).expect("read after shutdown"),
+            LocalStreamRead::Closed
+        ));
+
+        drop(client);
+        drop(server);
+        drop(listener);
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {
         assert!(stale_socket_connect_error(io::ErrorKind::ConnectionRefused));
@@ -311,6 +386,37 @@ mod tests {
             stale_socket_connect_error(io::ErrorKind::WouldBlock),
             cfg!(windows)
         );
+    }
+
+    /// Ported from upstream `2863b715`, retargeted at the fork's
+    /// `bind_local_listener` — `704a93d4` moved the protected pipe DACL into
+    /// it, so every Herdr listener carries it, not only the remote bridge's.
+    /// This is the only automated proof that a pipe created with
+    /// `D:P(A;;GA;;;SY)(A;;GA;;;OW)` still admits its own owner: a DACL that
+    /// denied the creating user would fail here and nowhere else.
+    #[cfg(windows)]
+    #[test]
+    fn private_named_pipe_accepts_same_user() {
+        use std::io::Write as _;
+
+        let path = temp_socket_marker_path("private-pipe");
+        let _ = fs::remove_file(&path);
+        let listener = bind_local_listener(&path).unwrap();
+        let mut client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"remote").unwrap();
+
+        let mut buffer = [0_u8; 16];
+        assert!(matches!(
+            poll_local_stream_read(&mut server, &mut buffer).unwrap(),
+            LocalStreamRead::Data(6)
+        ));
+        assert_eq!(&buffer[..6], b"remote");
+
+        drop(client);
+        drop(server);
+        drop(listener);
+        let _ = fs::remove_file(path);
     }
 
     #[cfg(windows)]

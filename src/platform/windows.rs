@@ -1936,6 +1936,27 @@ mod tests {
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
 
+    /// Ported from upstream `2863b715`, retargeted at the fork's
+    /// `create_private_dir_all` (which `704a93d4` generalised from upstream's
+    /// remote-only `create_remote_private_dir`). A path past `MAX_PATH` is the
+    /// case that fails without `extended_length_path`, and writing into the
+    /// created directory is what proves the protected DACL still admits the
+    /// owner.
+    #[test]
+    fn private_remote_directory_supports_long_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-private-remote-dir-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create test base");
+        let private = base.join("x".repeat(240));
+
+        super::create_private_dir_all(&private).expect("create private long-path directory");
+        fs::write(private.join("probe"), b"ok").expect("write inherited private file");
+
+        fs::remove_dir_all(base).expect("remove test directory");
+    }
+
     #[test]
     fn windows_clipboard_utf16_decode_stops_at_terminator() {
         let mut buffer: Vec<u16> = "paste me".encode_utf16().collect();
