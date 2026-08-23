@@ -135,14 +135,12 @@ pub struct ClipboardCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Windows does not wire clipboard-image bridging into semantic input yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub struct ClipboardImage {
     pub bytes: Vec<u8>,
     pub extension: &'static str,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LimitedRead {
     Empty,
@@ -150,7 +148,7 @@ pub(crate) enum LimitedRead {
     Oversized,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn read_limited_reader(
     mut reader: impl std::io::Read,
     max_bytes: usize,
@@ -201,6 +199,15 @@ pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix_common;
+
+/// DIB-to-PNG conversion and PNG validation for the Windows clipboard reader.
+///
+/// Compiled on Unix under `test` as well as on Windows: nothing in it touches
+/// an OS API, and the box this fork is developed on has no Windows machine, so
+/// keeping the decoder here is what lets its tests actually run. See the
+/// module's own header.
+#[cfg(any(windows, test))]
+pub(crate) mod clipboard_image;
 
 #[cfg(target_os = "linux")]
 mod linux;

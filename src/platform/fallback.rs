@@ -125,8 +125,6 @@ pub fn open_url(_url: &str) -> std::io::Result<()> {
 }
 
 /// Unsupported platform stub.
-// Windows does not wire clipboard-image bridging into semantic input yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     None
 }

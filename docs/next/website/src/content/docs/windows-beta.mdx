@@ -26,6 +26,7 @@ For internal beta testing, `HERDR_MANIFEST_URL` can point the installer at a cus
 | Local persistent sessions | beta |
 | Native panes through ConPTY | beta |
 | Windows Terminal / PowerShell app attach | beta |
+| Remote clipboard images and image-file drops | beta |
 | `cmd.exe` panes | beta |
 | Startup cwd and workspace labels | beta |
 | Pane launch cwd | beta |
@@ -47,14 +48,14 @@ Plugins support `windows` as a manifest platform in preview. GitHub install, loc
 | --- | --- |
 | Live cwd after shell `cd` | partial |
 | Live cwd via shell integration/OSC7 | beta |
-| Clipboard image paste to agents | unverified |
+| Clipboard image paste to agents in local panes | unverified |
 | CJK IME composition anchoring | partial |
 | Kitty graphics rendering | unverified |
 | Host cursor rendering | partial |
 
 Herdr can launch panes in the right directory and can create the initial workspace from the directory where you started Herdr. PowerShell directory changes after startup are different: the process field Herdr can inspect does not reliably track later logical `cd` changes. Use Herdr integrations or prompt shell integration for live cwd reporting.
 
-Windows Terminal may support image paste paths for specific agents, but Herdr's own clipboard-image reader is not wired on Windows yet. Treat `alt+v` image paste as unverified until the Windows clipboard bridge is implemented and tested. Remote clipboard image bridging is separate and remains tied to Unix/macOS `herdr --remote`.
+During `herdr --remote`, the key set by `keys.remote_image_paste` reads an image off the Windows clipboard and transfers it to the remote host, which writes it to a temp file there and pastes that path into the focused pane. Dropping one local image file onto the terminal transfers that file the same way. Windows Terminal claims `ctrl+v` — the default binding — for its own paste, so rebind the trigger to something it does not take, such as `alt+v`. Clipboard image paste into a local native Windows pane, where there is no remote host to copy the file to, remains unverified.
 
 Kitty graphics remains experimental and is not claimed as Windows-supported yet. Leave `experimental.kitty_graphics = false` unless you are specifically testing image rendering in Windows Terminal.
 
@@ -95,7 +96,6 @@ For text paste, right-click the pane, or use `ctrl+shift+v` in Windows Terminal.
 | Live server handoff | unsupported |
 | Unix file-descriptor handoff | unsupported |
 | Unix foreground process groups | unsupported |
-| Remote clipboard image bridge | unsupported |
 | Prefix input-source switching | unsupported |
 | Signed binary / SmartScreen avoidance | unsupported |
 

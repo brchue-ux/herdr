@@ -25,7 +25,8 @@ use windows_sys::{
         System::{
             Console::GetConsoleWindow,
             DataExchange::{
-                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
+                RegisterClipboardFormatW, SetClipboardData,
             },
             Diagnostics::{
                 Debug::ReadProcessMemory,
@@ -45,7 +46,7 @@ use windows_sys::{
                 GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
                 MEMORY_BASIC_INFORMATION,
             },
-            Ole::CF_UNICODETEXT,
+            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
             Threading::{
                 GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenThread,
                 QueryFullProcessImageNameW, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
@@ -74,6 +75,7 @@ use windows_sys::{
     },
 };
 
+use super::clipboard_image;
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 /// Protected DACL granting full access to SYSTEM and the creating owner only.
@@ -1558,10 +1560,110 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     }
 }
 
-// Windows does not wire clipboard-image bridging into semantic input yet.
-#[cfg_attr(windows, allow(dead_code))]
+/// Reads an image off the Windows clipboard, as PNG bytes.
+///
+/// Three formats are tried in decreasing order of fidelity:
+///
+/// 1. the registered `"PNG"` format, which modern browsers, Snipping Tool and
+///    most graphics applications set alongside the bitmap formats. It is taken
+///    as-is when it validates, so a screenshot keeps its own encoding and its
+///    alpha channel untouched.
+/// 2. `CF_DIBV5`, whose `BITMAPV5HEADER` carries explicit channel masks and so
+///    can express alpha.
+/// 3. `CF_DIB`, the plain `BITMAPINFOHEADER` every Windows application has set
+///    since 1995.
+///
+/// The clipboard is a single global resource any process can hold, so
+/// `OpenClipboard` failing is routine rather than fatal — another application
+/// is mid-copy. It is retried briefly before giving up, and closed through
+/// [`ClipboardGuard`] on every path out.
+///
+/// Everything after the Win32 calls is [`clipboard_image`], which is
+/// deliberately platform-neutral so it can be tested off Windows; see its
+/// module header.
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    for attempt in 0..CLIPBOARD_OPEN_ATTEMPTS {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            // Held for the whole scope so every return path below closes the
+            // clipboard through `Drop`.
+            let _clipboard = ClipboardGuard;
+            if let Some(bytes) = read_registered_png_clipboard() {
+                return Some(ClipboardImage {
+                    bytes,
+                    extension: "png",
+                });
+            }
+            for format in [CF_DIBV5 as u32, CF_DIB as u32] {
+                if let Some(bytes) =
+                    clipboard_global_bytes(format, clipboard_image::MAX_CLIPBOARD_ALLOCATION)
+                {
+                    if let Some(bytes) = clipboard_image::dib_to_png(&bytes) {
+                        return Some(ClipboardImage {
+                            bytes,
+                            extension: "png",
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+        if attempt + 1 < CLIPBOARD_OPEN_ATTEMPTS {
+            std::thread::sleep(CLIPBOARD_OPEN_RETRY_DELAY);
+        }
+    }
     None
+}
+
+/// How long Herdr will wait for another process to release the clipboard
+/// before reporting that there is no image on it.
+const CLIPBOARD_OPEN_ATTEMPTS: u32 = 10;
+const CLIPBOARD_OPEN_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+fn read_registered_png_clipboard() -> Option<Vec<u8>> {
+    static PNG_FORMAT: LazyLock<u32> = LazyLock::new(|| {
+        let name = wide_null("PNG");
+        unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+    });
+    if *PNG_FORMAT == 0 {
+        return None;
+    }
+    // `GlobalAlloc` rounds the block up, so the handle is allowed to be a
+    // little larger than the protocol limit; `validated_png` trims it back to
+    // the PNG's own logical length and re-checks that against the limit.
+    let bytes = clipboard_global_bytes(
+        *PNG_FORMAT,
+        crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD + 64 * 1024,
+    )?;
+    clipboard_image::validated_png(&bytes)
+}
+
+/// Copies one clipboard format's global memory block out, refusing anything
+/// larger than `max_bytes` rather than allocating it.
+///
+/// The clipboard owns the handle, so it is locked for reading only and never
+/// freed here.
+fn clipboard_global_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return None;
+    }
+    let data = unsafe { GlobalLock(handle) };
+    if data.is_null() {
+        return None;
+    }
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 || size > max_bytes {
+        unsafe {
+            GlobalUnlock(handle);
+        }
+        return None;
+    }
+    let mut bytes = vec![0_u8; size];
+    unsafe {
+        copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size);
+        GlobalUnlock(handle);
+    }
+    Some(bytes)
 }
 
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
