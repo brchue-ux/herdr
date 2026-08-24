@@ -1179,6 +1179,123 @@ mod tests {
         );
     }
 
+    /// A selection stores a **grid** row; the highlight is drawn back through
+    /// whatever split `render_panes` resolved this frame. The two agree only
+    /// while the split itself is stable — so a frame that quietly dropped the
+    /// split drew the same anchor `transcript_skip` rows away from the text it
+    /// was taken from.
+    ///
+    /// That is what a held frame used to do: the blit is frozen but the split
+    /// was recomputed from the live grid, which mid-DEC-2026-batch is a torn
+    /// screen that resolves no Claude shape at all. The highlight jumped by
+    /// eight rows on those frames and back on the next — intermittent, and
+    /// invisible to a fixture that never engages a hold.
+    #[tokio::test]
+    async fn a_held_frame_keeps_the_selection_highlight_on_the_row_it_was_dragged_over() {
+        let rows: u16 = 19;
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 0, 60, rows));
+        let info = pane_infos[0].clone();
+        let inner = info.inner_rect;
+
+        let rule = "\u{2500}".repeat(inner.width as usize);
+        let mut lines: Vec<String> = (1..=14)
+            .map(|n| format!("transcript line {n:02}"))
+            .collect();
+        lines.resize(inner.height as usize - 5, String::new());
+        lines.push(rule.clone());
+        lines.push("\u{276F} typed input".to_string());
+        lines.push(rule);
+        lines.push("~/proj main 42% context".to_string());
+        lines.push("? for shortcuts".to_string());
+        ws.insert_test_runtime(
+            pane_id,
+            TerminalRuntime::test_with_screen_bytes(
+                inner.width,
+                inner.height,
+                lines.join("\r\n").as_bytes(),
+            ),
+        );
+
+        let mut app = AppState::test_new();
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        app.terminals.insert(terminal_id, terminal_state);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.mode = Mode::Terminal;
+        app.view.pane_infos = pane_infos;
+        app.view.sidebar_rect = Rect::new(0, 0, 26, rows);
+        app.view.terminal_area = Rect::new(26, 0, 60, rows);
+        for command in ["cargo nextest run", "git status", "ls -la"] {
+            app.pane_command_log.record(pane_id, command.to_string());
+        }
+
+        let registry = crate::terminal::TerminalRuntimeRegistry::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(86, rows)).unwrap();
+        let draw = |app: &AppState, terminal: &mut ratatui::Terminal<_>| {
+            terminal
+                .draw(|frame| {
+                    crate::ui::render_tab_surface(app, &registry, app.view.tab_surface(), frame);
+                })
+                .unwrap();
+        };
+
+        // One paint so the split is recorded, then a drag over the row it drew
+        // "transcript line 14" on.
+        draw(&app, &mut terminal);
+        let layout = app.workspaces[0]
+            .test_runtimes
+            .get(&pane_id)
+            .and_then(TerminalRuntime::last_claude_triview_layout)
+            .expect("a Claude-shaped screen resolves a triview layout");
+        let pane_row: u16 = 5;
+        let mut selection =
+            Selection::anchor(pane_id, layout.grid_row_for_pane_row(pane_row), 0, None);
+        selection.drag(inner.x + 18, inner.y + pane_row, inner, None, Some(layout));
+        selection.finish();
+        app.selection = Some(selection);
+
+        let highlighted_rows = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            (0..rows)
+                .filter(|y| {
+                    (inner.x..inner.x + inner.width).any(|x| {
+                        buffer[(x, *y)]
+                            .style()
+                            .bg
+                            .is_some_and(|bg| bg != ratatui::style::Color::Reset)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        draw(&app, &mut terminal);
+        assert_eq!(
+            highlighted_rows(&terminal),
+            vec![inner.y + pane_row],
+            "baseline: the highlight is on the row the drag was over"
+        );
+
+        // The agent opens a synchronized update and starts repainting. The
+        // frame is held; the highlight must not move.
+        app.workspaces[0]
+            .test_runtimes
+            .get(&pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(b"\x1b[?2026h\x1b[H\x1b[2Jrepaint in progress");
+
+        draw(&app, &mut terminal);
+        assert_eq!(
+            highlighted_rows(&terminal),
+            vec![inner.y + pane_row],
+            "a held frame must not move the highlight off the row it is drawn over"
+        );
+    }
+
     #[test]
     fn pane_detected_agent_returns_the_pane_s_own_terminal_agent() {
         let mut app = AppState::test_new();
