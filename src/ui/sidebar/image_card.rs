@@ -1340,43 +1340,28 @@ impl CardLight {
         }
     }
 
-    /// The stroke's two ends and the bloom's, at this light.
+    /// The stroke and the bloom, at this light.
     ///
-    /// The measured gradient is reproduced as a *travel around* this card's own
-    /// ink rather than as the two sampled cyans: half the measured hue swing
-    /// either side, at the measured saturation ratio. So a card keeps the
-    /// left-to-right gradient the reference has, centred on whatever hue its
-    /// stage supplies.
+    /// **One flat colour, not a left-to-right gradient.** The captain's
+    /// 2026-08-23 mockup-convergence decision
+    /// (`card-corner-radius-and-stroke-vs-mockup`) replaced the card's
+    /// previous per-card cyan-to-blue gradient stroke with "Rio Window,
+    /// Assembled"'s own `.card { border: 1px solid var(--edge) }` — a single
+    /// flat edge colour on every card, never a travel across the card's own
+    /// width. `stroke_a` and `stroke_b` stay as two fields (rather than one)
+    /// only because [`CardInks::at`] still mixes a card *between* two
+    /// lifecycle states over the wash's time axis — that temporal mix is
+    /// unrelated to this removed spatial one and still needs both ends.
     fn inks(self) -> CardInk {
         let (h, s, l) = self.ink.to_hsl();
         let l = l * self.lum;
-        // **The travel is clamped into H1's band rather than running out of it.**
-        //
-        // The gradient is half the travel either side of the card's own hue, so
-        // a card at the cold end of the measured family — 181°, the queued
-        // stage — would put its left edge at 165.7° and its whole left border a
-        // green-cyan the reference's tree column does not contain. Measured
-        // over the reference's own column, 99.94% of chromatic ink above L25 is
-        // inside 175-265° and 99.7% of that is in one 15° bucket: the band is
-        // the finding, not the travel. So the travel gives way at the edges of
-        // the band and keeps its full 30.6° everywhere inside it, which is every
-        // hue the family actually uses but its two ends.
-        //
-        // `the_trees_ink_is_one_hue_family_and_a_fifth_of_its_area` is what
-        // holds this on the published pixels.
-        let band = |hue: f32| hue.clamp(measured::HUE_BAND.0, measured::HUE_BAND.1);
-        let stroke_a = Rgb::from_hsl(band(h - measured::HUE_TRAVEL / 2.0), s, l);
-        let stroke_b = Rgb::from_hsl(
-            band(h + measured::HUE_TRAVEL / 2.0),
-            s * measured::STROKE_B_SAT_RATIO,
-            l,
-        );
-        let bloomed = |c: Rgb| c.restate(measured::BLOOM_SAT_MUL, measured::BLOOM_LUM_MUL);
+        let flat = Rgb::from_hsl(h, s, l);
+        let bloomed = flat.restate(measured::BLOOM_SAT_MUL, measured::BLOOM_LUM_MUL);
         CardInk {
-            stroke_a,
-            stroke_b,
-            bloom_a: bloomed(stroke_a),
-            bloom_b: bloomed(stroke_b),
+            stroke_a: flat,
+            stroke_b: flat,
+            bloom_a: bloomed,
+            bloom_b: bloomed,
             bloom: self.bloom,
         }
     }
@@ -1400,10 +1385,10 @@ fn presence(accented: bool) -> f32 {
 
 /// The colours one column of a card is drawn from.
 ///
-/// The stroke runs a gradient from its own left end to its own right one and
-/// the bloom runs the same gradient in a more saturated form, so a column needs
-/// both ends rather than one colour — the *column's* position in that gradient
-/// is a separate axis from where the state wash has reached.
+/// `stroke_a`/`stroke_b` and `bloom_a`/`bloom_b` are equal now — see
+/// [`CardLight::inks`] — kept as pairs only because [`CardInks::at`] still
+/// mixes a card between two lifecycle states over the wash's *time* axis, a
+/// separate axis from the removed left-to-right spatial gradient.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CardInk {
     stroke_a: Rgb,
