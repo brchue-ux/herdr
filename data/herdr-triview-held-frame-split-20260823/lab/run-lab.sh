@@ -69,10 +69,13 @@ PANE=$(lab pane list | jq -r '.result.panes[0].pane_id // empty')
 echo "[lab] claude pane=$PANE"
 
 # A second pane, only so the window keeps being recomposited while the first
-# pane's own frame is held and asks for nothing.
-NOISE=$(lab pane split "$PANE" --direction down --ratio 0.15 | jq -r '.result.pane.pane_id // .result.pane_id // empty')
+# pane's own frame is held and asks for nothing. The ratio is the *first*
+# pane's share, and the split leaves the new pane focused - the Claude pane has
+# to be focused for the triview to engage at all, so focus walks back up.
+NOISE=$(lab pane split "$PANE" --direction down --ratio 0.85 | jq -r '.result.pane.pane_id // .result.pane_id // empty')
 echo "[lab] noise pane=$NOISE"
-lab pane focus "$PANE" >/dev/null
+lab pane focus --direction up >/dev/null
+echo "[lab] focused pane: $(lab pane current | jq -r '.result.pane.pane_id // .result.pane_id // "?"')"
 lab pane declare-agent "$PANE" --agent claude >/dev/null
 
 Xvfb "$DISPLAY_NUM" -screen 0 "${SCREEN_W}x${SCREEN_H}x24" -nolisten tcp >/dev/null 2>&1 &
@@ -96,38 +99,49 @@ for _ in $(seq 1 60); do [ -S "$KSOCK" ] && break; sleep 0.5; done
 sleep 4
 echo "[lab] kitty up (socket $( [ -S "$KSOCK" ] && echo yes || echo NO ))"
 
-TRIGGER="$SP/trigger-$TAG"
-rm -f "$TRIGGER"
-export HERDR_LAB_TRIGGER="$TRIGGER"
-
-lab pane run "$PANE" "HERDR_LAB_TRIGGER=$TRIGGER bash $LAB/paint-claude-hold.sh" >/dev/null
-[ -n "$NOISE" ] && lab pane run "$NOISE" "while true; do date +%s.%N; sleep 0.25; done" >/dev/null
-sleep 22
+lab pane run "$PANE" "bash $LAB/paint-claude-hold.sh" >/dev/null
+[ -n "$NOISE" ] && lab pane run "$NOISE" "while true; do date +%s.%N; sleep 0.05; done" >/dev/null
+sleep 12
 
 gettext() { DISPLAY="$DISPLAY_NUM" kitty @ --to "unix:$KSOCK" get-text --match all --extent screen; }
 shot() { DISPLAY="$DISPLAY_NUM" import -window root "$OUT/$TAG-$1.png" 2>/dev/null; }
+composer_row() { grep -n 'COMPOSER MARKER' "$1" | head -1 | cut -d: -f1; }
 
-gettext > "$OUT/$TAG-before.txt"
-shot before
-echo "[lab] before: composer marker on screen row $(grep -n 'COMPOSER MARKER' "$OUT/$TAG-before.txt" | head -1 | cut -d: -f1)"
-echo "[lab] before: log-zone bullets = $(grep -c 'zone_' "$OUT/$TAG-before.txt")"
-
-# Open the synchronized update and leave it open.
-touch "$TRIGGER"
+# Taken while the pane is still in phase 2 - before it starts opening batches -
+# so this is the split with nothing held, and every later sample is measured
+# against it.
+gettext > "$OUT/$TAG-settled.txt"
+shot settled
+SETTLED_ROW=$(composer_row "$OUT/$TAG-settled.txt")
+SETTLED_BULLETS=$(grep -c 'zone_' "$OUT/$TAG-settled.txt")
+echo "[lab] settled: composer row=${SETTLED_ROW:-none} log-zone bullets=$SETTLED_BULLETS"
 sleep 8
 
-gettext > "$OUT/$TAG-during.txt"
-shot during
-echo "[lab] during: composer marker on screen row $(grep -n 'COMPOSER MARKER' "$OUT/$TAG-during.txt" | head -1 | cut -d: -f1)"
-echo "[lab] during: log-zone bullets = $(grep -c 'zone_' "$OUT/$TAG-during.txt")"
-echo "[lab] during: 'partial repaint' visible = $(grep -c 'partial repaint' "$OUT/$TAG-during.txt")"
+# Phase 3 is already running by now: the pane opens and closes a DEC 2026 batch
+# about four times a second. Sample what the terminal is showing as fast as
+# `kitty @ get-text` will answer and count how many samples caught the split
+# somewhere other than where it settled.
+MOVED=0
+GONE=0
+SAMPLES=${HERDR_LAB_SAMPLES:-40}
+for index in $(seq 1 "$SAMPLES"); do
+  gettext > "$OUT/$TAG-sample.txt"
+  row=$(composer_row "$OUT/$TAG-sample.txt")
+  bullets=$(grep -c 'zone_' "$OUT/$TAG-sample.txt")
+  if [ "${row:-none}" != "${SETTLED_ROW:-none}" ]; then
+    MOVED=$((MOVED + 1))
+    cp "$OUT/$TAG-sample.txt" "$OUT/$TAG-moved-$index.txt"
+  fi
+  if [ "$bullets" -lt "$SETTLED_BULLETS" ]; then
+    GONE=$((GONE + 1))
+  fi
+done
+shot sampling
 
-BEFORE_ROW=$(grep -n 'COMPOSER MARKER' "$OUT/$TAG-before.txt" | head -1 | cut -d: -f1)
-DURING_ROW=$(grep -n 'COMPOSER MARKER' "$OUT/$TAG-during.txt" | head -1 | cut -d: -f1)
-echo "[lab] RESULT tag=$TAG before_row=${BEFORE_ROW:-none} during_row=${DURING_ROW:-none}"
-if [ "${BEFORE_ROW:-x}" = "${DURING_ROW:-y}" ]; then
-  echo "[lab] RESULT tag=$TAG VERDICT=held (the split survived the batch)"
+echo "[lab] RESULT tag=$TAG settled_row=${SETTLED_ROW:-none} settled_bullets=$SETTLED_BULLETS samples=$SAMPLES moved=$MOVED log_zone_lost=$GONE"
+if [ "$MOVED" -eq 0 ] && [ "$GONE" -eq 0 ]; then
+  echo "[lab] RESULT tag=$TAG VERDICT=held (every sample showed the split where it settled)"
 else
-  echo "[lab] RESULT tag=$TAG VERDICT=MOVED (the split changed while the frame was held)"
+  echo "[lab] RESULT tag=$TAG VERDICT=MOVED ($MOVED/$SAMPLES samples caught the split elsewhere)"
 fi
 echo "[lab] done"
