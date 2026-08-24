@@ -42,6 +42,16 @@ pub(super) const STROKE_B: Rgb = Rgb(126, 165, 209);
 /// Half either side of the card's own hue, so a stage's hue is the card's
 /// midpoint rather than its left edge — the gradient is a property of the
 /// card's *shape*, not a statement about which stage it is at.
+///
+/// No longer read by `CardLight::inks`: the captain's 2026-08-23
+/// mockup-convergence decision replaced the per-card left-to-right gradient
+/// this travel drove with a single flat stroke colour (see that function's
+/// own doc comment). Kept as a measurement, still exercised by
+/// `the_gradient_ratios_reproduce_the_sampled_pair` below and by
+/// `every_stage_by_severity_combination_is_distinguishable`'s distinguishability
+/// threshold in `image_card.rs`, both `#[cfg(test)]`-only — hence the
+/// `#[allow(dead_code)]` on the non-test build.
+#[allow(dead_code)] // used only from #[cfg(test)] call sites, see doc comment
 pub(super) const HUE_TRAVEL: f32 = 30.6;
 
 /// The hue band the whole tree column's ink stays inside, in degrees.
@@ -51,11 +61,12 @@ pub(super) const HUE_TRAVEL: f32 = 30.6;
 /// 99.7% of those in a single 15° bucket at 195°**. One hue family; everything
 /// else in the panel is brightness.
 ///
-/// It is a *clamp* on [`HUE_TRAVEL`] and not a replacement for it — see
-/// `CardLight::inks`. The travel is a property of a card's shape and runs its
-/// full width everywhere inside the band; it gives way only at the band's two
-/// edges, which is where a card at the cold end of the measured family would
-/// otherwise put its left border outside the tree's own colour.
+/// Was a *clamp* on [`HUE_TRAVEL`] inside `CardLight::inks`; that gradient is
+/// gone, replaced by a flat stroke per the captain's 2026-08-23
+/// mockup-convergence decision. Kept as a measurement, still exercised by a
+/// `#[cfg(test)]`-only check in `image_card.rs` that the tree's rendered ink
+/// stays in this band — hence the `#[allow(dead_code)]` on the non-test build.
+#[allow(dead_code)] // used only from a #[cfg(test)] call site, see doc comment
 pub(super) const HUE_BAND: (f32, f32) = (175.0, 265.0);
 
 /// How saturated the card's right edge is against its left.
@@ -66,6 +77,9 @@ pub(super) const HUE_BAND: (f32, f32) = (175.0, 265.0);
 /// 65.1%, not the 51/60 the sampling pass wrote down, and the pixels are what
 /// the card is drawn from. `the_gradient_ratios_reproduce_the_sampled_pair` is
 /// what keeps this tied to them.
+///
+/// No longer read by `CardLight::inks`, same removal as [`HUE_TRAVEL`].
+#[allow(dead_code)] // used only from #[cfg(test)] call sites, see doc comment
 pub(super) const STROKE_B_SAT_RATIO: f32 = 0.73;
 
 /// Geometric stroke width, as a fraction of `h`. Measured FWHM was 3 px on a
@@ -83,10 +97,16 @@ pub(super) const RADIUS: f32 = 0.13;
 
 /// The largest corner arc the card ever draws, in pixels.
 ///
-/// F6's own number. A pane in the reference is a sharp-cornered rectangle with
-/// at most a hairline break at the corner; anything above this reads as a
-/// rounded plate, which is the material the glass treatment replaces.
-pub(super) const RADIUS_MAX_PX: f32 = 3.0;
+/// Was 3.0, "F6's own number" — a different, older, single-reference sampling
+/// pass whose pane was a sharp-cornered rectangle. The captain's 2026-08-23
+/// mockup-convergence decision (`card-corner-radius-and-stroke-vs-mockup`)
+/// supersedes that reference with "Rio Window, Assembled"'s own `.card {
+/// border-radius: 7px }`, read directly off that artifact's live HTML/CSS —
+/// not the 6px the decision record itself paraphrases from the older,
+/// now-superseded "Flight Deck, Arriving" mockup. Where the two disagree, "Rio
+/// Window, Assembled" is the single ground truth per that decision, so 7px is
+/// what this constant carries now.
+pub(super) const RADIUS_MAX_PX: f32 = 7.0;
 
 /// The card's face, as glass rather than as a plate.
 ///
