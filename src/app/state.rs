@@ -712,12 +712,17 @@ impl Palette {
         Self {
             accent: Color::Rgb(90, 209, 255), // --cyan
             panel_bg: Color::Rgb(10, 18, 32), // --panel
-            // Built-in themes leave the sidebar background as the host
-            // terminal's own (see `built_in_themes_leave_sidebar_background_unset`);
-            // only an explicit user override sets it. The mockup's --void
-            // near-black backdrop is instead approximated by `panel_bg` and
-            // the host-contrast floor `refresh_sidebar_palette` applies.
-            sidebar_bg: Color::Reset,
+            // Unlike every other built-in theme (which leaves this as
+            // `Color::Reset` and lets the host terminal's own background
+            // show through — see `built_in_themes_leave_sidebar_background_unset`),
+            // abyss paints its own near-black `--void`: the mockup's panel
+            // is an explicit, opinionated backdrop, not a host-contrast
+            // approximation, and leaving it as Reset let an arbitrary host
+            // background (e.g. a muted mid-grey terminal theme) show
+            // straight through the sidebar instead of the mockup's own
+            // near-black, with none of the mockup's card glow/contrast
+            // reading correctly against it.
+            sidebar_bg: Color::Rgb(4, 7, 12),    // --void
             surface0: Color::Rgb(10, 18, 32),    // --panel
             surface1: Color::Rgb(22, 35, 58),    // --edge
             surface_dim: Color::Rgb(22, 35, 58), // --edge (all panel/card borders)
@@ -4932,6 +4937,12 @@ mod tests {
     #[test]
     fn built_in_themes_leave_sidebar_background_unset() {
         for name in THEME_NAMES {
+            if *name == "abyss" {
+                // abyss paints its own near-black `--void` sidebar fill
+                // rather than inheriting the host — see `Palette::abyss`'s
+                // doc comment and `abyss_theme_uses_the_mockups_exact_hex_values`.
+                continue;
+            }
             let palette = Palette::from_name(name).unwrap();
             assert_eq!(
                 palette.sidebar_bg,
@@ -4962,6 +4973,7 @@ mod tests {
         let p = Palette::from_name("abyss").expect("abyss should resolve");
         assert_eq!(p.accent, Color::Rgb(90, 209, 255), "--cyan");
         assert_eq!(p.panel_bg, Color::Rgb(10, 18, 32), "--panel");
+        assert_eq!(p.sidebar_bg, Color::Rgb(4, 7, 12), "--void");
         assert_eq!(p.surface_dim, Color::Rgb(22, 35, 58), "--edge");
         assert_eq!(p.overlay0, Color::Rgb(55, 65, 77), "--faint");
         assert_eq!(p.overlay1, Color::Rgb(100, 113, 126), "--dim");
