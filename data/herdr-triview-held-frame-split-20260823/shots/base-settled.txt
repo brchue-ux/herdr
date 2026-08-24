@@ -1,0 +1,42 @@
+                         │ 1       +                                                                                                        
+ ○ lab · star · 0 moons  │┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+                         ││  transcript line 09 — held-frame repro                                                                         │
+                         ││  transcript line 10 — held-frame repro                                                                         │
+                         ││  transcript line 11 — held-frame repro                                                                         │
+                         ││  transcript line 12 — held-frame repro                                                                         │
+                         ││  transcript line 13 — held-frame repro                                                                         │
+                         ││  transcript line 14 — held-frame repro                                                                         │
+                         ││  transcript line 15 — held-frame repro                                                                         │
+                         ││  transcript line 16 — held-frame repro                                                                         │
+                         ││  transcript line 17 — held-frame repro                                                                         │
+                         ││  transcript line 18 — held-frame repro                                                                         │
+                         ││  transcript line 19 — held-frame repro                                                                         │
+                         ││  transcript line 20 — held-frame repro                                                                         │
+                         ││  transcript line 21 — held-frame repro                                                                         │
+                         ││  transcript line 22 — held-frame repro                                                                         │
+                         ││  transcript line 23 — held-frame repro                                                                         │
+                         ││  transcript line 24 — held-frame repro                                                                         │
+                         ││  transcript line 25 — held-frame repro                                                                         │
+                         ││⏺ Bash(cargo nextest run --lib zone_01)                                                                         │
+                         ││⏺ Bash(cargo nextest run --lib zone_02)                                                                         │
+                         ││⏺ Bash(cargo nextest run --lib zone_03)                                                                         │
+                         ││─────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+                         ││ ❯ COMPOSER MARKER                                                                                              │
+                         ││─────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+                         ││● cargo nextest run --lib zone_03                                                                               │
+                         ││● cargo nextest run --lib zone_02                                                                               │
+                         ││● cargo nextest run --lib zone_01                                                                               │
+                         ││                                                                                                                │
+                         ││                                                                                                                │
+                         ││                                                                                                                │
+                         ││                                                                                                                │
+                         ││                                                                                                                │
+                         ││  ~/lab  main | Opus 4.5 | 42% context left   <<< STATUS BAR                                                    │
+                         ││  ? for shortcuts                                                                                               │
+                         │└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                         │┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+                         ││1787542116.979858788                                                                                           ▕│
+                         ││1787542117.035682106                                                                                           ▕│
+                         ││1787542117.095113960                                                                                           ▕│
+                         ││                                                                                                               ▕│
+ new              ● menu«│└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

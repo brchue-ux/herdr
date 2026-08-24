@@ -2395,6 +2395,11 @@ impl GhosttyPaneTerminal {
         show_cursor: bool,
     ) -> Option<ClaudeTriviewLayout> {
         let mut core = self.core.lock().ok()?;
+        // Read before the clear below: while the frame is held this is the
+        // split that gets drawn again, because it is the split that describes
+        // the frozen pixels — see the `held_for_synchronized_update` branch
+        // under the refresh.
+        let previous_layout = core.last_triview_layout;
         // Cleared up front so every bail-out below leaves the identity
         // mapping behind: on `None` the caller draws `Self::render`, which is
         // the unmodified full-pane copy.
@@ -2411,7 +2416,33 @@ impl GhosttyPaneTerminal {
             RenderStateRefresh::Updated => false,
         };
 
-        let layout = claude_triview_layout(&core.terminal, area.height)?;
+        let layout = if held_for_synchronized_update {
+            // A hold freezes `render_state`, which is what the three zones are
+            // blitted from — but not `core.terminal`, which is what
+            // `claude_triview_layout` reads. Splitting frozen pixels at the
+            // *live* screen's boundaries is the one way this call can draw a
+            // frame the agent never had: the agent repaints its whole screen
+            // inside a DEC 2026 batch, and an alternate-screen harvest scrolls
+            // the grid under the hold on purpose, so mid-hold the live grid is
+            // either a different Claude shape (the zones move while the pixels
+            // do not) or not a Claude shape at all (the split disengages and
+            // the pane visibly jumps by `transcript_skip` rows, then back).
+            //
+            // The frozen pixels are the ones the last unheld paint drew, so the
+            // split it recorded is exactly the split that describes them.
+            // Reusing it is both correct and cheaper than the grid read it
+            // replaces. `None` — no split was drawn before the hold engaged —
+            // takes the caller's plain full-pane render, which draws the same
+            // held frame unsplit.
+            previous_layout
+                .filter(|layout| layout.drawn_rows() <= area.height)
+                .or_else(|| {
+                    crate::render_prof::event("triview.held_without_prior_layout");
+                    None
+                })?
+        } else {
+            claude_triview_layout(&core.terminal, area.height)?
+        };
         // Recorded before anything is blitted: this is the projection every
         // later reader of the drawn pane has to share.
         core.last_triview_layout = Some(layout);
@@ -2624,6 +2655,15 @@ impl ClaudeTriviewLayout {
     /// sat before the transcript's shift moved the zone that draws it.
     pub(crate) fn grid_composer_start(&self) -> u16 {
         self.transcript_skip + self.transcript_rows + 1
+    }
+
+    /// Rows of `area` this split covers, top to bottom — every zone plus both
+    /// cropped border rows and the log zone between them. The pane it was
+    /// resolved against was exactly this tall, so a split whose `drawn_rows`
+    /// no longer fits its pane is one the pane has been resized out from
+    /// under and must not be reused.
+    pub(crate) fn drawn_rows(&self) -> u16 {
+        self.footer_start().saturating_add(self.footer_rows)
     }
 
     /// Where grid row `grid_row` was actually drawn in the pane's own `area`,
@@ -4998,6 +5038,154 @@ mod tests {
             ],
             "collapsed `\u{23BF}  $ ` echo and expanded `\u{25CF} Bash(...)` bullet both count; \
              the `\u{23BF} \u{a0}M src/main.rs` result line does not"
+        );
+    }
+
+    /// A frame hold freezes `render_state`, which is what the split's three
+    /// zones are blitted from. It does not freeze the live ghostty grid, which
+    /// is what [`claude_triview_layout`] reads — so a split recomputed mid-hold
+    /// describes a screen the drawn pixels are not from.
+    ///
+    /// Claude Code repaints its whole screen inside a DEC 2026 batch, so the
+    /// live grid mid-batch is a *torn* screen: the top has been cleared and
+    /// rewritten and the composer's rules have not been redrawn yet. Recomputed
+    /// against it the split either resolves to different offsets — herdr's
+    /// dividers land on transcript rows while the agent's own rules are still
+    /// visible one row away — or stops resolving at all, which drops the pane
+    /// to the plain full-pane render and jumps the transcript and composer down
+    /// by `transcript_skip` rows for that frame and back on the next.
+    ///
+    /// The held pixels are the ones the last unheld paint drew, so the split
+    /// that paint recorded is the split that describes them.
+    #[test]
+    fn a_synchronized_update_holds_the_triview_split_it_drew() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 17, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 12);
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let area = Rect::new(0, 0, 60, 17);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 17)).unwrap();
+        let mut before = None;
+        term.draw(|frame| before = pane.render_claude_triview(frame, area, false))
+            .unwrap();
+        let before = before.expect("a Claude-shaped screen resolves a triview layout");
+        let composer_row = before.transcript_rows + 1;
+        assert_eq!(
+            buffer_row_text(term.backend().buffer(), composer_row, 60),
+            " > typed input"
+        );
+
+        // The agent opens a batch and starts repainting: the grid is cleared
+        // and only its first row rewritten. Nothing here is Claude-shaped.
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h\x1b[H\x1b[2J", &tx);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[H > partial repaint", &tx);
+
+        let mut during = None;
+        term.draw(|frame| during = pane.render_claude_triview(frame, area, false))
+            .unwrap();
+        assert_eq!(
+            during,
+            Some(before),
+            "a held frame must keep the split that describes it, not re-split the torn live grid"
+        );
+        assert_eq!(
+            buffer_row_text(term.backend().buffer(), composer_row, 60),
+            " > typed input",
+            "and the composer must still be drawn on the row the split says it is on"
+        );
+    }
+
+    /// The same seam, through the other hold that matters: an alternate-screen
+    /// `pane read --source recent` harvest scrolls the pane's own grid on
+    /// purpose while promising the drawn frame does not move.
+    ///
+    /// The reshaped live screen below is still Claude-shaped — a wrapped
+    /// two-row composer, an ordinary thing for the agent to draw — which is the
+    /// case that garbles rather than disengages: the split moves, the pixels do
+    /// not, and herdr's dividers are drawn a row away from the agent's own
+    /// rules that are still on screen.
+    #[test]
+    fn an_alt_screen_read_hold_holds_the_triview_split_it_drew() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 18, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 13);
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let area = Rect::new(0, 0, 60, 18);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 18)).unwrap();
+        let mut before = None;
+        term.draw(|frame| before = pane.render_claude_triview(frame, area, false))
+            .unwrap();
+        let before = before.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(before.composer_rows, 1);
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[H\x1b[2J", &tx);
+        let mut reshaped = String::new();
+        for index in 1..=12 {
+            reshaped.push_str(&format!("transcript line {index:02}\r\n"));
+        }
+        reshaped.push_str("\u{2500}".repeat(26).as_str());
+        reshaped.push_str("\r\n > a composer that wrapped\r\n   onto a second row\r\n");
+        reshaped.push_str("\u{2500}".repeat(26).as_str());
+        reshaped.push_str("\r\n~/proj main 42% context\r\n? for shortcuts");
+        pane.process_pty_bytes(pane_id, 0, reshaped.as_bytes(), &tx);
+
+        // The live grid now resolves a two-row composer one row higher. The
+        // held frame does not have one.
+        let live =
+            claude_triview_layout(&pane.core.lock().expect("pane core").terminal, area.height)
+                .expect("the reshaped live screen is still Claude-shaped");
+        assert_ne!(
+            live, before,
+            "fixture check: the live grid must resolve a different split, or this proves nothing"
+        );
+
+        let mut during = None;
+        term.draw(|frame| during = pane.render_claude_triview(frame, area, false))
+            .unwrap();
+        assert_eq!(
+            during,
+            Some(before),
+            "a harvest's injected scroll must not move the split over the frame it is holding"
+        );
+    }
+
+    /// The one thing a held split may not be reused across: a pane that got
+    /// shorter while the hold was engaged. The recorded split describes a
+    /// taller pane, and blitting it into the smaller one would put the agent's
+    /// footer past the pane's own floor. Refuse and take the plain render.
+    #[test]
+    fn a_held_triview_split_is_refused_once_the_pane_no_longer_fits_it() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(60, 17, 0).unwrap();
+        write_tall_claude_shaped_screen(&mut terminal, 12);
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 17)).unwrap();
+        let mut before = None;
+        term.draw(|frame| {
+            before = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 17), false)
+        })
+        .unwrap();
+        let before = before.expect("a Claude-shaped screen resolves a triview layout");
+        assert_eq!(before.drawn_rows(), 17);
+
+        pane.set_alt_screen_read_hold(true);
+        pane.process_pty_bytes(pane_id, 0, b"anything", &tx);
+
+        let mut during = Some(before);
+        term.draw(|frame| {
+            during = pane.render_claude_triview(frame, Rect::new(0, 0, 60, 12), false)
+        })
+        .unwrap();
+        assert_eq!(
+            during, None,
+            "a split taller than the pane it would be drawn into must not be reused"
         );
     }
 

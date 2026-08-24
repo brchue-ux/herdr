@@ -1,0 +1,5 @@
+[lab] RESULT tag=base2 settled_row=24 settled_bullets=6 samples=40 moved=15 log_zone_lost=15
+[lab] RESULT tag=base2 VERDICT=MOVED (15/40 samples caught the split elsewhere)
+[lab] RESULT tag=fixed2 settled_row=24 settled_bullets=6 samples=40 moved=0 log_zone_lost=0
+[lab] RESULT tag=fixed2 VERDICT=held (every sample showed the split where it settled)
+[lab] TEARDOWN_STATUS=0
