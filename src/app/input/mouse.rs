@@ -1779,6 +1779,31 @@ impl AppState {
             .and_then(crate::terminal::TerminalRuntime::last_claude_triview_layout)
     }
 
+    /// The **grid** row a mouse event at screen row `screen_row` landed on in
+    /// `pane_id`, which is what the pane's own app has to be told.
+    ///
+    /// Identity for every pane but a Claude triview one, whose transcript and
+    /// composer are drawn [`crate::pane::ClaudeTriviewLayout::transcript_skip`]
+    /// rows above the grid rows they came from. A pane app with mouse
+    /// reporting on — Claude Code turns basic click tracking on for its own
+    /// clickable UI — otherwise receives every click, drag, hover and reported
+    /// wheel `transcript_skip` rows off the row the user actually clicked,
+    /// because the pane row was sent as if it were the grid row of the same
+    /// index. The same projection
+    /// [`crate::ui::panes::render_selection_highlight`] and this module's own
+    /// selection anchor already apply, so what the app is told and what herdr
+    /// highlights agree.
+    fn pane_grid_row_for_screen_row(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        screen_row: u16,
+    ) -> u16 {
+        let pane_row = screen_row.saturating_sub(info.inner_rect.y);
+        self.pane_claude_triview_layout(terminal_runtimes, info.id)
+            .map_or(pane_row, |layout| layout.grid_row_for_pane_row(pane_row))
+    }
+
     /// Scrolls `info`'s own command-log zone instead of its PTY scrollback
     /// when the wheel lands inside that zone, so reviewing older commands
     /// never disengages the triview split the way scrolling the pane itself
@@ -1928,10 +1953,17 @@ impl AppState {
 
         if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
-            if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
+            // Before the pane app gets a look at it. The triview's log zone is
+            // herdr's own rows — the agent drew nothing there and has no grid
+            // row under them — so a wheel that lands inside it is this zone's
+            // own scroll, not something to report to the app. Claude Code turns
+            // basic click tracking on for its own clickable UI, and with
+            // reporting on `forward_pane_wheel` claimed every notch, which left
+            // the zone's history unreachable by the one gesture that reaches it.
+            if self.scroll_pane_command_log_at(terminal_runtimes, &info, mouse) {
                 return;
             }
-            if self.scroll_pane_command_log_at(terminal_runtimes, &info, mouse) {
+            if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
                 return;
             }
             match mouse.kind {
@@ -1985,7 +2017,7 @@ impl AppState {
             return false;
         };
         let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
+        let row = self.pane_grid_row_for_screen_row(terminal_runtimes, info, mouse.row);
         let Some(bytes) = rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers) else {
             return false;
         };
@@ -2010,7 +2042,7 @@ impl AppState {
             return false;
         };
         let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
+        let row = self.pane_grid_row_for_screen_row(terminal_runtimes, info, mouse.row);
         let Some(bytes) = rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers) else {
             return false;
         };
@@ -2038,7 +2070,7 @@ impl AppState {
         }
         rt.scroll_reset();
         let column = mouse.column.saturating_sub(info.inner_rect.x);
-        let row = mouse.row.saturating_sub(info.inner_rect.y);
+        let row = self.pane_grid_row_for_screen_row(terminal_runtimes, info, mouse.row);
         let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers) else {
             warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
             return true;
@@ -2067,7 +2099,7 @@ impl AppState {
             Some(crate::pane::WheelRouting::MouseReport) => {
                 rt.scroll_reset();
                 let column = mouse.column.saturating_sub(info.inner_rect.x);
-                let row = mouse.row.saturating_sub(info.inner_rect.y);
+                let row = self.pane_grid_row_for_screen_row(terminal_runtimes, info, mouse.row);
                 let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
                 else {
                     warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
@@ -2198,8 +2230,10 @@ fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::{Direction, Rect};
+    use tokio::sync::mpsc;
 
     use super::super::{
         app_for_mouse_test, capture_snapshot, mouse, numbered_lines_bytes, root_layout_ratio,
@@ -2303,6 +2337,169 @@ mod tests {
             .unwrap();
 
         (app, info)
+    }
+
+    /// A rendered, focused Claude triview pane whose own app has **mouse
+    /// reporting on**, plus the channel its forwarded input lands in.
+    ///
+    /// Claude Code turns basic click tracking on (`\x1b[?1000h`) for its own
+    /// clickable UI, which is what makes the projection below reachable at all:
+    /// with reporting off, `encode_mouse_*` returns `None` and herdr keeps the
+    /// event for its own selection instead.
+    fn app_with_reporting_claude_triview() -> (App, crate::layout::PaneInfo, mpsc::Receiver<Bytes>)
+    {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        let mut terminal_state =
+            crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.detected_agent = Some(Agent::Claude);
+        app.state.terminals.insert(terminal_id, terminal_state);
+
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 0, 60, 19));
+        let info = pane_infos[0].clone();
+        let cols = info.inner_rect.width as usize;
+        let rows = info.inner_rect.height as usize;
+        let rule = "\u{2500}".repeat(cols);
+        let mut lines: Vec<String> = (1..=14)
+            .map(|n| format!("transcript line {n:02}"))
+            .collect();
+        lines.resize(rows - 5, String::new());
+        lines.push(rule.clone());
+        lines.push("\u{276F} typed input".to_string());
+        lines.push(rule);
+        lines.push("~/proj main 42% context".to_string());
+        lines.push("? for shortcuts".to_string());
+        let screen = lines.join("\r\n").into_bytes();
+
+        let (rt, rx) = crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            info.inner_rect.width,
+            info.inner_rect.height,
+            0,
+            &screen,
+            16,
+        );
+        rt.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        ws.insert_test_runtime(pane_id, rt);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        for command in ["cargo nextest run", "git status", "ls -la"] {
+            app.state
+                .pane_command_log
+                .record(pane_id, command.to_string());
+        }
+
+        let registry = crate::terminal::TerminalRuntimeRegistry::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(86, 19)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::render_tab_surface(
+                    &app.state,
+                    &registry,
+                    app.state.view.tab_surface(),
+                    frame,
+                );
+            })
+            .unwrap();
+
+        (app, info, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<Bytes>) -> String {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            out.extend_from_slice(&bytes);
+        }
+        String::from_utf8_lossy(&out).replace('\x1b', "ESC")
+    }
+
+    /// The same off-by-`transcript_skip` the selection anchor, the frame cursor
+    /// and the hyperlink targets each had, in the one reader left: what herdr
+    /// tells the pane's own app a click landed on.
+    ///
+    /// A triview pane draws the transcript and composer `transcript_skip` rows
+    /// above the grid rows they were copied from. Sending the *pane* row as if
+    /// it were the grid row hands the agent a click eight rows off the row the
+    /// user actually clicked — so a click on one of its own clickable lines
+    /// activates a different one.
+    #[tokio::test]
+    async fn a_forwarded_click_reports_the_grid_row_the_split_actually_drew() {
+        let (mut app, info, mut rx) = app_with_reporting_claude_triview();
+        let registry = crate::terminal::TerminalRuntimeRegistry::default();
+        let layout = app
+            .state
+            .pane_claude_triview_layout(&registry, info.id)
+            .expect("a Claude-shaped screen resolves a triview layout");
+        assert!(
+            layout.transcript_skip > 0,
+            "the fixture must actually shift, or this proves nothing"
+        );
+
+        let pane_row: u16 = 5;
+        let grid_row = layout.grid_row_for_pane_row(pane_row);
+        assert_eq!(grid_row, pane_row + layout.transcript_skip);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + 3,
+            info.inner_rect.y + pane_row,
+        ));
+
+        // SGR mouse coordinates are 1-based.
+        assert_eq!(
+            drain(&mut rx),
+            format!("ESC[<0;4;{}M", grid_row + 1),
+            "the app must be told the grid row its own content is drawn from"
+        );
+    }
+
+    /// The triview's log zone is herdr's own rows: the agent drew nothing there
+    /// and has no grid row under them. A wheel notch inside it scrolls that
+    /// zone's history, even when the pane's app has mouse reporting on and
+    /// would otherwise have claimed every notch in the pane.
+    #[tokio::test]
+    async fn a_wheel_inside_the_log_zone_scrolls_it_rather_than_reaching_the_agent() {
+        let (mut app, info, mut rx) = app_with_reporting_claude_triview();
+        let registry = crate::terminal::TerminalRuntimeRegistry::default();
+        let layout = app
+            .state
+            .pane_claude_triview_layout(&registry, info.id)
+            .expect("a Claude-shaped screen resolves a triview layout");
+
+        // More commands than the zone can show at once, so it has somewhere to
+        // scroll to.
+        for index in 0..20 {
+            app.state
+                .pane_command_log
+                .record(info.id, format!("command {index:02}"));
+        }
+
+        let log_row = info.inner_rect.y + layout.consumed_rows();
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            info.inner_rect.x + 3,
+            log_row,
+        ));
+
+        assert_eq!(
+            app.state
+                .pane_command_log_scroll
+                .get(&info.id)
+                .copied()
+                .unwrap_or(0),
+            u16::try_from(app.state.mouse_scroll_lines).unwrap_or(u16::MAX),
+            "the zone's own scroll must advance"
+        );
+        assert_eq!(
+            drain(&mut rx),
+            "",
+            "and nothing may be reported to the agent for a row it never drew"
+        );
     }
 
     /// The captain's bug: a drag over what the split actually drew must
