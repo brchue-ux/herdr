@@ -1526,6 +1526,41 @@ mod tests {
         assert_eq!(identity.version(), Some("0.5.19"));
     }
 
+    /// The three replies as one read, because that is how they arrive: the
+    /// client fires the Kitty capability probe, XTVERSION and `CSI 16 t` in one
+    /// breath at attach (`crate::client::run_client_with_mode`), so the
+    /// terminal answers them back to back — an APC, a DCS and a CSI, three
+    /// different control-string families that have to frame apart from each
+    /// other in one buffer.
+    ///
+    /// The bytes are a live capture from Rio 0.5.19 (the captain's terminal),
+    /// taken by writing herdr's own three query constants into a real Rio under
+    /// Xvfb and reading back what it wrote. Rio answering all three is what
+    /// settled the split-config investigation: the replies were never being
+    /// lost in transit — with `[experimental] kitty_graphics` off in the
+    /// client's own config, herdr never sent the questions.
+    #[test]
+    fn frames_all_three_attach_time_host_replies_from_one_read() {
+        let events =
+            parse_raw_input_bytes_sync(b"\x1b_Gi=1;OK\x1b\\\x1bP>|Rio 0.5.19\x1b\\\x1b[6;16;8t");
+        let [RawInputEvent::KittyGraphicsCapability(confirmed), RawInputEvent::HostTerminalIdentity(identity), RawInputEvent::HostCellSizeReport {
+            width_px,
+            height_px,
+        }] = events.as_slice()
+        else {
+            panic!("expected capability, identity and cell size events, got {events:?}");
+        };
+        assert!(confirmed);
+        assert_eq!(identity.name(), "Rio");
+        assert_eq!(identity.version(), Some("0.5.19"));
+        assert_eq!((*width_px, *height_px), (8, 16));
+        assert_eq!(
+            crate::kitty_graphics::host_terminal_kind_for_identity(identity.name()),
+            crate::kitty_graphics::HostTerminalKind::Rio,
+            "Rio's own capitalisation must not demote the terminal the environment already classified"
+        );
+    }
+
     /// The reply arrives in the same read as whatever the user was typing,
     /// which is the normal case at attach time.
     #[test]

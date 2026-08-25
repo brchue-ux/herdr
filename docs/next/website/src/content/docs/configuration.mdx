@@ -918,6 +918,30 @@ The path is read once at startup. Below 34 columns, with `kitty_graphics = false
 or on a direct attach — where graphics are disabled anyway — the sidebar renders
 its character cards exactly as before.
 
+### Over `herdr --remote`
+
+A `herdr --remote` session has two configs — the server's on the remote machine
+and the client's on the machine you are sitting at — and the pixel cards need
+this flag on **both**: the server decides whether the session paints them, and
+the client decides whether it asks its terminal whether it can draw them at all.
+
+You do not have to set it twice. `herdr --remote` reads the remote machine's
+answer before it starts your client and hands it down, so `kitty_graphics = true`
+in the *server's* config is enough. Setting it in the client's config alone still
+works too, and either one is enough on its own.
+
+Turning it on cannot force pixels onto a terminal that cannot draw them. The
+client asks its terminal the Kitty graphics capability question and waits for an
+answer; a terminal that does not implement the protocol never replies, and the
+session stays on character cards. What changed is that herdr now asks — before,
+a split setup carrying the flag only on the server never sent the question, so
+the answer never came and the sidebar stayed on character cards with
+`kitty_graphics = true` sitting in the config.
+
+If a client is still drawing character cards, `herdr status server --json` on
+either machine reports that machine's `kitty_graphics`, and the server log warns
+when a client connects that cannot paint the surfaces the session wants.
+
 By default the tree is drawn as one image with each row's background painted into
 it, so a card's glow stops at that image's rectangle rather than falling off into
 what is behind it. Draw each card as its own transparent shape instead with:

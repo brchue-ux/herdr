@@ -2920,6 +2920,62 @@ impl HeadlessServer {
         }
     }
 
+    /// Says out loud that a client cannot paint the pixel surfaces this session
+    /// is configured to draw.
+    ///
+    /// A client with its own `[experimental] kitty_graphics` off reports `0x0`
+    /// for its cell size and never asks its terminal the Kitty graphics
+    /// capability question, so `kitty_graphics_capability_confirmed` can never
+    /// become true and `AppState::host_paints_pixel_surfaces` stays false — see
+    /// `crate::client::may_claim_client_rasterized_surfaces`, which relies on
+    /// exactly that pair of signals. Until this warning the two configs
+    /// disagreeing was completely silent, and presented as "kitty_graphics is
+    /// on and I still get character cells".
+    ///
+    /// `herdr --remote` now hands the session's answer down to its client
+    /// (`crate::remote::bridge::SESSION_KITTY_GRAPHICS_ENV_VAR`), so this
+    /// covers the splits it cannot reach: a client attached over a
+    /// hand-forwarded socket, or one whose own config turns it off.
+    fn warn_if_client_cannot_paint_wanted_pixel_surfaces(
+        session_kitty_graphics_enabled: bool,
+        client_id: u64,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        direct_attach_requested: bool,
+    ) {
+        if !Self::client_cannot_paint_wanted_pixel_surfaces(
+            session_kitty_graphics_enabled,
+            cell_width_px,
+            cell_height_px,
+            direct_attach_requested,
+        ) {
+            return;
+        }
+        warn!(
+            client_id,
+            "client reported no host cell size, so it has kitty graphics disabled in its own \
+             config; this session will keep drawing character cells for it. Set `[experimental] \
+             kitty_graphics = true` in this client machine's herdr config too."
+        );
+    }
+
+    /// The predicate behind [`Self::warn_if_client_cannot_paint_wanted_pixel_surfaces`].
+    ///
+    /// A direct terminal attach forces its own kitty graphics off
+    /// unconditionally (`crate::client::run_client_with_mode`), so its `0x0` is
+    /// the mode working as designed rather than a configuration mismatch.
+    fn client_cannot_paint_wanted_pixel_surfaces(
+        session_kitty_graphics_enabled: bool,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        direct_attach_requested: bool,
+    ) -> bool {
+        session_kitty_graphics_enabled
+            && !direct_attach_requested
+            && cell_width_px == 0
+            && cell_height_px == 0
+    }
+
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
@@ -2963,6 +3019,13 @@ impl HeadlessServer {
                     cell_height_px,
                     ?render_encoding,
                     "client connected"
+                );
+                Self::warn_if_client_cannot_paint_wanted_pixel_surfaces(
+                    self.app.state.kitty_graphics_enabled,
+                    client_id,
+                    cell_width_px,
+                    cell_height_px,
+                    direct_attach_requested,
                 );
                 let last_activity = self.allocate_activity_stamp();
                 self.clients.insert(
@@ -5606,6 +5669,29 @@ mod tests {
 
     #[path = "pane_graphics.rs"]
     mod pane_graphics_tests;
+
+    /// A client reporting `0x0` for its cell size while this session is
+    /// configured to paint pixel surfaces is the split-config mismatch that
+    /// used to be silent — see
+    /// [`HeadlessServer::warn_if_client_cannot_paint_wanted_pixel_surfaces`].
+    #[test]
+    fn a_client_reporting_no_cell_size_is_flagged_when_the_session_wants_pixels() {
+        assert!(HeadlessServer::client_cannot_paint_wanted_pixel_surfaces(
+            true, 0, 0, false
+        ));
+        // A client that answered its own cell size did probe its terminal.
+        assert!(!HeadlessServer::client_cannot_paint_wanted_pixel_surfaces(
+            true, 10, 21, false
+        ));
+        // Nothing to warn about when this session is not painting pixels either.
+        assert!(!HeadlessServer::client_cannot_paint_wanted_pixel_surfaces(
+            false, 0, 0, false
+        ));
+        // Direct attach forces its own kitty graphics off by design.
+        assert!(!HeadlessServer::client_cannot_paint_wanted_pixel_surfaces(
+            true, 0, 0, true
+        ));
+    }
 
     #[test]
     fn retained_render_plan_covers_each_render_path() {

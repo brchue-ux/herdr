@@ -144,10 +144,12 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
+            println!("{indent}kitty_graphics: {}", host_kitty_graphics_enabled());
         }
         ServerRuntimeStatus::NotRunning => {
             println!("{indent}status: not running");
             println!("{indent}socket: {}", api::socket_path().display());
+            println!("{indent}kitty_graphics: {}", host_kitty_graphics_enabled());
         }
     }
 }
@@ -229,6 +231,15 @@ struct ServerStatusJson {
     socket: String,
     session: Option<String>,
     restart_needed: Option<bool>,
+    /// Whether a Herdr server on this host paints Kitty graphics surfaces —
+    /// `[experimental] kitty_graphics` in this host's own config.
+    ///
+    /// Read from the config rather than from a running server's reported
+    /// capabilities, so it answers the same way whether or not a server is up:
+    /// `herdr --remote` needs it before it launches its client process, and the
+    /// remote server is often not running yet at that point. See
+    /// `crate::remote::bridge::run_remote`.
+    kitty_graphics: bool,
 }
 
 #[derive(Serialize)]
@@ -273,6 +284,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
+            kitty_graphics: host_kitty_graphics_enabled(),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -284,8 +296,17 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: Some(false),
+            kitty_graphics: host_kitty_graphics_enabled(),
         },
     }
+}
+
+/// `[experimental] kitty_graphics` as this host's config has it.
+pub(crate) fn host_kitty_graphics_enabled() -> bool {
+    crate::config::Config::load()
+        .config
+        .experimental
+        .kitty_graphics
 }
 
 fn update_status_json(server: &ServerRuntimeStatus) -> UpdateStatusJson {
@@ -321,4 +342,34 @@ fn print_status_help() {
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
     eprintln!("  herdr status client [--json]  show local client binary status");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `herdr --remote` reads this JSON before it launches its client, and the
+    /// first launch of a session is exactly the case where the remote server is
+    /// not up yet — so the stopped-server shape has to carry the flag too. See
+    /// `crate::remote::bridge::ensure_remote_server_ready`.
+    #[test]
+    fn stopped_server_status_json_still_reports_kitty_graphics() {
+        let json =
+            serde_json::to_string(&server_status_json(&ServerRuntimeStatus::NotRunning)).unwrap();
+        assert!(
+            json.contains("\"kitty_graphics\""),
+            "stopped-server status JSON dropped the field: {json}"
+        );
+
+        let running = serde_json::to_string(&server_status_json(&ServerRuntimeStatus::Running {
+            version: Some("0.8.0".into()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            capabilities: None,
+        }))
+        .unwrap();
+        assert!(
+            running.contains("\"kitty_graphics\""),
+            "running-server status JSON dropped the field: {running}"
+        );
+    }
 }
