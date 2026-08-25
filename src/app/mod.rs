@@ -919,6 +919,8 @@ impl App {
             machine_corner_key: 0,
             machine_corner_absence: None,
             machine_corner_rgba: None,
+            diff_overlay: crate::ui::diff_overlay::DiffOverlayState::default(),
+            diff_overlay_layer: None,
             orbit_tracks: crate::app::background_scene::OrbitTracks::default(),
             ambient_motes: crate::app::background_scene::AmbientMotes::default(),
             background_scene_identity: Vec::new(),

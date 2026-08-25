@@ -508,6 +508,7 @@ mod tests {
             spider,
             wash: None,
             crew: Vec::new(),
+            bars: None,
         }
     }
 

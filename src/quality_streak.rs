@@ -60,6 +60,22 @@ pub(crate) const HALF_LIFE_TOKEN: &str = "streak_hl";
 /// without implying the other.
 pub(crate) const DEFECT_TOKEN: &str = "sev";
 
+/// The workspace metadata token carrying a Space's recent-activity sparkline:
+/// up to [`BARS_MAX`] comma-separated bar heights, each `0..=100`, oldest
+/// first — the mockup's literal `.bars`/`.bar` encoding
+/// (`data/herdr-mockup-stack-gap-20260824/mockup.html`), read fresh every
+/// render like [`STREAK_TOKEN`] rather than sampled and retained by Herdr
+/// itself. A fleet publisher decides what "activity" means (revs, commits,
+/// whatever); Herdr only draws the numbers it is handed.
+pub(crate) const BARS_TOKEN: &str = "bars";
+
+/// The most bars a card ever draws, matching the mockup's own five-bar
+/// fixture. A publisher sending more is trimmed rather than rejected — the
+/// same "degrade, don't blank" choice [`half_lives`] makes for a tuning
+/// knob, since a bar count is a display fact, not a value the readout could
+/// be wrong about.
+pub(crate) const BARS_MAX: usize = 5;
+
 /// The half-lives used when a fleet publishes a streak but no [`HALF_LIFE_TOKEN`]
 /// (or an unusable one): 5 days for wins, 10 for losses.
 ///
@@ -139,6 +155,23 @@ pub(crate) fn parse_half_lives(raw: &str) -> Option<HalfLives> {
         win_days,
         loss_days,
     })
+}
+
+/// Parse a [`BARS_TOKEN`] value: `<h0>,<h1>,...`, each clamped to `0..=100`
+/// and capped at [`BARS_MAX`] entries. An empty token, or one with no parseable
+/// entry at all, reads as no bars rather than a zero-height row — the same
+/// "absent, not zero" rule [`crate::app::lifecycle`]'s absence handling uses,
+/// so a publisher that has not sent this token yet draws no sparkline instead
+/// of a flat one.
+pub(crate) fn parse_bars(raw: &str) -> Option<Vec<u8>> {
+    let bars: Vec<u8> = raw
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0) as u8)
+        .take(BARS_MAX)
+        .collect();
+    (!bars.is_empty()).then_some(bars)
 }
 
 /// The half-lives to decay with, given whatever the row published.
@@ -567,5 +600,30 @@ mod tests {
                 "{severity:?} must not out-shout an unknown-size failure"
             );
         }
+    }
+
+    #[test]
+    fn bars_parses_the_mockups_own_fixture() {
+        assert_eq!(parse_bars("40,70,35,95,60"), Some(vec![40, 70, 35, 95, 60]));
+    }
+
+    #[test]
+    fn bars_clamps_out_of_range_heights_instead_of_dropping_the_row() {
+        assert_eq!(parse_bars("-10,140,50"), Some(vec![0, 100, 50]));
+    }
+
+    #[test]
+    fn bars_caps_at_the_mockups_five_and_skips_unparseable_entries() {
+        assert_eq!(
+            parse_bars("1,2,x,3,4,5,6"),
+            Some(vec![1, 2, 3, 4, 5]),
+            "a bad entry is skipped, not fatal to the rest, and the cap holds"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_unusable_token_draws_no_bars_rather_than_a_flat_row() {
+        assert_eq!(parse_bars(""), None);
+        assert_eq!(parse_bars("x,y,z"), None);
     }
 }

@@ -470,6 +470,14 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         } else {
             Vec::new()
         },
+        // A mate carries a sparkline on the same two-in-three cadence as its
+        // other two caption lines, so `herdr bench cards` measures the bar
+        // strip's real per-pixel cost rather than skipping it on every card.
+        bars: (depth == 1 && !index.is_multiple_of(3)).then(|| {
+            (0..5)
+                .map(|slot| ((index * 17 + slot * 29) % 101) as u8)
+                .collect()
+        }),
     }
 }
 

@@ -101,6 +101,76 @@ pub(crate) fn normalized_diff_scroll(app: &AppState, area: Rect, requested: usiz
     requested.min(total.saturating_sub(area.height as usize))
 }
 
+/// The diff pane's content rect, inside its border — the same rect
+/// `render_panel_shell` hands [`render_diff_content`] for the fixed Changes
+/// zone, recomputed here from `outer` (`AppState::view::diff_area`) without a
+/// `Frame` to draw into, so [`diff_overlay_anchors`] can be called from the
+/// scene-observing tick, which has none.
+pub(crate) fn diff_inner_rect(outer: Rect) -> Option<Rect> {
+    (outer.width >= 2 && outer.height >= 2)
+        .then(|| Rect::new(outer.x + 1, outer.y + 1, outer.width - 2, outer.height - 2))
+}
+
+/// Terminal-row anchors for the diff pane's pixel overlay (mechanics 3/4 —
+/// the traveling rail light and the arriving-file glow), in absolute screen
+/// rows.
+pub(crate) struct DiffOverlayAnchors {
+    /// Every currently-visible [`DiffRow::Rail`] row, top to bottom.
+    pub(crate) rail_rows: Vec<u16>,
+    /// Every currently-visible file's header row, keyed by the same path
+    /// [`crate::ui::diff_overlay::DiffOverlayState`] tracks arrivals under.
+    pub(crate) file_rows: Vec<(String, u16)>,
+}
+
+/// Resolves [`DiffOverlayAnchors`] for the fixed Changes zone at `outer`
+/// (`AppState::view::diff_area`) — `None` when the zone is not showing a
+/// diff at all, the same set of early-outs [`render_diff_content`] takes.
+///
+/// Walks the *same* [`build_diff_rows`] pass `render_diff_lines` draws from,
+/// rather than a second derivation of where each row landed — the failure
+/// mode that leaves a drawn position and a computed one free to disagree.
+/// This is still a separate call, from a separate tick (the graphics
+/// observer, not the render pass), so the two can still see a different
+/// `scroll`/diff snapshot a frame apart; that is the same tolerance every
+/// other TUI-drawn overlay in this codebase (`machine_corner`, the sidebar's
+/// particle field) already accepts.
+pub(crate) fn diff_overlay_anchors(app: &AppState, outer: Rect) -> Option<DiffOverlayAnchors> {
+    let area = diff_inner_rect(outer)?;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let ws = app.active.and_then(|idx| app.workspaces.get(idx))?;
+    ws.git_space()?;
+    let diff = ws.git_diff()?;
+    if diff.lines.is_empty() {
+        return None;
+    }
+    let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
+    let built = build_diff_rows(diff, scroll, area.height as usize);
+
+    let mut rail_rows = Vec::new();
+    let mut file_rows = Vec::new();
+    let mut offset: u16 = if scroll > 0 { 1 } else { 0 };
+    for row in &built.rows {
+        if offset >= area.height {
+            break;
+        }
+        match row {
+            DiffRow::Rail => rail_rows.push(area.y + offset),
+            DiffRow::FileHeader { path } => file_rows.push((path.clone(), area.y + offset)),
+            _ => {}
+        }
+        offset += match row {
+            DiffRow::FileHeader { .. } => 2,
+            _ => 1,
+        };
+    }
+    Some(DiffOverlayAnchors {
+        rail_rows,
+        file_rows,
+    })
+}
+
 fn render_message(frame: &mut Frame, area: Rect, text: &str, color: Color) {
     let paragraph = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))));
     frame.render_widget(paragraph, area);
@@ -127,6 +197,15 @@ enum DiffRow {
         new_ln: Option<u32>,
         text: String,
     },
+    /// The mockup's `.diff-rail` — a divider between one file's diff content
+    /// and the next file's header. Inserted only *between* files (never
+    /// before the first or after the last), so a single-file diff draws none
+    /// and the row exists at all only where the mockup's own DOM puts one.
+    /// Its static track is drawn here as plain text; the traveling light that
+    /// rides it (mechanic 3) is a pixel overlay — see
+    /// [`super::diff_overlay`] — anchored to this row by
+    /// [`diff_overlay_anchors`].
+    Rail,
 }
 
 /// Parses a unified-diff hunk header down to its two starting line numbers.
@@ -154,16 +233,14 @@ fn file_header_path(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn render_diff_lines(
-    app: &AppState,
-    frame: &mut Frame,
-    area: Rect,
-    diff: &GitDiffText,
-    scroll: usize,
-) {
-    let visible_rows = area.height as usize;
-    let width = area.width as usize;
-
+/// Walks `diff.lines` into terminal-ready [`DiffRow`]s, stopping once enough
+/// have been produced to know whether the remainder still overflows `area`.
+///
+/// The one row-layout pass, shared by [`render_diff_lines`] and
+/// [`diff_overlay_anchors`] rather than run twice with two chances to
+/// disagree — the same anchoring failure this project has hit before when a
+/// drawn position and a computed one came from two different walks.
+fn build_diff_rows(diff: &GitDiffText, scroll: usize, visible_rows: usize) -> BuiltDiffRows {
     // `scroll` is a count of source diff lines (not terminal rows) to skip
     // before the same bounded forward walk this pane always did from line 0
     // — stopping once enough terminal rows exist to know whether the
@@ -178,6 +255,11 @@ fn render_diff_lines(
     let mut consumed = 0usize;
     let mut old_ln: u32 = 0;
     let mut new_ln: u32 = 0;
+    // Whether any row from an earlier file has already been pushed — a
+    // `Rail` divider goes in front of every `FileHeader` after the first one
+    // rendered, and only there, so a single-file diff (or a diff scrolled to
+    // start mid-file) draws no rail at all.
+    let mut saw_a_file = false;
 
     let diff_lines: &Vec<GitDiffLine> = &diff.lines;
     for (idx, line) in diff_lines.iter().enumerate() {
@@ -199,13 +281,22 @@ fn render_diff_lines(
                     old_ln = old_ln.saturating_add(1);
                     new_ln = new_ln.saturating_add(1);
                 }
-                GitDiffLineKind::FileHeader => {}
+                GitDiffLineKind::FileHeader => {
+                    if line.text.starts_with("diff --git ") {
+                        saw_a_file = true;
+                    }
+                }
             }
             continue;
         }
         consumed += 1;
         match line.kind {
             GitDiffLineKind::FileHeader if line.text.starts_with("diff --git ") => {
+                if saw_a_file {
+                    rows.push(DiffRow::Rail);
+                    terminal_rows += 1;
+                }
+                saw_a_file = true;
                 rows.push(DiffRow::FileHeader {
                     path: file_header_path(&line.text).to_string(),
                 });
@@ -279,6 +370,38 @@ fn render_diff_lines(
         .map(|max| max.to_string().len())
         .unwrap_or(2)
         .max(2);
+
+    BuiltDiffRows {
+        rows,
+        gutter_w,
+        consumed,
+        terminal_rows,
+    }
+}
+
+struct BuiltDiffRows {
+    rows: Vec<DiffRow>,
+    gutter_w: usize,
+    consumed: usize,
+    terminal_rows: usize,
+}
+
+fn render_diff_lines(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    diff: &GitDiffText,
+    scroll: usize,
+) {
+    let visible_rows = area.height as usize;
+    let width = area.width as usize;
+
+    let BuiltDiffRows {
+        rows,
+        gutter_w,
+        consumed,
+        terminal_rows,
+    } = build_diff_rows(diff, scroll, visible_rows);
 
     let mut lines: Vec<Line> = Vec::with_capacity(terminal_rows.min(visible_rows + 2));
     if scroll > 0 {
@@ -380,6 +503,15 @@ fn push_row(
                 p, *kind, *old_ln, *new_ln, text, width, gutter_w,
             ));
         }
+        // The static track only — mirrors the mockup's always-visible
+        // `.diff-rail-line`. The traveling `.diff-rail-light` bar is not text
+        // at all; see `diff_overlay`.
+        DiffRow::Rail => {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width),
+                Style::default().fg(p.surface_dim),
+            )));
+        }
     }
 }
 
@@ -454,4 +586,114 @@ fn content_row(
         ),
         Span::styled(code, code_style.bg(bg)),
     ])
+}
+
+#[cfg(test)]
+mod the_diff_rail_stands_only_between_files {
+    use super::*;
+
+    fn file(path: &str) -> Vec<GitDiffLine> {
+        vec![
+            GitDiffLine {
+                kind: GitDiffLineKind::FileHeader,
+                text: format!("diff --git a/{path} b/{path}"),
+            },
+            GitDiffLine {
+                kind: GitDiffLineKind::Hunk,
+                text: "@@ -1,1 +1,1 @@".to_string(),
+            },
+            GitDiffLine {
+                kind: GitDiffLineKind::Added,
+                text: "+x".to_string(),
+            },
+        ]
+    }
+
+    fn diff(paths: &[&str]) -> GitDiffText {
+        GitDiffText {
+            lines: paths.iter().flat_map(|p| file(p)).collect(),
+            truncated: false,
+        }
+    }
+
+    /// A single-file diff has no boundary to stand a rail on — the mockup's
+    /// own DOM only ever shows one, between two files.
+    #[test]
+    fn a_single_file_diff_draws_no_rail() {
+        let built = build_diff_rows(&diff(&["a.rs"]), 0, 20);
+        assert!(
+            !built.rows.iter().any(|row| matches!(row, DiffRow::Rail)),
+            "one file has no boundary to stand a rail on"
+        );
+    }
+
+    /// Two files draw exactly one rail, between them and nowhere else — not
+    /// before the first file and not after the last.
+    #[test]
+    fn two_files_draw_exactly_one_rail_between_them() {
+        let built = build_diff_rows(&diff(&["a.rs", "b.rs"]), 0, 20);
+        let rail_count = built
+            .rows
+            .iter()
+            .filter(|row| matches!(row, DiffRow::Rail))
+            .count();
+        assert_eq!(rail_count, 1);
+        let rail_idx = built
+            .rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::Rail))
+            .unwrap();
+        assert!(
+            matches!(built.rows[rail_idx - 1], DiffRow::Content { .. }),
+            "the rail follows the first file's own content"
+        );
+        assert!(
+            matches!(built.rows[rail_idx + 1], DiffRow::FileHeader { .. }),
+            "the rail precedes the second file's header"
+        );
+    }
+
+    /// Three files draw exactly two rails — one for every boundary, never one
+    /// per file.
+    #[test]
+    fn three_files_draw_exactly_two_rails() {
+        let built = build_diff_rows(&diff(&["a.rs", "b.rs", "c.rs"]), 0, 20);
+        let rail_count = built
+            .rows
+            .iter()
+            .filter(|row| matches!(row, DiffRow::Rail))
+            .count();
+        assert_eq!(rail_count, 2);
+    }
+
+    /// [`diff_overlay_anchors`] locates the rail and the second file's header
+    /// at the exact rows the text renderer draws them at — driven through
+    /// the real `AppState`, not a hand-rolled offset walk, so this fails if
+    /// the overlay's positions and the drawn ones ever come from two
+    /// different derivations.
+    #[test]
+    fn overlay_anchors_land_on_the_same_rows_the_text_renderer_draws() {
+        let mut ws = crate::workspace::Workspace::test_new("one");
+        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "/repo".into(),
+            repo_name: "repo".into(),
+            repo_root: "/repo".into(),
+            is_linked_worktree: false,
+        });
+        ws.cached_git_diff = Some(diff(&["a.rs", "b.rs"]));
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+
+        let outer = Rect::new(0, 0, 40, 20);
+        let anchors = diff_overlay_anchors(&app, outer).expect("a diff to anchor against");
+        // a.rs is 4 terminal rows (2-row header, 1 hunk line, 1 content
+        // line), so the rail between the two files lands right after it.
+        assert_eq!(anchors.rail_rows, vec![outer.y + 1 + 4]);
+        assert_eq!(anchors.file_rows.len(), 2);
+        assert_eq!(anchors.file_rows[0], ("a.rs".to_string(), outer.y + 1));
+        assert_eq!(anchors.file_rows[1], ("b.rs".to_string(), outer.y + 1 + 5));
+    }
 }

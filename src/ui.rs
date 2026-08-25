@@ -7,6 +7,7 @@ use ratatui::{
 
 pub(crate) mod color;
 mod dialogs;
+pub(crate) mod diff_overlay;
 pub(crate) mod diff_pane;
 mod keybind_help;
 mod machine_corner;
