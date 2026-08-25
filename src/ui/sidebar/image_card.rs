@@ -969,6 +969,13 @@ struct CardContent {
     /// a crew is a fact about a row's *neighbours* — the entries the tree walk
     /// put under it — and `content_for` is handed one entry. See [`crew_for`].
     crew: Vec<crew::CrewMember>,
+    /// The mockup's literal `.bars`/`.bar` sparkline — up to
+    /// [`crate::quality_streak::BARS_MAX`] recent-activity heights, oldest
+    /// first, or `None` on a card no publisher has sent a
+    /// [`crate::quality_streak::BARS_TOKEN`] for. A worker never carries one:
+    /// the token is read off a Space's own metadata, the same scope
+    /// [`CardContent::register`]'s orbit line is.
+    bars: Option<Vec<u8>>,
 }
 
 impl CardContent {
@@ -979,6 +986,10 @@ impl CardContent {
         // anything else about the row changing — so a signature blind to it
         // would carry a stale `N revs` forward forever.
         self.register.hash(hasher);
+        // Read fresh every render like the streak it sits beside — see
+        // `BARS_TOKEN` — so a card carried forward on a stale signature would
+        // freeze the sparkline exactly the way an unhashed orbit line would.
+        self.bars.hash(hasher);
         self.state_label.hash(hasher);
         (self.state as u8).hash(hasher);
         self.stage.hash(hasher);
@@ -3041,6 +3052,21 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // competing with the two lines that carry numbers.
     let state_ink = measured::FILL_MID.mix(caption_ink, STATE_INK_MIX);
     let caption_top = block_top + title_block + caption_metrics.line_height * TIDBIT_GAP;
+    // The mockup's `.bars` sparkline sits on the tidbit line's own row, taken
+    // out of that line's right edge rather than reserving a row of its own:
+    // `content_floor_px`/`content_block_px` size every card in the tree by
+    // the same two numbers regardless of which row is on screen ("uniform
+    // height... whatever its depth or rank"), so a row of bars only some
+    // cards carry cannot grow the block those functions hand back without
+    // either un-uniforming every card's height or growing all of them for a
+    // sparkline most do not draw. Sharing line 0's row keeps that invariant
+    // intact.
+    let bars_reserve = content
+        .bars
+        .as_deref()
+        .filter(|bars| !bars.is_empty())
+        .map(|bars| sparkline_span_px(bars.len(), caption_metrics.line_height))
+        .unwrap_or(0.0);
     for (index, caption) in captions.iter().enumerate() {
         let Some((text, tone)) = caption else {
             continue;
@@ -3051,9 +3077,203 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             CaptionTone::Register => (caption_ink, (*text).to_string()),
             CaptionTone::State => (state_ink, text.to_lowercase()),
         };
+        let row_right = if index == 0 {
+            (text_right - bars_reserve).max(text_left)
+        } else {
+            text_right
+        };
         draw_text(
-            sheet, font, &text, caption_px, text_left, baseline, ink, text_left, text_right,
+            sheet, font, &text, caption_px, text_left, baseline, ink, text_left, row_right, opacity,
+        );
+    }
+    if let Some(bars) = content.bars.as_deref().filter(|bars| !bars.is_empty()) {
+        draw_sparkline(
+            sheet,
+            bars,
+            text_right,
+            caption_top,
+            caption_metrics.line_height,
+            caption_ink,
             opacity,
+        );
+    }
+}
+
+/// A bar's width as a share of the row height it stands in, and the gap
+/// between bars as a share of the same — chosen so the strip reads as
+/// distinct columns rather than one solid block at the caption sizes this
+/// draws at (11–14 px), the same way the mockup's `3px` bars in a `12px` row
+/// hold a visible gap.
+const SPARKLINE_BAR_WIDTH_MUL: f32 = 0.34;
+const SPARKLINE_BAR_GAP_MUL: f32 = 0.2;
+
+/// Total pixel width `count` bars take up in [`draw_sparkline`], including
+/// the gaps between them — what [`draw_card`] reserves out of the tidbit
+/// line before drawing its text, so the strip and the text it took the room
+/// from can never overlap.
+fn sparkline_span_px(count: usize, row_height: f32) -> f32 {
+    let (bar_w, gap) = sparkline_bar_geometry(row_height);
+    count as f32 * bar_w + count.saturating_sub(1) as f32 * gap
+}
+
+fn sparkline_bar_geometry(row_height: f32) -> (f32, f32) {
+    (
+        (row_height * SPARKLINE_BAR_WIDTH_MUL).max(1.0),
+        (row_height * SPARKLINE_BAR_GAP_MUL).max(1.0),
+    )
+}
+
+/// The mockup's literal `.bars`/`.bar` sparkline — mechanic 5 of the "Rio
+/// Window, Assembled" gap analysis, drawn per the captain's decision to use
+/// this encoding rather than [`draw_discharge`]'s groove metaphor. `bars` are
+/// `0..=100`, oldest first, right-aligned so the newest sample sits flush
+/// against the card's own text column edge exactly as the mockup's
+/// `flex-end`-anchored row does.
+fn draw_sparkline(
+    sheet: &mut Canvas,
+    bars: &[u8],
+    right: f32,
+    top: f32,
+    row_height: f32,
+    ink: Rgb,
+    opacity: f32,
+) {
+    let (bar_w, gap) = sparkline_bar_geometry(row_height);
+    let mut x = right - sparkline_span_px(bars.len(), row_height);
+    for &value in bars {
+        let height = (row_height * (f32::from(value) / 100.0)).max(1.0);
+        fill_rect(
+            sheet,
+            &RoundRect {
+                x,
+                y: top + (row_height - height),
+                w: bar_w,
+                h: height,
+                r: (bar_w * 0.3).min(1.5),
+            },
+            ink,
+            opacity,
+        );
+        x += bar_w + gap;
+    }
+}
+
+/// Fills `rect` at `opacity`, antialiased the same way every other shape on a
+/// card is — coverage from [`RoundRect::distance`], not supersampling. See
+/// `canvas`'s module doc for why that is the one distance every shape here
+/// reads.
+fn fill_rect(sheet: &mut Canvas, rect: &RoundRect, ink: Rgb, opacity: f32) {
+    let x0 = rect.x.floor().max(0.0) as u32;
+    let y0 = rect.y.floor().max(0.0) as u32;
+    let x1 = (rect.x + rect.w).ceil().max(0.0) as u32;
+    let y1 = (rect.y + rect.h).ceil().max(0.0) as u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let coverage = coverage(rect.distance(x as f32 + 0.5, y as f32 + 0.5));
+            if coverage > 0.0 {
+                sheet.blend(x, y, ink, coverage * opacity);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_cards_own_sparkline {
+    use super::*;
+
+    /// A tall bar and a short one paint different amounts of ink at the same
+    /// x — the whole reason this is a bar chart and not a fixed-height tick
+    /// mark. Checked at the bar's own centre column, not by scanning every
+    /// pixel: `fill_rect`'s antialiasing is already covered by
+    /// `canvas::tests`, and this test's job is only that `draw_sparkline`
+    /// actually varies height with the published value.
+    #[test]
+    fn a_tall_bar_paints_more_of_its_column_than_a_short_one() {
+        let row_height = 12.0;
+        let mut sheet = Canvas::new(64, 32);
+        draw_sparkline(
+            &mut sheet,
+            &[10, 90],
+            64.0,
+            0.0,
+            row_height,
+            Rgb(255, 255, 255),
+            1.0,
+        );
+        let (bar_w, gap) = sparkline_bar_geometry(row_height);
+        let start_x = 64.0 - sparkline_span_px(2, row_height);
+        let opaque_rows_in_column = |cx: u32| {
+            (0..32)
+                .filter(|&y| {
+                    let i = ((y as usize) * 64 + cx as usize) * 4;
+                    sheet.rgba8()[i + 3] > 0
+                })
+                .count()
+        };
+        let short_x = (start_x + bar_w / 2.0) as u32;
+        let tall_x = (start_x + bar_w + gap + bar_w / 2.0) as u32;
+        assert!(
+            opaque_rows_in_column(tall_x) > opaque_rows_in_column(short_x),
+            "the 90-value bar must stand taller than the 10-value bar"
+        );
+    }
+
+    /// A card with no [`CardContent::bars`] reserves nothing and draws
+    /// nothing — the whole point of sharing the tidbit line's row rather
+    /// than growing it: every card that does not publish [`BARS_TOKEN`]
+    /// (crate::quality_streak::BARS_TOKEN) must be pixel-identical to a
+    /// build of this feature that never existed.
+    #[test]
+    fn no_bars_reserves_no_room() {
+        assert_eq!(sparkline_span_px(0, 12.0), 0.0);
+    }
+
+    /// [`CardContent::hash_into`] must move when `bars` does, the same
+    /// invariant every other field on the card already holds — a card
+    /// carried forward on a signature blind to this would freeze the
+    /// sparkline the first time it changed.
+    #[test]
+    fn a_changed_sparkline_changes_the_cards_hash() {
+        use std::hash::Hasher;
+        let app = crate::app::state::AppState::test_new();
+        let mut hues = [0.0; 5];
+        for (slot, stage) in hues.iter_mut().zip(LifecycleStage::ALL) {
+            *slot = stage.hue(&app.sidebar_palette, &app.host_terminal_theme);
+        }
+        let make = |bars: Vec<u8>| CardContent {
+            title: "herdr".into(),
+            tidbit: None,
+            register: None,
+            state_label: "idle".into(),
+            state: AgentState::Idle,
+            stage: LifecycleStage::Running,
+            severity: Severity::Clear,
+            hues: StageHues(hues),
+            ground: Rgb(9, 17, 28),
+            split_channels: true,
+            seen: true,
+            depth: 0,
+            lifted: false,
+            focused_space: false,
+            mark: None,
+            residue: 0,
+            controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
+            breath: 0.0,
+            spider: None,
+            wash: None,
+            crew: Vec::new(),
+            bars: Some(bars),
+        };
+        let hash_of = |content: &CardContent| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            content.hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(
+            hash_of(&make(vec![40, 70, 35, 95, 60])),
+            hash_of(&make(vec![41, 70, 35, 95, 60]))
         );
     }
 }
@@ -3620,6 +3840,9 @@ fn content_for(
                 // has the whole entry list and can see what the tree walk hung
                 // under this row.
                 crew: Vec::new(),
+                bars: tokens
+                    .get(crate::quality_streak::BARS_TOKEN)
+                    .and_then(|value| crate::quality_streak::parse_bars(value)),
             })
         }
         super::WorkspaceListEntry::Agent { entry_idx, .. } => {
@@ -3685,6 +3908,10 @@ fn content_for(
                 // A worker is not a mate: nothing is dispatched *under* it, so
                 // it carries no list of its own and never grows one.
                 crew: Vec::new(),
+                // A worker is not a checkout either, so it has no Space-scoped
+                // metadata tokens of its own to read `BARS_TOKEN` off — same
+                // reasoning as `register` above.
+                bars: None,
             })
         }
     }
@@ -4267,6 +4494,13 @@ pub(crate) struct CardContentWire {
     /// new field here safe: `crate::protocol::wire::PROTOCOL_VERSION` is.
     #[serde(default)]
     crew: Vec<crew::CrewMember>,
+    /// The mockup's literal sparkline — see [`CardContent::bars`]. Carried
+    /// like every other resolved fleet fact on this wire, for the same reason
+    /// `register` is: a client rasterising its own cards has no fleet
+    /// metadata to read `BARS_TOKEN` off. New field — see `focused_space`
+    /// above for why `#[serde(default)]` alone would not make it safe.
+    #[serde(default)]
+    bars: Option<Vec<u8>>,
 }
 
 impl From<&CardContent> for CardContentWire {
@@ -4294,6 +4528,7 @@ impl From<&CardContent> for CardContentWire {
             breath: content.breath,
             spider: content.spider,
             crew: content.crew.clone(),
+            bars: content.bars.clone(),
         }
     }
 }
@@ -4324,6 +4559,7 @@ impl From<CardContentWire> for CardContent {
             spider: wire.spider,
             wash: None,
             crew: wire.crew,
+            bars: wire.bars,
         }
     }
 }
@@ -7292,6 +7528,7 @@ mod tests {
                 breath: 0.0,
                 wash: None,
                 crew: Vec::new(),
+                bars: None,
             }
         }
         let paints_near = |badge: Option<SpaceBadgeMark>, target: Rgb| {
@@ -7362,6 +7599,7 @@ mod tests {
                 breath: 0.0,
                 wash: None,
                 crew: Vec::new(),
+                bars: None,
             }
         }
 
@@ -7449,6 +7687,7 @@ mod tests {
                 breath: 0.0,
                 wash: None,
                 crew: Vec::new(),
+                bars: None,
             }
         }
 
@@ -10181,6 +10420,7 @@ mod a_card_is_its_own_shape {
                 breath: 0.0,
                 wash: None,
                 crew: Vec::new(),
+                bars: None,
             }
         }
 
@@ -10293,6 +10533,7 @@ mod a_card_is_its_own_shape {
             breath: 0.0,
             wash: None,
             crew: Vec::new(),
+            bars: None,
         };
 
         // Nothing at all through beats one and two: the light is still
@@ -10305,6 +10546,7 @@ mod a_card_is_its_own_shape {
             register: base.register.clone(),
             state_label: base.state_label.clone(),
             crew: base.crew.clone(),
+            bars: base.bars.clone(),
             ..base
         };
         draw_card(
@@ -10332,6 +10574,7 @@ mod a_card_is_its_own_shape {
             register: base.register.clone(),
             state_label: base.state_label.clone(),
             crew: base.crew.clone(),
+            bars: base.bars.clone(),
             ..base
         };
         draw_card(
@@ -10443,6 +10686,7 @@ mod a_card_is_its_own_shape {
             breath: 0.0,
             wash: None,
             crew: Vec::new(),
+            bars: None,
         };
         let quiet = PlacedCard {
             rect,
@@ -13795,6 +14039,7 @@ mod cards_breathe_and_wash {
             breath: 0.0,
             wash: None,
             crew: Vec::new(),
+            bars: None,
         }
     }
 
@@ -14604,6 +14849,7 @@ mod a_card_draws_the_workers_it_carries {
             spider: None,
             wash: None,
             crew,
+            bars: None,
         }
     }
 

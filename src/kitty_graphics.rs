@@ -209,6 +209,13 @@ enum HostSurfaceId {
     /// register's own two-second cadence. Folding one into the other would make every machine
     /// sample repaint the whole screen.
     MachineCorner,
+    /// The Changes zone's one-shot pixel overlay — the traveling diff-rail
+    /// light and arriving-file pop-in (mechanics 3/4 of the "Rio Window,
+    /// Assembled" mockup). Its own identity, sibling to `MachineCorner` and
+    /// `SidebarParticleField`: Herdr draws it itself, over the diff pane's
+    /// own text, and it is present only while an animation is actually
+    /// playing rather than every frame.
+    DiffOverlay,
     /// A pane's own character grid, rasterised by Herdr and composited back
     /// over the pane at `z = 0` (`src/grid_raster/`).
     ///
@@ -239,6 +246,7 @@ impl HostSurfaceId {
             Self::BackgroundScene => "surface.background.scene".hash(hasher),
             Self::BackgroundEffects => "surface.background.effects".hash(hasher),
             Self::MachineCorner => "surface.machine.corner".hash(hasher),
+            Self::DiffOverlay => "surface.diff.overlay".hash(hasher),
             Self::PaneText(pane_id) => {
                 "surface.pane.text".hash(hasher);
                 pane_id.raw().hash(hasher);
@@ -1599,6 +1607,10 @@ fn surface_layer_placement_targets(
                 app.machine_corner_rect(),
                 layer,
             )
+        }))
+        .chain(app.diff_overlay_layer.as_ref().and_then(|layer| {
+            crate::ui::diff_pane::diff_inner_rect(app.view.diff_area)
+                .map(|rect| (HostSurfaceId::DiffOverlay, rect, layer))
         }))
         // The TUI's own sidebar cards join here rather than through the API
         // map, so they travel the same clipping, dedup, signature and

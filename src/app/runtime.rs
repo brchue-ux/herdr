@@ -493,6 +493,7 @@ impl App {
         changed |= self.observe_background_scene(now);
         // The app's own loop is by definition its viewer, same as `advance_animations` above.
         changed |= self.observe_background_effects(now, true);
+        changed |= self.observe_diff_overlay(now);
 
         if self
             .selection_autoscroll_deadline
@@ -1309,6 +1310,87 @@ impl App {
         // demand. Returning `true` here would arm a repaint every two seconds forever, on a
         // terminal where nothing had changed — which is what this returns `false` for.
         self.observe_machine_corner(now)
+    }
+
+    /// (Re-)draws the Changes zone's one-shot pixel overlay — the traveling
+    /// diff-rail light and the arriving-file pop-in (mechanics 3/4 of the
+    /// "Rio Window, Assembled" mockup). See `crate::ui::diff_overlay`.
+    ///
+    /// Regenerated on every tick while
+    /// [`crate::ui::diff_overlay::DiffOverlayState::is_animating`] says
+    /// something is still playing, and cleared the instant nothing is —
+    /// unlike `observe_machine_corner`'s always-present readout, an idle
+    /// overlay costs nothing to redraw and holds no stale picture on screen,
+    /// which is the whole of how this stays off the frame-budget concern
+    /// `report.md`'s "Anything else" section raises for new animated chrome.
+    pub(crate) fn observe_diff_overlay(&mut self, now: Instant) -> bool {
+        let showing = self.state.view.layout == crate::app::state::ViewLayout::Desktop
+            && !self.state.view.diff_area.is_empty();
+        let ws = self
+            .state
+            .active
+            .and_then(|idx| self.state.workspaces.get(idx));
+        let (workspace_id, diff) = match ws {
+            Some(ws) if showing && ws.git_space().is_some() => {
+                (ws.id.clone(), ws.git_diff().cloned())
+            }
+            _ => (String::new(), None),
+        };
+        let animating = crate::ui::diff_overlay::observe(
+            &mut self.state.diff_overlay,
+            &workspace_id,
+            diff.as_ref(),
+            now,
+        );
+        if !animating {
+            return self.state.diff_overlay_layer.take().is_some();
+        }
+
+        let outer = self.state.view.diff_area;
+        let cell = self.state.shared_raster_cell_size();
+        let drawn = crate::ui::diff_pane::diff_inner_rect(outer)
+            .filter(|_| cell.is_known())
+            .zip(crate::ui::diff_pane::diff_overlay_anchors(
+                &self.state,
+                outer,
+            ))
+            .and_then(|(area, anchors)| {
+                let ink = crate::ui::color::color_to_rgb(self.state.palette.accent)
+                    .unwrap_or((90, 209, 255));
+                crate::ui::diff_overlay::frame(
+                    &self.state.diff_overlay,
+                    &anchors,
+                    area,
+                    cell,
+                    ink,
+                    now,
+                )
+            })
+            .and_then(|(width, height, rgba)| {
+                let png = crate::solar_system::encode_rgba_png(width, height, &rgba);
+                (!png.is_empty()).then_some((width, height, png))
+            });
+
+        let Some((width, height, png)) = drawn else {
+            return self.state.diff_overlay_layer.take().is_some();
+        };
+        self.state.diff_overlay_layer = Some(crate::app::state::GraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            width,
+            height,
+            png,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+                // Over the text, the same as a sidebar card: the rail row is
+                // blank and the arrival glow is meant to tint the file
+                // header's own text, not hide behind it.
+                z: 0,
+            },
+        ));
+        true
     }
 
     /// Record whatever herdr is currently saying into its own status stream.
