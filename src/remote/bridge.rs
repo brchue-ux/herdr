@@ -31,6 +31,29 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
+/// How the bridge hands the *remote session's* `[experimental] kitty_graphics`
+/// down to the client process it spawns.
+///
+/// A split `herdr --remote` setup has two configs, and the pixel-surface
+/// pipeline needs the flag in both: the server's decides whether the session
+/// paints Kitty graphics surfaces at all, and the client's decides whether this
+/// process asks its terminal the capability question, claims delegated
+/// rasterisation in its Hello, and emits graphics escapes. With the flag set
+/// only on the server — the natural place, since that is where the sidebar and
+/// every other feature decision lives — the client never sends the probe, so
+/// `kitty_graphics_capability_confirmed` never becomes true, and the session
+/// silently falls back to character cells with nothing anywhere reporting why.
+///
+/// The bridge already knows the remote host's answer: it reads
+/// `herdr status server --json` before launching the client (see
+/// [`run_remote`]). Handing it down here is the same bargain
+/// `HERDR_RENDER_ENCODING` already makes in [`run_client_process`], and it lands
+/// *before* the Hello, which the delegated-rasterisation claim has to ride.
+///
+/// Only ever widens the gate — see `crate::client::session_kitty_graphics_requested`
+/// for why that is safe.
+pub(crate) const SESSION_KITTY_GRAPHICS_ENV_VAR: &str = "HERDR_SESSION_KITTY_GRAPHICS";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteKeybindings {
     Local,
@@ -175,7 +198,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
-    ensure_remote_server_ready(
+    let session_kitty_graphics = ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
         prepared_remote.installed_or_replaced,
@@ -191,7 +214,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote_ssh.options(),
     )?;
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        session_kitty_graphics,
+    )
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -1069,6 +1097,18 @@ enum RemoteServerStatus {
     NotRunning,
 }
 
+/// A remote `herdr status server --json` read.
+///
+/// `kitty_graphics` sits beside the server state rather than inside
+/// [`RemoteServerStatus::Running`] because the remote host answers it from its
+/// own config, so it is known whether or not a server is up — and the first
+/// `herdr --remote` of a session is exactly the case where one is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteStatus {
+    server: RemoteServerStatus,
+    kitty_graphics: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteServerRestartReason {
     ProtocolMismatch,
@@ -1084,22 +1124,29 @@ enum RemoteInstallRunningServerPlan {
     StopRequired(RemoteServerRestartReason),
 }
 
+/// Returns the remote host's `[experimental] kitty_graphics`, which the caller
+/// hands to the client process (see [`SESSION_KITTY_GRAPHICS_ENV_VAR`]).
+///
+/// Read here rather than in [`run_remote`] so it costs no extra ssh round trip:
+/// this function already reads `herdr status server --json`, and the answer is
+/// config-derived, so restarting the server below cannot change it.
 fn ensure_remote_server_ready(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let status = remote_server_status(ssh, remote_herdr)?;
+    let kitty_graphics = status.kitty_graphics;
     let RemoteServerStatus::Running {
         version,
         protocol,
         live_handoff,
         detached_server_daemon,
-    } = status
+    } = status.server
     else {
-        return Ok(());
+        return Ok(kitty_graphics);
     };
 
     let Some(reason) = remote_server_restart_reason(
@@ -1108,12 +1155,12 @@ fn ensure_remote_server_ready(
         detached_server_daemon,
         remote_binary_changed,
     ) else {
-        return Ok(());
+        return Ok(kitty_graphics);
     };
 
     if live_handoff_enabled && live_handoff {
         match live_handoff_remote_server(ssh, remote_herdr) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(kitty_graphics),
             Err(err) => {
                 eprintln!("remote live handoff failed: {err}");
                 eprintln!("falling back to remote server restart.");
@@ -1123,13 +1170,13 @@ fn ensure_remote_server_ready(
 
     if stop_after_install_approved {
         stop_remote_server(ssh, remote_herdr)?;
-        return Ok(());
+        return Ok(kitty_graphics);
     }
 
     if confirm_remote_server_stop(ssh.target(), version.as_deref(), protocol, reason)? {
         stop_remote_server(ssh, remote_herdr)?;
     }
-    Ok(())
+    Ok(kitty_graphics)
 }
 
 fn remote_server_restart_reason(
@@ -1190,7 +1237,7 @@ fn confirm_remote_install_with_running_server(
         protocol,
         live_handoff,
         detached_server_daemon,
-    } = &status
+    } = &status.server
     else {
         return Ok(false);
     };
@@ -1288,10 +1335,7 @@ fn remote_install_running_server_plan(
     RemoteInstallRunningServerPlan::StopRequired(reason)
 }
 
-fn remote_server_status(
-    ssh: &RemoteSsh,
-    remote_herdr: &RemoteHerdr,
-) -> io::Result<RemoteServerStatus> {
+fn remote_server_status(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<RemoteStatus> {
     let command = format!("{} status server --json", remote_herdr.shell_path);
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
@@ -1313,6 +1357,10 @@ struct RemoteServerStatusJson {
     version: Option<String>,
     protocol: Option<u32>,
     capabilities: Option<RemoteServerCapabilitiesJson>,
+    /// Absent on a remote herdr older than this field; the bridge then behaves
+    /// exactly as it did before, leaving the client's own config to decide.
+    #[serde(default)]
+    kitty_graphics: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1326,27 +1374,34 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
     serde_json::from_str(status).ok()
 }
 
-fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatus> {
+fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteStatus> {
     let parsed: RemoteServerStatusJson = serde_json::from_str(status).map_err(|err| {
         io::Error::other(format!(
             "could not parse remote server status JSON from `{status}`: {err}"
         ))
     })?;
+    let kitty_graphics = parsed.kitty_graphics;
     if !parsed.running {
-        return Ok(RemoteServerStatus::NotRunning);
+        return Ok(RemoteStatus {
+            server: RemoteServerStatus::NotRunning,
+            kitty_graphics,
+        });
     }
 
     let capabilities = parsed.capabilities;
 
-    Ok(RemoteServerStatus::Running {
-        version: parsed.version,
-        protocol: parsed.protocol,
-        live_handoff: capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.live_handoff),
-        detached_server_daemon: capabilities
-            .as_ref()
-            .is_some_and(|capabilities| capabilities.detached_server_daemon),
+    Ok(RemoteStatus {
+        kitty_graphics,
+        server: RemoteServerStatus::Running {
+            version: parsed.version,
+            protocol: parsed.protocol,
+            live_handoff: capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.live_handoff),
+            detached_server_daemon: capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.detached_server_daemon),
+        },
     })
 }
 
@@ -1462,7 +1517,7 @@ fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result
 fn wait_for_remote_server_shutdown(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(ssh, remote_herdr)? == RemoteServerStatus::NotRunning {
+        if remote_server_status(ssh, remote_herdr)?.server == RemoteServerStatus::NotRunning {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -2175,6 +2230,7 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    session_kitty_graphics: bool,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let status = Command::new(exe)
@@ -2186,6 +2242,10 @@ fn run_client_process(
         .env("HERDR_RENDER_ENCODING", "terminal-ansi")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
+        .env(
+            SESSION_KITTY_GRAPHICS_ENV_VAR,
+            session_kitty_graphics_env_value(session_kitty_graphics),
+        )
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -2199,6 +2259,19 @@ fn run_client_process(
             io::ErrorKind::Interrupted,
             format!("remote client exited with {status}"),
         ))
+    }
+}
+
+/// The literal [`SESSION_KITTY_GRAPHICS_ENV_VAR`] value for a session answer.
+///
+/// Always set, never merely omitted for `false`: the client process inherits
+/// this one's environment, so a stale value from an outer herdr would otherwise
+/// survive into it.
+fn session_kitty_graphics_env_value(session_kitty_graphics: bool) -> &'static str {
+    if session_kitty_graphics {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -3021,7 +3094,8 @@ mod tests {
             parse_remote_server_status_json(
                 r#"{"status":"running","running":true,"version":"0.6.0","protocol":8,"capabilities":{"live_handoff":true,"detached_server_daemon":true}}"#
             )
-            .unwrap(),
+            .unwrap()
+            .server,
             RemoteServerStatus::Running {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
@@ -3037,7 +3111,8 @@ mod tests {
             parse_remote_server_status_json(
                 r#"{"status":"running","running":true,"version":"0.6.0","protocol":8}"#
             )
-            .unwrap(),
+            .unwrap()
+            .server,
             RemoteServerStatus::Running {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
@@ -3053,8 +3128,76 @@ mod tests {
             parse_remote_server_status_json(
                 r#"{"status":"not_running","running":false,"version":null,"protocol":null}"#
             )
-            .unwrap(),
+            .unwrap()
+            .server,
             RemoteServerStatus::NotRunning
+        );
+    }
+
+    /// The bridge writes this variable and the client reads it, from two
+    /// different modules — so the encoding has to be asserted across the seam,
+    /// not on either side alone.
+    #[test]
+    fn the_client_reads_back_exactly_what_the_bridge_writes() {
+        for requested in [true, false] {
+            let _guard =
+                SessionKittyGraphicsEnvGuard::set(session_kitty_graphics_env_value(requested));
+            assert_eq!(
+                crate::client::session_kitty_graphics_requested(),
+                requested,
+                "bridge wrote {:?}",
+                session_kitty_graphics_env_value(requested)
+            );
+        }
+    }
+
+    struct SessionKittyGraphicsEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SessionKittyGraphicsEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os(SESSION_KITTY_GRAPHICS_ENV_VAR);
+            std::env::set_var(SESSION_KITTY_GRAPHICS_ENV_VAR, value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for SessionKittyGraphicsEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(SESSION_KITTY_GRAPHICS_ENV_VAR, value),
+                None => std::env::remove_var(SESSION_KITTY_GRAPHICS_ENV_VAR),
+            }
+        }
+    }
+
+    /// The remote host answers `kitty_graphics` from its own config, so a
+    /// stopped server still carries it — which is the case `herdr --remote`
+    /// hits first, before the bridge has started one.
+    #[test]
+    fn parse_remote_server_status_json_reads_session_kitty_graphics_either_way() {
+        assert!(
+            parse_remote_server_status_json(
+                r#"{"status":"running","running":true,"version":"0.8.0","protocol":24,"capabilities":{"live_handoff":true,"detached_server_daemon":true},"kitty_graphics":true}"#
+            )
+            .unwrap()
+            .kitty_graphics
+        );
+        assert!(
+            parse_remote_server_status_json(
+                r#"{"status":"not_running","running":false,"version":null,"protocol":null,"kitty_graphics":true}"#
+            )
+            .unwrap()
+            .kitty_graphics
+        );
+        // A remote herdr older than the field behaves exactly as before.
+        assert!(
+            !parse_remote_server_status_json(
+                r#"{"status":"running","running":true,"version":"0.6.0","protocol":8}"#
+            )
+            .unwrap()
+            .kitty_graphics
         );
     }
 

@@ -821,6 +821,44 @@ fn is_remote_client_process() -> bool {
     std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
 }
 
+/// Whether the session this client is attaching to has `[experimental]
+/// kitty_graphics` on, as `herdr --remote`'s bridge read it from the remote
+/// host (see `crate::remote::bridge::SESSION_KITTY_GRAPHICS_ENV_VAR`).
+///
+/// This only ever *widens* the local config's gate, and widening it cannot
+/// paint pixels on a terminal that cannot draw them: everything downstream
+/// still waits on `kitty_graphics_capability_confirmed`, which only a terminal
+/// that actually answers the capability probe can set. A client told to ask a
+/// terminal that does not implement the protocol gets no reply and stays on
+/// character cells — exactly where it is today, minus the case where herdr
+/// never asked at all.
+pub(crate) fn session_kitty_graphics_requested() -> bool {
+    matches!(
+        std::env::var(crate::remote::SESSION_KITTY_GRAPHICS_ENV_VAR)
+            .ok()
+            .as_deref(),
+        Some("1" | "true")
+    )
+}
+
+/// Whether this client process draws Kitty graphics for its terminal.
+///
+/// Either config may turn it on. The client's own config is the local
+/// statement ("this terminal can take pixels"); the session's, handed down by
+/// `herdr --remote`, is the session-wide one ("this session paints them"). Both
+/// are the same human asking for the same thing, and requiring the flag in both
+/// places is what left a split setup silently on character cells.
+///
+/// A direct terminal attach forwards stdin straight to the attached pty and
+/// must never inject probes or graphics into it, so it overrides both.
+fn client_kitty_graphics_enabled(
+    config_kitty_graphics: bool,
+    session_kitty_graphics: bool,
+    direct_attach_requested: bool,
+) -> bool {
+    (config_kitty_graphics || session_kitty_graphics) && !direct_attach_requested
+}
+
 /// Windows remote-bridge clients rasterise sidebar cards themselves from
 /// `ServerMessage::CardScene` rather than receiving server-embedded card
 /// pixels, since the rest of the TUI already rides the unchanged
@@ -1417,8 +1455,12 @@ fn run_client_with_mode(
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    let kitty_graphics_enabled =
-        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+    let session_kitty_graphics = session_kitty_graphics_requested();
+    let kitty_graphics_enabled = client_kitty_graphics_enabled(
+        loaded_config.config.experimental.kitty_graphics,
+        session_kitty_graphics,
+        direct_attach_requested,
+    );
     let card_font_override = {
         let trimmed = loaded_config.config.experimental.sidebar_card_font.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -1437,6 +1479,19 @@ fn run_client_with_mode(
     let socket_path = client_socket_path();
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
+    // The one fact that decides whether this client ever asks its terminal the
+    // Kitty graphics capability question — and so whether the session can paint
+    // pixel surfaces at all. Previously silent, which is why a split
+    // server/client setup carrying the flag only on the server took a
+    // multi-round investigation to explain: the client simply never sent the
+    // probe, and neither side said so.
+    info!(
+        kitty_graphics_enabled,
+        config_kitty_graphics = loaded_config.config.experimental.kitty_graphics,
+        session_kitty_graphics,
+        direct_attach_requested,
+        "client kitty graphics gate resolved"
+    );
 
     // Try to connect to the server.
     let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
@@ -3164,6 +3219,94 @@ mod tests {
         fn drop(&mut self) {
             restore_env_var(self.key, self.previous.clone());
         }
+    }
+
+    /// The regression this exists for: a split `herdr --remote` server/client
+    /// pair with `[experimental] kitty_graphics` set only on the *server*. The
+    /// client's own config said no, so it never asked its terminal the Kitty
+    /// graphics capability question, `kitty_graphics_capability_confirmed`
+    /// never became true, and the session drew character cells forever with
+    /// `kitty_graphics = true` sitting in the config the human had edited.
+    #[test]
+    fn a_session_may_turn_kitty_graphics_on_for_a_client_whose_own_config_does_not() {
+        assert!(client_kitty_graphics_enabled(false, true, false));
+        assert!(client_kitty_graphics_enabled(true, false, false));
+        assert!(client_kitty_graphics_enabled(true, true, false));
+        assert!(!client_kitty_graphics_enabled(false, false, false));
+    }
+
+    /// Direct terminal attach forwards stdin to the attached pty verbatim, so
+    /// neither config may put a capability probe or a graphics escape into it.
+    #[test]
+    fn direct_attach_overrides_both_kitty_graphics_switches() {
+        assert!(!client_kitty_graphics_enabled(true, true, true));
+        assert!(!client_kitty_graphics_enabled(false, true, true));
+        assert!(!client_kitty_graphics_enabled(true, false, true));
+    }
+
+    /// A client that draws graphics must also be allowed to claim it will
+    /// rasterise the surfaces the server delegates to it — otherwise the
+    /// session-supplied switch would arm the probe and still leave the Windows
+    /// `--remote` card, tray and background paths standing down.
+    #[test]
+    fn a_session_supplied_switch_also_lets_the_client_claim_delegated_surfaces() {
+        assert!(may_claim_client_rasterized_surfaces(
+            client_kitty_graphics_enabled(false, true, false)
+        ));
+    }
+
+    /// The captain's exact shape: a Windows `herdr --remote` client. Prefixed
+    /// `windows_` so `scripts/windows_check.ps1` runs it on a real Windows
+    /// runner — the platform half of this gate cannot be exercised anywhere
+    /// else, and this is the claim the whole pixel-card pipeline rests on.
+    ///
+    /// Two independent things have to be true for the GPU bloom pass to run on
+    /// that machine:
+    ///
+    /// 1. the process rasterises cards at all, which is what
+    ///    [`crate::gpu::gate`] keys on; and
+    /// 2. its Hello *claims* the delegated card surface, or the server keeps
+    ///    rasterising cards itself and no `ServerMessage::CardScene` is ever
+    ///    sent for the GPU path to work on.
+    ///
+    /// (2) is the one that was false: the claim is gated on this client's own
+    /// `kitty_graphics_enabled`, which a split setup carrying the flag only on
+    /// the server left off. The negative control at the end is that exact
+    /// pre-fix state.
+    #[test]
+    fn windows_remote_client_opens_the_gpu_card_gate_and_claims_the_card_surface() {
+        let _guard = env_lock().lock().unwrap();
+        let _clean =
+            EnvVarsRemovedGuard::new(&["HERDR_GPU_CARD_BLOOM", "HERDR_CLIENT_RASTERIZED_CARDS"]);
+        let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
+
+        assert_eq!(
+            rasterises_cards_locally(),
+            cfg!(windows),
+            "a remote-bridge client rasterises its own cards exactly on Windows"
+        );
+        assert_eq!(
+            crate::gpu::gate(),
+            cfg!(windows),
+            "the GPU card gate follows the same platform answer"
+        );
+
+        // The session-supplied switch (`herdr --remote` handing down the
+        // server's `[experimental] kitty_graphics`) is what lets the Hello
+        // claim the surface the GPU path then draws.
+        let with_session_switch = client_kitty_graphics_enabled(false, true, false);
+        assert!(may_claim_client_rasterized_surfaces(with_session_switch));
+        assert_eq!(
+            wants_client_rasterized_cards() && with_session_switch,
+            cfg!(windows)
+        );
+
+        // Negative control — the state this fixes: neither config says yes, so
+        // the client claims nothing and the server never delegates a card
+        // scene, whatever the GPU gate says.
+        let before_fix = client_kitty_graphics_enabled(false, false, false);
+        assert!(!may_claim_client_rasterized_surfaces(before_fix));
+        assert!(!(wants_client_rasterized_cards() && before_fix));
     }
 
     #[test]

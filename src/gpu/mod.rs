@@ -82,14 +82,23 @@ pub(crate) fn enabled() -> bool {
         return pinned;
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("HERDR_GPU_CARD_BLOOM").ok().as_deref() {
-            Some("1" | "true" | "force") => return true,
-            Some("0" | "false") => return false,
-            _ => {}
-        }
-        cfg!(windows) && crate::client::rasterises_cards_locally()
-    })
+    *ENABLED.get_or_init(gate)
+}
+
+/// [`enabled`] without the process-wide cache in front of it.
+///
+/// Split out so the gate can be *asserted* rather than described: `enabled`
+/// answers once per process and keeps that answer, which is right in production
+/// and useless to a test asking whether a given kind of process opens the gate
+/// at all — it would read whichever answer the first caller in the binary
+/// happened to produce.
+pub(crate) fn gate() -> bool {
+    match std::env::var("HERDR_GPU_CARD_BLOOM").ok().as_deref() {
+        Some("1" | "true" | "force") => return true,
+        Some("0" | "false") => return false,
+        _ => {}
+    }
+    cfg!(windows) && crate::client::rasterises_cards_locally()
 }
 
 /// Whether to send every batch to the GPU regardless of what the cost model
