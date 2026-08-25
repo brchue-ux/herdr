@@ -17,7 +17,7 @@ When a session has no workspaces, Herdr opens one automatically. A workspace is 
 
 ## Use the mouse
 
-Herdr is mouse-native, so start by clicking. Click panes, tabs, workspaces, and agents to focus them. Drag split borders to resize. Drag-select text to copy it to your clipboard; double-click a token to copy it directly. Copying does not require Ctrl+C.
+Herdr is mouse-native, so start by clicking. Click panes, tabs, workspaces, and agents to focus them. Drag split borders to resize. Drag-select text or double-click a token, then press Ctrl+C (or Cmd+C when your host forwards it) to copy it to your clipboard. Set `ui.copy_on_select = true` to copy as soon as you select, without pressing Ctrl+C; it defaults to off because auto-copying every selection can race with other clipboard writers over SSH.
 
 Right-click a pane to paste your clipboard into it, the way right-click pastes in a plain terminal. Herdr's own context menus — splitting panes, creating tabs, workspace and pane actions — are on **modified** right-click: `shift`+right-click on a pane, tab, or workspace opens the menu for it. Any other modifier works too, which matters in terminals that keep `shift`+mouse for their own bypass and never forward it to Herdr; there, use `ctrl`+right-click or `alt`+right-click instead.
 
