@@ -4261,8 +4261,11 @@ fn render_crew_row(
 
     for (index, resolved) in crew.lines.iter().enumerate() {
         let y = card.rect.y.saturating_add(index as u16);
+        // Per line, not per row: a row clipped at the top of the list still has
+        // later lines to draw below the clip, and giving up on the whole row at
+        // the first one out of bounds would drop them.
         if y >= card.rect.y.saturating_add(card.rect.height) || y >= list_bottom || y < list_top {
-            break;
+            continue;
         }
         let trailing = if index == 0 { cmd_ack_width } else { 0 };
         let mut spans = resolved_token_spans(
