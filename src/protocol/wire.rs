@@ -36,9 +36,10 @@ use serde::{Deserialize, Serialize};
 /// `check_client_version` already gives any other incompatible pairing.
 ///
 /// `CardContentWire` has since also gained `crew` — the workers a Space's card
-/// draws inside its own box — `theme`, the card colours the server's own
-/// `[theme.custom]` block authored, and, inside `crew`, each worker's own
-/// `pulse`. All are the same class of positional shape change and need no
+/// draws inside its own box — `cut_above`, whether that box's own block is above
+/// the panel and only its workers are on screen, `theme`, the card colours the
+/// server's own `[theme.custom]` block authored, and, inside `crew`, each
+/// worker's own `pulse`. All are the same class of positional shape change and need no
 /// further bump: 24 has not been published in either channel (both
 /// `website/latest.json` and `website/preview.json` still declare 19), so every
 /// pairing that could see any of those fields is a pairing already separated by

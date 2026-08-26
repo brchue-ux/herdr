@@ -530,9 +530,12 @@ impl WorkspaceListEntry {
     /// own box ([`crew_folds_into_its_space`]), which is the captain's rule and
     /// is available to it only as a worker.
     ///
-    /// The rank still reaches the screen on its own where such a worker stands
-    /// outside a box — a panel scrolled past its mate — and it is what
-    /// [`card_frame_for`] measures the resulting card from.
+    /// The rank still reaches the screen, as the ladder every tree column is
+    /// stepped by — [`rank_width_inset`], of which a worker's is the deepest
+    /// rung. Not as a box of its own: the captain settled that a worker stays in
+    /// its mate's card, *"not escape it because of scrolling"*, so even a panel
+    /// scrolled past that mate draws the *mate's* border around it
+    /// ([`cut_crew_box_head`]) rather than one measured from this.
     ///
     /// A mate nested under another mate is the mirror of it. A Space is what a
     /// mate *is*, so a second mate that has itself dispatched a second mate
@@ -600,9 +603,16 @@ fn crew_folds_into_its_space(fold_width: u16) -> bool {
 /// Whether the row at `entry_idx` is drawn inside another card's box rather
 /// than in one of its own, for a panel occupying `area`.
 ///
-/// The same two conditions [`compute_workspace_list_areas`] hands a row no
-/// `card_frame` under, asked from outside the layout: the panel is drawing
-/// boxes at all, and this row's own box is somebody else's.
+/// The same two conditions [`compute_workspace_list_areas`] folds a row under,
+/// asked from outside the layout: the panel is drawing boxes at all, and this
+/// row's own box is somebody else's. Neither reads the scroll — a fold is
+/// ownership and ownership does not move when the panel does. See
+/// [`cut_crew_box_head`], which is the one thing scrolling past a mate changes:
+/// which row *opens* the box, never which rows are in it.
+///
+/// A row that opens a cut box still folds. It is handed a frame, because
+/// somebody has to draw the border, but the row itself is still a worker's line
+/// inside it and draws none of a card's own controls.
 ///
 /// Neither condition reads the renderer, because neither layout does: a pixel
 /// card is a skin over these same cells and folds the same rows
@@ -626,7 +636,7 @@ pub(crate) fn card_row_folds_into_a_mate(
     entry_idx: usize,
 ) -> bool {
     let fold_width = row_fold_width(app, workspace_list_rect(area));
-    crew_folds_into_its_space(fold_width) && drawn_crew_head(app, entries, entry_idx).is_some()
+    crew_folds_into_its_space(fold_width) && crew_head(entries, entry_idx).is_some()
 }
 
 /// Columns a worker's row is stepped in inside the box it is drawn in.
@@ -683,21 +693,35 @@ pub(crate) fn crew_head(entries: &[WorkspaceListEntry], idx: usize) -> Option<us
     None
 }
 
-/// [`crew_head`], but only when that head is a row the panel is actually
-/// drawing.
+/// The head whose box the row at `idx` **opens**, because that head is above
+/// the panel's own first drawn row.
 ///
-/// A card's box is drawn by its *head*, so a worker whose head has scrolled off
-/// the top has nothing to be inside of: it goes back to being a card of its own
-/// rather than becoming an invisible row under a border nobody drew. The panel's
-/// own first drawn row is the whole test — the tree walk emits a head before
-/// everything it owns, so a head at or after the scroll is on screen and one
-/// before it is not.
-pub(crate) fn drawn_crew_head(
+/// The captain settled what happens when a mate's own row scrolls off the top
+/// of the panel: *"they need to stay in the card. not escape it because of
+/// scrolling."* A worker's fold is a fact about ownership and nothing else —
+/// [`crew_head`] — so it does not change when the panel is scrolled. What has
+/// to change is *who draws the box*: a card's border is drawn by its head, and
+/// a head above the view draws nothing at all.
+///
+/// So the first worker the panel is still drawing opens the box instead. It is
+/// the same box — the head's own columns, the head's own hue — cut off at the
+/// top rather than closed there, which is [`card::Card::opened_above`].
+///
+/// **The first such worker is the panel's own first drawn row.** A crew is
+/// contiguous by construction: [`crate::app::agent_tree::walk_tree`] emits every
+/// worker immediately after the head that owns it, and [`crew_len`] counts that
+/// run. So every entry between an off-screen head and a drawn worker of its crew
+/// is itself a worker of that crew — which leaves exactly one candidate, the
+/// entry the layout's own walk starts on.
+pub(crate) fn cut_crew_box_head(
     app: &AppState,
     entries: &[WorkspaceListEntry],
     idx: usize,
 ) -> Option<usize> {
-    crew_head(entries, idx).filter(|head| *head >= app.workspace_scroll)
+    (idx == app.workspace_scroll)
+        .then(|| crew_head(entries, idx))
+        .flatten()
+        .filter(|head| *head < app.workspace_scroll)
 }
 
 /// Which indent step the row at `idx` draws at inside its Space's card.
@@ -2263,9 +2287,20 @@ fn list_entry_height(
         // has something to open and close when it arrives and leaves. What it no
         // longer keeps is a card's height — it is two lines of type inside
         // somebody else's box.
-        if crew_is_drawn(app, fold_width) && drawn_crew_head(app, entries, entry_idx).is_some() {
+        if crew_is_drawn(app, fold_width) && crew_head(entries, entry_idx).is_some() {
+            // Unless it is the row that *opens* a cut box, which pays for the
+            // band its mate's block would have stood in — the same band the
+            // dashed rule is drawn in under a head that is on screen. See
+            // [`cut_crew_box_head`]; the pixel card draws exactly that band and
+            // nothing above it ([`image_card::crew`]).
+            let cut = if cut_crew_box_head(app, entries, entry_idx).is_some() {
+                image_card::crew_divider_cells(app, fold_width).unwrap_or(0)
+            } else {
+                0
+            };
             return image_card::crew_row_cells(app, fold_width)
                 .unwrap_or(rows)
+                .saturating_add(cut)
                 .min(body_height);
         }
         // The dashed rule is carried by the head and not by the first worker,
@@ -2320,6 +2355,10 @@ fn list_entry_height(
 /// [`shell_row_height`] exists: a row whose reserved height and drawn lines
 /// disagree puts every card below it on the wrong row.
 struct CrewRowLayout {
+    /// The Space whose box this row is drawn in — [`crew_head`]'s answer, kept
+    /// so the row that has to *draw* that box can read the hue and the columns
+    /// off the mate they belong to rather than off itself.
+    head_idx: usize,
     /// Columns from the row's own left edge to where its type starts: the
     /// mate's card offset, the border and the pad inside it, then this row's
     /// own tier step.
@@ -2341,15 +2380,32 @@ struct CrewRowLayout {
     /// closes on the last worker's own last line and the rule is drawn over a
     /// name.
     closes_the_box: bool,
+    /// Whether this is the row that *opens* the box, because its mate's own row
+    /// has scrolled above the panel. See [`cut_crew_box_head`].
+    ///
+    /// **It reserves a row for that edge**, the mirror of `closes_the_box`. On a
+    /// head that is on screen the top border is paid for out of the head's own
+    /// two chrome rows; with the head above the view there is no such rect, so
+    /// the first worker still drawn pays for it — and its own lines start one
+    /// row down ([`Self::top_offset`]). Without it the cut edge is drawn over
+    /// this worker's name.
+    opens_the_box: bool,
     /// Its folded token lines.
     lines: Vec<Vec<ResolvedToken>>,
 }
 
 impl CrewRowLayout {
-    /// Rows this reserves: its lines, and the closing rule when it carries one.
+    /// Rows this reserves: its lines, the cut edge above them when it opens the
+    /// box, and the closing rule below them when it carries one.
     fn height(&self) -> u16 {
         shell_row_height(self.lines.len(), RowShell::Line)
+            .saturating_add(self.top_offset())
             .saturating_add(u16::from(self.closes_the_box))
+    }
+
+    /// Rows of this rect that are chrome above the row's own type.
+    fn top_offset(&self) -> u16 {
+        u16::from(self.opens_the_box)
     }
 }
 
@@ -2382,7 +2438,7 @@ fn crew_row_layout(
     if !crew_folds_into_its_space(fold_width) {
         return None;
     }
-    let head_idx = drawn_crew_head(app, entries, entry_idx)?;
+    let head_idx = crew_head(entries, entry_idx)?;
     let head = entries.get(head_idx)?;
     let WorkspaceListEntry::Agent {
         entry_idx: agent_idx,
@@ -2398,10 +2454,12 @@ fn crew_row_layout(
         .saturating_sub(card::CHROME_COLS)
         .saturating_sub(indent);
     Some(CrewRowLayout {
+        head_idx,
         text_offset: left.saturating_add(card::EDGE_COLS).saturating_add(indent),
         text_width,
         via_mate: indent > 0,
         closes_the_box: crew_head(entries, entry_idx.saturating_add(1)) != Some(head_idx),
+        opens_the_box: cut_crew_box_head(app, entries, entry_idx) == Some(head_idx),
         lines: shell_row_lines(
             resolved_agent_rows(app, detail),
             usize::from(text_width),
@@ -2690,12 +2748,22 @@ pub(crate) fn compute_workspace_list_areas(
             // draw one from. Its own columns are that mate's border's, resolved
             // where the row is drawn, by [`crew_row_layout`].
             //
+            // **Except the one worker whose mate is above the panel**, which is
+            // handed the frame the mate would have drawn — the mate's own
+            // columns, measured off the mate's entry — because a box still has
+            // to be drawn around rows that are still inside one. It is the
+            // mate's border and not this row's: a worker's own rank would be
+            // the width of the card it is not drawing. See [`cut_crew_box_head`].
+            //
             // Below the card shell's own floor there is no box to be inside of,
             // so a worker is still its own row with its own shell and nothing
             // about that panel changes.
-            card_frame: (!nested || drawn_crew_head(app, &entries, entry_idx).is_none())
-                .then(|| card_frame_for(rect, entry, fold_width))
-                .flatten(),
+            card_frame: match nested.then(|| crew_head(&entries, entry_idx)).flatten() {
+                Some(head) => cut_crew_box_head(app, &entries, entry_idx)
+                    .and_then(|_| entries.get(head))
+                    .and_then(|head| cut_card_frame_for(rect, head, fold_width)),
+                None => card_frame_for(rect, entry, fold_width),
+            },
             motion_cells: (0, 0),
             arriving: false,
             drawn_card,
@@ -2727,6 +2795,13 @@ pub(crate) fn compute_workspace_list_areas(
 /// Measured off the crew rows that were actually laid out, so a list the panel
 /// ran out of room part-way through closes its box at the last row it drew
 /// instead of reaching past the bottom of the panel.
+///
+/// **A crew whose head is above the panel is still one box.** The row that
+/// opened it ([`cut_crew_box_head`]) was handed the frame the head would have
+/// drawn, and it grows over the rest of its own crew from there — so the box a
+/// reader sees is the same box either way, cut at the top rather than closed
+/// there. It is recognised here by carrying a frame while being a crew row,
+/// which no other row in a nested panel does.
 fn stretch_cards_over_their_crew(
     app: &AppState,
     agents: &[AgentPanelEntry],
@@ -2737,7 +2812,10 @@ fn stretch_cards_over_their_crew(
     let mut head: Option<usize> = None;
     for index in 0..cards.len() {
         let entry_idx = cards[index].entry_idx;
-        if drawn_crew_head(app, entries, entry_idx).is_some() {
+        if crew_head(entries, entry_idx).is_some() {
+            if cards[index].card_frame.is_some() {
+                head = Some(index);
+            }
             let Some(head) = head else {
                 continue;
             };
@@ -2785,13 +2863,35 @@ fn stretch_cards_over_their_crew(
 /// panel too narrow to draw boxes at all. A worker on a panel that does draw
 /// them opens no box and is handed no frame — it is type inside its own mate's
 /// border, and the columns it stands in come from [`card_frame_columns`] by way
-/// of [`crew_row_layout`] instead.
+/// of [`crew_row_layout`] instead. The one worker that *does* draw a border —
+/// the one whose mate is above the panel — takes [`cut_card_frame_for`].
 fn card_frame_for(rect: Rect, head: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
     let (left, width) = card_frame_columns(head, fold_width)?;
     // A box has to hold a border, a line and a rule; anything shorter is a
     // frame around nothing.
     (rect.height > card::CHROME_ROWS)
         .then(|| Rect::new(rect.x.saturating_add(left), rect.y, width, rect.height))
+}
+
+/// The frame a *cut* box starts from: its mate's own columns, over the cells of
+/// the first worker still drawn. See [`cut_crew_box_head`].
+///
+/// **[`card_frame_for`]'s height gate is not this box's.** That one asks whether
+/// a row's own rect can hold a border, a line and a rule, which a cut box's
+/// first row never does: its top is a cut rather than a border, and its closing
+/// rule is always on a row below — the one this row keeps free
+/// ([`crew_closing_reserve`]) when the list carries on, and its own last row when
+/// it does not. So the box this returns is stretched to three rows at the least
+/// before anything draws it ([`stretch_cards_over_their_crew`]), and a gate here
+/// would only refuse a border to every mate whose workers are one line tall.
+fn cut_card_frame_for(rect: Rect, head: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
+    let (left, width) = card_frame_columns(head, fold_width)?;
+    Some(Rect::new(
+        rect.x.saturating_add(left),
+        rect.y,
+        width,
+        rect.height,
+    ))
 }
 
 /// The columns a box drawn for `head` occupies: its left offset into the row,
@@ -3831,7 +3931,22 @@ fn render_agent_row(
         // Except under a pixel card, which sets these rows in its own type —
         // see [`image_card::crew`]. Anything drawn here would be under it.
         if !crew_is_drawn(app, fold_width) {
+            // Unless this is the row that opens a box its mate is no longer on
+            // screen to open. It draws the border and the light its mate would
+            // have — the same three moves in the same order a Space makes, so
+            // the box a reader sees is the same box — and then its own line
+            // inside it, one row down past the cut. See [`cut_crew_box_head`].
+            let shell = crew
+                .opens_the_box
+                .then(|| cut_crew_shell(app, entries, card, crew.head_idx))
+                .flatten();
+            if let Some(shell) = &shell {
+                shell.render_glow(frame, list_bottom);
+            }
             render_crew_row(app, frame, card, detail, &crew, list_top, list_bottom);
+            if let Some(shell) = &shell {
+                shell.render_frame(frame, list_bottom, None);
+            }
         }
         return;
     }
@@ -4198,6 +4313,43 @@ fn render_agent_row(
     }
 }
 
+/// The box a worker draws when its own mate is above the panel, cut at the top
+/// rather than closed there.
+///
+/// The captain settled it: *"they need to stay in the card. not escape it
+/// because of scrolling."* So the box is still the mate's — the mate's columns
+/// ([`card_frame_for`], measured off the head's entry in
+/// [`compute_workspace_list_areas`]), the mate's hue, and the mate's own
+/// highlight — and the only thing this row supplies is somebody to draw it. A
+/// hue read off the worker instead would put one border around a list of rows
+/// in the colour of whichever of them happened to be first on screen.
+///
+/// `None` where the mate's box could not be drawn anyway: a frame the layout
+/// declined to hand out, or one too small to hold a border. The rows are still
+/// legible then — they are the same lines in the same columns, standing without
+/// their border, which is what a panel below [`card::MIN_FOLD_WIDTH`] draws
+/// everywhere.
+fn cut_crew_shell<'a>(
+    app: &'a AppState,
+    entries: &[WorkspaceListEntry],
+    card: &crate::app::state::WorkspaceCardArea,
+    head_idx: usize,
+) -> Option<Card<'a>> {
+    let Some(WorkspaceListEntry::Workspace { ws_idx, .. }) = entries.get(head_idx) else {
+        return None;
+    };
+    let ws = app.workspaces.get(*ws_idx)?;
+    let (state, seen) = ws.aggregate_state(&app.terminals);
+    Card::new(
+        card.card_frame?,
+        state_label_color(state, seen, &app.sidebar_palette),
+        workspace_row_highlighted(app, *ws_idx),
+        &app.sidebar_palette,
+        &app.host_terminal_theme,
+    )
+    .map(Card::opened_above)
+}
+
 /// Draw a worker inside the box its own mate already opened.
 ///
 /// The character twin of [`image_card::crew`], and the same design read at the
@@ -4259,8 +4411,13 @@ fn render_crew_row(
     let cmd_ack_instances: Vec<u64> = app.sidebar_cmd_acks.live(&cmd_ack_row).collect();
     let cmd_ack_width = cmd_ack_strip_width(cmd_ack_instances.len(), crew.text_width, 0);
 
+    // Where this row's own type starts, which is its rect's first row unless it
+    // is also the row the box is cut on — then that row is the box's, and the
+    // type starts under it. See [`CrewRowLayout::top_offset`].
+    let text_y = card.rect.y.saturating_add(crew.top_offset());
+
     for (index, resolved) in crew.lines.iter().enumerate() {
-        let y = card.rect.y.saturating_add(index as u16);
+        let y = text_y.saturating_add(index as u16);
         // Per line, not per row: a row clipped at the top of the list still has
         // later lines to draw below the clip, and giving up on the whole row at
         // the first one out of bounds would drop them.
@@ -4286,7 +4443,7 @@ fn render_crew_row(
         );
     }
 
-    if cmd_ack_width > 0 && card.rect.y < list_bottom && card.rect.y >= list_top {
+    if cmd_ack_width > 0 && text_y < list_bottom && text_y >= list_top {
         render_cmd_ack_strip(
             app,
             frame,
@@ -4294,7 +4451,7 @@ fn render_crew_row(
             &cmd_ack_instances,
             Rect::new(
                 text_x + crew.text_width - cmd_ack_width,
-                card.rect.y,
+                text_y,
                 cmd_ack_width,
                 1,
             ),
@@ -5300,7 +5457,10 @@ fn crew_marker_position(
         return None;
     }
     let left = card.rect.x.saturating_add(crew.text_offset);
-    let top = card.rect.y;
+    // The row's own lines, never its chrome: the marker climbs this worker's
+    // type and stops at its first line, not on the rule the box closes on or the
+    // cut it is opened at.
+    let top = card.rect.y.saturating_add(crew.top_offset());
     let bottom = card
         .rect
         .y
@@ -5449,10 +5609,12 @@ mod failure_spider_geometry {
             let mut area = card(Rect::new(0, 4, 40, height), Rect::new(6, 4, 34, height));
             area.card_frame = None;
             let crew = CrewRowLayout {
+                head_idx: 0,
                 text_offset: 8,
                 text_width: 30,
                 via_mate: false,
                 closes_the_box,
+                opens_the_box: false,
                 lines: Vec::new(),
             };
             let left = area.rect.x + crew.text_offset;
@@ -11780,11 +11942,13 @@ mod ownership_is_drawn_as_written {
     /// Where each row's **own** box would start and end, by name, on a panel
     /// this wide: the rank ladder, asked of the one function that decides it.
     ///
-    /// A worker is drawn inside its own mate's box on a resting panel and is
-    /// handed no frame at all there — see [`drawn_frames`], which is what the
-    /// layout actually produces. What this measures is the box a row of that
-    /// depth and rank *opens*, which is still the ladder every card is placed
-    /// on and is still what a worker gets when its mate's box is off screen.
+    /// A worker is drawn inside its own mate's box and is handed no frame at all
+    /// — see [`drawn_frames`], which is what the layout actually produces, and
+    /// [`cut_crew_box_head`], which hands the one worker that *does* draw a
+    /// border its mate's columns rather than its own. So what this measures is
+    /// the box a row of that depth and rank *opens*: the ladder every card is
+    /// placed on, and the step every tree column moves by, neither of which a
+    /// worker draws a box at any more.
     fn card_frames(
         app: &crate::app::state::AppState,
         sidebar_width: u16,
@@ -13829,10 +13993,19 @@ pub(crate) mod a_space_card_carries_its_own_workers {
 /// and a list that runs off the bottom. Both were live defects of the first
 /// implementation — the first drew nothing at all where the workers should be,
 /// the second drew rows past the border the layout had already closed.
+///
+/// The top cut was then fixed the wrong way round: a worker whose mate had
+/// scrolled off went back to a card of its own, so scrolling one row broke a
+/// mate's list into three separate boxes with no gap between them. The captain
+/// settled it against the mockup: **"they need to stay in the card. not escape
+/// it because of scrolling."** So the fold is ownership and nothing else, and
+/// what changes when a mate scrolls past is only which row *draws* the box —
+/// see [`cut_crew_box_head`].
 #[cfg(test)]
 mod a_scrolled_panel_still_draws_its_workers {
     use super::a_space_card_carries_its_own_workers::crewed_fleet;
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     fn drawing(mut app: AppState) -> AppState {
         app.kitty_graphics_enabled = true;
@@ -13850,12 +14023,72 @@ mod a_scrolled_panel_still_draws_its_workers {
         Rect::new(0, 0, 42, 46)
     }
 
-    /// **A worker whose Space has scrolled off is a card of its own again.**
+    /// The panel as characters, row by row, through the real render pass.
+    fn screen(app: &mut AppState, area: Rect) -> Vec<String> {
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(app, area);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|x| buffer[(x, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The rows the panel laid out, split into the one that carries the box and
+    /// the ones drawn inside it.
+    fn cut_box(
+        app: &AppState,
+        area: Rect,
+    ) -> (
+        crate::app::state::WorkspaceCardArea,
+        Vec<crate::app::state::WorkspaceCardArea>,
+    ) {
+        let entries = workspace_list_entries(app);
+        let cards = compute_workspace_card_areas(app, area);
+        assert!(!cards.is_empty(), "the scrolled panel drew nothing at all");
+        assert!(
+            cards
+                .iter()
+                .all(|card| crew_head(&entries, card.entry_idx).is_some()),
+            "the fixture has to be scrolled past every Space on it"
+        );
+        let framed: Vec<_> = cards
+            .iter()
+            .copied()
+            .filter(|card| card.card_frame.is_some())
+            .collect();
+        assert_eq!(
+            framed.len(),
+            1,
+            "{} of the {} workers drew a box; a cut list is one box",
+            framed.len(),
+            cards.len()
+        );
+        (framed[0], cards)
+    }
+
+    /// **A worker whose mate has scrolled off stays in that mate's card.**
     ///
-    /// There is no box above it to be inside of, so nesting it would leave a row
-    /// with no frame, no ink and no border — an invisible row where a worker is.
+    /// The captain, on the mockup: *"they need to stay in the card. not escape
+    /// it because of scrolling."* This is the assertion that says so on the
+    /// layout — one box over all three workers, at the *mate's* own columns,
+    /// closing under the last of them — where the superseded rule handed every
+    /// one of them a box of its own.
+    ///
+    /// It is asked of the pixel panel, which is where the un-fold shipped from.
+    /// [`a_character_cut_box_holds_the_whole_list_too`] asks the same of the
+    /// panel the captain actually runs.
     #[test]
-    fn a_worker_whose_head_scrolled_off_gets_its_own_box_back() {
+    fn a_worker_whose_head_scrolled_off_stays_in_its_mates_card() {
         let mut app = drawing(crewed_fleet());
         if image_card::row_height_cells(&app, row_fold_width(&app, workspace_list_rect(area())))
             .is_none()
@@ -13868,18 +14101,180 @@ mod a_scrolled_panel_still_draws_its_workers {
         // Scrolled past the Space itself.
         app.workspace_scroll = 1;
         assert_eq!(
-            drawn_crew_head(&app, &entries, 1),
-            None,
-            "a worker was still nested under a head the panel is not drawing"
+            crew_head(&entries, 1),
+            Some(0),
+            "scrolling moved a worker out of the card that owns it"
         );
-        let cards = compute_workspace_card_areas(&app, area());
-        assert!(!cards.is_empty(), "the scrolled panel drew nothing at all");
+        assert_eq!(
+            cut_crew_box_head(&app, &entries, 1),
+            Some(0),
+            "the first worker still drawn did not take over its mate's box"
+        );
+
+        let (box_row, cards) = cut_box(&app, area());
+        let frame = box_row.card_frame.expect("the row that carries the box");
+        let mate = card_frame_columns(
+            &entries[0],
+            row_fold_width(&app, workspace_list_rect(area())),
+        )
+        .expect("the mate's own box columns");
+        assert_eq!(
+            (frame.x - box_row.rect.x, frame.width),
+            mate,
+            "the cut box is not standing in its mate's own columns"
+        );
+        let last = cards.last().expect("a worker row");
+        assert_eq!(
+            frame.y + frame.height,
+            last.rect.y + last.rect.height,
+            "the box does not close under the last worker in it"
+        );
+        // Every row inside it, and no gap anywhere: the failure the un-fold left
+        // on screen was three boxes with their borders touching.
+        let mut next = box_row.rect.y;
         for card in &cards {
+            assert_eq!(card.rect.y, next, "the rows stopped tiling at {card:?}");
+            next = card.rect.y + card.rect.height;
             assert!(
-                card.card_frame.is_some(),
-                "a row with no head above it drew neither a box nor ink: {card:?}"
+                card.rect.y >= frame.y && next <= frame.y + frame.height,
+                "a worker's own row is outside the box it is drawn in: {card:?}"
             );
         }
+    }
+
+    /// **The character panel holds its cut list too** — the panel the captain
+    /// runs, 42 columns with no pixel card anywhere near it.
+    ///
+    /// This behaviour was pinned on the pixel path only, which is exactly how
+    /// the un-fold reached the character card the day the fold was ported to it.
+    #[test]
+    fn a_character_cut_box_holds_the_whole_list_too() {
+        let mut app = crewed_fleet();
+        let fold = row_fold_width(&app, workspace_list_rect(area()));
+        assert!(
+            !crew_is_drawn(&app, fold),
+            "this fixture has to be one with no pixel card"
+        );
+        assert!(RowShell::for_fold_width(fold).is_card());
+
+        app.workspace_scroll = 1;
+        let (box_row, cards) = cut_box(&app, area());
+        let frame = box_row.card_frame.expect("the row that carries the box");
+        assert_eq!(
+            (frame.x - box_row.rect.x, frame.width),
+            card_frame_columns(&workspace_list_entries(&app)[0], fold)
+                .expect("the mate's own box columns"),
+            "the cut box is not standing in its mate's own columns"
+        );
+        assert_eq!(
+            frame.y + frame.height,
+            cards
+                .last()
+                .map(|card| card.rect.y + card.rect.height)
+                .expect("a worker row"),
+            "the box does not close under the last worker in it"
+        );
+    }
+
+    /// **The box opens on the crew seam, not on a corner.**
+    ///
+    /// The glyph half of the rule. A cut box's first row is
+    /// [`card::Card::opened_above`]: the sides run straight through it and the
+    /// span between them is the same dashed rule
+    /// ([`card::Card::render_crew_rule`]) that separates a mate from its crew
+    /// everywhere else — which is what is genuinely above this row. A `╭───╮`
+    /// there would say the box starts here, and the worker's own name is one row
+    /// below it rather than under it.
+    #[test]
+    fn the_cut_row_is_a_seam_between_two_sides_and_not_a_top_corner() {
+        let mut app = crewed_fleet();
+        app.workspace_scroll = 1;
+        let (box_row, _) = cut_box(&app, area());
+        let frame = box_row.card_frame.expect("the row that carries the box");
+        let rows = screen(&mut app, area());
+
+        let cut = &rows[usize::from(frame.y)];
+        let span: String = cut
+            .chars()
+            .skip(usize::from(frame.x))
+            .take(usize::from(frame.width))
+            .collect();
+        let mut edges = span.chars();
+        assert_eq!(
+            edges.next(),
+            Some('│'),
+            "the cut row drew a left corner: {span:?}"
+        );
+        assert_eq!(
+            edges.next_back(),
+            Some('│'),
+            "the cut row drew a right corner: {span:?}"
+        );
+        assert!(
+            edges.clone().all(|glyph| glyph == '┈'),
+            "the cut row is not the crew seam: {span:?}"
+        );
+
+        // And the first worker's own name is under the seam rather than on it.
+        let below = &rows[usize::from(frame.y) + 1];
+        assert!(
+            below.contains("mate"),
+            "the row under the cut is not the first worker's name: {below:?}"
+        );
+        assert!(
+            !cut.contains("mate"),
+            "the cut was drawn over the worker's own name: {cut:?}"
+        );
+    }
+
+    /// **Scrolling past a mate moves the rows and nothing else.**
+    ///
+    /// The height half of the rule. A worker's rect is the same height scrolled
+    /// or not — it is the same folded row either way — and the one row the list
+    /// gains is the cut the box is opened on, which the row that opens it pays
+    /// for out of its own rect. Without that row the seam lands on the worker's
+    /// first line, which is the defect
+    /// [`CrewRowLayout::closes_the_box`] already fixed at the other end.
+    #[test]
+    fn the_cut_costs_exactly_the_one_row_the_box_is_opened_on() {
+        let mut app = crewed_fleet();
+        let fold = row_fold_width(&app, workspace_list_rect(area()));
+        let heights = |app: &AppState| -> Vec<u16> {
+            compute_workspace_card_areas(app, area())
+                .iter()
+                .map(|card| card.rect.height)
+                .collect()
+        };
+        let settled = heights(&app);
+        app.workspace_scroll = 1;
+        let scrolled = heights(&app);
+
+        assert_eq!(
+            scrolled.len(),
+            settled.len() - 1,
+            "scrolling by one row did not drop exactly one row"
+        );
+        assert_eq!(
+            scrolled[0],
+            settled[1] + 1,
+            "the row that opens the cut box did not pay for the cut"
+        );
+        assert_eq!(
+            scrolled[1..],
+            settled[2..],
+            "a worker that neither opens nor closes the box changed height"
+        );
+        // And the reserved height is the drawn height: the box's last row is the
+        // closing rule and no worker's line is under it.
+        let entries = workspace_list_entries(&app);
+        let agents = sidebar_agent_entries(&app);
+        let crew = crew_row_layout(&app, &agents, &entries, 1, fold).expect("a folded worker");
+        assert!(crew.opens_the_box, "row 1 does not open the cut box");
+        assert_eq!(
+            crew.height(),
+            scrolled[0],
+            "the row's own arithmetic drifted"
+        );
     }
 
     /// **A list that runs off the bottom closes its box under the last row it
@@ -13964,12 +14359,12 @@ mod the_trays_rows_go_back_to_the_tree {
     /// `mates` second mates under the first, each running one named idle agent
     /// delegated inside its own Space — the shape the tree draws crew rows for.
     ///
-    /// **A mate per worker, not one mate carrying all of them.** A worker is
-    /// drawn inside its own mate's box and goes back to a card of its own the
-    /// moment that box scrolls off the top ([`drawn_crew_head`]), so a single
-    /// mate holding twenty workers changes the tree's whole height as soon as
-    /// the panel is scrolled past it. That is a fact about the crew list, and
-    /// this module is asking about the tray.
+    /// **A mate per worker, not one mate carrying all of them.** A worker stays
+    /// inside its own mate's box however far the panel is scrolled, but the row
+    /// that *opens* that box pays for the cut it is opened on
+    /// ([`cut_crew_box_head`]), so a single mate holding twenty workers changes
+    /// the tree's height the moment the panel is scrolled past it. That is a
+    /// fact about the crew list, and this module is asking about the tray.
     fn fleet(mates: usize) -> AppState {
         let mut app = AppState::test_new();
         app.workspaces = vec![Workspace::test_new("firstmate")];

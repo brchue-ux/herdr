@@ -54,6 +54,16 @@ const CHIP_WIDTH: usize = 3;
 /// Columns between the subtitle and the status pill sharing its row.
 const PILL_GAP: u16 = 1;
 
+/// The seam this shell draws where one box carries on past the row.
+///
+/// Two rows draw it: the rule between a mate's own block and the workers under
+/// it ([`Card::render_crew_rule`]), and the cut top of a box whose mate is above
+/// the panel ([`Card::opened_above`]). One glyph for both because it is one
+/// statement — *this line is inside a box, not the end of one* — and dashed for
+/// the reason it was dashed to begin with: a solid rule there reads as the
+/// bottom of one box and the top of another.
+const CREW_RULE: &str = "┈";
+
 /// The narrowest fold width the card shell is drawn at.
 ///
 /// Below this the card stops being a card and becomes a frame around an
@@ -248,6 +258,13 @@ pub(super) struct Card<'a> {
     /// frame's height would land on a worker's row and be overwritten by the
     /// name it was drawn on top of.
     body_rows: u16,
+    /// Whether this box's own top is above the panel rather than drawn on it.
+    ///
+    /// A card's border is drawn by its head, and a head scrolled off the top
+    /// draws nothing at all — so the first worker still on screen draws the box
+    /// instead, and the row it draws first is a cut rather than a corner. See
+    /// [`Self::opened_above`] and `super::cut_crew_box_head`.
+    opened_above: bool,
     p: &'a Palette,
     host: &'a TerminalTheme,
 }
@@ -265,6 +282,7 @@ impl<'a> Card<'a> {
             accent,
             lifted,
             body_rows: frame.height.saturating_sub(CHROME_ROWS),
+            opened_above: false,
             p,
             host,
         })
@@ -279,6 +297,23 @@ impl<'a> Card<'a> {
         self.body_rows = rows
             .min(self.frame.height.saturating_sub(CHROME_ROWS))
             .max(1);
+        self
+    }
+
+    /// Draw this box's first row as a cut rather than as a top corner: the
+    /// card's own block is above the panel and only the workers inside it are
+    /// on screen.
+    ///
+    /// **It is [`Self::render_crew_rule`]'s own glyph, in the row a corner would
+    /// have stood in.** The seam between a mate and its crew is the one mark
+    /// this shell already has for *"one box continues past here"* — dashed
+    /// rather than solid precisely so it does not read as the bottom of one box
+    /// and the top of another — and what is immediately above the first worker
+    /// still drawn is that very seam, or another worker under it. The side
+    /// borders run straight through it, so the box has no corners at the top and
+    /// cannot be read as starting there.
+    pub(super) fn opened_above(mut self) -> Self {
+        self.opened_above = true;
         self
     }
 
@@ -385,18 +420,36 @@ impl<'a> Card<'a> {
             if y >= list_bottom {
                 return;
             }
-            let (left, right, style) = if row == 0 {
-                ("╭", "╮", Style::default().fg(hue(TOP_BORDER_MIX)))
+            // `fill` is what runs between the two ends: a solid rule on the
+            // edges that close the box, the seam glyph on a top that is a cut
+            // rather than an edge, and nothing at all on a content row.
+            let (left, right, fill, style) = if row == 0 && self.opened_above {
+                // No corners: the sides run straight up through this row and
+                // out of the panel, which is the whole of what the cut says.
+                (
+                    "│",
+                    "│",
+                    Some(CREW_RULE),
+                    Style::default().fg(hue(BOTTOM_RULE_MIX)),
+                )
+            } else if row == 0 {
+                (
+                    "╭",
+                    "╮",
+                    Some("─"),
+                    Style::default().fg(hue(TOP_BORDER_MIX)),
+                )
             } else if row == bottom {
                 (
                     "╰",
                     "╯",
+                    Some("─"),
                     Style::default()
                         .fg(hue(BOTTOM_RULE_MIX))
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                ("│", "│", Style::default().fg(hue(SIDE_BORDER_MIX)))
+                ("│", "│", None, Style::default().fg(hue(SIDE_BORDER_MIX)))
             };
             let style = match glow(row) {
                 Some(bg) => style.bg(bg),
@@ -408,9 +461,9 @@ impl<'a> Card<'a> {
             let right_x = self.frame.x + self.frame.width - 1;
             buf[(right_x, y)].set_symbol(right);
             buf[(right_x, y)].set_style(style);
-            if row == 0 || row == bottom {
+            if let Some(fill) = fill {
                 for x in self.frame.x + 1..right_x {
-                    buf[(x, y)].set_symbol("─");
+                    buf[(x, y)].set_symbol(fill);
                     buf[(x, y)].set_style(style);
                 }
             }
@@ -460,7 +513,7 @@ impl<'a> Card<'a> {
         };
         let buf = frame.buffer_mut();
         for x in self.frame.x + 1..self.frame.x + self.frame.width - 1 {
-            buf[(x, y)].set_symbol("┈");
+            buf[(x, y)].set_symbol(CREW_RULE);
             buf[(x, y)].set_style(style);
         }
     }
