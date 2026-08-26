@@ -29,18 +29,20 @@ impl AgentEditLog {
         self.entries.clear();
     }
 
-    // The two read accessors are still test-only: `pane.report_edit_diff`
-    // writes this log, but its only production reader — the Changes-zone
-    // renderer — lands in a later task of this feature.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only: the Changes-zone renderer asks [`Self::flatten`] for the
+    /// lines and checks *those* for emptiness, so a separate emptiness query
+    /// has no production caller. `#[cfg(test)]` rather than an
+    /// `allow(dead_code)`, so it stays honest if that ever changes.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Flattens every file's lines into one stream, files in path-sorted
     /// order, for the renderer to consume exactly like a single
-    /// `GitDiffText` today.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `GitDiffText` today. Each file's own `GitDiffText::truncated` flag is
+    /// dropped — the aggregate stream has nowhere to say "this one file was
+    /// cut short"; see `crate::ui::diff_pane`'s `render_diff_content`.
     pub(crate) fn flatten(&self) -> Vec<GitDiffLine> {
         self.entries
             .values()

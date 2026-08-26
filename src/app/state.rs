@@ -2796,6 +2796,30 @@ impl AppState {
             .filter(|group| group.contains(ws_idx))
     }
 
+    /// The agent-edit-log lines of the focused pane of the workspace at
+    /// `workspace_idx`, flattened for rendering — the Changes zone's data
+    /// source (see `crate::ui::diff_pane`).
+    ///
+    /// Lives on `AppState` rather than `Workspace` because the log lives on
+    /// `TerminalState`, and only `AppState` holds the `terminals` map the
+    /// focused pane's `attached_terminal_id` resolves against.
+    ///
+    /// `None` means there is nothing to show a log *for* — no such workspace,
+    /// no focused pane, or no terminal behind that pane. `Some(vec![])` means
+    /// the pane is there and has simply reported no edits yet; the renderer
+    /// draws a different message for each.
+    pub(crate) fn focused_pane_agent_edit_lines(
+        &self,
+        workspace_idx: usize,
+    ) -> Option<Vec<crate::workspace::GitDiffLine>> {
+        let workspace = self.workspaces.get(workspace_idx)?;
+        let pane_id = workspace.focused_pane_id()?;
+        let tab = workspace.active_tab()?;
+        let pane_state = tab.panes.get(&pane_id)?;
+        let terminal = self.terminals.get(&pane_state.attached_terminal_id)?;
+        Some(terminal.agent_edit_log.flatten())
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
