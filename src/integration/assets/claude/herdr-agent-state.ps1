@@ -2,7 +2,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=9
+# HERDR_INTEGRATION_VERSION=10
 
 param([string]$Action = "")
 
@@ -47,4 +47,16 @@ try {
     }
     & $herdr @args 2>$null | Out-Null
 } catch {
+}
+
+# A fresh agent session inherits the pane, not the previous session's work, so
+# the pane's agent edit log has to start empty. Sent after the session report
+# above so the pane is already bound to this session; subagent and SubagentStop
+# invocations exited long before this point.
+if ($payload.hook_event_name -eq "SessionStart") {
+    try {
+        $clearArgs = @("pane", "report-edit-diff", $env:HERDR_PANE_ID, "--clear-all")
+        & $herdr @clearArgs 2>$null | Out-Null
+    } catch {
+    }
 }
