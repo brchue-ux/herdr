@@ -484,6 +484,7 @@ mod tests {
             *slot = stage.hue(&app.sidebar_palette, &app.host_terminal_theme);
         }
         CardContent {
+            cut_above: false,
             title: String::new(),
             tidbit: None,
             register: None,
@@ -530,6 +531,7 @@ mod tests {
 
     fn placed<'a>(content: &'a CardContent) -> PlacedCard<'a> {
         PlacedCard {
+            clip_top: 0.0,
             rect: super::super::canvas::RoundRect {
                 x: 20.0,
                 y: CARD_TOP,

@@ -372,6 +372,7 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         _ => AgentState::Unknown,
     };
     CardContent {
+        cut_above: false,
         // A name of the length agent panes actually carry, varied so no two
         // adjacent cards hash the same and the held-image matcher cannot carry
         // one forward for another.

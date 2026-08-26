@@ -978,6 +978,26 @@ struct CardContent {
     /// a crew is a fact about a row's *neighbours* — the entries the tree walk
     /// put under it — and `content_for` is handed one entry. See [`crew_for`].
     crew: Vec<crew::CrewMember>,
+    /// Whether this card's **own block is above the panel** and only the
+    /// workers inside it are on screen.
+    ///
+    /// The captain settled what a worker does when its mate scrolls off the top:
+    /// *"they need to stay in the card. not escape it because of scrolling."* So
+    /// the card is still drawn — the same box, the same hue, the same list — by
+    /// the first worker still on screen, cut at the top rather than closed
+    /// there. See [`super::cut_crew_box_head`].
+    ///
+    /// What it changes here is that the card sets **none of its own block**: no
+    /// title, no captions, no icon plate, no control rail, no sparkline and no
+    /// marker of its own. Every one of them belongs to rows that are above the
+    /// panel, and drawing them over the workers would be the mate's block moved
+    /// rather than scrolled past. What is left is the border, the light, and the
+    /// list — which is exactly what a reader is still looking at.
+    ///
+    /// The cut itself is [`Rasteriser::place`]'s: the card is placed with its own
+    /// block above the row's first cell and drawn from that cell down, so it has
+    /// no top edge and no corners and its sides run out of the panel.
+    cut_above: bool,
     /// The mockup's literal `.bars`/`.bar` sparkline — up to
     /// [`crate::quality_streak::BARS_MAX`] recent-activity heights, oldest
     /// first, or `None` on a card no publisher has sent a
@@ -1058,6 +1078,11 @@ impl CardContent {
         for member in &self.crew {
             member.hash_into(hasher);
         }
+        // Scrolling one row past a mate turns its card into a cut box with the
+        // same title, the same state and the same workers — every other field
+        // here unchanged — so a signature blind to this would carry the closed
+        // card forward and draw the mate's block back over its own crew.
+        self.cut_above.hash(hasher);
     }
 
     /// Whether this card earns the mockup's strong cyan accent — a border
@@ -1820,6 +1845,18 @@ struct PlacedCard<'a> {
     /// worker rows are *drawn* at come from one number. See
     /// [`crew::CrewBands`].
     crew: crew::CrewBands,
+    /// The first sheet row any of this card's ink may reach.
+    ///
+    /// `0.0` on every card the panel is drawing whole — the image's own top
+    /// edge, which is where its bloom already started and so is no clip at all.
+    ///
+    /// The row's own first cell on a [`CardContent::cut_above`] card, whose
+    /// block is above the panel: the box is placed at the position its *whole*
+    /// height would have had and drawn from that cell down, so it has no top
+    /// edge, no corners, and sides that run out of the panel. Nothing about the
+    /// image changes — it still covers its bloom margin — this is only a row the
+    /// card may not paint above. Every draw pass in this module starts there.
+    clip_top: f32,
 }
 
 impl PlacedCard<'_> {
@@ -1967,7 +2004,11 @@ fn plan_bloom(card: &PlacedCard<'_>, width: u32, height: u32) -> Option<BloomSpl
     let far_sigma = near_sigma * measured::BLOOM_FAR_SIGMA_MUL;
 
     let x0 = (rect.x - reach).floor().max(0.0) as u32;
-    let y0 = (rect.y - reach).floor().max(0.0) as u32;
+    // A cut box has no top edge on the panel, so it has no halo above one
+    // either: the bloom starts at the first row the card is drawn into. See
+    // [`PlacedCard::clip_top`], which is `0.0` on every other card and so leaves
+    // the reach exactly where it has always been.
+    let y0 = (rect.y - reach).max(card.clip_top).floor().max(0.0) as u32;
     let x1 = ((rect.x + rect.w + reach).ceil() as u32).min(width);
     let y1 = ((rect.y + rect.h + reach).ceil() as u32).min(height);
 
@@ -2767,7 +2808,9 @@ fn draw_discharge(sheet: &mut Canvas, card: &PlacedCard<'_>, ink: Rgb, opacity: 
         if px >= sheet.width() {
             continue;
         }
-        for y in top.floor().max(0.0) as u32..(bottom.ceil() as u32).min(sheet.height()) {
+        for y in top.max(card.clip_top).floor().max(0.0) as u32
+            ..(bottom.ceil() as u32).min(sheet.height())
+        {
             // Brightest in the middle of its run and gone at both ends, so a
             // filament is a discharge arcing inside the pane rather than a rule
             // drawn on it.
@@ -2871,7 +2914,11 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // One pass over the card, reading the same distance for the face, the inner
     // glow and the edge.
     let x0 = ox.floor().max(0.0) as u32;
-    let y0 = oy.floor().max(0.0) as u32;
+    // Never above the card's own first drawn row: on a cut box that is the row
+    // the panel starts on, and everything of the box above it — its top edge and
+    // both its corners — is off the panel by construction. See
+    // [`PlacedCard::clip_top`].
+    let y0 = oy.max(card.clip_top).floor().max(0.0) as u32;
     let x1 = ((ox + width).ceil() as u32).min(sheet.width());
     let y1 = ((oy + height).ceil() as u32).min(sheet.height());
     if x1 <= x0 {
@@ -3037,10 +3084,13 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // Drawn only when there is a mark to put in it — `CardGeometry::new` has
     // already collapsed the slot to nothing when there is not, so this is the
     // same code path either way and the plate simply has no size.
+    //
+    // And only on a card whose own block is on the panel. A cut box's block is
+    // above it, plate and all — see [`CardContent::cut_above`].
     let plate = geometry.plate.min(head - geometry.pad * 2.0).max(0.0);
     let plate_x = ox + geometry.pad;
     let plate_y = oy + (head - plate) / 2.0;
-    if plate > 2.0 {
+    if plate > 2.0 && !content.cut_above {
         let plate_rect = RoundRect {
             x: plate_x,
             y: plate_y,
@@ -3088,7 +3138,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     // character row puts these two on its *first* content row, so this is that
     // row's own vertical order kept: controls at the top, over the title's
     // first line and nothing else.
-    if !content.controls.is_empty() {
+    if !content.controls.is_empty() && !content.cut_above {
         let rail = content.controls.layout(font, caption_px);
         // Anchored under the card's top pad. It only gives way on a card too
         // short to hold it there, and then only as far as its own stroke.
@@ -3141,6 +3191,15 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
 
     // ---- title and captions ----------------------------------------------
     //
+    // None of it on a cut box, whose block is above the panel with its own
+    // title, captions and sparkline in it. Stopping here rather than clipping
+    // them: a name drawn at the top of a box whose top is somewhere else is the
+    // mate's block *moved*, not scrolled past, and the reader would have a card
+    // that never leaves the panel however far the tree is scrolled.
+    if content.cut_above {
+        return;
+    }
+
     // Three caption lines under the title, in the register the reference sets
     // them in: what this body *is*, what it has *done*, and — as a bare dim
     // lowercase word and nothing else — what state it is in. A card carrying
@@ -3419,6 +3478,7 @@ mod the_cards_own_sparkline {
             *slot = stage.hue(&app.sidebar_palette, &app.host_terminal_theme);
         }
         let make = |bars: Vec<u8>| CardContent {
+            cut_above: false,
             title: "herdr".into(),
             tidbit: None,
             register: None,
@@ -3958,6 +4018,7 @@ fn content_for(
             );
             let breath = breath(app, &row, state, severity);
             Some(CardContent {
+                cut_above: false,
                 title: display_summary(tokens.get("doing").cloned().unwrap_or(label)),
                 // A Space is a mate, and a mate is a body in the sky: its two
                 // caption lines are that body's own registers, so the tree and
@@ -4049,6 +4110,7 @@ fn content_for(
             );
             let breath = breath(app, &row, detail.state, severity);
             Some(CardContent {
+                cut_above: false,
                 title: title_text(detail),
                 // A worker is a moon, and the reference's worker pane sets its
                 // task on line two and **its state as a bare lowercase word** on
@@ -4104,7 +4166,16 @@ fn content_for(
     }
 }
 
-/// The workers drawn inside the Space at `index`'s own card.
+/// The workers drawn inside the Space at `index`'s own card, beginning at the
+/// row `from`.
+///
+/// `from` is `index + 1` on a card whose Space is on screen, which is every row
+/// of its list. It is further down on a *cut* box — a Space scrolled off the top
+/// of the panel, whose workers stay in its card and whose first still-drawn
+/// worker draws that card in its place (see [`super::cut_crew_box_head`]). The
+/// rows above `from` are the ones already off the panel: carrying them would
+/// draw the list at its full height inside a box only as tall as what is left of
+/// it.
 ///
 /// # Where the two tiers come from
 ///
@@ -4130,11 +4201,13 @@ fn crew_for(
     app: &AppState,
     entries: &[super::WorkspaceListEntry],
     index: usize,
+    from: usize,
     agents: &[AgentPanelEntry],
     moving: bool,
     limit: usize,
 ) -> Vec<crew::CrewMember> {
-    (index + 1..index + 1 + super::crew_len(entries, index).min(limit))
+    let last = index + 1 + super::crew_len(entries, index);
+    (from.max(index + 1)..last.min(from.saturating_add(limit)))
         .filter_map(|row| {
             let tier = super::crew_tier(entries, row)?;
             let super::WorkspaceListEntry::Agent { entry_idx, .. } = entries.get(row)? else {
@@ -4485,31 +4558,65 @@ fn compute_card_placement(
         if frame.width == 0 || frame.height == 0 {
             continue;
         }
-        let Some(entry) = entries.get(card.entry_idx) else {
-            continue;
-        };
         // A worker drawn inside its Space's card is not a card. Its row is still
         // here — it has a rect, it takes a click, it opens and closes — but the
         // ink on it belongs to the head's own image, so nothing is placed for it
         // and nothing of it is rasterised twice.
-        if nested && super::drawn_crew_head(app, &entries, card.entry_idx).is_some() {
+        //
+        // **Unless its Space is above the panel**, and it is the first of that
+        // Space's workers still drawn: then it is the one row left to draw the
+        // box they are all still inside, and the image it places is that Space's
+        // own, cut at the top. See [`super::cut_crew_box_head`].
+        //
+        // And only where this path is the one setting crew lists at all: on a
+        // pass that has published no artwork the character card is still
+        // standing ([`card_covers_row`]) and draws the cut box itself, so a box
+        // placed here too would be two of them a few pixels apart.
+        let cut = super::cut_crew_box_head(app, &entries, card.entry_idx).filter(|_| nested);
+        if cut.is_none() && super::crew_head(&entries, card.entry_idx).is_some() {
             continue;
         }
-        let Some(mut content) = content_for(app, entry, &agents, &bodies) else {
+        // The row the box belongs to, which is this row on everything the panel
+        // draws whole and the Space above the panel on a cut box. Every number
+        // the image is built from — its title, its state, its list — comes off
+        // it, because it is one box either way.
+        let head_idx = cut.unwrap_or(card.entry_idx);
+        let Some(head_entry) = entries.get(head_idx) else {
             continue;
         };
-        content.controls = control_rail(app, entry, &agents, card);
+        let Some(mut content) = content_for(app, head_entry, &agents, &bodies) else {
+            continue;
+        };
+        content.cut_above = cut.is_some();
+        if cut.is_some() {
+            // Both belong to the block above the panel: the rail is anchored
+            // under the card's top pad and the marker climbs the card's own
+            // border to it. Cleared rather than clipped, so nothing reserves
+            // columns out of a worker's name for a control no pixel of which is
+            // drawn. Each worker keeps its *own* marker — that rides its row,
+            // inside the list. See [`crew::CrewMember::spider`].
+            content.spider = None;
+        } else {
+            content.controls = control_rail(app, head_entry, &agents, card);
+        }
         if nested {
             // Only the crew rows this pass actually laid out. A list that ran
             // off the bottom of the panel would otherwise be drawn past the box
             // the layout closed under its last visible row.
-            let drawn = cards[index + 1..]
-                .iter()
-                .take_while(|row| {
-                    super::drawn_crew_head(app, &entries, row.entry_idx) == Some(card.entry_idx)
-                })
-                .count();
-            content.crew = crew_for(app, &entries, card.entry_idx, &agents, moving, drawn);
+            //
+            // A cut box counts itself in: it *is* one of its Space's workers,
+            // and the row it draws first is its own.
+            let drawn = usize::from(cut.is_some())
+                + cards[index + 1..]
+                    .iter()
+                    .take_while(|row| super::crew_head(&entries, row.entry_idx) == Some(head_idx))
+                    .count();
+            let from = if cut.is_some() {
+                card.entry_idx
+            } else {
+                head_idx + 1
+            };
+            content.crew = crew_for(app, &entries, head_idx, from, &agents, moving, drawn);
         }
         // The card-bloom beat, resolved where the row's own life is known. A
         // panel with motion off leaves every card whole, which is what it has
@@ -4713,6 +4820,19 @@ pub(crate) struct CardContentWire {
     /// new field here safe: `crate::protocol::wire::PROTOCOL_VERSION` is.
     #[serde(default)]
     crew: Vec<crew::CrewMember>,
+    /// Whether this box's own block is above the panel — see
+    /// [`CardContent::cut_above`].
+    ///
+    /// Carried, and not derivable at the other end: it is a fact about where the
+    /// *server's* tree is scrolled, and a client that rasterises its own cards
+    /// has no entry list to ask. A client that defaulted it would draw the
+    /// mate's title, captions and icon back over the very workers the box was
+    /// cut to keep — which is the design the captain settled against.
+    ///
+    /// See `focused_space` above for why `#[serde(default)]` is not what makes a
+    /// new field here safe: `crate::protocol::wire::PROTOCOL_VERSION` is.
+    #[serde(default)]
+    cut_above: bool,
     /// The mockup's literal sparkline — see [`CardContent::bars`]. Carried
     /// like every other resolved fleet fact on this wire, for the same reason
     /// `register` is: a client rasterising its own cards has no fleet
@@ -4748,6 +4868,7 @@ impl From<&CardContent> for CardContentWire {
             breath: content.breath,
             spider: content.spider,
             crew: content.crew.clone(),
+            cut_above: content.cut_above,
             bars: content.bars.clone(),
         }
     }
@@ -4756,6 +4877,7 @@ impl From<&CardContent> for CardContentWire {
 impl From<CardContentWire> for CardContent {
     fn from(wire: CardContentWire) -> Self {
         Self {
+            cut_above: wire.cut_above,
             title: wire.title,
             tidbit: wire.tidbit,
             register: wire.register,
@@ -5802,8 +5924,23 @@ impl Rasteriser<'_> {
         // what keeps the box's bottom edge and the next card's top edge
         // together for the whole of the gesture.
         let crew = crew::drawn_extent_px(self.crew_bands, &content.crew);
-        let wanted =
-            (card_height_px(self.title_metrics, self.tidbit_metrics) + crew).min(cell_height);
+        // The band the card's **own block** stands in. Above the row's first
+        // cell on a cut box and drawn into no pixel of it — the mate is scrolled
+        // past, and what is left on screen is the list inside its border. Kept as
+        // a real band rather than collapsed to nothing because every ratio the
+        // card is drawn from is a fraction of it: a box whose head band was zero
+        // would light and round itself like a card an inch tall.
+        //
+        // See [`CardContent::cut_above`]; `head` in [`draw_card`] is this same
+        // number, arrived at from the other end as `height - crew`.
+        let head = card_height_px(self.title_metrics, self.tidbit_metrics);
+        // What the card is drawn *into* the row's own cells: the whole box on
+        // every card the panel draws whole, and the list alone on a cut one.
+        let wanted = if content.cut_above {
+            crew.min(cell_height)
+        } else {
+            (head + crew).min(cell_height)
+        };
         // Clamped into the gutter the card actually has.
         //
         // The offset is half a cell on an even-cell row, and a row whose card
@@ -5821,27 +5958,53 @@ impl Rasteriser<'_> {
         // measures both halves — how close the line lands, and that the card
         // never leaves its cells to get there.
         let gutter = (cell_height - wanted).max(0.0);
-        let connector_offset =
-            connector_row_offset_px(frame.height, self.cell_h).clamp(-gutter / 2.0, gutter / 2.0);
         // The left border stands where the tree's rails have their ink, not
         // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
         let left =
             (f32::from(frame.x.saturating_sub(rect.x)) + RAIL_INK_COLUMN_FRACTION) * self.cell_w;
+        // Where the part of the box that is on screen begins. On a cut box the
+        // whole card is placed `head` higher than that, so the border it draws
+        // through this row is a side and never a top.
+        let drawn_top = if content.cut_above {
+            // **Pinned to the panel's own first cell, never centred in it.**
+            // Nothing to centre a cut box on: no branch line meets it, because
+            // the row it would point at is above the panel. And nothing to
+            // centre it *in*, either — its visible top is the panel's hard
+            // boundary rather than a gutter, so the box grows downward only.
+            // Centring would walk the cut a few pixels into the panel while the
+            // crew's tracks opened and lift it back as they settled, which reads
+            // as the top of the panel moving rather than as a list arriving.
+            cell_top
+        } else {
+            cell_top
+                + (cell_height - wanted) / 2.0
+                + connector_row_offset_px(frame.height, self.cell_h)
+                    .clamp(-gutter / 2.0, gutter / 2.0)
+        };
         PlacedCard {
             rect: RoundRect {
                 x: left,
-                y: cell_top + (cell_height - wanted) / 2.0 + connector_offset,
+                y: if content.cut_above {
+                    drawn_top - head
+                } else {
+                    drawn_top
+                },
                 // The right edge does not move: nothing in the tree is drawn
                 // against it, so pulling the left one in is what aligns the card
                 // rather than sliding the whole box off the columns the layout
                 // gave it.
                 w: (f32::from(frame.width) - RAIL_INK_COLUMN_FRACTION) * self.cell_w,
-                h: wanted,
+                h: if content.cut_above {
+                    head + wanted
+                } else {
+                    wanted
+                },
                 r: geometry.radius,
             },
             content,
             geometry,
             crew: self.crew_bands,
+            clip_top: if content.cut_above { drawn_top } else { 0.0 },
         }
     }
 
@@ -6055,7 +6218,9 @@ fn lift(sheet: &mut Canvas, card: &PlacedCard<'_>) {
         return;
     }
     let rect = card.rect;
-    for y in rect.y.max(0.0) as u32..((rect.y + rect.h).ceil() as u32).min(sheet.height()) {
+    for y in rect.y.max(card.clip_top).max(0.0) as u32
+        ..((rect.y + rect.h).ceil() as u32).min(sheet.height())
+    {
         for x in rect.x.max(0.0) as u32..((rect.x + rect.w).ceil() as u32).min(sheet.width()) {
             let inside = coverage(rect.distance(x as f32 + 0.5, y as f32 + 0.5));
             if inside > 0.0 {
@@ -7722,6 +7887,7 @@ mod tests {
         };
         fn content(badge: Option<SpaceBadgeMark>) -> CardContent {
             CardContent {
+                cut_above: false,
                 title: String::new(),
                 tidbit: None,
                 register: None,
@@ -7759,6 +7925,7 @@ mod tests {
             draw_card(
                 &mut canvas,
                 &PlacedCard {
+                    clip_top: 0.0,
                     rect,
                     content: &drawn,
                     geometry: CardGeometry::new(21.0, false),
@@ -7798,6 +7965,7 @@ mod tests {
     fn only_the_focused_space_or_an_arriving_card_is_accented() {
         fn content(focused_space: bool, generate: f32) -> CardContent {
             CardContent {
+                cut_above: false,
                 title: String::new(),
                 tidbit: None,
                 register: None,
@@ -7887,6 +8055,7 @@ mod tests {
         };
         fn content(register: Option<Caption>) -> CardContent {
             CardContent {
+                cut_above: false,
                 title: "fm/verve-notes".into(),
                 tidbit: None,
                 register,
@@ -7945,6 +8114,7 @@ mod tests {
         draw_card(
             &mut worker_canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content: &worker,
                 geometry: CardGeometry::new(21.0, false),
@@ -7961,6 +8131,7 @@ mod tests {
         draw_card(
             &mut space_canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content: &space,
                 geometry: CardGeometry::new(21.0, false),
@@ -9303,17 +9474,19 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// The rows that carry a card, which is what a published layer answers to.
     /// The frame of every row that gets an image of its own — which is every
-    /// row with a *card*, and so not the worker rows drawn inside a Space's own
-    /// box. Those keep a frame, because they keep a rect and a click target, but
-    /// their ink is in their Space's image and nothing is placed for them. See
-    /// [`crew_for`].
+    /// row that opens a box. Most worker rows do not: they keep a rect and a
+    /// click target but their ink is in their Space's image, so the layout hands
+    /// them no frame at all (see [`crew_for`]).
+    ///
+    /// **Asked of the frame and never of the fold**, because the two part company
+    /// exactly once: the worker that opens a *cut* box is a folded row that does
+    /// hold a frame ([`super::super::cut_crew_box_head`]). Filtering on the fold
+    /// would drop that row silently and hand a scrolled test an empty vector
+    /// instead of an assertion it could fail.
     fn framed(app: &AppState) -> Vec<Rect> {
-        let entries = super::super::workspace_list_entries(app);
         super::super::compute_workspace_card_areas(app, sidebar_rect())
             .into_iter()
-            .filter(|card| super::super::crew_head(&entries, card.entry_idx).is_none())
             .filter_map(|card| card.card_frame)
             .filter(|frame| frame.width > 0 && frame.height > 0)
             .collect()
@@ -9758,8 +9931,8 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// Every card in a real tree — first mate, second mates, and their
-    /// workers — is drawn at the same height on screen.
+    /// Every card in a real tree is drawn at the same height on screen,
+    /// whatever rank it is — **and a worker scrolled past its mate draws none.**
     ///
     /// Through the real render path rather than the constants: builds the
     /// captain's own fleet at his 42-column width, decodes the actual PNG the
@@ -9768,9 +9941,73 @@ mod a_card_is_its_own_shape {
     /// being zero) rather than trusting the row height it was handed. A second,
     /// quieter scale hiding in the chrome instead of the row height would still
     /// show up here.
+    ///
+    /// # Why the worker rung is a zero and not a height
+    ///
+    /// It used to be one. The panel was scrolled onto the worker, which put its
+    /// mate's box off the top, and the worker took a card of its own back — so
+    /// the third rung could be measured there. The captain retired that:
+    /// *"they need to stay in the card. not escape it because of scrolling."* A
+    /// worker scrolled past its mate now draws that mate's box, cut at the top
+    /// ([`super::super::cut_crew_box_head`]), and no card of its own at any
+    /// rank — so the second pass measures the absence rather than a third
+    /// height, which is the stronger claim of the two: a worker that took a card
+    /// back at *any* size would fail it, including one that took it at exactly
+    /// the right height and so would have passed the old assertion.
+    ///
+    /// Rank still reaches the screen as *width*, which is
+    /// [`a_workers_card_is_narrower_than_its_mates`]'s.
     #[test]
-    fn every_rank_renders_at_the_same_card_height() {
-        let app = three_rank_pixel_app();
+    fn every_card_renders_at_the_same_height_and_a_scrolled_past_worker_draws_none() {
+        let mut resting: std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            Vec<u32>,
+        > = std::collections::BTreeMap::new();
+        measure_card_heights(0, &mut resting);
+
+        let mut all_heights = resting.values().flatten().copied();
+        let Some(first) = all_heights.next() else {
+            return; // No face on this machine; nothing was measured.
+        };
+        assert_eq!(
+            resting.keys().copied().collect::<Vec<_>>(),
+            vec![
+                crate::app::agent_tree::AgentRelation::FirstMate,
+                crate::app::agent_tree::AgentRelation::SecondMate,
+            ],
+            "the resting panel did not draw one card of each mate's rank: {resting:?}"
+        );
+        for h in all_heights {
+            assert!(
+                h.abs_diff(first) <= 1,
+                "card heights differ by rank (a device-pixel rounding tolerance of 1 is \
+                 allowed): {resting:?}"
+            );
+        }
+
+        // Scrolled onto the worker, which puts its mate's own row above the
+        // panel. Nothing of the worker's rank may be drawn there.
+        let mut scrolled = std::collections::BTreeMap::new();
+        measure_card_heights(2, &mut scrolled);
+        assert!(
+            scrolled.is_empty(),
+            "a worker whose mate scrolled off took a card of its own back: {scrolled:?}"
+        );
+    }
+
+    /// One pass of
+    /// [`every_card_renders_at_the_same_height_and_a_scrolled_past_worker_draws_none`],
+    /// at one
+    /// scroll offset, folded into the heights it found.
+    fn measure_card_heights(
+        scroll: usize,
+        heights_by_rank: &mut std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            Vec<u32>,
+        >,
+    ) {
+        let mut app = three_rank_pixel_app();
+        app.workspace_scroll = scroll;
         let Some(layers) = built(&app) else {
             return; // No face on this machine.
         };
@@ -9782,10 +10019,6 @@ mod a_card_is_its_own_shape {
         let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
         let entries = super::super::workspace_list_entries(&app);
         let agents = super::super::sidebar_agent_entries(&app);
-        let mut heights_by_rank: std::collections::BTreeMap<
-            crate::app::agent_tree::AgentRelation,
-            Vec<u32>,
-        > = std::collections::BTreeMap::new();
 
         for card in &cards {
             let Some(frame) = card.card_frame else {
@@ -9845,20 +10078,6 @@ mod a_card_is_its_own_shape {
                     .push(bottom - top + 1);
             }
         }
-
-        assert!(
-            heights_by_rank.len() >= 3,
-            "the fixture did not exercise at least three ranks: {heights_by_rank:?}"
-        );
-        let mut all_heights = heights_by_rank.values().flatten().copied();
-        let first = all_heights.next().expect("at least one card was measured");
-        for h in all_heights {
-            assert!(
-                h.abs_diff(first) <= 1,
-                "card heights differ by rank (a device-pixel rounding tolerance of 1 is \
-                 allowed): {heights_by_rank:?}"
-            );
-        }
     }
 
     /// Width still reads as rank in the real render path: a worker's card is
@@ -9866,38 +10085,59 @@ mod a_card_is_its_own_shape {
     /// at the captain's 42-column width. This is [`super::rank_width_inset`],
     /// unrelated to and unaffected by the height change — this test exists so a
     /// future change to height cannot silently take width down with it.
+    ///
+    /// The two mates are measured off the panel it actually draws. **The
+    /// worker's rung is measured off the ladder function**, because no panel
+    /// draws that box any more: a worker is inside its own mate's border
+    /// wherever it is on screen, scrolled past its mate or not — see
+    /// [`super::super::cut_crew_box_head`], which hands the first worker still
+    /// drawn its *mate's* columns. The rung is still real, because it is what
+    /// sets the step every tree column moves by, so it is still measured, from
+    /// the one function that decides it.
     #[test]
     fn width_still_narrows_by_rank_at_the_captains_width() {
-        let app = three_rank_pixel_app();
-        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
-        let entries = super::super::workspace_list_entries(&app);
-        let agents = super::super::sidebar_agent_entries(&app);
-
         let mut widths_by_rank: std::collections::BTreeMap<
             crate::app::agent_tree::AgentRelation,
             u16,
         > = std::collections::BTreeMap::new();
-        for card in &cards {
-            let Some(frame) = card.card_frame else {
-                continue;
-            };
-            if frame.width == 0 {
-                continue;
-            }
-            let Some(entry) = entries.get(card.entry_idx) else {
-                continue;
-            };
-            if content_for(
+        {
+            let app = three_rank_pixel_app();
+            let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+            let entries = super::super::workspace_list_entries(&app);
+            let agents = super::super::sidebar_agent_entries(&app);
+            let fold = super::super::row_fold_width(
                 &app,
-                entry,
-                &agents,
-                &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
-            )
-            .is_none()
-            {
-                continue;
+                super::super::workspace_list_rect(sidebar_rect()),
+            );
+            for card in &cards {
+                let Some(frame) = card.card_frame else {
+                    continue;
+                };
+                if frame.width == 0 {
+                    continue;
+                }
+                let Some(entry) = entries.get(card.entry_idx) else {
+                    continue;
+                };
+                if content_for(
+                    &app,
+                    entry,
+                    &agents,
+                    &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                widths_by_rank.insert(entry.rank(), frame.width);
             }
-            widths_by_rank.insert(entry.rank(), frame.width);
+            let worker = entries
+                .iter()
+                .find(|entry| entry.rank() == crate::app::agent_tree::AgentRelation::Worker)
+                .expect("the fixture has a worker");
+            let (_, width) = super::super::card_frame_columns(worker, fold)
+                .expect("the ladder answers for a worker");
+            widths_by_rank.insert(worker.rank(), width);
         }
 
         let first = widths_by_rank
@@ -9954,6 +10194,107 @@ mod a_card_is_its_own_shape {
             built(&sheet).map(|layers| layers.len()),
             Some(1),
             "the sheet stopped being one image for the whole tree"
+        );
+    }
+
+    /// **A cut box is drawn open at the top: two sides and no edge between
+    /// them.**
+    ///
+    /// The pixel half of the captain's rule. A worker stays in its mate's card
+    /// however far the panel is scrolled — *"they need to stay in the card. not
+    /// escape it because of scrolling."* — so the first worker still drawn
+    /// places its *mate's* image, cut at the row the panel starts on
+    /// ([`super::super::cut_crew_box_head`], [`CardContent::cut_above`]). The
+    /// box is placed at the height its whole self would have had and painted
+    /// from that row down, so the top edge and both corners are above the panel
+    /// and never rasterised at all.
+    ///
+    /// Measured in the published pixels, and against the box's *own* closing
+    /// edge rather than against a number: a strong pixel is a stroke, an edge
+    /// that closes runs strokes across the whole width, and a side is two of
+    /// them. The closing edge is what proves the measurement can see an edge at
+    /// all — without it a card that failed to draw would pass.
+    #[test]
+    fn a_cut_box_is_drawn_open_at_the_top() {
+        let mut app = crate::ui::sidebar::a_space_card_carries_its_own_workers::crewed_fleet();
+        app.kitty_graphics_enabled = true;
+        app.kitty_graphics_capability_confirmed = true;
+        app.sidebar_card_shapes = true;
+        app.view.sidebar_card_layers_published = true;
+        app.host_cell_size = HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        // Scrolled one row past the mate, which leaves its three workers on
+        // screen with nothing above them to open their box.
+        app.workspace_scroll = 1;
+        let entries = super::super::workspace_list_entries(&app);
+        assert_eq!(
+            super::super::cut_crew_box_head(&app, &entries, 1),
+            Some(0),
+            "the fixture is not scrolled onto a cut box"
+        );
+
+        let Some(layers) = built(&app) else {
+            return; // No face on this machine; nothing was drawn.
+        };
+        assert_eq!(
+            layers.len(),
+            1,
+            "a cut list drew {} images; it is one box",
+            layers.len()
+        );
+        let layer = &layers[0];
+        let (img_w, img_h, px) = decode(layer);
+        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+        let frame = cards[0].card_frame.expect("the row that carries the box");
+        let cell_h = f32::from(u16::try_from(app.host_cell_size.height_px).unwrap());
+
+        // Strokes, not the glass face behind them: the face is a tenth of an
+        // alpha by construction (`measured::GLASS_FACE_ALPHA`), so a threshold
+        // this high cannot mistake the inside of the box for its border.
+        let strokes = |y: u32| {
+            (0..img_w)
+                .filter(|x| px[((y * img_w + x) * 4 + 3) as usize] > 128)
+                .count()
+        };
+        let full = usize::from(frame.width) * app.host_cell_size.width_px as usize / 2;
+        let widest = (0..img_h).map(strokes).max().unwrap_or(0);
+        assert!(
+            widest >= full,
+            "no row of this image is a closing edge ({widest} strokes at the widest), so the \
+             measurement cannot tell an open top from a card that drew nothing"
+        );
+
+        // The first rows the box may paint into. Three of them, because the band
+        // boundary is a float rounded onto a pixel grid.
+        let first = (f32::from(frame.y.saturating_sub(layer.rect.y)) * cell_h).round() as u32;
+        for y in first..(first + 3).min(img_h) {
+            let strokes = strokes(y);
+            assert!(
+                strokes <= 8,
+                "row {y} of the cut box draws {strokes} strokes, which is a top edge and not \
+                 two sides"
+            );
+        }
+
+        // And it closes on the last cell the layout gave the list: a box whose
+        // rows were laid on bands the layout did not reserve would close short
+        // of its own frame or run past it.
+        let last = (0..img_h)
+            .rev()
+            .find(|y| strokes(*y) >= full)
+            .expect("a closing edge");
+        let floor = (f32::from(
+            frame
+                .y
+                .saturating_add(frame.height)
+                .saturating_sub(layer.rect.y),
+        ) * cell_h)
+            .round() as u32;
+        assert!(
+            floor.saturating_sub(last) <= 2,
+            "the box closes at row {last} but the layout gave its list cells down to {floor}"
         );
     }
 
@@ -10633,6 +10974,7 @@ mod a_card_is_its_own_shape {
         // glow.
         fn content(state: AgentState, stage: LifecycleStage, hues: [f32; 5]) -> CardContent {
             CardContent {
+                cut_above: false,
                 title: String::new(),
                 tidbit: None,
                 register: None,
@@ -10677,6 +11019,7 @@ mod a_card_is_its_own_shape {
             draw_card(
                 &mut canvas,
                 &PlacedCard {
+                    clip_top: 0.0,
                     rect,
                     content: &content,
                     geometry: CardGeometry::new(21.0, false),
@@ -10744,6 +11087,7 @@ mod a_card_is_its_own_shape {
             r: geometry.radius,
         };
         let base = CardContent {
+            cut_above: false,
             title: "2ndmate-explore".into(),
             tidbit: Some("gas giant · 99 files · 2 moons".into()),
             register: Some(Caption {
@@ -10790,6 +11134,7 @@ mod a_card_is_its_own_shape {
         draw_card(
             &mut empty,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content: &none,
                 geometry: CardGeometry::new(21.0, false),
@@ -10818,6 +11163,7 @@ mod a_card_is_its_own_shape {
         draw_card(
             &mut whole_canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content: &whole,
                 geometry: CardGeometry::new(21.0, false),
@@ -10837,6 +11183,7 @@ mod a_card_is_its_own_shape {
         draw_card(
             &mut half_canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content: &half,
                 geometry: CardGeometry::new(21.0, false),
@@ -10901,6 +11248,7 @@ mod a_card_is_its_own_shape {
         // so a card carrying words would report its own title's alpha rather
         // than its face's. What is under test is the material.
         let content = CardContent {
+            cut_above: false,
             title: String::new(),
             tidbit: None,
             register: None,
@@ -10928,6 +11276,7 @@ mod a_card_is_its_own_shape {
             bars: None,
         };
         let quiet = PlacedCard {
+            clip_top: 0.0,
             rect,
             content: &content,
             geometry: CardGeometry::new(21.0, false),
@@ -10944,6 +11293,7 @@ mod a_card_is_its_own_shape {
             ..content
         };
         let loud = PlacedCard {
+            clip_top: 0.0,
             rect,
             content: &loud_content,
             geometry: CardGeometry::new(21.0, false),
@@ -14193,6 +14543,7 @@ mod cards_breathe_and_wash {
             draw_card(
                 &mut sheet,
                 &PlacedCard {
+                    clip_top: 0.0,
                     rect,
                     content: &content,
                     geometry: CardGeometry::new(21.0, false),
@@ -14254,6 +14605,7 @@ mod cards_breathe_and_wash {
 
     fn residue_test_content(residue: u8) -> CardContent {
         CardContent {
+            cut_above: false,
             title: "2ndmate-explore".into(),
             tidbit: None,
             register: None,
@@ -14423,9 +14775,15 @@ mod the_sheet_leaves_the_trees_lines_alone {
         }
     }
 
-    /// The sheet a fleet of three ranks publishes, and the frames it was drawn
-    /// for. `None` on a machine with no proportional face, where there is no
-    /// pixel path to read at all.
+    /// The sheet a nested fleet publishes, and the frames it was drawn for.
+    /// `None` on a machine with no proportional face, where there is no pixel
+    /// path to read at all.
+    ///
+    /// Two frames, not three: the worker in this fleet is drawn inside its own
+    /// mate's box and opens no card of its own (see
+    /// [`super::super::crew_folds_into_its_space`]). What these tests need is a
+    /// card with a gutter under it and a card with nothing under it, and a
+    /// nested pair is both.
     fn sheet() -> Option<(Sheet, Vec<Rect>)> {
         let app = three_rank_pixel_app();
         assert!(
@@ -14435,7 +14793,10 @@ mod the_sheet_leaves_the_trees_lines_alone {
         let rect = sidebar_rect();
         let cards = super::super::compute_workspace_card_areas(&app, rect);
         let frames: Vec<Rect> = cards.iter().filter_map(|card| card.card_frame).collect();
-        assert!(frames.len() >= 3, "the fixture lost a rank: {frames:?}");
+        assert!(
+            frames.len() >= 2,
+            "the fixture lost a card, so there is no join to read: {frames:?}"
+        );
         let CardsUpdate::Rebuilt(layers) =
             build_cards(&app, &cards, rect, app.host_cell_size, &[]).update
         else {
@@ -15064,6 +15425,7 @@ mod a_card_draws_the_workers_it_carries {
             );
         }
         CardContent {
+            cut_above: false,
             title: "herdr".into(),
             tidbit: Some("gas giant · 2,470 files".into()),
             register: Some(Caption {
@@ -15114,6 +15476,7 @@ mod a_card_draws_the_workers_it_carries {
         draw_card(
             &mut canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect,
                 content,
                 geometry: CardGeometry::new(CELL_H, false),
@@ -15199,6 +15562,195 @@ mod a_card_draws_the_workers_it_carries {
         );
     }
 
+    /// **A cut box paints nothing at all in the band above its own cut.**
+    ///
+    /// The pixel half of the captain's ruling — *"they need to stay in the card.
+    /// not escape it because of scrolling."* — is three guards in [`draw_card`],
+    /// and this is the one assertion that holds all three. On a
+    /// [`CardContent::cut_above`] card the icon plate, the control rail, and
+    /// everything from the title down (its captions, its worker dot and its
+    /// sparkline) are all suppressed: every one of them belongs to a block that
+    /// is above the panel, and drawing any of them here would be the mate's own
+    /// block *moved* rather than scrolled past — a card that never leaves the
+    /// panel however far the tree is scrolled.
+    ///
+    /// The box is placed the way [`Rasteriser::place`] places a cut one: the
+    /// whole card `head` px above the first row the panel draws, with
+    /// [`PlacedCard::clip_top`] at that row. So the head band is in frame, it is
+    /// exactly where all three of those blocks would land, and deleting any one
+    /// guard puts ink in it. Each is given something real to draw first — a
+    /// title, a rail with a badge on it, a plate with a size, a sparkline — so a
+    /// missing guard has something to say rather than nothing.
+    #[test]
+    fn a_cut_box_paints_nothing_above_its_own_cut() {
+        let Some(font) = font::card_font(None) else {
+            return; // No proportional face on this machine.
+        };
+        let head = card_height_px(
+            font.metrics(TITLE_PX),
+            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+        );
+        let mut content = content(vec![
+            member("fm/direct", 0, crew::CrewArrival::SETTLED),
+            member("fm/via", 1, crew::CrewArrival::SETTLED),
+        ]);
+        content.cut_above = true;
+        content.controls = ControlRail {
+            summary: Some(SummaryBadge {
+                count: 3,
+                fresh: true,
+            }),
+            group: None,
+            space_badge: None,
+        };
+        content.bars = Some(vec![20, 60, 100, 40]);
+        assert!(
+            !content.title.is_empty() && content.register.is_some(),
+            "the title guard has nothing to suppress"
+        );
+        assert!(
+            !content.controls.is_empty(),
+            "the rail guard has nothing to suppress"
+        );
+
+        // The plate is sized off the *geometry*, exactly as `Rasteriser::place`
+        // sizes it (`CardGeometry::new(cell, content.mark.is_some())`), and the
+        // guard reads that. `CardMark` is uninhabited today, so the slot is asked
+        // for here directly rather than through a mark that cannot be built.
+        let geometry = CardGeometry::new(CELL_H, true);
+        let plate = geometry.plate.min(head - geometry.pad * 2.0).max(0.0);
+        assert!(
+            plate > 2.0,
+            "the icon slot collapsed to {plate} px, so the plate guard is not \
+             under test at all"
+        );
+
+        let crew_px = crew::drawn_extent_px(BANDS, &content.crew);
+        let rect = RoundRect {
+            x: 4.0,
+            y: 4.0,
+            w: 320.0,
+            h: head + crew_px,
+            r: geometry.radius,
+        };
+        // Where the panel starts, which on a cut box is where its own block ends.
+        let cut = rect.y + head;
+        let mut canvas = Canvas::new(340, (rect.y + rect.h).ceil() as u32 + 8);
+        draw_card(
+            &mut canvas,
+            &PlacedCard {
+                clip_top: cut,
+                rect,
+                content: &content,
+                geometry,
+                crew: BANDS,
+            },
+            font,
+        );
+
+        let width = canvas.width();
+        let band = cut.floor() as u32;
+        assert!(
+            band > 0 && band < canvas.height(),
+            "the head band is not in frame, so this measures nothing"
+        );
+        let px = canvas.rgba8();
+        let lit: Vec<(u32, u32)> = (0..band)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|(x, y)| px[((y * width + x) * 4 + 3) as usize] != 0)
+            .collect();
+        assert!(
+            lit.is_empty(),
+            "a cut box painted {} pixels above its own cut, the first at {:?} — \
+             its block is above the panel and none of it may be drawn here",
+            lit.len(),
+            lit.first()
+        );
+
+        // And it drew its list below the cut, so the band check above is not
+        // passing on a card that drew nothing anywhere.
+        assert!(
+            (band..canvas.height())
+                .any(|y| (0..width).any(|x| px[((y * width + x) * 4 + 3) as usize] != 0)),
+            "the cut box drew nothing at all; an empty head band proves nothing"
+        );
+    }
+
+    /// **A cut box stands on the panel's own first cell for the whole of its
+    /// arrival.**
+    ///
+    /// A card the panel draws whole is centred in the cells its row was given,
+    /// so it grows out of the middle of its own gutter as its crew opens — that
+    /// is what keeps its ink on the row its branch line meets it on. A cut box
+    /// has no such gutter above it: its visible top edge *is* the panel's own
+    /// hard boundary and every row above it is off screen. Centring it would
+    /// walk the cut a few pixels down into the panel while the tracks opened and
+    /// lift it back as they settled, which reads as the top of the panel moving
+    /// rather than as a list arriving. So it is pinned, and grows downward only.
+    #[test]
+    fn a_cut_box_stands_on_its_first_cell_for_the_whole_of_its_arrival() {
+        let Some(font) = font::card_font(None) else {
+            return; // No proportional face on this machine.
+        };
+        let cell = HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        let cell_h = f32::from(u16::try_from(cell.height_px).expect("a sane cell"));
+        let field = Rect::new(0, 0, 42, 46);
+        let rasteriser = Rasteriser {
+            font,
+            title_metrics: font.metrics(TITLE_PX),
+            tidbit_metrics: font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+            cell_size: cell,
+            cell_w: f32::from(u16::try_from(cell.width_px).expect("a sane cell")),
+            cell_h,
+            crew_bands: crew::CrewBands::of(font, TITLE_PX, cell_h),
+            field,
+            bounds: field,
+            bloom_floor: field.height,
+            backdrop: Rgb(9, 17, 28),
+            rail: None,
+            dissolve: None,
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::Kitty,
+            host_graphics_is_local: true,
+        };
+        // The cells the layout reserves for a *settled* two-worker list, which
+        // is what a row carrying one is actually given. So the box fills its own
+        // cells at the end of the gesture and has a real gutter part-way through
+        // it — exactly the gutter the old centring drifted into.
+        let bands = rasteriser.crew_bands;
+        let settled_px = bands.divider + bands.row * 2.0;
+        let frame = Rect::new(1, 3, 20, (settled_px / cell_h).round() as u16);
+        let first_cell = f32::from(frame.y - field.y) * cell_h;
+
+        // `clip_top` is where the box begins on screen — see `Rasteriser::place`.
+        let cut_at = |open: f32| {
+            let arrival = crew::CrewArrival { open, bloom: open };
+            let mut content = content(vec![
+                member("fm/direct", 0, arrival),
+                member("fm/via", 1, arrival),
+            ]);
+            content.cut_above = true;
+            rasteriser.place(frame, &content, field).clip_top
+        };
+        assert_eq!(
+            cut_at(1.0),
+            first_cell,
+            "a settled cut box is not standing on the panel's own first cell"
+        );
+        for step in 1u8..8 {
+            let open = f32::from(step) / 8.0;
+            assert_eq!(
+                cut_at(open),
+                first_cell,
+                "a cut box {open:.3} of the way through its arrival is cut at \
+                 {}, not on the panel's first cell at {first_cell}",
+                cut_at(open)
+            );
+        }
+    }
+
     /// **A second mate's row is drawn one fixed step right of a direct one.**
     ///
     /// Measured as the leftmost column at which a card carrying the row differs
@@ -15250,6 +15802,7 @@ mod a_card_draws_the_workers_it_carries {
             &app,
             &entries,
             0,
+            1,
             &agents,
             app.sidebar_rows_move(),
             usize::MAX,
@@ -15382,6 +15935,7 @@ mod the_theme_reaches_the_card {
 
     fn content(theme: CardTheme, focused_space: bool, crew: Vec<crew::CrewMember>) -> CardContent {
         CardContent {
+            cut_above: false,
             title: "herdr".to_string(),
             tidbit: None,
             register: None,
@@ -15470,6 +16024,7 @@ mod the_theme_reaches_the_card {
         draw_card(
             &mut canvas,
             &PlacedCard {
+                clip_top: 0.0,
                 rect: RoundRect {
                     x: CARD_X as f32,
                     y: CARD_Y as f32,
