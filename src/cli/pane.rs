@@ -3,9 +3,10 @@ use crate::api::schema::{
     PaneFocusDirectionParams, PaneLayoutParams, PaneListParams, PaneMoveDestination,
     PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneWaitForOutputParams,
-    PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request, SplitDirection,
+    PaneReportEditDiffParams, PaneReportMetadataParams, PaneResizeParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
+    PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
+    SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -39,6 +40,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "release-agent" => pane_release_agent(&args[1..]),
         "declare-agent" => pane_declare_agent(&args[1..]),
         "report-metadata" => pane_report_metadata(&args[1..]),
+        "report-edit-diff" => pane_report_edit_diff(&args[1..]),
         "run" => pane_run(&args[1..]),
         "help" | "--help" | "-h" => {
             print_pane_help();
@@ -1550,6 +1552,83 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     }))
 }
 
+/// Reports one file's cumulative agent-edit diff, or clears the pane's whole
+/// edit log.
+///
+/// The diff text arrives on stdin (`--diff -`) rather than as an argument
+/// because a unified diff is multi-line and unbounded, which is exactly what
+/// an argv value is worst at carrying. Callers are hook scripts that already
+/// have the diff on a pipe.
+fn pane_report_edit_diff(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!(
+            "usage: herdr pane report-edit-diff <pane_id> --file PATH --diff - [--clear-all]"
+        );
+        return Ok(2);
+    };
+
+    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let mut file = None;
+    let mut read_diff_from_stdin = false;
+    let mut clear_all = false;
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --file");
+                    return Ok(2);
+                };
+                file = Some(value.clone());
+                index += 2;
+            }
+            "--diff" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --diff");
+                    return Ok(2);
+                };
+                if value != "-" {
+                    eprintln!("--diff only accepts \"-\" (read the diff from stdin)");
+                    return Ok(2);
+                }
+                read_diff_from_stdin = true;
+                index += 2;
+            }
+            "--clear-all" => {
+                clear_all = true;
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    if !clear_all && file.is_none() {
+        eprintln!("missing required --file");
+        return Ok(2);
+    }
+
+    let diff = if read_diff_from_stdin {
+        use std::io::Read;
+
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        Some(buffer)
+    } else {
+        None
+    };
+
+    super::send_ok_request(Method::PaneReportEditDiff(PaneReportEditDiffParams {
+        pane_id,
+        file: file.unwrap_or_default(),
+        diff,
+        clear_all,
+    }))
+}
+
 fn print_pane_help() {
     eprintln!("herdr pane commands:");
     eprintln!("  herdr pane list [--workspace <workspace_id>]");
@@ -1583,6 +1662,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
     eprintln!("  herdr pane declare-agent <pane_id> --agent LABEL|--clear");
     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--clear-all-tokens] [--seq N] [--ttl-ms N]");
+    eprintln!("  herdr pane report-edit-diff <pane_id> --file PATH --diff - [--clear-all]");
     eprintln!("  herdr pane run <pane_id> <command>");
 }
 
