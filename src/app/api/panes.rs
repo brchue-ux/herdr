@@ -1635,7 +1635,24 @@ impl App {
             );
         }
 
-        let (lines, truncated) = crate::workspace::parse_unified_diff_lines(&diff_text);
+        // The renderer starts a file's card — and the rail between two files —
+        // off a literal `diff --git a/x b/x` line
+        // (`crate::ui::diff_pane::build_diff_rows`), which is stricter than
+        // `classify_diff_line`'s `FileHeader` tagging. GNU `diff -u` output,
+        // which is what the capture hooks send, carries `---`/`+++` and never
+        // that line, so without this a multi-file log would render as
+        // unlabelled runs of hunks with no divider. Synthesized from the file
+        // the request already names rather than asked of the hooks, so every
+        // caller gets it. Skipped for an empty diff: that is the
+        // clear-this-file path, and a header-only entry would never clear.
+        let (lines, truncated) = if diff_text.is_empty() {
+            (Vec::new(), false)
+        } else {
+            crate::workspace::parse_unified_diff_lines(&format!(
+                "diff --git a/{path} b/{path}\n{diff_text}",
+                path = params.file,
+            ))
+        };
         terminal
             .agent_edit_log
             .set_or_clear(params.file, GitDiffText { lines, truncated });
@@ -4588,6 +4605,49 @@ mod tests {
         app.handle_pane_report_edit_diff("req2".into(), clear_all);
 
         assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    /// Hook-fed diffs are GNU `diff -u` output with no `diff --git` line, and
+    /// the Changes zone starts a file's card — and the rail between two files
+    /// — off exactly that line. This drives two files through the real
+    /// handler and then asks the renderer's own row walk
+    /// (`diff_overlay_anchors`, which shares `build_diff_rows` with the drawn
+    /// text) what boundaries it found, rather than hand-writing a header into
+    /// a fixture the production path would never produce.
+    #[test]
+    fn reported_non_git_diffs_still_render_one_card_per_file_and_a_rail_between() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.state.active = Some(0);
+
+        for path in ["/tmp/a.rs", "/tmp/b.rs"] {
+            let mut params = edit_diff_params(pane_id.clone());
+            params.file = path.into();
+            // `diff -u --label` output: `---`/`+++`, never `diff --git`.
+            params.diff = Some(format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"));
+            let response = app.handle_pane_report_edit_diff("req".into(), params);
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        }
+
+        let anchors = crate::ui::diff_pane::diff_overlay_anchors(
+            &app.state,
+            ratatui::layout::Rect::new(0, 0, 40, 20),
+        )
+        .expect("two reported files must render as diff content");
+
+        assert_eq!(
+            anchors
+                .file_rows
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/a.rs".to_string(), "/tmp/b.rs".to_string()],
+            "each reported file must get its own header card"
+        );
+        assert_eq!(
+            anchors.rail_rows.len(),
+            1,
+            "two files have exactly one boundary to stand a rail on"
+        );
     }
 
     #[test]

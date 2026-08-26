@@ -59,35 +59,45 @@ pub(super) fn render_diff_popup_overlay(app: &AppState, frame: &mut Frame, area:
     render_diff_content(app, frame, inner);
 }
 
+/// The Changes zone's content: the active Space's focused pane's agent edit
+/// log, as the one [`GitDiffText`] every part of this zone reads — the drawn
+/// text, the scroll clamp, and the pixel overlay's anchors and animation
+/// state. One source, so none of them can disagree about what is on screen.
+///
+/// `None` means there is nothing to show a log *for* (no active Space, no
+/// focused pane, no terminal behind it); `Some` with no lines means the pane
+/// simply has not reported an edit yet.
+///
+/// `truncated: false` is a known simplification: [`AgentEditLog::flatten`]
+/// drops each file's own `truncated` flag, so the aggregate cannot say "one
+/// of these files was cut short". Individual files are already capped at the
+/// RPC layer, so nothing is lost but that notice; surfacing it would mean
+/// widening `flatten`'s return, which this phase does not need.
+///
+/// [`AgentEditLog::flatten`]: crate::agent_edit_log::AgentEditLog::flatten
+pub(crate) fn focused_pane_diff(app: &AppState) -> Option<GitDiffText> {
+    let lines = app.focused_pane_agent_edit_lines(app.active?)?;
+    Some(GitDiffText {
+        lines,
+        truncated: false,
+    })
+}
+
 fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let Some(workspace_idx) = app.active else {
+    let Some(diff) = focused_pane_diff(app) else {
         render_message(frame, area, "no active space", app.palette.subtext0);
         return;
     };
 
-    let Some(lines) = app.focused_pane_agent_edit_lines(workspace_idx) else {
-        render_message(frame, area, "no active space", app.palette.subtext0);
-        return;
-    };
-
-    if lines.is_empty() {
+    if diff.lines.is_empty() {
         render_message(frame, area, "no edits yet", app.palette.subtext0);
         return;
     }
 
-    // `truncated: false` is a known simplification: `AgentEditLog::flatten`
-    // drops each file's own `truncated` flag, so an aggregate view cannot say
-    // "one of these files was cut short". Individual files are already capped
-    // at the RPC layer, so nothing is lost but that notice; surfacing it would
-    // mean widening `flatten`'s return, which this phase does not need.
-    let diff = GitDiffText {
-        lines,
-        truncated: false,
-    };
     let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
     render_diff_lines(app, frame, area, &diff, scroll);
 }
@@ -98,10 +108,8 @@ fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
 /// handler (`AppState::scroll_diff_pane`) call through this so the two can
 /// never disagree.
 pub(crate) fn normalized_diff_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let total = app
-        .active
-        .and_then(|idx| app.focused_pane_agent_edit_lines(idx))
-        .map(|lines| lines.len())
+    let total = focused_pane_diff(app)
+        .map(|diff| diff.lines.len())
         .unwrap_or(0);
     requested.min(total.saturating_sub(area.height as usize))
 }
@@ -144,14 +152,12 @@ pub(crate) fn diff_overlay_anchors(app: &AppState, outer: Rect) -> Option<DiffOv
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    let ws = app.active.and_then(|idx| app.workspaces.get(idx))?;
-    ws.git_space()?;
-    let diff = ws.git_diff()?;
+    let diff = focused_pane_diff(app)?;
     if diff.lines.is_empty() {
         return None;
     }
     let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
-    let built = build_diff_rows(diff, scroll, area.height as usize);
+    let built = build_diff_rows(&diff, scroll, area.height as usize);
 
     let mut rail_rows = Vec::new();
     let mut file_rows = Vec::new();
@@ -675,22 +681,26 @@ mod the_diff_rail_stands_only_between_files {
     /// at the exact rows the text renderer draws them at — driven through
     /// the real `AppState`, not a hand-rolled offset walk, so this fails if
     /// the overlay's positions and the drawn ones ever come from two
-    /// different derivations.
+    /// different derivations. It also pins the overlay to the *same* source
+    /// the text draws from: the focused pane's agent edit log.
     #[test]
     fn overlay_anchors_land_on_the_same_rows_the_text_renderer_draws() {
-        let mut ws = crate::workspace::Workspace::test_new("one");
-        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "repo-key".into(),
-            checkout_key: "/repo".into(),
-            repo_name: "repo".into(),
-            repo_root: "/repo".into(),
-            is_linked_worktree: false,
-        });
-        ws.cached_git_diff = Some(diff(&["a.rs", "b.rs"]));
+        let ws = crate::workspace::Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
 
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![ws];
         app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("ensure_test_terminals must have backfilled this terminal")
+            .agent_edit_log
+            .set_or_clear("both".into(), diff(&["a.rs", "b.rs"]));
 
         let outer = Rect::new(0, 0, 40, 20);
         let anchors = diff_overlay_anchors(&app, outer).expect("a diff to anchor against");
