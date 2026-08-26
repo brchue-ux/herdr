@@ -360,11 +360,11 @@ herdr pane report-edit-diff <pane_id> \
 diff -u "$BASELINE" "$FILE" | herdr pane report-edit-diff "$PANE_ID" --file "$FILE" --diff -
 ```
 
-Each call replaces that file's previous entry; it never appends. Snapshot each file's content once, the first time the agent touches it in a session, and recompute the whole diff against that same fixed baseline on every later edit, so three edits to one file stay one clean diff instead of three stacked hunks. `--file` is the path as you want it displayed; it is not resolved or checked against the pane's cwd. The diff does not need a `diff --git` line — Herdr synthesizes one from `--file` so each reported file opens under its own header card.
+Each call replaces that file's previous entry; it never appends. Snapshot each file's content once, the first time the agent touches it in a session, and recompute the whole diff against that same fixed baseline on every later edit, so three edits to one file stay one clean diff instead of three stacked hunks. `--file` is the path as you want it displayed; it is not resolved or checked against the pane's cwd, but it is trimmed, stripped of control characters, and capped at 4096 characters. The diff does not need a `diff --git` line — Herdr synthesizes one from `--file` so each reported file opens under its own header card.
 
 Omitting `--diff`, or piping in nothing, clears that one file's entry — send that when an edit is reverted back to its baseline. `--clear-all` ignores `--file` and empties the pane's whole log instead; send it when a new agent session takes over the pane, so it does not inherit the previous session's edits. `--file` is required for every call that is not `--clear-all`.
 
-A diff longer than 4000 lines — the same ceiling the Changes zone renders to — is rejected whole rather than stored truncated. The log is display-only, takes no lifecycle authority, and is not restored after a server restart.
+One call's diff is capped at 4000 lines, counting the `diff --git` line Herdr synthesizes — that bounds one file's report, not the pane's whole log, which has no total ceiling. A longer one is rejected whole rather than stored truncated. The log is display-only, takes no lifecycle authority, and is not restored after a server restart.
 
 Herdr does not capture these edits itself: this is the door for a `PreToolUse`/`PostToolUse` hook pair installed beside the managed integration hook. The bundled Claude Code integration sends only `--clear-all`, on `SessionStart`.
 
