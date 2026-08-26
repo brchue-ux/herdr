@@ -423,14 +423,29 @@ impl<'a> Card<'a> {
             // `fill` is what runs between the two ends: a solid rule on the
             // edges that close the box, the seam glyph on a top that is a cut
             // rather than an edge, and nothing at all on a content row.
-            let (left, right, fill, style) = if row == 0 && self.opened_above {
+            //
+            // `fill_style` is `None` wherever the ends and the span between them
+            // are one mark in one ink, which is every row that closes the box.
+            // The seam is the one row where they are two: see below.
+            let (left, right, fill, style, fill_style) = if row == 0 && self.opened_above {
                 // No corners: the sides run straight up through this row and
                 // out of the panel, which is the whole of what the cut says.
+                //
+                // **And the two ends are the box's own side border, not part of
+                // the rule.** They are the same `│` at the same hue every other
+                // side row draws, because that is what they are — the sides
+                // running through — and only the `┈` between them is the dimmer
+                // seam. This is the exact end/fill split
+                // [`Self::render_crew_rule`] already draws on a card that is not
+                // cut, where the ends belong to `render_frame` and the fill to
+                // the rule; a seam drawn in one style would be the one row of
+                // the box whose sides are a shade off.
                 (
                     "│",
                     "│",
                     Some(CREW_RULE),
-                    Style::default().fg(hue(BOTTOM_RULE_MIX)),
+                    Style::default().fg(hue(SIDE_BORDER_MIX)),
+                    Some(Style::default().fg(hue(BOTTOM_RULE_MIX))),
                 )
             } else if row == 0 {
                 (
@@ -438,6 +453,7 @@ impl<'a> Card<'a> {
                     "╮",
                     Some("─"),
                     Style::default().fg(hue(TOP_BORDER_MIX)),
+                    None,
                 )
             } else if row == bottom {
                 (
@@ -447,14 +463,24 @@ impl<'a> Card<'a> {
                     Style::default()
                         .fg(hue(BOTTOM_RULE_MIX))
                         .add_modifier(Modifier::BOLD),
+                    None,
                 )
             } else {
-                ("│", "│", None, Style::default().fg(hue(SIDE_BORDER_MIX)))
+                (
+                    "│",
+                    "│",
+                    None,
+                    Style::default().fg(hue(SIDE_BORDER_MIX)),
+                    None,
+                )
             };
-            let style = match glow(row) {
+            // The row's glow is the row's, whichever ink is standing on it.
+            let lit = |style: Style| match glow(row) {
                 Some(bg) => style.bg(bg),
                 None => style,
             };
+            let style = lit(style);
+            let fill_style = fill_style.map_or(style, lit);
             let buf = frame.buffer_mut();
             buf[(self.frame.x, y)].set_symbol(left);
             buf[(self.frame.x, y)].set_style(style);
@@ -464,7 +490,7 @@ impl<'a> Card<'a> {
             if let Some(fill) = fill {
                 for x in self.frame.x + 1..right_x {
                     buf[(x, y)].set_symbol(fill);
-                    buf[(x, y)].set_style(style);
+                    buf[(x, y)].set_style(fill_style);
                 }
             }
         }

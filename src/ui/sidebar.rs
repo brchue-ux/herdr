@@ -718,10 +718,22 @@ pub(crate) fn cut_crew_box_head(
     entries: &[WorkspaceListEntry],
     idx: usize,
 ) -> Option<usize> {
-    (idx == app.workspace_scroll)
-        .then(|| crew_head(entries, idx))
-        .flatten()
-        .filter(|head| *head < app.workspace_scroll)
+    if idx != app.workspace_scroll {
+        return None;
+    }
+    let head = crew_head(entries, idx)?;
+    // "Above the panel" needs no second test. [`crew_head`] walks strictly *up*
+    // the list — [`tree_parent`] only ever looks at rows before its own — so a
+    // head is always below its worker's index, and `idx` here is the panel's own
+    // first drawn row. Stated as the invariant it is rather than re-asked as a
+    // condition that cannot fail, so a change to either walk trips a debug build
+    // instead of silently turning this into a filter that does something.
+    debug_assert!(
+        head < app.workspace_scroll,
+        "crew_head({idx}) is {head}, which is not above the panel's first drawn row {}",
+        app.workspace_scroll
+    );
+    Some(head)
 }
 
 /// Which indent step the row at `idx` draws at inside its Space's card.
@@ -14023,8 +14035,10 @@ mod a_scrolled_panel_still_draws_its_workers {
         Rect::new(0, 0, 42, 46)
     }
 
-    /// The panel as characters, row by row, through the real render pass.
-    fn screen(app: &mut AppState, area: Rect) -> Vec<String> {
+    /// The panel's own cells, through the real render pass — glyphs *and* the
+    /// styles they were drawn in, which is what the two colour assertions below
+    /// read.
+    fn painted(app: &mut AppState, area: Rect) -> ratatui::buffer::Buffer {
         app.view.sidebar_rect = area;
         app.view.workspace_card_areas = compute_workspace_card_areas(app, area);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -14033,7 +14047,12 @@ mod a_scrolled_panel_still_draws_its_workers {
                 render_sidebar(app, &TerminalRuntimeRegistry::new(), frame, area);
             })
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The panel as characters, row by row, through the real render pass.
+    fn screen(app: &mut AppState, area: Rect) -> Vec<String> {
+        let buffer = painted(app, area);
         (0..area.height)
             .map(|row| {
                 (0..area.width)
@@ -14224,6 +14243,144 @@ mod a_scrolled_panel_still_draws_its_workers {
         assert!(
             !cut.contains("mate"),
             "the cut was drawn over the worker's own name: {cut:?}"
+        );
+    }
+
+    /// **The seam's two ends are the box's side border, not part of the rule.**
+    ///
+    /// The seam row is one row of one box, and its `│` ends are the sides
+    /// running through it — so they carry the same ink every other side row's
+    /// `│` does, and only the `┈` between them is the dimmer rule. This is the
+    /// split [`card::Card::render_crew_rule`] already draws on an *uncut* card,
+    /// where the ends belong to the frame and the fill to the rule; drawing the
+    /// whole seam in the rule's ink left the box with one row whose sides were
+    /// visibly a shade off.
+    #[test]
+    fn the_seams_ends_are_the_side_border_and_only_its_fill_is_the_rule() {
+        let mut app = crewed_fleet();
+        app.workspace_scroll = 1;
+        let (box_row, _) = cut_box(&app, area());
+        let frame = box_row.card_frame.expect("the row that carries the box");
+        assert!(
+            frame.height > 2,
+            "the cut box has no plain side row to compare against"
+        );
+        let buffer = painted(&mut app, area());
+        let right_x = frame.x + frame.width - 1;
+        let cell = |x: u16, y: u16| {
+            let cell = &buffer[(x, y)];
+            (cell.symbol().to_string(), cell.fg)
+        };
+
+        let (seam_left, seam_left_fg) = cell(frame.x, frame.y);
+        let (seam_right, seam_right_fg) = cell(right_x, frame.y);
+        let (seam_fill, seam_fill_fg) = cell(frame.x + 1, frame.y);
+        let (side_left, side_fg) = cell(frame.x, frame.y + 1);
+        assert_eq!(
+            (seam_left.as_str(), seam_right.as_str(), seam_fill.as_str()),
+            ("│", "│", "┈"),
+            "this is not the seam row at all"
+        );
+        assert_eq!(side_left, "│", "the row under the seam is not a plain side");
+
+        assert_eq!(
+            (seam_left_fg, seam_right_fg),
+            (side_fg, side_fg),
+            "the seam's own ends are drawn in a different ink from every other \
+             side row's, so the box has one row whose border is a shade off"
+        );
+        assert_ne!(
+            seam_fill_fg, side_fg,
+            "the seam's fill is drawn at the side border's ink, so the rule has \
+             stopped reading as a rule"
+        );
+
+        // And the fill is the *rule's* ink, which is the one the box's own
+        // closing edge is drawn in.
+        let (closing, closing_fg) = cell(frame.x, frame.y + frame.height - 1);
+        assert_eq!(closing, "╰", "the box does not close inside the panel");
+        assert_eq!(
+            seam_fill_fg, closing_fg,
+            "the seam's fill is not the rule ink the box's own closing edge uses"
+        );
+    }
+
+    /// **A cut box is drawn in its mate's colour, never in its worker's.**
+    ///
+    /// The box belongs to the Space; the worker that draws it only supplies
+    /// somebody to hold the pen ([`cut_crew_shell`]). So the hue is read off the
+    /// *mate's* own aggregate state — a hue read off the worker instead would
+    /// put one border around a whole list in the colour of whichever row
+    /// happened to be first on screen, and would change as that one worker's own
+    /// state moved while the rest of the list stood still.
+    ///
+    /// Held against the two candidate boxes actually drawn rather than against a
+    /// colour name: the border's ink is the accent mixed toward the panel, so
+    /// what the wrong read would have looked like is only knowable by drawing it.
+    #[test]
+    fn the_cut_box_takes_its_colour_from_the_mate_and_not_the_worker() {
+        let mut app = crewed_fleet();
+        // The Space and the worker that opens its box are put in deliberately
+        // different states. Moved on the *last* worker, because the Space's
+        // aggregate is the loudest pane in it: changing the first worker — the
+        // one that draws the border — would move both at once and the test could
+        // not tell them apart.
+        for terminal in app.terminals.values_mut() {
+            if terminal.agent_name.as_deref() == Some("fm/via") {
+                terminal.state = AgentState::Blocked;
+            }
+        }
+        app.workspace_scroll = 1;
+
+        let entries = workspace_list_entries(&app);
+        let agents = sidebar_agent_entries(&app);
+        let (mate_state, mate_seen) = app.workspaces[0].aggregate_state(&app.terminals);
+        let mate_ink = state_label_color(mate_state, mate_seen, &app.sidebar_palette);
+        let WorkspaceListEntry::Agent { entry_idx, .. } = entries[1] else {
+            panic!("row 1 is not the worker that opens the box");
+        };
+        let worker = &agents[entry_idx];
+        let worker_ink = state_label_color(worker.state, worker.seen, &app.sidebar_palette);
+        assert_ne!(
+            mate_ink, worker_ink,
+            "the fixture puts the mate and its first worker in the same state, so \
+             a border read off either one would look identical"
+        );
+
+        let (box_row, _) = cut_box(&app, area());
+        let frame = box_row.card_frame.expect("the row that carries the box");
+        let drawn = painted(&mut app, area())[(frame.x, frame.y)].fg;
+
+        // The same box the panel drew, in each of the two candidate hues.
+        let shell_fg = |accent| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(area().width, area().height)).unwrap();
+            terminal
+                .draw(|f| {
+                    card::Card::new(
+                        frame,
+                        accent,
+                        workspace_row_highlighted(&app, 0),
+                        &app.sidebar_palette,
+                        &app.host_terminal_theme,
+                    )
+                    .expect("a frame big enough to hold a box")
+                    .opened_above()
+                    .render_frame(f, area().height, None);
+                })
+                .unwrap();
+            terminal.backend().buffer()[(frame.x, frame.y)].fg
+        };
+        let from_mate = shell_fg(mate_ink);
+        let from_worker = shell_fg(worker_ink);
+        assert_ne!(
+            from_mate, from_worker,
+            "the two hues resolve to the same border ink, so this measures nothing"
+        );
+        assert_eq!(
+            drawn, from_mate,
+            "the cut box is drawn in {worker_ink:?} — the worker's own state — \
+             where it must carry the mate's {mate_ink:?}"
         );
     }
 

@@ -5958,14 +5958,6 @@ impl Rasteriser<'_> {
         // measures both halves — how close the line lands, and that the card
         // never leaves its cells to get there.
         let gutter = (cell_height - wanted).max(0.0);
-        // Nothing to centre a cut box on: no branch line meets it, because the
-        // row it would point at is above the panel. It stands on its own first
-        // cell and the cut is what its top says.
-        let connector_offset = if content.cut_above {
-            0.0
-        } else {
-            connector_row_offset_px(frame.height, self.cell_h).clamp(-gutter / 2.0, gutter / 2.0)
-        };
         // The left border stands where the tree's rails have their ink, not
         // where the card's first cell begins. See [`RAIL_INK_COLUMN_FRACTION`].
         let left =
@@ -5973,7 +5965,22 @@ impl Rasteriser<'_> {
         // Where the part of the box that is on screen begins. On a cut box the
         // whole card is placed `head` higher than that, so the border it draws
         // through this row is a side and never a top.
-        let drawn_top = cell_top + (cell_height - wanted) / 2.0 + connector_offset;
+        let drawn_top = if content.cut_above {
+            // **Pinned to the panel's own first cell, never centred in it.**
+            // Nothing to centre a cut box on: no branch line meets it, because
+            // the row it would point at is above the panel. And nothing to
+            // centre it *in*, either — its visible top is the panel's hard
+            // boundary rather than a gutter, so the box grows downward only.
+            // Centring would walk the cut a few pixels into the panel while the
+            // crew's tracks opened and lift it back as they settled, which reads
+            // as the top of the panel moving rather than as a list arriving.
+            cell_top
+        } else {
+            cell_top
+                + (cell_height - wanted) / 2.0
+                + connector_row_offset_px(frame.height, self.cell_h)
+                    .clamp(-gutter / 2.0, gutter / 2.0)
+        };
         PlacedCard {
             rect: RoundRect {
                 x: left,
@@ -9468,15 +9475,18 @@ mod a_card_is_its_own_shape {
     }
 
     /// The frame of every row that gets an image of its own — which is every
-    /// row with a *card*, and so not the worker rows drawn inside a Space's own
-    /// box. Those keep a rect and a click target but open no box, so they are
-    /// handed no frame at all and their ink is in their Space's image. See
-    /// [`crew_for`].
+    /// row that opens a box. Most worker rows do not: they keep a rect and a
+    /// click target but their ink is in their Space's image, so the layout hands
+    /// them no frame at all (see [`crew_for`]).
+    ///
+    /// **Asked of the frame and never of the fold**, because the two part company
+    /// exactly once: the worker that opens a *cut* box is a folded row that does
+    /// hold a frame ([`super::super::cut_crew_box_head`]). Filtering on the fold
+    /// would drop that row silently and hand a scrolled test an empty vector
+    /// instead of an assertion it could fail.
     fn framed(app: &AppState) -> Vec<Rect> {
-        let entries = super::super::workspace_list_entries(app);
         super::super::compute_workspace_card_areas(app, sidebar_rect())
             .into_iter()
-            .filter(|card| super::super::crew_head(&entries, card.entry_idx).is_none())
             .filter_map(|card| card.card_frame)
             .filter(|frame| frame.width > 0 && frame.height > 0)
             .collect()
@@ -15550,6 +15560,195 @@ mod a_card_draws_the_workers_it_carries {
             leftmost_difference(&crewed_canvas, &unbloomed, first, first + BANDS.row).is_some(),
             "a card with a worker drew nothing in its own list's band"
         );
+    }
+
+    /// **A cut box paints nothing at all in the band above its own cut.**
+    ///
+    /// The pixel half of the captain's ruling — *"they need to stay in the card.
+    /// not escape it because of scrolling."* — is three guards in [`draw_card`],
+    /// and this is the one assertion that holds all three. On a
+    /// [`CardContent::cut_above`] card the icon plate, the control rail, and
+    /// everything from the title down (its captions, its worker dot and its
+    /// sparkline) are all suppressed: every one of them belongs to a block that
+    /// is above the panel, and drawing any of them here would be the mate's own
+    /// block *moved* rather than scrolled past — a card that never leaves the
+    /// panel however far the tree is scrolled.
+    ///
+    /// The box is placed the way [`Rasteriser::place`] places a cut one: the
+    /// whole card `head` px above the first row the panel draws, with
+    /// [`PlacedCard::clip_top`] at that row. So the head band is in frame, it is
+    /// exactly where all three of those blocks would land, and deleting any one
+    /// guard puts ink in it. Each is given something real to draw first — a
+    /// title, a rail with a badge on it, a plate with a size, a sparkline — so a
+    /// missing guard has something to say rather than nothing.
+    #[test]
+    fn a_cut_box_paints_nothing_above_its_own_cut() {
+        let Some(font) = font::card_font(None) else {
+            return; // No proportional face on this machine.
+        };
+        let head = card_height_px(
+            font.metrics(TITLE_PX),
+            font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+        );
+        let mut content = content(vec![
+            member("fm/direct", 0, crew::CrewArrival::SETTLED),
+            member("fm/via", 1, crew::CrewArrival::SETTLED),
+        ]);
+        content.cut_above = true;
+        content.controls = ControlRail {
+            summary: Some(SummaryBadge {
+                count: 3,
+                fresh: true,
+            }),
+            group: None,
+            space_badge: None,
+        };
+        content.bars = Some(vec![20, 60, 100, 40]);
+        assert!(
+            !content.title.is_empty() && content.register.is_some(),
+            "the title guard has nothing to suppress"
+        );
+        assert!(
+            !content.controls.is_empty(),
+            "the rail guard has nothing to suppress"
+        );
+
+        // The plate is sized off the *geometry*, exactly as `Rasteriser::place`
+        // sizes it (`CardGeometry::new(cell, content.mark.is_some())`), and the
+        // guard reads that. `CardMark` is uninhabited today, so the slot is asked
+        // for here directly rather than through a mark that cannot be built.
+        let geometry = CardGeometry::new(CELL_H, true);
+        let plate = geometry.plate.min(head - geometry.pad * 2.0).max(0.0);
+        assert!(
+            plate > 2.0,
+            "the icon slot collapsed to {plate} px, so the plate guard is not \
+             under test at all"
+        );
+
+        let crew_px = crew::drawn_extent_px(BANDS, &content.crew);
+        let rect = RoundRect {
+            x: 4.0,
+            y: 4.0,
+            w: 320.0,
+            h: head + crew_px,
+            r: geometry.radius,
+        };
+        // Where the panel starts, which on a cut box is where its own block ends.
+        let cut = rect.y + head;
+        let mut canvas = Canvas::new(340, (rect.y + rect.h).ceil() as u32 + 8);
+        draw_card(
+            &mut canvas,
+            &PlacedCard {
+                clip_top: cut,
+                rect,
+                content: &content,
+                geometry,
+                crew: BANDS,
+            },
+            font,
+        );
+
+        let width = canvas.width();
+        let band = cut.floor() as u32;
+        assert!(
+            band > 0 && band < canvas.height(),
+            "the head band is not in frame, so this measures nothing"
+        );
+        let px = canvas.rgba8();
+        let lit: Vec<(u32, u32)> = (0..band)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|(x, y)| px[((y * width + x) * 4 + 3) as usize] != 0)
+            .collect();
+        assert!(
+            lit.is_empty(),
+            "a cut box painted {} pixels above its own cut, the first at {:?} — \
+             its block is above the panel and none of it may be drawn here",
+            lit.len(),
+            lit.first()
+        );
+
+        // And it drew its list below the cut, so the band check above is not
+        // passing on a card that drew nothing anywhere.
+        assert!(
+            (band..canvas.height())
+                .any(|y| (0..width).any(|x| px[((y * width + x) * 4 + 3) as usize] != 0)),
+            "the cut box drew nothing at all; an empty head band proves nothing"
+        );
+    }
+
+    /// **A cut box stands on the panel's own first cell for the whole of its
+    /// arrival.**
+    ///
+    /// A card the panel draws whole is centred in the cells its row was given,
+    /// so it grows out of the middle of its own gutter as its crew opens — that
+    /// is what keeps its ink on the row its branch line meets it on. A cut box
+    /// has no such gutter above it: its visible top edge *is* the panel's own
+    /// hard boundary and every row above it is off screen. Centring it would
+    /// walk the cut a few pixels down into the panel while the tracks opened and
+    /// lift it back as they settled, which reads as the top of the panel moving
+    /// rather than as a list arriving. So it is pinned, and grows downward only.
+    #[test]
+    fn a_cut_box_stands_on_its_first_cell_for_the_whole_of_its_arrival() {
+        let Some(font) = font::card_font(None) else {
+            return; // No proportional face on this machine.
+        };
+        let cell = HostCellSize {
+            width_px: 10,
+            height_px: 21,
+        };
+        let cell_h = f32::from(u16::try_from(cell.height_px).expect("a sane cell"));
+        let field = Rect::new(0, 0, 42, 46);
+        let rasteriser = Rasteriser {
+            font,
+            title_metrics: font.metrics(TITLE_PX),
+            tidbit_metrics: font.metrics(TITLE_PX * measured::TIDBIT_SIZE_MUL),
+            cell_size: cell,
+            cell_w: f32::from(u16::try_from(cell.width_px).expect("a sane cell")),
+            cell_h,
+            crew_bands: crew::CrewBands::of(font, TITLE_PX, cell_h),
+            field,
+            bounds: field,
+            bloom_floor: field.height,
+            backdrop: Rgb(9, 17, 28),
+            rail: None,
+            dissolve: None,
+            host_terminal_kind: crate::kitty_graphics::HostTerminalKind::Kitty,
+            host_graphics_is_local: true,
+        };
+        // The cells the layout reserves for a *settled* two-worker list, which
+        // is what a row carrying one is actually given. So the box fills its own
+        // cells at the end of the gesture and has a real gutter part-way through
+        // it — exactly the gutter the old centring drifted into.
+        let bands = rasteriser.crew_bands;
+        let settled_px = bands.divider + bands.row * 2.0;
+        let frame = Rect::new(1, 3, 20, (settled_px / cell_h).round() as u16);
+        let first_cell = f32::from(frame.y - field.y) * cell_h;
+
+        // `clip_top` is where the box begins on screen — see `Rasteriser::place`.
+        let cut_at = |open: f32| {
+            let arrival = crew::CrewArrival { open, bloom: open };
+            let mut content = content(vec![
+                member("fm/direct", 0, arrival),
+                member("fm/via", 1, arrival),
+            ]);
+            content.cut_above = true;
+            rasteriser.place(frame, &content, field).clip_top
+        };
+        assert_eq!(
+            cut_at(1.0),
+            first_cell,
+            "a settled cut box is not standing on the panel's own first cell"
+        );
+        for step in 1u8..8 {
+            let open = f32::from(step) / 8.0;
+            assert_eq!(
+                cut_at(open),
+                first_cell,
+                "a cut box {open:.3} of the way through its arrival is cut at \
+                 {}, not on the panel's first cell at {first_cell}",
+                cut_at(open)
+            );
+        }
     }
 
     /// **A second mate's row is drawn one fixed step right of a direct one.**
