@@ -493,6 +493,7 @@ mod tests {
             severity: Severity::Clear,
             hues: StageHues(hues),
             ground: Rgb(9, 17, 28),
+            theme: super::super::CardTheme::UNTHEMED,
             split_channels: true,
             seen: true,
             depth: 0,

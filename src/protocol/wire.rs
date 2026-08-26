@@ -36,11 +36,14 @@ use serde::{Deserialize, Serialize};
 /// `check_client_version` already gives any other incompatible pairing.
 ///
 /// `CardContentWire` has since also gained `crew` — the workers a Space's card
-/// draws inside its own box — which is the same class of positional shape change
-/// and needs no further bump: 24 has not been published in either channel (both
+/// draws inside its own box — `theme`, the card colours the server's own
+/// `[theme.custom]` block authored, and, inside `crew`, each worker's own
+/// `pulse`. All are the same class of positional shape change and need no
+/// further bump: 24 has not been published in either channel (both
 /// `website/latest.json` and `website/preview.json` still declare 19), so every
-/// pairing that could see either field is a pairing already separated by 24. The
-/// bump is owed once per *published* protocol, not once per incompatible change.
+/// pairing that could see any of those fields is a pairing already separated by
+/// 24. The bump is owed once per *published* protocol, not once per
+/// incompatible change.
 pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
