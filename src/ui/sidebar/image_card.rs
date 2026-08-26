@@ -15630,6 +15630,35 @@ mod the_theme_reaches_the_card {
         assert_eq!(resolved.face(), measured::GLASS_FACE);
     }
 
+    /// All six roles at once, spelled as the `[theme.custom]` block someone
+    /// converging on the mockup would actually write.
+    ///
+    /// The three-role case above proves the mechanism; this proves the
+    /// *mapping* — that `surface0` is the card's edge and not its fill, that
+    /// `yellow` is the warn badge and not the healthy one, and so on. A
+    /// mechanism that worked while the roles were crossed would put every
+    /// colour on screen and none of them where the mockup puts it.
+    #[test]
+    fn the_mockups_own_six_roles_land_where_the_mockup_puts_them() {
+        let mut app = AppState::test_new();
+        app.theme_runtime.custom = Some(crate::config::CustomThemeColors {
+            accent: Some("#5ad1ff".to_string()),   // --cyan
+            surface0: Some("#16233a".to_string()), // --edge
+            panel_bg: Some("#0a1220".to_string()), // --panel
+            text: Some("#e6edf3".to_string()),     // --ink
+            green: Some("#3ddc84".to_string()),    // --ok
+            yellow: Some("#ffb454".to_string()),   // --amber
+            ..Default::default()
+        });
+        let t = CardTheme::resolve(&app);
+        assert_eq!(t.accent(), Rgb(0x5a, 0xd1, 0xff), "accent");
+        assert_eq!(t.edge(), Rgb(0x16, 0x23, 0x3a), "edge");
+        assert_eq!(t.face(), Rgb(0x0a, 0x12, 0x20), "face");
+        assert_eq!(t.ink(), Rgb(0xe6, 0xed, 0xf3), "ink");
+        assert_eq!(t.badge_ok(), Rgb(0x3d, 0xdc, 0x84), "badge ok");
+        assert_eq!(t.badge_warn(), Rgb(0xff, 0xb4, 0x54), "badge warn");
+    }
+
     /// A role authored as a reset alias is *not* an authored colour.
     ///
     /// `panel_bg = "reset"` is in the configuration docs' own example, and it
