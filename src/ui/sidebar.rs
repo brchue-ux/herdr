@@ -5282,6 +5282,12 @@ fn failure_spider_waypoints(
 /// It stays inside that text column at every point of the climb. A marker that
 /// set out from the trunk, as a card's does, would cross its mate's border on
 /// the way in — a mark from inside the box drawn outside it.
+///
+/// The row it sets out from is its own last *line*, which is not always its
+/// rect's last row: the worker that ends its mate's list reserved a row in its
+/// own rect for the closing rule ([`CrewRowLayout::closes_the_box`]), and that
+/// row belongs to the box's border, not to this worker. Starting there would
+/// paint the marker over the `╰────╯` the card draws.
 fn crew_marker_position(
     card: &crate::app::state::WorkspaceCardArea,
     crew: &CrewRowLayout,
@@ -5296,7 +5302,9 @@ fn crew_marker_position(
         .rect
         .y
         .saturating_add(card.rect.height)
-        .saturating_sub(1);
+        .saturating_sub(1)
+        .saturating_sub(u16::from(crew.closes_the_box))
+        .max(top);
     let centre = left.saturating_add(crew.text_width.saturating_sub(1) / 2);
     let t = t.clamp(0.0, 1.0);
     let climb = f32::from(bottom.saturating_sub(top));
@@ -5422,46 +5430,70 @@ mod failure_spider_geometry {
     /// reason would retire an open defect the moment the design changed. So it
     /// rides its own row instead — and never sets out from the trunk, which
     /// would put a mark from inside the box in the gutter outside it.
+    ///
+    /// **Its own row is its own lines.** The worker that ends its mate's list
+    /// holds a row in its rect for the box's closing rule
+    /// ([`CrewRowLayout::closes_the_box`]), and that row is the border's. A
+    /// climb that set out from the rect's last row would start on the `╰────╯`
+    /// and paint over it, so both cases are walked here.
     #[test]
     fn a_workers_marker_rides_its_own_row_and_never_leaves_the_box() {
-        let mut area = card(Rect::new(0, 4, 40, 2), Rect::new(6, 4, 34, 2));
-        area.card_frame = None;
-        let crew = CrewRowLayout {
-            text_offset: 8,
-            text_width: 30,
-            via_mate: false,
-            closes_the_box: false,
-            lines: Vec::new(),
-        };
-        let left = area.rect.x + crew.text_offset;
-        let right = left + crew.text_width;
+        for closes_the_box in [false, true] {
+            // Two lines of type, plus the closing rule's row when this worker
+            // is the one the box closes under.
+            let rule = u16::from(closes_the_box);
+            let height = 2 + rule;
+            let mut area = card(Rect::new(0, 4, 40, height), Rect::new(6, 4, 34, height));
+            area.card_frame = None;
+            let crew = CrewRowLayout {
+                text_offset: 8,
+                text_width: 30,
+                via_mate: false,
+                closes_the_box,
+                lines: Vec::new(),
+            };
+            let left = area.rect.x + crew.text_offset;
+            let right = left + crew.text_width;
+            // The last row this worker's own type is set on, which is where the
+            // climb starts — not the rect's last row when a rule is under it.
+            let last_line = area.rect.y + height - 1 - rule;
 
-        let (x, y) = crew_marker_position(&area, &crew, 1.0).expect("a crew row gives a position");
-        assert_eq!(y, area.rect.y, "settled on the row's own first line");
-        assert_eq!(
-            x,
-            left + (crew.text_width - 1) / 2,
-            "centred on its own row"
-        );
+            let (x, y) =
+                crew_marker_position(&area, &crew, 1.0).expect("a crew row gives a position");
+            assert_eq!(y, area.rect.y, "settled on the row's own first line");
+            assert_eq!(
+                x,
+                left + (crew.text_width - 1) / 2,
+                "centred on its own row"
+            );
 
-        let mut previous = crew_marker_position(&area, &crew, 0.0).unwrap();
-        for step in 0u16..=20 {
-            let current = crew_marker_position(&area, &crew, f32::from(step) / 20.0)
-                .expect("a crew row gives a position");
-            assert!(
-                current.0 >= left && current.0 < right,
-                "the marker left its mate's text column at step {step}: {current:?}"
+            assert_eq!(
+                crew_marker_position(&area, &crew, 0.0).expect("a crew row gives a position"),
+                (left, last_line),
+                "the climb did not set out from the row's own last line \
+                 (closes_the_box: {closes_the_box})"
             );
-            assert!(
-                current.1 >= area.rect.y && current.1 < area.rect.y + area.rect.height,
-                "the marker left its own row at step {step}: {current:?}"
-            );
-            // One axis at a time, exactly as a card's own climb is.
-            assert!(
-                current.0 == previous.0 || current.1 == previous.1,
-                "a step moved diagonally: {previous:?} -> {current:?}"
-            );
-            previous = current;
+
+            let mut previous = crew_marker_position(&area, &crew, 0.0).unwrap();
+            for step in 0u16..=20 {
+                let current = crew_marker_position(&area, &crew, f32::from(step) / 20.0)
+                    .expect("a crew row gives a position");
+                assert!(
+                    current.0 >= left && current.0 < right,
+                    "the marker left its mate's text column at step {step}: {current:?}"
+                );
+                assert!(
+                    current.1 >= area.rect.y && current.1 <= last_line,
+                    "the marker left its own lines at step {step}: {current:?} \
+                     (closes_the_box: {closes_the_box})"
+                );
+                // One axis at a time, exactly as a card's own climb is.
+                assert!(
+                    current.0 == previous.0 || current.1 == previous.1,
+                    "a step moved diagonally: {previous:?} -> {current:?}"
+                );
+                previous = current;
+            }
         }
     }
 
