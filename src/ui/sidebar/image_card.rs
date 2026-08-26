@@ -15630,6 +15630,28 @@ mod the_theme_reaches_the_card {
         assert_eq!(resolved.face(), measured::GLASS_FACE);
     }
 
+    /// A role authored as a reset alias is *not* an authored colour.
+    ///
+    /// `panel_bg = "reset"` is in the configuration docs' own example, and it
+    /// means "this surface has no colour of its own". [`parse_color`] turns it
+    /// into `Color::Reset` and `resolve_color_rgb` answers `None` for that, so
+    /// it has to land on the measurement rather than on whatever a resolved
+    /// `Reset` would otherwise composite to.
+    ///
+    /// [`parse_color`]: crate::config::parse_color
+    #[test]
+    fn a_reset_alias_leaves_the_measurement_standing() {
+        let mut app = AppState::test_new();
+        app.theme_runtime.custom = Some(crate::config::CustomThemeColors {
+            panel_bg: Some("reset".to_string()),
+            green: Some("transparent".to_string()),
+            ..Default::default()
+        });
+        let resolved = CardTheme::resolve(&app);
+        assert_eq!(resolved.face(), measured::GLASS_FACE);
+        assert_eq!(resolved.badge_ok(), measured::BADGE_OK);
+    }
+
     /// A card's signature moves when its theme does.
     ///
     /// Without this the sheet is carried forward on a stale hash and the panel

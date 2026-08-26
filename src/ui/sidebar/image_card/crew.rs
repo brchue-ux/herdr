@@ -359,8 +359,9 @@ pub(super) fn drawn_extent_px(bands: CrewBands, members: &[CrewMember]) -> f32 {
 /// `rgba(--cyan, .55)`. They are the same colour on an unthemed panel — the
 /// one measured hue family — and only a theme that authored `--edge`
 /// separates them.
-#[allow(clippy::too_many_arguments)] // Sheet, font, rows, geometry, two inks and
-                                     // the card's own opacity: each varies per call.
+#[allow(clippy::too_many_arguments)] // Sheet, font, rows, geometry, three inks
+                                     // and the card's own opacity: each varies
+                                     // per call.
 pub(super) fn draw(
     sheet: &mut Canvas,
     font: &CardFont,
