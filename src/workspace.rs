@@ -55,7 +55,6 @@ pub struct WorkspaceGitStatus {
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub dirty: Option<GitDirtyCounts>,
-    pub diff: Option<GitDiffText>,
     pub space: Option<GitSpaceMetadata>,
 }
 
@@ -65,7 +64,6 @@ pub struct WorkspaceGitStatusSnapshot {
     pub branch: Option<String>,
     pub ahead_behind: Option<(usize, usize)>,
     pub dirty: Option<GitDirtyCounts>,
-    pub diff: Option<GitDiffText>,
     pub space: Option<GitSpaceMetadata>,
 }
 
@@ -119,7 +117,6 @@ impl WorkspaceGitStatusSnapshot {
             branch: self.branch,
             ahead_behind: self.ahead_behind,
             dirty: self.dirty,
-            diff: self.diff,
             space: self.space,
         }
     }
@@ -216,11 +213,6 @@ pub struct Workspace {
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
     /// Cached uncommitted-work counts for this workspace's checkout.
     pub(crate) cached_git_dirty: Option<GitDirtyCounts>,
-    /// Cached unified diff against `HEAD` for this workspace's checkout.
-    ///
-    /// Only ever populated for the workspace backing the currently visible
-    /// diff pane — see `GitStatusRefreshDemand::diff`.
-    pub(crate) cached_git_diff: Option<GitDiffText>,
     /// Remote URL whose pull requests belong to this workspace's checkout.
     pub(crate) cached_remote_url: Option<String>,
     /// Cached open pull request counts for `cached_remote_url`'s repository.
@@ -301,7 +293,6 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_dirty: None,
-            cached_git_diff: None,
             cached_remote_url: None,
             cached_pull_requests: None,
             cached_git_space: identity.space,
@@ -504,7 +495,6 @@ impl Workspace {
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
                 cached_git_dirty: None,
-                cached_git_diff: None,
                 cached_remote_url: None,
                 cached_pull_requests: None,
                 cached_git_space: identity.space,
@@ -1185,28 +1175,6 @@ impl Workspace {
             .or_else(|| Some(self.identity_cwd.clone()))
     }
 
-    /// The cwd of whichever pane is focused in this Space's active tab right
-    /// now — the diff pane's own target, kept independent of
-    /// [`Self::resolved_identity_cwd_from`] (the *Space's* sidebar identity,
-    /// fixed to its first tab's root pane) so that switching to a different
-    /// worker's pane, in a different tab and a different worktree, changes
-    /// what the diff pane shows without disturbing the Space's own label or
-    /// branch. Falls back to [`Self::identity_cwd`] on the same terms as
-    /// `resolved_identity_cwd_from` when the focused pane's own terminal
-    /// state is not resolvable, rather than showing nothing.
-    pub(crate) fn focused_pane_cwd_from(
-        &self,
-        terminals: &HashMap<TerminalId, TerminalState>,
-        terminal_runtimes: &TerminalRuntimeRegistry,
-    ) -> Option<PathBuf> {
-        self.focused_pane_id()
-            .and_then(|pane_id| {
-                self.active_tab()?
-                    .cwd_for_pane(pane_id, terminals, terminal_runtimes)
-            })
-            .or_else(|| Some(self.identity_cwd.clone()))
-    }
-
     #[cfg(test)]
     pub fn display_name(&self) -> String {
         if let Some(name) = &self.custom_name {
@@ -1266,10 +1234,6 @@ impl Workspace {
 
     pub fn git_dirty(&self) -> Option<GitDirtyCounts> {
         self.cached_git_dirty
-    }
-
-    pub fn git_diff(&self) -> Option<&GitDiffText> {
-        self.cached_git_diff.as_ref()
     }
 
     pub fn pull_requests(&self) -> Option<crate::forge::PullRequestCounts> {
@@ -1409,7 +1373,6 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_dirty: None,
-            cached_git_diff: None,
             cached_remote_url: None,
             cached_pull_requests: None,
             cached_git_space: None,

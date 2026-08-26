@@ -2718,22 +2718,13 @@ impl AppState {
                 continue;
             };
 
-            // The diff pane's own target (the focused pane's worker) can be a
-            // different cwd than this Space's sidebar identity (its first
-            // tab's root pane) — see `Workspace::focused_pane_cwd_from`. Each
-            // is gated against its own freshly-recomputed source of truth so
-            // a result computed for one never gets applied under the other's
-            // name if the two have since diverged (focus moved, a pane's own
-            // cwd changed) while the refresh was in flight.
+            // Gated against a freshly-recomputed source of truth, so a result
+            // computed for one cwd never gets applied under another's name if
+            // the Space's identity moved while the refresh was in flight.
             let is_identity_result = self.workspaces[ws_idx]
                 .resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
                 .as_ref()
                 == Some(&result.resolved_identity_cwd);
-            let is_diff_result = result.demand.diff
-                && self.workspaces[ws_idx]
-                    .focused_pane_cwd_from(&self.terminals, terminal_runtimes)
-                    .as_ref()
-                    == Some(&result.resolved_identity_cwd);
 
             let demand = result.demand;
             let WorkspaceGitStatus {
@@ -2743,7 +2734,6 @@ impl AppState {
                 branch,
                 ahead_behind,
                 dirty,
-                diff,
                 space,
                 ..
             } = result;
@@ -2774,14 +2764,6 @@ impl AppState {
                 }
                 if ws.cached_git_space != space {
                     ws.cached_git_space = space;
-                    changed = true;
-                }
-            }
-
-            if is_diff_result {
-                let ws = &mut self.workspaces[ws_idx];
-                if ws.cached_git_diff != diff {
-                    ws.cached_git_diff = diff;
                     changed = true;
                 }
             }
@@ -4488,155 +4470,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_workspace_git_statuses_updates_diff_only_when_demanded() {
-        let diff_text = crate::workspace::GitDiffText {
-            lines: vec![crate::workspace::GitDiffLine {
-                kind: crate::workspace::GitDiffLineKind::Added,
-                text: "+new line".into(),
-            }],
-            truncated: false,
-        };
-
-        let mut state = app_with_workspaces(&["one"]);
-        let workspace_id = state.workspaces[0].id.clone();
-        let cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
-        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-
-        // Not demanded: the diff must not be applied even though it's present.
-        let changed = state.apply_workspace_git_statuses(
-            &terminal_runtimes,
-            vec![WorkspaceGitStatus {
-                workspace_id: workspace_id.clone(),
-                resolved_identity_cwd: cwd.clone(),
-                status_cache_key: cwd.clone(),
-                demand: crate::workspace::GitStatusRefreshDemand {
-                    branch: false,
-                    ahead_behind: false,
-                    dirty: false,
-                    diff: false,
-                },
-                auto_label: "one".into(),
-                branch: None,
-                ahead_behind: None,
-                dirty: None,
-                diff: Some(diff_text.clone()),
-                space: None,
-            }],
-        );
-        assert!(!changed);
-        assert_eq!(state.workspaces[0].git_diff(), None);
-
-        // Demanded: the diff is applied and reported as a change.
-        let changed = state.apply_workspace_git_statuses(
-            &terminal_runtimes,
-            vec![WorkspaceGitStatus {
-                workspace_id,
-                resolved_identity_cwd: cwd.clone(),
-                status_cache_key: cwd,
-                demand: crate::workspace::GitStatusRefreshDemand {
-                    branch: false,
-                    ahead_behind: false,
-                    dirty: false,
-                    diff: true,
-                },
-                auto_label: "one".into(),
-                branch: None,
-                ahead_behind: None,
-                dirty: None,
-                diff: Some(diff_text.clone()),
-                space: None,
-            }],
-        );
-        assert!(changed);
-        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
-    }
-
-    /// The diff pane's own gate follows the focused pane's cwd
-    /// (`Workspace::focused_pane_cwd_from`), independent of the Space's own
-    /// sidebar identity cwd (its first tab's root pane) — see
-    /// `App::diff_pane_target`.
-    #[test]
-    fn apply_workspace_git_statuses_gates_diff_by_the_focused_panes_cwd_not_the_spaces_identity() {
-        let mut state = app_with_workspaces(&["one"]);
-        let workspace_id = state.workspaces[0].id.clone();
-        let space_identity_cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
-
-        let second_tab_idx = state.workspaces[0].test_add_tab(Some("second worker"));
-        let second_root_pane = state.workspaces[0].tabs[second_tab_idx].root_pane;
-        let second_terminal_id = state.workspaces[0].tabs[second_tab_idx]
-            .terminal_id(second_root_pane)
-            .unwrap()
-            .clone();
-        let worker_cwd = std::path::PathBuf::from("/repo/second-worker");
-        state.terminals.insert(
-            second_terminal_id.clone(),
-            crate::terminal::TerminalState::new(second_terminal_id, worker_cwd.clone()),
-        );
-        state.workspaces[0].active_tab = second_tab_idx;
-        assert_ne!(worker_cwd, space_identity_cwd);
-
-        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let diff_text = crate::workspace::GitDiffText {
-            lines: vec![crate::workspace::GitDiffLine {
-                kind: crate::workspace::GitDiffLineKind::Added,
-                text: "+worker change".into(),
-            }],
-            truncated: false,
-        };
-
-        // A diff computed for the focused worker's own cwd applies, even
-        // though it differs from the Space's own sidebar identity cwd.
-        let changed = state.apply_workspace_git_statuses(
-            &terminal_runtimes,
-            vec![WorkspaceGitStatus {
-                workspace_id: workspace_id.clone(),
-                resolved_identity_cwd: worker_cwd.clone(),
-                status_cache_key: worker_cwd.clone(),
-                demand: crate::workspace::GitStatusRefreshDemand {
-                    branch: false,
-                    ahead_behind: false,
-                    dirty: false,
-                    diff: true,
-                },
-                auto_label: "one".into(),
-                branch: None,
-                ahead_behind: None,
-                dirty: None,
-                diff: Some(diff_text.clone()),
-                space: None,
-            }],
-        );
-        assert!(changed);
-        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
-
-        // A stale diff result computed against a cwd that is no longer the
-        // focused pane (e.g. focus moved back while the refresh was in
-        // flight) must not clobber the cached diff.
-        let changed = state.apply_workspace_git_statuses(
-            &terminal_runtimes,
-            vec![WorkspaceGitStatus {
-                workspace_id,
-                resolved_identity_cwd: space_identity_cwd,
-                status_cache_key: worker_cwd,
-                demand: crate::workspace::GitStatusRefreshDemand {
-                    branch: false,
-                    ahead_behind: false,
-                    dirty: false,
-                    diff: true,
-                },
-                auto_label: "one".into(),
-                branch: None,
-                ahead_behind: None,
-                dirty: None,
-                diff: None,
-                space: None,
-            }],
-        );
-        assert!(!changed);
-        assert_eq!(state.workspaces[0].git_diff(), Some(&diff_text));
-    }
-
-    #[test]
     fn apply_workspace_git_statuses_updates_matching_workspace() {
         let mut state = app_with_workspaces(&["one", "two"]);
         let first_id = state.workspaces[0].id.clone();
@@ -4655,7 +4488,6 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 dirty: None,
-                diff: None,
                 space: None,
             }],
         );
@@ -4686,7 +4518,6 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
                 dirty: None,
-                diff: None,
                 space: None,
             }],
         );
@@ -4715,13 +4546,11 @@ mod tests {
                     branch: false,
                     ahead_behind: true,
                     dirty: false,
-                    diff: false,
                 },
                 auto_label: "one".into(),
                 branch: Some("new".into()),
                 ahead_behind: None,
                 dirty: None,
-                diff: None,
                 space: None,
             }],
         );
@@ -4750,7 +4579,6 @@ mod tests {
                 branch: None,
                 ahead_behind: None,
                 dirty: None,
-                diff: None,
                 space: None,
             }],
         );
@@ -4780,7 +4608,6 @@ mod tests {
                 branch: Some("scratch".into()),
                 ahead_behind: None,
                 dirty: None,
-                diff: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),

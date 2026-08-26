@@ -17,9 +17,7 @@ use super::{
 /// The surrounding refresh loop ticks every 1.5s, which is the right cadence for
 /// reading refs out of `.git` but far too hot for `git status`, whose cost scales
 /// with the size of the checkout rather than with a handful of ref files. Dirty
-/// counts therefore carry their own deadline and are reused in between. Diff
-/// text is the same shape of cost (it also scales with checkout/change size,
-/// not ref count) so it shares this deadline rather than carrying a second one.
+/// counts therefore carry their own deadline and are reused in between.
 const GIT_DIRTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Diff lines kept before falling back to a truncation marker.
@@ -34,13 +32,6 @@ pub struct GitStatusRefreshDemand {
     pub branch: bool,
     pub ahead_behind: bool,
     pub dirty: bool,
-    /// Whether hunk text (not just counts) is wanted for this checkout.
-    ///
-    /// Kept separate from `dirty` because it is only ever true for the one
-    /// checkout backing the currently visible diff pane, never for every
-    /// checkout a `git_dirty` sidebar token happens to be configured for -
-    /// see `App::diff_pane_target`.
-    pub diff: bool,
 }
 
 impl GitStatusRefreshDemand {
@@ -49,11 +40,10 @@ impl GitStatusRefreshDemand {
         branch: true,
         ahead_behind: true,
         dirty: true,
-        diff: true,
     };
 
     pub fn is_empty(self) -> bool {
-        !self.branch && !self.ahead_behind && !self.dirty && !self.diff
+        !self.branch && !self.ahead_behind && !self.dirty
     }
 }
 
@@ -71,7 +61,8 @@ impl GitDirtyCounts {
     }
 }
 
-/// How a `GitDiffText` line reads in the unified diff `git diff` produced.
+/// How one line of unified-diff text reads. Tagged once at parse time
+/// (`classify_diff_line`) so the renderer never re-sniffs prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitDiffLineKind {
     /// `diff --git`, `index`, `---`/`+++` file headers, `new file mode`, etc.
@@ -92,8 +83,8 @@ pub struct GitDiffLine {
     pub text: String,
 }
 
-/// This checkout's unified diff against `HEAD`, capped so one pathological
-/// checkout cannot make the diff pane choke — see `GIT_DIFF_MAX_LINES`.
+/// One unified diff, capped so a single pathological file cannot make the
+/// Changes zone choke — see `GIT_DIFF_MAX_LINES`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitDiffText {
     pub lines: Vec<GitDiffLine>,
@@ -175,7 +166,6 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             branch: None,
             ahead_behind: None,
             dirty: None,
-            diff: None,
             space: None,
         };
         return (
@@ -190,7 +180,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     };
     let auto_label = automatic_workspace_label(cwd, &info.repo_root);
     let space = git_space_metadata_from_info(&info);
-    let (dirty, diff, dirty_refresh_after) = resolve_dirty_and_diff(&info, cached, demand);
+    let (dirty, dirty_refresh_after) = resolve_dirty(&info, cached, demand);
 
     if !demand.ahead_behind {
         let branch = demand
@@ -207,7 +197,6 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             branch,
             ahead_behind: None,
             dirty,
-            diff,
             space: Some(space),
         };
         // Nothing here is fingerprint-backed, so the entry exists only to carry
@@ -229,7 +218,6 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 branch: None,
                 ahead_behind: None,
                 dirty,
-                diff,
                 space: Some(space),
             },
             None,
@@ -243,7 +231,6 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             branch,
             ahead_behind: cached.snapshot.ahead_behind,
             dirty,
-            diff,
             space: Some(space),
         };
         return (
@@ -266,7 +253,6 @@ pub fn git_status_snapshot_for_cwd_with_demand(
         branch,
         ahead_behind,
         dirty,
-        diff,
         space: Some(space),
     };
     (
@@ -284,16 +270,15 @@ pub fn git_status_snapshot_for_cwd_with_demand(
 ///
 /// A cached scan is reused while its deadline holds; the ref fingerprint is
 /// deliberately not consulted, because editing a tracked file moves no ref.
-/// Resolves both dirty counts and diff text together so they share one
-/// cached-scan deadline instead of racing two independent ones — see
-/// `GIT_DIRTY_REFRESH_INTERVAL`.
-fn resolve_dirty_and_diff(
+/// See `GIT_DIRTY_REFRESH_INTERVAL` for why the scan carries its own deadline
+/// rather than leaning on the ref fingerprint.
+fn resolve_dirty(
     info: &GitWorktreeInfo,
     cached: Option<&GitStatusCacheEntry>,
     demand: GitStatusRefreshDemand,
-) -> (Option<GitDirtyCounts>, Option<GitDiffText>, Option<Instant>) {
-    if !demand.dirty && !demand.diff {
-        return (None, None, None);
+) -> (Option<GitDirtyCounts>, Option<Instant>) {
+    if !demand.dirty {
+        return (None, None);
     }
 
     let now = Instant::now();
@@ -302,22 +287,11 @@ fn resolve_dirty_and_diff(
             .dirty_refresh_after
             .is_some_and(|deadline| deadline > now)
     }) {
-        return (
-            cached.snapshot.dirty,
-            cached.snapshot.diff.clone(),
-            cached.dirty_refresh_after,
-        );
+        return (cached.snapshot.dirty, cached.dirty_refresh_after);
     }
 
-    let dirty = demand
-        .dirty
-        .then(|| git_dirty_counts(&info.repo_root))
-        .flatten();
-    let diff = demand
-        .diff
-        .then(|| git_diff_text(&info.repo_root))
-        .flatten();
-    (dirty, diff, Some(now + GIT_DIRTY_REFRESH_INTERVAL))
+    let dirty = git_dirty_counts(&info.repo_root);
+    (dirty, Some(now + GIT_DIRTY_REFRESH_INTERVAL))
 }
 
 /// Counts uncommitted entries in a checkout.
@@ -366,50 +340,6 @@ fn git_dirty_counts(repo_root: &Path) -> Option<GitDirtyCounts> {
     Some(counts)
 }
 
-/// This checkout's unified diff against `HEAD` (staged and unstaged changes
-/// together, tracked deletions included), plus a synthetic "new file" section
-/// for every untracked, non-ignored file — so the diff pane shows a worker's
-/// whole visible change set, not just edits to files Git already knew about.
-/// Parsed into coloring-ready lines.
-///
-/// `--no-renames` matches `git_dirty_counts` above: a rename is shown as a
-/// full delete of the old path plus a full add of the new one rather than a
-/// compact rename record — decided for the diff pane's first cut in
-/// `data/decisions/2026-08-19-terminal-diffpane-standing-authority.md`, same
-/// reasoning as today's dirty-count path (cheaper, easily upgraded later).
-fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
-    let output = crate::noninteractive_process::command("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
-            "--no-optional-locks",
-            "diff",
-            "HEAD",
-            "--no-color",
-            "--no-renames",
-        ])
-        .output()
-        .ok()?;
-
-    let mut lines = Vec::new();
-    let mut truncated = false;
-
-    // An unborn branch (no commits yet) makes `git diff HEAD` fail; that is
-    // "nothing tracked to diff against", not an error worth surfacing as
-    // `None` (which the pane would otherwise have no way to distinguish from
-    // "not a git checkout at all") — untracked files below can still show.
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        (lines, truncated) = parse_unified_diff_lines(&text);
-    }
-
-    if !truncated {
-        append_untracked_diff_lines(repo_root, &mut lines, &mut truncated);
-    }
-
-    Some(GitDiffText { lines, truncated })
-}
-
 /// Parses arbitrary unified-diff text into the same tagged-line shape the diff
 /// pane renders, capped at `GIT_DIFF_MAX_LINES` (the returned flag says whether
 /// the cap cut it short).
@@ -417,9 +347,9 @@ fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
 /// The text need not be `git diff`'s own stdout: `classify_diff_line` tags
 /// `--- `/`+++ ` file headers on their own prefix, with no dependency on a
 /// preceding `diff --git a/x b/x` line, so GNU `diff -u --label a/x --label
-/// b/x` output round-trips through here identically. Used both by
-/// `git_diff_text` and by the agent-edit pipeline, which parses hook-submitted
-/// `diff -u` output.
+/// b/x` output round-trips through here identically — which is exactly what
+/// the agent-edit pipeline submits (`pane.report_edit_diff`), its only
+/// caller.
 pub(crate) fn parse_unified_diff_lines(text: &str) -> (Vec<GitDiffLine>, bool) {
     let mut lines = Vec::new();
     let mut truncated = false;
@@ -440,132 +370,6 @@ fn push_diff_lines<'a>(
         lines.push(GitDiffLine {
             kind: classify_diff_line(raw),
             text: raw.to_string(),
-        });
-    }
-}
-
-/// Appends a synthetic "new file" diff section for every untracked,
-/// non-ignored file in `repo_root` — `git diff` itself never reports these,
-/// since it only ever compares content Git already tracks. Each file is read
-/// directly rather than shelled out to `git diff --no-index` against a null
-/// device, which has no portable path across platforms; the header lines
-/// mirror the exact convention `git diff` itself already uses for a tracked
-/// add (see `classify_diff_line`), so the pane renders both identically.
-fn append_untracked_diff_lines(
-    repo_root: &Path,
-    lines: &mut Vec<GitDiffLine>,
-    truncated: &mut bool,
-) {
-    if lines.len() >= GIT_DIFF_MAX_LINES {
-        *truncated = true;
-        return;
-    }
-    let Ok(output) = crate::noninteractive_process::command("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args([
-            "--no-optional-locks",
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
-        .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-
-    for raw_path in output.stdout.split(|byte| *byte == 0) {
-        if raw_path.is_empty() {
-            continue;
-        }
-        if lines.len() >= GIT_DIFF_MAX_LINES {
-            *truncated = true;
-            return;
-        }
-        let rel_path = String::from_utf8_lossy(raw_path).into_owned();
-        push_untracked_file_diff(repo_root, &rel_path, lines, truncated);
-    }
-}
-
-/// How many prefix bytes are sniffed to decide whether an untracked file is
-/// binary, rather than reading the whole file first — matches Git's own
-/// binary-detection heuristic closely enough, and keeps a large stray binary
-/// asset sitting in the worktree from making the background refresh thread
-/// read the whole thing into memory just to conclude it can't be shown.
-const UNTRACKED_BINARY_SNIFF_BYTES: usize = 8000;
-
-fn push_untracked_file_diff(
-    repo_root: &Path,
-    rel_path: &str,
-    lines: &mut Vec<GitDiffLine>,
-    truncated: &mut bool,
-) {
-    use std::io::Read;
-
-    let Ok(mut file) = std::fs::File::open(repo_root.join(rel_path)) else {
-        return;
-    };
-    let mut sniff = [0u8; UNTRACKED_BINARY_SNIFF_BYTES];
-    let Ok(sniffed) = file.read(&mut sniff) else {
-        return;
-    };
-
-    lines.push(GitDiffLine {
-        kind: GitDiffLineKind::FileHeader,
-        text: format!("diff --git a/{rel_path} b/{rel_path}"),
-    });
-    lines.push(GitDiffLine {
-        kind: GitDiffLineKind::FileHeader,
-        text: "new file mode 100644".to_string(),
-    });
-
-    if sniff[..sniffed].contains(&0) {
-        lines.push(GitDiffLine {
-            kind: GitDiffLineKind::FileHeader,
-            text: format!("Binary files /dev/null and b/{rel_path} differ"),
-        });
-        return;
-    }
-
-    let mut content = sniff[..sniffed].to_vec();
-    let mut rest = Vec::new();
-    if file.read_to_end(&mut rest).is_err() {
-        return;
-    }
-    content.extend_from_slice(&rest);
-
-    let text = String::from_utf8_lossy(&content);
-    let content_lines: Vec<&str> = text.lines().collect();
-    if content_lines.is_empty() {
-        // Matches Git's own convention for an empty new file: the two header
-        // lines above, no hunk.
-        return;
-    }
-
-    lines.push(GitDiffLine {
-        kind: GitDiffLineKind::FileHeader,
-        text: "--- /dev/null".to_string(),
-    });
-    lines.push(GitDiffLine {
-        kind: GitDiffLineKind::FileHeader,
-        text: format!("+++ b/{rel_path}"),
-    });
-    lines.push(GitDiffLine {
-        kind: GitDiffLineKind::Hunk,
-        text: format!("@@ -0,0 +1,{} @@", content_lines.len()),
-    });
-    for content_line in content_lines {
-        if lines.len() >= GIT_DIFF_MAX_LINES {
-            *truncated = true;
-            return;
-        }
-        lines.push(GitDiffLine {
-            kind: GitDiffLineKind::Added,
-            text: format!("+{content_line}"),
         });
     }
 }
@@ -820,251 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_text_classifies_added_and_removed_lines() {
-        let root = temp_test_dir("diff-text-basic");
-        init_repo_with_commit(&root);
-        std::fs::write(root.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
-        run_git(&root, &["add", "tracked.txt"]);
-        run_git(&root, &["commit", "--quiet", "-m", "add tracked"]);
-        std::fs::write(root.join("tracked.txt"), "one\nTWO\nthree\n").unwrap();
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(!diff.truncated);
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Hunk && line.text.starts_with("@@")));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Removed && line.text == "-two"));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+TWO"));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::FileHeader
-                && line.text.starts_with("diff --git")));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_is_empty_for_a_clean_checkout() {
-        let root = temp_test_dir("diff-text-clean");
-        init_repo_with_commit(&root);
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(diff.lines.is_empty());
-        assert!(!diff.truncated);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_treats_a_rename_as_delete_and_add_not_a_compact_rename() {
-        // Settled in `data/decisions/2026-08-19-terminal-diffpane-standing-authority.md`:
-        // renamed files show as a full delete of the old path plus a full add
-        // of the new one, matching `--no-renames` in `git_dirty_counts`.
-        let root = temp_test_dir("diff-text-rename");
-        init_repo_with_commit(&root);
-        std::fs::write(root.join("old_name.txt"), "unchanged content\n").unwrap();
-        run_git(&root, &["add", "old_name.txt"]);
-        run_git(&root, &["commit", "--quiet", "-m", "add old_name"]);
-        run_git(&root, &["mv", "old_name.txt", "new_name.txt"]);
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(
-            !diff
-                .lines
-                .iter()
-                .any(|line| line.text.starts_with("rename from")
-                    || line.text.starts_with("rename to")),
-            "a --no-renames diff must never emit a compact rename record: {:?}",
-            diff.lines
-        );
-        // A rename becomes two independent file sections, not one combined
-        // header naming both paths: a full delete of the old path...
-        assert!(
-            diff.lines
-                .iter()
-                .any(|line| line.text.starts_with("deleted file mode")),
-            "{:?}",
-            diff.lines
-        );
-        assert!(
-            diff.lines
-                .iter()
-                .any(|line| line.kind == GitDiffLineKind::Removed
-                    && line.text == "-unchanged content")
-        );
-        // ...plus a full add of the new one.
-        assert!(
-            diff.lines
-                .iter()
-                .any(|line| line.text.starts_with("new file mode")),
-            "{:?}",
-            diff.lines
-        );
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+unchanged content"));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_is_empty_before_the_first_commit_rather_than_none() {
-        let root = temp_test_dir("diff-text-unborn");
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .output()
-            .expect("git init");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let diff = git_diff_text(&root).expect("diff on an unborn branch is Some, not None");
-
-        assert!(diff.lines.is_empty());
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_shows_an_untracked_file_even_on_an_unborn_branch() {
-        // `git diff HEAD` alone fails with no commits to diff against, but an
-        // untracked file is still real, visible work — it must not get lost
-        // behind the unborn-branch fallback.
-        let root = temp_test_dir("diff-text-unborn-untracked");
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("init")
-            .output()
-            .expect("git init");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("new.txt"), "content\n").unwrap();
-
-        let diff = git_diff_text(&root).expect("diff on an unborn branch is Some, not None");
-
-        assert!(
-            diff.lines
-                .iter()
-                .any(|line| line.text.starts_with("new file mode")),
-            "{:?}",
-            diff.lines
-        );
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+content"));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_shows_a_new_untracked_file_alongside_a_tracked_edit() {
-        let root = temp_test_dir("diff-text-untracked-add");
-        init_repo_with_commit(&root);
-        std::fs::write(root.join("tracked.txt"), "one\n").unwrap();
-        run_git(&root, &["add", "tracked.txt"]);
-        run_git(&root, &["commit", "--quiet", "-m", "add tracked"]);
-        std::fs::write(root.join("tracked.txt"), "one\nTWO\n").unwrap();
-        std::fs::write(root.join("brand_new.txt"), "fresh line\n").unwrap();
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(!diff.truncated);
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.text == "diff --git a/tracked.txt b/tracked.txt"));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+TWO"));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.text == "diff --git a/brand_new.txt b/brand_new.txt"));
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added && line.text == "+fresh line"));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_marks_a_binary_untracked_file_as_binary() {
-        let root = temp_test_dir("diff-text-untracked-binary");
-        init_repo_with_commit(&root);
-        std::fs::write(root.join("blob.bin"), [0u8, 1, 2, 3, 0, 4]).unwrap();
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(diff
-            .lines
-            .iter()
-            .any(|line| line.text == "Binary files /dev/null and b/blob.bin differ"));
-        assert!(!diff
-            .lines
-            .iter()
-            .any(|line| line.kind == GitDiffLineKind::Added));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_ignores_untracked_files_excluded_by_gitignore() {
-        let root = temp_test_dir("diff-text-untracked-ignored");
-        init_repo_with_commit(&root);
-        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
-        run_git(&root, &["add", ".gitignore"]);
-        run_git(&root, &["commit", "--quiet", "-m", "add gitignore"]);
-        std::fs::write(root.join("ignored.txt"), "should not appear\n").unwrap();
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(!diff
-            .lines
-            .iter()
-            .any(|line| line.text.contains("ignored.txt")));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn diff_text_truncates_past_the_line_cap() {
-        let root = temp_test_dir("diff-text-truncate");
-        init_repo_with_commit(&root);
-        let long_content: String = (0..GIT_DIFF_MAX_LINES * 2)
-            .map(|i| format!("line {i}\n"))
-            .collect();
-        std::fs::write(root.join("big.txt"), &long_content).unwrap();
-        run_git(&root, &["add", "big.txt"]);
-        run_git(&root, &["commit", "--quiet", "-m", "add big file"]);
-        let changed_content: String = (0..GIT_DIFF_MAX_LINES * 2)
-            .map(|i| format!("line {i} changed\n"))
-            .collect();
-        std::fs::write(root.join("big.txt"), &changed_content).unwrap();
-
-        let diff = git_diff_text(&root).expect("diff for a real repo");
-
-        assert!(diff.truncated);
-        assert_eq!(diff.lines.len(), GIT_DIFF_MAX_LINES);
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn parse_unified_diff_lines_handles_gnu_diff_label_output() {
         // Exact shape produced by:
         //   diff -u --label a/foo.rs --label b/foo.rs /dev/null current
@@ -1123,7 +682,6 @@ mod tests {
                 branch: true,
                 ahead_behind: false,
                 dirty: false,
-                diff: false,
             },
         );
 
@@ -1144,7 +702,6 @@ mod tests {
             branch: false,
             ahead_behind: false,
             dirty: true,
-            diff: false,
         };
         let (snapshot, entry) = git_status_snapshot_for_cwd_with_demand(&root, None, demand);
 
@@ -1169,7 +726,6 @@ mod tests {
             branch: false,
             ahead_behind: false,
             dirty: true,
-            diff: false,
         };
         let (_, entry) = git_status_snapshot_for_cwd_with_demand(&root, None, demand);
         let entry = entry.expect("first scan caches");
@@ -1334,7 +890,6 @@ mod tests {
                 branch: true,
                 ahead_behind: false,
                 dirty: false,
-                diff: false,
             },
         );
 
@@ -1359,7 +914,6 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 dirty: None,
-                diff: None,
                 space: git_space_metadata(&root),
             },
         };
@@ -1387,7 +941,6 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((4, 0)),
                 dirty: None,
-                diff: None,
                 space: git_space_metadata(&root),
             },
         };
@@ -1425,7 +978,6 @@ mod tests {
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 3)),
                 dirty: None,
-                diff: None,
                 space: git_space_metadata(&root),
             },
         };
