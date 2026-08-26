@@ -2379,6 +2379,38 @@ fn crew_row_layout(
     })
 }
 
+/// The row a crew row has to keep free below it for the box to close.
+///
+/// A worker that ends its mate's list reserves the closing rule itself
+/// ([`CrewRowLayout::closes_the_box`]). Every worker *before* it reserves
+/// nothing, because the rule is not coming there — unless the panel runs out of
+/// room and stops on one, and then it is: the box has to close under the last
+/// worker the panel drew, and with nothing kept free the rule lands on that
+/// worker's own last line.
+///
+/// So a placement walk inside a crew asks for one row more than the row itself
+/// takes. Nothing consumes it while the list continues, and a list the panel
+/// cannot finish stops one worker earlier — the same trade
+/// [`a_card_is_drawn_whole_or_not_at_all`] already makes for a card.
+///
+/// Zero under a pixel card, which owes nothing here: its closing edge is drawn
+/// *inside* the cells its own band already has, so a cut list needs no row of
+/// anybody's to close over.
+fn crew_closing_reserve(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entries: &[WorkspaceListEntry],
+    entry_idx: usize,
+    fold_width: u16,
+) -> u16 {
+    if crew_is_drawn(app, fold_width) {
+        return 0;
+    }
+    crew_row_layout(app, agents, entries, entry_idx, fold_width)
+        .map(|crew| u16::from(!crew.closes_the_box))
+        .unwrap_or(0)
+}
+
 /// Gap after one tree row. Each kind keeps its own `row_gap`; the compact
 /// worktree-group packing is unchanged.
 fn list_entry_gap(
@@ -2433,7 +2465,13 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
         if row_height == 0 {
             continue;
         }
-        if used_rows.saturating_add(row_height) > body.height {
+        if used_rows
+            .saturating_add(row_height)
+            .saturating_add(crew_closing_reserve(
+                app, &agents, &entries, entry_idx, fold_width,
+            ))
+            > body.height
+        {
             break;
         }
         used_rows = used_rows.saturating_add(row_height);
@@ -2579,7 +2617,13 @@ pub(crate) fn compute_workspace_list_areas(
         if row_height == 0 {
             continue;
         }
-        if row_y.saturating_add(row_height) > body_bottom {
+        if row_y
+            .saturating_add(row_height)
+            .saturating_add(crew_closing_reserve(
+                app, &agents, &entries, entry_idx, fold_width,
+            ))
+            > body_bottom
+        {
             break;
         }
         let (ws_idx, worktree_child, agent) = match entry {
@@ -2631,7 +2675,7 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     if nested {
-        stretch_cards_over_their_crew(app, &entries, &mut cards);
+        stretch_cards_over_their_crew(app, &agents, &entries, &mut cards, fold_width);
     }
     (cards, headers)
 }
@@ -2653,8 +2697,10 @@ pub(crate) fn compute_workspace_list_areas(
 /// instead of reaching past the bottom of the panel.
 fn stretch_cards_over_their_crew(
     app: &AppState,
+    agents: &[AgentPanelEntry],
     entries: &[WorkspaceListEntry],
     cards: &mut [crate::app::state::WorkspaceCardArea],
+    fold_width: u16,
 ) {
     let mut head: Option<usize> = None;
     for index in 0..cards.len() {
@@ -2663,7 +2709,16 @@ fn stretch_cards_over_their_crew(
             let Some(head) = head else {
                 continue;
             };
-            let bottom = cards[index].rect.y.saturating_add(cards[index].rect.height);
+            // A worker that ends its mate's list reserved the closing rule in
+            // its own rect. One that does not did not — so where the panel
+            // stops on it, the box closes on the row kept free below it.
+            let bottom = cards[index]
+                .rect
+                .y
+                .saturating_add(cards[index].rect.height)
+                .saturating_add(crew_closing_reserve(
+                    app, agents, entries, entry_idx, fold_width,
+                ));
             if let Some(frame) = cards[head].card_frame.as_mut() {
                 frame.height = bottom.saturating_sub(frame.y);
             }
@@ -5031,7 +5086,13 @@ fn render_failure_spiders(
         return;
     }
     for card in cards {
-        if card.card_frame.is_none() {
+        // A worker drawn inside its mate's box has no border of its own to
+        // climb, and its marker follows it there rather than being dropped —
+        // the same call [`image_card::crew`] makes, and for the same reason: an
+        // open defect that stops being drawn the moment the design changed is a
+        // regression nobody sees until they need it.
+        let crew = crew_row_layout(app, agents, entries, card.entry_idx, fold_width);
+        if card.card_frame.is_none() && crew.is_none() {
             continue;
         }
         let Some(entry) = entries.get(card.entry_idx) else {
@@ -5061,7 +5122,10 @@ fn render_failure_spiders(
             crate::anim::Phase::Mount | crate::anim::Phase::Dismount => elem_frame.progress,
             crate::anim::Phase::Retired => continue,
         };
-        let Some((x, y)) = failure_spider_position(card, t) else {
+        let Some((x, y)) = (match &crew {
+            Some(crew) => crew_marker_position(card, crew, t),
+            None => failure_spider_position(card, t),
+        }) else {
             continue;
         };
         let buf = frame.buffer_mut();
@@ -5175,6 +5239,54 @@ fn failure_spider_waypoints(
     ])
 }
 
+/// Where a worker's marker sits on the row it is drawn on, at `t`.
+///
+/// A worker inside its mate's box has no border of its own to climb, so the
+/// journey is the row's: up its own last line to its first, then in to the
+/// middle of its text column. The same two moves at the scale the row actually
+/// has — which is what [`image_card::crew`] gives it on the pixel path, a climb
+/// up the row's own band rather than up a card's border.
+///
+/// It stays inside that text column at every point of the climb. A marker that
+/// set out from the trunk, as a card's does, would cross its mate's border on
+/// the way in — a mark from inside the box drawn outside it.
+fn crew_marker_position(
+    card: &crate::app::state::WorkspaceCardArea,
+    crew: &CrewRowLayout,
+    t: f32,
+) -> Option<(u16, u16)> {
+    if crew.text_width == 0 || card.rect.height == 0 {
+        return None;
+    }
+    let left = card.rect.x.saturating_add(crew.text_offset);
+    let top = card.rect.y;
+    let bottom = card
+        .rect
+        .y
+        .saturating_add(card.rect.height)
+        .saturating_sub(1);
+    let centre = left.saturating_add(crew.text_width.saturating_sub(1) / 2);
+    let t = t.clamp(0.0, 1.0);
+    let climb = f32::from(bottom.saturating_sub(top));
+    let across = f32::from(centre.saturating_sub(left));
+    let total = climb + across;
+    if total <= 0.0 {
+        return Some((centre, top));
+    }
+    let travelled = t * total;
+    Some(if travelled <= climb {
+        let leg = if climb > 0.0 { travelled / climb } else { 1.0 };
+        (left, lerp_u16(bottom, top, leg))
+    } else {
+        let leg = if across > 0.0 {
+            (travelled - climb) / across
+        } else {
+            1.0
+        };
+        (lerp_u16(left, centre, leg), top)
+    })
+}
+
 /// Where the spider sits on its climb, at `t` in `0.0..=1.0`: `0.0` is just
 /// setting out from below the row, `1.0` is arrived and resting at the top
 /// centre border. Each leg gets a share of `t` proportional to its own length
@@ -5269,6 +5381,56 @@ mod failure_spider_geometry {
             None,
             "a bare line has no border to rest on"
         );
+    }
+
+    /// **A worker inside its mate's box keeps its marker, and keeps it inside
+    /// the box.**
+    ///
+    /// It has no border of its own to climb, and dropping the marker for that
+    /// reason would retire an open defect the moment the design changed. So it
+    /// rides its own row instead — and never sets out from the trunk, which
+    /// would put a mark from inside the box in the gutter outside it.
+    #[test]
+    fn a_workers_marker_rides_its_own_row_and_never_leaves_the_box() {
+        let mut area = card(Rect::new(0, 4, 40, 2), Rect::new(6, 4, 34, 2));
+        area.card_frame = None;
+        let crew = CrewRowLayout {
+            text_offset: 8,
+            text_width: 30,
+            via_mate: false,
+            closes_the_box: false,
+            lines: Vec::new(),
+        };
+        let left = area.rect.x + crew.text_offset;
+        let right = left + crew.text_width;
+
+        let (x, y) = crew_marker_position(&area, &crew, 1.0).expect("a crew row gives a position");
+        assert_eq!(y, area.rect.y, "settled on the row's own first line");
+        assert_eq!(
+            x,
+            left + (crew.text_width - 1) / 2,
+            "centred on its own row"
+        );
+
+        let mut previous = crew_marker_position(&area, &crew, 0.0).unwrap();
+        for step in 0u16..=20 {
+            let current = crew_marker_position(&area, &crew, f32::from(step) / 20.0)
+                .expect("a crew row gives a position");
+            assert!(
+                current.0 >= left && current.0 < right,
+                "the marker left its mate's text column at step {step}: {current:?}"
+            );
+            assert!(
+                current.1 >= area.rect.y && current.1 < area.rect.y + area.rect.height,
+                "the marker left its own row at step {step}: {current:?}"
+            );
+            // One axis at a time, exactly as a card's own climb is.
+            assert!(
+                current.0 == previous.0 || current.1 == previous.1,
+                "a step moved diagonally: {previous:?} -> {current:?}"
+            );
+            previous = current;
+        }
     }
 
     /// The tree's own lines never run diagonally, and the climb has to match:
@@ -8051,6 +8213,39 @@ mod tests {
                 opened, closed,
                 "a card was opened and not closed at height {height}:\n{screen}"
             );
+        }
+    }
+
+    /// **A crew list the panel cannot finish stops one worker short, so the
+    /// closing rule is a rule.**
+    ///
+    /// A worker that ends its mate's list reserves the row the box closes on;
+    /// the ones before it do not, because the rule is not coming there. Where
+    /// the panel runs out mid-list it *is* coming there, and with nothing kept
+    /// free it landed on the last worker's own line — a closing rule with a
+    /// branch name set into the middle of it, live at every height that cut a
+    /// crew. See [`crew_closing_reserve`].
+    #[test]
+    fn a_cut_crew_list_closes_on_a_rule_and_not_on_a_workers_name() {
+        for height in 3u16..=20 {
+            let rows = default_layout_fleet_rows(40, height);
+            let screen = rows.join("\n");
+            for row in tree_rows(&rows)
+                .iter()
+                .filter(|row| row.contains('\u{2570}'))
+            {
+                let rule: String = row
+                    .chars()
+                    .skip_while(|glyph| *glyph != '\u{2570}')
+                    .take_while(|glyph| *glyph != '\u{256f}')
+                    .collect();
+                assert!(
+                    rule.chars()
+                        .all(|glyph| glyph == '\u{2570}' || glyph == '\u{2500}'),
+                    "a closing rule at height {height} has a worker\'s row set \
+                     into it — {rule:?}:\n{screen}"
+                );
+            }
         }
     }
 
