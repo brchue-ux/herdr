@@ -20,12 +20,18 @@ use super::{
 /// counts therefore carry their own deadline and are reused in between.
 const GIT_DIRTY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Diff lines kept before falling back to a truncation marker.
+/// Diff lines [`parse_unified_diff_lines`] keeps before falling back to a
+/// truncation marker.
 ///
 /// Mirrors the shape of this project's other payload caps (the 32 MiB kitty
 /// graphics cap, the 80-char metadata token cap): bound it and say so
 /// explicitly rather than choking on one pathological checkout.
-const GIT_DIFF_MAX_LINES: usize = 4000;
+///
+/// `pub(crate)` because `pane.report_edit_diff` rejects a report at exactly
+/// this ceiling rather than letting it be silently cut here, and derives its
+/// own cap from this constant so the two cannot drift apart — see
+/// `crate::app::api::panes`'s `MAX_EDIT_DIFF_LINES_PER_REQUEST`.
+pub(crate) const GIT_DIFF_MAX_LINES: usize = 4000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GitStatusRefreshDemand {

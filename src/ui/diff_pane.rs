@@ -68,11 +68,18 @@ pub(super) fn render_diff_popup_overlay(app: &AppState, frame: &mut Frame, area:
 /// focused pane, no terminal behind it); `Some` with no lines means the pane
 /// simply has not reported an edit yet.
 ///
-/// `truncated: false` is a known simplification: [`AgentEditLog::flatten`]
-/// drops each file's own `truncated` flag, so the aggregate cannot say "one
-/// of these files was cut short". Individual files are already capped at the
-/// RPC layer, so nothing is lost but that notice; surfacing it would mean
-/// widening `flatten`'s return, which this phase does not need.
+/// `truncated: false` is a fact about this pipeline, not a placeholder: no
+/// file's entry can ever carry a set flag to aggregate. `pane.report_edit_diff`
+/// caps a report at `GIT_DIFF_MAX_LINES` — the parser's own cap, derived from
+/// the same constant — and applies that cap to the *same* post-synthesis text
+/// the parser is then handed, so the parser's truncation branch cannot fire on
+/// anything that reaches this log. Nothing else writes to it. That is why the
+/// renderer and the overlay's signature carry no truncation branch either;
+/// loosening either half of the cap rule would have to put both back.
+///
+/// [`AgentEditLog::flatten`] would drop a per-file flag anyway — the
+/// aggregate stream has nowhere to say "one of these files was cut short" —
+/// which is only harmless because there is never one to drop.
 ///
 /// [`AgentEditLog::flatten`]: crate::agent_edit_log::AgentEditLog::flatten
 pub(crate) fn focused_pane_diff(app: &AppState) -> Option<GitDiffText> {
@@ -437,13 +444,11 @@ fn render_diff_lines(
     }
 
     let shown = scroll + consumed;
-    let overflowed = shown < diff.lines.len() || diff.truncated;
-    if overflowed {
+    if shown < diff.lines.len() {
         lines.truncate(visible_rows.saturating_sub(1));
         let hidden = diff.lines.len().saturating_sub(shown);
-        let suffix = if diff.truncated { "+" } else { "" };
         lines.push(Line::from(Span::styled(
-            format!("… {hidden}{suffix} more lines"),
+            format!("… {hidden} more lines"),
             Style::default().fg(app.palette.subtext0),
         )));
     }

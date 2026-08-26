@@ -32,7 +32,7 @@ pub use self::{
     tab::{NewPane, Tab},
 };
 pub(crate) use self::{
-    git::{git_status_snapshot_for_cwd_with_demand, parse_unified_diff_lines},
+    git::{git_status_snapshot_for_cwd_with_demand, parse_unified_diff_lines, GIT_DIFF_MAX_LINES},
     tab::MovedPane,
 };
 
