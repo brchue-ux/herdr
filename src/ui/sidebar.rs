@@ -12082,7 +12082,14 @@ mod ownership_is_drawn_as_written {
         let entries = workspace_list_entries(&app);
         let row = |name: &str| drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, name);
 
-        for (mate, workers) in [("2ndmate-a", ["a-one", "a-two", "a-three"].as_slice())] {
+        // Both mates carry the whole assertion set. A rule that generalises is
+        // one that holds on the second mate it was not written against, so the
+        // second one earns the same four questions as the first rather than a
+        // spot-check of the one that is easiest to get right.
+        for (mate, workers) in [
+            ("2ndmate-a", ["a-one", "a-two", "a-three"].as_slice()),
+            ("2ndmate-b", ["b-one", "b-two"].as_slice()),
+        ] {
             for worker in workers {
                 assert_eq!(
                     crew_head(&entries, row(worker)),
@@ -12105,13 +12112,6 @@ mod ownership_is_drawn_as_written {
                     "{worker} opened a box of its own inside {mate}'s"
                 );
             }
-        }
-        for worker in ["b-one", "b-two"] {
-            assert_eq!(
-                crew_head(&entries, row(worker)),
-                Some(row("2ndmate-b")),
-                "{worker} left its own mate's card"
-            );
         }
 
         // The mates themselves are unchanged: their own cards, nested under the
