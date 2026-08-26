@@ -2649,6 +2649,68 @@ mod tests {
         )
     }
 
+    /// A `[theme.custom]` override reaches the rendered sidebar background
+    /// even when `auto_switch = true` and no `name`/`dark_name`/`light_name`
+    /// is set — the captain's exact config shape, which he reported as
+    /// having "zero visible effect". Pinned end to end (parsed config →
+    /// `theme_runtime.custom` → `palette` → `sidebar_palette` → the actual
+    /// `TestBackend` buffer) because the failure this guards against is a
+    /// silent one: any break in that chain looks identical to "it rendered
+    /// fine" from the type system's point of view.
+    #[test]
+    fn theme_custom_overrides_reach_the_sidebar_background_with_auto_switch_and_no_theme_name() {
+        let toml_src = r##"
+[theme]
+auto_switch = true
+
+[theme.custom]
+accent = "#5ad1ff"
+teal = "#5ad1ff"
+blue = "#3a7fa3"
+panel_bg = "#0a1220"
+sidebar_bg = "#04070c"
+surface0 = "#16233a"
+surface1 = "#16233a"
+overlay0 = "#37414d"
+overlay1 = "#37414d"
+text = "#e6edf3"
+subtext0 = "#64717e"
+green = "#3ddc84"
+yellow = "#ffb454"
+"##;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert!(config.theme.name.is_none());
+        assert!(config.theme.custom.is_some());
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let void = ratatui::style::Color::Rgb(4, 7, 12);
+        let panel = ratatui::style::Color::Rgb(10, 18, 32);
+        let cyan = ratatui::style::Color::Rgb(90, 209, 255);
+        let ink = ratatui::style::Color::Rgb(230, 237, 243);
+
+        assert_eq!(app.state.palette.sidebar_bg, void);
+        assert_eq!(app.state.palette.panel_bg, panel);
+        assert_eq!(app.state.palette.accent, cyan);
+        assert_eq!(app.state.palette.text, ink);
+
+        app.state.refresh_sidebar_palette();
+        assert_eq!(app.state.sidebar_palette.sidebar_bg, void);
+        assert_eq!(app.state.sidebar_palette.panel_bg, panel);
+        assert_eq!(app.state.sidebar_palette.accent, cyan);
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 30);
+        crate::ui::compute_view(&mut app.state, area);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(&app.state, frame))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(2, 2)].style().bg, Some(void));
+    }
+
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
