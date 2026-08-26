@@ -41,6 +41,20 @@ impl AppState {
         let entries = crate::ui::workspace_list_entries(self);
         let agents = crate::ui::sidebar_agent_entries(self);
         cards.iter().find_map(|card| {
+            // A worker folded into its mate's card is type inside somebody
+            // else's border: no frame, no controls, no badge. Its rect would
+            // still yield one — `control_right` falls back to the row's own
+            // right edge with no frame to measure from — so the fold is asked
+            // here rather than left to a rect that cannot tell the difference
+            // between a bare line and a row standing inside a box.
+            if crate::ui::card_row_folds_into_a_mate(
+                self,
+                &entries,
+                self.view.sidebar_rect,
+                card.entry_idx,
+            ) {
+                return None;
+            }
             let (owner, count) = crate::ui::worker_summary_badge(self, &entries, &agents, card)?;
             let badge = card.drawn(crate::ui::worker_summary_badge_rect(card, count))?;
             rect_contains(badge, col, row).then_some(owner)

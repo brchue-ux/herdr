@@ -597,6 +597,38 @@ fn crew_folds_into_its_space(fold_width: u16) -> bool {
     RowShell::for_fold_width(fold_width).is_card()
 }
 
+/// Whether the row at `entry_idx` is drawn inside another card's box rather
+/// than in one of its own, for a panel occupying `area`.
+///
+/// The same two conditions [`compute_workspace_list_areas`] hands a row no
+/// `card_frame` under, asked from outside the layout: the panel is drawing
+/// boxes at all, and this row's own box is somebody else's.
+///
+/// Neither condition reads the renderer, because neither layout does: a pixel
+/// card is a skin over these same cells and folds the same rows
+/// ([`image_card::crew`]). So this is one answer for both paths, and a hit test
+/// that asks it is right on both.
+///
+/// # Why the hit-tests need it
+///
+/// A folded row has no frame, and every control rect is measured off
+/// [`crate::app::state::WorkspaceCardArea::control_right`], which falls back to
+/// the row's own right edge when there is no frame to measure from. That
+/// fallback is right for a bare line — a row below [`card::MIN_FOLD_WIDTH`] is
+/// still a row with its own controls — and wrong for a folded one, which draws
+/// no controls at all because the renderer stood the whole row down in favour
+/// of [`render_crew_row`]. Without this the fallback would hand back a live
+/// click target for a badge nothing ever drew.
+pub(crate) fn card_row_folds_into_a_mate(
+    app: &AppState,
+    entries: &[WorkspaceListEntry],
+    area: Rect,
+    entry_idx: usize,
+) -> bool {
+    let fold_width = row_fold_width(app, workspace_list_rect(area));
+    crew_folds_into_its_space(fold_width) && drawn_crew_head(app, entries, entry_idx).is_some()
+}
+
 /// Columns a worker's row is stepped in inside the box it is drawn in.
 ///
 /// The character twin of [`image_card::crew`]'s `INDENT_MUL`, and saturated the
@@ -7468,6 +7500,146 @@ mod tests {
             drawn_card: true,
         };
         assert_eq!(worker_summary_badge_rect(&card, 1), Rect::default());
+    }
+
+    /// A mate, a worker of its own that finished, and a worker of *that*
+    /// worker's that finished too — so the mate's row and the worker's row have
+    /// both earned a badge, and only one of them is a card.
+    ///
+    /// Returns the state and the drawn panel, so a test can hit-test the badges
+    /// and check what was actually painted with the same fleet.
+    fn folded_worker_summary_fleet(width: u16) -> (crate::app::state::AppState, Vec<String>) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut second_mate = Workspace::test_new("2ndmate-explore");
+        let worker_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        let sub_pane = second_mate.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let now = std::time::Instant::now();
+        app.workspaces[1].metadata_tokens.patch(
+            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
+            None,
+            now,
+        );
+
+        for (pane, name, owner) in [
+            (worker_pane, "worker", "2ndmate-explore"),
+            (sub_pane, "sub", "worker"),
+        ] {
+            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_agent_name(name.to_string());
+            terminal.state = AgentState::Idle;
+            terminal.metadata_tokens.patch(
+                std::collections::HashMap::from([
+                    ("owner".to_string(), Some(owner.to_string())),
+                    ("summary".to_string(), Some(format!("{name} finished"))),
+                ]),
+                None,
+                now,
+            );
+        }
+
+        let area = Rect::new(0, 0, width, 20);
+        app.view.sidebar_rect = area;
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..20).map(|row| row_text(buffer, row, width)).collect();
+        (app, rows)
+    }
+
+    /// **A worker folded into its mate's card has no badge to click.**
+    ///
+    /// It is type inside somebody else's border: no frame of its own, and so no
+    /// controls of its own — the renderer stands the whole row down in favour of
+    /// [`render_crew_row`], which draws a name, a status line and nothing else.
+    /// A rect for a badge is still *derivable* for that row, because
+    /// [`crate::app::state::WorkspaceCardArea::control_right`] falls back to the
+    /// row's own right edge when there is no frame to measure from — real cells,
+    /// inside the panel, that nothing has ever painted a badge on. Clicking them
+    /// must not open a view for a mark that is not there.
+    ///
+    /// The mate's own badge is checked in the same fleet, because a gate that
+    /// closed both would be no better than the bug.
+    #[test]
+    fn a_folded_workers_summary_badge_has_no_click_target() {
+        // Wide enough for the panel to draw boxes at all — below
+        // [`card::MIN_FOLD_WIDTH`] a worker is a bare line with controls of its
+        // own, and there is nothing to fold and nothing to suppress.
+        let (app, rows) = folded_worker_summary_fleet(42);
+        let screen = rows.join("\n");
+        let entries = workspace_list_entries(&app);
+        let agents = sidebar_agent_entries(&app);
+
+        let card_named = |name: &str| {
+            app.view
+                .workspace_card_areas
+                .iter()
+                .find(|card| {
+                    entries
+                        .get(card.entry_idx)
+                        .map(|entry| entry_tree_name(&app, &agents, entry))
+                        == Some(Some(name.to_string()))
+                })
+                .unwrap_or_else(|| panic!("{name} has no row in:\n{screen}"))
+        };
+
+        // The scenario is the one the fix is for: the worker is folded, and it
+        // has earned a badge. Without both, the sweep below would pass for the
+        // wrong reason.
+        let worker_card = card_named("worker");
+        assert!(
+            worker_card.card_frame.is_none(),
+            "the worker was not folded into its mate's card:\n{screen}"
+        );
+        let (owner, count) = worker_summary_badge(&app, &entries, &agents, worker_card)
+            .expect("the worker's own worker published a summary");
+        assert_eq!((owner.as_str(), count), ("worker", 1));
+        let phantom = worker_summary_badge_rect(worker_card, count);
+        assert!(
+            phantom.width > 0 && phantom.x + phantom.width <= app.view.sidebar_rect.width,
+            "no phantom rect was derivable, so this test proves nothing: {phantom:?}"
+        );
+
+        // Nothing drew it, and nothing opens it.
+        assert_eq!(
+            screen.matches(WORKER_SUMMARY_BADGE_GLYPH).count(),
+            1,
+            "a folded worker's row drew a badge of its own:\n{screen}"
+        );
+        for row in app.view.sidebar_rect.y..app.view.sidebar_rect.y + app.view.sidebar_rect.height {
+            for col in
+                app.view.sidebar_rect.x..app.view.sidebar_rect.x + app.view.sidebar_rect.width
+            {
+                assert_ne!(
+                    app.worker_summary_badge_at(col, row).as_deref(),
+                    Some("worker"),
+                    "({col}, {row}) opens a folded worker's summaries; \
+                     its undrawn rect is {phantom:?}\n{screen}"
+                );
+            }
+        }
+
+        // The mate's badge is drawn, and stays clickable.
+        let mate_card = card_named("2ndmate-explore");
+        let mate_badge = worker_summary_badge_rect(mate_card, 1);
+        assert!(mate_badge.width > 0, "the mate lost its badge:\n{screen}");
+        assert_eq!(
+            app.worker_summary_badge_at(mate_badge.x, mate_badge.y)
+                .as_deref(),
+            Some("2ndmate-explore"),
+            "the mate's own badge stopped opening its summaries:\n{screen}"
+        );
     }
 
     /// Draws the sidebar and reads the bar column back out of the buffer as
