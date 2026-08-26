@@ -25,8 +25,27 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # Agent-edit baseline snapshots (written by the diff-capture PreToolUse hook)
 # are keyed by agent session id and are dead the moment that session ends.
 # Nothing else ever reaps them, so sweep stale ones on session start.
+#
+# Never the current session's own directory, though. A directory's mtime only
+# advances when a *new* file lands inside it, so a long-lived session that has
+# settled on a stable set of touched files — still editing, just not touching
+# anything new — looks stale here after three days and would be reaped by any
+# other session's sweep. Its next edit would then diff against /dev/null and
+# render as a whole-file addition.
+herdr_session_id="$(HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 -c '
+import json, os, sys
+
+try:
+    with open(os.environ["HERDR_HOOK_INPUT_FILE"], encoding="utf-8") as handle:
+        session_id = json.load(handle).get("session_id")
+except Exception:
+    session_id = None
+sys.stdout.write(session_id if isinstance(session_id, str) else "")
+' 2>/dev/null)" || herdr_session_id=""
+# "." when the id is unknown: -mindepth 1 means no candidate is ever named
+# ".", so the guard then excludes nothing rather than everything.
 find /tmp/herdr-agent-diff-baseline -maxdepth 1 -mindepth 1 -type d -mtime +3 \
-  -exec rm -rf {} + 2>/dev/null || true
+  ! -name "${herdr_session_id:-.}" -exec rm -rf {} + 2>/dev/null || true
 
 HERDR_ACTION="$action" HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
 import json
