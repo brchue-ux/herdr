@@ -522,11 +522,17 @@ impl WorkspaceListEntry {
     /// chain that opened it is not.
     ///
     /// A worker the first mate opened directly hangs off the first mate,
-    /// because that is genuinely who owns it, so its connector is a branch off
-    /// the trunk at depth 1 — the same column a second mate's is. Reading its
-    /// rank off that depth would promote it to second mate purely because of
-    /// who spawned it, which is the one outcome the captain ruled out: *"sub
-    /// agent size card, not secondmate or first mate ssize."*
+    /// because that is genuinely who owns it, so it sits at depth 1 — the same
+    /// level a second mate does. Reading its rank off that depth would make it
+    /// a second mate purely because of who spawned it, and a second mate is a
+    /// *card*: it would take a box of its own, at a mate's width, beside the
+    /// mate that dispatched it. What it is instead is a row inside that mate's
+    /// own box ([`crew_folds_into_its_space`]), which is the captain's rule and
+    /// is available to it only as a worker.
+    ///
+    /// The rank still reaches the screen on its own where such a worker stands
+    /// outside a box — a panel scrolled past its mate — and it is what
+    /// [`card_frame_for`] measures the resulting card from.
     ///
     /// A mate nested under another mate is the mirror of it. A Space is what a
     /// mate *is*, so a second mate that has itself dispatched a second mate
@@ -1246,16 +1252,19 @@ fn space_rows(blocks: &[SpaceBlock]) -> Vec<SpaceRow> {
 /// Hang a first-mate-opened worker off the second mate whose scope fits it.
 ///
 /// The captain's rule, verbatim: *"if the firstmate opens a worker or subagent
-/// it should always be tied to a secondmate. if there is no relevant secondmate
-/// have it create the card as a sub agent as a branch under it."*
+/// it should always be tied to a secondmate."*
 ///
-/// This is the first half — the tie. The second half is not here and is not a
-/// re-parenting at all: a worker with no fitting mate keeps the first mate as
-/// its owner, because that is who genuinely opened it, and it is
-/// [`WorkspaceListEntry::rank`] that stops the resulting depth from promoting
-/// it. Moving it deeper instead would draw a `├─` in the second mate column
-/// with no second mate above it to hang from, which is a broken branch rather
-/// than a sub agent.
+/// This is the tie, and it is all that is left of the rule. The captain's own
+/// second clause — *"if there is no relevant secondmate have it create the card
+/// as a sub agent as a branch under it"* — is superseded: a worker with no
+/// fitting mate is now drawn *inside the first mate's own card* rather than as
+/// a sub agent's card branched off it. See [`crew_folds_into_its_space`].
+///
+/// The re-parenting is unchanged either way. A worker with no fitting mate
+/// keeps the first mate as its owner, because that is who genuinely opened it,
+/// and it is [`WorkspaceListEntry::rank`] that stops the resulting depth from
+/// promoting it to a mate. Moving it deeper instead would put it in a second
+/// mate's column with no second mate above it to belong to.
 ///
 /// **What "fits" means, and why it is this:** the Space the worker is actually
 /// running in. A pane is *in* one checkout and one Space, and that is the scope
@@ -11321,12 +11330,25 @@ rows = [
 /// how wide it is drawn.
 ///
 /// One module because the three are one structure. The captain reported the
-/// first as two findings — *"tree trunk not aligned with firstmate/workers.
-/// branches not aligned with secondmates"* — and settled the other two in the
-/// same breath as one rule: a worker the first mate opens is tied to a second
-/// mate if one fits, is a sub agent under the first mate if none does, and is
-/// drawn at *"sub agent size card, not secondmate or first mate ssize"* either
-/// way.
+/// alignment as two findings — *"tree trunk not aligned with firstmate/workers.
+/// branches not aligned with secondmates"* — and settled who hangs where in the
+/// same breath: a worker the first mate opens is tied to a second mate if one
+/// fits, and keeps the first mate if none does.
+///
+/// # What a worker is drawn as, and what it is no longer drawn as
+///
+/// The captain's first answer was a card of its own — *"sub agent size card,
+/// not secondmate or first mate ssize"*, *"have it create the card as a sub
+/// agent as a branch under it"* — and he replaced it after seeing both drawn:
+/// a worker belongs **inside the card of the mate that dispatched it**, and
+/// *"2nd mates' workers will function just like firstmate's workers, only they
+/// show up in their respective 2nd [mate's card]"*. So the rank ladder is still
+/// three rungs and still decides how wide a box is, but a worker only ever
+/// opens one where its own mate's box is not on screen. See
+/// [`crew_folds_into_its_space`].
+///
+/// A mate is untouched by that. A second mate is still its own card, still
+/// branch-nested under whoever owns it, at its own rung of the ladder.
 ///
 /// Everything here is asserted through the flattened tree or the geometry the
 /// renderer is handed, never against the source of a glyph.
@@ -11353,7 +11375,14 @@ mod ownership_is_drawn_as_written {
         interleaved_worker_fleet()
     }
 
-    /// Where each row's card starts and ends, by name, on a panel this wide.
+    /// Where each row's **own** box would start and end, by name, on a panel
+    /// this wide: the rank ladder, asked of the one function that decides it.
+    ///
+    /// A worker is drawn inside its own mate's box on a resting panel and is
+    /// handed no frame at all there — see [`drawn_frames`], which is what the
+    /// layout actually produces. What this measures is the box a row of that
+    /// depth and rank *opens*, which is still the ladder every card is placed
+    /// on and is still what a worker gets when its mate's box is off screen.
     fn card_frames(
         app: &crate::app::state::AppState,
         sidebar_width: u16,
@@ -11388,6 +11417,53 @@ mod ownership_is_drawn_as_written {
             .unwrap_or_else(|| panic!("{name} draws no card"))
     }
 
+    /// What the **layout** hands each row, by name: the box it draws, or `None`
+    /// where it opens none because it is drawn inside somebody else's.
+    ///
+    /// [`card_frames`] answers the ladder; this answers the panel. They differ
+    /// on exactly one kind of row, and that difference is the captain's rule.
+    fn drawn_frames(
+        app: &crate::app::state::AppState,
+        sidebar_width: u16,
+    ) -> Vec<(String, Option<Rect>)> {
+        let area = Rect::new(0, 0, sidebar_width, 60);
+        let agents = sidebar_agent_entries(app);
+        let entries = workspace_list_entries(app);
+        compute_workspace_card_areas(app, area)
+            .into_iter()
+            .filter_map(|card| {
+                let name = match entries.get(card.entry_idx)? {
+                    WorkspaceListEntry::Workspace { ws_idx, .. } => space_tree_name(app, *ws_idx),
+                    WorkspaceListEntry::Agent { entry_idx, .. } => agents
+                        .get(*entry_idx)
+                        .and_then(|agent| agent.agent_name.clone()),
+                }?;
+                Some((name, card.card_frame))
+            })
+            .collect()
+    }
+
+    /// The box the panel drew for `name`, and `None` when it drew none.
+    fn drawn_frame_of(
+        app: &crate::app::state::AppState,
+        sidebar_width: u16,
+        name: &str,
+    ) -> Option<Rect> {
+        drawn_frames(app, sidebar_width)
+            .into_iter()
+            .find(|(row, _)| row == name)
+            .map(|(_, frame)| frame)
+            .unwrap_or_else(|| panic!("{name} drew no row at all"))
+    }
+
+    /// The row index of `name` in the drawn tree.
+    fn drawn_row_of(app: &crate::app::state::AppState, sidebar_width: u16, name: &str) -> usize {
+        drawn_frames(app, sidebar_width)
+            .into_iter()
+            .position(|(row, _)| row == name)
+            .unwrap_or_else(|| panic!("{name} drew no row at all"))
+    }
+
     // ---------------------------------------------------------------- alignment
 
     /// The column a row of this depth puts its `├`/`└` in, read off the prefix
@@ -11417,6 +11493,12 @@ mod ownership_is_drawn_as_written {
     /// Asserted across the two functions that have to agree — the prefix the
     /// renderer draws and the frame [`card_frame_for`] hands the card — because
     /// a tree whose lines miss its cards is exactly those two disagreeing.
+    ///
+    /// Every row here still answers it, worker rows included, because the
+    /// question is about the ladder rather than about what the panel drew: a
+    /// worker only *uses* its connector where it stands outside a box, and it
+    /// has to land in the right column when it does. Where it does not is
+    /// [`a_worker_hangs_off_nothing_inside_the_box_that_holds_it`].
     #[test]
     fn every_branch_starts_in_the_column_its_parents_border_stands_in() {
         let app = mate_fleet();
@@ -11442,6 +11524,40 @@ mod ownership_is_drawn_as_written {
                 parent.1.x,
                 "{name}'s connector column is not the column {}'s border stands in",
                 parent.0
+            );
+        }
+    }
+
+    /// **A worker draws no branch at all, because the box it is in is the
+    /// relation.**
+    ///
+    /// The other half of the alignment contract, and the half the captain's new
+    /// rule created: a `├─` beside a worker would be a second, weaker statement
+    /// of what its mate's border already says, drawn in the gutter of a card it
+    /// is not outside of. Read off the panel the captain runs.
+    #[test]
+    fn a_worker_hangs_off_nothing_inside_the_box_that_holds_it() {
+        let app = mate_fleet();
+        let rows = drawn_panel(mate_fleet(), 40);
+        let screen = rows.join("\n");
+        for (name, frame) in drawn_frames(&app, CAPTAIN_SIDEBAR_WIDTH) {
+            let mate = matches!(name.as_str(), "firstmate" | "2ndmate-a" | "2ndmate-b");
+            assert_eq!(
+                frame.is_some(),
+                mate,
+                "{name} {} a box of its own",
+                if mate { "lost" } else { "opened" }
+            );
+            if mate {
+                continue;
+            }
+            let row = rows
+                .iter()
+                .find(|row| row.contains(&name))
+                .unwrap_or_else(|| panic!("{name} drew no row:\n{screen}"));
+            assert!(
+                !row.contains('\u{251c}') && !row.contains('\u{2514}'),
+                "{name} grew a connector inside the box that already holds it:\n{screen}"
             );
         }
     }
@@ -11532,18 +11648,119 @@ mod ownership_is_drawn_as_written {
         let (_, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "fm-opened");
         assert_eq!(depth, 2, "it did not hang at worker depth");
         assert_eq!(rank, AgentRelation::Worker);
+
+        // And it is drawn in *that* mate's card, not in the card of the mate
+        // whose name its token carries.
+        let entries = workspace_list_entries(&app);
+        assert_eq!(
+            crew_head(
+                &entries,
+                drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, "fm-opened")
+            ),
+            Some(drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, "2ndmate-a")),
+            "the worker's ink went to a card its scope does not put it in"
+        );
     }
 
-    /// With no mate whose scope fits, the same worker stays under the first mate
-    /// — *"have it create the card as a sub agent as a branch under it"* — and
-    /// is a sub agent there rather than a second mate.
+    /// **A second mate's own worker is in the second mate's card — the
+    /// generalisation, stated on the row it was generalised for.**
     ///
-    /// It is deliberately **not** pushed a level deeper. A `├─` in the second
-    /// mate column with no second mate above it hangs off nothing, which is a
-    /// broken branch rather than a sub agent; what stops the promotion is its
-    /// rank, which is what the card's size is measured from.
+    /// The captain settled the first mate's case first and then widened it in
+    /// one sentence: *"2nd mates' workers will function just like firstmate's
+    /// workers, only they show up in their respective 2nd [mate's card]"*. Two
+    /// mates, each running workers of its own, so a rule that only ever found
+    /// the first mate would show up here as a worker in the wrong box.
+    ///
+    /// The mate itself is untouched by the fold, which is the other half of what
+    /// was asked: a second mate is still its own card, still branch-nested under
+    /// the first mate, at its own rung of the ladder.
     #[test]
-    fn a_worker_with_no_fitting_mate_is_a_sub_agent_on_the_first_mates_branch() {
+    fn a_second_mates_own_worker_lands_in_the_second_mates_card() {
+        let app = mate_fleet();
+        let entries = workspace_list_entries(&app);
+        let row = |name: &str| drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, name);
+
+        for (mate, workers) in [("2ndmate-a", ["a-one", "a-two", "a-three"].as_slice())] {
+            for worker in workers {
+                assert_eq!(
+                    crew_head(&entries, row(worker)),
+                    Some(row(mate)),
+                    "{worker} is not drawn in {mate}'s own card"
+                );
+                assert_ne!(
+                    crew_head(&entries, row(worker)),
+                    Some(row("firstmate")),
+                    "{worker} was folded into the first mate's card instead"
+                );
+                assert_eq!(
+                    crew_tier(&entries, row(worker)),
+                    Some(0),
+                    "{worker} was stepped in as though it came through somebody"
+                );
+                assert_eq!(
+                    drawn_frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, worker),
+                    None,
+                    "{worker} opened a box of its own inside {mate}'s"
+                );
+            }
+        }
+        for worker in ["b-one", "b-two"] {
+            assert_eq!(
+                crew_head(&entries, row(worker)),
+                Some(row("2ndmate-b")),
+                "{worker} left its own mate's card"
+            );
+        }
+
+        // The mates themselves are unchanged: their own cards, nested under the
+        // first mate, at a second mate's rung.
+        for mate in ["2ndmate-a", "2ndmate-b"] {
+            let (ladder, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, mate);
+            assert_eq!(depth, 1, "{mate} stopped hanging off the first mate");
+            assert_eq!(rank, AgentRelation::SecondMate);
+            let drawn = drawn_frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, mate)
+                .unwrap_or_else(|| panic!("{mate} lost its own box"));
+            assert_eq!(
+                (drawn.x, drawn.width),
+                (ladder.x, ladder.width),
+                "{mate}'s box left its own rung of the ladder"
+            );
+            // And it closes under its last worker rather than above the first.
+            let last = drawn_frames(&app, CAPTAIN_SIDEBAR_WIDTH)
+                .into_iter()
+                .position(|(name, _)| name == mate)
+                .expect("the mate drew a row");
+            assert!(
+                drawn.height
+                    > compute_workspace_card_areas(
+                        &app,
+                        Rect::new(0, 0, CAPTAIN_SIDEBAR_WIDTH, 60)
+                    )[last]
+                        .rect
+                        .height,
+                "{mate}'s box did not grow over the workers inside it"
+            );
+        }
+    }
+
+    /// With no mate whose scope fits, the same worker stays under the first
+    /// mate — and is drawn **inside the first mate's own card**.
+    ///
+    /// This is the captain's revision. His first answer was a card of its own,
+    /// *"have it create the card as a sub agent as a branch under it"*, and this
+    /// test used to pin exactly that: a narrower box, offset from the first
+    /// mate's, ending where the other sub agents end. Having seen both drawn he
+    /// replaced it — a worker belongs in the card of the mate that dispatched
+    /// it — so what is pinned here now is the box it is *in* rather than the box
+    /// it opens.
+    ///
+    /// It is still deliberately **not** pushed a level deeper. A row in the
+    /// second mate column with no second mate above it belongs to nothing; what
+    /// stops the promotion is its rank, which is also what its card is measured
+    /// from on the one panel that still gives it one — a panel scrolled past its
+    /// mate.
+    #[test]
+    fn a_worker_with_no_fitting_mate_is_drawn_inside_the_first_mates_card() {
         let mut app = mate_fleet();
         // In the first mate's *own* Space, so no second mate's scope holds it.
         let pane = app.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
@@ -11581,8 +11798,9 @@ mod ownership_is_drawn_as_written {
             "being opened by the first mate promoted its rank"
         );
 
-        // Never a peer of the first mate, and never a second mate: it ends where
-        // the sub agents end and not where the mates do.
+        // The rank it kept is still a rung of the ladder — never a peer of the
+        // first mate, never a second mate's width — which is what it is drawn at
+        // on a panel that has scrolled its mate off the top.
         let (mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "2ndmate-a");
         let (first_mate, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "firstmate");
         let (worker, ..) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "a-one");
@@ -11592,14 +11810,48 @@ mod ownership_is_drawn_as_written {
         );
         assert!(
             frame.width < mate.width,
-            "a sub agent drew at second mate width: {} vs {}",
+            "a worker drew at second mate width: {} vs {}",
             frame.width,
             mate.width
         );
         assert_eq!(
             frame.x + frame.width,
             worker.x + worker.width,
-            "it does not end where the other sub agents end"
+            "it does not end where the other workers end"
+        );
+
+        // And on the panel itself it opens no box at all: it is a row inside the
+        // first mate's, directly under it and above the mates nested below.
+        assert_eq!(
+            drawn_frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "fm-direct"),
+            None,
+            "it drew a box of its own inside the card it is in"
+        );
+        let entries = workspace_list_entries(&app);
+        let fm_direct = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, WorkspaceListEntry::Agent { entry_idx, .. }
+                    if sidebar_agent_entries(&app)[*entry_idx].agent_name.as_deref()
+                        == Some("fm-direct"))
+            })
+            .expect("the worker has a row");
+        let first_mate_row = entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. }
+                    if space_tree_name(&app, *ws_idx).as_deref() == Some("firstmate"))
+            })
+            .expect("the first mate has a row");
+        assert_eq!(
+            crew_head(&entries, fm_direct),
+            Some(first_mate_row),
+            "the worker is not in the first mate's own list"
+        );
+        assert_eq!(
+            crew_tier(&entries, fm_direct),
+            Some(0),
+            "a worker the first mate dispatched itself must sit flush in its card"
         );
     }
 
@@ -11668,10 +11920,15 @@ mod ownership_is_drawn_as_written {
 
     // -------------------------------------------------------------------- width
 
-    /// **Width reads as rank.** At the captain's own width a sub agent's card is
+    /// **Width reads as rank.** At the captain's own width a worker's card is
     /// visibly narrower than a second mate's, which is visibly narrower than the
     /// first mate's — and the right edges form a staircase, which is the part a
     /// reader actually compares.
+    ///
+    /// The worker's rung is asked of the ladder rather than of the panel,
+    /// because a worker is drawn inside its own mate's box and opens a card of
+    /// its own only where that box is off screen. The rung still has to be
+    /// there, and still has to be legible, for the panel that gives it one.
     #[test]
     fn a_rank_is_legible_from_the_cards_width_alone() {
         let app = mate_fleet();
@@ -11710,7 +11967,7 @@ mod ownership_is_drawn_as_written {
         let step = mate.width - worker.width;
         assert!(
             step >= 6,
-            "a sub agent is only {step} columns narrower than a second mate"
+            "a worker is only {step} columns narrower than a second mate"
         );
         assert!(
             f32::from(step) / f32::from(mate.width) > 0.12,
@@ -12053,9 +12310,32 @@ mod ownership_is_drawn_as_written {
     /// depth 2, which is a *worker's* rung of the ladder — and reading its rank
     /// off that depth drew a persistent mate at exactly the size of the one-off
     /// tasks running underneath it.
+    ///
+    /// The stakes went up with the captain's fold rule rather than down: a mate
+    /// mistaken for a worker would no longer merely be drawn small, it would be
+    /// drawn *inside its parent's card*, with its own crew under it. So this
+    /// also asserts what the panel hands each of them — the nested mate a box,
+    /// its worker none.
     #[test]
     fn a_mate_nested_under_a_mate_is_still_a_mate() {
         let app = nested_mate_fleet();
+        assert!(
+            drawn_frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "3rdmate").is_some(),
+            "a nested mate was folded into its parent's card"
+        );
+        assert_eq!(
+            drawn_frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "deep-worker"),
+            None,
+            "the nested mate's own worker opened a box of its own"
+        );
+        assert_eq!(
+            crew_head(
+                &workspace_list_entries(&app),
+                drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, "deep-worker")
+            ),
+            Some(drawn_row_of(&app, CAPTAIN_SIDEBAR_WIDTH, "3rdmate")),
+            "the worker is not in the card of the mate that dispatched it"
+        );
         let (nested, depth, rank) = frame_of(&app, CAPTAIN_SIDEBAR_WIDTH, "3rdmate");
         assert_eq!(depth, 2, "the fixture did not nest the second mate at all");
         assert_eq!(
@@ -12136,13 +12416,14 @@ mod ownership_is_drawn_as_written {
         );
     }
 
-    /// The rows that were already drawn are drawn the same way.
+    /// No rail is ever drawn into a border, and the ladder is the same three
+    /// widths on a fleet with no nested mate.
     ///
     /// [`fit_rails_to_card`] only takes columns back from a row whose card is
-    /// wider than its level, which no row in the captain's own fleet is, so the
-    /// whole panel it renders today must be byte-for-byte what it was.
+    /// wider than its level, which no row in the captain's own fleet is, so
+    /// nothing it does may reach that fleet's rails.
     #[test]
-    fn a_fleet_with_no_nested_mate_draws_exactly_as_it_did() {
+    fn a_fleet_with_no_nested_mate_keeps_its_rails_out_of_every_border() {
         let rows = drawn_panel(mate_fleet(), 32);
         for (index, row) in rows.iter().enumerate() {
             assert!(
