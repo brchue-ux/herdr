@@ -54,6 +54,7 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
     io::stdout().flush()
 }
 
+mod agent_edit_log;
 mod agent_resume;
 mod agent_view;
 // The animation engine deliberately publishes a wider surface than its

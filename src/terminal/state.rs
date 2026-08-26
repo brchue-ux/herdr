@@ -133,6 +133,13 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    /// This pane's agent-driven file edits this session, keyed by path —
+    /// the Changes zone's data source. Unrelated to git; populated only by
+    /// `pane.report_edit_diff` (Claude Code hooks), never by git status.
+    // No reader yet: the RPC writer and the Changes-zone reader land in later
+    // tasks of this feature.
+    #[allow(dead_code)]
+    pub agent_edit_log: crate::agent_edit_log::AgentEditLog,
     /// Which pane asked Herdr to create this one, and the workspace that pane
     /// was in. See [`crate::api::schema::PaneOrigin`].
     ///
@@ -188,6 +195,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            agent_edit_log: crate::agent_edit_log::AgentEditLog::default(),
             created_by: None,
             persisted_agent_session: None,
             terminal_title: None,
