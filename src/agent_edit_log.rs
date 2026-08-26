@@ -49,6 +49,18 @@ impl AgentEditLog {
             .flat_map(|text| text.lines.iter().cloned())
             .collect()
     }
+
+    /// How many lines [`Self::flatten`] would produce, without producing them.
+    ///
+    /// The scroll clamp (`crate::ui::diff_pane::normalized_diff_scroll`)
+    /// wants the total and nothing else, and runs twice per drawn frame —
+    /// once inside the render pass, once on the overlay-anchor path. Asking
+    /// `flatten` for it there would clone every line of every edited file on
+    /// each of those calls, on a log that grows for as long as the session
+    /// does and carries no total-line ceiling of its own.
+    pub(crate) fn total_lines(&self) -> usize {
+        self.entries.values().map(|text| text.lines.len()).sum()
+    }
 }
 
 #[cfg(test)]

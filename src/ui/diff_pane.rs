@@ -107,9 +107,17 @@ fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
 /// the per-frame render clamp (`compute_view_internal`) and the mouse wheel
 /// handler (`AppState::scroll_diff_pane`) call through this so the two can
 /// never disagree.
+///
+/// Counts through [`AppState::focused_pane_agent_edit_line_count`] rather
+/// than [`focused_pane_diff`]: this runs twice per drawn frame — once from
+/// [`render_diff_content`], once from [`diff_overlay_anchors`] — and the
+/// clamp needs a total, not the lines. Going through `focused_pane_diff`
+/// cloned the whole session's edit log on each of those calls to read
+/// `.len()` off it.
 pub(crate) fn normalized_diff_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
-    let total = focused_pane_diff(app)
-        .map(|diff| diff.lines.len())
+    let total = app
+        .active
+        .and_then(|workspace_idx| app.focused_pane_agent_edit_line_count(workspace_idx))
         .unwrap_or(0);
     requested.min(total.saturating_sub(area.height as usize))
 }
@@ -849,5 +857,41 @@ mod the_changes_zone_follows_the_focused_pane {
         // 10 lines in a 4-row area scroll at most 6 lines down.
         assert_eq!(normalized_diff_scroll(&app, area, 99), 6);
         assert_eq!(normalized_diff_scroll(&app, area, 2), 2);
+    }
+
+    /// The clamp counts through `focused_pane_agent_edit_line_count` so a
+    /// frame never clones the whole log to read a length off it. That is only
+    /// safe while the count answers exactly what the flattening accessor
+    /// would — including which cases are `None` — across several files, which
+    /// is where a hand-rolled sum would be free to drift.
+    #[test]
+    fn the_count_only_accessor_agrees_with_the_flattening_one() {
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let count = |app: &AppState| app.focused_pane_agent_edit_line_count(0);
+        let flattened_count = |app: &AppState| {
+            app.focused_pane_agent_edit_lines(0)
+                .map(|lines| lines.len())
+        };
+
+        assert_eq!(count(&app), Some(0));
+        assert_eq!(count(&app), flattened_count(&app));
+
+        record_edit(&mut app, pane_id, "a.rs", sample("first"));
+        record_edit(&mut app, pane_id, "b.rs", sample("second"));
+
+        assert_eq!(count(&app), flattened_count(&app));
+        assert_eq!(count(&app), Some(sample("first").lines.len() * 2));
+
+        // The `None` cases have to line up too, or the clamp would fall back
+        // to 0 for a pane whose content still draws.
+        assert_eq!(app.focused_pane_agent_edit_line_count(1), None);
+        assert_eq!(app.focused_pane_agent_edit_lines(1), None);
     }
 }

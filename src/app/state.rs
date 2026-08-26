@@ -2812,12 +2812,42 @@ impl AppState {
         &self,
         workspace_idx: usize,
     ) -> Option<Vec<crate::workspace::GitDiffLine>> {
+        Some(self.focused_pane_agent_edit_log(workspace_idx)?.flatten())
+    }
+
+    /// How many lines [`Self::focused_pane_agent_edit_lines`] would return,
+    /// without building — and cloning — the flattened `Vec` to count it.
+    ///
+    /// The scroll clamp (`crate::ui::diff_pane::normalized_diff_scroll`) is
+    /// the caller, and it wants the total and nothing else. It runs twice per
+    /// drawn frame, on a log with no total-line ceiling, so counting through
+    /// the flattening accessor made every frame's cost scale with the whole
+    /// session's edits for a number that is a sum of `Vec` lengths.
+    ///
+    /// `None` for exactly the cases the flattening accessor returns `None`
+    /// for — both resolve the focused pane's terminal the same way, through
+    /// [`Self::focused_pane_agent_edit_log`], so the clamp and the drawn text
+    /// can never disagree about which log they are looking at.
+    pub(crate) fn focused_pane_agent_edit_line_count(&self, workspace_idx: usize) -> Option<usize> {
+        Some(
+            self.focused_pane_agent_edit_log(workspace_idx)?
+                .total_lines(),
+        )
+    }
+
+    /// The focused pane's edit log itself — the one place the
+    /// workspace → focused pane → terminal walk lives, so the flattening and
+    /// counting accessors above cannot drift apart on which pane they read.
+    fn focused_pane_agent_edit_log(
+        &self,
+        workspace_idx: usize,
+    ) -> Option<&crate::agent_edit_log::AgentEditLog> {
         let workspace = self.workspaces.get(workspace_idx)?;
         let pane_id = workspace.focused_pane_id()?;
         let tab = workspace.active_tab()?;
         let pane_state = tab.panes.get(&pane_id)?;
         let terminal = self.terminals.get(&pane_state.attached_terminal_id)?;
-        Some(terminal.agent_edit_log.flatten())
+        Some(&terminal.agent_edit_log)
     }
 
     pub(crate) fn mark_session_dirty(&mut self) {
