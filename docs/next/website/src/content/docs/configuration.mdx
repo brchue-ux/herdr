@@ -284,6 +284,19 @@ yellow = "#f9e2af"
 
 Color values accept hex, named colors, `rgb(r,g,b)`, or reset aliases like `reset`, `default`, `none`, and `transparent`.
 
+On a terminal that draws the sidebar's cards as pixels, six of these roles also colour the cards themselves:
+
+| role | what it colours on a card |
+| --- | --- |
+| `accent` | worker dots and their glow, each worker row's left rail, and the focused Space's border |
+| `surface0` | every other card's border, and the dashed rule above its worker list |
+| `panel_bg` | the card's own translucent face |
+| `text` | the card's title and captions |
+| `green` | the healthy `N rev` badge |
+| `yellow` | the `bug` badge |
+
+Only roles you set here reach the cards. A built-in theme leaves them alone, so a panel you have not themed keeps the one sampled colour family the cards ship with.
+
 ## UI and sidebar
 
 The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](/docs/config-reference/) for sizing, collapsed mode, Agent panel ordering, mouse behavior, pane borders, and other presentation settings.

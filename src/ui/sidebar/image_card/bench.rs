@@ -403,6 +403,7 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
         severity,
         hues,
         ground: measured::CANVAS,
+        theme: CardTheme::UNTHEMED,
         split_channels: true,
         seen: index.is_multiple_of(2),
         depth,
@@ -457,6 +458,7 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
                     detail: Some("laying the crew list out".to_string()),
                     tier: 0,
                     arrival: crew::CrewArrival::SETTLED,
+                    pulse: 0.0,
                     spider: None,
                 },
                 crew::CrewMember {
@@ -464,6 +466,7 @@ fn content(index: usize, depth: u8, hues: StageHues) -> CardContent {
                     detail: Some("dispatched by a second mate".to_string()),
                     tier: 1,
                     arrival: crew::CrewArrival::SETTLED,
+                    pulse: 0.0,
                     spider: None,
                 },
             ]

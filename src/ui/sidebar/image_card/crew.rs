@@ -87,6 +87,19 @@ const DOT_MUL: f32 = 0.45;
 /// `margin-right`.
 const DOT_GAP_MUL: f32 = 0.36;
 
+/// How far a breathing dot dips, as a share of its own strength.
+///
+/// The mockup's `@keyframes wk-pulse { 0%,100% { opacity: 1 } 50% { opacity:
+/// 0.4 } }` — a dot at the bottom of its breath is drawn at 40% of the top,
+/// so the swing is the remaining 60%.
+///
+/// Applied to the dot alone and never to the row's rail or its type. The
+/// mockup pulses `.wk-dot` and nothing else on the row, and it is the right
+/// call for the same reason [`super::CardLight::breathed`] leaves saturation
+/// alone: a name that faded in and out would read as the row itself being
+/// uncertain rather than as its work being live.
+const DOT_BREATH_DIP: f32 = 0.6;
+
 /// How much of its full strength a second mate's row is drawn at.
 ///
 /// The mockup dims the whole row's *edge* — `rgba(90,209,255,0.55)` becomes
@@ -143,6 +156,26 @@ pub(crate) struct CrewMember {
     /// that constructs one.
     pub(crate) tier: u8,
     pub(crate) arrival: CrewArrival,
+    /// Where this worker's dot is in its own breath, as the engine's envelope
+    /// — the mockup's `.wk-dot.pulse`.
+    ///
+    /// `0.0` is the dot at full strength, which is every dot on a host with no
+    /// card animation, every dot with `[ui.sidebar.cards] pulse = false`, and
+    /// every dot on a worker that is not working. A full swing is `1.0`, and a
+    /// snapping behaviour carries past it on its overshoot exactly as
+    /// [`super::CardContent::breath`] does.
+    ///
+    /// # Why this is a number and not a flag
+    ///
+    /// Because the envelope is already being computed. A worker row declares
+    /// the same three `card-*` behaviours its Space's card does (see
+    /// `AppState::sidebar_row_lifecycle`), and the engine accumulates their
+    /// phases for every row whether or not anything reads them — so this reads
+    /// a value the animator has already stepped rather than starting a clock.
+    /// A flag would have to be turned into an envelope somewhere, and that
+    /// somewhere would be a second clock to keep in step with the card's.
+    #[serde(default)]
+    pub(crate) pulse: f32,
     /// The failure marker this worker's fleet says it is carrying.
     ///
     /// A worker used to have a card of its own for its marker to climb, and it
@@ -173,6 +206,12 @@ impl CrewMember {
         // same and its card is carried forward rather than redrawn.
         ((self.arrival.open * ARRIVAL_STEPS).round() as u16).hash(hasher);
         ((self.arrival.bloom * ARRIVAL_STEPS).round() as u16).hash(hasher);
+        // Quantized on the card's own breath ladder rather than the arrival's:
+        // this *is* a card breath, read off the same engine at the same tier,
+        // and hashing it any finer would rasterise the sheet for a step of the
+        // dot's opacity nothing on screen could resolve. Without it the card is
+        // carried forward on a stale signature and the dot never moves at all.
+        ((self.pulse * super::CARD_BREATH_STEPS).round() as u16).hash(hasher);
         // Presence first, then the frame — the same two-part reading a card's
         // own marker gets, and for the same reason: a row that has just been
         // marked and one that has none are two different rows even before the
@@ -309,12 +348,20 @@ pub(super) fn drawn_extent_px(bands: CrewBands, members: &[CrewMember]) -> f32 {
 /// follow it. `left`/`right` are the card's own text column, so a worker's name
 /// starts exactly where the card's title does and is clipped exactly where it is.
 ///
-/// `ink` is the card's own caption ink and `edge` its stroke ink, both taken
-/// from the caller rather than resolved here: the crew is part of the card, not
-/// a widget standing on it, and a list that picked its own colours would be the
-/// one thing on the card that did not change when its state did.
-#[allow(clippy::too_many_arguments)] // Sheet, font, rows, geometry, two inks and
-                                     // the card's own opacity: each varies per call.
+/// `ink` is the card's own caption ink, `edge` its stroke ink and `accent` the
+/// theme's own full-strength accent, all three taken from the caller rather
+/// than resolved here: the crew is part of the card, not a widget standing on
+/// it, and a list that picked its own colours would be the one thing on the
+/// card that did not change when its state did.
+///
+/// `edge` and `accent` are two colours because the mockup draws them as two:
+/// `hr.divider` is `1px dashed var(--edge)` while `.wrow`'s own rail is
+/// `rgba(--cyan, .55)`. They are the same colour on an unthemed panel — the
+/// one measured hue family — and only a theme that authored `--edge`
+/// separates them.
+#[allow(clippy::too_many_arguments)] // Sheet, font, rows, geometry, three inks
+                                     // and the card's own opacity: each varies
+                                     // per call.
 pub(super) fn draw(
     sheet: &mut Canvas,
     font: &CardFont,
@@ -322,7 +369,7 @@ pub(super) fn draw(
     (metrics, bands): (&CrewMetrics, CrewBands),
     (left, right): (f32, f32),
     top: f32,
-    (ink, edge): (Rgb, Rgb),
+    (ink, edge, accent): (Rgb, Rgb, Rgb),
     marker: super::spider::Palette,
     opacity: f32,
 ) {
@@ -333,7 +380,7 @@ pub(super) fn draw(
     let rule_y = top + bands.divider * DIVIDER_LEAD_MUL / (DIVIDER_LEAD_MUL + DIVIDER_TRAIL_MUL);
     draw_dashed_rule(sheet, (left, right), rule_y, title_px, edge, opacity);
 
-    let name_ink = measured::INK.restate(1.0, 0.92);
+    let name_ink = ink.restate(1.0, 0.92);
     let detail_ink = measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX);
     let mut y = top + bands.divider;
     for member in members {
@@ -354,7 +401,7 @@ pub(super) fn draw(
                 metrics,
                 (left, right),
                 y + (bands.row - metrics.row).max(0.0) / 2.0,
-                (name_ink, detail_ink, edge),
+                (name_ink, detail_ink, accent),
                 alpha,
             );
             // Over the row it belongs to, after its type, exactly as a card's
@@ -423,7 +470,7 @@ fn draw_row(
     metrics: &CrewMetrics,
     (left, right): (f32, f32),
     top: f32,
-    (name_ink, detail_ink, edge): (Rgb, Rgb, Rgb),
+    (name_ink, detail_ink, accent): (Rgb, Rgb, Rgb),
     opacity: f32,
 ) {
     let presence = member.presence();
@@ -452,7 +499,7 @@ fn draw_row(
             if x >= sheet.width() {
                 break;
             }
-            sheet.blend(x, y, edge, 0.55 * presence * opacity);
+            sheet.blend(x, y, accent, 0.55 * presence * opacity);
         }
     }
 
@@ -465,7 +512,19 @@ fn draw_row(
         text_left + radius,
         name_top + metrics.name.line_height / 2.0,
     );
-    draw_dot(sheet, center, radius, presence, opacity);
+    // The breath rides the dot's own opacity and nothing else's, which is
+    // exactly what the mockup animates. Floored at zero for the reason
+    // `CardLight::breathed` floors its own: a negative envelope would drive the
+    // dot *past* full strength, and full strength is where it already is.
+    let breath = 1.0 - DOT_BREATH_DIP * member.pulse.max(0.0);
+    draw_dot(
+        sheet,
+        center,
+        radius,
+        presence,
+        opacity * breath.clamp(0.0, 1.0),
+        accent,
+    );
 
     let type_left = text_left + metrics.dot + metrics.dot_gap;
     if type_left >= right {
@@ -519,8 +578,14 @@ fn draw_row(
 /// partly covers used to take its fill and *skip* the glow, so it came out darker
 /// than the halo around it and the dot wore a dark ring. The glow is laid over
 /// the fill at `1 - fill` instead, which is the same number the disc did not use.
-fn draw_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, presence: f32, opacity: f32) {
-    let ink = measured::STROKE_A;
+fn draw_dot(
+    sheet: &mut Canvas,
+    center: (f32, f32),
+    radius: f32,
+    presence: f32,
+    opacity: f32,
+    ink: Rgb,
+) {
     // A dimmed row draws no glow at all, per the mockup's `box-shadow: none`:
     // the glow is what makes a dot read as lit, and a lit dot at a lower alpha
     // is a dim light rather than a light that is not this row's.
@@ -580,6 +645,7 @@ mod tests {
             detail: Some("craft.md falloff numbers".to_string()),
             tier,
             arrival,
+            pulse: 0.0,
             spider: None,
         }
     }
@@ -663,7 +729,14 @@ mod tests {
     fn a_lit_dot_has_a_round_halo_that_reaches_nothing() {
         let mut sheet = Canvas::new(60, 60);
         let radius = 2.7;
-        draw_dot(&mut sheet, (30.0, 30.0), radius, 1.0, 1.0);
+        draw_dot(
+            &mut sheet,
+            (30.0, 30.0),
+            radius,
+            1.0,
+            1.0,
+            measured::STROKE_A,
+        );
         let px = sheet.rgba8();
         let alpha = |dx: i32, dy: i32| {
             let x = (30 + dx) as u32;
@@ -721,7 +794,14 @@ mod tests {
 
         // A dimmed row draws the disc and no halo at all.
         let mut dim = Canvas::new(60, 60);
-        draw_dot(&mut dim, (30.0, 30.0), radius, VIA_MATE_PRESENCE, 1.0);
+        draw_dot(
+            &mut dim,
+            (30.0, 30.0),
+            radius,
+            VIA_MATE_PRESENCE,
+            1.0,
+            measured::STROKE_A,
+        );
         let dim = dim.rgba8();
         assert_eq!(
             dim[((30 * 60 + 33) * 4 + 3) as usize],

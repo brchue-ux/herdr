@@ -905,6 +905,15 @@ struct CardContent {
     /// The panel colour this card's ink is placed against. The severity channel
     /// is a *distance from the ground*, so the ground is part of resolving it.
     ground: Rgb,
+    /// The colours this card's theme has an authored answer for. See
+    /// [`CardTheme`] — every field `None` on a theme that authored none,
+    /// which is every built-in theme and the default.
+    ///
+    /// Per card for the same reason `ground` is: it is one fact for the whole
+    /// sheet, but [`CardLight::of`] and [`draw_card`] are reached through a
+    /// `&CardContent` and nothing else, so putting it anywhere else would mean
+    /// threading a second argument through every one of them.
+    theme: CardTheme,
     /// Whether the two channels are switched on. Off draws the reference's own
     /// single hue family with its intensity following the stage, which is what
     /// shipped before the split — see [`crate::config::SidebarCardsConfig`].
@@ -1001,6 +1010,11 @@ impl CardContent {
             hue.to_bits().hash(hasher);
         }
         self.ground.hash(hasher);
+        // For the same reason the hues and the ground go in: a theme change
+        // moves the card's colours without moving anything else about it, and
+        // a card carried forward on a stale signature would keep the old
+        // theme's ink.
+        self.theme.hash(hasher);
         self.split_channels.hash(hasher);
         self.seen.hash(hasher);
         self.depth.hash(hasher);
@@ -1095,6 +1109,7 @@ impl CardContent {
             self.ground,
             self.split_channels,
             self.accented(),
+            self.theme,
         )
     }
 
@@ -1167,6 +1182,140 @@ enum CaptionTone {
     State,
 }
 
+/// The colours a card is drawn in that the *theme* has an answer for.
+///
+/// # Why every field is optional
+///
+/// Because [`measured`] is the authority and this is an override, never the
+/// other way round. Each field is `Some` only when the user *authored* that
+/// role in `[theme.custom]` — a built-in theme leaves every one of them
+/// `None`, and so does the default. That keeps the captain's 2026-08-13
+/// decision D-c intact by construction: with no custom colours the panel
+/// still draws the one measured hue family the reference was sampled from,
+/// byte for byte, and every measured test still measures the measurement.
+///
+/// # Why the resolved palette is not read directly
+///
+/// [`crate::app::state::AppState::sidebar_palette`] always has an `accent` —
+/// Catppuccin's is `#89b4fa` — so reading it would repaint every default
+/// user's cards blue for a preference nobody expressed. A `[theme.custom]`
+/// entry is the one signal that is unambiguously a *statement about this
+/// colour*, which is exactly the authority an override needs.
+///
+/// # What each field answers
+///
+/// The roles are the "Rio Window, Assembled" mockup's own `:root` tokens,
+/// mapped onto the palette roles that already mean the same thing, so a theme
+/// that sets them gets the mockup and a theme that sets them differently gets
+/// itself:
+///
+/// | mockup | palette role | what it draws |
+/// |---|---|---|
+/// | `--cyan` | `accent` | `.wk-dot`, `.wrow` rail, `.card.active` border |
+/// | `--edge` | `surface0` | `.card` border, `hr.divider` |
+/// | `--panel` | `panel_bg` | the glass face's own tint |
+/// | `--ink` | `text` | the card's title |
+/// | `--ok` | `green` | `.badge` |
+/// | `--amber` | `yellow` | `.badge.warn` |
+///
+/// `--cyan-dim` needs no role of its own: the mockup's own second tier is
+/// `--cyan` dimmed, which is what [`crew::CrewMember`]'s tier presence
+/// already does to whatever ink it is handed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct CardTheme {
+    accent: Option<Rgb>,
+    edge: Option<Rgb>,
+    face: Option<Rgb>,
+    ink: Option<Rgb>,
+    ok: Option<Rgb>,
+    warn: Option<Rgb>,
+}
+
+impl CardTheme {
+    /// No role authored: every colour comes from [`measured`]. The default,
+    /// and what every card built before a `[theme.custom]` block existed
+    /// carries.
+    pub(crate) const UNTHEMED: Self = Self {
+        accent: None,
+        edge: None,
+        face: None,
+        ink: None,
+        ok: None,
+        warn: None,
+    };
+
+    /// The roles this app's `[theme.custom]` block authored, resolved against
+    /// the host theme exactly as [`backdrop_rgb`] and [`rail_rgb`] are.
+    ///
+    /// Reads `theme_runtime.custom` rather than `sidebar_palette` for the
+    /// reason the type's own doc gives — a resolved palette cannot say which
+    /// of its colours anyone chose. The *value* still comes from the palette
+    /// path where it can: a custom entry is parsed by
+    /// [`crate::config::parse_color`], the same function
+    /// [`crate::app::state::Palette::with_overrides`] uses, so the two cannot
+    /// disagree about what `#5ad1ff` means.
+    fn resolve(app: &AppState) -> Self {
+        let Some(custom) = app.theme_runtime.custom.as_ref() else {
+            return Self::UNTHEMED;
+        };
+        let host = &app.host_terminal_theme;
+        let role = |authored: &Option<String>| -> Option<Rgb> {
+            let parsed = crate::config::parse_color(authored.as_ref()?);
+            crate::ui::color::resolve_color_rgb(parsed, host).map(|(r, g, b)| Rgb(r, g, b))
+        };
+        Self {
+            accent: role(&custom.accent),
+            edge: role(&custom.surface0),
+            face: role(&custom.panel_bg),
+            ink: role(&custom.text),
+            ok: role(&custom.green),
+            warn: role(&custom.yellow),
+        }
+    }
+
+    /// The card's full-strength accent: its lit dots, its crew rails, and the
+    /// border of the one Space the panel is accenting.
+    fn accent(self) -> Rgb {
+        self.accent.unwrap_or(measured::STROKE_A)
+    }
+
+    /// A resting card's own border, and the dashed rule inside it.
+    ///
+    /// Unthemed this is the accent walked back to the `Queued` endpoint of the
+    /// one-hue ramp, which is what shipped and what the reference measures. A
+    /// theme that authored `--edge` gets it flat instead: the mockup's
+    /// `.card { border: 1px solid var(--edge) }` is a *stated* colour, not a
+    /// restatement of the accent, and restating it again would land somewhere
+    /// neither the theme nor the reference asked for.
+    fn edge(self) -> Rgb {
+        self.edge.unwrap_or_else(|| {
+            let mix = crate::anim::cell::one_hue_stage_mix(LifecycleStage::Queued);
+            self.accent().restate(mix.saturation, mix.luminance)
+        })
+    }
+
+    /// The card's own type ink.
+    fn ink(self) -> Rgb {
+        self.ink.unwrap_or(measured::INK)
+    }
+
+    /// The glass face's tint. See [`measured::GLASS_FACE`] — this changes
+    /// which colour the tint is, never how much of it reaches the pixel.
+    fn face(self) -> Rgb {
+        self.face.unwrap_or(measured::GLASS_FACE)
+    }
+
+    fn badge_ok(self) -> Rgb {
+        self.ok.unwrap_or(measured::BADGE_OK)
+    }
+
+    fn badge_warn(self) -> Rgb {
+        self.warn.unwrap_or(measured::BADGE_WARN)
+    }
+}
+
 /// The ground the cards float on.
 ///
 /// The reference's own canvas is `#09111C`, but the ground under a card is
@@ -1225,7 +1374,19 @@ fn chip_ink(content: &CardContent) -> Rgb {
             (AgentState::Idle, true) => (210.0, 0.16, 0.42),
             (AgentState::Unknown, _) => (210.0, 0.10, 0.36),
         };
-        return Rgb::from_hsl(h, s, l);
+        // The angles are the *measured* family's, and they move with the theme
+        // for the reason the whole table exists: they were sampled as one hue
+        // 175–265° with state carried by saturation and lightness alone. A
+        // theme that moved the accent and left these where they were would put
+        // the chip in a second hue family beside cards drawn in the first,
+        // which is the one thing the measurement rules out. Each angle keeps
+        // its own offset from the family's own centre, so the state ladder the
+        // table encodes survives the move intact.
+        let (h, s, l) = match content.theme.accent {
+            Some(accent) => (h + accent.to_hsl().0 - measured::STROKE_A.to_hsl().0, s, l),
+            None => (h, s, l),
+        };
+        return Rgb::from_hsl(h.rem_euclid(360.0), s, l);
     }
     Rgb::from_tuple(crate::anim::cell::signal_ink(
         content.hues.of(content.stage),
@@ -1290,25 +1451,38 @@ impl CardLight {
     /// approved mockup reserves the strong accent for the focused Space and a
     /// card mid its own arrival, never for a card's work state. `accented`
     /// carries that binary instead — see [`CardContent::accented`].
-    fn of(severity: Severity, hue: f32, ground: Rgb, split_channels: bool, accented: bool) -> Self {
+    fn of(
+        severity: Severity,
+        hue: f32,
+        ground: Rgb,
+        split_channels: bool,
+        accented: bool,
+        theme: CardTheme,
+    ) -> Self {
         let ink = if split_channels {
             Rgb::from_tuple(crate::anim::cell::signal_ink(
                 hue,
                 severity,
                 ground.as_tuple(),
             ))
-        } else {
+        } else if accented {
             // The reference's own answer to "what carries state without a
-            // rainbow": one hue, with saturation and light muted to the
-            // `Queued` endpoint on an ordinary card and lifted to the
-            // `Running` endpoint only when `accented` — never picked by the
-            // card's own stage any more.
-            let mix = crate::anim::cell::one_hue_stage_mix(if accented {
-                LifecycleStage::Running
-            } else {
-                LifecycleStage::Queued
-            });
-            measured::STROKE_A.restate(mix.saturation, mix.luminance)
+            // rainbow": one hue, at the `Running` endpoint of the ramp for the
+            // one card the panel is accenting — never picked by the card's own
+            // stage any more.
+            //
+            // Still routed through `restate` even though `Running`'s own mix is
+            // `(1.0, 1.0)`: that is an HSL round trip, and dropping it would
+            // move an unthemed card's stroke by a rounding step for no reason
+            // anyone asked for. The only thing this line changes is *which*
+            // colour is being restated.
+            let mix = crate::anim::cell::one_hue_stage_mix(LifecycleStage::Running);
+            theme.accent().restate(mix.saturation, mix.luminance)
+        } else {
+            // Every other card sits at the `Queued` endpoint — or, on a theme
+            // that authored `--edge`, at that colour flat. See
+            // [`CardTheme::edge`].
+            theme.edge()
         };
         Self {
             ink,
@@ -1489,7 +1663,7 @@ const BREATH_BLOOM_DIP: f32 = 0.36;
 /// Going further buys little: the loop cannot show more than ~62 changes a
 /// second, and 96 steps doubles the cost again for a median step already under
 /// the frame interval.
-const CARD_BREATH_STEPS: f32 = 48.0;
+pub(super) const CARD_BREATH_STEPS: f32 = 48.0;
 
 /// Steps of a card's bloom opacity the artwork is rebuilt at.
 ///
@@ -2155,10 +2329,10 @@ impl SpaceBadgeMark {
         }
     }
 
-    fn ink(self) -> Rgb {
+    fn ink(self, theme: CardTheme) -> Rgb {
         match self {
-            Self::Healthy(_) => measured::BADGE_OK,
-            Self::Warn => measured::BADGE_WARN,
+            Self::Healthy(_) => theme.badge_ok(),
+            Self::Warn => theme.badge_warn(),
         }
     }
 }
@@ -2626,13 +2800,13 @@ const DOT_GLOW_ALPHA: f32 = 0.6;
 /// A small solid circle with a soft falloff outside it — the worker status
 /// dot, `.wk-dot` in the flight-deck mockup.
 ///
-/// Always drawn at [`measured::STROKE_A`], the tree's own full-strength
-/// cyan, never the card's own (possibly dimmed) stroke ink: the mockup's dot
-/// is cyan on every worker row it draws, discharging hard or sitting idle
-/// alike, so this is one more place — with the badge and the discharge
-/// filaments — a worker's state reaches the card outside the border.
-fn draw_worker_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, opacity: f32) {
-    let ink = measured::STROKE_A;
+/// Always drawn at the theme's own full-strength accent — unthemed,
+/// [`measured::STROKE_A`], the tree's own cyan — and never the card's own
+/// (possibly dimmed) stroke ink: the mockup's dot is cyan on every worker row
+/// it draws, discharging hard or sitting idle alike, so this is one more place
+/// — with the badge and the discharge filaments — a worker's state reaches the
+/// card outside the border.
+fn draw_worker_dot(sheet: &mut Canvas, center: (f32, f32), radius: f32, opacity: f32, ink: Rgb) {
     let glow_radius = radius * DOT_GLOW_MUL;
     let glow_sigma = (glow_radius - radius).max(0.5);
     let x0 = (center.0 - glow_radius).floor().max(0.0) as u32;
@@ -2779,7 +2953,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                 sheet.blend(
                     x,
                     y,
-                    measured::GLASS_FACE,
+                    content.theme.face(),
                     measured::GLASS_BACK_ALPHA * inside * opacity,
                 );
             }
@@ -2823,7 +2997,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
                 sheet.blend(
                     x,
                     y,
-                    measured::GLASS_FACE,
+                    content.theme.face(),
                     measured::GLASS_FACE_ALPHA * body * opacity,
                 );
                 // The face is not a vertical ramp: it is a symmetric inner glow
@@ -2929,6 +3103,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             geometry,
             (ox + column.right - rail.width, rail_y),
             opacity,
+            content.theme,
         );
     }
 
@@ -2952,7 +3127,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             (&metrics, card.crew),
             (ox + column.left, ox + column.text_right()),
             oy + head,
-            (measured::INK, stroke_a),
+            (content.theme.ink(), stroke_a, content.theme.accent()),
             // The Space's own ground and stage hue: a worker's marker is
             // resolved against the card it is standing on, which is the one
             // rule [`spider::draw_at`] has.
@@ -3018,7 +3193,10 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
     };
     let block_top = oy + (head - title_block - caption_block) / 2.0;
 
-    let ink = measured::INK.restate(1.0, (0.55 + 0.45 * lum).min(1.0));
+    let ink = content
+        .theme
+        .ink()
+        .restate(1.0, (0.55 + 0.45 * lum).min(1.0));
     let first_line_right = ox + column.first_line_right();
     let first_line_left = text_left + dot_reserve;
     for (index, line) in lines.iter().enumerate() {
@@ -3042,7 +3220,7 @@ fn draw_card(sheet: &mut Canvas, card: &PlacedCard<'_>, font: &CardFont) {
             text_left + radius,
             block_top + title_metrics.line_height / 2.0,
         );
-        draw_worker_dot(sheet, center, radius, opacity);
+        draw_worker_dot(sheet, center, radius, opacity, content.theme.accent());
     }
 
     let caption_ink = measured::FILL_MID.mix(ink, measured::TIDBIT_INK_MIX);
@@ -3250,6 +3428,7 @@ mod the_cards_own_sparkline {
             severity: Severity::Clear,
             hues: StageHues(hues),
             ground: Rgb(9, 17, 28),
+            theme: CardTheme::UNTHEMED,
             split_channels: true,
             seen: true,
             depth: 0,
@@ -3295,6 +3474,7 @@ fn draw_control_rail(
     geometry: &CardGeometry,
     at: (f32, f32),
     opacity: f32,
+    theme: CardTheme,
 ) {
     let (x, y) = at;
     if let Some(badge) = &rail.badge {
@@ -3306,6 +3486,7 @@ fn draw_control_rail(
             geometry,
             (x, y + (rail.height - badge.height) / 2.0),
             opacity,
+            theme,
         );
     }
     if let Some(summary) = &rail.summary {
@@ -3363,6 +3544,9 @@ fn draw_control_rail(
 /// own colour ([`SpaceBadgeMark::ink`]) rather than the card's chip ink: it is
 /// a fleet-published quality signal, not the row's own agent-lifecycle state,
 /// and drawing it in the chip's hue would make the two unreadable apart.
+#[allow(clippy::too_many_arguments)] // One more than `draw_control_rail`: the
+                                     // badge carries its own ink, so it needs
+                                     // the theme that answers for it.
 fn draw_space_badge(
     sheet: &mut Canvas,
     font: &CardFont,
@@ -3371,10 +3555,11 @@ fn draw_space_badge(
     geometry: &CardGeometry,
     at: (f32, f32),
     opacity: f32,
+    theme: CardTheme,
 ) {
     let (x, y) = at;
     let badge_px = px * measured::BADGE_SIZE_MUL;
-    let ink = badge.mark.ink();
+    let ink = badge.mark.ink(theme);
     let pill = RoundRect {
         x,
         y,
@@ -3797,6 +3982,7 @@ fn content_for(
                 stage,
                 severity,
                 hues: StageHues::resolve(app),
+                theme: CardTheme::resolve(app),
                 ground: backdrop_rgb(app),
                 split_channels: app.sidebar_cards.stage_hue,
                 seen,
@@ -3880,6 +4066,7 @@ fn content_for(
                 stage,
                 severity,
                 hues: StageHues::resolve(app),
+                theme: CardTheme::resolve(app),
                 ground: backdrop_rgb(app),
                 split_channels: app.sidebar_cards.stage_hue,
                 seen: detail.seen,
@@ -3975,6 +4162,30 @@ fn crew_for(
             let age = detail
                 .last_agent_state_change_at
                 .map(|at| app.state_age_now.saturating_duration_since(at));
+            // The mockup's `.wk-dot.pulse`, read off the worker's *own* row
+            // rather than off the card it is drawn inside. That is what makes
+            // it say something: a Space's card breathes on the Space's state,
+            // and a list of workers all breathing that one rhythm would be five
+            // copies of a fact the card above them already carries. On its own
+            // row it is each worker's own state, and the row already exists —
+            // it is the element the arrival circuit and the spider are keyed on
+            // three lines up, and it already declares these behaviours (see
+            // `AppState::sidebar_row_lifecycle`), so this starts no clock and
+            // mounts no element. `breath_behaviour` also gives the dot the
+            // card's own tiering for free: `card-live` while it works,
+            // `card-rest` when it does not, `card-alert` when something is
+            // badly wrong.
+            let pulse = breath(
+                app,
+                &crate::anim::ElementId::agent_row(detail.pane_id),
+                detail.state,
+                crate::app::lifecycle::severity(
+                    detail
+                        .tokens
+                        .get(crate::app::lifecycle::SEVERITY_TOKEN)
+                        .map(String::as_str),
+                ),
+            );
             Some(crew::CrewMember {
                 // The same two lines the worker's *own* card set, so a fleet
                 // that publishes a `doing` sees the same words wherever the
@@ -3987,6 +4198,7 @@ fn crew_for(
                     .or_else(|| Some(super::agent_status_label(detail).to_lowercase())),
                 tier,
                 arrival,
+                pulse,
                 spider,
             })
         })
@@ -4455,6 +4667,13 @@ pub(crate) struct CardContentWire {
     severity: Severity,
     hues: StageHues,
     ground: Rgb,
+    /// The theme's authored card colours — see [`CardContent::theme`].
+    /// Carried, like `ground` and `hues`, because a client that rasterises its
+    /// own cards reads the *server's* config and has no `[theme.custom]` block
+    /// of its own to resolve. New field: see `focused_space` below for why
+    /// `#[serde(default)]` alone is not what makes one safe here.
+    #[serde(default)]
+    theme: CardTheme,
     split_channels: bool,
     seen: bool,
     depth: u8,
@@ -4515,6 +4734,7 @@ impl From<&CardContent> for CardContentWire {
             severity: content.severity,
             hues: content.hues,
             ground: content.ground,
+            theme: content.theme,
             split_channels: content.split_channels,
             seen: content.seen,
             depth: content.depth,
@@ -4545,6 +4765,7 @@ impl From<CardContentWire> for CardContent {
             severity: wire.severity,
             hues: wire.hues,
             ground: wire.ground,
+            theme: wire.theme,
             split_channels: wire.split_channels,
             seen: wire.seen,
             depth: wire.depth,
@@ -7510,6 +7731,7 @@ mod tests {
                 severity: Severity::Clear,
                 hues: StageHues([196.0; 5]),
                 ground: measured::CANVAS,
+                theme: CardTheme::UNTHEMED,
                 split_channels: false,
                 seen: true,
                 depth: 1,
@@ -7585,6 +7807,7 @@ mod tests {
                 severity: Severity::Critical,
                 hues: StageHues([196.0; 5]),
                 ground: measured::CANVAS,
+                theme: CardTheme::UNTHEMED,
                 split_channels: false,
                 seen: true,
                 depth: 1,
@@ -7673,6 +7896,7 @@ mod tests {
                 severity: Severity::Clear,
                 hues: StageHues([196.0; 5]),
                 ground: measured::CANVAS,
+                theme: CardTheme::UNTHEMED,
                 split_channels: false,
                 seen: true,
                 depth: 1,
@@ -8116,7 +8340,14 @@ mod tests {
     #[test]
     fn without_the_split_a_card_stays_inside_the_measured_hue_family() {
         for accented in [false, true] {
-            let light = CardLight::of(Severity::Critical, 0.0, measured::CANVAS, false, accented);
+            let light = CardLight::of(
+                Severity::Critical,
+                0.0,
+                measured::CANVAS,
+                false,
+                accented,
+                CardTheme::UNTHEMED,
+            );
             assert!((0.0..=1.0).contains(&light.lum));
             assert!((0.0..=1.0).contains(&light.bloom));
             // Desaturating toward grey is allowed; rotating the hue is not, and
@@ -8145,7 +8376,7 @@ mod tests {
             let inks: Vec<_> = Severity::ALL
                 .into_iter()
                 .map(|severity| {
-                    CardLight::of(severity, hue, ground, true, false)
+                    CardLight::of(severity, hue, ground, true, false, CardTheme::UNTHEMED)
                         .ink
                         .to_hsl()
                 })
@@ -8162,19 +8393,21 @@ mod tests {
         for severity in Severity::ALL {
             let placed = crate::anim::cell::signal_light(severity, ground.as_tuple());
             for (stage, hue) in LifecycleStage::ALL.into_iter().zip(hues) {
-                let (_, sat, light) = CardLight::of(severity, hue, ground, true, false)
-                    .ink
-                    .to_hsl();
+                let (_, sat, light) =
+                    CardLight::of(severity, hue, ground, true, false, CardTheme::UNTHEMED)
+                        .ink
+                        .to_hsl();
                 assert!(
                     (light - placed).abs() < 0.02,
                     "{stage:?} is placed at lightness {light:.3} where {severity:?} \
                      asks for {placed:.3}: the stage channel reached into the \
                      severity channel"
                 );
-                let first = CardLight::of(severity, hues[0], ground, true, false)
-                    .ink
-                    .to_hsl()
-                    .1;
+                let first =
+                    CardLight::of(severity, hues[0], ground, true, false, CardTheme::UNTHEMED)
+                        .ink
+                        .to_hsl()
+                        .1;
                 assert!(
                     (sat - first).abs() < 0.02,
                     "{stage:?} is drawn at saturation {sat:.3} where {severity:?} \
@@ -8202,9 +8435,10 @@ mod tests {
                         &crate::app::state::Palette::catppuccin(),
                         &crate::terminal_theme::TerminalTheme::default(),
                     );
-                    let (h, _, l) = CardLight::of(severity, hue, ground, true, false)
-                        .ink
-                        .to_hsl();
+                    let (h, _, l) =
+                        CardLight::of(severity, hue, ground, true, false, CardTheme::UNTHEMED)
+                            .ink
+                            .to_hsl();
                     (stage, severity, h, l)
                 })
             })
@@ -8250,7 +8484,8 @@ mod tests {
             let greys: Vec<f32> = Severity::ALL
                 .into_iter()
                 .map(|severity| {
-                    let ink = CardLight::of(severity, hue, ground, true, false).ink;
+                    let ink =
+                        CardLight::of(severity, hue, ground, true, false, CardTheme::UNTHEMED).ink;
                     crate::ui::color::relative_luminance(ink.as_tuple())
                 })
                 .collect();
@@ -9458,6 +9693,7 @@ mod a_card_is_its_own_shape {
                 &CardGeometry::new(21.0, false),
                 (4.0, 4.0),
                 1.0,
+                CardTheme::UNTHEMED,
             );
             sheet.rgba8().to_vec()
         };
@@ -10406,6 +10642,7 @@ mod a_card_is_its_own_shape {
                 severity: Severity::Clear,
                 hues: StageHues(hues),
                 ground: measured::CANVAS,
+                theme: CardTheme::UNTHEMED,
                 split_channels: false,
                 seen: true,
                 depth: 1,
@@ -10519,6 +10756,7 @@ mod a_card_is_its_own_shape {
             severity: Severity::Clear,
             hues: StageHues([196.0; 5]),
             ground: measured::CANVAS,
+            theme: CardTheme::UNTHEMED,
             split_channels: false,
             seen: true,
             depth: 1,
@@ -10672,6 +10910,7 @@ mod a_card_is_its_own_shape {
             severity: Severity::Clear,
             hues: StageHues([196.0; 5]),
             ground: measured::CANVAS,
+            theme: CardTheme::UNTHEMED,
             split_channels: false,
             seen: true,
             depth: 1,
@@ -14024,6 +14263,7 @@ mod cards_breathe_and_wash {
             severity: Severity::Clear,
             hues: StageHues([0.0; 5]),
             ground: measured::CANVAS,
+            theme: CardTheme::UNTHEMED,
             split_channels: true,
             seen: true,
             depth: 1,
@@ -14810,6 +15050,7 @@ mod a_card_draws_the_workers_it_carries {
             detail: Some("holding the line".to_string()),
             tier,
             arrival,
+            pulse: 0.0,
             spider: None,
         }
     }
@@ -14835,6 +15076,7 @@ mod a_card_draws_the_workers_it_carries {
             severity: Severity::Clear,
             hues: StageHues(hues),
             ground: Rgb(9, 17, 28),
+            theme: CardTheme::UNTHEMED,
             split_channels: true,
             seen: true,
             depth: 0,
@@ -15088,6 +15330,449 @@ mod a_card_draws_the_workers_it_carries {
                 crew::CrewArrival::SETTLED
             )),
             "the fixture cannot tell two settled rows apart, so it cannot see ink at all"
+        );
+    }
+}
+
+/// The theme's own card colours: that they reach the pixels a card is actually
+/// drawn from, and — the half that protects everyone who authored nothing —
+/// that a card with no `[theme.custom]` block still draws exactly the measured
+/// family it always did.
+///
+/// # Why these are pixel tests and not palette tests
+///
+/// Because the palette chain was already proved to resolve, and the cards were
+/// still the wrong colour. `config.theme.custom` → `refresh_sidebar_palette` →
+/// `sidebar_palette` is exercised by
+/// `custom_theme_overrides_survive_auto_switch_into_the_sidebar` in
+/// `src/app/mod.rs` and lands the mockup's exact hex values in the palette —
+/// and none of it ever reached this module, because the pixel card resolved
+/// its stroke, its dots and its ink from [`measured`] and never asked the
+/// palette anything. A test that stops at the palette cannot see that, which
+/// is why every assertion here reads a drawn pixel.
+///
+/// The sampled evidence, off the captain's own screen on 2026-08-25: the live
+/// worker dot was `#7fe2e4` — [`measured::STROKE_A`] to the byte — with
+/// `accent = "#5ad1ff"` set in his config, and the resting card border was
+/// `#4f6b6c`, which is that same constant walked to the `Queued` endpoint of
+/// the one-hue ramp.
+#[cfg(test)]
+mod the_theme_reaches_the_card {
+    use super::*;
+
+    /// `#5ad1ff` — the "Rio Window, Assembled" mockup's own `--cyan`, and what
+    /// the captain's `[theme.custom] accent` is set to.
+    const MOCKUP_CYAN: Rgb = Rgb(0x5a, 0xd1, 0xff);
+    /// `#16233a` — the mockup's `--edge`, its `.card` border and its
+    /// `hr.divider`.
+    const MOCKUP_EDGE: Rgb = Rgb(0x16, 0x23, 0x3a);
+    /// `#e6edf3` — the mockup's `--ink`.
+    const MOCKUP_INK: Rgb = Rgb(0xe6, 0xed, 0xf3);
+
+    fn themed() -> CardTheme {
+        CardTheme {
+            accent: Some(MOCKUP_CYAN),
+            edge: Some(MOCKUP_EDGE),
+            face: Some(Rgb(0x0a, 0x12, 0x20)),
+            ink: Some(MOCKUP_INK),
+            ok: Some(Rgb(0x3d, 0xdc, 0x84)),
+            warn: Some(Rgb(0xff, 0xb4, 0x54)),
+        }
+    }
+
+    fn content(theme: CardTheme, focused_space: bool, crew: Vec<crew::CrewMember>) -> CardContent {
+        CardContent {
+            title: "herdr".to_string(),
+            tidbit: None,
+            register: None,
+            state_label: String::new(),
+            state: AgentState::Working,
+            stage: LifecycleStage::Running,
+            severity: Severity::Clear,
+            hues: StageHues([196.0; 5]),
+            ground: Rgb(0x04, 0x07, 0x0c),
+            theme,
+            // The captain's own setting, and the default: one measured hue
+            // family, not the five-hue lifecycle channel. This is the branch
+            // that was hardcoded.
+            split_channels: false,
+            seen: true,
+            depth: 0,
+            lifted: false,
+            focused_space,
+            mark: None,
+            residue: 0,
+            controls: ControlRail::default(),
+            generate: 1.0,
+            discharge: 0.0,
+            spider: None,
+            breath: 0.0,
+            wash: None,
+            crew,
+            bars: None,
+        }
+    }
+
+    fn worker(pulse: f32) -> crew::CrewMember {
+        crew::CrewMember {
+            name: "fm/worker-card-redesign".to_string(),
+            detail: Some("nested cards, tiered indent".to_string()),
+            tier: 0,
+            arrival: crew::CrewArrival::SETTLED,
+            pulse,
+            spider: None,
+        }
+    }
+
+    /// The canvas the fixture draws on, and the card's own rect inside it.
+    /// Named so [`border_strip`] can address the stroke by the same numbers
+    /// [`drawn`] drew it at.
+    const SHEET_W: usize = 280;
+    const CARD_X: usize = 10;
+    const CARD_Y: usize = 10;
+    const CARD_W: usize = 250;
+    const CARD_H: usize = 120;
+
+    /// The card's own top border, corners excluded.
+    ///
+    /// # Why a strip and not the whole canvas
+    ///
+    /// Because "no pixel anywhere is near colour X" is a claim a card full of
+    /// antialiased type cannot honour. The measured ramp's own edge is
+    /// `#557475`, a desaturated teal, and a half-covered pixel of grey caption
+    /// ink lands at `#5e6a75` — nine away on red, ten on green, zero on blue,
+    /// and so inside any tolerance loose enough to admit the stroke's own
+    /// antialiasing. That is a false positive about *text*, not a fact about
+    /// the border. Three rows of the card's own top edge are stroke and
+    /// nothing else: no glyph is set there, and the corners are excluded so
+    /// the arc's own coverage ramp cannot dilute it either.
+    fn border_strip(pixels: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in CARD_Y..CARD_Y + 3 {
+            for x in CARD_X + CARD_H / 2..CARD_X + CARD_W - CARD_H / 2 {
+                let i = (y * SHEET_W + x) * 4;
+                out.extend_from_slice(&pixels[i..i + 4]);
+            }
+        }
+        out
+    }
+
+    /// Draw one card and hand back its pixels.
+    ///
+    /// Returns `None` when the machine has no proportional face, which is the
+    /// same gate [`is_available`] puts on the whole path — a card is not drawn
+    /// at all there, so there is nothing for these tests to be true or false
+    /// about.
+    fn drawn(content: &CardContent) -> Option<Vec<u8>> {
+        let font = font::card_font(None)?;
+        let geometry = CardGeometry::new(21.0, false);
+        let mut canvas = Canvas::new(SHEET_W as u32, 150);
+        draw_card(
+            &mut canvas,
+            &PlacedCard {
+                rect: RoundRect {
+                    x: CARD_X as f32,
+                    y: CARD_Y as f32,
+                    w: CARD_W as f32,
+                    h: CARD_H as f32,
+                    r: geometry.radius,
+                },
+                content,
+                geometry,
+                crew: crew::CrewBands {
+                    divider: 21.0,
+                    row: 34.0,
+                },
+            },
+            font,
+        );
+        Some(canvas.rgba8().to_vec())
+    }
+
+    /// How close a pixel has to sit to a colour to count as that colour.
+    ///
+    /// Tight. A card's ink is antialiased and blended, so nothing is required
+    /// to land on the target exactly — but the two colours these tests have to
+    /// tell apart, `#5ad1ff` and `#7fe2e4`, are 37 apart on green and 39 on
+    /// blue, so a tolerance any looser than this would call one the other and
+    /// pass on a card that never changed.
+    const NEAR: u32 = 12;
+
+    fn paints_near(pixels: &[u8], target: Rgb) -> bool {
+        pixels.chunks_exact(4).any(|c| {
+            u32::from(c[0]).abs_diff(u32::from(target.0)) <= NEAR
+                && u32::from(c[1]).abs_diff(u32::from(target.1)) <= NEAR
+                && u32::from(c[2]).abs_diff(u32::from(target.2)) <= NEAR
+                && c[3] > 40
+        })
+    }
+
+    /// **The bug, as a test.** A themed card draws its worker dot and its
+    /// accented border in the theme's own accent, and draws no pixel at the
+    /// hardcoded constant it used to be locked to.
+    ///
+    /// The negative half is the whole point: the dot was `#7fe2e4` on the
+    /// captain's real screen with `#5ad1ff` in his config, so a test that only
+    /// checked the cyan was present would have passed against the bug — the
+    /// two are close enough to sit in the same "cyan family" by eye, and
+    /// eyeballing them is exactly what cost the time this test exists to save.
+    #[test]
+    fn a_themed_card_draws_its_accent_and_not_the_measured_one() {
+        let Some(pixels) = drawn(&content(themed(), true, vec![worker(0.0)])) else {
+            return;
+        };
+        assert!(
+            paints_near(&pixels, MOCKUP_CYAN),
+            "a themed card drew no pixel at its own accent"
+        );
+        assert!(
+            !paints_near(&pixels, measured::STROKE_A),
+            "a themed card is still drawing the hardcoded measured cyan"
+        );
+    }
+
+    /// **The regression guard for the captain's decision D-c.** A card whose
+    /// theme authored nothing draws the measured family, exactly as it did
+    /// before any of this existed.
+    ///
+    /// Every built-in theme leaves [`CardTheme`] empty, so this is the branch
+    /// every user who never wrote a `[theme.custom]` block is on. If this ever
+    /// fails, a preference nobody expressed has started repainting their
+    /// panel.
+    #[test]
+    fn an_unthemed_card_still_draws_the_measured_family() {
+        let Some(pixels) = drawn(&content(CardTheme::UNTHEMED, true, vec![worker(0.0)])) else {
+            return;
+        };
+        assert!(
+            paints_near(&pixels, measured::STROKE_A),
+            "an unthemed card stopped drawing the measured cyan"
+        );
+        assert!(
+            !paints_near(&pixels, MOCKUP_CYAN),
+            "an unthemed card drew a colour no theme asked for"
+        );
+    }
+
+    /// A resting card's border is the authored `--edge` **flat**, not that
+    /// colour walked down the one-hue ramp a second time.
+    ///
+    /// `--edge` is a stated colour in the mockup — `.card { border: 1px solid
+    /// var(--edge) }` — so restating it would land somewhere neither the theme
+    /// nor the reference asked for. Unthemed, the same call still walks the
+    /// accent to `Queued`, which is what the sampled `#4f6b6c` was.
+    #[test]
+    fn a_resting_card_takes_the_authored_edge_flat() {
+        assert_eq!(themed().edge(), MOCKUP_EDGE);
+        let mix = crate::anim::cell::one_hue_stage_mix(LifecycleStage::Queued);
+        assert_eq!(
+            CardTheme::UNTHEMED.edge(),
+            measured::STROKE_A.restate(mix.saturation, mix.luminance),
+            "an unthemed resting card's border moved off the measured ramp"
+        );
+    }
+
+    /// Nothing about an unthemed card's light changed. The one-hue branch is
+    /// reached through [`CardTheme`] now, and it has to come out the other side
+    /// bit for bit — including the HSL round trip `restate(1.0, 1.0)` performs
+    /// on the accented card, which is why that call is still made.
+    #[test]
+    fn the_unthemed_one_hue_light_is_unchanged() {
+        for accented in [false, true] {
+            let mix = crate::anim::cell::one_hue_stage_mix(if accented {
+                LifecycleStage::Running
+            } else {
+                LifecycleStage::Queued
+            });
+            assert_eq!(
+                CardLight::of(
+                    Severity::Clear,
+                    196.0,
+                    measured::CANVAS,
+                    false,
+                    accented,
+                    CardTheme::UNTHEMED,
+                )
+                .ink,
+                measured::STROKE_A.restate(mix.saturation, mix.luminance),
+                "the one-hue ink moved for accented={accented}"
+            );
+        }
+    }
+
+    /// `[theme.custom]` is what [`CardTheme::resolve`] reads, and a theme that
+    /// authored nothing resolves to [`CardTheme::UNTHEMED`].
+    ///
+    /// The resolved palette is deliberately *not* the source: it always has an
+    /// `accent` — Catppuccin's is `#89b4fa` — so reading it would repaint every
+    /// default user's cards blue.
+    #[test]
+    fn only_an_authored_custom_block_themes_a_card() {
+        let mut app = AppState::test_new();
+        assert_eq!(
+            CardTheme::resolve(&app),
+            CardTheme::UNTHEMED,
+            "a theme that authored nothing themed the cards anyway"
+        );
+        app.theme_runtime.custom = Some(crate::config::CustomThemeColors {
+            accent: Some("#5ad1ff".to_string()),
+            surface0: Some("#16233a".to_string()),
+            text: Some("#e6edf3".to_string()),
+            ..Default::default()
+        });
+        let resolved = CardTheme::resolve(&app);
+        assert_eq!(resolved.accent(), MOCKUP_CYAN);
+        assert_eq!(resolved.edge(), MOCKUP_EDGE);
+        assert_eq!(resolved.ink(), MOCKUP_INK);
+        // Untouched roles still fall through to the measurement rather than to
+        // some neutral of their own.
+        assert_eq!(resolved.badge_ok(), measured::BADGE_OK);
+        assert_eq!(resolved.face(), measured::GLASS_FACE);
+    }
+
+    /// All six roles at once, spelled as the `[theme.custom]` block someone
+    /// converging on the mockup would actually write.
+    ///
+    /// The three-role case above proves the mechanism; this proves the
+    /// *mapping* — that `surface0` is the card's edge and not its fill, that
+    /// `yellow` is the warn badge and not the healthy one, and so on. A
+    /// mechanism that worked while the roles were crossed would put every
+    /// colour on screen and none of them where the mockup puts it.
+    #[test]
+    fn the_mockups_own_six_roles_land_where_the_mockup_puts_them() {
+        let mut app = AppState::test_new();
+        app.theme_runtime.custom = Some(crate::config::CustomThemeColors {
+            accent: Some("#5ad1ff".to_string()),   // --cyan
+            surface0: Some("#16233a".to_string()), // --edge
+            panel_bg: Some("#0a1220".to_string()), // --panel
+            text: Some("#e6edf3".to_string()),     // --ink
+            green: Some("#3ddc84".to_string()),    // --ok
+            yellow: Some("#ffb454".to_string()),   // --amber
+            ..Default::default()
+        });
+        let t = CardTheme::resolve(&app);
+        assert_eq!(t.accent(), Rgb(0x5a, 0xd1, 0xff), "accent");
+        assert_eq!(t.edge(), Rgb(0x16, 0x23, 0x3a), "edge");
+        assert_eq!(t.face(), Rgb(0x0a, 0x12, 0x20), "face");
+        assert_eq!(t.ink(), Rgb(0xe6, 0xed, 0xf3), "ink");
+        assert_eq!(t.badge_ok(), Rgb(0x3d, 0xdc, 0x84), "badge ok");
+        assert_eq!(t.badge_warn(), Rgb(0xff, 0xb4, 0x54), "badge warn");
+    }
+
+    /// A role authored as a reset alias is *not* an authored colour.
+    ///
+    /// `panel_bg = "reset"` is in the configuration docs' own example, and it
+    /// means "this surface has no colour of its own". [`parse_color`] turns it
+    /// into `Color::Reset` and `resolve_color_rgb` answers `None` for that, so
+    /// it has to land on the measurement rather than on whatever a resolved
+    /// `Reset` would otherwise composite to.
+    ///
+    /// [`parse_color`]: crate::config::parse_color
+    #[test]
+    fn a_reset_alias_leaves_the_measurement_standing() {
+        let mut app = AppState::test_new();
+        app.theme_runtime.custom = Some(crate::config::CustomThemeColors {
+            panel_bg: Some("reset".to_string()),
+            green: Some("transparent".to_string()),
+            ..Default::default()
+        });
+        let resolved = CardTheme::resolve(&app);
+        assert_eq!(resolved.face(), measured::GLASS_FACE);
+        assert_eq!(resolved.badge_ok(), measured::BADGE_OK);
+    }
+
+    /// A card's signature moves when its theme does.
+    ///
+    /// Without this the sheet is carried forward on a stale hash and the panel
+    /// keeps the old theme's ink until something *else* about a card changes —
+    /// which on a settled fleet is never. The same trap `hues` and `ground`
+    /// are already hashed against.
+    #[test]
+    fn a_themes_change_moves_the_cards_signature() {
+        let hash_of = |content: &CardContent| {
+            let mut hasher = DefaultHasher::new();
+            content.hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(
+            hash_of(&content(CardTheme::UNTHEMED, false, Vec::new())),
+            hash_of(&content(themed(), false, Vec::new())),
+            "a card carried its own signature across a theme change"
+        );
+    }
+
+    /// A worker's dot breath moves its card's signature too.
+    ///
+    /// Same trap, one level down: `crew` is hashed member by member, and a
+    /// `pulse` left out of [`crew::CrewMember::hash_into`] is a dot that is
+    /// computed every frame and drawn once.
+    #[test]
+    fn a_dots_breath_moves_the_cards_signature() {
+        let hash_of = |pulse: f32| {
+            let mut hasher = DefaultHasher::new();
+            content(themed(), false, vec![worker(pulse)]).hash_into(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(
+            hash_of(0.0),
+            hash_of(1.0),
+            "a breathing dot hashed the same at both ends of its own swing"
+        );
+    }
+
+    /// A resting card — every card but the one the panel is accenting — draws
+    /// its border in the theme's `--edge`, and the dashed rule inside it in the
+    /// same colour.
+    ///
+    /// Separate from the accented case because they are two colours in the
+    /// mockup and were one here: `.card` is `1px solid var(--edge)` while
+    /// `.card.active` is `--cyan` at an alpha. Before this they were the same
+    /// hardcoded constant at two rungs of one ramp, which is why the captain's
+    /// resting borders sampled `#4f6b6c` — a dim teal — where the mockup asks
+    /// for a dark navy.
+    #[test]
+    fn a_resting_themed_card_draws_its_border_in_the_authored_edge() {
+        let Some(pixels) = drawn(&content(themed(), false, vec![worker(0.0)])) else {
+            return;
+        };
+        let border = border_strip(&pixels);
+        assert!(
+            paints_near(&border, MOCKUP_EDGE),
+            "a resting themed card drew its border in something other than its own edge colour"
+        );
+        assert!(
+            !paints_near(&border, CardTheme::UNTHEMED.edge()),
+            "a resting themed card is still drawing the measured ramp's own edge"
+        );
+    }
+
+    /// A dot at the bottom of its breath is dimmer than one at the top, and
+    /// the row's type is not.
+    ///
+    /// The mockup animates `.wk-dot` alone — `opacity: 1` to `0.4` — so a
+    /// pass that dimmed the whole row would be the list going quiet rather
+    /// than its work being live.
+    #[test]
+    fn the_breath_dims_the_dot_and_leaves_the_row_alone() {
+        let Some(lit) = drawn(&content(themed(), false, vec![worker(0.0)])) else {
+            return;
+        };
+        let Some(dipped) = drawn(&content(themed(), false, vec![worker(1.0)])) else {
+            return;
+        };
+        assert!(
+            paints_near(&lit, MOCKUP_CYAN),
+            "the fixture drew no dot to breathe with"
+        );
+        assert!(
+            !paints_near(&dipped, MOCKUP_CYAN),
+            "a dot at the bottom of its breath is still at full strength"
+        );
+        // The name is drawn in the card's ink and never in the accent, so it
+        // has to survive the swing untouched.
+        assert!(
+            paints_near(&lit, MOCKUP_INK) && paints_near(&dipped, MOCKUP_INK),
+            "the breath reached the row's own type"
         );
     }
 }
