@@ -30,8 +30,17 @@ use crate::ui::color::{ensure_contrast, mix_rgb, resolve_color_rgb, Rgb};
 /// [`super::tree_prefix_width`] exists to prevent on the horizontal axis.
 pub(super) const CHROME_ROWS: u16 = 2;
 
+/// Columns the shell spends on one of its edges: the border, and the pad inside
+/// it.
+///
+/// Spelled on its own because a row drawn *inside* somebody else's box needs
+/// exactly this — where the text column starts — and half of [`CHROME_COLS`] is
+/// that number only by arithmetic nobody should have to redo. See
+/// [`super::render_crew_row`].
+pub(super) const EDGE_COLS: u16 = 2;
+
 /// Columns the shell spends on itself: the two borders, and the pad inside each.
-pub(super) const CHROME_COLS: u16 = 4;
+pub(super) const CHROME_COLS: u16 = EDGE_COLS * 2;
 
 /// Columns the chip pads a one-cell state mark out to.
 ///
@@ -230,6 +239,15 @@ pub(super) struct Card<'a> {
     accent: Color,
     /// Whether this row is the selected/active one.
     lifted: bool,
+    /// Rows of this box that are the card's **own** content.
+    ///
+    /// The whole interior on an ordinary card, and only the top of it on one
+    /// whose frame has been stretched down over the workers drawn inside it
+    /// (see `super::stretch_cards_over_their_crew`). The distinction exists for
+    /// the pill: it closes the card's own block, and a pill placed off the
+    /// frame's height would land on a worker's row and be overwritten by the
+    /// name it was drawn on top of.
+    body_rows: u16,
     p: &'a Palette,
     host: &'a TerminalTheme,
 }
@@ -246,9 +264,22 @@ impl<'a> Card<'a> {
             frame,
             accent,
             lifted,
+            body_rows: frame.height.saturating_sub(CHROME_ROWS),
             p,
             host,
         })
+    }
+
+    /// Say how many of this box's rows are the card's own content, for a frame
+    /// that has been stretched over the workers under it.
+    ///
+    /// The default is the whole interior, which is what every unstretched card
+    /// has, so this changes nothing for a card that heads no crew.
+    pub(super) fn over_body(mut self, rows: u16) -> Self {
+        self.body_rows = rows
+            .min(self.frame.height.saturating_sub(CHROME_ROWS))
+            .max(1);
+        self
     }
 
     /// Columns inside the frame and its pads, before any control drawn over the
@@ -390,6 +421,50 @@ impl<'a> Card<'a> {
         }
     }
 
+    /// The dashed rule between the card's own content and the workers drawn
+    /// under it, on the row its box used to close on.
+    ///
+    /// The character twin of the pixel list's `hr.divider`, and it does the same
+    /// job: without it a mate's own subtitle and its first worker's name are two
+    /// lines of type with nothing between them, and the box stops saying which
+    /// of them is the Space. Dashed rather than solid so it reads as a seam
+    /// inside one box rather than as the bottom of one box and the top of
+    /// another.
+    ///
+    /// Drawn only where a frame was actually stretched — a card that heads no
+    /// crew never calls this, and so is byte-for-byte the card it always was.
+    pub(super) fn render_crew_rule(&self, frame: &mut Frame, row: u16, list_bottom: u16) {
+        if row == 0 || row >= self.frame.height.saturating_sub(1) {
+            return;
+        }
+        let y = self.frame.y + row;
+        if y >= list_bottom {
+            return;
+        }
+        let ink = CardInk::new(self.accent, self.p, self.host);
+        let hue = ink
+            .as_ref()
+            .map(|ink| ink.toward_panel(BOTTOM_RULE_MIX))
+            .unwrap_or(self.accent);
+        let stops = if self.lifted {
+            &GLOW_STOPS_LIFTED
+        } else {
+            &GLOW_STOPS
+        };
+        let style = match ink
+            .as_ref()
+            .and_then(|ink| ink.glow(glow_amount(stops, row, self.frame.height)))
+        {
+            Some(bg) => Style::default().fg(hue).bg(bg),
+            None => Style::default().fg(hue),
+        };
+        let buf = frame.buffer_mut();
+        for x in self.frame.x + 1..self.frame.x + self.frame.width - 1 {
+            buf[(x, y)].set_symbol("┈");
+            buf[(x, y)].set_style(style);
+        }
+    }
+
     /// The status pill, right-aligned on the card's last content row.
     ///
     /// Drawn over the row rather than laid out in it, exactly as the worker
@@ -400,10 +475,14 @@ impl<'a> Card<'a> {
         if width.saturating_add(PILL_GAP) >= self.content_width() {
             return;
         }
-        let bottom = self.frame.height.saturating_sub(1);
-        let Some(row) = bottom.checked_sub(1) else {
+        // The card's own last content row — its first row is the one under the
+        // top border, so the last of `body_rows` of them is `body_rows` down.
+        // On an unstretched card that is the row above the closing rule, which
+        // is where the pill has always been drawn.
+        let row = self.body_rows;
+        if row >= self.frame.height {
             return;
-        };
+        }
         let y = self.frame.y + row;
         if y >= list_bottom {
             return;

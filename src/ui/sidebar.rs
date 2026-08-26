@@ -568,6 +568,42 @@ fn crew_is_drawn(app: &AppState, fold_width: u16) -> bool {
     image_card::card_covers_row(app, fold_width)
 }
 
+/// Whether a worker is drawn inside its own mate's box rather than in a box of
+/// its own.
+///
+/// **One rule at every level.** The captain settled it as a generalisation of
+/// the first mate's own case: *"2nd mates' workers will function just like
+/// firstmate's workers, only they show up in their respective 2nd
+/// [mate's card]"*. Which box a worker belongs in is [`crew_head`]'s answer —
+/// the nearest Space up its own parent chain — so nothing here has to know
+/// which mate it is looking at, and a second mate's worker lands in the second
+/// mate's card by the same walk that puts the first mate's in the first mate's.
+/// A mate itself is unaffected: a Space is still its own card, still branch-
+/// nested under whoever owns it.
+///
+/// True wherever the panel draws boxes at all, because a box is the whole of
+/// the relation being drawn. Both renderers merge — the pixel card sets the
+/// rows itself ([`image_card::crew`]) and the character card draws them under
+/// the mate's own content ([`render_crew_row`]) — and below
+/// [`card::MIN_FOLD_WIDTH`] a row is a styled line with no box to be inside of,
+/// so every worker there keeps the row and the connector it always had.
+fn crew_folds_into_its_space(fold_width: u16) -> bool {
+    RowShell::for_fold_width(fold_width).is_card()
+}
+
+/// Columns a worker's row is stepped in inside the box it is drawn in.
+///
+/// The character twin of [`image_card::crew`]'s `INDENT_MUL`, and saturated the
+/// same way: one step for a worker that reached this card through anybody at
+/// all, and one step for anything deeper too. Past the first the indent has
+/// stopped answering "did this come through somebody" and started eating a
+/// 26-column sidebar.
+const CREW_INDENT_COLS: u16 = 2;
+
+fn crew_indent_cols(entries: &[WorkspaceListEntry], idx: usize) -> u16 {
+    u16::from(crew_tier(entries, idx).unwrap_or(0).min(1)) * CREW_INDENT_COLS
+}
+
 /// The row that owns the row at `idx` in the drawn tree.
 ///
 /// The nearest row above it at a shallower depth, which a depth-first walk makes
@@ -2202,6 +2238,12 @@ fn list_entry_height(
         };
         return rows.saturating_add(divider).min(body_height);
     }
+    // A worker inside its mate's own box is two lines of type in somebody
+    // else's border, so it reserves its lines and no chrome at all. The box
+    // above it grows over them instead — see [`stretch_cards_over_their_crew`].
+    if let Some(crew) = crew_row_layout(app, agents, entries, entry_idx, fold_width) {
+        return crew.height().min(body_height);
+    }
     let content_width = list_entry_content_width(app, agents, entry, fold_width);
     let shell = RowShell::for_fold_width(fold_width);
     match entry {
@@ -2231,6 +2273,103 @@ fn list_entry_height(
     }
 }
 
+/// A worker's row as it is laid out inside its own mate's box.
+///
+/// The layout and the renderer both resolve one of these, for the reason
+/// [`shell_row_height`] exists: a row whose reserved height and drawn lines
+/// disagree puts every card below it on the wrong row.
+struct CrewRowLayout {
+    /// Columns from the row's own left edge to where its type starts: the
+    /// mate's card offset, the border and the pad inside it, then this row's
+    /// own tier step.
+    text_offset: u16,
+    /// Columns it has for that type.
+    text_width: u16,
+    /// Whether it reached this card through another worker rather than straight
+    /// from the mate whose box it is in. See [`crew_tier`].
+    via_mate: bool,
+    /// Whether this is the last worker in its mate's list, and so the row the
+    /// box closes under.
+    ///
+    /// **It reserves a row for that rule.** A mate's own rect already pays for
+    /// two chrome rows — the top border and the closing one — and when the box
+    /// is stretched the closing rule *moves*, down past every worker, leaving
+    /// the row it vacated to be the dashed rule between the mate and its crew
+    /// ([`Card::render_crew_rule`]). Something has to pay for it where it
+    /// landed, and the row it landed under is this one. Without it the box
+    /// closes on the last worker's own last line and the rule is drawn over a
+    /// name.
+    closes_the_box: bool,
+    /// Its folded token lines.
+    lines: Vec<Vec<ResolvedToken>>,
+}
+
+impl CrewRowLayout {
+    /// Rows this reserves: its lines, and the closing rule when it carries one.
+    fn height(&self) -> u16 {
+        shell_row_height(self.lines.len(), RowShell::Line)
+            .saturating_add(u16::from(self.closes_the_box))
+    }
+}
+
+/// How a worker's row is laid out inside its mate's box, or `None` when this
+/// row is not drawn inside one.
+///
+/// Every measurement is taken off the *head's* card and not off the worker's
+/// own rank: the row is standing in that border, so the columns it has are the
+/// ones that border left it, less the step its tier costs. A width read off the
+/// worker's own rank would be the width of the card it no longer draws.
+///
+/// Nothing is reserved for a control drawn over the row, because a crew row
+/// carries none: the worker-summary badge belongs to the card, and the card is
+/// its mate's. That is the pixel list's own rule — [`image_card::crew`] draws a
+/// name, a status line and a marker and nothing else — and reserving columns
+/// here for a badge no renderer draws would clip a worker's name to buy space
+/// for nothing.
+///
+/// The lines are folded on the bare line's rules rather than stacked on the
+/// card's, because a crew row *is* a line — the compact one-per-worker row the
+/// mockups put under the rule, not a second card's worth of block set inside
+/// the first.
+fn crew_row_layout(
+    app: &AppState,
+    agents: &[AgentPanelEntry],
+    entries: &[WorkspaceListEntry],
+    entry_idx: usize,
+    fold_width: u16,
+) -> Option<CrewRowLayout> {
+    if !crew_folds_into_its_space(fold_width) {
+        return None;
+    }
+    let head_idx = drawn_crew_head(app, entries, entry_idx)?;
+    let head = entries.get(head_idx)?;
+    let WorkspaceListEntry::Agent {
+        entry_idx: agent_idx,
+        ..
+    } = entries.get(entry_idx)?
+    else {
+        return None;
+    };
+    let detail = agents.get(*agent_idx)?;
+    let (left, width) = card_frame_columns(head, fold_width)?;
+    let indent = crew_indent_cols(entries, entry_idx);
+    let text_width = width
+        .saturating_sub(card::CHROME_COLS)
+        .saturating_sub(indent);
+    Some(CrewRowLayout {
+        text_offset: left.saturating_add(card::EDGE_COLS).saturating_add(indent),
+        text_width,
+        via_mate: indent > 0,
+        closes_the_box: crew_head(entries, entry_idx.saturating_add(1)) != Some(head_idx),
+        lines: shell_row_lines(
+            resolved_agent_rows(app, detail),
+            usize::from(text_width),
+            None,
+            RowShell::Line,
+        ),
+    })
+}
+
 /// Gap after one tree row. Each kind keeps its own `row_gap`; the compact
 /// worktree-group packing is unchanged.
 fn list_entry_gap(
@@ -2244,11 +2383,12 @@ fn list_entry_gap(
     // already follows, for the same reason — a gap here would be a band of
     // panel showing through the middle of one border.
     //
-    // Gated on a card actually being drawn, because the crew list is a *card*
-    // and there is no box to be inside of without one: a panel on the character
-    // fallback keeps every gap it always had, and a worker there is still its
-    // own row with its own air around it.
-    if crew_is_drawn(app, fold_width) && crew_head(entries, entry_idx.saturating_add(1)).is_some() {
+    // Gated on there being a box at all, because a gap is only "inside" one if
+    // one is drawn: below the card shell's own floor a row is a styled line,
+    // and a worker there is still its own row with its own air around it.
+    if crew_folds_into_its_space(fold_width)
+        && crew_head(entries, entry_idx.saturating_add(1)).is_some()
+    {
         return 0;
     }
     match entries.get(entry_idx) {
@@ -2407,7 +2547,7 @@ pub(crate) fn compute_workspace_list_areas(
     // lookup. `list_entry_height` asks the same question again per row, which is
     // where the height itself comes from; this is only the fact that it did.
     let drawn_card = image_card::row_height_cells(app, fold_width).is_some();
-    let nested = crew_is_drawn(app, fold_width);
+    let nested = crew_folds_into_its_space(fold_width);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
@@ -2460,19 +2600,17 @@ pub(crate) fn compute_workspace_list_areas(
             worktree_child,
             entry_idx,
             agent,
-            card_frame: card_frame_for(
-                rect,
-                // A crew row borrows the border it is drawn inside — but only
-                // where there *is* one. On the character fallback a worker is
-                // still its own row with its own shell, so it keeps its own
-                // column and nothing about that panel changes.
-                nested
-                    .then(|| drawn_crew_head(app, &entries, entry_idx))
-                    .flatten()
-                    .and_then(|head| entries.get(head))
-                    .unwrap_or(entry),
-                fold_width,
-            ),
+            // A worker drawn inside its mate's box opens no box of its own —
+            // that is the whole of the change — so it is handed no frame to
+            // draw one from. Its own columns are that mate's border's, resolved
+            // where the row is drawn, by [`crew_row_layout`].
+            //
+            // Below the card shell's own floor there is no box to be inside of,
+            // so a worker is still its own row with its own shell and nothing
+            // about that panel changes.
+            card_frame: (!nested || drawn_crew_head(app, &entries, entry_idx).is_none())
+                .then(|| card_frame_for(rect, entry, fold_width))
+                .flatten(),
             motion_cells: (0, 0),
             arriving: false,
             drawn_card,
@@ -2495,6 +2633,11 @@ pub(crate) fn compute_workspace_list_areas(
 /// what a click on a worker lands on and what the engine opens and closes when
 /// it arrives. What changes is the *box*: one border around the Space and
 /// everything it is running, rather than one border each.
+///
+/// **Every Space, not the first mate's.** The head is simply the last Space row
+/// walked past, so a second mate's own workers stretch the second mate's box
+/// and stop at the second mate's own border — which is the whole of the
+/// captain's generalisation. See [`crew_folds_into_its_space`].
 ///
 /// Measured off the crew rows that were actually laid out, so a list the panel
 /// ran out of room part-way through closes its box at the last row it drew
@@ -2539,25 +2682,31 @@ fn stretch_cards_over_their_crew(
 /// Both of the two questions a row answers are therefore spent on the *left*
 /// edge, via [`card_left_offset`]: [`WorkspaceListEntry::depth`], because it is
 /// where the row *hangs*, and [`WorkspaceListEntry::rank`], because it is what
-/// the row *is*. That is still the whole of the captain's size rule — a worker
-/// the first mate opened hangs at depth 1 and is still drawn a sub agent's
-/// width — it is just read off the left edge now.
-/// `head` is the row whose *border* this frame belongs to, which is this row
-/// itself on every card and the Space above it on a crew row.
+/// the row *is*.
 ///
-/// A crew row has no box of its own: it is type inside somebody else's border,
-/// so it takes that border's column rather than the one its own depth would put
-/// it in. Its indent inside the card is the *tier* step ([`crew_tier`]), drawn
-/// by the rasteriser — one step for everything a second mate dispatched, and
-/// nothing at all for a worker the Space dispatched itself.
+/// `head` is the row whose *border* this frame belongs to, which is the row
+/// itself for everything that reaches here: every Space, and every worker on a
+/// panel too narrow to draw boxes at all. A worker on a panel that does draw
+/// them opens no box and is handed no frame — it is type inside its own mate's
+/// border, and the columns it stands in come from [`card_frame_columns`] by way
+/// of [`crew_row_layout`] instead.
 fn card_frame_for(rect: Rect, head: &WorkspaceListEntry, fold_width: u16) -> Option<Rect> {
+    let (left, width) = card_frame_columns(head, fold_width)?;
+    // A box has to hold a border, a line and a rule; anything shorter is a
+    // frame around nothing.
+    (rect.height > card::CHROME_ROWS)
+        .then(|| Rect::new(rect.x.saturating_add(left), rect.y, width, rect.height))
+}
+
+/// The columns a box drawn for `head` occupies: its left offset into the row,
+/// and its width. `None` on a panel that draws no boxes at all.
+fn card_frame_columns(head: &WorkspaceListEntry, fold_width: u16) -> Option<(u16, u16)> {
     if !RowShell::for_fold_width(fold_width).is_card() {
         return None;
     }
     let left = card_left_offset(head.depth(), head.rank(), fold_width);
     let width = fold_width.saturating_sub(left);
-    (width > card::CHROME_COLS && rect.height > card::CHROME_ROWS)
-        .then(|| Rect::new(rect.x.saturating_add(left), rect.y, width, rect.height))
+    (width > card::CHROME_COLS).then_some((left, width))
 }
 
 pub(crate) fn compute_workspace_card_areas(
@@ -3577,6 +3726,20 @@ fn render_agent_row(
         return;
     };
 
+    // A worker drawn inside its own mate's box is not a card and takes none of
+    // what follows: no frame of its own, no glow, and no connector — the box it
+    // is standing in *is* the relation, and a `├─` beside it would be a second,
+    // weaker statement of what the border already says, drawn in the gutter of a
+    // card it is not outside of.
+    if let Some(crew) = crew_row_layout(app, agents, entries, card.entry_idx, fold_width) {
+        // Except under a pixel card, which sets these rows in its own type —
+        // see [`image_card::crew`]. Anything drawn here would be under it.
+        if !crew_is_drawn(app, fold_width) {
+            render_crew_row(app, frame, card, detail, &crew, list_top, list_bottom);
+        }
+        return;
+    }
+
     let p = &app.sidebar_palette;
     let shell = RowShell::for_fold_width(fold_width);
     let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
@@ -3677,15 +3840,6 @@ fn render_agent_row(
     );
     let connector_style = Style::default().fg(p.overlay0);
     let top_charge = ConnectorCharge::new(app, connector_style, signal_phase, row_severity);
-
-    // A worker drawn inside its Space's card hangs off nothing the tree has to
-    // draw: the box it is in *is* the relation, and its tier is the indent
-    // step inside that box. So it grows no rail and takes no connector — a
-    // `├─` beside it would be a second, weaker statement of what the border
-    // already says, drawn in the gutter of a card it is not outside of.
-    if crew_is_drawn(app, fold_width) && drawn_crew_head(app, entries, card.entry_idx).is_some() {
-        return;
-    }
 
     if let Some(shell) = &card_shell {
         let (mut connector, _) = agent_row_prefix(
@@ -3944,6 +4098,107 @@ fn render_agent_row(
             cmd_ack_reserved,
             cmd_ack_width,
             list_bottom,
+        );
+    }
+}
+
+/// Draw a worker inside the box its own mate already opened.
+///
+/// The character twin of [`image_card::crew`], and the same design read at the
+/// scale a cell grid has: the mate's card carries its own block, then a dashed
+/// rule ([`Card::render_crew_rule`]), then one compact row per worker. What a
+/// row keeps is its mark, its name and its dim status line; what it gives up is
+/// everything that said "separate card" — the border, the glow, the pill and the
+/// connector.
+///
+/// The two tiers are the list's own, saturated at one step: a worker this mate
+/// dispatched sits flush with the card's text column at full strength, and one
+/// that reached it through another worker is stepped in by
+/// [`CREW_INDENT_COLS`] and drawn dim. One step whichever chain it came down,
+/// because the question the step answers is "did this come through somebody"
+/// and not "through whom".
+fn render_crew_row(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    detail: &AgentPanelEntry,
+    crew: &CrewRowLayout,
+    list_top: u16,
+    list_bottom: u16,
+) {
+    if crew.text_width == 0 {
+        return;
+    }
+    let text_x = card.rect.x.saturating_add(crew.text_offset);
+
+    let p = &app.sidebar_palette;
+    // A row that came through somebody is dimmed whole — the mark, the name and
+    // the status line together — for the reason the pixel list dims its whole
+    // row: a tier is one signal, and every mark on the row says the same thing.
+    let dim = |style: Style| {
+        if crew.via_mate {
+            style.add_modifier(Modifier::DIM)
+        } else {
+            style
+        }
+    };
+    let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+    let name_style = dim(Style::default()
+        .fg(if is_active { p.text } else { p.subtext0 })
+        .add_modifier(Modifier::BOLD));
+    let detail_style = dim(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM));
+    let status_style = dim(Style::default().fg(state_label_color(detail.state, detail.seen, p)));
+    // The row's own mark, undecorated. A chip is a *card's* plate and this row
+    // has no card; the pixel list makes the same call, giving a worker a dot
+    // where a card gets its plated mark.
+    let mark = state_icon(detail.state, detail.seen, app.status_indicators, p);
+    let row_anim = RowAnimation::for_agent_row(app, detail.pane_id);
+
+    // A worker's command flashes follow it inside the box, for the reason its
+    // failure marker does: a signal that stops being drawn the moment the design
+    // changed is a regression nobody sees until they need it. They are still
+    // drawn *over* the row's own last columns, so the first line gives them up
+    // out of its token budget exactly as a card's row gives up the badge's.
+    let cmd_ack_row = crate::anim::CardRow::Agent(detail.pane_id);
+    let cmd_ack_instances: Vec<u64> = app.sidebar_cmd_acks.live(&cmd_ack_row).collect();
+    let cmd_ack_width = cmd_ack_strip_width(cmd_ack_instances.len(), crew.text_width, 0);
+
+    for (index, resolved) in crew.lines.iter().enumerate() {
+        let y = card.rect.y.saturating_add(index as u16);
+        if y >= card.rect.y.saturating_add(card.rect.height) || y >= list_bottom || y < list_top {
+            break;
+        }
+        let trailing = if index == 0 { cmd_ack_width } else { 0 };
+        let mut spans = resolved_token_spans(
+            resolved,
+            (mark.0, dim(mark.1)),
+            status_style,
+            name_style,
+            detail_style,
+            detail_style,
+            p,
+            &row_anim,
+            usize::from(crew.text_width.saturating_sub(trailing)),
+        );
+        animate_row_spans(&mut spans, &row_anim);
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(text_x, y, crew.text_width, 1),
+        );
+    }
+
+    if cmd_ack_width > 0 && card.rect.y < list_bottom && card.rect.y >= list_top {
+        render_cmd_ack_strip(
+            app,
+            frame,
+            &cmd_ack_row,
+            &cmd_ack_instances,
+            Rect::new(
+                text_x + crew.text_width - cmd_ack_width,
+                card.rect.y,
+                cmd_ack_width,
+                1,
+            ),
         );
     }
 }
@@ -4235,6 +4490,22 @@ fn render_cmd_acks(
     if rect.width == 0 || rect.y >= list_bottom {
         return;
     }
+    render_cmd_ack_strip(app, frame, row, instances, rect);
+}
+
+/// The markers themselves, in a strip the caller has already placed.
+///
+/// Split out because a worker drawn inside its mate's box has no card of its
+/// own to measure a strip against — its columns are that box's, resolved by
+/// [`crew_row_layout`] — while the glyphs, their clocks and their ink are the
+/// same on either row.
+fn render_cmd_ack_strip(
+    app: &AppState,
+    frame: &mut Frame,
+    row: &crate::anim::CardRow,
+    instances: &[u64],
+    rect: Rect,
+) {
     let base = Style::default().fg(app.palette.accent);
     // The newest instances are the ones still worth a reader's attention when
     // the row cannot show every one of them.
@@ -5491,7 +5762,17 @@ fn render_workspace_list(
                 p,
                 &app.host_terminal_theme,
             )
+            // The box may reach well past this row — it grows over the workers
+            // drawn inside it — but the card's *own* block is still this row's
+            // rect, and that is what its pill closes.
+            .map(|shell| shell.over_body(card.rect.height.saturating_sub(card::CHROME_ROWS)))
         });
+        // Whether this Space's box was stretched down over workers of its own.
+        // Read off the frame rather than re-walked, so the rule can only be
+        // drawn on a box that actually holds a crew.
+        let heads_a_crew = card
+            .card_frame
+            .is_some_and(|frame| frame.height > card.rect.height);
         // A transparent pixel card carries this row's ink itself, and anything
         // drawn under it would show through it rather than be covered by it. The
         // shell is still constructed — the row's content width, its rails and its
@@ -5879,6 +6160,12 @@ fn render_workspace_list(
         if let Some(shell) = &card_shell {
             if !covered {
                 shell.render_frame(frame, list_bottom, pill.as_ref());
+                if heads_a_crew {
+                    // On the row this box used to close on, which is the one row
+                    // of a stretched box that carries neither the card's own
+                    // content nor a worker's.
+                    shell.render_crew_rule(frame, card.rect.height.saturating_sub(1), list_bottom);
+                }
             }
         }
 
@@ -6326,26 +6613,39 @@ mod tests {
     /// blank, so the "line" joining a mate to its workers was a column of
     /// disconnected ticks. This walks the rows between two siblings' connectors
     /// and insists every one of them carries the rail.
+    ///
+    /// **Two second mates, each running a worker of its own.** The siblings are
+    /// mates rather than workers now: a worker is drawn inside the box of the
+    /// mate that dispatched it and hangs off nothing
+    /// ([`crew_folds_into_its_space`]). That makes the question harder rather
+    /// than easier — the box the rail has to run past is as tall as its mate's
+    /// whole crew — which is exactly the run that used to come out as ticks.
     #[test]
     fn a_cards_rail_is_unbroken_from_one_sibling_to_the_next() {
         let width = NARROWEST_CARD_WIDTH + 6;
         let mut app = crate::app::state::AppState::test_new();
-        let mut second_mate = Workspace::test_new("2ndmate-explore");
-        let first = second_mate.test_split(ratatui::layout::Direction::Vertical);
-        let second = second_mate.test_split(ratatui::layout::Direction::Vertical);
-        app.workspaces = vec![Workspace::test_new("firstmate"), second_mate];
+        let mut explore = Workspace::test_new("2ndmate-explore");
+        let first = explore.test_split(ratatui::layout::Direction::Vertical);
+        let mut build = Workspace::test_new("2ndmate-build");
+        let second = build.test_split(ratatui::layout::Direction::Vertical);
+        app.workspaces = vec![Workspace::test_new("firstmate"), explore, build];
         app.ensure_test_terminals();
         app.active = Some(0);
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
         app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
-        app.workspaces[1].metadata_tokens.patch(
-            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
-            None,
-            std::time::Instant::now(),
-        );
-        let owner_id = app.workspaces[1].id.clone();
-        for (pane, name) in [(first, "worker-one"), (second, "worker-two")] {
-            let terminal_id = app.workspaces[1].tabs[0].panes[&pane]
+        for ws_idx in [1, 2] {
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+        }
+        for (ws_idx, pane, name) in [(1usize, first, "worker-one"), (2, second, "worker-two")] {
+            let owner_id = app.workspaces[ws_idx].id.clone();
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
                 .attached_terminal_id
                 .clone();
             let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
@@ -6355,7 +6655,7 @@ mod tests {
             terminal.state = AgentState::Idle;
             terminal.created_by = Some(crate::api::schema::PaneOrigin {
                 pane_id: name.to_string(),
-                workspace_id: owner_id.clone(),
+                workspace_id: owner_id,
             });
         }
 
@@ -6380,16 +6680,20 @@ mod tests {
                 .position(|row| row.contains(name))
                 .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
         };
-        // `worker-two` was created second, so it entered at the head of the
-        // group and draws above `worker-one` - see [`enter_at_head`]. Which of
-        // them is on top is not what this test is about; that there is an
-        // unbroken rail between them is.
-        let upper = row_of("worker-two");
-        let lower = row_of("worker-one");
-        assert!(upper < lower, "workers drew out of order:\n{screen}");
-        // Only the columns left of the workers' own frame count. The card's
-        // left border is itself a `│`, so a test that looked at the whole row
-        // would pass on a rail that was never drawn at all.
+        // Which of the two mates is on top is not what this test is about; that
+        // there is an unbroken rail between them is.
+        let upper = row_of("2ndmate-explore").min(row_of("2ndmate-build"));
+        let lower = row_of("2ndmate-explore").max(row_of("2ndmate-build"));
+        // Each of them is holding a worker of its own, so the run under test is
+        // a run past a whole crew rather than past a bare card.
+        let held = row_of("worker-one").min(row_of("worker-two"));
+        assert!(
+            held > upper && held < lower,
+            "the upper mate is not holding a worker of its own:\n{screen}"
+        );
+        // Only the columns left of the mates' own frame count. The card's left
+        // border is itself a `│`, so a test that looked at the whole row would
+        // pass on a rail that was never drawn at all.
         let rail_columns = app
             .view
             .workspace_card_areas
@@ -6404,7 +6708,7 @@ mod tests {
             let rail: String = row.chars().take(usize::from(rail_columns)).collect();
             assert!(
                 rail.contains('│') || rail.contains('├') || rail.contains('└'),
-                "row {index} rail {rail:?} broke between the two workers:\n{screen}"
+                "row {index} rail {rail:?} broke between the two mates:\n{screen}"
             );
         }
     }
@@ -6412,11 +6716,17 @@ mod tests {
     /// The same ownership, drawn in the **card** shell.
     ///
     /// Two properties, because a card can satisfy either one alone and still be
-    /// wrong. The names step in by rank, which is what "nested" looks like at a
-    /// glance; and each child's row carries its own `├`/`└`, which is what says
-    /// *who* it is nested under. The card used to put that connector on its top
-    /// border row instead — pointing at a corner rather than at a name — and
-    /// this asserted only the indent, so the misplacement had nothing to fail.
+    /// wrong. A *mate* steps in by rank, which is what "nested" looks like at a
+    /// glance, and its row carries its own `├`/`└`, which is what says who it is
+    /// nested under. The card used to put that connector on its top border row
+    /// instead — pointing at a corner rather than at a name — and this asserted
+    /// only the indent, so the misplacement had nothing to fail.
+    ///
+    /// A *worker* answers neither, and that is the captain's rule rather than a
+    /// gap: it is drawn inside its own mate's box, so it steps in past that
+    /// box's border rather than onto a rung of the ladder, and it grows no
+    /// connector at all because the border it is inside already says whose it
+    /// is. See [`crew_folds_into_its_space`].
     #[test]
     fn native_ownership_still_nests_when_the_panel_draws_cards() {
         let (_app, rows) = natively_owned_fleet(NARROWEST_CARD_WIDTH + 6, 1);
@@ -6426,32 +6736,58 @@ mod tests {
             "expected the card shell at this width:\n{screen}"
         );
 
-        let row_with = |name: &str| {
+        let row_index_of = |name: &str| {
             rows.iter()
-                .find(|row| row.contains(name))
+                .position(|row| row.contains(name))
                 .unwrap_or_else(|| panic!("{name} row missing:\n{screen}"))
         };
+        // The *column* the name starts in, not its byte offset: the prefixes are
+        // box-drawing glyphs of three bytes each, so two names in the same
+        // column are at wildly different offsets depending on how much rail is
+        // to their left.
         let indent_of = |name: &str| {
-            row_with(name)
-                .find(name)
+            let row = &rows[row_index_of(name)];
+            row.find(name)
+                .map(|byte| row[..byte].chars().count())
                 .unwrap_or_else(|| panic!("{name} row is blank:\n{screen}"))
         };
 
         let first = indent_of("firstmate");
         let mate = indent_of("2ndmate-explore");
-        let worker = indent_of("worker");
         assert!(
-            first < mate && mate < worker,
-            "cards did not step in by rank (first={first}, mate={mate}, worker={worker}):\n{screen}"
+            first < mate,
+            "the mates' cards did not step in by rank (first={first}, mate={mate}):\n{screen}"
+        );
+        let mate_row = &rows[row_index_of("2ndmate-explore")];
+        assert!(
+            mate_row.contains('└') || mate_row.contains('├'),
+            "the mate's connector is not on the row carrying its name:\n{screen}"
         );
 
-        for child in ["2ndmate-explore", "worker"] {
-            let row = row_with(child);
+        // The worker is inside that mate's box: flush with the mate's own text
+        // column — a worker the mate dispatched itself takes no step, exactly as
+        // the pixel list's tier `0` does — with no border and no connector of
+        // its own between them.
+        let worker_row = row_index_of("worker");
+        assert_eq!(
+            indent_of("worker"),
+            mate,
+            "the worker is not flush with its mate's own text column:\n{screen}"
+        );
+        assert!(
+            mate > first,
+            "the mate's box is not stepped in from the first mate's:\n{screen}"
+        );
+        for row in &rows[row_index_of("2ndmate-explore")..=worker_row] {
             assert!(
-                row.contains('└') || row.contains('├'),
-                "{child}'s connector is not on the row carrying its name:\n{screen}"
+                !row.contains('╭'),
+                "a box was opened between a mate and its own worker:\n{screen}"
             );
         }
+        assert!(
+            !rows[worker_row].contains('└') && !rows[worker_row].contains('├'),
+            "the worker grew a connector inside the box that already holds it:\n{screen}"
+        );
     }
 
     /// The load-bearing clause. A pane created from a *different* Space is a
@@ -7631,8 +7967,18 @@ mod tests {
 
     /// The one step that does cost rows, pinned so it stays deliberate: the
     /// column at which the panel stops drawing lines and starts drawing cards.
+    ///
+    /// **A box per mate, not per entity.** A worker is drawn inside the box of
+    /// the mate that dispatched it ([`crew_folds_into_its_space`]), so the
+    /// fixture's six rows open three boxes: the first mate's, and one for each
+    /// second mate. The bill is two rows a box — its top border and its closing
+    /// rule — plus one more for every box whose rule had to move down past a
+    /// crew, which is the row that rule landed on. See
+    /// [`CrewRowLayout::closes_the_box`].
     #[test]
-    fn the_card_shell_starts_at_one_named_width_and_costs_two_rows_an_entity() {
+    fn the_card_shell_starts_at_one_named_width_and_costs_two_rows_a_box() {
+        const BOXES: usize = 3;
+        const BOXES_WITH_A_CREW: usize = 1;
         let line = default_layout_fleet_rows(WIDEST_LINE_WIDTH, 40);
         let card = default_layout_fleet_rows(NARROWEST_CARD_WIDTH, 40);
         assert!(
@@ -7642,14 +7988,15 @@ mod tests {
         );
         assert_eq!(
             tree_rows(&card).iter().filter(|r| r.contains('╭')).count(),
-            6,
+            BOXES,
             "the card shell did not start at {NARROWEST_CARD_WIDTH} columns:\n{}",
             card.join("\n")
         );
         assert_eq!(
             tree_rows(&card).len(),
-            tree_rows(&line).len() + 2 * 6,
-            "the shell cost something other than two rows an entity"
+            tree_rows(&line).len() + 2 * BOXES + BOXES_WITH_A_CREW,
+            "the shell cost something other than two rows a box:\n{}",
+            card.join("\n")
         );
     }
 
@@ -7701,24 +8048,52 @@ mod tests {
     /// The card's content rows *are* the card, so they never merge however much
     /// room the panel has. A folded card would be a bordered line, which is the
     /// one thing the shell exists not to be.
+    ///
+    /// A *worker* inside one is the other way round, and deliberately: it is a
+    /// line, and a line folds. That is what makes a mate's crew the compact
+    /// one-row-per-worker list the mockups ask for rather than a second card's
+    /// worth of block set inside the first — see [`crew_row_layout`]. So the
+    /// height under test is each mate's own, asked of the layout, rather than
+    /// the whole tree's row count, which now moves with how far a crew folds.
     #[test]
     fn a_card_never_folds_the_lines_it_is_made_of() {
         for width in [NARROWEST_CARD_WIDTH, 44, 70, 90] {
-            let rows = foldable_fleet_rows(width, 40);
+            let (app, rows) = default_layout_fleet_on(width, 40, None, FOLDABLE_BRANCH);
             let screen = rows.join("\n");
             let tree = tree_rows(&rows);
-            // Six entities: a top border, two content rows and a closing rule
-            // each, whatever the width.
+            // Three boxes, one per mate: a top border, two content rows and a
+            // closing rule each, whatever the width.
             assert_eq!(
                 tree.iter().filter(|row| row.contains('╭')).count(),
-                6,
-                "not every entity drew a card at {width} columns:\n{screen}"
+                3,
+                "not every mate drew a card at {width} columns:\n{screen}"
             );
-            assert_eq!(
-                tree.len(),
-                24,
-                "a card folded its content rows at {width} columns:\n{screen}"
-            );
+
+            let area = Rect::new(0, 0, width, 40);
+            let fold = row_fold_width(&app, workspace_list_rect(area));
+            let body = workspace_list_body_rect(&app, workspace_list_rect(area), false);
+            let entries = workspace_list_entries(&app);
+            let agents = sidebar_agent_entries(&app);
+            let bodies = body_register::BodyRegister::resolve(&app);
+            for (entry_idx, entry) in entries.iter().enumerate() {
+                if !matches!(entry, WorkspaceListEntry::Workspace { .. }) {
+                    continue;
+                }
+                assert_eq!(
+                    list_entry_height(
+                        &app,
+                        &agents,
+                        &entries,
+                        entry_idx,
+                        body.height,
+                        fold,
+                        &bodies
+                    ),
+                    4,
+                    "a card folded its two content rows at {width} columns:\n{screen}"
+                );
+            }
+
             let title = tree
                 .iter()
                 .find(|row| row.contains("firstmate"))
@@ -12701,27 +13076,65 @@ pub(crate) mod a_space_card_carries_its_own_workers {
         }
     }
 
-    /// **A panel drawing no cards keeps every row it always had.**
+    /// **A panel that draws no boxes keeps every row it always had.**
     ///
-    /// The crew list is a *card*: on the character fallback there is no box to be
-    /// inside of, so a worker is its own row with its own height and its own air
-    /// around it, exactly as before. Nothing about that panel changes.
+    /// The crew list is a *box*: below [`card::MIN_FOLD_WIDTH`] a row is a
+    /// styled line, there is nothing to be inside of, and a worker is its own
+    /// row with its own height and its own air around it, exactly as before.
+    ///
+    /// The pixel path has nothing to do with it. That is the change: the fold
+    /// used to wait on a pixel card being published, so the very panel the
+    /// captain runs — a character card at 42 columns — drew a card per worker
+    /// inside the card that already contained them.
     #[test]
-    fn a_panel_that_draws_no_cards_keeps_every_worker_row_it_had() {
+    fn a_panel_that_draws_no_boxes_keeps_every_worker_row_it_had() {
         let app = crewed_fleet();
+        let narrow = Rect::new(0, 0, card::MIN_FOLD_WIDTH - 1, 46);
         assert!(
-            !crew_is_drawn(&app, row_fold_width(&app, workspace_list_rect(area()))),
-            "this fixture has to be one with no pixel card"
+            !RowShell::for_fold_width(row_fold_width(&app, workspace_list_rect(narrow))).is_card(),
+            "this panel has to be one that draws no boxes at all"
         );
-        let cards = compute_workspace_card_areas(&app, area());
+        let cards = compute_workspace_card_areas(&app, narrow);
         let entries = workspace_list_entries(&app);
         assert_eq!(cards.len(), entries.len(), "a row went missing");
         assert!(
-            cards
-                .iter()
-                .filter(|card| card.agent.is_some())
-                .all(|card| card.card_frame.is_some()),
-            "a worker lost its own shell on a panel with no card to be inside of"
+            cards.iter().all(|card| card.card_frame.is_none()),
+            "a shell was drawn below the width the shell starts at"
+        );
+    }
+
+    /// **The character card merges too, with no pixel card anywhere near it.**
+    ///
+    /// The captain's own panel: 42 columns, `session_kitty_graphics=false`. The
+    /// box is the character shell's, so the workers fold into their Space's card
+    /// and none of them opens one — which is the whole of the reported bug.
+    #[test]
+    fn a_character_card_holds_its_workers_just_as_a_pixel_one_does() {
+        let app = crewed_fleet();
+        let fold = row_fold_width(&app, workspace_list_rect(area()));
+        assert!(
+            !crew_is_drawn(&app, fold),
+            "this fixture has to be one with no pixel card"
+        );
+        assert!(RowShell::for_fold_width(fold).is_card());
+
+        let cards = compute_workspace_card_areas(&app, area());
+        let entries = workspace_list_entries(&app);
+        let (head, crew): (Vec<&crate::app::state::WorkspaceCardArea>, Vec<_>) = cards
+            .iter()
+            .partition(|card| crew_head(&entries, card.entry_idx).is_none());
+        assert_eq!(head.len(), 1, "the Space did not stay one card");
+        assert_eq!(crew.len(), 3, "a worker row went missing");
+        assert!(
+            crew.iter().all(|card| card.card_frame.is_none()),
+            "a worker drew a box of its own inside the card it is in"
+        );
+        let frame = head[0].card_frame.expect("the Space has a box");
+        let last = crew.last().expect("a worker row");
+        assert_eq!(
+            frame.y + frame.height,
+            last.rect.y + last.rect.height,
+            "the Space's box does not close under its last worker"
         );
     }
 }
@@ -12865,27 +13278,40 @@ mod the_trays_rows_go_back_to_the_tree {
     use crate::ui::sidebar::AgentState;
     use crate::workspace::Workspace;
 
-    /// A mate Space carrying `workers` panes, each a named idle agent
-    /// delegated inside that Space — the shape the tree draws crew rows for.
-    fn fleet(workers: usize) -> AppState {
+    /// `mates` second mates under the first, each running one named idle agent
+    /// delegated inside its own Space — the shape the tree draws crew rows for.
+    ///
+    /// **A mate per worker, not one mate carrying all of them.** A worker is
+    /// drawn inside its own mate's box and goes back to a card of its own the
+    /// moment that box scrolls off the top ([`drawn_crew_head`]), so a single
+    /// mate holding twenty workers changes the tree's whole height as soon as
+    /// the panel is scrolled past it. That is a fact about the crew list, and
+    /// this module is asking about the tray.
+    fn fleet(mates: usize) -> AppState {
         let mut app = AppState::test_new();
-        let mut mate = Workspace::test_new("2ndmate-explore");
-        let panes = (0..workers)
-            .map(|_| mate.test_split(ratatui::layout::Direction::Vertical))
-            .collect::<Vec<_>>();
-        app.workspaces = vec![Workspace::test_new("firstmate"), mate];
+        app.workspaces = vec![Workspace::test_new("firstmate")];
+        let mut panes = Vec::with_capacity(mates);
+        for index in 0..mates {
+            let mut mate = Workspace::test_new(&format!("2ndmate-{index}"));
+            panes.push(mate.test_split(ratatui::layout::Direction::Vertical));
+            app.workspaces.push(mate);
+        }
         app.ensure_test_terminals();
         app.active = Some(0);
         app.sidebar_spaces.rows = vec![vec![crate::config::SpaceSidebarToken::Workspace]];
         app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
-        app.workspaces[1].metadata_tokens.patch(
-            std::collections::HashMap::from([("owner".to_string(), Some("firstmate".to_string()))]),
-            None,
-            std::time::Instant::now(),
-        );
-        let space_id = app.workspaces[1].id.clone();
         for (index, pane) in panes.iter().enumerate() {
-            let terminal_id = app.workspaces[1].tabs[0].panes[pane]
+            let ws_idx = index + 1;
+            app.workspaces[ws_idx].metadata_tokens.patch(
+                std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    Some("firstmate".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+            let space_id = app.workspaces[ws_idx].id.clone();
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[pane]
                 .attached_terminal_id
                 .clone();
             let Some(terminal) = app.terminals.get_mut(&terminal_id) else {
@@ -12895,7 +13321,7 @@ mod the_trays_rows_go_back_to_the_tree {
             terminal.state = AgentState::Idle;
             terminal.created_by = Some(crate::api::schema::PaneOrigin {
                 pane_id: format!("creator-{index}"),
-                workspace_id: space_id.clone(),
+                workspace_id: space_id,
             });
         }
         app

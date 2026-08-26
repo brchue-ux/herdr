@@ -9303,11 +9303,10 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// The rows that carry a card, which is what a published layer answers to.
     /// The frame of every row that gets an image of its own — which is every
     /// row with a *card*, and so not the worker rows drawn inside a Space's own
-    /// box. Those keep a frame, because they keep a rect and a click target, but
-    /// their ink is in their Space's image and nothing is placed for them. See
+    /// box. Those keep a rect and a click target but open no box, so they are
+    /// handed no frame at all and their ink is in their Space's image. See
     /// [`crew_for`].
     fn framed(app: &AppState) -> Vec<Rect> {
         let entries = super::super::workspace_list_entries(app);
@@ -9758,8 +9757,19 @@ mod a_card_is_its_own_shape {
         }
     }
 
-    /// Every card in a real tree — first mate, second mates, and their
-    /// workers — is drawn at the same height on screen.
+    /// How far the fixture has to be scrolled for each rung of the ladder to
+    /// open a card of its own.
+    ///
+    /// **Two passes, because no one panel carries all three any more.** A worker
+    /// is drawn inside its own mate's box now — see
+    /// [`super::super::crew_folds_into_its_space`] — and opens a card of its own
+    /// only where that box is not on screen, which is exactly what scrolling its
+    /// mate off the top does. The resting panel gives the two mates; the panel
+    /// scrolled onto the worker gives the worker.
+    const LADDER_SCROLLS: [usize; 2] = [0, 2];
+
+    /// Every card in a real tree — first mate, second mates, and workers — is
+    /// drawn at the same height on screen.
     ///
     /// Through the real render path rather than the constants: builds the
     /// captain's own fleet at his 42-column width, decodes the actual PNG the
@@ -9770,7 +9780,42 @@ mod a_card_is_its_own_shape {
     /// show up here.
     #[test]
     fn every_rank_renders_at_the_same_card_height() {
-        let app = three_rank_pixel_app();
+        let mut heights_by_rank: std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            Vec<u32>,
+        > = std::collections::BTreeMap::new();
+        for scroll in LADDER_SCROLLS {
+            measure_card_heights(scroll, &mut heights_by_rank);
+        }
+
+        assert!(
+            heights_by_rank.len() >= 3,
+            "the fixture did not exercise at least three ranks: {heights_by_rank:?}"
+        );
+        let mut all_heights = heights_by_rank.values().flatten().copied();
+        let Some(first) = all_heights.next() else {
+            return; // No face on this machine; nothing was measured.
+        };
+        for h in all_heights {
+            assert!(
+                h.abs_diff(first) <= 1,
+                "card heights differ by rank (a device-pixel rounding tolerance of 1 is \
+                 allowed): {heights_by_rank:?}"
+            );
+        }
+    }
+
+    /// One pass of [`every_rank_renders_at_the_same_card_height`], at one
+    /// scroll offset, folded into the heights it found.
+    fn measure_card_heights(
+        scroll: usize,
+        heights_by_rank: &mut std::collections::BTreeMap<
+            crate::app::agent_tree::AgentRelation,
+            Vec<u32>,
+        >,
+    ) {
+        let mut app = three_rank_pixel_app();
+        app.workspace_scroll = scroll;
         let Some(layers) = built(&app) else {
             return; // No face on this machine.
         };
@@ -9782,10 +9827,6 @@ mod a_card_is_its_own_shape {
         let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
         let entries = super::super::workspace_list_entries(&app);
         let agents = super::super::sidebar_agent_entries(&app);
-        let mut heights_by_rank: std::collections::BTreeMap<
-            crate::app::agent_tree::AgentRelation,
-            Vec<u32>,
-        > = std::collections::BTreeMap::new();
 
         for card in &cards {
             let Some(frame) = card.card_frame else {
@@ -9845,20 +9886,6 @@ mod a_card_is_its_own_shape {
                     .push(bottom - top + 1);
             }
         }
-
-        assert!(
-            heights_by_rank.len() >= 3,
-            "the fixture did not exercise at least three ranks: {heights_by_rank:?}"
-        );
-        let mut all_heights = heights_by_rank.values().flatten().copied();
-        let first = all_heights.next().expect("at least one card was measured");
-        for h in all_heights {
-            assert!(
-                h.abs_diff(first) <= 1,
-                "card heights differ by rank (a device-pixel rounding tolerance of 1 is \
-                 allowed): {heights_by_rank:?}"
-            );
-        }
     }
 
     /// Width still reads as rank in the real render path: a worker's card is
@@ -9866,38 +9893,43 @@ mod a_card_is_its_own_shape {
     /// at the captain's 42-column width. This is [`super::rank_width_inset`],
     /// unrelated to and unaffected by the height change — this test exists so a
     /// future change to height cannot silently take width down with it.
+    ///
+    /// Read over [`LADDER_SCROLLS`], because a worker only opens a card of its
+    /// own where its mate's box is off screen.
     #[test]
     fn width_still_narrows_by_rank_at_the_captains_width() {
-        let app = three_rank_pixel_app();
-        let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
-        let entries = super::super::workspace_list_entries(&app);
-        let agents = super::super::sidebar_agent_entries(&app);
-
         let mut widths_by_rank: std::collections::BTreeMap<
             crate::app::agent_tree::AgentRelation,
             u16,
         > = std::collections::BTreeMap::new();
-        for card in &cards {
-            let Some(frame) = card.card_frame else {
-                continue;
-            };
-            if frame.width == 0 {
-                continue;
+        for scroll in LADDER_SCROLLS {
+            let mut app = three_rank_pixel_app();
+            app.workspace_scroll = scroll;
+            let cards = super::super::compute_workspace_card_areas(&app, sidebar_rect());
+            let entries = super::super::workspace_list_entries(&app);
+            let agents = super::super::sidebar_agent_entries(&app);
+            for card in &cards {
+                let Some(frame) = card.card_frame else {
+                    continue;
+                };
+                if frame.width == 0 {
+                    continue;
+                }
+                let Some(entry) = entries.get(card.entry_idx) else {
+                    continue;
+                };
+                if content_for(
+                    &app,
+                    entry,
+                    &agents,
+                    &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                widths_by_rank.insert(entry.rank(), frame.width);
             }
-            let Some(entry) = entries.get(card.entry_idx) else {
-                continue;
-            };
-            if content_for(
-                &app,
-                entry,
-                &agents,
-                &crate::ui::sidebar::body_register::BodyRegister::resolve(&app),
-            )
-            .is_none()
-            {
-                continue;
-            }
-            widths_by_rank.insert(entry.rank(), frame.width);
         }
 
         let first = widths_by_rank
@@ -14423,9 +14455,15 @@ mod the_sheet_leaves_the_trees_lines_alone {
         }
     }
 
-    /// The sheet a fleet of three ranks publishes, and the frames it was drawn
-    /// for. `None` on a machine with no proportional face, where there is no
-    /// pixel path to read at all.
+    /// The sheet a nested fleet publishes, and the frames it was drawn for.
+    /// `None` on a machine with no proportional face, where there is no pixel
+    /// path to read at all.
+    ///
+    /// Two frames, not three: the worker in this fleet is drawn inside its own
+    /// mate's box and opens no card of its own (see
+    /// [`super::super::crew_folds_into_its_space`]). What these tests need is a
+    /// card with a gutter under it and a card with nothing under it, and a
+    /// nested pair is both.
     fn sheet() -> Option<(Sheet, Vec<Rect>)> {
         let app = three_rank_pixel_app();
         assert!(
@@ -14435,7 +14473,10 @@ mod the_sheet_leaves_the_trees_lines_alone {
         let rect = sidebar_rect();
         let cards = super::super::compute_workspace_card_areas(&app, rect);
         let frames: Vec<Rect> = cards.iter().filter_map(|card| card.card_frame).collect();
-        assert!(frames.len() >= 3, "the fixture lost a rank: {frames:?}");
+        assert!(
+            frames.len() >= 2,
+            "the fixture lost a card, so there is no join to read: {frames:?}"
+        );
         let CardsUpdate::Rebuilt(layers) =
             build_cards(&app, &cards, rect, app.host_cell_size, &[]).update
         else {
