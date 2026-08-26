@@ -10,16 +10,17 @@ use crate::api::schema::{
     PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneReportEditDiffParams, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams,
+    PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
 #[cfg(test)]
 use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
+use crate::workspace::GitDiffText;
 
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
@@ -28,6 +29,12 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+/// Ceiling on one `pane.report_edit_diff` payload, in lines. Matches the diff
+/// pane's own `GIT_DIFF_MAX_LINES` render cap: anything past it could not be
+/// shown anyway, so it is rejected at the door rather than silently truncated
+/// into a diff the caller thinks was stored whole.
+const MAX_EDIT_DIFF_LINES_PER_REQUEST: usize = 4000;
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1578,6 +1585,60 @@ impl App {
             // restart.
             self.state.mark_session_dirty();
         }
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Records one file's cumulative agent-edit diff on the pane's terminal,
+    /// replacing whatever that file last reported. See
+    /// [`PaneReportEditDiffParams`] for the replace-not-append contract.
+    pub(super) fn handle_pane_report_edit_diff(
+        &mut self,
+        id: String,
+        params: PaneReportEditDiffParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        if params.clear_all {
+            terminal.agent_edit_log.clear();
+            return encode_success(id, ResponseResult::Ok {});
+        }
+
+        if params.file.is_empty() {
+            return encode_error(id, "invalid_edit_diff_file", "file must not be empty");
+        }
+
+        let diff_text = params.diff.unwrap_or_default();
+        let line_count = diff_text.lines().count();
+        if line_count > MAX_EDIT_DIFF_LINES_PER_REQUEST {
+            return encode_error(
+                id,
+                "invalid_edit_diff_too_large",
+                format!(
+                    "diff exceeds {MAX_EDIT_DIFF_LINES_PER_REQUEST} lines ({line_count} given)"
+                ),
+            );
+        }
+
+        let (lines, truncated) = crate::workspace::parse_unified_diff_lines(&diff_text);
+        terminal
+            .agent_edit_log
+            .set_or_clear(params.file, GitDiffText { lines, truncated });
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -4441,6 +4502,116 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // pane.report_edit_diff
+    // -----------------------------------------------------------------
+
+    fn edit_diff_params(pane_id: String) -> PaneReportEditDiffParams {
+        PaneReportEditDiffParams {
+            pane_id,
+            file: "src/foo.rs".into(),
+            diff: Some("--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -0,0 +1 @@\n+fn main() {}\n".into()),
+            clear_all: false,
+        }
+    }
+
+    /// The pane's agent-edit log, reached the way production does: pane id ->
+    /// attached terminal -> that terminal's log.
+    fn agent_edit_log<'a>(app: &'a App, pane_id: &str) -> &'a crate::agent_edit_log::AgentEditLog {
+        let (ws_idx, resolved_pane_id) = app.parse_pane_id(pane_id).unwrap();
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(resolved_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        &app.state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .agent_edit_log
+    }
+
+    #[test]
+    fn pane_report_edit_diff_stores_the_file_entry() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let params = edit_diff_params(pane_id.clone());
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert!(!agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    #[test]
+    fn pane_report_edit_diff_replaces_not_appends_same_file() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut second = edit_diff_params(pane_id.clone());
+        second.diff =
+            Some("--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -0,0 +1 @@\n+fn other() {}\n".into());
+        app.handle_pane_report_edit_diff("req2".into(), second);
+
+        let joined = agent_edit_log(&app, &pane_id)
+            .flatten()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("+fn other() {}"), "joined: {joined}");
+        assert!(!joined.contains("+fn main() {}"), "joined: {joined}");
+    }
+
+    #[test]
+    fn pane_report_edit_diff_with_empty_diff_clears_the_file() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut clearing = edit_diff_params(pane_id.clone());
+        clearing.diff = Some(String::new());
+        app.handle_pane_report_edit_diff("req2".into(), clearing);
+
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    #[test]
+    fn pane_report_edit_diff_clear_all_empties_the_whole_log() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut clear_all = edit_diff_params(pane_id.clone());
+        clear_all.clear_all = true;
+        clear_all.diff = None;
+        app.handle_pane_report_edit_diff("req2".into(), clear_all);
+
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    #[test]
+    fn pane_report_edit_diff_rejects_unknown_pane() {
+        let (mut app, _pane_id) = app_with_test_workspace();
+        let params = edit_diff_params("h-does-not-exist".into());
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_report_edit_diff_rejects_oversized_diff() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.diff = Some("+x\n".repeat(MAX_EDIT_DIFF_LINES_PER_REQUEST + 1));
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_edit_diff_too_large");
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
     }
 
     // -----------------------------------------------------------------

@@ -12,10 +12,6 @@ pub(crate) struct AgentEditLog {
     entries: BTreeMap<String, GitDiffText>,
 }
 
-// Only this module's own tests call these today. The `pane.report_edit_diff`
-// RPC handler and the Changes-zone renderer are the production callers, and
-// they land in later tasks of this feature.
-#[cfg_attr(not(test), allow(dead_code))]
 impl AgentEditLog {
     /// Replaces `path`'s entry with `diff`, or removes it entirely if
     /// `diff` has no lines (an edit that reverted the file back to its
@@ -33,6 +29,10 @@ impl AgentEditLog {
         self.entries.clear();
     }
 
+    // The two read accessors are still test-only: `pane.report_edit_diff`
+    // writes this log, but its only production reader — the Changes-zone
+    // renderer — lands in a later task of this feature.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -40,6 +40,7 @@ impl AgentEditLog {
     /// Flattens every file's lines into one stream, files in path-sorted
     /// order, for the renderer to consume exactly like a single
     /// `GitDiffText` today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn flatten(&self) -> Vec<GitDiffLine> {
         self.entries
             .values()

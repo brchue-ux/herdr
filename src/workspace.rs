@@ -31,7 +31,10 @@ pub use self::{
     },
     tab::{NewPane, Tab},
 };
-pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPane};
+pub(crate) use self::{
+    git::{git_status_snapshot_for_cwd_with_demand, parse_unified_diff_lines},
+    tab::MovedPane,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeSpaceMembership {

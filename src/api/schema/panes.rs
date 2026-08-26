@@ -463,6 +463,30 @@ pub struct PaneReportMetadataParams {
     pub ttl_ms: Option<u64>,
 }
 
+/// Params for `pane.report_edit_diff`.
+///
+/// Reports one file's cumulative unified diff against that file's
+/// session-start content for the named pane's agent-edit log — the Changes
+/// zone's data source when that pane is focused. Each call **replaces**
+/// (never appends to) that file's prior entry: callers are expected to
+/// recompute the diff against the same fixed baseline every time, not to
+/// diff against the last report. An empty or absent `diff` (when
+/// `clear_all` is false) clears that one file's entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportEditDiffParams {
+    pub pane_id: String,
+    /// The edited file's path, exactly as the caller wants it displayed.
+    pub file: String,
+    /// Unified diff text (e.g. `diff -u` output). `None` or empty clears
+    /// this file's entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// When true, ignore `file`/`diff` and clear this pane's entire edit
+    /// log instead — used on agent session start.
+    #[serde(default)]
+    pub clear_all: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneClearAgentAuthorityParams {
     pub pane_id: String,

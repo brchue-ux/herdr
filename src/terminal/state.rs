@@ -136,9 +136,6 @@ pub struct TerminalState {
     /// This pane's agent-driven file edits this session, keyed by path —
     /// the Changes zone's data source. Unrelated to git; populated only by
     /// `pane.report_edit_diff` (Claude Code hooks), never by git status.
-    // No reader yet: the RPC writer and the Changes-zone reader land in later
-    // tasks of this feature.
-    #[allow(dead_code)]
     pub agent_edit_log: crate::agent_edit_log::AgentEditLog,
     /// Which pane asked Herdr to create this one, and the workspace that pane
     /// was in. See [`crate::api::schema::PaneOrigin`].
