@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.minimize`, `pane.dormant.reappear`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.minimize`, `pane.dormant.reappear`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.report_edit_diff`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.declare_agent`, `pane.close`, `pane.wait_for_output` |
 | Surface | `surface.graphics.info`, `surface.graphics.set`, `surface.graphics.clear` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio`, `layout.arrange` |
@@ -942,6 +942,30 @@ Presentation text is normalized before storage. Herdr trims surrounding whitespa
 Use `ttl_ms` for short-lived metadata. It must be between `1` and `86400000` milliseconds. Omit `ttl_ms` for metadata that should stay until replaced, cleared, or the pane/workspace closes. Presentation fields retain their existing source-scoped expiry behavior; each token updated by the call receives its own deadline. Token metadata is not restored after a server restart.
 
 Use `seq` when a hook may send updates out of order. For the same `source`, reports with a sequence number less than or equal to the last accepted sequence are accepted by the API but ignored by the pane state. A pane or workspace accepts sequenced token reports from at most 32 distinct sources during its lifetime; clearing or expiry does not release those source slots.
+
+Use `pane.report_edit_diff` when a hook can report the files the pane's agent has edited this session. It is what the Changes zone draws for the focused pane: that zone reads this per-pane edit log, not the pane's `git diff`.
+
+```json
+{
+  "id": "req_4",
+  "method": "pane.report_edit_diff",
+  "params": {
+    "pane_id": "w1:p1",
+    "file": "src/auth/middleware.rs",
+    "diff": "--- a/src/auth/middleware.rs\n+++ b/src/auth/middleware.rs\n@@ -12,3 +12,4 @@\n fn authorize() {\n-    legacy_check();\n+    verify_token()?;\n+    audit(\"authorize\");\n }\n"
+  }
+}
+```
+
+Each report replaces that file's previous entry rather than appending to it. A reporter is expected to snapshot each file's content once, the first time the agent touches it in a session, and to recompute the whole diff against that same fixed baseline on every later edit, so three edits to one file stay one clean diff instead of three stacked hunks. Diffing against the last report instead produces a log the zone cannot read as cumulative change.
+
+`diff` is unified-diff text, such as `diff -u` output. It does not have to carry a `diff --git a/x b/x` line: Herdr synthesizes one from `file`, so every reported file opens under its own header card without the reporter having to know that convention. `file` is the path as you want it displayed. It is not resolved, validated, or checked against the pane's cwd.
+
+An omitted or empty `diff` clears that one file's entry — the report to send when an edit is reverted back to its baseline. `clear_all` ignores `file` and `diff` and empties the pane's whole log instead; send it when a new agent session takes over the pane, so the new session does not inherit the previous one's edits. `file` may be empty only in that case, and is otherwise rejected with `invalid_edit_diff_file`.
+
+One report is capped at 4000 lines — the same ceiling the zone renders to — and a longer one is rejected whole with `invalid_edit_diff_too_large` rather than stored truncated, so a reporter is never told a diff was kept in full when it was not. An unknown `pane_id` returns `pane_not_found`.
+
+The log lives on the pane's terminal, is display-only, takes no lifecycle authority, emits no event, and is not restored after a server restart. Herdr does not capture these edits itself: `herdr pane report-edit-diff` is the CLI door for a `PreToolUse`/`PostToolUse` hook pair installed beside the managed integration hook. The bundled Claude Code integration sends only the `clear_all` report, on `SessionStart`.
 
 ## Event subscriptions
 

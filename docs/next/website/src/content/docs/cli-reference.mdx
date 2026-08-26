@@ -345,6 +345,29 @@ Metadata text is normalized before storage. Herdr trims surrounding whitespace, 
 
 `--source` and `--applies-to-source` must be 80 characters or fewer and may contain only ASCII letters, digits, colon, dot, underscore, and hyphen. `--ttl-ms` makes metadata expire automatically and must be between `1` and `86400000` milliseconds. Omit it for metadata that should stay until replaced, cleared, or the pane closes. `--seq` lets Herdr ignore stale reports from the same `--source`; stale reports are accepted by the API but ignored by pane state. A pane or workspace accepts sequenced token reports from at most 32 distinct sources during its lifetime; clearing or expiry does not release those source slots.
 
+Report the running edits the pane's agent has made this session. This is what the Changes zone draws for the focused pane — that zone reads this per-pane edit log, not the pane's `git diff`:
+
+```bash
+herdr pane report-edit-diff <pane_id> \
+  --file PATH \
+  --diff - \
+  [--clear-all]
+```
+
+`--diff` accepts only `-`, and reads the diff from stdin. A unified diff is newline-heavy, arbitrarily long text, which is the worst thing to carry in an argv value, and the callers are hook scripts that already have it on a pipe:
+
+```bash
+diff -u "$BASELINE" "$FILE" | herdr pane report-edit-diff "$PANE_ID" --file "$FILE" --diff -
+```
+
+Each call replaces that file's previous entry; it never appends. Snapshot each file's content once, the first time the agent touches it in a session, and recompute the whole diff against that same fixed baseline on every later edit, so three edits to one file stay one clean diff instead of three stacked hunks. `--file` is the path as you want it displayed; it is not resolved or checked against the pane's cwd. The diff does not need a `diff --git` line — Herdr synthesizes one from `--file` so each reported file opens under its own header card.
+
+Omitting `--diff`, or piping in nothing, clears that one file's entry — send that when an edit is reverted back to its baseline. `--clear-all` ignores `--file` and empties the pane's whole log instead; send it when a new agent session takes over the pane, so it does not inherit the previous session's edits. `--file` is required for every call that is not `--clear-all`.
+
+A diff longer than 4000 lines — the same ceiling the Changes zone renders to — is rejected whole rather than stored truncated. The log is display-only, takes no lifecycle authority, and is not restored after a server restart.
+
+Herdr does not capture these edits itself: this is the door for a `PreToolUse`/`PostToolUse` hook pair installed beside the managed integration hook. The bundled Claude Code integration sends only `--clear-all`, on `SessionStart`.
+
 ## Agents
 
 For the pane-versus-agent model and complete orchestration examples, see [Agent automation](/docs/agent-automation/).
