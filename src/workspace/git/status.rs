@@ -400,7 +400,7 @@ fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
     // "not a git checkout at all") — untracked files below can still show.
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout);
-        push_diff_lines(text.lines(), &mut lines, &mut truncated);
+        (lines, truncated) = parse_unified_diff_lines(&text);
     }
 
     if !truncated {
@@ -408,6 +408,23 @@ fn git_diff_text(repo_root: &Path) -> Option<GitDiffText> {
     }
 
     Some(GitDiffText { lines, truncated })
+}
+
+/// Parses arbitrary unified-diff text into the same tagged-line shape the diff
+/// pane renders, capped at `GIT_DIFF_MAX_LINES` (the returned flag says whether
+/// the cap cut it short).
+///
+/// The text need not be `git diff`'s own stdout: `classify_diff_line` tags
+/// `--- `/`+++ ` file headers on their own prefix, with no dependency on a
+/// preceding `diff --git a/x b/x` line, so GNU `diff -u --label a/x --label
+/// b/x` output round-trips through here identically. Used both by
+/// `git_diff_text` and by the agent-edit pipeline, which parses hook-submitted
+/// `diff -u` output.
+pub(crate) fn parse_unified_diff_lines(text: &str) -> (Vec<GitDiffLine>, bool) {
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    push_diff_lines(text.lines(), &mut lines, &mut truncated);
+    (lines, truncated)
 }
 
 fn push_diff_lines<'a>(
@@ -1045,6 +1062,52 @@ mod tests {
         assert_eq!(diff.lines.len(), GIT_DIFF_MAX_LINES);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_unified_diff_lines_handles_gnu_diff_label_output() {
+        // Exact shape produced by:
+        //   diff -u --label a/foo.rs --label b/foo.rs /dev/null current
+        // — no leading `diff --git` line, which only `git diff` emits.
+        let text = "--- a/foo.rs\n\
+                    +++ b/foo.rs\n\
+                    @@ -0,0 +1,2 @@\n\
+                    +fn main() {}\n\
+                    +// added\n";
+
+        let (lines, truncated) = parse_unified_diff_lines(text);
+
+        assert!(!truncated);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].kind, GitDiffLineKind::FileHeader);
+        assert_eq!(lines[0].text, "--- a/foo.rs");
+        assert_eq!(lines[1].kind, GitDiffLineKind::FileHeader);
+        assert_eq!(lines[1].text, "+++ b/foo.rs");
+        assert_eq!(lines[2].kind, GitDiffLineKind::Hunk);
+        assert_eq!(lines[3].kind, GitDiffLineKind::Added);
+        assert_eq!(lines[3].text, "+fn main() {}");
+        assert_eq!(lines[4].kind, GitDiffLineKind::Added);
+        assert_eq!(lines[4].text, "+// added");
+    }
+
+    #[test]
+    fn parse_unified_diff_lines_on_empty_text_returns_no_lines() {
+        let (lines, truncated) = parse_unified_diff_lines("");
+
+        assert!(lines.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn parse_unified_diff_lines_truncates_past_the_line_cap() {
+        let text: String = (0..GIT_DIFF_MAX_LINES * 2)
+            .map(|i| format!("+line {i}\n"))
+            .collect();
+
+        let (lines, truncated) = parse_unified_diff_lines(&text);
+
+        assert!(truncated);
+        assert_eq!(lines.len(), GIT_DIFF_MAX_LINES);
     }
 
     #[test]
