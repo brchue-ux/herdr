@@ -1238,6 +1238,9 @@ impl App {
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }
+            Method::PaneReportEditDiff(params) => {
+                return self.handle_pane_report_edit_diff(request.id, params);
+            }
             Method::PaneClearAgentAuthority(params) => {
                 return self.handle_pane_clear_agent_authority(request.id, params);
             }

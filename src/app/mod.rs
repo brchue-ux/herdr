@@ -3065,7 +3065,6 @@ yellow = "#ffb454"
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
                 dirty: None,
-                diff: None,
                 space: None,
             }],
             cache_updates: Vec::new(),

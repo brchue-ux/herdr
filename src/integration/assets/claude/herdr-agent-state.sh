@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=9
+# HERDR_INTEGRATION_VERSION=10
 
 set -eu
 
@@ -21,6 +21,31 @@ esac
 [ -n "${HERDR_SOCKET_PATH:-}" ] || exit 0
 [ -n "${HERDR_PANE_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+
+# Agent-edit baseline snapshots (written by the diff-capture PreToolUse hook)
+# are keyed by agent session id and are dead the moment that session ends.
+# Nothing else ever reaps them, so sweep stale ones on session start.
+#
+# Never the current session's own directory, though. A directory's mtime only
+# advances when a *new* file lands inside it, so a long-lived session that has
+# settled on a stable set of touched files — still editing, just not touching
+# anything new — looks stale here after three days and would be reaped by any
+# other session's sweep. Its next edit would then diff against /dev/null and
+# render as a whole-file addition.
+herdr_session_id="$(HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 -c '
+import json, os, sys
+
+try:
+    with open(os.environ["HERDR_HOOK_INPUT_FILE"], encoding="utf-8") as handle:
+        session_id = json.load(handle).get("session_id")
+except Exception:
+    session_id = None
+sys.stdout.write(session_id if isinstance(session_id, str) else "")
+' 2>/dev/null)" || herdr_session_id=""
+# "." when the id is unknown: -mindepth 1 means no candidate is ever named
+# ".", so the guard then excludes nothing rather than everything.
+find /tmp/herdr-agent-diff-baseline -maxdepth 1 -mindepth 1 -type d -mtime +3 \
+  ! -name "${herdr_session_id:-.}" -exec rm -rf {} + 2>/dev/null || true
 
 HERDR_ACTION="$action" HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
 import json
@@ -98,4 +123,28 @@ try:
     client.close()
 except Exception:
     pass
+
+# A fresh agent session inherits the pane, not the previous session's work, so
+# the pane's agent edit log has to start empty. Gated on SessionStart because
+# this script's "session" action is only installed there, and sent after the
+# report above so the pane is already bound to this session. Subagent and
+# SubagentStop invocations returned long before this point.
+if hook_event_name == "SessionStart":
+    clear_request = {
+        "id": f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}",
+        "method": "pane.report_edit_diff",
+        "params": {"pane_id": pane_id, "file": "", "clear_all": True},
+    }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        client.connect(socket_path)
+        client.sendall((json.dumps(clear_request) + "\n").encode())
+        try:
+            client.recv(4096)
+        except Exception:
+            pass
+        client.close()
+    except Exception:
+        pass
 PY

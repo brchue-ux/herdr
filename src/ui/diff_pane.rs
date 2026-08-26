@@ -1,6 +1,10 @@
 //! The diff pane — herdr's "Changes" zone: a third zone, always to the right
-//! of the sidebar and terminal zones, showing the active Space's uncommitted
-//! `git diff`, plus a popup-overlay fallback for when the zone is folded —
+//! of the sidebar and terminal zones, showing the running edits the coding
+//! agent in the focused pane has made this session — that pane's
+//! [`crate::agent_edit_log::AgentEditLog`], reported in over
+//! `pane.report_edit_diff` and read here through
+//! `crate::app::AppState::focused_pane_agent_edit_lines`, not the Space's
+//! `git diff` — plus a popup-overlay fallback for when the zone is folded —
 //! see `crate::app::AppState::diff_zone_width_threshold` for the fold rule
 //! and `crate::app::AppState::diff_popup_open` for the fallback's toggle
 //! state. Its own width is a percentage of the remaining space
@@ -55,35 +59,54 @@ pub(super) fn render_diff_popup_overlay(app: &AppState, frame: &mut Frame, area:
     render_diff_content(app, frame, inner);
 }
 
+/// The Changes zone's content: the active Space's focused pane's agent edit
+/// log, as the one [`GitDiffText`] every part of this zone reads — the drawn
+/// text, the scroll clamp, and the pixel overlay's anchors and animation
+/// state. One source, so none of them can disagree about what is on screen.
+///
+/// `None` means there is nothing to show a log *for* (no active Space, no
+/// focused pane, no terminal behind it); `Some` with no lines means the pane
+/// simply has not reported an edit yet.
+///
+/// `truncated: false` is a fact about this pipeline, not a placeholder: no
+/// file's entry can ever carry a set flag to aggregate. `pane.report_edit_diff`
+/// caps a report at `GIT_DIFF_MAX_LINES` — the parser's own cap, derived from
+/// the same constant — and applies that cap to the *same* post-synthesis text
+/// the parser is then handed, so the parser's truncation branch cannot fire on
+/// anything that reaches this log. Nothing else writes to it. That is why the
+/// renderer and the overlay's signature carry no truncation branch either;
+/// loosening either half of the cap rule would have to put both back.
+///
+/// [`AgentEditLog::flatten`] would drop a per-file flag anyway — the
+/// aggregate stream has nowhere to say "one of these files was cut short" —
+/// which is only harmless because there is never one to drop.
+///
+/// [`AgentEditLog::flatten`]: crate::agent_edit_log::AgentEditLog::flatten
+pub(crate) fn focused_pane_diff(app: &AppState) -> Option<GitDiffText> {
+    let lines = app.focused_pane_agent_edit_lines(app.active?)?;
+    Some(GitDiffText {
+        lines,
+        truncated: false,
+    })
+}
+
 fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let active_workspace = app.active.and_then(|idx| app.workspaces.get(idx));
-
-    let Some(ws) = active_workspace else {
+    let Some(diff) = focused_pane_diff(app) else {
         render_message(frame, area, "no active space", app.palette.subtext0);
         return;
     };
 
-    if ws.git_space().is_none() {
-        render_message(frame, area, "not a git checkout", app.palette.subtext0);
-        return;
-    }
-
-    let Some(diff) = ws.git_diff() else {
-        render_message(frame, area, "loading diff…", app.palette.subtext0);
-        return;
-    };
-
     if diff.lines.is_empty() {
-        render_message(frame, area, "no changes", app.palette.subtext0);
+        render_message(frame, area, "no edits yet", app.palette.subtext0);
         return;
     }
 
     let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
-    render_diff_lines(app, frame, area, diff, scroll);
+    render_diff_lines(app, frame, area, &diff, scroll);
 }
 
 /// Clamps `requested` to how far the active diff can actually scroll for
@@ -91,12 +114,17 @@ fn render_diff_content(app: &AppState, frame: &mut Frame, area: Rect) {
 /// the per-frame render clamp (`compute_view_internal`) and the mouse wheel
 /// handler (`AppState::scroll_diff_pane`) call through this so the two can
 /// never disagree.
+///
+/// Counts through [`AppState::focused_pane_agent_edit_line_count`] rather
+/// than [`focused_pane_diff`]: this runs twice per drawn frame — once from
+/// [`render_diff_content`], once from [`diff_overlay_anchors`] — and the
+/// clamp needs a total, not the lines. Going through `focused_pane_diff`
+/// cloned the whole session's edit log on each of those calls to read
+/// `.len()` off it.
 pub(crate) fn normalized_diff_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
     let total = app
         .active
-        .and_then(|idx| app.workspaces.get(idx))
-        .and_then(|ws| ws.git_diff())
-        .map(|diff| diff.lines.len())
+        .and_then(|workspace_idx| app.focused_pane_agent_edit_line_count(workspace_idx))
         .unwrap_or(0);
     requested.min(total.saturating_sub(area.height as usize))
 }
@@ -139,14 +167,12 @@ pub(crate) fn diff_overlay_anchors(app: &AppState, outer: Rect) -> Option<DiffOv
     if area.width == 0 || area.height == 0 {
         return None;
     }
-    let ws = app.active.and_then(|idx| app.workspaces.get(idx))?;
-    ws.git_space()?;
-    let diff = ws.git_diff()?;
+    let diff = focused_pane_diff(app)?;
     if diff.lines.is_empty() {
         return None;
     }
     let scroll = normalized_diff_scroll(app, area, app.diff_pane_scroll);
-    let built = build_diff_rows(diff, scroll, area.height as usize);
+    let built = build_diff_rows(&diff, scroll, area.height as usize);
 
     let mut rail_rows = Vec::new();
     let mut file_rows = Vec::new();
@@ -418,13 +444,11 @@ fn render_diff_lines(
     }
 
     let shown = scroll + consumed;
-    let overflowed = shown < diff.lines.len() || diff.truncated;
-    if overflowed {
+    if shown < diff.lines.len() {
         lines.truncate(visible_rows.saturating_sub(1));
         let hidden = diff.lines.len().saturating_sub(shown);
-        let suffix = if diff.truncated { "+" } else { "" };
         lines.push(Line::from(Span::styled(
-            format!("… {hidden}{suffix} more lines"),
+            format!("… {hidden} more lines"),
             Style::default().fg(app.palette.subtext0),
         )));
     }
@@ -670,22 +694,26 @@ mod the_diff_rail_stands_only_between_files {
     /// at the exact rows the text renderer draws them at — driven through
     /// the real `AppState`, not a hand-rolled offset walk, so this fails if
     /// the overlay's positions and the drawn ones ever come from two
-    /// different derivations.
+    /// different derivations. It also pins the overlay to the *same* source
+    /// the text draws from: the focused pane's agent edit log.
     #[test]
     fn overlay_anchors_land_on_the_same_rows_the_text_renderer_draws() {
-        let mut ws = crate::workspace::Workspace::test_new("one");
-        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "repo-key".into(),
-            checkout_key: "/repo".into(),
-            repo_name: "repo".into(),
-            repo_root: "/repo".into(),
-            is_linked_worktree: false,
-        });
-        ws.cached_git_diff = Some(diff(&["a.rs", "b.rs"]));
+        let ws = crate::workspace::Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
 
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![ws];
         app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("ensure_test_terminals must have backfilled this terminal")
+            .agent_edit_log
+            .set_or_clear("both".into(), diff(&["a.rs", "b.rs"]));
 
         let outer = Rect::new(0, 0, 40, 20);
         let anchors = diff_overlay_anchors(&app, outer).expect("a diff to anchor against");
@@ -695,5 +723,180 @@ mod the_diff_rail_stands_only_between_files {
         assert_eq!(anchors.file_rows.len(), 2);
         assert_eq!(anchors.file_rows[0], ("a.rs".to_string(), outer.y + 1));
         assert_eq!(anchors.file_rows[1], ("b.rs".to_string(), outer.y + 1 + 5));
+    }
+}
+
+/// The Changes zone reads the *focused pane's* agent edit log, not the
+/// Space's `git diff` — so what it shows follows focus, and an untouched
+/// pane in a git checkout full of uncommitted work still shows nothing.
+#[cfg(test)]
+mod the_changes_zone_follows_the_focused_pane {
+    use super::*;
+    use crate::app::state::AppState;
+    use crate::workspace::Workspace;
+
+    fn sample(marker: &str) -> GitDiffText {
+        GitDiffText {
+            lines: vec![GitDiffLine {
+                kind: GitDiffLineKind::Added,
+                text: format!("+{marker}"),
+            }],
+            truncated: false,
+        }
+    }
+
+    /// Records `diff` against the pane `pane_id`'s attached terminal, the way
+    /// `pane.report_edit_diff` does server-side.
+    fn record_edit(
+        app: &mut AppState,
+        pane_id: crate::layout::PaneId,
+        path: &str,
+        diff: GitDiffText,
+    ) {
+        let terminal_id = app.workspaces[0]
+            .tabs
+            .iter()
+            .find_map(|tab| tab.panes.get(&pane_id))
+            .expect("pane must exist in some tab")
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("ensure_test_terminals must have backfilled this terminal")
+            .agent_edit_log
+            .set_or_clear(path.to_string(), diff);
+    }
+
+    #[test]
+    fn focused_pane_agent_edit_lines_reads_the_terminal_not_the_workspace() {
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        // Nothing reported yet: an empty log, not "no active space".
+        assert_eq!(app.focused_pane_agent_edit_lines(0), Some(Vec::new()));
+
+        record_edit(&mut app, pane_id, "a.rs", sample("hello"));
+
+        assert_eq!(
+            app.focused_pane_agent_edit_lines(0),
+            Some(sample("hello").lines)
+        );
+    }
+
+    /// A workspace index that names no workspace has no log to read — the
+    /// `None` the renderer turns into "no active space", distinct from the
+    /// `Some(vec![])` above.
+    #[test]
+    fn focused_pane_agent_edit_lines_is_none_for_an_unfocused_workspace_index() {
+        let ws = Workspace::test_new("one");
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        assert_eq!(app.focused_pane_agent_edit_lines(1), None);
+    }
+
+    /// Switching tabs switches which pane's edits the zone shows: each tab's
+    /// root pane has its own terminal, and so its own edit log.
+    #[test]
+    fn switching_the_active_tab_switches_which_panes_edits_show() {
+        let mut ws = Workspace::test_new("one");
+        let second_tab = ws.test_add_tab(Some("second"));
+        let first_pane = ws.tabs[0].root_pane;
+        let second_pane = ws.tabs[second_tab].root_pane;
+        assert_ne!(first_pane, second_pane);
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        record_edit(&mut app, first_pane, "first.rs", sample("first"));
+        record_edit(&mut app, second_pane, "second.rs", sample("second"));
+
+        assert_eq!(app.workspaces[0].active_tab_index(), 0);
+        assert_eq!(
+            app.focused_pane_agent_edit_lines(0),
+            Some(sample("first").lines)
+        );
+
+        app.workspaces[0].switch_tab(second_tab);
+
+        assert_eq!(
+            app.focused_pane_agent_edit_lines(0),
+            Some(sample("second").lines),
+            "the zone must follow focus, not stay on the tab it started on"
+        );
+    }
+
+    /// The scroll clamp reads the same source the content does, so the two
+    /// can never disagree about how far the pane can scroll.
+    #[test]
+    fn normalized_diff_scroll_clamps_against_the_agent_edit_log() {
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let long = GitDiffText {
+            lines: (0..10)
+                .map(|i| GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    text: format!("+line {i}"),
+                })
+                .collect(),
+            truncated: false,
+        };
+        record_edit(&mut app, pane_id, "a.rs", long);
+
+        let area = Rect::new(0, 0, 40, 4);
+        // 10 lines in a 4-row area scroll at most 6 lines down.
+        assert_eq!(normalized_diff_scroll(&app, area, 99), 6);
+        assert_eq!(normalized_diff_scroll(&app, area, 2), 2);
+    }
+
+    /// The clamp counts through `focused_pane_agent_edit_line_count` so a
+    /// frame never clones the whole log to read a length off it. That is only
+    /// safe while the count answers exactly what the flattening accessor
+    /// would — including which cases are `None` — across several files, which
+    /// is where a hand-rolled sum would be free to drift.
+    #[test]
+    fn the_count_only_accessor_agrees_with_the_flattening_one() {
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+
+        let count = |app: &AppState| app.focused_pane_agent_edit_line_count(0);
+        let flattened_count = |app: &AppState| {
+            app.focused_pane_agent_edit_lines(0)
+                .map(|lines| lines.len())
+        };
+
+        assert_eq!(count(&app), Some(0));
+        assert_eq!(count(&app), flattened_count(&app));
+
+        record_edit(&mut app, pane_id, "a.rs", sample("first"));
+        record_edit(&mut app, pane_id, "b.rs", sample("second"));
+
+        assert_eq!(count(&app), flattened_count(&app));
+        assert_eq!(count(&app), Some(sample("first").lines.len() * 2));
+
+        // The `None` cases have to line up too, or the clamp would fall back
+        // to 0 for a pane whose content still draws.
+        assert_eq!(app.focused_pane_agent_edit_line_count(1), None);
+        assert_eq!(app.focused_pane_agent_edit_lines(1), None);
     }
 }

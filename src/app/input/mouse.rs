@@ -2640,30 +2640,38 @@ mod tests {
     /// `crate::ui::diff_pane::normalized_diff_scroll`.
     #[test]
     fn wheel_over_the_diff_zone_scrolls_it_without_touching_workspace_or_pane_scroll() {
-        use crate::workspace::{GitDiffLine, GitDiffLineKind, GitDiffText, GitSpaceMetadata};
+        use crate::workspace::{GitDiffLine, GitDiffLineKind, GitDiffText};
 
         let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("one");
-        ws.cached_git_space = Some(GitSpaceMetadata {
-            key: "repo-key".into(),
-            checkout_key: "/repo".into(),
-            repo_name: "repo".into(),
-            repo_root: "/repo".into(),
-            is_linked_worktree: false,
-        });
-        ws.cached_git_diff = Some(GitDiffText {
-            lines: (0..40)
-                .map(|i| GitDiffLine {
-                    kind: GitDiffLineKind::Context,
-                    text: format!("line {i}"),
-                })
-                .collect(),
-            truncated: false,
-        });
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
         app.state.workspaces = vec![ws];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
+        app.state.ensure_test_terminals();
+        // The zone's content is the focused pane's agent edit log, so that is
+        // what has to be long enough to scroll.
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("ensure_test_terminals must have backfilled this terminal")
+            .agent_edit_log
+            .set_or_clear(
+                "file.txt".into(),
+                GitDiffText {
+                    lines: (0..40)
+                        .map(|i| GitDiffLine {
+                            kind: GitDiffLineKind::Context,
+                            text: format!("line {i}"),
+                        })
+                        .collect(),
+                    truncated: false,
+                },
+            );
         // main_area.width = 200 - 26 (default sidebar) = 174 >= 150.
         app.state.diff_zone_width_threshold = 150;
 

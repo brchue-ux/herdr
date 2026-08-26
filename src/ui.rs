@@ -1508,17 +1508,33 @@ mod tests {
         );
     }
 
-    fn diff_pane_test_workspace(diff: Option<crate::workspace::GitDiffText>) -> Workspace {
-        let mut ws = Workspace::test_new("one");
-        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: "repo-key".into(),
-            checkout_key: "/repo".into(),
-            repo_name: "repo".into(),
-            repo_root: "/repo".into(),
-            is_linked_worktree: false,
-        });
-        ws.cached_git_diff = diff;
-        ws
+    /// An app whose focused pane has reported `diff` as its agent edits —
+    /// the Changes zone's source (`AppState::focused_pane_agent_edit_lines`),
+    /// which is a pane's edit log rather than the Space's `git diff`.
+    fn diff_pane_test_app(
+        diff: Option<crate::workspace::GitDiffText>,
+    ) -> crate::app::state::AppState {
+        let ws = Workspace::test_new("one");
+        let pane_id = ws.tabs[0].root_pane;
+
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ensure_test_terminals();
+
+        if let Some(diff) = diff {
+            let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            app.terminals
+                .get_mut(&terminal_id)
+                .expect("ensure_test_terminals must have backfilled this terminal")
+                .agent_edit_log
+                .set_or_clear("file.txt".into(), diff);
+        }
+        app
     }
 
     fn sample_diff() -> crate::workspace::GitDiffText {
@@ -1551,11 +1567,7 @@ mod tests {
     #[test]
     fn sidebar_pixels_are_byte_identical_whether_the_diff_zone_shows_or_folds() {
         let render_sidebar = |diff_zone_width_threshold: u16| -> Vec<String> {
-            let mut app = crate::app::state::AppState::test_new();
-            app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
-            app.active = Some(0);
-            app.selected = 0;
-            app.mode = Mode::Terminal;
+            let mut app = diff_pane_test_app(Some(sample_diff()));
             app.diff_zone_width_threshold = diff_zone_width_threshold;
 
             compute_view(&mut app, Rect::new(0, 0, 200, 20));
@@ -1581,11 +1593,7 @@ mod tests {
 
     #[test]
     fn diff_zone_renders_added_and_removed_lines_in_green_and_red() {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
+        let mut app = diff_pane_test_app(Some(sample_diff()));
         app.diff_zone_width_threshold = 150;
 
         compute_view(&mut app, Rect::new(0, 0, 200, 20));
@@ -1646,11 +1654,7 @@ mod tests {
                 .collect(),
             truncated: false,
         };
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![diff_pane_test_workspace(Some(long_diff))];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
+        let mut app = diff_pane_test_app(Some(long_diff));
         app.diff_zone_width_threshold = 150;
 
         let render_diff_text = |app: &crate::app::state::AppState| -> String {
@@ -1690,11 +1694,7 @@ mod tests {
 
     #[test]
     fn folded_diff_pane_is_reachable_via_the_popup_overlay_toggle() {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![diff_pane_test_workspace(Some(sample_diff()))];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
+        let mut app = diff_pane_test_app(Some(sample_diff()));
 
         // Default threshold (300) folds at this frame size.
         compute_view(&mut app, Rect::new(0, 0, 80, 20));

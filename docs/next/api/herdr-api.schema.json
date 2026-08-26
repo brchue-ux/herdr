@@ -3139,6 +3139,35 @@
           ],
           "type": "object"
         },
+        "PaneReportEditDiffParams": {
+          "description": "Params for `pane.report_edit_diff`.\n\nReports one file's cumulative unified diff against that file's\nsession-start content for the named pane's agent-edit log — the Changes\nzone's data source when that pane is focused. Each call **replaces**\n(never appends to) that file's prior entry: callers are expected to\nrecompute the diff against the same fixed baseline every time, not to\ndiff against the last report. An empty or absent `diff` (when\n`clear_all` is false) clears that one file's entry.",
+          "properties": {
+            "clear_all": {
+              "default": false,
+              "description": "When true, ignore `file`/`diff` and clear this pane's entire edit\nlog instead — used on agent session start.",
+              "type": "boolean"
+            },
+            "diff": {
+              "description": "Unified diff text (e.g. `diff -u` output). `None` or empty clears\nthis file's entry.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "description": "The edited file's path, exactly as the caller wants it displayed.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "file"
+          ],
+          "type": "object"
+        },
         "PaneReportMetadataParams": {
           "properties": {
             "agent": {
@@ -6064,6 +6093,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneReportMetadataParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.report_edit_diff",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportEditDiffParams"
             }
           },
           "required": [

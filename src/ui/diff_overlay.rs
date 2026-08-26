@@ -105,6 +105,11 @@ fn file_paths(diff: &GitDiffText) -> Vec<String> {
 
 /// A cheap signature of a diff's actual content, so a re-fetch that came back
 /// byte-identical is not mistaken for a change.
+///
+/// The lines are the whole of the content: `GitDiffText::truncated` is always
+/// false for everything that reaches this zone — see
+/// [`crate::ui::diff_pane::focused_pane_diff`] — so hashing it could only ever
+/// mix a constant into every signature.
 fn diff_signature(diff: &GitDiffText) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -112,7 +117,6 @@ fn diff_signature(diff: &GitDiffText) -> u64 {
         (line.kind as u8).hash(&mut hasher);
         line.text.hash(&mut hasher);
     }
-    diff.truncated.hash(&mut hasher);
     hasher.finish()
 }
 

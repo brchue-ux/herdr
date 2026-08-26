@@ -7,6 +7,7 @@ mod status;
 pub(super) mod test_support;
 
 pub(crate) use self::discovery::automatic_workspace_label;
+pub(crate) use self::status::{parse_unified_diff_lines, GIT_DIFF_MAX_LINES};
 
 pub use self::{
     discovery::{

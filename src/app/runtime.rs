@@ -1326,14 +1326,21 @@ impl App {
     pub(crate) fn observe_diff_overlay(&mut self, now: Instant) -> bool {
         let showing = self.state.view.layout == crate::app::state::ViewLayout::Desktop
             && !self.state.view.diff_area.is_empty();
-        let ws = self
+        // The same content the zone's text draws
+        // (`crate::ui::diff_pane::focused_pane_diff`) — the focused pane's
+        // agent edit log, not the Space's `git diff` — so the traveling rail
+        // light and the arriving-file pop-in decorate the rows that are
+        // actually on screen. The identity key stays the Space: a tab switch
+        // inside one Space changes which pane's edits show, and reads here as
+        // a content change (the newly shown files pop in), which is what a
+        // viewer sees happen.
+        let workspace_id = self
             .state
             .active
-            .and_then(|idx| self.state.workspaces.get(idx));
-        let (workspace_id, diff) = match ws {
-            Some(ws) if showing && ws.git_space().is_some() => {
-                (ws.id.clone(), ws.git_diff().cloned())
-            }
+            .and_then(|idx| self.state.workspaces.get(idx))
+            .map(|ws| ws.id.clone());
+        let (workspace_id, diff) = match workspace_id {
+            Some(id) if showing => (id, crate::ui::diff_pane::focused_pane_diff(&self.state)),
             _ => (String::new(), None),
         };
         let animating = crate::ui::diff_overlay::observe(

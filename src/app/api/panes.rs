@@ -10,16 +10,17 @@ use crate::api::schema::{
     PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneReportEditDiffParams, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams,
+    PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
 #[cfg(test)]
 use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
+use crate::workspace::GitDiffText;
 
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
@@ -28,6 +29,20 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+/// Ceiling on one `pane.report_edit_diff` payload, in lines: anything past
+/// the parser's own cap could not be shown anyway, so it is rejected at the
+/// door rather than silently truncated into a diff the caller thinks was
+/// stored whole.
+///
+/// *Derived from* `GIT_DIFF_MAX_LINES` rather than restated as `4000`, and
+/// checked against the same post-synthesis text the parser is handed (see
+/// [`App::handle_pane_report_edit_diff`]). Those two together are what make
+/// `crate::workspace::GitDiffText::truncated` unreachable on this path —
+/// `crate::ui::diff_pane::focused_pane_diff` states the resulting invariant,
+/// and neither half may be loosened without putting a truncation branch back
+/// in the renderer.
+const MAX_EDIT_DIFF_LINES_PER_REQUEST: usize = crate::workspace::GIT_DIFF_MAX_LINES;
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1582,6 +1597,101 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Records one file's cumulative agent-edit diff on the pane's terminal,
+    /// replacing whatever that file last reported. See
+    /// [`PaneReportEditDiffParams`] for the replace-not-append contract.
+    pub(super) fn handle_pane_report_edit_diff(
+        &mut self,
+        id: String,
+        params: PaneReportEditDiffParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        if params.clear_all {
+            terminal.agent_edit_log.clear();
+            return encode_success(id, ResponseResult::Ok {});
+        }
+
+        // Normalized like every other caller-supplied string on this API
+        // (`normalize_presentation_text`, `normalize_metadata_tokens`): a raw
+        // `file` is interpolated into the synthetic header line below, so a
+        // newline or other control character in it would splice extra lines
+        // into the parsed diff rather than name one file.
+        let Some(file) = normalize_edit_diff_file(params.file) else {
+            return encode_error(id, "invalid_edit_diff_file", "file must not be empty");
+        };
+
+        let diff_text = params.diff.unwrap_or_default();
+
+        // The renderer starts a file's card — and the rail between two files —
+        // off a literal `diff --git a/x b/x` line
+        // (`crate::ui::diff_pane::build_diff_rows`), which is stricter than
+        // `classify_diff_line`'s `FileHeader` tagging. GNU `diff -u` output,
+        // which is what the capture hooks send, carries `---`/`+++` and never
+        // that line, so without this a multi-file log would render as
+        // unlabelled runs of hunks with no divider. Synthesized from the file
+        // the request already names rather than asked of the hooks, so every
+        // caller gets it. Skipped for an empty diff: that is the
+        // clear-this-file path, and a header-only entry would never clear.
+        if diff_text.is_empty() {
+            terminal.agent_edit_log.set_or_clear(
+                file,
+                GitDiffText {
+                    lines: Vec::new(),
+                    truncated: false,
+                },
+            );
+            return encode_success(id, ResponseResult::Ok {});
+        }
+
+        let synthesized = format!("diff --git a/{file} b/{file}\n{diff_text}");
+
+        // Counted on the synthesized text, not on `diff_text` alone: the
+        // header line is one of the lines the parser will keep, so a body of
+        // exactly `MAX_EDIT_DIFF_LINES_PER_REQUEST` lines checked before
+        // synthesis passed here and then lost its last line to the parser's
+        // own cap — silently, under a doc promise that an over-long report is
+        // rejected whole rather than stored short.
+        let line_count = synthesized.lines().count();
+        if line_count > MAX_EDIT_DIFF_LINES_PER_REQUEST {
+            return encode_error(
+                id,
+                "invalid_edit_diff_too_large",
+                format!(
+                    "diff exceeds {MAX_EDIT_DIFF_LINES_PER_REQUEST} lines ({line_count} given, \
+                     including the synthesized header line)"
+                ),
+            );
+        }
+
+        let (lines, truncated) = crate::workspace::parse_unified_diff_lines(&synthesized);
+        debug_assert!(
+            !truncated,
+            "the request cap is GIT_DIFF_MAX_LINES and is checked on this exact text, so the \
+             parser cannot have cut it short",
+        );
+        terminal
+            .agent_edit_log
+            .set_or_clear(file, GitDiffText { lines, truncated });
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_clear_agent_authority(
         &mut self,
         id: String,
@@ -1819,6 +1929,35 @@ fn normalize_presentation_text(value: Option<String>) -> Option<String> {
         .take(80)
         .collect();
     (!normalized.trim().is_empty()).then(|| normalized.trim().to_string())
+}
+
+/// Ceiling on a reported edited-file path, in characters. Set to the same
+/// 4096 `crate::agent_resume` allows an agent session path rather than to
+/// [`normalize_presentation_text`]'s 80 — this is a real path, not a label,
+/// and 80 characters would cut most of them off mid-directory.
+const MAX_EDIT_DIFF_FILE_CHARS: usize = 4096;
+
+/// `pane.report_edit_diff`'s `file`, cleaned the same way every other
+/// caller-supplied string on this API is: trimmed, stripped of control
+/// characters, and bounded.
+///
+/// `None` when nothing is left, which is the `invalid_edit_diff_file` case.
+///
+/// The control-character strip is the load-bearing one. `file` is
+/// interpolated into a synthetic `diff --git a/{file} b/{file}` line, so a
+/// newline inside it would end that line early and splice the remainder into
+/// the parsed diff as content — one report describing itself as two files, or
+/// as a file plus a hunk. The path is still not resolved or checked against
+/// the pane's cwd; it is display text, and only has to stay one line of it.
+fn normalize_edit_diff_file(value: String) -> Option<String> {
+    let normalized: String = value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_EDIT_DIFF_FILE_CHARS)
+        .collect();
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
 fn normalize_state_labels(
@@ -4441,6 +4580,249 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // pane.report_edit_diff
+    // -----------------------------------------------------------------
+
+    fn edit_diff_params(pane_id: String) -> PaneReportEditDiffParams {
+        PaneReportEditDiffParams {
+            pane_id,
+            file: "src/foo.rs".into(),
+            diff: Some("--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -0,0 +1 @@\n+fn main() {}\n".into()),
+            clear_all: false,
+        }
+    }
+
+    /// The pane's agent-edit log, reached the way production does: pane id ->
+    /// attached terminal -> that terminal's log.
+    fn agent_edit_log<'a>(app: &'a App, pane_id: &str) -> &'a crate::agent_edit_log::AgentEditLog {
+        let (ws_idx, resolved_pane_id) = app.parse_pane_id(pane_id).unwrap();
+        let terminal_id = app.state.workspaces[ws_idx]
+            .pane_state(resolved_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        &app.state
+            .terminals
+            .get(&terminal_id)
+            .unwrap()
+            .agent_edit_log
+    }
+
+    #[test]
+    fn pane_report_edit_diff_stores_the_file_entry() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let params = edit_diff_params(pane_id.clone());
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert!(!agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    #[test]
+    fn pane_report_edit_diff_replaces_not_appends_same_file() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut second = edit_diff_params(pane_id.clone());
+        second.diff =
+            Some("--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -0,0 +1 @@\n+fn other() {}\n".into());
+        app.handle_pane_report_edit_diff("req2".into(), second);
+
+        let joined = agent_edit_log(&app, &pane_id)
+            .flatten()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("+fn other() {}"), "joined: {joined}");
+        assert!(!joined.contains("+fn main() {}"), "joined: {joined}");
+    }
+
+    #[test]
+    fn pane_report_edit_diff_with_empty_diff_clears_the_file() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut clearing = edit_diff_params(pane_id.clone());
+        clearing.diff = Some(String::new());
+        app.handle_pane_report_edit_diff("req2".into(), clearing);
+
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    #[test]
+    fn pane_report_edit_diff_clear_all_empties_the_whole_log() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.handle_pane_report_edit_diff("req1".into(), edit_diff_params(pane_id.clone()));
+
+        let mut clear_all = edit_diff_params(pane_id.clone());
+        clear_all.clear_all = true;
+        clear_all.diff = None;
+        app.handle_pane_report_edit_diff("req2".into(), clear_all);
+
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    /// Hook-fed diffs are GNU `diff -u` output with no `diff --git` line, and
+    /// the Changes zone starts a file's card — and the rail between two files
+    /// — off exactly that line. This drives two files through the real
+    /// handler and then asks the renderer's own row walk
+    /// (`diff_overlay_anchors`, which shares `build_diff_rows` with the drawn
+    /// text) what boundaries it found, rather than hand-writing a header into
+    /// a fixture the production path would never produce.
+    #[test]
+    fn reported_non_git_diffs_still_render_one_card_per_file_and_a_rail_between() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        app.state.active = Some(0);
+
+        for path in ["/tmp/a.rs", "/tmp/b.rs"] {
+            let mut params = edit_diff_params(pane_id.clone());
+            params.file = path.into();
+            // `diff -u --label` output: `---`/`+++`, never `diff --git`.
+            params.diff = Some(format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"));
+            let response = app.handle_pane_report_edit_diff("req".into(), params);
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        }
+
+        let anchors = crate::ui::diff_pane::diff_overlay_anchors(
+            &app.state,
+            ratatui::layout::Rect::new(0, 0, 40, 20),
+        )
+        .expect("two reported files must render as diff content");
+
+        assert_eq!(
+            anchors
+                .file_rows
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/a.rs".to_string(), "/tmp/b.rs".to_string()],
+            "each reported file must get its own header card"
+        );
+        assert_eq!(
+            anchors.rail_rows.len(),
+            1,
+            "two files have exactly one boundary to stand a rail on"
+        );
+    }
+
+    #[test]
+    fn pane_report_edit_diff_rejects_unknown_pane() {
+        let (mut app, _pane_id) = app_with_test_workspace();
+        let params = edit_diff_params("h-does-not-exist".into());
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_report_edit_diff_rejects_oversized_diff() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.diff = Some("+x\n".repeat(MAX_EDIT_DIFF_LINES_PER_REQUEST + 1));
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_edit_diff_too_large");
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    /// The cap counts the synthesized `diff --git` line, because the parser
+    /// does. A body one line short of the cap therefore fills it exactly, and
+    /// every one of its lines has to survive.
+    #[test]
+    fn a_body_that_fills_the_cap_with_its_synthesized_header_is_stored_whole() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.diff = Some("+x\n".repeat(MAX_EDIT_DIFF_LINES_PER_REQUEST - 1));
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let stored = agent_edit_log(&app, &pane_id).flatten();
+        assert_eq!(
+            stored.len(),
+            MAX_EDIT_DIFF_LINES_PER_REQUEST,
+            "header plus every body line, nothing dropped"
+        );
+        assert_eq!(stored.last().unwrap().text, "+x");
+    }
+
+    /// The off-by-one this cap check moved to close: a body of exactly the cap
+    /// passed the old pre-synthesis check, then lost its last line to the
+    /// parser's own identical cap once the header was prepended — silently,
+    /// under a documented promise that an over-long report is rejected whole
+    /// rather than stored short.
+    #[test]
+    fn a_body_the_synthesized_header_pushes_over_the_cap_is_rejected_not_trimmed() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.diff = Some("+x\n".repeat(MAX_EDIT_DIFF_LINES_PER_REQUEST));
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_edit_diff_too_large");
+        assert!(
+            error
+                .error
+                .message
+                .contains(&(MAX_EDIT_DIFF_LINES_PER_REQUEST + 1).to_string()),
+            "the count reported is the one that was checked: {}",
+            error.error.message
+        );
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
+    }
+
+    /// `file` is interpolated into the synthesized `diff --git a/x b/x` line,
+    /// so an unnormalized newline inside it would end that line early and
+    /// splice its tail into the parsed diff as content.
+    #[test]
+    fn a_newline_in_file_does_not_splice_extra_lines_into_the_stored_diff() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.file = "src/foo.rs\n+spliced\n@@ -1 +1 @@".into();
+        params.diff = Some("@@ -1 +1 @@\n-old\n+new\n".into());
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let stored = agent_edit_log(&app, &pane_id).flatten();
+        assert_eq!(
+            stored.len(),
+            4,
+            "one header line plus the diff's own three: {stored:?}"
+        );
+        assert!(
+            stored[0].text.starts_with("diff --git "),
+            "the header is still one whole line: {:?}",
+            stored[0].text
+        );
+        assert!(
+            !stored.iter().any(|line| line.text == "+spliced"),
+            "the newline's tail must not become a diff line: {stored:?}"
+        );
+    }
+
+    #[test]
+    fn pane_report_edit_diff_rejects_a_file_that_normalizes_to_nothing() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let mut params = edit_diff_params(pane_id.clone());
+        params.file = " \n\t ".into();
+
+        let response = app.handle_pane_report_edit_diff("req".into(), params);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_edit_diff_file");
+        assert!(agent_edit_log(&app, &pane_id).is_empty());
     }
 
     // -----------------------------------------------------------------
