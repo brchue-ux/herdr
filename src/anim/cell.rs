@@ -232,6 +232,20 @@ impl LifecycleStage {
     /// states"*, `green` *"Done / idle states"*, `red` *"Needs attention"*,
     /// `peach` *"Interrupted / warning states"*. `Queued` takes `teal`, the
     /// coolest chromatic role, because a queue is the absence of demand.
+    ///
+    /// The comment above does not match the code for `Waiting`, and it cannot:
+    /// it takes `mauve` (documented *"Branch name / special label color"*) while
+    /// `peach`, the one role documented as a warning, is claimed by no stage.
+    /// Moving `Waiting` onto `peach` was tried on 2026-08-27 and reverted the
+    /// same hour — `peach` resolves to ~23° and `Running`'s `yellow` to ~41°,
+    /// which is **18.4° apart** and fails
+    /// [`tests::the_stage_hues_are_separated_under_every_shipped_theme`]'s 40°
+    /// floor. Solving that floor against the four fixed stages leaves exactly
+    /// one legal band for `Waiting`, 210°–303°, and mauve sits in the middle of
+    /// it. Amber is adjacent to running-yellow by construction, so "waiting is
+    /// amber" and "five stage hues survive the card's gradient" cannot both
+    /// hold in this vocabulary. Anything wanting an amber *needs-an-answer*
+    /// signal has to live outside the stage-hue channel, not inside it.
     pub(crate) fn role(self, p: &crate::app::state::Palette) -> ratatui::style::Color {
         match self {
             Self::Queued => p.teal,

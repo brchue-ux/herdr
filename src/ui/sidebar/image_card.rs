@@ -1128,6 +1128,43 @@ impl CardContent {
     /// over, the severity decides how far off the panel it is placed, and
     /// neither is consulted about the other's number.
     fn light_of(&self, stage: LifecycleStage) -> CardLight {
+        // 2026-08-27, captain's direction: a card whose agent needs an answer
+        // to proceed washes amber, and it does so in **both** channel modes.
+        //
+        // `Waiting` is the one stage that is not a report on the work — it is a
+        // request aimed at a person, and it stays true until that person acts.
+        // With `stage_hue = false` (the default, and the captain's setting) the
+        // arm below hands every non-accented card `theme.edge()`: one flat
+        // colour that says nothing about state, by design. That is why a mate
+        // stopped on a decision looked identical to one working — the card drew
+        // correctly and had no state colour to draw.
+        //
+        // Deliberately OUTSIDE the five-hue stage vocabulary, not a sixth entry
+        // in it. `LifecycleStage::role` cannot carry this: stage hues must sit
+        // >40° apart to survive the card's own gradient
+        // (`the_stage_hues_are_separated_under_every_shipped_theme`), amber is
+        // adjacent to `Running`'s yellow by construction, and solving that floor
+        // leaves `Waiting` exactly one legal band — 210°–303°, where mauve
+        // already sits. Both cannot hold, so this signal lives here instead and
+        // the stage table is left alone.
+        //
+        // The colour is the card theme's own `warn` role (`--amber`, the same
+        // one `.badge.warn` draws), so it moves with a custom theme rather than
+        // being a literal. Severity still travels its own channel: the hue goes
+        // through the same `signal_ink` path every other card uses, so "needs an
+        // answer" and "how bad it is" stay independent. `split_channels` is
+        // forced true for this one call so the hue is actually honoured — that
+        // argument selects the path, and this card has a hue to say.
+        if stage == LifecycleStage::Waiting {
+            return CardLight::of(
+                self.severity,
+                crate::ui::color::to_hsl(self.theme.badge_warn().as_tuple()).0,
+                self.ground,
+                true,
+                self.accented(),
+                self.theme,
+            );
+        }
         CardLight::of(
             self.severity,
             self.hues.of(stage),
@@ -3764,16 +3801,52 @@ fn draw_text(
     });
 }
 
-/// What this card's tidbit line says: `project · N% ctx · Ns`.
+/// The owning mate's moniker as a card says it: `2ndmate-herdr` reads `herdr`.
+///
+/// The fleet's own id for a mate carries a `2ndmate-` prefix that is on every
+/// worker without exception, so it separates nothing and costs eight columns on
+/// a line that already holds two other facts. Carrying the whole 15-char id is
+/// what got the owner dropped from these rows on 2026-07-28 in the first place;
+/// the moniker is the part that was ever worth reading. `firstmate` has no
+/// prefix and is left whole.
+fn owner_moniker(owner: &str) -> &str {
+    owner.strip_prefix("2ndmate-").unwrap_or(owner)
+}
+
+/// What this card's tidbit line says: `owner · N% ctx · Ns`, or `project · …`
+/// on a card with no owner published.
 ///
 /// D-MID, the density the captain picked: one dim line carrying the facts the
 /// title does not, at 72% of the title's size and 52% of its ink so the eye
 /// still lands on the title and reads this as caption. Every part is dropped
 /// when the fleet did not publish it, so a pane with no tokens gets no line
 /// rather than a line of placeholders.
+///
+/// The lead is the owner because a worker is now folded into its mate's card
+/// and is still read on its own: the title is the task, the third line is the
+/// state, and before this nothing on the card named the mate — the fleet had to
+/// open a tab to find out whose worker it was looking at. Only a worker
+/// resolves an owner at all, so leading with it names the mate exactly where
+/// the ambiguity is and changes no mate's own card. It takes `project`'s slot
+/// rather than adding a fourth part: for a worker the two usually say nearly
+/// the same thing, and only one of them survives a narrow card.
+///
+/// Read off [`AgentPanelEntry::owner`] rather than the `owner` *token* under
+/// it. That field is [`super::resolve_entry_owner`], which falls back to the
+/// `created_by` record Herdr writes itself when no token is published — and a
+/// published token expires. The fleet stamps `owner` at spawn time with no TTL,
+/// but Herdr caps metadata at 24h regardless, so a worker alive longer than a
+/// day would otherwise go back to showing its project and lose the one fact
+/// this line exists to carry. The native record has no clock on it.
 fn tidbit_line(entry: &AgentPanelEntry, state_age: Option<std::time::Duration>) -> Option<String> {
+    let owner = entry
+        .owner
+        .as_deref()
+        .map(owner_moniker)
+        .filter(|moniker| !moniker.is_empty())
+        .map(str::to_string);
     tidbit_parts(
-        entry.tokens.get("project"),
+        owner.as_ref().or_else(|| entry.tokens.get("project")),
         entry.tokens.get("context"),
         state_age,
     )
@@ -4019,25 +4092,43 @@ fn content_for(
             let breath = breath(app, &row, state, severity);
             Some(CardContent {
                 cut_above: false,
-                title: display_summary(tokens.get("doing").cloned().unwrap_or(label)),
-                // A Space is a mate, and a mate is a body in the sky: its two
-                // caption lines are that body's own registers, so the tree and
-                // the system in front of it finally read the same quantities.
-                // A Space the register cannot resolve — a roster mid-rebuild —
-                // keeps the caption it always had rather than losing its line.
-                tidbit: body
-                    .and_then(super::body_register::BodyFacts::body_line)
-                    .or_else(|| tidbit_parts(tokens.get("project"), tokens.get("context"), age)),
-                // A mate's third line is its orbit register — what its body has
-                // done. It carries no state word, and neither does the
-                // reference's mate pane: the card's own colour, its breath and
-                // its spider all say what state it is in.
-                register: body
-                    .and_then(super::body_register::BodyFacts::orbit_line)
-                    .map(|text| Caption {
-                        text,
-                        tone: CaptionTone::Register,
-                    }),
+                title: display_summary(
+                    tokens
+                        .get("doing")
+                        .cloned()
+                        .unwrap_or_else(|| label.clone()),
+                ),
+                // 2026-08-26, captain's direction: a mate's card no longer
+                // draws the body and orbit registers. They read the fleet as a
+                // sky — `gas giant · 99 files · 2 moons`, `streak 5 · T 13.4s ·
+                // 23 revs` — and the sky is off (`persistent_background =
+                // false`), so the vocabulary had nothing behind it to be read
+                // against: a card that calls a mate a gas giant beside no gas
+                // giant is asking the reader to hold a metaphor with no
+                // referent on screen.
+                //
+                // Line two is the Space's own label — the one fact that says
+                // *which mate this is*, and the one the card was not drawing.
+                //
+                // `title` is the mate's published `doing`, so the label it
+                // falls back on is discarded on every mate that publishes one,
+                // which is all of them. The configured `[ui.sidebar.spaces]`
+                // rows do ask for `workspace`, but the configured rows are the
+                // character path: once the card draws, `content_for` is the
+                // whole content and that request is silently dropped. So the
+                // panel had a name for every mate and put it nowhere.
+                //
+                // It takes the slot rather than `project` for the reason the
+                // worker line leads with its owner: `project` is `bchue` for
+                // most of this fleet, identical down the panel, and a caption
+                // that reads the same on six cards distinguishes nothing.
+                //
+                // Neither register is deleted. Both stay live as the
+                // `body_register` and `orbit_register` Space row tokens, so a
+                // fleet running the background scene can configure them back
+                // onto the rows; this is the *card* declining to draw them.
+                tidbit: tidbit_parts(Some(&label), tokens.get("context"), age),
+                register: None,
                 state_label: crate::ui::status::state_label(state, seen).to_string(),
                 state,
                 stage,
@@ -8806,6 +8897,143 @@ mod tests {
         );
     }
 
+    /// A worker folded into its mate's card is still read on its own, so its
+    /// line leads with the mate that owns it — and a mate, which publishes no
+    /// `owner`, keeps the project it always showed.
+    #[test]
+    fn a_workers_tidbit_leads_with_the_mate_that_owns_it() {
+        let mut entry = AgentPanelEntry::test_new("worker");
+        entry.tokens.insert(
+            "project".to_string(),
+            "app_onboarding_pattern_v1".to_string(),
+        );
+        entry.tokens.insert("context".to_string(), "6%".to_string());
+
+        // No owner resolved — this is a mate's own card, and it is untouched.
+        assert_eq!(
+            tidbit_line(&entry, None).as_deref(),
+            Some("app_onboarding_pattern_v1  ·  6% ctx"),
+            "a card with no owner lost its project"
+        );
+
+        // A worker: the owner takes the project's slot, prefix stripped.
+        entry.owner = Some("2ndmate-onboarding".to_string());
+        assert_eq!(
+            tidbit_line(&entry, None).as_deref(),
+            Some("onboarding  ·  6% ctx"),
+            "the worker's line does not name its mate"
+        );
+
+        // ...and it got there without an `owner` token anywhere in sight. This
+        // is the durable half: `AgentPanelEntry::owner` also carries Herdr's
+        // own `created_by` fallback, so a worker whose published token has aged
+        // out past the 24h metadata cap still names its mate.
+        assert!(
+            !entry.tokens.contains_key("owner"),
+            "the line is reading a published token after all, and will go blank \
+             when that token expires"
+        );
+
+        // `firstmate` carries no `2ndmate-` prefix and is left whole.
+        entry.owner = Some("firstmate".to_string());
+        assert_eq!(
+            tidbit_line(&entry, None).as_deref(),
+            Some("firstmate  ·  6% ctx")
+        );
+
+        // An owner that resolves to an empty string is not a fact; the line
+        // falls back to the project rather than opening with a stray separator.
+        entry.owner = Some(String::new());
+        assert_eq!(
+            tidbit_line(&entry, None).as_deref(),
+            Some("app_onboarding_pattern_v1  ·  6% ctx")
+        );
+    }
+
+    /// A mate's card says which mate it is.
+    ///
+    /// The Space label is the only fact on the card that does, and it was drawn
+    /// nowhere: `title` falls back to the label only when no `doing` is
+    /// published, and every mate in this fleet publishes one. The test asserts
+    /// the title is *not* the label first, so the caption assertion cannot be
+    /// satisfied by the title having happened to carry it.
+    #[test]
+    fn a_mates_card_names_the_mate() {
+        let mut app = fleet_app();
+        // Every mate in the real fleet publishes a Space-level `doing`, and
+        // that is precisely what displaces the label out of the title. A
+        // fixture without one would fall back to the label and prove nothing.
+        app.workspaces[0].metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                "doing".to_string(),
+                Some("Compare new prototype with previous version".to_string()),
+            )]),
+            None,
+            app.state_age_now,
+        );
+        let bodies = crate::ui::sidebar::body_register::BodyRegister::resolve(&app);
+        let entries = crate::ui::workspace_list_entries_whole_fleet(&app);
+        let space = entries
+            .iter()
+            .find(|entry| matches!(entry, crate::ui::WorkspaceListEntry::Workspace { .. }))
+            .expect("the fleet has a Space");
+        let content = content_for(&app, space, &[], &bodies).expect("a Space draws a card");
+
+        assert_ne!(
+            content.title, "fleet",
+            "the fixture's title is already the label, so the caption below \
+             proves nothing"
+        );
+        let tidbit = content.tidbit.expect("a mate's card draws a caption");
+        assert!(
+            tidbit.starts_with("fleet"),
+            "a mate's card does not name its mate: {tidbit:?}"
+        );
+    }
+
+    /// A mate's card does not call it a gas giant and does not count its moons.
+    ///
+    /// The registers still *resolve* — this asserts that first, so the test
+    /// cannot pass merely because the fixture had nothing to draw. What changed
+    /// is that the card declines to draw them: the sky they were readings of is
+    /// off, and a metaphor with no referent on screen is not a caption.
+    #[test]
+    fn a_mates_card_draws_neither_sky_register() {
+        let app = fleet_app();
+        let bodies = crate::ui::sidebar::body_register::BodyRegister::resolve(&app);
+        let row = crate::anim::CardRow::Space(app.workspaces[0].id.clone());
+        let facts = bodies
+            .get(&row)
+            .expect("the fixture's mate resolves to a body");
+        let sky = facts
+            .body_line()
+            .expect("the fixture's mate resolves a body line");
+        assert!(
+            sky.contains("moon"),
+            "the fixture would not have drawn a moon count anyway, so the \
+             tidbit assertion below proves nothing: {sky:?}"
+        );
+
+        let entries = crate::ui::workspace_list_entries_whole_fleet(&app);
+        let space = entries
+            .iter()
+            .find(|entry| matches!(entry, crate::ui::WorkspaceListEntry::Workspace { .. }))
+            .expect("the fleet has a Space");
+        let content = content_for(&app, space, &[], &bodies).expect("a Space draws a card");
+
+        let tidbit = content.tidbit.unwrap_or_default();
+        for sky in ["gas giant", "ringed planet", "moon", "rev"] {
+            assert!(
+                !tidbit.contains(sky),
+                "a mate's caption still reads as sky: {tidbit:?} contains {sky:?}"
+            );
+        }
+        assert!(
+            content.register.is_none(),
+            "a mate's card still draws an orbit register"
+        );
+    }
+
     /// The title is the fleet's own words, and the token behind it is never
     /// written back.
     ///
@@ -10884,8 +11112,18 @@ mod a_card_is_its_own_shape {
             return; // No face on this machine.
         };
         let ground = backdrop_rgb(&app);
+        // 2026-08-27, captain's direction: the family now has exactly one
+        // deliberate exception. A card whose agent needs an answer to proceed
+        // washes the card theme's `warn` amber, which is outside H1's band by
+        // construction — see `CardContent::light_of` for why that signal cannot
+        // live inside the stage-hue vocabulary. It is counted as in-family below
+        // rather than by lowering the floor: the floor's job is to catch a
+        // *stray* third hue drifting into the panel, and that job is unchanged.
+        const WARN_BAND_DEGREES: f32 = 20.0;
+        let warn_hue = crate::ui::color::to_hsl(CardTheme::UNTHEMED.badge_warn().as_tuple()).0;
         let mut chromatic = 0u64;
         let mut in_band = 0u64;
+        let mut needs_answer = 0u64;
         let mut alpha_sum = 0f64;
         let mut pixels = 0u64;
         for layer in &layers {
@@ -10915,15 +11153,29 @@ mod a_card_is_its_own_shape {
                 chromatic += 1;
                 if (measured::HUE_BAND.0..=measured::HUE_BAND.1).contains(&hue) {
                     in_band += 1;
+                } else {
+                    let gap = (hue - warn_hue).abs() % 360.0;
+                    if gap.min(360.0 - gap) <= WARN_BAND_DEGREES {
+                        needs_answer += 1;
+                    }
                 }
             }
         }
         assert!(chromatic > 0, "the tree drew no chromatic ink at all");
-        let band = in_band as f64 / chromatic as f64;
+        // The fixture has a blocked agent in it, so the amber has to be on
+        // screen. Asserted before the ratio below, which counts it as in-family:
+        // without this the ratio would also pass on a build where the wash
+        // silently stopped drawing, and that is the whole feature.
+        assert!(
+            needs_answer > 0,
+            "no card washed the needs-an-answer amber, though the fixture has a \
+             blocked agent"
+        );
+        let band = (in_band + needs_answer) as f64 / chromatic as f64;
         assert!(
             band >= 0.99,
-            "only {:.2}% of the tree's chromatic ink is inside H1's 175-265 band, \
-             against the reference's 99.94%",
+            "only {:.2}% of the tree's chromatic ink is inside H1's 175-265 band \
+             or the needs-an-answer amber, against the reference's 99.94%",
             band * 100.0
         );
 
