@@ -169,6 +169,9 @@ const DIFF_ZONE_PERCENT: u16 = 53;
 /// custom `diff_zone_width_threshold` can't shrink the zone to an unreadable
 /// sliver once it does show.
 const DIFF_ZONE_MIN_WIDTH: u16 = 40;
+/// Columns kept for the terminal beside the Changes zone when its bar is
+/// dragged. Enough to keep a command line readable rather than a token width.
+const DIFF_ZONE_MIN_CONTENT: u16 = 20;
 
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
@@ -408,6 +411,26 @@ fn update_sidebar_card_layers(
     !app.sidebar_card_layers.is_empty()
 }
 
+/// The narrowest and widest the Changes zone may be inside `main_width`.
+///
+/// One owner for both readers - the layout that draws the zone and the drag
+/// that writes its width - because a drag clamped against different numbers
+/// than the layout uses would let the pointer set a width the next frame
+/// silently overrides, which reads as the bar refusing to follow the cursor.
+///
+/// The upper bound reserves [`DIFF_ZONE_MIN_CONTENT`] columns for the terminal
+/// beside it. Without that the bar could be dragged until the terminal is a
+/// single column: the proportional default never goes near that edge, so the
+/// floor only ever binds during a drag. If the window is too narrow to honour
+/// both floors, the zone's own minimum wins and the bound collapses onto it,
+/// so the range can never invert.
+pub(crate) fn diff_zone_width_bounds(main_width: u16) -> (u16, u16) {
+    let max = main_width
+        .saturating_sub(DIFF_ZONE_MIN_CONTENT)
+        .max(DIFF_ZONE_MIN_WIDTH);
+    (DIFF_ZONE_MIN_WIDTH, max)
+}
+
 /// Splits `main_area` (the frame minus the sidebar) into the terminal zone's
 /// content area and the diff zone, or leaves it whole with an empty diff
 /// area when there is not enough remaining width for a real third zone.
@@ -422,10 +445,14 @@ fn split_diff_zone(app: &AppState, main_area: Rect) -> (Rect, Rect) {
     if main_area.width < app.diff_zone_width_threshold {
         return (main_area, Rect::default());
     }
-    let diff_w = ((main_area.width as u32 * DIFF_ZONE_PERCENT as u32) / 100) as u16;
-    let diff_w = diff_w
-        .max(DIFF_ZONE_MIN_WIDTH)
-        .min(main_area.width.saturating_sub(1));
+    // A dragged width wins over the proportion, but only while one is set:
+    // `None` keeps the zone re-proportioning itself on every resize, which is
+    // the behaviour every window had before the bar became draggable.
+    let diff_w = app
+        .diff_zone_width
+        .unwrap_or_else(|| ((main_area.width as u32 * DIFF_ZONE_PERCENT as u32) / 100) as u16);
+    let (min_w, max_w) = diff_zone_width_bounds(main_area.width);
+    let diff_w = diff_w.clamp(min_w, max_w);
     let [content_area, diff_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(diff_w)]).areas(main_area);
     (content_area, diff_area)

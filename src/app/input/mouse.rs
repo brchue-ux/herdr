@@ -462,6 +462,21 @@ impl AppState {
                     return None;
                 }
 
+                // Tested before pane split borders because this bar lives in the
+                // main area beside them; its band is one column of the Changes
+                // zone's own frame and cannot overlap the sidebar's band, which
+                // sits at the far side of the terminal zone.
+                if let Some(grab_offset) = self.diff_divider_grab_at(mouse.column, mouse.row) {
+                    self.drag = Some(DragState {
+                        target: DragTarget::DiffDivider { grab_offset },
+                    });
+                    self.set_manual_diff_width(AppState::divider_pos_from_grab(
+                        mouse.column,
+                        grab_offset,
+                    ));
+                    return None;
+                }
+
                 if !in_sidebar {
                     if let Some(border) = self.find_border_at(mouse.column, mouse.row) {
                         let grab_offset = match border.direction {
@@ -801,6 +816,12 @@ impl AppState {
                         }
                         DragTarget::SidebarDivider { grab_offset } => {
                             self.set_manual_sidebar_width(AppState::divider_pos_from_grab(
+                                mouse.column,
+                                *grab_offset,
+                            ));
+                        }
+                        DragTarget::DiffDivider { grab_offset } => {
+                            self.set_manual_diff_width(AppState::divider_pos_from_grab(
                                 mouse.column,
                                 *grab_offset,
                             ));
@@ -4760,6 +4781,88 @@ mod tests {
         assert!(app.state.context_menu.is_none());
         assert!(app.state.tab_press.is_none());
         assert!(app.state.drag.is_none());
+    }
+
+    /// A wide enough frame to draw all three zones side by side. The Changes
+    /// zone folds below `diff_zone_width_threshold` (300 columns of main area),
+    /// so a narrower fixture would test the folded path by accident and pass
+    /// while proving nothing.
+    fn app_with_changes_zone() -> (App, ratatui::layout::Rect) {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let frame = ratatui::layout::Rect::new(0, 0, 360, 40);
+        crate::ui::compute_view(&mut app.state, frame);
+        (app, frame)
+    }
+
+    /// The Changes zone's vertical bar can be grabbed and dragged sideways, and
+    /// the zone follows the pointer instead of snapping back to its proportion.
+    #[test]
+    fn dragging_the_changes_bar_widens_the_changes_zone() {
+        let (mut app, frame) = app_with_changes_zone();
+        let diff = app.state.view.diff_area;
+        assert!(
+            diff.width > 0,
+            "the fixture drew no Changes zone, so there is no bar to drag"
+        );
+
+        let before = diff.width;
+        let bar = diff.x;
+        let row = diff.y + 1;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), bar, row));
+        assert!(
+            app.state.drag.is_some(),
+            "pressing the Changes bar started no drag"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            bar - 10,
+            row,
+        ));
+        crate::ui::compute_view(&mut app.state, frame);
+
+        assert_eq!(
+            app.state.view.diff_area.width,
+            before + 10,
+            "the Changes zone did not follow its bar"
+        );
+    }
+
+    /// The bar stops at both ends rather than letting either side vanish.
+    #[test]
+    fn the_changes_bar_stops_at_both_ends() {
+        let (mut app, frame) = app_with_changes_zone();
+        let diff = app.state.view.diff_area;
+        let row = diff.y + 1;
+        let main_left = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width;
+        let (min_w, max_w) = crate::ui::diff_zone_width_bounds(diff.x + diff.width - main_left);
+        assert!(min_w < max_w, "the fixture leaves no room to drag at all");
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), diff.x, row));
+
+        // Shoved right, off the end of the frame: the zone keeps its floor.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            frame.width - 1,
+            row,
+        ));
+        crate::ui::compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state.view.diff_area.width, min_w,
+            "the Changes zone was squeezed past its own minimum"
+        );
+
+        // Shoved the other way, into the sidebar: the terminal keeps a strip.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, row));
+        crate::ui::compute_view(&mut app.state, frame);
+        assert_eq!(
+            app.state.view.diff_area.width, max_w,
+            "the Changes zone grew until the terminal had nothing left"
+        );
     }
 
     #[test]

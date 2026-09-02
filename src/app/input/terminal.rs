@@ -1510,6 +1510,7 @@ mod tests {
             app.state.active,
             app.state.selected,
             app.state.sidebar_width,
+            app.state.diff_zone_width,
             app.state.collapsed_space_keys.clone(),
             None,
         );

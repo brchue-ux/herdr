@@ -49,6 +49,7 @@ impl App {
                 self.state.active,
                 self.state.selected,
                 self.state.sidebar_width,
+                self.state.diff_zone_width,
                 self.state.collapsed_space_keys.clone(),
                 self.state.agent_views.durable().cloned(),
             );

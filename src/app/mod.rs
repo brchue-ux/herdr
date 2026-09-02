@@ -557,6 +557,7 @@ impl App {
             selected,
             sidebar_width,
             sidebar_width_source,
+            restored_diff_zone_width,
             collapsed_space_keys,
         ) = if no_session {
             (
@@ -565,6 +566,7 @@ impl App {
                 0,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
+                None,
                 std::collections::HashSet::new(),
             )
         } else if let Some(snap) = crate::persist::load() {
@@ -601,6 +603,7 @@ impl App {
                     } else {
                         state::SidebarWidthSource::ConfigDefault
                     },
+                    snap.diff_zone_width,
                     snap.collapsed_space_keys,
                 )
             } else {
@@ -617,6 +620,7 @@ impl App {
                     } else {
                         state::SidebarWidthSource::ConfigDefault
                     },
+                    snap.diff_zone_width,
                     snap.collapsed_space_keys,
                 )
             }
@@ -627,6 +631,7 @@ impl App {
                 0,
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
+                None,
                 std::collections::HashSet::new(),
             )
         };
@@ -804,6 +809,7 @@ impl App {
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             diff_popup_open: false,
             diff_pane_scroll: 0,
+            diff_zone_width: restored_diff_zone_width,
             agent_panel_sort,
             agent_views: restored_agent_views(config, restored_agent_view, &installed_plugins),
             // Never restored: a status is a claim about the world right now,
