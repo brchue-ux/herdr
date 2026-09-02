@@ -28,6 +28,11 @@ pub struct SessionSnapshot {
     pub selected: usize,
     #[serde(default)]
     pub sidebar_width: Option<u16>,
+    /// The Changes zone's dragged width, or `None` when it still follows the
+    /// proportional default. Absent from a snapshot written by an older build,
+    /// which restores as `None` and keeps that build's behaviour exactly.
+    #[serde(default)]
+    pub diff_zone_width: Option<u16>,
     #[serde(default)]
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
@@ -235,6 +240,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     sidebar_width: Option<u16>,
     #[serde(default)]
+    diff_zone_width: Option<u16>,
+    #[serde(default)]
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
@@ -253,6 +260,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         active: raw.active,
         selected: raw.selected,
         sidebar_width: raw.sidebar_width,
+        diff_zone_width: raw.diff_zone_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
         agent_view: raw.agent_view,
@@ -316,6 +324,7 @@ pub fn capture(
     active: Option<usize>,
     selected: usize,
     sidebar_width: u16,
+    diff_zone_width: Option<u16>,
     collapsed_space_keys: std::collections::HashSet<String>,
     agent_view: Option<crate::api::schema::AgentViewSetParams>,
 ) -> SessionSnapshot {
@@ -333,6 +342,7 @@ pub fn capture(
         active,
         selected,
         sidebar_width: Some(sidebar_width),
+        diff_zone_width,
         // Retired with the Agents panel: the sidebar is one section, so there is
         // no split to size. Kept on the wire, always `None`, so a snapshot
         // written by an older build still parses instead of failing restore.
@@ -641,6 +651,7 @@ mod tests {
             state.active,
             state.selected,
             state.sidebar_width,
+            state.diff_zone_width,
             state.collapsed_space_keys.clone(),
             None,
         )
@@ -754,6 +765,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: Some(26),
+            diff_zone_width: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             agent_view: None,
@@ -851,6 +863,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
+            diff_zone_width: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             agent_view: None,
@@ -1156,6 +1169,7 @@ mod tests {
             state.active,
             state.selected,
             state.sidebar_width,
+            state.diff_zone_width,
             state.collapsed_space_keys.clone(),
             Some(view.clone()),
         );
@@ -1519,6 +1533,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: None,
+            diff_zone_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: std::collections::HashSet::new(),
             agent_view: None,
@@ -1579,6 +1594,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: None,
+            diff_zone_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: std::collections::HashSet::new(),
             agent_view: Some(crate::api::schema::AgentViewSetParams {
@@ -1694,6 +1710,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
+            diff_zone_width: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             agent_view: None,

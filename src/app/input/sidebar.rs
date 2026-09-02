@@ -427,6 +427,60 @@ impl AppState {
     /// The detent never traps the drag: a pointer at either configured bound
     /// commits immediately, so bounds that sit inside the detent band (a
     /// `sidebar_min_width` above the drop column, say) still resize.
+    /// Where the Changes zone's vertical bar sits relative to a press, or
+    /// `None` when the press is outside the grab band.
+    ///
+    /// The band extends **right**, over the zone's own border column, which is
+    /// the mirror of the sidebar band extending left over its own last column
+    /// and is chosen for the same reason: the column on the other side belongs
+    /// to a terminal, herdr draws no border for a lone pane there, and a press
+    /// in it is forwarded to the running program. Losing a column of the zone's
+    /// own frame is the cheaper of the two.
+    ///
+    /// The returned offset is negative because this bar is the left edge of its
+    /// zone while the sidebar's is the right edge of its own;
+    /// [`Self::divider_pos_from_grab`] adds it to the press column either way.
+    pub(super) fn diff_divider_grab_at(&self, col: u16, row: u16) -> Option<i16> {
+        let diff = self.view.diff_area;
+        // A folded zone has no bar to grab, so there is nothing to hit-test.
+        if diff.width == 0 || row < diff.y || row >= diff.y + diff.height {
+            return None;
+        }
+        let offset = col.checked_sub(diff.x)?;
+        if offset > Self::DIVIDER_GRAB_TOLERANCE {
+            return None;
+        }
+        // Never reach past the zone's own right edge on a very narrow zone.
+        if col >= diff.x + diff.width {
+            return None;
+        }
+        Some(-(offset as i16))
+    }
+
+    /// Sets the Changes zone's width from the column its bar was dragged to.
+    ///
+    /// The zone's right edge is fixed to the frame, so the width is simply the
+    /// distance from the dragged column to that edge. Clamped through
+    /// [`crate::ui::diff_zone_width_bounds`], the same bounds the layout uses,
+    /// so the pointer can never set a width the next frame overrides.
+    pub(super) fn set_manual_diff_width(&mut self, divider_col: u16) {
+        let diff = self.view.diff_area;
+        if diff.width == 0 {
+            return;
+        }
+        let right_edge = diff.x.saturating_add(diff.width);
+        let main_left = self
+            .view
+            .sidebar_rect
+            .x
+            .saturating_add(self.view.sidebar_rect.width);
+        let main_width = right_edge.saturating_sub(main_left);
+        let (min_w, max_w) = crate::ui::diff_zone_width_bounds(main_width);
+        let raw = right_edge.saturating_sub(divider_col);
+        self.diff_zone_width = Some(raw.clamp(min_w, max_w));
+        self.mark_session_dirty();
+    }
+
     pub(super) fn set_manual_sidebar_width(&mut self, divider_col: u16) {
         let sidebar = self.view.sidebar_rect;
         let raw = divider_col

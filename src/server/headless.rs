@@ -1247,6 +1247,7 @@ impl HeadlessServer {
             self.app.state.active,
             self.app.state.selected,
             self.app.state.sidebar_width,
+            self.app.state.diff_zone_width,
             self.app.state.collapsed_space_keys.clone(),
             self.app.state.agent_views.durable().cloned(),
         );

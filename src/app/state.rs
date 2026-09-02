@@ -1733,6 +1733,17 @@ pub(crate) enum DragTarget {
     SidebarDivider {
         grab_offset: i16,
     },
+    /// A live drag on the Changes zone's own vertical bar.
+    ///
+    /// Carries the same grab offset as [`Self::SidebarDivider`] and for the
+    /// same reason: the bar keeps the distance from the cursor it was grabbed
+    /// at, so a press two columns into the band does not snap the edge under
+    /// the pointer. The sign convention differs because this bar is the *left*
+    /// edge of its zone and the sidebar's is the right edge of its own, so the
+    /// offset is taken in the opposite direction - see `diff_divider_grab_at`.
+    DiffDivider {
+        grab_offset: i16,
+    },
 }
 
 /// Active mouse drag on a split border or sidebar divider.
@@ -2124,6 +2135,15 @@ pub struct AppState {
     /// see `crate::ui::diff_pane::normalized_diff_scroll`. Pure client
     /// presentation state, like `diff_popup_open` beside it.
     pub diff_pane_scroll: usize,
+    /// The Changes zone's width in columns when the captain has dragged its
+    /// bar, or `None` to keep following the proportional default.
+    ///
+    /// `None` is not "the default value" written out - it is the absence of a
+    /// choice, which is what lets the zone keep re-proportioning itself as the
+    /// window resizes until somebody actually sets a width. Once set it is an
+    /// exact column count, clamped at use rather than at write so a width
+    /// chosen on a wide window survives a narrow one and comes back.
+    pub diff_zone_width: Option<u16>,
     /// Order agent rows take within their owner in the sidebar tree.
     pub agent_panel_sort: AgentPanelSort,
     /// Every source that currently wants to own the built-in Agents view. It
@@ -3802,6 +3822,7 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             diff_popup_open: false,
             diff_pane_scroll: 0,
+            diff_zone_width: None,
             agent_panel_sort: AgentPanelSort::Spaces,
             agent_views: crate::agent_view::AgentViewSlots::default(),
             session_status: None,
